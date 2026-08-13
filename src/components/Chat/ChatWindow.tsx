@@ -258,6 +258,12 @@ function activeModelDescription(): string {
   return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
 }
 
+/** How much of a session's transcript exists right now — the evidence for
+ * whether a failed send ever became a turn. */
+function messageCount(sessionId: string): number {
+  return useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.messages.length ?? 0;
+}
+
 export async function switchModelFromSlash(selector: string): Promise<string> {
   const state = useModelStore.getState();
   const providerModelFilters = useSettingsStore.getState().providerModelFilters;
@@ -813,9 +819,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
     // any skill not already explicitly invoked above — see
     // `settingsStore.skillAutoInvokeEnabled`.
+    const messagesBefore = messageCount(sessionId);
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
         setError(errorMessage(err));
+        // A send refused before it was accepted — an unavailable resident
+        // runner is the usual reason — leaves nothing behind: no transcript
+        // entry, no durable turn, no run. The typed message is the only thing
+        // that would be lost, so it goes back in the box, and pressing Send
+        // again once the runner is up is the same send rather than a retyped
+        // one. A turn that got far enough to write to the transcript owns its
+        // own failure and the composer stays as the user left it.
+        if (messageCount(sessionId) !== messagesBefore) return;
+        setInput((current) => current || text);
+        setAttachments((current) => (current.length > 0 ? current : pendingAttachments));
       })
       .finally(() => {
         textareaRef.current?.focus();

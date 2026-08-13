@@ -370,8 +370,30 @@ export async function buildDaemonDesktopRecipe(
   };
 }
 
-export function daemonRouteFromStatus(status: DaemonStatus): "fallback" | "daemon" {
-  if (!status.installed) return "fallback";
+/**
+ * Where a conversational turn is allowed to execute.
+ *
+ * `browser` is a profile with no Tauri bridge at all — a dev server in a plain
+ * browser tab, where no durable execution authority exists on the machine and
+ * the in-process loop is the only thing there is. `daemon` is the resident
+ * runner. The packaged desktop app is always the second one: there is no third
+ * value for "desktop without a runner", because that state is a refusal rather
+ * than a different place to run.
+ */
+export type ConversationRoute = "browser" | "daemon";
+
+/**
+ * The route for a machine that HAS the bridge — so, only ever `daemon`.
+ *
+ * Every unhealthy state throws instead of returning, and the return type says so:
+ * a caller cannot accidentally treat a stopped, stale, kill-switched or missing
+ * runner as permission to execute somewhere else. Execution authority is not a
+ * thing this app silently changes.
+ */
+export function daemonRouteFromStatus(status: DaemonStatus): "daemon" {
+  if (!status.installed) {
+    throw new Error("The M6A resident runner is required for conversations. Install it in Background Agents before sending this turn.");
+  }
   if (!status.serviceRunning || !status.heartbeatFresh) {
     throw new Error("The installed M6A resident runner is not healthy. Start it in Background Agents before sending this turn.");
   }
@@ -398,11 +420,11 @@ export function daemonRouteFromStatus(status: DaemonStatus): "fallback" | "daemo
   return "daemon";
 }
 
-/** Local browser/dev profiles that cannot expose the typed command are the
- * only error case treated as legacy fallback. An installed-but-broken daemon
- * never silently changes execution authority. */
-export async function daemonDesktopRoute(): Promise<"fallback" | "daemon"> {
-  if (!isTauri()) return "fallback";
+/** The only place `browser` can come from: no Tauri bridge, so no resident
+ * runner can exist. Once the bridge is there, the turn belongs to the durable
+ * backend or it does not run at all. */
+export async function daemonDesktopRoute(): Promise<ConversationRoute> {
+  if (!isTauri()) return "browser";
   return daemonRouteFromStatus(await daemonStatus());
 }
 

@@ -228,6 +228,39 @@ describe("every desktop send is a durable ingress turn", () => {
     expect(streamed).toEqual([]);
   });
 
+  /** Every way the resident runner can be unusable. None of them is permission
+   * to execute the turn here instead: the app refuses, and says which state the
+   * runner is in so the person can go fix it in Background Agents. */
+  const unusable = [
+    ["is not installed", { installed: false }, /required for conversations/i],
+    ["is installed but stopped", { serviceRunning: false }, /not healthy/i],
+    ["has a stale heartbeat", { heartbeatFresh: false }, /not healthy/i],
+    ["is kill-switched", { killSwitch: true }, /kill switch/i],
+  ] as const;
+
+  for (const [description, patch, message] of unusable) {
+    it(`refuses a send when the runner ${description}, rather than running it here`, async () => {
+      invokeMock.mockImplementation(async (command: string) => {
+        if (command === "daemon_desktop_status") return { ...HEALTHY_DAEMON, ...patch };
+        if (command === "process_admit") return { processId: "p-1" };
+        if (command === "rules_list") return [];
+        if (command === "workspace_list_roots") {
+          return [{ id: "root-1", path: WORKSPACE, label: "project", is_primary: true }];
+        }
+        return undefined;
+      });
+
+      await expect(runAgentTurn("s-1", "fix the failing test in src/lib/a.ts")).rejects.toThrow(message);
+
+      // Nothing ran, and nothing was invented: no model round trip, no ingress
+      // row, no run, and no assistant message pretending a turn happened.
+      expect(streamed).toEqual([]);
+      expect(mocks.submitDaemonDesktopTurn).not.toHaveBeenCalled();
+      expect(mocks.watchDaemonDesktopTurn).not.toHaveBeenCalled();
+      expect(useSessionStore.getState().sessions[0].messages).toEqual([]);
+    });
+  }
+
   it("still refuses a mutating send with no open workspace, before anything is submitted", async () => {
     useWorkspaceStore.setState({ roots: [] });
     await runAgentTurn("s-1", "fix the failing test in src/lib/a.ts");

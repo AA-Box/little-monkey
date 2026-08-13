@@ -23,7 +23,7 @@
  * "session affinity" (keep using whatever just worked) falls out of the
  * same mechanism a manual model switch uses — no separate sticky field.
  */
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
@@ -126,6 +126,7 @@ import {
   submitDaemonDesktopTurn,
   watchDaemonDesktopTurn,
   type ActiveDaemonDesktopTurn,
+  type ConversationRoute,
   type DesktopTurnSource,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
@@ -1595,12 +1596,13 @@ export async function runAgentTurn(
     // executed from the context frozen when that turn was accepted rather than
     // from whatever this process is configured with at resume time.
     //
-    // `fallback` is not an exception to that rule: it is the configuration in
-    // which no durable execution authority exists on this machine at all — a
-    // browser/dev profile with no Tauri bridge, or a desktop with no resident
-    // runner installed. There is nothing to hand the turn to, so the in-process
-    // loop is the only thing that can run it, and `runTurnGuarded` refuses to be
-    // entered on any other route.
+    // `browser` is not an exception to that rule either: it is the one
+    // configuration in which no durable execution authority can exist on the
+    // machine at all — a dev profile with no Tauri bridge. There is nothing to
+    // hand the turn to there, so the in-process loop is the only thing that can
+    // run it. A packaged desktop never reaches it: `daemonDesktopRoute` refuses
+    // rather than routing a turn away from a runner that is missing, stopped,
+    // stale or kill-switched, and `runTurnGuarded` refuses again on its own.
     if (route === 'daemon') {
       if (resume !== null) {
         await resumeDurableDesktopTurn(sessionId, resume, controller, origin);
@@ -2092,12 +2094,16 @@ export function maybeAutoPreviewNewestArtifact(sessionId: string, anchorIndex: n
 /** `runAgentTurn` minus the per-session turn registration — the checkpoint
  * lifecycle half of the wrapper.
  *
- * This is the in-process conversational loop, and `route` is the guard that keeps
- * it from being one. It runs a user's turn inside the webview, which is only
- * defensible where nothing else on the machine can: a profile with no Tauri
- * bridge, or a desktop whose resident runner is not installed. The moment a
- * durable execution authority exists, every accepted turn belongs to it, and
- * entering here would be an execution bypass — so it throws instead. */
+ * This is the in-process conversational loop, and the two checks below are what
+ * keep it from being one on the desktop. It runs a user's turn inside the
+ * webview, which is only defensible where nothing else on the machine can: a
+ * profile with no Tauri bridge. Anywhere the bridge exists, a durable execution
+ * authority is reachable and every accepted turn belongs to it.
+ *
+ * The environment is checked here and not only at the caller on purpose. Routing
+ * already refuses, so this second check is dead code today — which is the point:
+ * it is what a future caller that skips `daemonDesktopRoute` hits, so
+ * reintroducing the bypass takes deleting a guard rather than forgetting one. */
 async function runTurnGuarded(
   sessionId: string,
   userText: string,
@@ -2109,11 +2115,11 @@ async function runTurnGuarded(
   ultracode = false,
   mutationRequired = false,
   resume: ResumedTurn | null = null,
-  route: 'fallback' | 'daemon' = 'fallback',
+  route: ConversationRoute = 'browser',
 ): Promise<void> {
-  if (route !== 'fallback') {
+  if (route !== 'browser' || isTauri()) {
     throw new Error(
-      'A conversational turn cannot be executed in the app process while a resident runner owns execution.',
+      'A conversational turn cannot be executed in the app process. The resident runner owns desktop execution.',
     );
   }
   // The index this turn's user message will land at — captured before

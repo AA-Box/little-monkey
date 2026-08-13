@@ -200,11 +200,14 @@ describe("daemon desktop routing and event replay", () => {
     platform: "macos",
   };
 
-  it("falls back only when M6A is absent and fails closed when installed but unhealthy", () => {
-    expect(daemonRouteFromStatus({ ...healthy, installed: false })).toBe("fallback");
+  it("routes to the runner or refuses — every unusable state fails closed", () => {
     // `healthy` carries no `backpressure` field, which is what an older daemon
     // sends: a missing signal must route normally rather than block the app.
     expect(daemonRouteFromStatus(healthy)).toBe("daemon");
+    // A missing runner is a refusal, not a different place to execute. This is
+    // the case that used to hand the turn back to the app process.
+    expect(() => daemonRouteFromStatus({ ...healthy, installed: false })).toThrow(/required for conversations/i);
+    expect(() => daemonRouteFromStatus({ ...healthy, serviceRunning: false })).toThrow(/not healthy/i);
     expect(() => daemonRouteFromStatus({ ...healthy, heartbeatFresh: false })).toThrow(/not healthy/i);
     expect(() => daemonRouteFromStatus({ ...healthy, killSwitch: true })).toThrow(/kill switch/i);
   });
