@@ -47,6 +47,11 @@ pub struct TelegramAdapter {
     /// `false` and let the ingress gate handle it.
     self_id: Mutex<Option<i64>>,
     self_username: Mutex<Option<String>>,
+    /// The most recent poll failure, cleared by the next successful poll.
+    /// Folded into `probe` so the health an operator reads reflects the
+    /// transport actually moving messages, not only the credential: a valid
+    /// token whose `getUpdates` keeps failing is degraded, not connected.
+    last_poll_error: Mutex<Option<String>>,
     /// The Bot API origin. Always [`API_BASE`] in production; swappable in
     /// tests so an upload can be exercised against a loopback fixture.
     api_base: String,
@@ -64,6 +69,7 @@ impl TelegramAdapter {
             token: config.secret.clone(),
             self_id: Mutex::new(None),
             self_username: Mutex::new(None),
+            last_poll_error: Mutex::new(None),
             api_base: API_BASE.to_string(),
             blobs: std::sync::Arc::new(crate::daemon::channel_adapter::DaemonBlobs),
         })
@@ -128,6 +134,7 @@ impl TelegramAdapter {
         client: &reqwest::Client,
         message: &OutboundMessage,
         attachment: &little_monkey_lib::channels::types::OutboundAttachment,
+        any_sent: bool,
     ) -> Result<Option<String>, SendOutcome> {
         let bytes = self
             .blobs
@@ -139,6 +146,23 @@ impl TelegramAdapter {
             .clone()
             .unwrap_or_else(|| "attachment".to_string());
         let (method, field) = upload_method(&mime);
+        // The provider's own limit, checked before a single byte goes on the
+        // wire: an oversized file fails the same way every time, and burning
+        // the whole upload to hear that from Telegram helps nobody.
+        let limit = upload_limit(method);
+        if bytes.len() as u64 > limit {
+            return Err(SendOutcome::PermanentFailure {
+                error: format!(
+                    "'{filename}' is {} bytes, over Telegram's {limit}-byte limit for {method}{}",
+                    bytes.len(),
+                    if method == "sendPhoto" {
+                        "; send it as a document instead"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
 
         let part = match reqwest::multipart::Part::bytes(bytes)
             .file_name(filename)
@@ -161,7 +185,10 @@ impl TelegramAdapter {
         let response = match little_monkey_lib::egress::send(request).await {
             Ok(response) => response,
             Err(error) => {
-                return Err(if error.is_connect() {
+                // A connect failure provably sent nothing — but once any
+                // chunk or earlier file of this message has been delivered,
+                // the whole-message retry the outbox would run duplicates it.
+                return Err(if error.is_connect() && !any_sent {
                     SendOutcome::RetryableFailure {
                         error: self.redact(format!("Could not connect to Telegram: {error}")),
                         retry_after_ms: None,
@@ -181,14 +208,36 @@ impl TelegramAdapter {
                 .and_then(|error| error.parameters)
                 .and_then(|parameters| parameters.retry_after)
                 .map(|seconds| seconds * 1000);
-            return Err(SendOutcome::RetryableFailure {
-                error: "Telegram rate-limited the upload (429)".to_string(),
-                retry_after_ms,
+            return Err(if any_sent {
+                SendOutcome::NeedsReconciliation {
+                    error: "Telegram rate-limited the upload after part of the message was sent"
+                        .to_string(),
+                }
+            } else {
+                SendOutcome::RetryableFailure {
+                    error: "Telegram rate-limited the upload (429)".to_string(),
+                    retry_after_ms,
+                }
             });
         }
         if !status.is_success() {
-            return Err(SendOutcome::PermanentFailure {
-                error: self.redact(format!("Telegram returned {status} for {method}")),
+            // A Telegram outage (5xx) is worth retrying when nothing has
+            // been delivered; after partial delivery every failure parks.
+            return Err(if any_sent {
+                SendOutcome::NeedsReconciliation {
+                    error: self.redact(format!(
+                        "Telegram returned {status} for {method} after part of the message was sent"
+                    )),
+                }
+            } else if status.is_server_error() {
+                SendOutcome::RetryableFailure {
+                    error: self.redact(format!("Telegram returned {status} for {method}")),
+                    retry_after_ms: None,
+                }
+            } else {
+                SendOutcome::PermanentFailure {
+                    error: self.redact(format!("Telegram returned {status} for {method}")),
+                }
             });
         }
         match serde_json::from_str::<TelegramApiResponse<TelegramMessage>>(&body_text) {
@@ -202,17 +251,39 @@ impl TelegramAdapter {
     }
 }
 
+/// Telegram's own cap on a photo uploaded through `sendPhoto`: 10 MB.
+/// Everything else — documents, audio, video — goes through the 50 MB
+/// bot-upload cap. Both are the provider's published limits, named here so
+/// the pre-upload check and the tests agree on the same numbers.
+const TELEGRAM_MAX_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
+/// Telegram's cap on every non-photo bot upload (documents, audio, video).
+const TELEGRAM_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
 /// The API method and form field one MIME type should be uploaded through.
 ///
-/// A picture goes as a photo so it renders inline in the chat. Everything else
-/// goes as a document, which is also the right answer for SVG: Telegram's photo
-/// path re-encodes what it is given, and an SVG that survives as a file is more
-/// useful than one that arrives as a raster.
+/// A picture goes as a photo so it renders inline in the chat; audio and
+/// video go through their own methods so they arrive playable rather than as
+/// opaque files. Everything else goes as a document — which is also the
+/// right answer for SVG: Telegram's photo path re-encodes what it is given,
+/// and an SVG that survives as a file is more useful than one that arrives
+/// as a raster.
 fn upload_method(mime: &str) -> (&'static str, &'static str) {
     if mime.starts_with("image/") && mime != "image/svg+xml" {
         ("sendPhoto", "photo")
+    } else if mime.starts_with("audio/") {
+        ("sendAudio", "audio")
+    } else if mime.starts_with("video/") {
+        ("sendVideo", "video")
     } else {
         ("sendDocument", "document")
+    }
+}
+
+/// The provider's size cap for one upload method.
+fn upload_limit(method: &str) -> u64 {
+    match method {
+        "sendPhoto" => TELEGRAM_MAX_PHOTO_BYTES,
+        _ => TELEGRAM_MAX_FILE_BYTES,
     }
 }
 
@@ -282,7 +353,25 @@ impl ChannelAdapter for TelegramAdapter {
                         *self.self_username.lock().unwrap() = Some(username.clone());
                     }
                     let detail = user.username.unwrap_or(user.first_name);
-                    ChannelHealth::connected(now, Some(detail))
+                    // The credential works, but health describes the whole
+                    // transport: a poll loop that keeps failing means
+                    // messages are not arriving, and that is degraded.
+                    let poll_error = self
+                        .last_poll_error
+                        .lock()
+                        .ok()
+                        .and_then(|slot| slot.clone());
+                    match poll_error {
+                        Some(error) => ChannelHealth {
+                            state: little_monkey_lib::channels::types::HealthState::Degraded,
+                            detail: Some(format!(
+                                "Authenticated to Telegram as {detail}; the last poll failed"
+                            )),
+                            last_error: Some(error),
+                            probed_at_ms: now,
+                        },
+                        None => ChannelHealth::connected(now, Some(detail)),
+                    }
                 }
                 None => ChannelHealth::error(now, "Telegram returned no bot identity for getMe"),
             },
@@ -294,6 +383,10 @@ impl ChannelAdapter for TelegramAdapter {
     }
 
     async fn poll(&self, cursor: Option<&str>) -> Result<InboundBatch, String> {
+        // The outcome is mirrored into `last_poll_error` either way, so the
+        // next probe reports the polling loop's actual condition rather than
+        // only whether the credential works.
+        let result = async {
         // `is_self` and `mentions_self` are only meaningful once the bot knows
         // who it is, and nothing in the daemon's inbound loop calls `probe`.
         // Resolved here, once, so a group configured to answer on mention works
@@ -348,6 +441,12 @@ impl ChannelAdapter for TelegramAdapter {
             envelopes,
             cursor: new_cursor,
         })
+        }
+        .await;
+        if let Ok(mut slot) = self.last_poll_error.lock() {
+            *slot = result.as_ref().err().cloned();
+        }
+        result
     }
 
     /// Telegram hands out a `file_id`, not a URL: it is resolved with
@@ -419,6 +518,9 @@ impl ChannelAdapter for TelegramAdapter {
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
         let mut last_message_id: Option<String> = None;
+        // Once any chunk has been delivered, a whole-message retry would
+        // deliver it twice — from that point every failure parks the row.
+        let mut any_sent = false;
         for chunk in &chunks {
             let mut body = serde_json::json!({
                 "chat_id": message.conversation_id,
@@ -442,9 +544,10 @@ impl ChannelAdapter for TelegramAdapter {
             let response = match little_monkey_lib::egress::send(request).await {
                 Ok(response) => response,
                 Err(error) => {
-                    return if error.is_connect() {
+                    return if error.is_connect() && !any_sent {
                         // The TCP/TLS handshake itself failed: the request
-                        // provably never left this machine.
+                        // provably never left this machine, and nothing of
+                        // this message has been delivered yet.
                         SendOutcome::RetryableFailure {
                             error: self.redact(format!("Could not connect to Telegram: {error}")),
                             retry_after_ms: None,
@@ -452,7 +555,8 @@ impl ChannelAdapter for TelegramAdapter {
                     } else {
                         // Anything else (a stalled read, a reset mid-response)
                         // may have happened after the request was already
-                        // written, so whether Telegram received it is unknown.
+                        // written — and once a chunk has landed, retrying the
+                        // whole message would deliver it twice.
                         SendOutcome::NeedsReconciliation {
                             error: self.redact(format!("Telegram send outcome unknown: {error}")),
                         }
@@ -467,18 +571,42 @@ impl ChannelAdapter for TelegramAdapter {
                     .and_then(|error| error.parameters)
                     .and_then(|parameters| parameters.retry_after)
                     .map(|seconds| seconds * 1000);
-                return SendOutcome::RetryableFailure {
-                    error: "Telegram rate-limited the request (429)".to_string(),
-                    retry_after_ms,
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation {
+                        error: "Telegram rate-limited the request after part of the message was sent"
+                            .to_string(),
+                    }
+                } else {
+                    SendOutcome::RetryableFailure {
+                        error: "Telegram rate-limited the request (429)".to_string(),
+                        retry_after_ms,
+                    }
                 };
             }
             if !status.is_success() {
-                return SendOutcome::PermanentFailure {
-                    error: self.redact(format!("Telegram returned {status} for sendMessage")),
+                // A Telegram outage (5xx) retries while nothing has been
+                // delivered; after partial delivery every failure parks, and
+                // a definite rejection with nothing sent is permanent.
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation {
+                        error: self.redact(format!(
+                            "Telegram returned {status} after part of the message was sent"
+                        )),
+                    }
+                } else if status.is_server_error() {
+                    SendOutcome::RetryableFailure {
+                        error: self.redact(format!("Telegram returned {status} for sendMessage")),
+                        retry_after_ms: None,
+                    }
+                } else {
+                    SendOutcome::PermanentFailure {
+                        error: self.redact(format!("Telegram returned {status} for sendMessage")),
+                    }
                 };
             }
             match serde_json::from_str::<TelegramApiResponse<TelegramMessage>>(&body_text) {
                 Ok(parsed) if parsed.ok => {
+                    any_sent = true;
                     last_message_id = parsed.result.map(|message| message.message_id.to_string());
                 }
                 _ => {
@@ -490,8 +618,14 @@ impl ChannelAdapter for TelegramAdapter {
             }
         }
         for attachment in &message.attachments {
-            match self.send_one_attachment(&client, message, attachment).await {
-                Ok(message_id) => last_message_id = message_id.or(last_message_id),
+            match self
+                .send_one_attachment(&client, message, attachment, any_sent)
+                .await
+            {
+                Ok(message_id) => {
+                    any_sent = true;
+                    last_message_id = message_id.or(last_message_id);
+                }
                 Err(outcome) => return outcome,
             }
         }
@@ -1164,9 +1298,11 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_is_uploaded_as_a_photo_and_everything_else_as_a_document() {
+    fn each_attachment_type_picks_the_method_telegram_renders_it_with() {
         assert_eq!(upload_method("image/png"), ("sendPhoto", "photo"));
         assert_eq!(upload_method("image/jpeg"), ("sendPhoto", "photo"));
+        assert_eq!(upload_method("audio/mpeg"), ("sendAudio", "audio"));
+        assert_eq!(upload_method("video/mp4"), ("sendVideo", "video"));
         assert_eq!(
             upload_method("application/pdf"),
             ("sendDocument", "document")
@@ -1177,6 +1313,183 @@ mod tests {
             upload_method("application/octet-stream"),
             ("sendDocument", "document")
         );
+    }
+
+    #[test]
+    fn each_method_carries_its_own_provider_limit() {
+        assert_eq!(upload_limit("sendPhoto"), 10 * 1024 * 1024);
+        for method in ["sendDocument", "sendAudio", "sendVideo"] {
+            assert_eq!(upload_limit(method), 50 * 1024 * 1024);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_photo_at_exactly_the_limit_is_uploaded() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":101,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, &vec![0u8; TELEGRAM_MAX_PHOTO_BYTES as usize]);
+        let outcome = adapter.send(&message_with_file("exact.png")).await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+        assert!(requests
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_photo_one_byte_over_the_limit_is_refused_before_any_upload() {
+        // No server at all: the refusal must happen before a request exists,
+        // and a PermanentFailure (not a connect error) proves it did.
+        let adapter = upload_adapter(
+            "http://127.0.0.1:9",
+            &vec![0u8; TELEGRAM_MAX_PHOTO_BYTES as usize + 1],
+        );
+        match adapter.send(&message_with_file("big.png")).await {
+            SendOutcome::PermanentFailure { error } => {
+                assert!(error.contains("sendPhoto"), "{error}");
+                assert!(error.contains("document instead"), "{error}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_document_one_byte_over_the_limit_is_refused_before_any_upload() {
+        let adapter = upload_adapter(
+            "http://127.0.0.1:9",
+            &vec![0u8; TELEGRAM_MAX_FILE_BYTES as usize + 1],
+        );
+        match adapter.send(&message_with_file("big.pdf")).await {
+            SendOutcome::PermanentFailure { error } => {
+                assert!(error.contains("sendDocument"), "{error}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_targets_the_forum_topic_it_replies_into() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":102,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"%PDF-1.7");
+        let message = OutboundMessage {
+            thread_id: Some("42".into()),
+            ..message_with_file("report.pdf")
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.contains("name=\"message_thread_id\""), "{text}");
+        assert!(text.contains("name=\"reply_to_message_id\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_second_chunk_parks_the_message() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"message_id":1,"chat":{"id":7,"type":"private"}}}"#
+                    .to_string(),
+            ),
+            (
+                429,
+                r#"{"ok":false,"parameters":{"retry_after":5}}"#.to_string(),
+            ),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        let message = OutboundMessage {
+            text: "a".repeat(MAX_MESSAGE_UTF16 + 100),
+            attachments: Vec::new(),
+            ..message_with_file("unused.txt")
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_failure_after_the_text_landed_parks_the_message() {
+        // The text chunk is delivered; the attachment upload is then rate
+        // limited. A whole-message retry would say the text twice.
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"message_id":1,"chat":{"id":7,"type":"private"}}}"#
+                    .to_string(),
+            ),
+            (
+                429,
+                r#"{"ok":false,"parameters":{"retry_after":5}}"#.to_string(),
+            ),
+        ]);
+        let adapter = upload_adapter(&base, b"bytes");
+        let message = OutboundMessage {
+            text: "here is the file".into(),
+            ..message_with_file("notes.txt")
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_telegram_outage_is_retried_when_nothing_was_delivered() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            502,
+            r#"{"ok":false}"#.to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"unused");
+        let message = OutboundMessage {
+            text: "hello".into(),
+            attachments: Vec::new(),
+            ..message_with_file("unused.txt")
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::RetryableFailure { .. }),
+            "a 502 with nothing delivered must retry, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_poll_degrades_health_until_it_recovers() {
+        // getMe (identity), a failing getUpdates, then the probe's own getMe:
+        // the probe must fold the poll failure in rather than report the
+        // working credential as a working channel.
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"result":{"id":42,"is_bot":true,"first_name":"Monkey","username":"m"}}"#
+                    .to_string(),
+            ),
+            (500, r#"{"ok":false}"#.to_string()),
+            (
+                200,
+                r#"{"ok":true,"result":{"id":42,"is_bot":true,"first_name":"Monkey","username":"m"}}"#
+                    .to_string(),
+            ),
+        ]);
+        let adapter = upload_adapter(&base, b"unused");
+        assert!(adapter.poll(None).await.is_err());
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Degraded,
+            "{health:?}"
+        );
+        assert!(health.last_error.is_some());
     }
 
     const PRIVATE_MESSAGE: &str = r#"{
