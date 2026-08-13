@@ -30,6 +30,19 @@ use super::telecom_store::{CallDirection, InboundCallPolicy};
 /// what an unauthenticated caller can make this process hold.
 const MAX_MEDIA_SOCKETS: usize = 16;
 
+/// How long a dropped media stream has to come back before the call it was
+/// carrying is hung up.
+///
+/// A carrier's socket can close mid-call and be re-established seconds later —
+/// a proxy recycling a connection, a media server handing the stream to
+/// another node — and hanging up on the first close would drop somebody who is
+/// still holding the phone to their ear. Waiting is not free either: with no
+/// stream there is nothing to hear and nothing to say, so every extra second is
+/// a caller listening to silence on a line the carrier is still billing. Two
+/// seconds is long enough for a reconnect and short enough that a stream which
+/// is really gone is not paid for.
+const STREAM_DISCONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+
 fn open_sockets() -> &'static std::sync::atomic::AtomicUsize {
     static OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     &OPEN
@@ -82,14 +95,7 @@ pub(crate) async fn handle_media_upgrade(
     if !account.enabled {
         return refuse();
     }
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    };
+    let secret = account_secret(&account);
     if super::telephony::verify_media_stream_token(
         &secret,
         &account_id,
@@ -154,6 +160,7 @@ pub(crate) async fn handle_media_upgrade(
     }
     let slot = SocketSlot;
 
+    let disconnected = (account_id.clone(), call_id.clone());
     let identity = CallIdentity {
         account_id,
         call_id,
@@ -200,6 +207,10 @@ pub(crate) async fn handle_media_upgrade(
             "monkey daemon: a call ended after {} turn(s)",
             report.turns_submitted
         );
+        if report.stream_dropped {
+            let (account_id, call_id) = disconnected;
+            end_after_disconnect_grace(paths, account_id, call_id).await;
+        }
     });
 
     Response::builder()
@@ -209,6 +220,88 @@ pub(crate) async fn handle_media_upgrade(
         .header(SEC_WEBSOCKET_ACCEPT, accept)
         .body(Full::new(Bytes::new()))
         .unwrap_or_else(|_| refuse())
+}
+
+/// Hang up a call whose media stream dropped — unless the carrier comes back
+/// for it first.
+///
+/// A closed socket is not the same fact as an ended call. The carrier decides
+/// when a call is over and says so with a `stop` event and a status callback; a
+/// socket that simply stops is a transport failure, and the call it was
+/// carrying is still up, still billing, and now silent in both directions. So
+/// the close starts a clock rather than a hangup: if a new media socket
+/// registers this call inside [`STREAM_DISCONNECT_GRACE`] the conversation
+/// carries on untouched, and only a stream that never came back gets the line
+/// hung up and the row closed.
+///
+/// Doing nothing was the old behaviour, and it left the caller on a dead line
+/// until the max-duration sweep noticed minutes later.
+async fn end_after_disconnect_grace(paths: DaemonPaths, account_id: String, call_id: String) {
+    tokio::time::sleep(STREAM_DISCONNECT_GRACE).await;
+    end_dropped_call(paths, account_id, call_id).await;
+}
+
+/// What the grace decides once it is up. Split from the wait so a test can ask
+/// the question without one.
+async fn end_dropped_call(paths: DaemonPaths, account_id: String, call_id: String) {
+    // A reconnect re-registers the call as live. That is a conversation in
+    // progress, not a dead line, and it must not be hung up.
+    if super::call_media::is_on_the_line(&call_id) {
+        return;
+    }
+    let Ok(mut store) = DaemonStore::open(&paths) else {
+        return;
+    };
+    let Ok(Some(call)) = store.telecom_call(&call_id) else {
+        return;
+    };
+    // The carrier's own status callback may have landed during the grace. A
+    // call it already closed needs nothing from us.
+    if call.state.is_terminal() {
+        return;
+    }
+    let carrier = store
+        .telecom_account(&account_id)
+        .ok()
+        .flatten()
+        .and_then(|account| {
+            let secret = account_secret(&account);
+            super::telephony::provider_for_account(&account, secret).ok()
+        });
+    let Ok(now_ms) = super::now_ms()
+        .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))
+    else {
+        return;
+    };
+    match super::telecom_worker::hang_up_and_close(
+        &mut store,
+        carrier.as_ref(),
+        &call_id,
+        call.provider_call_id.as_deref(),
+        super::telephony::CallState::Completed,
+        "The carrier's media stream disconnected and did not reconnect",
+        now_ms,
+    )
+    .await
+    {
+        Ok(true) => eprintln!("monkey daemon: hung up {call_id} after its media stream dropped"),
+        Ok(false) => eprintln!(
+            "monkey daemon: {call_id} lost its media stream and the carrier would not hang it up"
+        ),
+        Err(error) => eprintln!("monkey daemon: could not close {call_id}: {error}"),
+    }
+}
+
+/// The carrier credential for one account, resolved from the keychain.
+fn account_secret(account: &super::telecom_store::TelecomAccountRecord) -> String {
+    match &account.credential_ref {
+        Some(reference) => super::channel_adapter::ChannelSecrets::get(
+            &super::channel_adapter::KeyringChannelSecrets,
+            reference,
+        )
+        .unwrap_or_default(),
+        None => String::new(),
+    }
 }
 
 /// The route a call's turns run under.
@@ -299,6 +392,115 @@ mod tests {
         assert_eq!(
             websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    /// A telephony account and one call in progress on it, in a store of their
+    /// own. No credential reference, so nothing reaches for the keychain.
+    fn call_in_progress(label: &str) -> (DaemonPaths, String) {
+        use super::super::telecom_store::{
+            CallLimits, OutboundCallApproval, TelecomAccountRecord, TelecomCallRecord,
+        };
+        use super::super::telephony::{CallState, TelecomKind};
+        use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+
+        const NOW: i64 = 1_700_000_000_000;
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-call-grace-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().expect("paths");
+        let mut store = DaemonStore::open(&paths).expect("store");
+        store
+            .upsert_telecom_account(&TelecomAccountRecord {
+                account_id: "tel-1".into(),
+                kind: TelecomKind::Mock,
+                label: "Support line".into(),
+                enabled: true,
+                carrier_account_id: "carrier-1".into(),
+                from_number: "+15550000000".into(),
+                credential_ref: None,
+                public_base_url: None,
+                non_secret_config: serde_json::json!({}),
+                inbound_policy: InboundCallPolicy::Answer,
+                outbound_approval: OutboundCallApproval::Approval,
+                limits: CallLimits::default(),
+                health: ChannelHealth {
+                    state: HealthState::Connected,
+                    detail: None,
+                    last_error: None,
+                    probed_at_ms: NOW,
+                },
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("account");
+        let call_id = format!("call-{label}");
+        store
+            .start_call(&TelecomCallRecord {
+                call_id: call_id.clone(),
+                account_id: "tel-1".into(),
+                provider_call_id: Some(format!("carrier-{label}")),
+                direction: CallDirection::Inbound,
+                peer_number: "+15551234567".into(),
+                state: CallState::InProgress,
+                session_key: Some(format!("call:tel-1:{call_id}")),
+                job_id: None,
+                idempotency_key: format!("inbound:carrier-{label}"),
+                opening_line: None,
+                last_error: None,
+                started_at_ms: Some(NOW),
+                ended_at_ms: None,
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("call");
+        (paths, call_id)
+    }
+
+    fn state_of(paths: &DaemonPaths, call_id: &str) -> super::super::telephony::CallState {
+        DaemonStore::open(paths)
+            .expect("store")
+            .telecom_call(call_id)
+            .expect("query")
+            .expect("row")
+            .state
+    }
+
+    #[test]
+    fn a_dropped_stream_is_given_two_seconds_to_come_back() {
+        assert_eq!(STREAM_DISCONNECT_GRACE.as_millis(), 2000);
+    }
+
+    /// The stream is gone and stays gone: the caller is on a line nobody can
+    /// hear, so the carrier is told to hang it up.
+    #[tokio::test]
+    async fn a_stream_that_never_comes_back_ends_the_call() {
+        let (paths, call_id) = call_in_progress("dropped");
+
+        end_dropped_call(paths.clone(), "tel-1".to_string(), call_id.clone()).await;
+
+        assert_eq!(
+            state_of(&paths, &call_id),
+            super::super::telephony::CallState::Completed
+        );
+    }
+
+    /// The same drop, but the carrier reconnects inside the grace. Somebody is
+    /// mid-conversation, and hanging up on them is the failure this avoids.
+    #[tokio::test]
+    async fn a_stream_that_reconnects_inside_the_grace_keeps_the_call() {
+        let (paths, call_id) = call_in_progress("reconnected");
+        let _reconnected = super::super::call_media::register_reconnected_call(&call_id);
+
+        end_dropped_call(paths.clone(), "tel-1".to_string(), call_id.clone()).await;
+
+        assert_eq!(
+            state_of(&paths, &call_id),
+            super::super::telephony::CallState::InProgress,
+            "a reconnected stream must not have its call hung up"
         );
     }
 
