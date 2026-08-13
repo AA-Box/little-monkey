@@ -387,60 +387,62 @@ impl ChannelAdapter for TelegramAdapter {
         // next probe reports the polling loop's actual condition rather than
         // only whether the credential works.
         let result = async {
-        // `is_self` and `mentions_self` are only meaningful once the bot knows
-        // who it is, and nothing in the daemon's inbound loop calls `probe`.
-        // Resolved here, once, so a group configured to answer on mention works
-        // from the first poll rather than from whenever an operator happens to
-        // run `channels probe`. A failure leaves the identity unknown, which is
-        // the conservative answer — never a claim of self it cannot back.
-        let identity_known = self.self_id.lock().map(|id| id.is_some()).unwrap_or(false);
-        if !identity_known {
-            let _ = self.probe().await;
-        }
-        let offset = cursor.and_then(|value| value.parse::<i64>().ok());
-        let client = self.client()?;
-        let mut query = vec![
-            ("timeout".to_string(), "25".to_string()),
-            (
-                "allowed_updates".to_string(),
-                r#"["message","edited_message"]"#.to_string(),
-            ),
-        ];
-        if let Some(offset) = offset {
-            query.push(("offset".to_string(), (offset + 1).to_string()));
-        }
-        let request = client.get(self.method_url("getUpdates")).query(&query);
-        let response = little_monkey_lib::egress::send(request)
-            .await
-            .map_err(|error| self.redact(format!("Telegram poll failed: {error}")))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| self.redact(format!("Telegram poll body failed: {error}")))?;
-        if !status.is_success() {
-            return Err(self.redact(format!("Telegram returned {status} for getUpdates")));
-        }
-        let parsed: TelegramApiResponse<Vec<TelegramUpdate>> = serde_json::from_str(&body)
-            .map_err(|error| self.redact(format!("Telegram getUpdates parse failed: {error}")))?;
-        if !parsed.ok {
-            return Err(self.redact(format!(
-                "Telegram getUpdates failed: {}",
-                parsed.description.unwrap_or_default()
-            )));
-        }
-        let updates = parsed.result.unwrap_or_default();
-        let new_cursor = next_cursor(&updates, cursor);
-        let self_id = *self.self_id.lock().unwrap();
-        let self_username = self.self_username.lock().unwrap().clone();
-        let envelopes = updates
-            .iter()
-            .filter_map(|update| normalize_update(update, self_id, self_username.as_deref()))
-            .collect();
-        Ok(InboundBatch {
-            envelopes,
-            cursor: new_cursor,
-        })
+            // `is_self` and `mentions_self` are only meaningful once the bot knows
+            // who it is, and nothing in the daemon's inbound loop calls `probe`.
+            // Resolved here, once, so a group configured to answer on mention works
+            // from the first poll rather than from whenever an operator happens to
+            // run `channels probe`. A failure leaves the identity unknown, which is
+            // the conservative answer — never a claim of self it cannot back.
+            let identity_known = self.self_id.lock().map(|id| id.is_some()).unwrap_or(false);
+            if !identity_known {
+                let _ = self.probe().await;
+            }
+            let offset = cursor.and_then(|value| value.parse::<i64>().ok());
+            let client = self.client()?;
+            let mut query = vec![
+                ("timeout".to_string(), "25".to_string()),
+                (
+                    "allowed_updates".to_string(),
+                    r#"["message","edited_message"]"#.to_string(),
+                ),
+            ];
+            if let Some(offset) = offset {
+                query.push(("offset".to_string(), (offset + 1).to_string()));
+            }
+            let request = client.get(self.method_url("getUpdates")).query(&query);
+            let response = little_monkey_lib::egress::send(request)
+                .await
+                .map_err(|error| self.redact(format!("Telegram poll failed: {error}")))?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .map_err(|error| self.redact(format!("Telegram poll body failed: {error}")))?;
+            if !status.is_success() {
+                return Err(self.redact(format!("Telegram returned {status} for getUpdates")));
+            }
+            let parsed: TelegramApiResponse<Vec<TelegramUpdate>> = serde_json::from_str(&body)
+                .map_err(|error| {
+                    self.redact(format!("Telegram getUpdates parse failed: {error}"))
+                })?;
+            if !parsed.ok {
+                return Err(self.redact(format!(
+                    "Telegram getUpdates failed: {}",
+                    parsed.description.unwrap_or_default()
+                )));
+            }
+            let updates = parsed.result.unwrap_or_default();
+            let new_cursor = next_cursor(&updates, cursor);
+            let self_id = *self.self_id.lock().unwrap();
+            let self_username = self.self_username.lock().unwrap().clone();
+            let envelopes = updates
+                .iter()
+                .filter_map(|update| normalize_update(update, self_id, self_username.as_deref()))
+                .collect();
+            Ok(InboundBatch {
+                envelopes,
+                cursor: new_cursor,
+            })
         }
         .await;
         if let Ok(mut slot) = self.last_poll_error.lock() {
@@ -573,8 +575,9 @@ impl ChannelAdapter for TelegramAdapter {
                     .map(|seconds| seconds * 1000);
                 return if any_sent {
                     SendOutcome::NeedsReconciliation {
-                        error: "Telegram rate-limited the request after part of the message was sent"
-                            .to_string(),
+                        error:
+                            "Telegram rate-limited the request after part of the message was sent"
+                                .to_string(),
                     }
                 } else {
                     SendOutcome::RetryableFailure {

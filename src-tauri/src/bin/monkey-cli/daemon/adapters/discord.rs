@@ -399,8 +399,7 @@ impl ChannelAdapter for DiscordAdapter {
         // is the honest outcome.
         if let Some(wait_ms) = self.route_cooldown_remaining_ms(target_channel(message)) {
             return SendOutcome::RetryableFailure {
-                error: "Discord's rate-limit window for this channel has not reset yet"
-                    .to_string(),
+                error: "Discord's rate-limit window for this channel has not reset yet".to_string(),
                 retry_after_ms: Some(wait_ms),
             };
         }

@@ -1439,7 +1439,9 @@ mod tests {
             account: &account,
             secret: r#"{"bot_token":"xoxb-test","app_token":"xapp-test"}"#.to_string(),
         };
-        SlackAdapter::new(&config).expect("adapter").with_base_url(base)
+        SlackAdapter::new(&config)
+            .expect("adapter")
+            .with_base_url(base)
     }
 
     const AUTH_TEST_OK: &str = r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#;

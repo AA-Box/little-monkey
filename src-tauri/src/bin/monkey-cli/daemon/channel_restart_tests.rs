@@ -61,7 +61,9 @@ impl RunQueue for FakeQueue {
 
 /// An in-memory store with one enabled account and an open route to a chat
 /// recipe — the minimum for `plan_channel_ingress` to accept a stranger.
-fn seeded_store(account_id: &str, kind: ChannelKind) -> DaemonStore {
+/// `pub(crate)` because the opt-in live tests build the same minimal world
+/// around a real provider account.
+pub(crate) fn seeded_store(account_id: &str, kind: ChannelKind) -> DaemonStore {
     let mut store = DaemonStore::open_in_memory().expect("open in-memory store");
     store
         .upsert_channel_account(&ChannelAccountRecord {
@@ -738,7 +740,7 @@ async fn slack_poll_account_once_releases_the_ack_after_ingest() {
 /// Queue a reply to the run `job_id` exactly the way the `send_message` tool
 /// does — same origin lookup, same payload shape, same idempotency scheme,
 /// same durable enqueue. Only the model behind the tool is this test.
-fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &str) {
+pub(crate) fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &str) {
     let origin = store
         .channel_origin_for_job(job_id)
         .expect("origin lookup")
@@ -854,7 +856,9 @@ async fn telegram_full_path_from_wire_to_wire() {
     )
     .await;
     assert_eq!(
-        batch.envelopes[0].attachments[0].stored_artifact_id.as_deref(),
+        batch.envelopes[0].attachments[0]
+            .stored_artifact_id
+            .as_deref(),
         Some("fixture-blob"),
         "the photo's bytes must be stored before the turn becomes durable"
     );
@@ -887,7 +891,10 @@ async fn telegram_full_path_from_wire_to_wire() {
         .recv_timeout(std::time::Duration::from_secs(5))
         .expect("the reply request");
     let reply = String::from_utf8_lossy(&reply);
-    assert!(reply.starts_with("POST /botbot-token/sendMessage"), "{reply}");
+    assert!(
+        reply.starts_with("POST /botbot-token/sendMessage"),
+        "{reply}"
+    );
     assert!(reply.contains(r#""chat_id":"-999""#), "{reply}");
     assert!(reply.contains(r#""message_thread_id":42"#), "{reply}");
     assert!(reply.contains(r#""reply_to_message_id":9"#), "{reply}");
