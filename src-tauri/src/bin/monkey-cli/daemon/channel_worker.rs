@@ -462,21 +462,21 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
                 {
                     Ok(report) => {
                         worked |= report.accepted + report.challenged + report.duplicates > 0;
-                        // A poll that came back is the transport working with
-                        // this account's real credential — the "actual
-                        // authenticated live transport" that may claim
-                        // Connected, and the only thing here that may. An
-                        // adapter holding a socket open answers for itself
-                        // instead: its poll returns an empty batch whether
-                        // the connection is live or dropped.
-                        record_health_transition(
-                            &mut store,
-                            &mut posted_health,
-                            account_id,
-                            health_after_poll(adapter.as_ref()),
-                            None,
-                            now,
-                        );
+                        // A poll that actually spoke to the provider is the
+                        // "authenticated live transport" that may claim
+                        // Connected — and the only thing here that may. A
+                        // socket adapter answers for its own connection, and
+                        // a webhook adapter's no-op poll says nothing at all.
+                        if let Some(state) = health_after_poll(adapter.as_ref()) {
+                            record_health_transition(
+                                &mut store,
+                                &mut posted_health,
+                                account_id,
+                                state,
+                                None,
+                                now,
+                            );
+                        }
                     }
                     // One provider being unreachable must not stop the others,
                     // and must not stop the outbox either. It must show up,
@@ -508,18 +508,25 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
     });
 }
 
-/// What a successful poll says about an account's health.
+/// What a successful poll says about an account's health, if anything.
 ///
-/// For a long-polling or webhook adapter the poll is the whole story: it
-/// spoke to the provider with this account's real credential and came back.
-/// An adapter holding a socket open answers for itself, because its poll
-/// returns an empty batch whether the connection is live or dropped.
+/// For a long-polling or helper adapter the poll is the whole story: it spoke
+/// to the provider with this account's real credential and came back. An
+/// adapter holding a socket open answers for itself, because its poll returns
+/// an empty batch whether the connection is live or dropped. And a webhook
+/// adapter's poll is a local no-op that spoke to nobody — its success proves
+/// nothing, so it moves health nowhere: for those accounts Connected can only
+/// come from a real probe.
 fn health_after_poll(
     adapter: &dyn ChannelAdapter,
-) -> little_monkey_lib::channels::types::HealthState {
-    adapter
-        .live_transport()
-        .unwrap_or(little_monkey_lib::channels::types::HealthState::Connected)
+) -> Option<little_monkey_lib::channels::types::HealthState> {
+    if let Some(live) = adapter.live_transport() {
+        return Some(live);
+    }
+    match adapter.capabilities().inbound_transport {
+        little_monkey_lib::channels::types::InboundTransport::Webhook => None,
+        _ => Some(little_monkey_lib::channels::types::HealthState::Connected),
+    }
 }
 
 /// Persist one account's health when it differs from what was last written.
@@ -755,6 +762,7 @@ mod tests {
         /// What a socket-holding adapter would report. `None` is every
         /// long-polling and webhook provider.
         live: Option<little_monkey_lib::channels::types::HealthState>,
+        transport: InboundTransport,
     }
 
     impl FakeAdapter {
@@ -764,12 +772,22 @@ mod tests {
                 outcomes: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
                 live: None,
+                transport: InboundTransport::LongPoll,
             }
         }
 
         fn with_live(state: little_monkey_lib::channels::types::HealthState) -> Self {
             Self {
                 live: Some(state),
+                ..Self::new()
+            }
+        }
+
+        /// A delivered-to provider: `poll` is a local no-op that returns an
+        /// empty batch without speaking to anyone.
+        fn webhook() -> Self {
+            Self {
+                transport: InboundTransport::Webhook,
                 ..Self::new()
             }
         }
@@ -782,7 +800,7 @@ mod tests {
         }
 
         fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities::minimal(ChannelKind::Telegram, InboundTransport::LongPoll)
+            ProviderCapabilities::minimal(ChannelKind::Telegram, self.transport)
         }
 
         fn live_transport(&self) -> Option<little_monkey_lib::channels::types::HealthState> {
@@ -1080,7 +1098,7 @@ mod tests {
         // A long-polling provider: the poll came back, so it is connected.
         assert_eq!(
             health_after_poll(&FakeAdapter::new()),
-            HealthState::Connected
+            Some(HealthState::Connected)
         );
         // A socket provider whose connection has dropped polls exactly the
         // same way — empty batch, no error — so recording Connected off the
@@ -1090,8 +1108,51 @@ mod tests {
             HealthState::Degraded,
             HealthState::Error,
         ] {
-            assert_eq!(health_after_poll(&FakeAdapter::with_live(state)), state);
+            assert_eq!(
+                health_after_poll(&FakeAdapter::with_live(state)),
+                Some(state)
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn a_webhook_adapters_no_op_poll_never_claims_connected() {
+        use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+        // A webhook adapter's poll succeeds without speaking to anyone, so a
+        // successful tick must leave health exactly where it was.
+        let adapter = FakeAdapter::webhook();
+        assert_eq!(health_after_poll(&adapter), None);
+
+        // End to end through the same sequence the runtime loop performs: the
+        // poll succeeds, and a Disconnected account stays Disconnected.
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.health = ChannelHealth {
+            state: HealthState::Disconnected,
+            detail: None,
+            last_error: None,
+            probed_at_ms: NOW,
+        };
+        store.upsert_channel_account(&account).unwrap();
+
+        let queue = FakeQueue::default();
+        let mut posted = BTreeMap::new();
+        poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
+            .await
+            .expect("the no-op poll succeeds");
+        if let Some(state) = health_after_poll(&adapter) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Disconnected);
+
+        // The same sequence with a long-polling adapter does move it: the
+        // difference is the transport, not the emptiness of the batch.
+        if let Some(state) = health_after_poll(&FakeAdapter::new()) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Connected);
     }
 
     #[test]
@@ -1273,6 +1334,102 @@ mod tests {
         )
         .expect_err("disabled");
         assert!(error.contains("disabled"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_artifact_over_the_account_configured_limit_never_reaches_the_outbox() {
+        // The account, not a constant, is what bounds an outbound file: an
+        // operator who set max_attachment_bytes low gets exactly that limit,
+        // checked from durable metadata before any row is written.
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.non_secret_config = serde_json::json!({ "max_attachment_bytes": 4 });
+        store.upsert_channel_account(&account).unwrap();
+
+        let root = scratch_root();
+        let paths = DaemonPaths::under(&root);
+        let blobs = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            root.join("content-v1"),
+            16 * 1024 * 1024,
+        )
+        .expect("store");
+        let blob = blobs.put(b"more than four bytes").expect("blob");
+
+        let mut request = send_to("chat-9", "here is the file");
+        request.artifact_ids = vec![blob.id.clone()];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("over the account limit");
+        assert!(error.contains("on this account"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+
+        // Raising the account's limit is all it takes for the same artifact.
+        account.non_secret_config = serde_json::json!({ "max_attachment_bytes": 1024 });
+        store.upsert_channel_account(&account).unwrap();
+        queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect("within the raised limit");
+    }
+
+    #[tokio::test]
+    async fn more_artifacts_than_the_account_allows_are_refused_before_anything_is_resolved() {
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.non_secret_config = serde_json::json!({ "max_listed_attachments": 1 });
+        store.upsert_channel_account(&account).unwrap();
+
+        let paths = scratch_paths();
+        let mut request = send_to("chat-9", "two files");
+        request.artifact_ids = vec!["a".repeat(64), "b".repeat(64)];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("over the account's count limit");
+        assert!(error.contains("at most 1"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_artifact_id_queues_nothing() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let mut request = send_to("chat-9", "the chart");
+        request.artifact_ids = vec!["c".repeat(64)];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("no such artifact");
+        assert!(error.contains("no stored artifact"), "{error}");
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
     }
 

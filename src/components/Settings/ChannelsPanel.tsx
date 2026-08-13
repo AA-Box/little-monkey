@@ -10,6 +10,7 @@ import {
   type GroupActivation,
   type PendingSender,
   PROVIDER_GUIDES,
+  UNIVERSAL_CONFIG_FIELDS,
   buildProviderConfig,
   channelsAdd,
   channelsCallbackUrl,
@@ -26,6 +27,7 @@ import {
   channelsSetPolicy,
   channelsSetPublicUrl,
   configFormValues,
+  editableConfigFields,
   mergeProviderConfig,
   missingRequiredConfig,
   needsPublicCallback,
@@ -54,9 +56,7 @@ function healthTone(state: ChannelHealthState): string {
  * for anything a guide does not describe — an account configured from the
  * terminal can carry keys the UI has never heard of. */
 function configLabel(kind: string, key: string): string {
-  const field = PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields.find(
-    (entry) => entry.key === key,
-  );
+  const field = editableConfigFields(kind).find((entry) => entry.key === key);
   return field?.label ?? key;
 }
 
@@ -66,6 +66,43 @@ function formatConfigValue(value: unknown): string {
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "string") return value;
   return JSON.stringify(value) ?? "";
+}
+
+/** One typed input for one non-secret setting, shared by the add flow and the
+ * edit form so the two cannot drift in how they collect a value. */
+function ConfigFieldInput({
+  field,
+  value,
+  onChange,
+  yesLabel,
+  noLabel,
+}: {
+  field: import("../../lib/channelsClient").ProviderConfigField;
+  value: string;
+  onChange: (next: string) => void;
+  yesLabel: string;
+  noLabel: string;
+}) {
+  return (
+    <label className="text-xs text-muted">
+      {field.label}{field.required ? " *" : ""}
+      {field.type === "boolean" ? (
+        <select className={`${INPUT} mt-1`} value={value || "false"} onChange={(event) => onChange(event.target.value)}>
+          <option value="false">{noLabel}</option>
+          <option value="true">{yesLabel}</option>
+        </select>
+      ) : (
+        <input
+          className={`${INPUT} mt-1`}
+          inputMode={field.type === "number" ? "numeric" : undefined}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={field.placeholder ?? ""}
+        />
+      )}
+      {field.hint && <span className="mt-1 block text-faint">{field.hint}</span>}
+    </label>
+  );
 }
 
 export function ChannelsPanel() {
@@ -250,7 +287,7 @@ export function ChannelsPanel() {
                     return;
                   }
                   setLabelDraft(account.label);
-                  setSettingsDraft(configFormValues(guide?.configFields ?? [], account.non_secret_config));
+                  setSettingsDraft(configFormValues(editableConfigFields(account.kind), account.non_secret_config));
                 }}
               >
                 <Save size={14} />{settingsDraft ? t("ChannelsPanel.cancel") : t("ChannelsPanel.editSettings")}
@@ -324,28 +361,30 @@ export function ChannelsPanel() {
                   <input className={`${INPUT} mt-1`} value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} />
                 </label>
                 {(guide?.configFields ?? []).map((field) => (
-                  <label key={field.key} className="text-xs text-muted">
-                    {field.label}{field.required ? " *" : ""}
-                    {field.type === "boolean" ? (
-                      <select
-                        className={`${INPUT} mt-1`}
-                        value={settingsDraft[field.key] ?? "false"}
-                        onChange={(event) => setSettingsDraft({ ...settingsDraft, [field.key]: event.target.value })}
-                      >
-                        <option value="false">{t("ChannelsPanel.no")}</option>
-                        <option value="true">{t("ChannelsPanel.yes")}</option>
-                      </select>
-                    ) : (
-                      <input
-                        className={`${INPUT} mt-1`}
-                        inputMode={field.type === "number" ? "numeric" : undefined}
-                        value={settingsDraft[field.key] ?? ""}
-                        onChange={(event) => setSettingsDraft({ ...settingsDraft, [field.key]: event.target.value })}
-                        placeholder={field.placeholder ?? ""}
-                      />
-                    )}
-                    {field.hint && <span className="mt-1 block text-faint">{field.hint}</span>}
-                  </label>
+                  <ConfigFieldInput
+                    key={field.key}
+                    field={field}
+                    value={settingsDraft[field.key] ?? ""}
+                    onChange={(next) => setSettingsDraft({ ...settingsDraft, [field.key]: next })}
+                    yesLabel={t("ChannelsPanel.yes")}
+                    noLabel={t("ChannelsPanel.no")}
+                  />
+                ))}
+              </div>
+              {/* The knobs every account accepts regardless of provider: what
+                  one message's files may cost. Separated so a provider's own
+                  settings stay the short list an operator usually wants. */}
+              <h6 className="mt-3 text-xs font-semibold text-muted">{t("ChannelsPanel.advancedSettings")}</h6>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {UNIVERSAL_CONFIG_FIELDS.map((field) => (
+                  <ConfigFieldInput
+                    key={field.key}
+                    field={field}
+                    value={settingsDraft[field.key] ?? ""}
+                    onChange={(next) => setSettingsDraft({ ...settingsDraft, [field.key]: next })}
+                    yesLabel={t("ChannelsPanel.yes")}
+                    noLabel={t("ChannelsPanel.no")}
+                  />
                 ))}
               </div>
               <p className="mt-2 text-xs text-faint">{t("ChannelsPanel.settingsReprobeHint")}</p>
@@ -355,12 +394,12 @@ export function ChannelsPanel() {
                 disabled={
                   busy !== null ||
                   labelDraft.trim().length === 0 ||
-                  missingRequiredConfig(guide?.configFields ?? [], settingsDraft).length > 0
+                  missingRequiredConfig(editableConfigFields(account.kind), settingsDraft).length > 0
                 }
                 onClick={() => void run("settings", async () => {
                   const merged = mergeProviderConfig(
                     account.non_secret_config,
-                    guide?.configFields ?? [],
+                    editableConfigFields(account.kind),
                     settingsDraft,
                   );
                   await channelsSetConfig(account.account_id, JSON.stringify(merged), labelDraft.trim());
@@ -507,35 +546,21 @@ export function ChannelsPanel() {
                 setConfigDraft({});
               }}
             >
-              {PROVIDER_GUIDES.map((entry) => <option key={entry.kind} value={entry.kind}>{entry.label}</option>)}
+              {PROVIDER_GUIDES.filter((entry) => !entry.editOnly).map((entry) => <option key={entry.kind} value={entry.kind}>{entry.label}</option>)}
             </select>
           </label>
           <label className="text-xs text-muted">{t("ChannelsPanel.label")}
             <input className={`${INPUT} mt-1`} value={draft.label} onChange={(event) => setDraft({ ...draft, label: event.target.value })} placeholder={t("ChannelsPanel.labelPlaceholder")} />
           </label>
           {(draftGuide?.configFields ?? []).map((field) => (
-            <label key={field.key} className="text-xs text-muted">
-              {field.label}{field.required ? " *" : ""}
-              {field.type === "boolean" ? (
-                <select
-                  className={`${INPUT} mt-1`}
-                  value={configDraft[field.key] ?? "false"}
-                  onChange={(event) => setConfigDraft({ ...configDraft, [field.key]: event.target.value })}
-                >
-                  <option value="false">{t("ChannelsPanel.no")}</option>
-                  <option value="true">{t("ChannelsPanel.yes")}</option>
-                </select>
-              ) : (
-                <input
-                  className={`${INPUT} mt-1`}
-                  inputMode={field.type === "number" ? "numeric" : undefined}
-                  value={configDraft[field.key] ?? ""}
-                  onChange={(event) => setConfigDraft({ ...configDraft, [field.key]: event.target.value })}
-                  placeholder={field.placeholder ?? ""}
-                />
-              )}
-              {field.hint && <span className="mt-1 block text-faint">{field.hint}</span>}
-            </label>
+            <ConfigFieldInput
+              key={field.key}
+              field={field}
+              value={configDraft[field.key] ?? ""}
+              onChange={(next) => setConfigDraft({ ...configDraft, [field.key]: next })}
+              yesLabel={t("ChannelsPanel.yes")}
+              noLabel={t("ChannelsPanel.no")}
+            />
           ))}
         </div>
         {draftGuide?.requiresPlatform === "macos" && (

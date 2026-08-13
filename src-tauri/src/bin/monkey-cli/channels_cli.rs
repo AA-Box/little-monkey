@@ -401,10 +401,36 @@ pub fn set_config(
     label: Option<&str>,
     json: bool,
 ) -> Result<(), String> {
+    let mut store = store()?;
+    let (account, config_changed) = apply_account_edit(&mut store, account_id, config_json, label)?;
+    if json {
+        println!("{}", account_json(&account));
+    } else {
+        println!(
+            "Updated {account_id}.{}",
+            if config_changed {
+                " The change takes effect within about 30 seconds; run `monkey channels probe` to verify the connection."
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The edit itself, against whichever store the caller owns: label and
+/// settings applied, and — only when the settings actually changed — the old
+/// connectivity claim dropped. A label rename proves nothing about the
+/// connection either way, so it leaves health alone.
+pub(crate) fn apply_account_edit(
+    store: &mut DaemonStore,
+    account_id: &str,
+    config_json: Option<&str>,
+    label: Option<&str>,
+) -> Result<(ChannelAccountRecord, bool), String> {
     if config_json.is_none() && label.is_none() {
         return Err("Pass --config, --label, or both.".to_string());
     }
-    let mut store = store()?;
     let mut account = store
         .channel_account(account_id)?
         .ok_or_else(|| format!("No such account '{account_id}'"))?;
@@ -424,28 +450,47 @@ pub fn set_config(
         account.non_secret_config = config;
     }
     if config_changed {
-        account.health = ChannelHealth {
-            state: HealthState::Disconnected,
-            detail: Some("Settings changed; run a probe to verify the connection.".to_string()),
-            last_error: None,
-            probed_at_ms: now_ms(),
-        };
+        account.health = unverified_health(
+            "Settings changed; run a probe to verify the connection.",
+            now_ms(),
+        );
     }
     account.updated_at_ms = now_ms();
     store.upsert_channel_account(&account)?;
-    if json {
-        println!("{}", account_json(&account));
-    } else {
-        println!(
-            "Updated {account_id}.{}",
-            if config_changed {
-                " The change takes effect within about 30 seconds; run `monkey channels probe` to verify the connection."
-            } else {
-                ""
-            }
-        );
+    Ok((account, config_changed))
+}
+
+/// The state a configuration or credential write leaves behind: whatever the
+/// old value had proven, the new one has proven nothing yet. Only a real
+/// probe, or a real authenticated transport, may claim Connected again.
+fn unverified_health(detail: &str, now_ms: i64) -> ChannelHealth {
+    ChannelHealth {
+        state: HealthState::Disconnected,
+        detail: Some(detail.to_string()),
+        last_error: None,
+        probed_at_ms: now_ms,
     }
-    Ok(())
+}
+
+/// Record that `account_id`'s credential was just written: point the row at
+/// its keychain entry and drop the connectivity claim the old credential had
+/// earned. Every credential write path — the CLI's `set-token`, the desktop's
+/// save (which arrives here as `mark-credential`) — funnels through this.
+pub(crate) fn record_credential_change(
+    store: &mut DaemonStore,
+    account_id: &str,
+) -> Result<ChannelAccountRecord, String> {
+    let mut account = store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    account.credential_ref = Some(little_monkey_lib::channels::credential_ref(account_id));
+    account.health = unverified_health(
+        "Credential changed; run a probe to verify the connection.",
+        now_ms(),
+    );
+    account.updated_at_ms = now_ms();
+    store.upsert_channel_account(&account)?;
+    Ok(account)
 }
 
 /// Store the account's credential in the keychain. The value is read from
@@ -453,9 +498,9 @@ pub fn set_config(
 /// shell history file.
 pub fn set_token(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
-    let mut account = store
-        .channel_account(account_id)?
-        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    if store.channel_account(account_id)?.is_none() {
+        return Err(format!("No such account '{account_id}'"));
+    }
 
     let mut secret = String::new();
     std::io::stdin()
@@ -466,24 +511,16 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
         return Err("No credential was supplied on stdin".to_string());
     }
 
-    let credential_ref = little_monkey_lib::channels::credential_ref(account_id);
-    KeyringChannelSecrets.put(&credential_ref, secret)?;
-    account.credential_ref = Some(credential_ref);
-    account.updated_at_ms = now_ms();
-    store.upsert_channel_account(&account)?;
-    println!("Credential stored for {account_id}.");
+    KeyringChannelSecrets.put(&little_monkey_lib::channels::credential_ref(account_id), secret)?;
+    record_credential_change(&mut store, account_id)?;
+    println!("Credential stored for {account_id}. Run `monkey channels probe {account_id}` to verify it.");
     Ok(())
 }
 
 /// Point the account at its keychain entry after the app stored one there.
 pub fn mark_credential(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
-    let mut account = store
-        .channel_account(account_id)?
-        .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    account.credential_ref = Some(little_monkey_lib::channels::credential_ref(account_id));
-    account.updated_at_ms = now_ms();
-    store.upsert_channel_account(&account)?;
+    record_credential_change(&mut store, account_id)?;
     println!("Credential recorded for {account_id}.");
     Ok(())
 }
@@ -944,6 +981,187 @@ mod tests {
         assert!(rendered.contains("\"has_credential\":true"));
         assert!(!rendered.contains("credential_ref"));
         assert!(!rendered.contains("channel:chan-1"));
+    }
+
+    /// One connected account in a store this test owns.
+    fn connected_store() -> DaemonStore {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "chan-1".into(),
+                kind: ChannelKind::Telegram,
+                label: "Ops".into(),
+                enabled: true,
+                non_secret_config: serde_json::json!({}),
+                credential_ref: Some("channel:chan-1".into()),
+                access_policy: ChannelAccessPolicy::default(),
+                health: ChannelHealth::connected(1, None),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("account");
+        store
+    }
+
+    #[test]
+    fn a_replaced_credential_invalidates_the_old_connectivity_claim() {
+        // Connected → replace credential → Disconnected. The new credential
+        // has never spoken to the provider, so the old claim must not
+        // survive the write.
+        let mut store = connected_store();
+        let account = record_credential_change(&mut store, "chan-1").expect("recorded");
+        assert_eq!(account.health.state, HealthState::Disconnected);
+        assert!(
+            account.health.detail.as_deref().unwrap_or("").contains("probe"),
+            "{:?}",
+            account.health.detail
+        );
+
+        // And writing a credential over a Disconnected account never makes it
+        // Connected: saving is not connecting.
+        let again = record_credential_change(&mut store, "chan-1").expect("recorded");
+        assert_ne!(again.health.state, HealthState::Connected);
+    }
+
+    #[test]
+    fn a_label_only_edit_keeps_the_health_a_probe_earned() {
+        let mut store = connected_store();
+        let (account, config_changed) =
+            apply_account_edit(&mut store, "chan-1", None, Some("Renamed")).expect("edited");
+        assert!(!config_changed);
+        assert_eq!(account.label, "Renamed");
+        assert_eq!(account.health.state, HealthState::Connected);
+    }
+
+    #[test]
+    fn a_settings_change_drops_the_old_connectivity_claim() {
+        let mut store = connected_store();
+        let (account, config_changed) = apply_account_edit(
+            &mut store,
+            "chan-1",
+            Some(r#"{"max_attachment_bytes": 1024}"#),
+            None,
+        )
+        .expect("edited");
+        assert!(config_changed);
+        assert_eq!(account.health.state, HealthState::Disconnected);
+
+        // Saving the identical settings again is not a change, so the (now
+        // Disconnected) state and its detail are left alone.
+        let (_, changed_again) = apply_account_edit(
+            &mut store,
+            "chan-1",
+            Some(r#"{"max_attachment_bytes": 1024}"#),
+            None,
+        )
+        .expect("edited");
+        assert!(!changed_again);
+    }
+
+    /// Every option the CLI, the bridge and the UI can set, all at once.
+    fn fully_populated_options() -> RouteOptions {
+        RouteOptions {
+            account: Some("chan-1".to_string()),
+            conversation: Some("conv-7".to_string()),
+            thread: Some("thread-2".to_string()),
+            sender: Some("user-9".to_string()),
+            kind: None,
+            repository: Some("/work/repo".to_string()),
+            params: vec!["focus=deps".to_string(), "depth=3".to_string()],
+            session_scope: Some("sender".to_string()),
+            priority: Some(7),
+            no_reply: true,
+            disabled: true,
+        }
+    }
+
+    #[test]
+    fn a_fully_populated_route_round_trips_through_create_read_edit_and_reenable() {
+        // The daemon replaces a route's target wholesale on update, so the
+        // one way an editor can be honest is to send everything back. This
+        // holds the other half of that bargain: everything sent is stored,
+        // read back, and survives an edit that touches one field.
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let options = fully_populated_options();
+        let route = ChannelRoute {
+            route_id: "route-full".to_string(),
+            scope: route_scope(&options).expect("scope"),
+            target: route_target("triage", &options).expect("target"),
+            enabled: !options.disabled,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.insert_channel_route(&route).expect("insert");
+
+        let read = |store: &DaemonStore| {
+            store
+                .channel_routes()
+                .expect("routes")
+                .into_iter()
+                .find(|entry| entry.route_id == "route-full")
+                .expect("the route exists")
+        };
+        let stored = read(&store);
+        assert_eq!(stored.scope.account_id.as_deref(), Some("chan-1"));
+        assert_eq!(stored.scope.conversation_id.as_deref(), Some("conv-7"));
+        assert_eq!(stored.scope.thread_id.as_deref(), Some("thread-2"));
+        assert_eq!(stored.scope.sender_id.as_deref(), Some("user-9"));
+        assert_eq!(stored.target.recipe, "triage");
+        assert_eq!(stored.target.repository.as_deref(), Some("/work/repo"));
+        assert_eq!(stored.target.params.get("focus").map(String::as_str), Some("deps"));
+        assert_eq!(stored.target.params.get("depth").map(String::as_str), Some("3"));
+        assert_eq!(
+            stored.target.session_scope,
+            little_monkey_lib::channels::routing::SessionScope::Sender
+        );
+        assert_eq!(stored.target.priority, 7);
+        assert!(!stored.target.reply_to_conversation);
+        assert!(!stored.enabled);
+
+        // Edit one field — the recipe — with everything else resent, exactly
+        // as the UI does. Nothing else may move.
+        let updated = ChannelRoute {
+            route_id: "route-full".to_string(),
+            scope: route_scope(&options).expect("scope"),
+            target: route_target("chat-2", &options).expect("target"),
+            enabled: !options.disabled,
+            created_at_ms: stored.created_at_ms,
+            updated_at_ms: 2,
+        };
+        store.update_channel_route(&updated).expect("update");
+        let after_edit = read(&store);
+        assert_eq!(after_edit.target.recipe, "chat-2");
+        assert_eq!(after_edit.target.params.len(), 2);
+        assert_eq!(after_edit.target.repository.as_deref(), Some("/work/repo"));
+        assert_eq!(after_edit.target.priority, 7);
+        assert!(!after_edit.target.reply_to_conversation);
+        assert_eq!(after_edit.scope, stored.scope);
+
+        // Disable and re-enable through the dedicated switch: the target is
+        // not part of that operation and must not be touched by it.
+        store
+            .set_channel_route_enabled("route-full", true, 3)
+            .expect("enable");
+        let enabled = read(&store);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.target, after_edit.target);
+        store
+            .set_channel_route_enabled("route-full", false, 4)
+            .expect("disable");
+        let disabled = read(&store);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.target, after_edit.target);
+    }
+
+    #[test]
+    fn a_parameter_with_no_name_is_refused_with_the_daemons_own_words() {
+        let mut options = fully_populated_options();
+        options.params = vec!["=value".to_string()];
+        let error = route_target("triage", &options).expect_err("empty name");
+        assert!(error.contains("empty name"), "{error}");
+        options.params = vec!["notapair".to_string()];
+        let error = route_target("triage", &options).expect_err("no separator");
+        assert!(error.contains("name=value"), "{error}");
     }
 
     #[test]

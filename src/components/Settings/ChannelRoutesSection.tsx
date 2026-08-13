@@ -40,6 +40,13 @@ const INPUT =
  * rather than discovering which field combinations the daemon rejects. */
 type ScopeLevel = "global" | "provider" | "account" | "conversation" | "thread" | "sender";
 
+/** One recipe parameter row in the editor. Kept as an ordered list rather
+ * than an object so a row being renamed does not jump around the form. */
+export interface ParamRow {
+  name: string;
+  value: string;
+}
+
 interface RouteDraft {
   /** The route being edited, or null while adding. */
   routeId: string | null;
@@ -51,6 +58,7 @@ interface RouteDraft {
   threadId: string;
   senderId: string;
   repository: string;
+  params: ParamRow[];
   sessionScope: SessionScope;
   priority: string;
   reply: boolean;
@@ -67,6 +75,7 @@ const EMPTY_DRAFT: RouteDraft = {
   threadId: "",
   senderId: "",
   repository: "",
+  params: [],
   sessionScope: "thread",
   priority: "",
   reply: true,
@@ -84,7 +93,7 @@ function levelOf(scope: ChannelRouteScope): ScopeLevel {
   return "global";
 }
 
-function draftFrom(route: ChannelRoute): RouteDraft {
+export function draftFrom(route: ChannelRoute): RouteDraft {
   return {
     routeId: route.route_id,
     recipe: route.target.recipe,
@@ -95,11 +104,32 @@ function draftFrom(route: ChannelRoute): RouteDraft {
     threadId: route.scope.thread_id ?? "",
     senderId: route.scope.sender_id ?? "",
     repository: route.target.repository ?? "",
+    // Every stored parameter becomes a row, so saving an unrelated edit sends
+    // them all back — the daemon replaces the target wholesale, and a param
+    // the form forgot to carry would simply be gone.
+    params: Object.entries(route.target.params ?? {}).map(([name, value]) => ({ name, value })),
     sessionScope: route.target.session_scope,
     priority: route.target.priority === 0 ? "" : String(route.target.priority),
     reply: route.target.reply_to_conversation,
     enabled: route.enabled,
   };
+}
+
+/** Why the parameter rows cannot be saved yet, or null when they can.
+ * Mirrors nothing: the daemon rejects an empty name too — this only says so
+ * while the operator is still looking at the row. A duplicate name would
+ * silently collapse into one entry on the daemon side, so it is refused here
+ * where both rows are still visible. */
+export function paramsProblem(
+  params: ParamRow[],
+): "empty_name" | "invalid_name" | "duplicate_name" | null {
+  const names = params.map((row) => row.name.trim());
+  if (names.some((name) => name.length === 0)) return "empty_name";
+  // `=` is the wire separator between name and value; a name carrying one
+  // would silently become a different parameter with a longer value.
+  if (names.some((name) => name.includes("="))) return "invalid_name";
+  if (new Set(names).size !== names.length) return "duplicate_name";
+  return null;
 }
 
 /** Which scope fields a rung carries. A field the rung does not use is not
@@ -137,6 +167,10 @@ export function draftOptions(draft: RouteDraft): RouteOptions {
     thread_id: uses.thread ? value(draft.threadId) : null,
     sender_id: uses.sender ? value(draft.senderId) : null,
     repository: value(draft.repository),
+    // The daemon's own `--param name=value` shape, one entry per row. An
+    // empty value is legal (the daemon stores it); an empty name is refused
+    // before this is ever built.
+    params: draft.params.map((row) => `${row.name.trim()}=${row.value}`),
     session_scope: draft.sessionScope,
     priority: draft.priority.trim().length > 0 && Number.isFinite(priority) ? priority : null,
     reply: draft.reply,
@@ -255,6 +289,7 @@ export function ChannelRoutesSection({
   );
 
   const uses = draft ? scopeFields(draft.level) : null;
+  const paramError = draft ? paramsProblem(draft.params) : null;
   // Every id the chosen rung needs must be present before the daemon is asked:
   // a scope missing its account is refused there, and refusing here says so
   // while the operator is still looking at the field.
@@ -262,6 +297,7 @@ export function ChannelRoutesSection({
     draft !== null &&
     uses !== null &&
     (draft.recipe.trim().length === 0 ||
+      paramError !== null ||
       (uses.account && draft.accountId.trim().length === 0) ||
       (uses.conversation && draft.conversationId.trim().length === 0) ||
       (uses.sender && draft.senderId.trim().length === 0));
@@ -519,6 +555,70 @@ export function ChannelRoutesSection({
               />
               {t("ChannelsPanel.routeEnabled")}
             </label>
+          </div>
+
+          {/* Recipe parameters, as the daemon stores them: name and value,
+              nothing interpreted here. The rows loaded from an existing route
+              are all sent back on save, because the daemon replaces the
+              target wholesale. */}
+          <div className="mt-3">
+            <h6 className="text-xs font-semibold text-muted">{t("ChannelsPanel.routeParams")}</h6>
+            {draft.params.map((row, index) => (
+              // Position is the identity here: names are editable, so they
+              // cannot key the row.
+              <div key={index} className="mt-2 flex items-end gap-2">
+                <label className="min-w-0 flex-1 text-xs text-muted">
+                  {t("ChannelsPanel.paramName")}
+                  <input
+                    className={`${INPUT} mt-1`}
+                    value={row.name}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        params: draft.params.map((entry, at) =>
+                          at === index ? { ...entry, name: event.target.value } : entry,
+                        ),
+                      })
+                    }
+                  />
+                </label>
+                <label className="min-w-0 flex-1 text-xs text-muted">
+                  {t("ChannelsPanel.paramValue")}
+                  <input
+                    className={`${INPUT} mt-1`}
+                    value={row.value}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        params: draft.params.map((entry, at) =>
+                          at === index ? { ...entry, value: event.target.value } : entry,
+                        ),
+                      })
+                    }
+                  />
+                </label>
+                <Button
+                  size="sm"
+                  aria-label={t("ChannelsPanel.removeParam")}
+                  onClick={() =>
+                    setDraft({ ...draft, params: draft.params.filter((_, at) => at !== index) })
+                  }
+                >
+                  <X size={12} />
+                </Button>
+              </div>
+            ))}
+            {paramError && (
+              <p className="mt-1 text-xs text-danger">{t(`ChannelsPanel.paramError_${paramError}`)}</p>
+            )}
+            <Button
+              className="mt-2"
+              size="sm"
+              onClick={() => setDraft({ ...draft, params: [...draft.params, { name: "", value: "" }] })}
+            >
+              <Plus size={12} />
+              {t("ChannelsPanel.addParam")}
+            </Button>
           </div>
 
           <p className="mt-2 text-xs text-faint">{t("ChannelsPanel.routeReplyHint")}</p>

@@ -909,7 +909,6 @@ async fn execute_tool_call(
             thread_id: string_arg("thread"),
             reply_to_provider_id: string_arg("reply_to"),
             text: args["text"].as_str().unwrap_or_default().to_string(),
-            attachment_paths: string_list("attachments"),
             artifact_ids: string_list("artifacts"),
         };
         // The approval prompt names everything that makes this send what it
@@ -925,12 +924,6 @@ async fn execute_tool_call(
             preview.push_str(&format!("[to: {to}] "));
         }
         preview.extend(request.text.chars().take(120));
-        if !request.attachment_paths.is_empty() {
-            preview.push_str(&format!(
-                " [files: {}]",
-                request.attachment_paths.join(", ")
-            ));
-        }
         if !request.artifact_ids.is_empty() {
             preview.push_str(&format!(
                 " [artifacts: {}]",

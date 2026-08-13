@@ -820,6 +820,32 @@ fn permission_policy(mode: PermissionMode, approval_timeout_ms: u64) -> Permissi
     }
 }
 
+/// The one permission policy a run both records and executes under.
+///
+/// Precedence: a placed run's immutable policy, then a desktop turn's
+/// snapshot, then the recipe's own declaration on top of the mode's defaults.
+/// `run_inner` freezes exactly this into the RunSpec and hands exactly this
+/// to `TerminalPermissions`, so what the ledger says the run could do and
+/// what its tools consult at call time cannot be two different things.
+fn frozen_permission_policy(
+    recipe: &Recipe,
+    mode: PermissionMode,
+    approval_timeout_ms: u64,
+) -> PermissionPolicySnapshot {
+    match (&recipe.placed_run, &recipe.desktop_turn) {
+        (Some(placed), _) => placed.permission_policy.clone(),
+        (_, Some(snapshot)) => snapshot.permission_policy.clone(),
+        _ => {
+            let mut policy = permission_policy(mode, approval_timeout_ms);
+            // A hand-authored/scheduled recipe is the only carrier of a
+            // cross-conversation messaging grant on this path; the snapshot
+            // records it so the run's authority is auditable after the fact.
+            policy.channel_send = recipe.channel_send.clone();
+            policy
+        }
+    }
+}
+
 fn workspace_snapshot(state: &little_monkey_lib::AppState) -> Result<WorkspaceContext, String> {
     let root = workspace::primary_root_canon(state)?;
     let canonical_path = root.to_string_lossy().to_string();
@@ -1090,18 +1116,7 @@ async fn run_inner(
         (_, Some(snapshot)) => Some(snapshot.workspace.clone()),
         _ => Some(workspace_snapshot(&state)?),
     };
-    let frozen_policy = match (&recipe.placed_run, &recipe.desktop_turn) {
-        (Some(placed), _) => placed.permission_policy.clone(),
-        (_, Some(snapshot)) => snapshot.permission_policy.clone(),
-        _ => {
-            let mut policy = permission_policy(mode, approval_timeout_ms);
-            // A hand-authored/scheduled recipe is the only carrier of a
-            // cross-conversation messaging grant on this path; the snapshot
-            // records it so the run's authority is auditable after the fact.
-            policy.channel_send = recipe.channel_send.clone();
-            policy
-        }
-    };
+    let frozen_policy = frozen_permission_policy(&recipe, mode, approval_timeout_ms);
     let input_artifact_ids = recipe
         .desktop_turn
         .as_ref()
@@ -1269,25 +1284,15 @@ async fn run_inner(
     let event_sink: Arc<dyn CliRunEventSink> = recorder.clone();
     let mut perms =
         TerminalPermissions::with_event_sink(mode, event_sink, approval_timeout_ms, json_output);
-    if let Some(snapshot) = &recipe.desktop_turn {
-        perms.set_allow_network(snapshot.permission_policy.allow_network);
-    }
-    // The one place `allow_external_mutations` is read. It was recorded on the
-    // run's immutable snapshot and then had no reader at all, which meant a
-    // tool that leaves an effect outside this machine had nothing to consult.
-    // A desktop turn carries its own value; a daemon child inherits the
-    // policy this run was queued under.
-    perms.set_allow_external_mutations(match &recipe.desktop_turn {
-        Some(snapshot) => snapshot.permission_policy.allow_external_mutations,
-        None => permission_policy(mode, approval_timeout_ms).allow_external_mutations,
-    });
-    // The cross-conversation/cross-account messaging grant, from the same
-    // snapshot precedence as `allow_external_mutations`: a desktop turn's
-    // recorded policy wins, a hand-authored recipe may carry its own.
-    perms.set_channel_send(match &recipe.desktop_turn {
-        Some(snapshot) => snapshot.permission_policy.channel_send.clone(),
-        None => recipe.channel_send.clone(),
-    });
+    // The run executes under exactly the policy its immutable RunSpec
+    // recorded — the same `frozen_policy` precedence (placed run, then
+    // desktop turn, then the recipe's own declaration) — rather than a second
+    // derivation that could drift from it. This is what makes a placed run's
+    // cross-account messaging grant, and its external-mutations flag, real at
+    // tool time instead of only auditable after the fact.
+    perms.set_allow_network(run_spec.permission_policy.allow_network);
+    perms.set_allow_external_mutations(run_spec.permission_policy.allow_external_mutations);
+    perms.set_channel_send(run_spec.permission_policy.channel_send.clone());
     let mut history: Vec<serde_json::Value> = recipe
         .desktop_turn
         .as_ref()
@@ -1894,6 +1899,111 @@ mod tests {
             desktop_turn: None,
             placed_run: None,
         }
+    }
+
+    /// The immutable snapshot a submitter placed this run with, carrying one
+    /// explicit cross-account messaging grant.
+    fn placed_with_grant(
+        channel_send: Option<little_monkey_lib::run_protocol::ChannelSendPolicy>,
+    ) -> little_monkey_lib::node_placement::PlacedRunSnapshot {
+        let mut policy = permission_policy(PermissionMode::Manual, 1_000);
+        policy.allow_external_mutations = true;
+        policy.channel_send = channel_send;
+        little_monkey_lib::node_placement::PlacedRunSnapshot {
+            schema_version: 1,
+            submitted_run_id: "run:placed".to_string(),
+            kind: little_monkey_lib::run_protocol::RunKind::Workflow,
+            target: snapshot_target(&ollama_target()).expect("target"),
+            workspace: None,
+            permission_policy: policy,
+            budgets: little_monkey_lib::run_protocol::RunBudgets {
+                wall_time_ms: 60_000,
+                max_iterations: 5,
+                max_model_calls: 100,
+                max_tool_calls: 100,
+                max_input_tokens: 1_000_000,
+                max_output_tokens: 1_000_000,
+                max_cost_micros: None,
+                max_artifact_bytes: 1 << 20,
+                max_event_count: 10_000,
+            },
+        }
+    }
+
+    #[test]
+    fn a_placed_run_executes_under_the_grant_it_was_placed_with() {
+        use little_monkey_lib::run_protocol::ChannelSendPolicy;
+        // The recipe wrapping a placed run declares nothing of its own; the
+        // grant must come from the placement snapshot and nowhere else.
+        let mut recipe = recipe_with_workspace(None);
+        recipe.placed_run = Some(placed_with_grant(Some(ChannelSendPolicy {
+            cross_conversation: false,
+            accounts: vec!["chan-ops".to_string()],
+        })));
+
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        let grant = policy.channel_send.expect("the placed grant survives");
+        assert_eq!(grant.accounts, vec!["chan-ops".to_string()]);
+        assert!(policy.allow_external_mutations);
+
+        // And the grant is exactly what the tool's authorization ladder then
+        // consults: that account is reachable, any other is refused.
+        let authority = crate::daemon::channel_tool::SendAuthority {
+            reply: false,
+            cross_conversation: grant.cross_conversation,
+            accounts: grant.accounts,
+        };
+        let mut request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: Some("chan-ops".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            text: "placed".to_string(),
+            ..Default::default()
+        };
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect("the placed grant reaches exactly that account");
+        request.account_id = Some("chan-other".to_string());
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect_err("an account the placement never granted stays refused");
+    }
+
+    #[test]
+    fn a_placed_run_without_the_grant_cannot_send_cross_account() {
+        let mut recipe = recipe_with_workspace(None);
+        // The wrapping recipe tries to smuggle a grant of its own in; the
+        // placed snapshot, which carries none, must win.
+        recipe.channel_send = Some(little_monkey_lib::run_protocol::ChannelSendPolicy {
+            cross_conversation: true,
+            accounts: vec!["chan-ops".to_string()],
+        });
+        recipe.placed_run = Some(placed_with_grant(None));
+
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        assert!(policy.channel_send.is_none());
+
+        let authority = crate::daemon::channel_tool::SendAuthority {
+            reply: false,
+            cross_conversation: false,
+            accounts: Vec::new(),
+        };
+        let request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: Some("chan-ops".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            text: "placed".to_string(),
+            ..Default::default()
+        };
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect_err("no grant on the placement, no cross-account send");
+    }
+
+    #[test]
+    fn a_plain_recipes_own_declaration_still_reaches_execution() {
+        let mut recipe = recipe_with_workspace(None);
+        recipe.channel_send = Some(little_monkey_lib::run_protocol::ChannelSendPolicy {
+            cross_conversation: true,
+            accounts: Vec::new(),
+        });
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        assert!(policy.channel_send.expect("declared").cross_conversation);
     }
 
     #[test]

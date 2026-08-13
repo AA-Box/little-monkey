@@ -193,7 +193,8 @@ describe("ChannelsPanel", () => {
         credential_required: true,
         has_credential: true,
         health: "connected",
-        // A setting the panel has no input for, configured from the terminal.
+        // A per-account attachment knob set from the terminal: the panel now
+        // has a typed input for it, and an unrelated edit must carry it over.
         non_secret_config: { base_url: "https://old.example.com", max_attachment_bytes: 2048 },
       },
     ]);
@@ -209,9 +210,40 @@ describe("ChannelsPanel", () => {
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("channels_set_config", {
         accountId: "chan-1",
-        // The untouched key survives a wholesale replacement, and no secret
-        // travels in either direction.
-        config: JSON.stringify({ max_attachment_bytes: 2048, base_url: "https://new.example.com" }),
+        // The already-configured limit survives a wholesale replacement, and
+        // no secret travels in either direction.
+        config: JSON.stringify({ base_url: "https://new.example.com", max_attachment_bytes: 2048 }),
+        label: "Work",
+      }),
+    );
+  });
+
+  it("edits the per-account attachment limits as typed fields, never as JSON", async () => {
+    mockAccounts([
+      {
+        ...BASE,
+        kind: "mattermost",
+        label: "Work",
+        credential_required: true,
+        has_credential: true,
+        non_secret_config: { base_url: "https://chat.example.com" },
+      },
+    ]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Work"));
+
+    fireEvent.click(await screen.findByText("Edit settings"));
+    fireEvent.change(await screen.findByLabelText(/^Max attachment size/), {
+      target: { value: "1048576" },
+    });
+    fireEvent.click(screen.getByText("Save settings"));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_set_config", {
+        accountId: "chan-1",
+        // Typed by the field's declared kind: the daemon parses a number, so
+        // a number is what travels.
+        config: JSON.stringify({ base_url: "https://chat.example.com", max_attachment_bytes: 1048576 }),
         label: "Work",
       }),
     );
@@ -316,6 +348,116 @@ describe("route management", () => {
     fireEvent.click(screen.getByText("Save route"));
 
     await waitFor(() => expect(screen.getByText(/already owns this scope/)).toBeTruthy());
+  });
+
+  it("sends a route's parameters exactly as typed, one name=value each", async () => {
+    mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Add route"));
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
+
+    fireEvent.click(screen.getByText("Add parameter"));
+    fireEvent.change(screen.getByLabelText("Parameter"), { target: { value: "focus" } });
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "deps" } });
+    fireEvent.click(screen.getByText("Save route"));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_add_route", {
+        recipe: "triage",
+        options: expect.objectContaining({ params: ["focus=deps"] }),
+      }),
+    );
+  });
+
+  it("refuses a parameter with no name while the operator is still looking at it", async () => {
+    mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Add route"));
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
+
+    fireEvent.click(screen.getByText("Add parameter"));
+    expect(await screen.findByText("Every parameter needs a name.")).toBeTruthy();
+    fireEvent.click(screen.getByText("Save route"));
+    expect(invoke).not.toHaveBeenCalledWith("channels_add_route", expect.anything());
+  });
+
+  it("refuses two parameters with the same name instead of silently keeping one", async () => {
+    mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Add route"));
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
+
+    fireEvent.click(screen.getByText("Add parameter"));
+    fireEvent.click(screen.getByText("Add parameter"));
+    const names = screen.getAllByLabelText("Parameter");
+    fireEvent.change(names[0], { target: { value: "focus" } });
+    fireEvent.change(names[1], { target: { value: "focus" } });
+    expect(await screen.findByText("Two parameters have the same name.")).toBeTruthy();
+    fireEvent.click(screen.getByText("Save route"));
+    expect(invoke).not.toHaveBeenCalledWith("channels_add_route", expect.anything());
+  });
+
+  it("loads an existing route's parameters and carries them through an unrelated edit", async () => {
+    mockChannels({
+      accounts: [{ ...BASE, label: "Family Signal" }],
+      routes: [
+        {
+          ...ROUTE,
+          target: { ...ROUTE.target, params: { focus: "deps", depth: "3" } },
+        },
+      ],
+    });
+    render(<ChannelsPanel />);
+    await screen.findByText("Everything");
+
+    fireEvent.click(screen.getAllByText("Edit")[0]);
+    // Both stored parameters are on screen, loaded from the route.
+    const names = screen.getAllByLabelText("Parameter") as HTMLInputElement[];
+    expect(names.map((input) => input.value).sort()).toEqual(["depth", "focus"]);
+
+    // An edit that never touches the parameters still sends them all back:
+    // the daemon replaces the target wholesale, so what the form forgets
+    // would be gone.
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "chat-2" } });
+    fireEvent.click(screen.getByText("Save route"));
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_update_route", {
+        routeId: "route-1",
+        recipe: "chat-2",
+        options: expect.objectContaining({
+          params: expect.arrayContaining(["focus=deps", "depth=3"]),
+        }),
+      }),
+    );
+  });
+
+  it("removes exactly the parameter whose row was deleted", async () => {
+    mockChannels({
+      accounts: [{ ...BASE, label: "Family Signal" }],
+      routes: [
+        {
+          ...ROUTE,
+          target: { ...ROUTE.target, params: { focus: "deps", depth: "3" } },
+        },
+      ],
+    });
+    render(<ChannelsPanel />);
+    await screen.findByText("Everything");
+
+    fireEvent.click(screen.getAllByText("Edit")[0]);
+    const removeButtons = await screen.findAllByLabelText("Remove parameter");
+    const names = screen.getAllByLabelText("Parameter") as HTMLInputElement[];
+    const removeAt = names.findIndex((input) => input.value === "focus");
+    fireEvent.click(removeButtons[removeAt]);
+    fireEvent.click(screen.getByText("Save route"));
+
+    await waitFor(() =>
+      expect(invoke).toHaveBeenCalledWith("channels_update_route", {
+        routeId: "route-1",
+        recipe: "chat",
+        options: expect.objectContaining({ params: ["depth=3"] }),
+      }),
+    );
   });
 
   it("turns a route off without editing what it routes to", async () => {

@@ -196,6 +196,10 @@ export interface ProviderGuide {
   credentialOptional?: boolean;
   /** Platforms this provider can run on at all. Absent means anywhere. */
   requiresPlatform?: "macos";
+  /** True for accounts another subsystem creates (SMS shadows a telephony
+   * account). Their settings are editable here, but the add flow must not
+   * offer to create one directly. */
+  editOnly?: boolean;
   /** The parts the credential is made of, when it is more than one value.
    * Setup collects each one and saves them as the single JSON bundle the
    * adapter parses, so nobody has to know the wire shape. Omitted means the
@@ -252,13 +256,44 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     configFields: [
       { key: "handle", label: "Your iMessage handle", type: "text", required: true, placeholder: "you@example.com" },
       { key: "helper_path", label: "Helper path (optional)", type: "text", placeholder: "/usr/local/bin/imessage-helper", hint: "Leave empty to use Messages on this Mac directly. Set it only if you run your own helper process." },
+      { key: "db_path", label: "Messages database path (optional)", type: "text", placeholder: "~/Library/Messages/chat.db", hint: "Leave empty to read the signed-in user's own Messages database." },
+      { key: "osascript_path", label: "osascript path (optional)", type: "text", placeholder: "/usr/bin/osascript", hint: "Leave empty to use the system osascript." },
     ],
   },
   { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "WhatsApp credentials", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup for the access token and phone number ID; App settings → Basic for the app secret. The verify token is yours to invent — type the same value here and into Meta's webhook form.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configFields: [{ key: "phone_number_id", label: "Phone number ID", type: "text", required: true }], secretFields: [{ key: "access_token", label: "Access token" }, { key: "app_secret", label: "App secret" }, { key: "verify_token", label: "Verify token (you choose it)" }] },
   { kind: "line", label: "LINE", transport: "webhook", credentialLabel: "LINE credentials", whereToGetIt: "LINE Developers Console → your channel → Messaging API for the access token, and Basic settings for the channel secret that verifies signatures.", docsUrl: "https://developers.line.biz/en/docs/messaging-api/", configFields: [], secretFields: [{ key: "channel_access_token", label: "Channel access token" }, { key: "channel_secret", label: "Channel secret" }] },
-  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "Client secret", whereToGetIt: "Azure Bot resource → Configuration for the Microsoft App ID and tenant ID; Certificates & secrets for a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configFields: [{ key: "app_id", label: "Microsoft App ID", type: "text", required: true }, { key: "tenant_id", label: "Tenant ID", type: "text", required: true }], secretFields: [{ key: "app_password", label: "Client secret" }] },
-  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (paste the whole JSON file)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key. Paste the file's contents unchanged.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configFields: [{ key: "project_number", label: "Project number", type: "text", required: true }] },
+  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "Client secret", whereToGetIt: "Azure Bot resource → Configuration for the Microsoft App ID and tenant ID; Certificates & secrets for a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configFields: [{ key: "app_id", label: "Microsoft App ID", type: "text", required: true }, { key: "tenant_id", label: "Tenant ID", type: "text", required: true }, { key: "open_id_metadata_url", label: "OpenID metadata URL (optional)", type: "text", placeholder: "https://login.botframework.com/v1/.well-known/openidconfiguration", hint: "Leave empty for the public Bot Framework endpoint. Set it only for a sovereign cloud." }], secretFields: [{ key: "app_password", label: "Client secret" }] },
+  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (paste the whole JSON file)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key. Paste the file's contents unchanged.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configFields: [{ key: "project_number", label: "Project number", type: "text", required: true }, { key: "bot_user_name", label: "Bot user name (optional)", type: "text", placeholder: "users/1234567890", hint: "The app's own Chat user resource name, used to recognize mentions of itself." }] },
+  {
+    kind: "sms", label: "SMS", transport: "webhook", credentialLabel: "None here — the carrier credential lives on the telephony account", credentialOptional: true, editOnly: true,
+    whereToGetIt: "An SMS account is created automatically for a telephony account of the same id; configure the carrier and its credential under Telephony.",
+    docsUrl: "https://www.twilio.com/docs/usage/webhooks/sms-webhooks",
+    configFields: [
+      { key: "webhook_public_key", label: "Webhook public key (optional)", type: "text", hint: "The carrier's signing key for inbound webhook verification, when the carrier publishes one." },
+      { key: "session_scope", label: "Session scope (optional)", type: "text", placeholder: "conversation", hint: "Which durable session a text thread maps onto." },
+    ],
+  },
 ];
+
+/** Keys every account accepts regardless of provider: the per-account
+ * attachment knobs the daemon's `AttachmentLimits::for_account` reads. They
+ * bound what one inbound message may cost and what one outbound reply may
+ * carry, so they are edited in the account's advanced section rather than
+ * hidden behind the terminal. */
+export const UNIVERSAL_CONFIG_FIELDS: ProviderConfigField[] = [
+  { key: "max_attachment_bytes", label: "Max attachment size (bytes)", type: "number", placeholder: "16777216", hint: "Per file, inbound and outbound. The application ceiling still applies." },
+  { key: "max_attachment_excerpt_chars", label: "Max text excerpt (characters)", type: "number", placeholder: "4000", hint: "How much of an inbound text file is quoted into the conversation." },
+  { key: "max_listed_attachments", label: "Max attachments per message", type: "number", placeholder: "8", hint: "How many files one message may list or carry." },
+];
+
+/** Every non-secret setting an account of this kind can hold: the provider's
+ * own schema plus the universal attachment knobs. Exactly what the daemon's
+ * `validate_non_secret_config` accepts — the contract test holds the two
+ * sides together. */
+export function editableConfigFields(kind: string): ProviderConfigField[] {
+  const guide = PROVIDER_GUIDES.find((entry) => entry.kind === kind);
+  return [...(guide?.configFields ?? []), ...UNIVERSAL_CONFIG_FIELDS];
+}
 
 /** Turn what the operator typed into the account row's settings object.
  *
@@ -351,10 +386,15 @@ export const channelsCallbackUrl = (accountId: string) =>
 export const channelsSetPublicUrl = (url: string | null) =>
   invoke<void>("channels_set_public_url", { url });
 
-/** Whether this provider needs the operator to expose a public callback URL.
- * Setup asks for one only when it is genuinely required. */
+/** Whether this provider needs the operator to expose a public callback URL
+ * on the channels listener. Setup asks for one only when it is genuinely
+ * required. SMS is webhook-delivered too, but to the telephony listener —
+ * its callback belongs to the telephony account, and showing the channels
+ * path for it would hand the operator a URL nothing answers. */
 export function needsPublicCallback(kind: string): boolean {
-  return PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport === "webhook";
+  return (
+    kind !== "sms" && PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport === "webhook"
+  );
 }
 
 /** Merge edited guide fields back over an account's stored settings.

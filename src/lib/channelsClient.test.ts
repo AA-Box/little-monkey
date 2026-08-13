@@ -26,6 +26,9 @@ describe("channels setup guidance", () => {
     expect(needsPublicCallback("line")).toBe(true);
     expect(needsPublicCallback("teams")).toBe(true);
     expect(needsPublicCallback("google_chat")).toBe(true);
+    // SMS is webhook-delivered too, but to the telephony listener: showing
+    // the channels path for it would be a URL nothing answers.
+    expect(needsPublicCallback("sms")).toBe(false);
     // An unknown provider must not claim a webhook requirement it cannot have.
     expect(needsPublicCallback("nonsense")).toBe(false);
   });
@@ -58,7 +61,9 @@ describe("channels setup guidance", () => {
     // never received.
     for (const guide of PROVIDER_GUIDES) {
       for (const field of guide.configFields) {
-        expect(field.key).not.toMatch(/secret|token|password|key/);
+        // A *public* key is the one kind of key that belongs here: it
+        // verifies inbound signatures and unlocks nothing.
+        expect(field.key).not.toMatch(/secret|token|password|(?<!public_)key/);
       }
     }
   });

@@ -241,15 +241,10 @@ pub fn send_message_tool_def() -> serde_json::Value {
                     "to": { "type": "string", "description": "Optional destination conversation id. Defaults to the conversation this run came from." },
                     "thread": { "type": "string", "description": "Optional provider thread id inside the destination conversation." },
                     "reply_to": { "type": "string", "description": "Optional provider message id to reply to. Defaults to the message that produced this run when replying to it." },
-                    "attachments": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Optional files to send with the message, as paths inside this run's own directory. At most 4, each under 16 MB. Not every provider can carry files."
-                    },
                     "artifacts": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional durable artifact ids of stored files to send, such as an image this conversation received earlier."
+                        "description": "Optional durable artifact ids of stored files to send, such as an image this conversation received earlier. Files travel only by artifact id — there is no path parameter."
                     }
                 },
                 "required": ["text"],

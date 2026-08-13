@@ -110,9 +110,9 @@ pub(crate) struct ChannelSendRequest {
     /// message that produced this run.
     pub reply_to_provider_id: Option<String>,
     pub text: String,
-    /// Files from the run's own directory, confined and copied at queue time.
-    pub attachment_paths: Vec<String>,
-    /// Durable artifact ids already in the content store.
+    /// Durable artifact ids already in the content store. The only way a file
+    /// travels: the tool takes no filesystem path, so nothing the model says
+    /// can name a file on this machine that was not already made durable.
     pub artifact_ids: Vec<String>,
 }
 
@@ -232,8 +232,7 @@ pub(crate) fn plan_send(
     origin: Option<&ChannelOrigin>,
 ) -> Result<SendPlan, String> {
     let text = request.text.trim();
-    let has_files = !request.attachment_paths.is_empty() || !request.artifact_ids.is_empty();
-    if text.is_empty() && !has_files {
+    if text.is_empty() && request.artifact_ids.is_empty() {
         return Err("A message must contain some text.".to_string());
     }
     if text.chars().count() > MAX_REPLY_CHARS {
@@ -294,7 +293,7 @@ pub(crate) fn queue_send(
     now_ms: i64,
 ) -> Result<serde_json::Value, String> {
     let text = request.text.trim();
-    let has_files = !request.attachment_paths.is_empty() || !request.artifact_ids.is_empty();
+    let has_files = !request.artifact_ids.is_empty();
     let Destination {
         account_id,
         conversation_id,
@@ -307,22 +306,27 @@ pub(crate) fn queue_send(
     if !account.enabled {
         return Err("That account is disabled, so nothing was queued.".to_string());
     }
-    // Refused before the files are read, not after: an agent that cannot send
-    // a file on this provider should not have caused it to be copied anywhere.
     if has_files && !super::adapters::sends_attachments(account.kind) {
         return Err(format!(
             "Little Monkey cannot send files on {} yet, so nothing was queued.",
             account.kind.label()
         ));
     }
-    if request.attachment_paths.len() + request.artifact_ids.len() > MAX_ATTACHMENTS_PER_REPLY {
+    // The account's own configured limits, bounded by the ceilings nothing may
+    // raise — the reply-wide file cap and the artifact store's blob cap. All
+    // checked before the row is written, so a request over a deterministic
+    // limit never becomes durable.
+    let limits =
+        super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
+    let max_files = limits.max_listed.min(MAX_ATTACHMENTS_PER_REPLY);
+    if request.artifact_ids.len() > max_files {
         return Err(format!(
-            "A message may carry at most {MAX_ATTACHMENTS_PER_REPLY} files; this one asked for {}.",
-            request.attachment_paths.len() + request.artifact_ids.len()
+            "A message on this account may carry at most {max_files} files; this one asked for {}.",
+            request.artifact_ids.len()
         ));
     }
-    let mut attachments = import_attachments(paths, &request.attachment_paths)?;
-    attachments.extend(resolve_artifacts(paths, &request.artifact_ids)?);
+    let max_bytes = limits.max_bytes.min(MAX_ATTACHMENT_BYTES);
+    let mut attachments = resolve_artifacts(paths, &request.artifact_ids, max_bytes)?;
     // An artifact id names bytes and nothing else, so a file forwarded by id
     // would otherwise leave as "attachment" with no type. What this run was
     // *sent* is the one place a real name and type for those bytes exists.
@@ -504,12 +508,15 @@ fn refuse(account_id: &str, conversation_id: &str, reason: &str) -> String {
 
 /// Reference already-durable artifacts by id.
 ///
-/// Unlike [`import_attachments`] nothing is copied — the id names bytes the
-/// content store already holds. What is checked: the id is a well-formed
-/// digest, the blob exists, and it is inside the per-file cap.
+/// Nothing is copied and nothing is read into memory — the id names bytes the
+/// content store already holds, and the size check reads the blob's metadata.
+/// What is checked: the id is a well-formed digest, the blob exists, and it is
+/// inside `max_bytes` — the account's configured limit already bounded by the
+/// application ceiling.
 fn resolve_artifacts(
     paths: &DaemonPaths,
     artifact_ids: &[String],
+    max_bytes: u64,
 ) -> Result<Vec<OutboundAttachment>, String> {
     if artifact_ids.is_empty() {
         return Ok(Vec::new());
@@ -533,9 +540,9 @@ fn resolve_artifacts(
             .map_err(|error| format!("'{id}': {error}"))?;
         let metadata = std::fs::metadata(&path)
             .map_err(|_| format!("There is no stored artifact with id '{id}'."))?;
-        if metadata.len() > MAX_ATTACHMENT_BYTES {
+        if metadata.len() > max_bytes {
             return Err(format!(
-                "Artifact '{id}' is {} bytes; the limit for one attachment is {MAX_ATTACHMENT_BYTES}.",
+                "Artifact '{id}' is {} bytes; the limit for one attachment on this account is {max_bytes}.",
                 metadata.len()
             ));
         }
@@ -548,105 +555,14 @@ fn resolve_artifacts(
     Ok(resolved)
 }
 
-/// How many files one reply may carry.
+/// How many files one reply may carry, no matter what the account configures.
 const MAX_ATTACHMENTS_PER_REPLY: usize = 4;
-
-/// Copy the files an agent asked to attach into the content store.
-///
-/// Sending a file to an outside conversation is the one part of this tool that
-/// could move data off the machine, so what it will accept is deliberately
-/// narrow:
-///
-/// - Paths are resolved against the run's own working directory, and the
-///   canonical result must still be inside it. `../../.ssh/id_rsa`, an absolute
-///   path, and a symlink pointing out of the workspace all fail the same check,
-///   because all three are compared after resolution rather than as text.
-/// - Only regular files. A directory, a device node or a fifo is refused rather
-///   than read.
-/// - Each file is capped at [`MAX_ATTACHMENT_BYTES`], and a reply at
-///   [`MAX_ATTACHMENTS_PER_REPLY`] files.
-///
-/// The bytes are copied now, not referenced: the outbox may retry this row
-/// minutes later, and the file the agent meant is the one that existed when it
-/// said so.
-fn import_attachments(
-    paths: &DaemonPaths,
-    requested: &[String],
-) -> Result<Vec<OutboundAttachment>, String> {
-    if requested.is_empty() {
-        return Ok(Vec::new());
-    }
-    let root = std::env::current_dir()
-        .and_then(|directory| directory.canonicalize())
-        .map_err(|_| "This run has no working directory to attach files from.".to_string())?;
-    let app_data = paths
-        .root
-        .parent()
-        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
-    let store = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
-        app_data.join("content-v1"),
-        MAX_ATTACHMENT_BYTES,
-    )
-    .map_err(|error| format!("Failed to open the content store: {error}"))?;
-    import_from(&root, &store, requested)
-}
-
-/// The confinement and size rules, separated from where the run's directory and
-/// the content store come from so they can be exercised without a daemon.
-fn import_from(
-    root: &std::path::Path,
-    store: &little_monkey_lib::artifact_store::ArtifactStore,
-    requested: &[String],
-) -> Result<Vec<OutboundAttachment>, String> {
-    if requested.len() > MAX_ATTACHMENTS_PER_REPLY {
-        return Err(format!(
-            "A reply may carry at most {MAX_ATTACHMENTS_PER_REPLY} files; this one asked for {}.",
-            requested.len()
-        ));
-    }
-    let mut imported = Vec::with_capacity(requested.len());
-    for path in requested {
-        let resolved = root
-            .join(path)
-            .canonicalize()
-            .map_err(|_| format!("There is no file at '{path}' in this run's directory."))?;
-        if !resolved.starts_with(root) {
-            return Err(format!(
-                "'{path}' is outside this run's directory, so it cannot be attached."
-            ));
-        }
-        let metadata = std::fs::symlink_metadata(&resolved)
-            .map_err(|_| format!("'{path}' could not be read."))?;
-        if !metadata.is_file() {
-            return Err(format!("'{path}' is not a regular file."));
-        }
-        if metadata.len() > MAX_ATTACHMENT_BYTES {
-            return Err(format!(
-                "'{path}' is {} bytes; the limit for one attachment is {MAX_ATTACHMENT_BYTES}.",
-                metadata.len()
-            ));
-        }
-        let blob = store
-            .import_file(&resolved)
-            .map_err(|error| format!("Failed to store '{path}': {error}"))?;
-        imported.push(OutboundAttachment {
-            artifact_id: blob.id,
-            filename: resolved
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string()),
-            mime_type: None,
-        });
-    }
-    Ok(imported)
-}
 
 /// Give a forwarded artifact back the filename and type it arrived with.
 ///
-/// Only for attachments the tool resolved by id and that have no name yet —
-/// a file imported from the run's own directory already carries its own. The
-/// lookup is the run's own inbound envelope, so an id this conversation never
-/// received simply stays unnamed rather than borrowing another message's
-/// metadata.
+/// Only for attachments that have no name yet. The lookup is the run's own
+/// inbound envelope, so an id this conversation never received simply stays
+/// unnamed rather than borrowing another message's metadata.
 fn name_known_artifacts(store: &DaemonStore, job_id: &str, attachments: &mut [OutboundAttachment]) {
     if attachments
         .iter()
@@ -745,93 +661,6 @@ mod tests {
         asked.account_id = Some("x".repeat(MAX_DESTINATION_CHARS + 1));
         let error = send_message(&asked, &reply_authority()).expect_err("oversized id");
         assert!(error.contains("'account'"), "{error}");
-    }
-
-    /// A run directory with one file in it, plus a content store to import
-    /// into. Both live in the same temp dir so nothing here touches the real
-    /// daemon or the shared ledger.
-    fn workspace() -> (std::path::PathBuf, std::path::PathBuf, ArtifactStore) {
-        let base =
-            std::env::temp_dir().join(format!("lm-attach-{}", uuid::Uuid::new_v4().simple()));
-        let root = base.join("run");
-        std::fs::create_dir_all(&root).expect("run dir");
-        std::fs::write(root.join("report.txt"), b"the build passed").expect("file");
-        let store =
-            ArtifactStore::with_max_blob_size(base.join("content-v1"), MAX_ATTACHMENT_BYTES)
-                .expect("store");
-        let base = base.canonicalize().expect("canonical base");
-        let root = root.canonicalize().expect("canonical run dir");
-        (base, root, store)
-    }
-
-    #[test]
-    fn a_file_in_the_run_directory_is_copied_into_the_content_store() {
-        let (_base, root, store) = workspace();
-        let imported = import_from(&root, &store, &["report.txt".to_string()]).expect("imported");
-        assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].filename.as_deref(), Some("report.txt"));
-        // Copied, not referenced: the bytes survive the original being replaced.
-        std::fs::write(root.join("report.txt"), b"something else").expect("overwrite");
-        assert_eq!(
-            store.read(&imported[0].artifact_id).expect("read back"),
-            b"the build passed"
-        );
-    }
-
-    #[test]
-    fn a_path_climbing_out_of_the_run_directory_is_refused() {
-        let (base, root, store) = workspace();
-        std::fs::write(base.join("secret"), b"private key").expect("outside file");
-        let error = import_from(&root, &store, &["../secret".to_string()]).expect_err("refused");
-        assert!(error.contains("outside this run's directory"), "{error}");
-    }
-
-    #[test]
-    fn an_absolute_path_elsewhere_is_refused() {
-        let (base, root, store) = workspace();
-        let outside = base.join("secret");
-        std::fs::write(&outside, b"private key").expect("outside file");
-        let error =
-            import_from(&root, &store, &[outside.display().to_string()]).expect_err("refused");
-        assert!(error.contains("outside this run's directory"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_pointing_out_of_the_run_directory_is_refused() {
-        // The name is inside the workspace; the file is not. Comparing the
-        // resolved path rather than the requested one is what catches this.
-        let (base, root, store) = workspace();
-        let outside = base.join("secret");
-        std::fs::write(&outside, b"private key").expect("outside file");
-        std::os::unix::fs::symlink(&outside, root.join("innocent.txt")).expect("symlink");
-        let error = import_from(&root, &store, &["innocent.txt".to_string()]).expect_err("refused");
-        assert!(error.contains("outside this run's directory"), "{error}");
-    }
-
-    #[test]
-    fn a_directory_is_not_a_file() {
-        let (_base, root, store) = workspace();
-        std::fs::create_dir(root.join("logs")).expect("dir");
-        let error = import_from(&root, &store, &["logs".to_string()]).expect_err("refused");
-        assert!(error.contains("not a regular file"), "{error}");
-    }
-
-    #[test]
-    fn a_missing_file_is_named_rather_than_silently_dropped() {
-        let (_base, root, store) = workspace();
-        let error = import_from(&root, &store, &["nope.txt".to_string()]).expect_err("refused");
-        assert!(error.contains("no file at 'nope.txt'"), "{error}");
-    }
-
-    #[test]
-    fn more_files_than_the_cap_are_refused_before_any_are_copied() {
-        let (_base, root, store) = workspace();
-        let requested: Vec<String> = (0..MAX_ATTACHMENTS_PER_REPLY + 1)
-            .map(|_| "report.txt".to_string())
-            .collect();
-        let error = import_from(&root, &store, &requested).expect_err("refused");
-        assert!(error.contains("at most"), "{error}");
     }
 
     #[test]
@@ -968,7 +797,7 @@ mod tests {
         std::fs::create_dir_all(&base).expect("app data root");
         // resolve_artifacts only needs `root` to find app-data's content store.
         let paths = DaemonPaths::under(&base);
-        let error = resolve_artifacts(&paths, &["not-a-digest".to_string()])
+        let error = resolve_artifacts(&paths, &["not-a-digest".to_string()], MAX_ATTACHMENT_BYTES)
             .expect_err("malformed artifact id");
         assert!(error.contains("not an artifact id"), "{error}");
     }
@@ -980,7 +809,8 @@ mod tests {
         std::fs::create_dir_all(&base).expect("app data root");
         let paths = DaemonPaths::under(&base);
         let id = "a".repeat(64);
-        let error = resolve_artifacts(&paths, &[id]).expect_err("missing artifact");
+        let error =
+            resolve_artifacts(&paths, &[id], MAX_ATTACHMENT_BYTES).expect_err("missing artifact");
         assert!(error.contains("no stored artifact"), "{error}");
     }
 
@@ -994,8 +824,42 @@ mod tests {
             ArtifactStore::with_max_blob_size(base.join("content-v1"), MAX_ATTACHMENT_BYTES)
                 .expect("store");
         let blob = store.put(b"the chart").expect("blob");
-        let resolved = resolve_artifacts(&paths, &[blob.id.clone()]).expect("resolved");
+        let resolved =
+            resolve_artifacts(&paths, &[blob.id.clone()], MAX_ATTACHMENT_BYTES).expect("resolved");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].artifact_id, blob.id);
+    }
+
+    #[test]
+    fn an_artifact_over_the_accounts_own_limit_is_refused() {
+        // The stored blob is fine by the application ceiling; it is the
+        // account's configured limit — already folded into `max_bytes` by the
+        // caller — that refuses it. Checked from metadata: the bytes are
+        // never read.
+        let base =
+            std::env::temp_dir().join(format!("lm-artifact-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&base).expect("app data root");
+        let paths = DaemonPaths::under(&base);
+        let store =
+            ArtifactStore::with_max_blob_size(base.join("content-v1"), MAX_ATTACHMENT_BYTES)
+                .expect("store");
+        let blob = store.put(b"nine bytes").expect("blob");
+        let error =
+            resolve_artifacts(&paths, &[blob.id.clone()], 4).expect_err("over the account limit");
+        assert!(error.contains("on this account"), "{error}");
+        resolve_artifacts(&paths, &[blob.id], MAX_ATTACHMENT_BYTES)
+            .expect("the same blob is fine under the default limit");
+    }
+
+    #[test]
+    fn the_tool_takes_no_filesystem_path() {
+        // The universal contract is artifact-only: the model-visible schema
+        // must offer no way to name a file on this machine.
+        let schema = little_monkey_lib::agent_tools::send_message_tool_def();
+        let properties = &schema["function"]["parameters"]["properties"];
+        assert!(properties.get("artifacts").is_some());
+        assert!(properties.get("attachments").is_none());
+        assert!(properties.get("paths").is_none());
+        assert_eq!(schema["function"]["parameters"]["additionalProperties"], false);
     }
 }
