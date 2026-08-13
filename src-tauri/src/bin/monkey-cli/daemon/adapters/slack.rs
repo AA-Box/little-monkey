@@ -165,6 +165,12 @@ impl SlackAdapter {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_blobs(mut self, blobs: Arc<dyn BlobSource>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
     async fn ensure_started(&self) {
         self.started
             .get_or_init(|| async {
@@ -216,14 +222,21 @@ impl ChannelAdapter for SlackAdapter {
         match auth_test(&self.http, &self.api_base, &self.secret.bot_token).await {
             Ok(identity) if identity.ok => {
                 // The Web API proves the bot token; the socket is what proves
-                // events can actually arrive. An authenticated token with a
-                // down socket is degraded, not connected.
+                // events can actually arrive. `Connected` is written for
+                // exactly one combination — a started task with a live Socket
+                // Mode connection. A token whose socket has never started is
+                // not connected, and one whose socket dropped is degraded.
                 let started = self.started.get().is_some();
                 let socket_up = self
                     .shared
                     .socket_connected
                     .load(std::sync::atomic::Ordering::SeqCst);
-                if started && !socket_up {
+                if started && socket_up {
+                    ChannelHealth::connected(
+                        now,
+                        Some(format!("Connected to Slack as {}", identity.user_id)),
+                    )
+                } else if started {
                     ChannelHealth {
                         state: little_monkey_lib::channels::types::HealthState::Degraded,
                         detail: Some(format!(
@@ -234,10 +247,15 @@ impl ChannelAdapter for SlackAdapter {
                         probed_at_ms: now,
                     }
                 } else {
-                    ChannelHealth::connected(
-                        now,
-                        Some(format!("Connected to Slack as {}", identity.user_id)),
-                    )
+                    ChannelHealth {
+                        state: little_monkey_lib::channels::types::HealthState::Disconnected,
+                        detail: Some(format!(
+                            "Authenticated to Slack as {}; the Socket Mode connection has not started yet",
+                            identity.user_id
+                        )),
+                        last_error: None,
+                        probed_at_ms: now,
+                    }
                 }
             }
             Ok(identity) => ChannelHealth::error(
@@ -441,6 +459,11 @@ impl SlackAdapter {
         files: &[LoadedAttachment],
     ) -> SendOutcome {
         let mut uploaded: Vec<Value> = Vec::with_capacity(files.len());
+        // Flipped the moment Slack's store has accepted any file's bytes.
+        // From then on the whole logical message has an external footprint,
+        // and a failure that would otherwise be a plain retry parks the row
+        // instead — the outbox retries a message from its first byte.
+        let mut any_uploaded = false;
         for file in files {
             let request = self
                 .http
@@ -453,10 +476,14 @@ impl SlackAdapter {
             let response = match little_monkey_lib::egress::send(request).await {
                 Ok(response) => response,
                 Err(error) => {
-                    return SendOutcome::RetryableFailure {
-                        error: scrub(&error.to_string(), &self.secret.bot_token),
-                        retry_after_ms: None,
-                    }
+                    let error = scrub(&error.to_string(), &self.secret.bot_token);
+                    return parked_after_upload(
+                        SendOutcome::RetryableFailure {
+                            error,
+                            retry_after_ms: None,
+                        },
+                        any_uploaded,
+                    );
                 }
             };
             let status = response.status().as_u16();
@@ -467,11 +494,11 @@ impl SlackAdapter {
                     .and_then(|value| value.to_str().ok()),
             );
             let body: Value = response.json().await.unwrap_or(Value::Null);
-            // Nothing has been sent yet, so a rate limit or a server error
-            // here is a plain retry — only a refusal is permanent.
+            // Before the first byte upload this step is a plain retry — only
+            // a refusal is permanent. After one, see `any_uploaded`.
             if let Some(outcome) = upload_step_failure(status, retry_after_ms, &body, "upload URL")
             {
-                return outcome;
+                return parked_after_upload(outcome, any_uploaded);
             }
             let (Some(upload_url), Some(file_id)) = (
                 body.get("upload_url").and_then(Value::as_str),
@@ -497,14 +524,31 @@ impl SlackAdapter {
             match little_monkey_lib::egress::send(upload).await {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => {
-                    return SendOutcome::PermanentFailure {
-                        error: format!("Slack refused the upload ({})", response.status().as_u16()),
-                    }
+                    let status = response.status().as_u16();
+                    // A rate limit or a server error from the storage host is
+                    // transient — the upload URL flow simply starts over —
+                    // but only while no earlier file's bytes have landed.
+                    // Anything else is a refusal that will repeat.
+                    return match status {
+                        429 | 500..=599 => parked_after_upload(
+                            SendOutcome::RetryableFailure {
+                                error: format!("Slack returned HTTP {status} for the byte upload"),
+                                retry_after_ms: None,
+                            },
+                            any_uploaded,
+                        ),
+                        _ => SendOutcome::PermanentFailure {
+                            error: format!("Slack refused the upload ({status})"),
+                        },
+                    };
                 }
                 Err(error) => {
+                    // Only a connect failure proves no byte reached Slack's
+                    // store; anything later — and anything at all once an
+                    // earlier file landed — is an unknown external footprint.
                     let is_connect = error.is_connect();
                     let error = scrub(&error.to_string(), &self.secret.bot_token);
-                    return if is_connect {
+                    return if is_connect && !any_uploaded {
                         SendOutcome::RetryableFailure {
                             error,
                             retry_after_ms: None,
@@ -514,6 +558,7 @@ impl SlackAdapter {
                     };
                 }
             }
+            any_uploaded = true;
             uploaded.push(serde_json::json!({ "id": file_id, "title": file.filename }));
         }
         let mut body = serde_json::json!({
@@ -549,11 +594,7 @@ impl SlackAdapter {
                 .and_then(|value| value.to_str().ok()),
         );
         let body: Value = response.json().await.unwrap_or(Value::Null);
-        // A rate-limited completion provably posted nothing — the bytes wait
-        // in Slack's store under their file ids and the whole send retries.
-        if let Some(outcome) =
-            upload_step_failure(status, retry_after_ms, &body, "upload completion")
-        {
+        if let Some(outcome) = completion_failure(status, retry_after_ms, &body) {
             return outcome;
         }
         SendOutcome::Sent {
@@ -613,6 +654,61 @@ fn missing_scope_error(reason: &str) -> String {
             .to_string(),
         other => format!("Slack refused files.info: {other}"),
     }
+}
+
+/// Converts a would-be retry into a parked row once any file's bytes have
+/// already landed in Slack's store: the outbox retries a logical message
+/// from its first byte, and a message with an external footprint is not the
+/// outbox's to repeat blindly. (An unpublished upload is invisible in the
+/// channel, but it exists — reconciliation is the honest state.)
+fn parked_after_upload(outcome: SendOutcome, any_uploaded: bool) -> SendOutcome {
+    match outcome {
+        SendOutcome::RetryableFailure { error, .. } if any_uploaded => {
+            SendOutcome::NeedsReconciliation { error }
+        }
+        other => other,
+    }
+}
+
+/// The failure outcome of `files.completeUploadExternal`, or `None` on
+/// success. This is the one call that makes the upload visible, so its
+/// failures split by whether Slack may have processed it: a 429 (either
+/// shape) is refused before processing and retries safely, while a server
+/// error may have posted the message before dying — that parks.
+fn completion_failure(
+    http_status: u16,
+    retry_after_ms: Option<i64>,
+    body: &Value,
+) -> Option<SendOutcome> {
+    if http_status == 429 {
+        return Some(SendOutcome::RetryableFailure {
+            error: "Slack rate limited the upload completion".to_string(),
+            retry_after_ms,
+        });
+    }
+    if (500..600).contains(&http_status) {
+        return Some(SendOutcome::NeedsReconciliation {
+            error: format!(
+                "Slack returned HTTP {http_status} for the upload completion; the message may have posted"
+            ),
+        });
+    }
+    if body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let error = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown_error");
+    Some(match error {
+        "ratelimited" => SendOutcome::RetryableFailure {
+            error: "Slack rate limited the upload completion (ok:false)".to_string(),
+            retry_after_ms,
+        },
+        other => SendOutcome::PermanentFailure {
+            error: format!("Slack refused the upload completion: {other}"),
+        },
+    })
 }
 
 /// The failure outcome for one step of the upload flow, or `None` when the
@@ -1335,6 +1431,231 @@ mod tests {
         let text = serde_json::json!({ "type": "disconnect", "reason": "warning" }).to_string();
         let actions = handle_socket_frame("acct", &text, None, None, 500);
         assert!(matches!(actions.last(), Some(Action::Reconnect)));
+    }
+
+    fn adapter_with_base(base: &str) -> SlackAdapter {
+        let account = account_fixture();
+        let config = AdapterConfig {
+            account: &account,
+            secret: r#"{"bot_token":"xoxb-test","app_token":"xapp-test"}"#.to_string(),
+        };
+        SlackAdapter::new(&config).expect("adapter").with_base_url(base)
+    }
+
+    const AUTH_TEST_OK: &str = r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#;
+
+    // -- health semantics ---------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_before_the_socket_starts_is_not_connected() {
+        let (base, _requests) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, AUTH_TEST_OK.to_string())]);
+        let adapter = adapter_with_base(&base);
+        // auth.test succeeds, but nothing has ever asked the socket to
+        // connect. A working token is not a connection.
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Disconnected,
+            "{health:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_while_the_socket_is_down_is_degraded() {
+        let (base, _requests) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, AUTH_TEST_OK.to_string())]);
+        let adapter = adapter_with_base(&base);
+        let _ = adapter.started.set(());
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Degraded,
+            "{health:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_with_a_live_socket_is_connected() {
+        let (base, _requests) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, AUTH_TEST_OK.to_string())]);
+        let adapter = adapter_with_base(&base);
+        let _ = adapter.started.set(());
+        adapter
+            .shared
+            .socket_connected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Connected,
+            "{health:?}"
+        );
+    }
+
+    // -- partial sends and upload classification ------------------------------
+
+    #[tokio::test]
+    async fn a_rate_limited_second_chunk_parks_the_message() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (200, r#"{"ok":true,"ts":"1.1"}"#.to_string()),
+            (429, r#"{"ok":false,"error":"ratelimited"}"#.to_string()),
+        ]);
+        let adapter = adapter_with_base(&base);
+        let message = OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Slack,
+            conversation_id: "C1".into(),
+            thread_id: None,
+            text: "a".repeat(SLACK_MAX_TEXT_CHARS + 10),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    fn message_with_files(count: usize) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Slack,
+            conversation_id: "C1".into(),
+            thread_id: None,
+            text: "here".into(),
+            attachments: (0..count)
+                .map(
+                    |index| little_monkey_lib::channels::types::OutboundAttachment {
+                        artifact_id: format!("blob-{index}"),
+                        filename: Some(format!("file-{index}.txt")),
+                        mime_type: Some("text/plain".into()),
+                    },
+                )
+                .collect(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_completion_server_error_parks_the_upload() {
+        // The bytes are in Slack's store and the completing call — the one
+        // that makes them visible — died mid-flight. Whether a message
+        // posted is unknown; a blind retry could post it twice.
+        let (upload_base, _uploads) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, "{}".to_string())]);
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                format!(r#"{{"ok":true,"upload_url":"{upload_base}/up1","file_id":"F1"}}"#),
+            ),
+            (500, r#"{"ok":false}"#.to_string()),
+        ]);
+        let adapter = adapter_with_base(&base).with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(b"bytes".to_vec()),
+        ));
+        let outcome = adapter.send(&message_with_files(1)).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_first_file_landed_parks_the_message() {
+        // File 0 is fully in Slack's store; file 1's upload-URL request gets
+        // rate limited. Retrying the whole message would re-upload file 0,
+        // so the row parks for reconciliation instead.
+        let (upload_base, _uploads) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, "{}".to_string())]);
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                format!(r#"{{"ok":true,"upload_url":"{upload_base}/up1","file_id":"F1"}}"#),
+            ),
+            (429, r#"{"ok":false,"error":"ratelimited"}"#.to_string()),
+        ]);
+        let adapter = adapter_with_base(&base).with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(b"bytes".to_vec()),
+        ));
+        let outcome = adapter.send(&message_with_files(2)).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_before_any_byte_landed_is_a_plain_retry() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            429,
+            r#"{"ok":false,"error":"ratelimited"}"#.to_string(),
+        )]);
+        let adapter = adapter_with_base(&base).with_blobs(std::sync::Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(b"bytes".to_vec()),
+        ));
+        let outcome = adapter.send(&message_with_files(1)).await;
+        assert!(
+            matches!(outcome, SendOutcome::RetryableFailure { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn completion_failures_split_by_whether_slack_may_have_posted() {
+        // 429 in either shape is refused before processing: retry.
+        assert!(matches!(
+            completion_failure(429, Some(1000), &Value::Null),
+            Some(SendOutcome::RetryableFailure { .. })
+        ));
+        assert!(matches!(
+            completion_failure(
+                200,
+                None,
+                &serde_json::json!({"ok": false, "error": "ratelimited"})
+            ),
+            Some(SendOutcome::RetryableFailure { .. })
+        ));
+        // A server error may have posted the message first: park.
+        assert!(matches!(
+            completion_failure(502, None, &Value::Null),
+            Some(SendOutcome::NeedsReconciliation { .. })
+        ));
+        // An explicit refusal repeats forever: permanent.
+        assert!(matches!(
+            completion_failure(
+                200,
+                None,
+                &serde_json::json!({"ok": false, "error": "invalid_auth"})
+            ),
+            Some(SendOutcome::PermanentFailure { .. })
+        ));
+        assert!(completion_failure(200, None, &serde_json::json!({"ok": true})).is_none());
+    }
+
+    #[test]
+    fn a_retry_becomes_reconciliation_once_bytes_have_landed() {
+        let retry = SendOutcome::RetryableFailure {
+            error: "x".into(),
+            retry_after_ms: None,
+        };
+        assert!(matches!(
+            parked_after_upload(retry.clone(), true),
+            SendOutcome::NeedsReconciliation { .. }
+        ));
+        assert!(matches!(
+            parked_after_upload(retry, false),
+            SendOutcome::RetryableFailure { .. }
+        ));
+        // Permanent stays permanent — no retry happens either way.
+        let permanent = SendOutcome::PermanentFailure { error: "x".into() };
+        assert!(matches!(
+            parked_after_upload(permanent, true),
+            SendOutcome::PermanentFailure { .. }
+        ));
     }
 
     #[test]
