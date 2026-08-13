@@ -149,9 +149,18 @@ pub(crate) async fn poll_account_once(
     let mut batch = adapter.poll(cursor.as_deref()).await?;
     // Files are fetched before the turn becomes durable, so the stored event is
     // the turn as the agent will see it rather than a promise to look later.
+    let limits = store
+        .channel_account(account_id)
+        .ok()
+        .flatten()
+        .map(|account| {
+            super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config)
+        })
+        .unwrap_or_default();
     super::channel_adapter::hydrate_attachments(
         adapter,
         &super::channel_adapter::DaemonBlobs,
+        limits,
         &mut batch.envelopes,
     )
     .await;

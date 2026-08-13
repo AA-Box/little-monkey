@@ -46,6 +46,47 @@ pub(crate) fn current_channel_origin() -> Option<(String, ChannelOrigin)> {
     Some((job_id, origin))
 }
 
+/// Image files this run's own inbound message carried.
+///
+/// The list comes from the durable event that produced this job, never from
+/// the prompt: the message text is written by a stranger, and scanning it for
+/// paths would let that stranger name any image on this machine and have the
+/// model describe it back to them. Only what an adapter downloaded for this
+/// turn is offered.
+///
+/// Empty for every run that did not arrive from a conversation, which is what
+/// keeps this invisible to ordinary CLI use.
+pub(crate) fn current_turn_images() -> Vec<std::path::PathBuf> {
+    let Ok(job_id) = std::env::var(JOB_ID_ENV) else {
+        return Vec::new();
+    };
+    if job_id.is_empty() {
+        return Vec::new();
+    }
+    let Ok(paths) = DaemonPaths::resolve() else {
+        return Vec::new();
+    };
+    let Ok(store) = DaemonStore::open(&paths) else {
+        return Vec::new();
+    };
+    let Ok(Some(envelope_json)) = store.inbound_envelope_for_job(&job_id) else {
+        return Vec::new();
+    };
+    let Ok(envelope) = serde_json::from_str::<ChannelEnvelope>(&envelope_json) else {
+        return Vec::new();
+    };
+    envelope
+        .attachments
+        .iter()
+        .filter_map(|attachment| {
+            let artifact_id = attachment.stored_artifact_id.as_deref()?;
+            let extension =
+                super::channel_adapter::vision_extension(attachment.mime_type.as_deref())?;
+            super::channel_adapter::image_path_in(&paths, artifact_id, extension)
+        })
+        .collect()
+}
+
 /// Queue one reply to the conversation this run came from.
 ///
 /// Returns the JSON the tool loop hands back to the model. Deliberately terse:

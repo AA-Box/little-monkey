@@ -391,7 +391,7 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
                 .iter()
                 .map(|media| ChannelAttachment {
                     stored_artifact_id: None,
-            text_excerpt: None,
+                    text_excerpt: None,
                     fetch_error: None,
                     provider_id: None,
                     kind: media

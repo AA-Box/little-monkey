@@ -569,6 +569,7 @@ mod macos {
         async fn fetch_attachment(
             &self,
             attachment: &ChannelAttachment,
+            limits: crate::daemon::channel_adapter::AttachmentLimits,
         ) -> Result<Vec<u8>, String> {
             let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
                 return Err("This iMessage attachment has no path.".to_string());
