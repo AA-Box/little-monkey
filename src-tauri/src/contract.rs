@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.4.0";
+pub const CONTRACT_VERSION: &str = "1.5.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -96,6 +96,9 @@ pub enum RemotePlane {
     /// Placement and live migration (K17/K18) — the only way a run authored
     /// elsewhere starts here.
     Node,
+    /// Bounded traffic between two paired installations. Carries words, never
+    /// a spec: what a peer says runs under this node's own recipe.
+    Peer,
     /// A paired physical device's own hardware: what it advertises, and the
     /// durable queue of commands the runner has for it. The only plane whose
     /// effects happen somewhere other than this machine.
@@ -110,6 +113,10 @@ pub enum RemoteGate {
     Capability(&'static str),
     /// A device may always sever itself; no grant beyond a valid signature.
     SelfService,
+    /// Any one of the three peer grants. Which one a request actually needs
+    /// depends on what it carries, and is decided per envelope inside the
+    /// gate; reaching the plane at all needs peer standing of some kind.
+    PeerStanding,
 }
 
 /// Every route the signed remote plane dispatches.
@@ -345,6 +352,18 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         path: "/v1/remote/node/migration/accept",
         gate: RemoteGate::Capability("Migrate"),
     },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/messages",
+        gate: RemoteGate::PeerStanding,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "GET",
+        path: "/v1/remote/peer/threads/{thread_id}",
+        gate: RemoteGate::PeerStanding,
+    },
 ];
 
 /// Every ACP method `monkey-cli acp` dispatches. Checked against `acp.rs`'s
@@ -509,6 +528,7 @@ fn gate_name(gate: RemoteGate) -> String {
         RemoteGate::Action(action) => format!("action:{action}"),
         RemoteGate::Capability(capability) => format!("capability:{capability}"),
         RemoteGate::SelfService => "self_service".to_string(),
+        RemoteGate::PeerStanding => "peer_standing".to_string(),
     }
 }
 

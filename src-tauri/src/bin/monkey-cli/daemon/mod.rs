@@ -11,6 +11,10 @@ pub(crate) mod channel_worker;
 mod engine;
 pub(crate) mod ingress_store;
 mod ledger;
+pub(crate) mod peer_audit;
+pub(crate) mod peer_ingress;
+pub(crate) mod peer_store;
+pub(crate) mod peer_tool;
 pub(crate) mod remote;
 mod scheduler;
 mod service;
@@ -2322,6 +2326,9 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         desktop_control.clone(),
         std::sync::Arc::new(DaemonMobileChatQueue::new(paths.clone())),
         std::sync::Arc::new(DaemonPlacementQueue::new(paths.clone())),
+        // Peer traffic reaches the queue through the same seam channel
+        // messages do: one funnel, one set of durability rules.
+        std::sync::Arc::new(DaemonChannelQueue::new(paths.clone())),
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;

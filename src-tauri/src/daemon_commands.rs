@@ -2058,6 +2058,138 @@ pub async fn channels_set_credential(account_id: String, secret: String) -> Resu
     .map(|_| ())
 }
 
+// --- Peers -----------------------------------------------------------------
+//
+// Thin, fixed-argument wrappers over `monkey peers …`, like the messaging
+// channel commands above. Two things are deliberately absent: any way to name
+// a capability that is not a peer grant (the CLI's parser knows three words),
+// and any way for React to see a pairing token — an invitation is written to a
+// file the operator chooses and moved out of band, exactly as a controller
+// pairing already is.
+
+/// Peer grants an operator may hand out, spelled once.
+fn peer_grants(allow: &[String]) -> Result<String, String> {
+    let mut tokens = Vec::new();
+    for grant in allow {
+        match grant.as_str() {
+            "message" | "task" | "artifact" => tokens.push(grant.as_str()),
+            other => return Err(format!("Unknown peer grant '{other}'")),
+        }
+    }
+    Ok(tokens.join(","))
+}
+
+#[tauri::command]
+pub async fn peers_list() -> Result<Value, String> {
+    parse_json(&command(vec!["peers".into(), "list".into(), "--json".into()]).await?)
+}
+
+/// Offer another installation peer standing on this one. The invitation is
+/// written to `output`; it is one-time and expires.
+#[tauri::command]
+pub async fn peers_invite(
+    label: String,
+    allow: Vec<String>,
+    expires_minutes: u64,
+    output: String,
+) -> Result<Value, String> {
+    validate_token("peer label", &label, 120)?;
+    validate_output_path(&output)?;
+    let grants = peer_grants(&allow)?;
+    if grants.is_empty() {
+        return Err(
+            "A peer invitation must grant at least one of message, task or artifact".to_string(),
+        );
+    }
+    if !(1..=24 * 60).contains(&expires_minutes) {
+        return Err("Invitation expiry must be between 1 and 1440 minutes".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "peers".into(),
+            "invite".into(),
+            label,
+            "--allow".into(),
+            grants,
+            "--expires-minutes".into(),
+            expires_minutes.to_string(),
+            "--output".into(),
+            output,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Take up another installation's invitation from a file the operator chose.
+#[tauri::command]
+pub async fn peers_accept(invitation: String, alias: String) -> Result<Value, String> {
+    validate_id("peer alias", &alias)?;
+    let path = Path::new(&invitation);
+    if !path.is_absolute() || !path.is_file() {
+        return Err("Choose the invitation file the other installation gave you".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "peers".into(),
+            "accept".into(),
+            invitation,
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Replace what one inbound peer may ask for. An empty list leaves it paired
+/// and unable to ask for anything.
+#[tauri::command]
+pub async fn peers_grant(device_id: String, allow: Vec<String>) -> Result<Value, String> {
+    validate_id("device id", &device_id)?;
+    let grants = peer_grants(&allow)?;
+    parse_json(
+        &command(vec![
+            "peers".into(),
+            "grant".into(),
+            device_id,
+            "--allow".into(),
+            grants,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn peers_revoke(device_id: String, reason: String) -> Result<(), String> {
+    validate_id("device id", &device_id)?;
+    validate_token("revoke reason", &reason, 1024)?;
+    command(vec![
+        "peers".into(),
+        "revoke".into(),
+        device_id,
+        "--reason".into(),
+        reason,
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// Threads inbound peers opened here, with their recent traffic.
+#[tauri::command]
+pub async fn peers_threads(peer: Option<String>, limit: u32) -> Result<Value, String> {
+    let mut args = vec!["peers".into(), "threads".into()];
+    if let Some(peer) = peer {
+        validate_id("device id", &peer)?;
+        args.push("--peer".into());
+        args.push(peer);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
 // --- Conversation ingress -------------------------------------------------
 
 /// Turns that arrived from outside, across every origin, with the run each one
