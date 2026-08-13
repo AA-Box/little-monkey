@@ -79,6 +79,48 @@ pub struct SecurityAuditReport {
     pub findings: Vec<SecurityFinding>,
 }
 
+/// One paired physical device, as the runner's own state describes it.
+///
+/// Passed in rather than read here: the queue and the grants live in the
+/// daemon's SQLite database, whose schema `monkey-cli` owns. A second reader in
+/// this library would be a second copy of that schema, and the first migration
+/// would make the audit quietly wrong. The CLI, which already owns the store,
+/// collects this and hands it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceGrantSnapshot {
+    pub device_id: String,
+    pub device_name: String,
+    /// Physical capabilities the operator granted, as wire tokens.
+    pub granted_physical: Vec<String>,
+    /// Of those, the ones currently effective.
+    pub effective_physical: Vec<String>,
+    pub revoked: bool,
+    /// When the device last reported its surface, if ever.
+    pub last_seen_at_ms: Option<u64>,
+    /// Whether this device can be woken by push.
+    pub push_registered: bool,
+}
+
+/// One device command that has not finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCommandSnapshot {
+    pub command_id: String,
+    pub device_id: String,
+    pub capability: String,
+    pub state: String,
+}
+
+/// The operator's push configuration, reduced to what the audit asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPrivacySnapshot {
+    pub configured: bool,
+    pub enabled: bool,
+    /// True when notifications are allowed to carry specifics onto a lock
+    /// screen.
+    pub include_detail: bool,
+    pub registered_devices: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecurityRuntimeSnapshot {
     pub browser_grants: Vec<BrowserGrantSnapshot>,
@@ -89,6 +131,11 @@ pub struct SecurityRuntimeSnapshot {
     pub companion_error: Option<String>,
     pub native_skills: Vec<NativeSkillSnapshot>,
     pub native_skills_error: Option<String>,
+    pub devices: Vec<DeviceGrantSnapshot>,
+    pub device_commands: Vec<DeviceCommandSnapshot>,
+    pub device_state_observed: bool,
+    pub device_state_error: Option<String>,
+    pub push: Option<PushPrivacySnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +200,7 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_mcp_origins(app_data, request.fix, &mut findings);
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
+    audit_paired_devices(&request.runtime, &mut findings);
     audit_workspace_skill_root(request.workspace.as_deref(), &mut findings);
     audit_sandbox_enforcement(&mut findings);
 
@@ -1017,6 +1065,214 @@ fn audit_runtime_grants(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Se
     }
 }
 
+/// How long a paired device may go without reporting itself before its grants
+/// are treated as stale. A phone that has not been seen in a month may have
+/// been sold, wiped, or simply lost; either way the operator should be told
+/// that a camera grant is still sitting on it.
+const STALE_DEVICE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// The physical capabilities that see or hear the room the device is in. A
+/// grant of any of these is worth naming individually rather than counting.
+const INTIMATE_CAPABILITIES: &[&str] = &["microphone_capture", "screen_capture", "voice_stream"];
+
+/// Paired phones and tablets: what they may do to their own hardware, whether
+/// anything is doing it right now, and whether push would carry private text.
+fn audit_paired_devices(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
+    if let Some(error) = &runtime.device_state_error {
+        findings.push(finding(
+            "devices.unreadable",
+            "devices",
+            "Paired device state could not be read",
+            error,
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("Run `monkey daemon remote device-list` to see the underlying error."),
+        ));
+        return;
+    }
+    if !runtime.device_state_observed {
+        return;
+    }
+    let active: Vec<&DeviceGrantSnapshot> = runtime
+        .devices
+        .iter()
+        .filter(|device| !device.revoked)
+        .collect();
+    if active.is_empty() {
+        findings.push(finding(
+            "devices.none_paired",
+            "devices",
+            "No paired physical devices",
+            "Nothing on this machine can reach a phone's camera, microphone, screen or location.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+
+    for device in &active {
+        let intimate: Vec<&str> = device
+            .granted_physical
+            .iter()
+            .map(String::as_str)
+            .filter(|capability| INTIMATE_CAPABILITIES.contains(capability))
+            .collect();
+        if !intimate.is_empty() {
+            findings.push(finding(
+                "devices.intimate_grant",
+                "devices",
+                "A device may capture its surroundings",
+                &format!(
+                    "'{}' ({}) is granted {}. Anything that can drive a run on this machine can ask for it.",
+                    device.device_name,
+                    device.device_id,
+                    intimate.join(", ")
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Withdraw what is not in use: `monkey daemon remote device-grant <device-id> --capability <kept>…`, listing only the capabilities to keep."),
+            ));
+        }
+        if device.granted_physical.len() >= 4 {
+            findings.push(finding(
+                "devices.broad_grant",
+                "devices",
+                "A device holds a broad hardware grant",
+                &format!(
+                    "'{}' ({}) is granted {} physical capabilities: {}.",
+                    device.device_name,
+                    device.device_id,
+                    device.granted_physical.len(),
+                    device.granted_physical.join(", ")
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Grant only what a workflow actually uses; each capability is independent and none implies another."),
+            ));
+        }
+        let stale = match device.last_seen_at_ms {
+            None => !device.granted_physical.is_empty(),
+            Some(last_seen) => now_ms().saturating_sub(last_seen) > STALE_DEVICE_MS,
+        };
+        if stale {
+            findings.push(finding(
+                "devices.stale_grant",
+                "devices",
+                "A device holds grants but has not been seen",
+                &format!(
+                    "'{}' ({}) still holds {} and {}.",
+                    device.device_name,
+                    device.device_id,
+                    if device.granted_physical.is_empty() {
+                        "no hardware grant".to_string()
+                    } else {
+                        device.granted_physical.join(", ")
+                    },
+                    match device.last_seen_at_ms {
+                        None => "has never reported what it is".to_string(),
+                        Some(last_seen) => format!("last reported at {last_seen} ms"),
+                    }
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("If that device is gone, revoke it: `monkey daemon remote pair-revoke <device-id>`."),
+            ));
+        }
+    }
+
+    // A revoked device keeps nothing, including an address. This catches the
+    // one row that could outlive a revocation and quietly keep a wiped phone
+    // on the notification list.
+    for device in runtime.devices.iter().filter(|device| device.revoked) {
+        if device.push_registered {
+            findings.push(finding(
+                "devices.revoked_still_reachable",
+                "devices",
+                "A revoked device still has a push address",
+                &format!(
+                    "'{}' ({}) is revoked but still has a registered push token.",
+                    device.device_name, device.device_id
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Re-run the revocation so the registration is cleared."),
+            ));
+        }
+    }
+
+    // Something happening right now, on hardware, in a room.
+    for command in &runtime.device_commands {
+        if !INTIMATE_CAPABILITIES.contains(&command.capability.as_str()) {
+            continue;
+        }
+        findings.push(finding(
+            "devices.capture_in_flight",
+            "devices",
+            "A capture is in progress on a device",
+            &format!(
+                "Command {} on {} is {} and is a {}.",
+                command.command_id, command.device_id, command.state, command.capability
+            ),
+            if command.state == "running" {
+                FindingStatus::Critical
+            } else {
+                FindingStatus::Warning
+            },
+            false,
+            None,
+            Some("Stop it with `monkey daemon remote device-cancel <command-id>`. A capture already taken cannot be untaken."),
+        ));
+    }
+
+    match &runtime.push {
+        None => {}
+        Some(push) if !push.configured => findings.push(finding(
+            "devices.push_absent",
+            "devices",
+            "Push is not configured",
+            "Devices are only reachable while the app is open. Little Monkey ships no push project of its own.",
+            FindingStatus::Info,
+            false,
+            None,
+            None,
+        )),
+        Some(push) => {
+            if push.enabled && push.include_detail {
+                findings.push(finding(
+                    "devices.push_detail",
+                    "devices",
+                    "Push notifications carry specifics",
+                    &format!(
+                        "Detail is switched on, so run and message specifics reach the lock screens of {} registered device(s) before anyone unlocks them.",
+                        push.registered_devices
+                    ),
+                    FindingStatus::Warning,
+                    false,
+                    None,
+                    Some("Turn detail off unless every registered device is trusted while locked; the app can always fetch the specifics after unlock."),
+                ));
+            } else if push.enabled {
+                findings.push(finding(
+                    "devices.push_private",
+                    "devices",
+                    "Push notifications withhold content",
+                    "Notifications say what kind of thing happened, not what it said.",
+                    FindingStatus::Pass,
+                    false,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+}
+
 fn audit_workspace_skill_root(workspace: Option<&Path>, findings: &mut Vec<SecurityFinding>) {
     let Some(workspace) = workspace else {
         findings.push(finding(
@@ -1384,6 +1640,127 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
+    }
+
+    fn device(name: &str, granted: &[&str], last_seen_at_ms: Option<u64>) -> DeviceGrantSnapshot {
+        DeviceGrantSnapshot {
+            device_id: format!("device-{name}"),
+            device_name: name.to_string(),
+            granted_physical: granted.iter().map(|value| value.to_string()).collect(),
+            effective_physical: granted.iter().map(|value| value.to_string()).collect(),
+            revoked: false,
+            last_seen_at_ms,
+            push_registered: false,
+        }
+    }
+
+    fn device_findings(runtime: SecurityRuntimeSnapshot) -> Vec<SecurityFinding> {
+        let mut findings = Vec::new();
+        audit_paired_devices(&runtime, &mut findings);
+        findings
+    }
+
+    fn has(findings: &[SecurityFinding], id: &str) -> bool {
+        findings.iter().any(|finding| finding.id == id)
+    }
+
+    /// The four things an operator most needs told about a phone they granted
+    /// hardware to: it can hear the room, it can do a lot, it has not been seen
+    /// in a month, and something is capturing right now.
+    #[test]
+    fn the_doctor_names_broad_stale_and_in_flight_device_grants() {
+        let now = now_ms();
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![
+                device("kitchen tablet", &["microphone_capture"], Some(now)),
+                device(
+                    "old phone",
+                    &[
+                        "camera_capture",
+                        "location_read",
+                        "notification_post",
+                        "audio_playback",
+                    ],
+                    Some(now - STALE_DEVICE_MS - 1),
+                ),
+            ],
+            device_commands: vec![DeviceCommandSnapshot {
+                command_id: "dcmd-one".into(),
+                device_id: "device-kitchen tablet".into(),
+                capability: "microphone_capture".into(),
+                state: "running".into(),
+            }],
+            ..Default::default()
+        });
+        assert!(has(&findings, "devices.intimate_grant"));
+        assert!(has(&findings, "devices.broad_grant"));
+        assert!(has(&findings, "devices.stale_grant"));
+        let capture = findings
+            .iter()
+            .find(|finding| finding.id == "devices.capture_in_flight")
+            .expect("a running microphone must be reported");
+        assert_eq!(capture.status, FindingStatus::Critical);
+        assert!(capture
+            .remediation
+            .as_ref()
+            .is_some_and(|text| text.contains("cannot be untaken")));
+
+        // A quiet, narrowly-granted, recently-seen device produces none of them.
+        let quiet = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![device("phone", &["notification_post"], Some(now))],
+            ..Default::default()
+        });
+        assert!(!has(&quiet, "devices.intimate_grant"));
+        assert!(!has(&quiet, "devices.broad_grant"));
+        assert!(!has(&quiet, "devices.stale_grant"));
+    }
+
+    /// A revoked device must keep nothing, an address included.
+    #[test]
+    fn the_doctor_flags_a_revoked_device_that_can_still_be_woken() {
+        let mut revoked = device("sold phone", &[], Some(now_ms()));
+        revoked.revoked = true;
+        revoked.push_registered = true;
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![revoked],
+            ..Default::default()
+        });
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "devices.revoked_still_reachable")
+            .expect("a revoked device with a push address must be reported");
+        assert_eq!(finding.status, FindingStatus::Critical);
+    }
+
+    #[test]
+    fn the_doctor_reports_whether_push_would_put_specifics_on_a_lock_screen() {
+        let leaky = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            push: Some(PushPrivacySnapshot {
+                configured: true,
+                enabled: true,
+                include_detail: true,
+                registered_devices: 2,
+            }),
+            ..Default::default()
+        });
+        assert!(has(&leaky, "devices.push_detail"));
+
+        let private = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            push: Some(PushPrivacySnapshot {
+                configured: true,
+                enabled: true,
+                include_detail: false,
+                registered_devices: 2,
+            }),
+            ..Default::default()
+        });
+        assert!(has(&private, "devices.push_private"));
+        assert!(!has(&private, "devices.push_detail"));
     }
 
     impl Drop for TestDirectory {
