@@ -14,17 +14,20 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use std::collections::BTreeMap;
+
 use super::adapters::discord::DiscordAdapter;
 use super::adapters::slack::SlackAdapter;
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
-use super::channel_store::ChannelAccountRecord;
-use super::channel_worker::{ingest_batch, poll_account_once, RunQueue};
+use super::channel_ingress::OutboxPayload;
+use super::channel_store::{ChannelAccountRecord, EventDirection, NewOutboxMessage};
+use super::channel_worker::{drain_outbox_once, ingest_batch, poll_account_once, RunQueue};
 use super::store::DaemonStore;
 use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
-use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
+use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, OutboundMessage};
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -725,6 +728,617 @@ async fn slack_poll_account_once_releases_the_ack_after_ingest() {
     })
     .await;
     assert_eq!(store.recent_channel_events("acct-sl", 10).unwrap().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Full wire-to-wire paths: provider fixture → durable event → run → reply →
+// durable outbox → drain → provider fixture
+// ---------------------------------------------------------------------------
+
+/// Queue a reply to the run `job_id` exactly the way the `send_message` tool
+/// does — same origin lookup, same payload shape, same idempotency scheme,
+/// same durable enqueue. Only the model behind the tool is this test.
+fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &str) {
+    let origin = store
+        .channel_origin_for_job(job_id)
+        .expect("origin lookup")
+        .expect("the run has a channel origin");
+    let account = store
+        .channel_account(&origin.account_id)
+        .expect("account lookup")
+        .expect("account");
+    let sequence = store.outbox_count_for_job(job_id).expect("sequence");
+    let idempotency_key = format!("reply-{job_id}-{sequence}");
+    let payload = OutboxPayload {
+        message: OutboundMessage {
+            account_id: origin.account_id.clone(),
+            kind: account.kind,
+            conversation_id: origin.conversation_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            text: text.to_string(),
+            attachments: Vec::new(),
+            reply_to_provider_id: Some(origin.provider_event_id.clone()),
+            idempotency_key: idempotency_key.clone(),
+        },
+        reply_depth: 1,
+    };
+    let payload_json = serde_json::to_string(&payload).expect("payload");
+    store
+        .enqueue_channel_message(&NewOutboxMessage {
+            account_id: origin.account_id,
+            conversation_id: origin.conversation_id,
+            thread_id: origin.thread_id,
+            reply_to_provider_id: Some(origin.provider_event_id),
+            payload_digest: super::trigger::sha256_hex(payload_json.as_bytes()),
+            payload_json,
+            idempotency_key,
+            max_attempts: 3,
+            job_id: Some(job_id.to_string()),
+            created_at_ms: NOW,
+        })
+        .expect("enqueue");
+}
+
+fn adapters_map(
+    account_id: &str,
+    adapter: Arc<dyn ChannelAdapter>,
+) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
+    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+    adapters.insert(account_id.to_string(), adapter);
+    adapters
+}
+
+/// The one outbound event the drain recorded for `account_id`.
+fn outbound_event_id(store: &mut DaemonStore, account_id: &str) -> String {
+    store
+        .recent_channel_events(account_id, 10)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.direction == EventDirection::Outbound)
+        .expect("an outbound event")
+        .provider_event_id
+}
+
+/// getUpdates → durable inbound event (with the photo's stored artifact) →
+/// one run → reply row in the durable outbox → drain → sendMessage on the
+/// wire with the right chat, forum topic and reply target → the provider's
+/// message id stored on the outbound event.
+#[tokio::test]
+async fn telegram_full_path_from_wire_to_wire() {
+    const THREADED_PHOTO_UPDATE: &str = r#"{
+        "ok": true,
+        "result": [{
+            "update_id": 700,
+            "message": {
+                "message_id": 9,
+                "message_thread_id": 42,
+                "date": 1700000000,
+                "chat": {"id": -999, "type": "supergroup", "title": "Ops"},
+                "from": {"id": 777, "is_bot": false, "first_name": "Bo"},
+                "text": "look at this",
+                "photo": [{"file_id": "PHOTO1", "width": 100, "height": 100, "file_size": 7}]
+            }
+        }]
+    }"#;
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+    let (base, requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, THREADED_PHOTO_UPDATE.to_string()),
+        (
+            200,
+            r#"{"ok":true,"result":{"file_id":"PHOTO1","file_path":"photos/p.png"}}"#.to_string(),
+        ),
+        (200, "PNGDATA".to_string()),
+        (
+            200,
+            r#"{"ok":true,"result":{"message_id":99,"chat":{"id":-999,"type":"supergroup"}}}"#
+                .to_string(),
+        ),
+    ]);
+    let adapter = telegram_adapter(&base);
+
+    // Inbound: poll, hydrate the photo's real bytes into the (injected) blob
+    // store, then ingest — the same steps poll_account_once runs, with the
+    // daemon's on-disk store swapped for the fixture sink.
+    let mut batch = adapter.poll(None).await.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-tg".to_string();
+    }
+    super::channel_adapter::hydrate_attachments(
+        &adapter,
+        &super::channel_adapter::test_http::FixtureBlobs(Vec::new()),
+        Default::default(),
+        &mut batch.envelopes,
+    )
+    .await;
+    assert_eq!(
+        batch.envelopes[0].attachments[0].stored_artifact_id.as_deref(),
+        Some("fixture-blob"),
+        "the photo's bytes must be stored before the turn becomes durable"
+    );
+    let report = ingest_batch(&mut store, &queue, &batch.envelopes, NOW);
+    assert_eq!(report.accepted, 1);
+
+    // The durable record the run reads carries the artifact reference.
+    let events = store.recent_channel_events("acct-tg", 10).expect("events");
+    assert!(
+        events[0].envelope_json.contains("fixture-blob"),
+        "durable event lost the artifact id: {}",
+        events[0].envelope_json
+    );
+
+    // The run replies through the production reply seam.
+    let job_id = queue.submitted.lock().unwrap()[0].clone();
+    queue_reply_for_job(&mut store, &job_id, "on it");
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-tg", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1);
+
+    // What actually went on the wire.
+    for _ in 0..4 {
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("inbound-side request");
+    }
+    let reply = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the reply request");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("POST /botbot-token/sendMessage"), "{reply}");
+    assert!(reply.contains(r#""chat_id":"-999""#), "{reply}");
+    assert!(reply.contains(r#""message_thread_id":42"#), "{reply}");
+    assert!(reply.contains(r#""reply_to_message_id":9"#), "{reply}");
+    assert!(reply.contains("on it"), "{reply}");
+
+    // The provider's message id is stored on the outbound event.
+    assert_eq!(outbound_event_id(&mut store, "acct-tg"), "99");
+}
+
+/// Gateway MESSAGE_CREATE in a thread this process has never seen → REST
+/// thread resolution → durable event → one run → durable reply → REST post
+/// to the thread with a message_reference → provider id captured.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_full_path_from_wire_to_wire() {
+    let mut store = seeded_store("acct-dc", ChannelKind::Discord);
+    let queue = FakeQueue::default();
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()]]);
+    let (api_base, requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (
+            200,
+            r#"{"id":"thread-9","type":11,"parent_id":"chan-1"}"#.to_string(),
+        ),
+        (200, r#"{"id":"reply-1"}"#.to_string()),
+    ]);
+    let adapter = discord_adapter(&api_base);
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    wait_for_frame(&ws.received, 20, "IDENTIFY", |connection, frame| {
+        connection == 0 && frame_op(frame) == 2
+    })
+    .await;
+    ws.inject
+        .send(
+            serde_json::json!({
+                "op": 0, "t": "READY", "s": 1,
+                "d": { "session_id": "sess-e2e", "resume_gateway_url": ws.url, "user": { "id": "bot-1" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    // The message arrives in a thread that existed before this process: no
+    // THREAD_CREATE was ever dispatched, only the REST lookup can place it.
+    ws.inject
+        .send(
+            serde_json::json!({
+                "op": 0, "t": "MESSAGE_CREATE", "s": 5,
+                "d": {
+                    "id": "msg-1", "channel_id": "thread-9", "guild_id": "guild-1",
+                    "content": "old thread, new process",
+                    "author": { "id": "user-1", "username": "ada", "bot": false },
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let (adapter, batch) = poll.await.expect("poll task");
+    let mut batch = batch.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    assert_eq!(batch.envelopes[0].conversation.conversation_id, "chan-1");
+    assert_eq!(
+        batch.envelopes[0].conversation.thread_id.as_deref(),
+        Some("thread-9")
+    );
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-dc".to_string();
+    }
+    let report = ingest_batch(&mut store, &queue, &batch.envelopes, NOW);
+    assert_eq!(report.accepted, 1);
+
+    let job_id = queue.submitted.lock().unwrap()[0].clone();
+    queue_reply_for_job(&mut store, &job_id, "answered in the thread");
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-dc", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1);
+
+    // Requests: gateway lookup, channel lookup, then the reply.
+    for _ in 0..2 {
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("inbound-side request");
+    }
+    let reply = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the reply request");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(
+        reply.starts_with("POST /channels/thread-9/messages"),
+        "the reply must land in the thread, not the parent channel: {reply}"
+    );
+    assert!(reply.contains("message_reference"), "{reply}");
+    assert!(reply.contains("msg-1"), "{reply}");
+    assert!(reply.contains("answered in the thread"), "{reply}");
+
+    assert_eq!(outbound_event_id(&mut store, "acct-dc"), "reply-1");
+}
+
+/// Socket Mode envelope (in a thread) → no early ACK → durable event → ACK →
+/// one run → durable reply → chat.postMessage with the right thread_ts →
+/// provider ts captured.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_full_path_from_wire_to_wire() {
+    let mut store = seeded_store("acct-sl", ChannelKind::Slack);
+    let queue = FakeQueue::default();
+    let ws = spawn_ws_fixture(vec![vec![
+        serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string(),
+    ]]);
+    let (api_base, requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+        (200, r#"{"ok":true,"ts":"77.88"}"#.to_string()),
+    ]);
+    let adapter = slack_adapter(&api_base);
+
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = inject.send(
+            serde_json::json!({
+                "envelope_id": "env-e2e",
+                "type": "events_api",
+                "payload": { "event": {
+                    "type": "message", "channel": "C1", "channel_type": "channel",
+                    "user": "U1", "text": "threaded ask",
+                    "ts": "3000.002", "thread_ts": "999.000",
+                }}
+            })
+            .to_string(),
+        );
+    });
+    // The full production inbound path: ingest, cursor, deferred ACK.
+    let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW)
+        .await
+        .expect("poll_account_once");
+    assert_eq!(report.accepted, 1);
+    wait_for_frame(&ws.received, 10, "ACK for env-e2e", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-e2e")
+    })
+    .await;
+
+    let job_id = queue.submitted.lock().unwrap()[0].clone();
+    queue_reply_for_job(&mut store, &job_id, "answered in the thread");
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-sl", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1);
+
+    for _ in 0..2 {
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("inbound-side request");
+    }
+    let reply = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the reply request");
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("POST /chat.postMessage"), "{reply}");
+    assert!(reply.contains(r#""channel":"C1""#), "{reply}");
+    assert!(reply.contains(r#""thread_ts":"999.000""#), "{reply}");
+    assert!(reply.contains("answered in the thread"), "{reply}");
+
+    assert_eq!(outbound_event_id(&mut store, "acct-sl"), "77.88");
+}
+
+// ---------------------------------------------------------------------------
+// Provider echoes of our own messages never start a run
+// ---------------------------------------------------------------------------
+
+/// Telegram redelivers the bot's own outbound message through getUpdates.
+/// The identity from getMe flags it; ingress records and drops it.
+#[tokio::test]
+async fn telegram_echo_of_our_own_message_never_starts_a_run() {
+    const OWN_MESSAGE: &str = r#"{
+        "ok": true,
+        "result": [{
+            "update_id": 800,
+            "message": {
+                "message_id": 12,
+                "date": 1700000000,
+                "chat": {"id": 555, "type": "private"},
+                "from": {"id": 42, "is_bot": true, "first_name": "Monkey", "username": "little_monkey_bot"},
+                "text": "our own reply, echoed back"
+            }
+        }]
+    }"#;
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, OWN_MESSAGE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll");
+    assert_eq!(report.ignored, 1);
+    assert_eq!(report.accepted, 0);
+    assert!(queue.submitted.lock().unwrap().is_empty(), "an echo ran");
+}
+
+/// A RESUMEd Discord session sees no second READY, so the bot's identity
+/// comes only from the persisted cursor — and its own echoed message must
+/// still be recognized and dropped without a run.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_echo_after_resume_never_starts_a_run() {
+    let mut store = seeded_store("acct-dc", ChannelKind::Discord);
+    let queue = FakeQueue::default();
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()]]);
+    let stored = serde_json::json!({
+        "session_id": "sess-echo",
+        "resume_gateway_url": ws.url,
+        "seq": 41,
+        "bot_user_id": "bot-9",
+    })
+    .to_string();
+    let adapter = discord_adapter("http://127.0.0.1:9");
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(Some(&stored)).await;
+        (adapter, batch)
+    });
+    wait_for_frame(&ws.received, 20, "RESUME", |connection, frame| {
+        connection == 0 && frame_op(frame) == 6
+    })
+    .await;
+    ws.inject
+        .send(serde_json::json!({ "op": 0, "t": "RESUMED", "s": 41 }).to_string())
+        .unwrap();
+    // A DM from ourselves: Discord dispatches a bot its own messages.
+    ws.inject
+        .send(
+            serde_json::json!({
+                "op": 0, "t": "MESSAGE_CREATE", "s": 42,
+                "d": {
+                    "id": "own-1", "channel_id": "dm-1",
+                    "content": "our own reply",
+                    "author": { "id": "bot-9", "username": "little-monkey", "bot": true },
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let (_adapter, batch) = poll.await.expect("poll task");
+    let mut batch = batch.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    assert!(batch.envelopes[0].sender.is_self);
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-dc".to_string();
+    }
+    let report = ingest_batch(&mut store, &queue, &batch.envelopes, NOW);
+    assert_eq!(report.ignored, 1);
+    assert_eq!(report.accepted, 0);
+    assert!(queue.submitted.lock().unwrap().is_empty(), "an echo ran");
+}
+
+/// Slack delivers the bot's own message as a bot_message with our bot_id.
+/// It is recorded, dropped, and still ACKed so Slack stops redelivering it.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_echo_of_our_own_bot_message_never_starts_a_run() {
+    let mut store = seeded_store("acct-sl", ChannelKind::Slack);
+    let queue = FakeQueue::default();
+    let ws = spawn_ws_fixture(vec![vec![
+        serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string(),
+    ]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+    ]);
+    let adapter = slack_adapter(&api_base);
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = inject.send(
+            serde_json::json!({
+                "envelope_id": "env-own",
+                "type": "events_api",
+                "payload": { "event": {
+                    "type": "message", "subtype": "bot_message",
+                    "channel": "C1", "channel_type": "channel",
+                    "bot_id": "B1", "text": "our own reply", "ts": "4000.001",
+                }}
+            })
+            .to_string(),
+        );
+    });
+    let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW)
+        .await
+        .expect("poll_account_once");
+    assert_eq!(report.ignored, 1);
+    assert_eq!(report.accepted, 0);
+    assert!(queue.submitted.lock().unwrap().is_empty(), "an echo ran");
+    // The echo is still acknowledged — Slack must stop redelivering it.
+    wait_for_frame(&ws.received, 10, "ACK for env-own", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-own")
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Discord liveness and admission at the wire level
+// ---------------------------------------------------------------------------
+
+/// A connection whose heartbeats stop being acknowledged is a zombie: the
+/// adapter must hang up and RESUME on a fresh socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_missed_heartbeat_ack_reconnects_and_resumes() {
+    // A 150ms heartbeat interval, and a fixture that never answers op 1.
+    let fast_hello =
+        serde_json::json!({ "op": 10, "d": { "heartbeat_interval": 150 } }).to_string();
+    let ws = spawn_ws_fixture(vec![vec![fast_hello], vec![discord_hello()]]);
+    let (api_base, _requests) =
+        super::channel_adapter::test_http::serve(vec![(200, format!(r#"{{"url":"{}"}}"#, ws.url))]);
+    let adapter = discord_adapter(&api_base);
+    let _poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    wait_for_frame(&ws.received, 20, "IDENTIFY", |connection, frame| {
+        connection == 0 && frame_op(frame) == 2
+    })
+    .await;
+    ws.inject
+        .send(
+            serde_json::json!({
+                "op": 0, "t": "READY", "s": 1,
+                "d": { "session_id": "sess-hb", "resume_gateway_url": ws.url, "user": { "id": "bot-1" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    // First heartbeat goes unanswered; the next tick closes the socket and
+    // the session is resumed on connection 1.
+    let resume = wait_for_frame(
+        &ws.received,
+        20,
+        "RESUME after missed heartbeat ACK",
+        |connection, frame| connection == 1 && frame_op(frame) == 6,
+    )
+    .await;
+    assert_eq!(resume["d"]["session_id"], "sess-hb");
+}
+
+/// `session_start_limit.remaining == 0` means no IDENTIFY until the reset
+/// Discord named — the adapter must wait it out, not spend a session start
+/// it does not have.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_exhausted_session_budget_delays_identify() {
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![(
+        200,
+        format!(
+            r#"{{"url":"{}","session_start_limit":{{"total":1000,"remaining":0,"reset_after":1500,"max_concurrency":1}}}}"#,
+            ws.url
+        ),
+    )]);
+    let started = std::time::Instant::now();
+    let adapter = discord_adapter(&api_base);
+    let _poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    // Too early: the allowance has not reset, so no IDENTIFY may exist yet.
+    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    assert!(
+        !ws.received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, frame)| frame_op(frame) == 2),
+        "an IDENTIFY was sent before the session-start reset"
+    );
+    wait_for_frame(&ws.received, 20, "IDENTIFY after the reset", |_, frame| {
+        frame_op(frame) == 2
+    })
+    .await;
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(1_400),
+        "IDENTIFY came before Discord's reset_after: {:?}",
+        started.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Architecture: the outbox drain is the only production sender
+// ---------------------------------------------------------------------------
+
+/// Every normal reply must reach a provider through the durable outbox drain.
+/// This scan pins the invariant: no daemon source file outside the drain, the
+/// adapters' own internals, and the test files may call the adapter send
+/// primitive.
+#[test]
+fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    let daemon = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/monkey-cli/daemon");
+    let mut files = Vec::new();
+    rust_files(&daemon, &mut files);
+    assert!(files.len() > 10, "the scan found too few files to be real");
+
+    // The drain itself, the adapters (whose internals may chunk through their
+    // own send), and the channel test files that exercise the primitive.
+    let allowed = |path: &std::path::Path| {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        path.components()
+            .any(|component| component.as_os_str() == "adapters")
+            || name == "channel_worker.rs"
+            || name == "channel_restart_tests.rs"
+            || name == "live_smoke.rs"
+    };
+    let mut offenders = Vec::new();
+    let mut drain_seen = false;
+    for path in files {
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if source.contains("adapter.send(") {
+            if path.file_name().and_then(|n| n.to_str()) == Some("channel_worker.rs") {
+                drain_seen = true;
+            }
+            if !allowed(&path) {
+                offenders.push(path);
+            }
+        }
+    }
+    assert!(
+        drain_seen,
+        "the drain call in channel_worker.rs moved; update this scan so it keeps guarding the invariant"
+    );
+    assert!(
+        offenders.is_empty(),
+        "adapter.send is called outside the outbox drain: {offenders:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -918,6 +918,35 @@ impl DaemonStore {
         }
     }
 
+    /// Put a claimed row back without spending its attempt.
+    ///
+    /// The claim itself incremented `attempt`, but the drain never tried the
+    /// send — its account's adapter was not loaded. Handing the attempt back
+    /// is what keeps a temporarily disabled account from burning through
+    /// `max_attempts` and permanently failing replies nothing ever sent.
+    pub fn release_outbox_claim(
+        &mut self,
+        outbox_id: &str,
+        delay_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE channel_outbox
+                 SET state='queued',
+                     attempt=CASE WHEN attempt>0 THEN attempt-1 ELSE 0 END,
+                     next_attempt_at_ms=?2, updated_at_ms=?3
+                 WHERE outbox_id=?1 AND state='sending'",
+                params![outbox_id, now_ms.saturating_add(delay_ms), now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!("Unknown or unclaimed outbox message '{outbox_id}'"));
+        }
+        Ok(())
+    }
+
     pub fn cancel_outbox_message(&mut self, outbox_id: &str, now_ms: i64) -> Result<bool, String> {
         self.connection
             .execute(

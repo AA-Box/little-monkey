@@ -298,15 +298,11 @@ pub(crate) async fn drain_outbox_once(
     for row in claimed {
         let Some(adapter) = adapters.get(&row.account_id).cloned() else {
             report.skipped += 1;
-            // Back to queued with a short delay: nothing was attempted.
-            store.complete_outbox_send(
-                &row.outbox_id,
-                &SendOutcome::RetryableFailure {
-                    error: "No adapter is loaded for this account".to_string(),
-                    retry_after_ms: Some(60_000),
-                },
-                now_ms,
-            )?;
+            // Back to queued with a short delay, and with the claim's attempt
+            // handed back: nothing was attempted, and an account that stays
+            // disabled for an hour must not exhaust max_attempts without a
+            // single real send.
+            store.release_outbox_claim(&row.outbox_id, 60_000, now_ms)?;
             continue;
         };
         let payload: OutboxPayload = match serde_json::from_str(&row.payload_json) {
@@ -1125,5 +1121,31 @@ mod tests {
             .claim_outbox_batch(NOW + 120_000, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn skipped_claims_never_exhaust_the_attempt_budget() {
+        // The account's adapter stays unloaded for far more drains than the
+        // row has attempts. Each claim spends an attempt; each skip must hand
+        // it back — otherwise a disabled account permanently fails replies
+        // nothing ever tried to send.
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let mut now = NOW;
+        for _ in 0..6 {
+            let report = drain_outbox_once(&mut store, &BTreeMap::new(), now)
+                .await
+                .expect("drain");
+            assert_eq!(report.skipped, 1, "row must stay claimable");
+            assert_eq!(report.failed, 0);
+            now += 61_000;
+        }
+        // The adapter comes back; the message still sends.
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), now)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 }
