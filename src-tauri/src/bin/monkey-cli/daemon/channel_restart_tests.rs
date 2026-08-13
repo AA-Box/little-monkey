@@ -412,10 +412,15 @@ async fn discord_resume_state_survives_a_daemon_restart() {
     let queue = FakeQueue::default();
 
     // Both of the daemon's lives share one gateway fixture: connection 0 is
-    // the fresh IDENTIFY session, connection 1 must be the RESUME.
+    // the fresh IDENTIFY session, connection 1 must be the RESUME. The two
+    // extra HTTP responses answer each life's one REST lookup for the
+    // never-before-seen guild channel (it is not a thread).
     let ws = spawn_ws_fixture(vec![vec![discord_hello()], vec![discord_hello()]]);
-    let (api_base, _requests) =
-        super::channel_adapter::test_http::serve(vec![(200, format!(r#"{{"url":"{}"}}"#, ws.url))]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, r#"{"id":"chan-1","type":0}"#.to_string()),
+        (200, r#"{"id":"chan-1","type":0}"#.to_string()),
+    ]);
 
     // First life: IDENTIFY, READY (naming the resume URL), one message at seq 5.
     let adapter = discord_adapter(&api_base);

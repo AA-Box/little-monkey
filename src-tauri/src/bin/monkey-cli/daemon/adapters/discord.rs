@@ -11,7 +11,6 @@
 //! handled by [`handle_frame`] and [`handle_close`], both pure functions of a
 //! [`GatewayState`] so the protocol logic is testable without a socket.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,9 +45,20 @@ const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const POLL_WAIT: Duration = Duration::from_secs(20);
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// Discord allows one IDENTIFY per five seconds per token; sending them
-/// faster earns a 4008/invalid-session spiral rather than a connection.
+/// Discord allows one IDENTIFY per five seconds per concurrency bucket;
+/// sending them faster earns a 4008/invalid-session spiral rather than a
+/// connection. A single-account client is one shard in bucket zero, so this
+/// spacing is exactly the `max_concurrency` semantics for it.
 const IDENTIFY_SPACING: Duration = Duration::from_secs(5);
+/// The longest an open socket is held waiting for session-start allowance
+/// before hanging up and waiting outside instead. Discord tolerates a short
+/// pause between HELLO and IDENTIFY but not minutes of one.
+const MAX_IDENTIFY_HOLD: Duration = Duration::from_secs(10);
+/// How many thread-to-parent mappings ride the persisted cursor. The cursor
+/// column caps its value at 4096 bytes, and 64 snowflake pairs plus the
+/// resume fields stay safely under that; threads evicted past the cap are
+/// re-resolved through the REST API on their next message.
+const MAX_PERSISTED_THREADS: usize = 64;
 
 /// What a RESUME needs to survive a daemon restart: the session, where Discord
 /// said to resume it, and the last sequence number seen. Serialized as the
@@ -70,6 +80,37 @@ pub(crate) struct ResumeState {
     /// secret: a bot's user id is visible to everyone it talks to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bot_user_id: Option<String>,
+    /// Thread channel id -> parent channel id, carried here because thread
+    /// topology otherwise lives only in gateway dispatches: a message in a
+    /// thread the restarted process never saw a THREAD_CREATE for would
+    /// normalize as a plain channel. Bounded to [`MAX_PERSISTED_THREADS`]
+    /// entries (the cursor column the state is stored in caps its value at
+    /// 4096 bytes); the oldest snowflake is evicted first, and an evicted
+    /// thread is simply re-resolved through the REST API on its next message.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub thread_parents: std::collections::BTreeMap<String, String>,
+}
+
+/// Insert a thread mapping, evicting the oldest thread (smallest snowflake —
+/// they are ordered by creation time) once the bound is reached. Numeric
+/// order for equal-length strings is lexicographic order, so the comparison
+/// key is (length, string).
+fn insert_thread_parent(
+    map: &mut std::collections::BTreeMap<String, String>,
+    thread_id: String,
+    parent_id: String,
+) {
+    map.insert(thread_id, parent_id);
+    while map.len() > MAX_PERSISTED_THREADS {
+        let Some(oldest) = map
+            .keys()
+            .min_by_key(|key| (key.len(), key.as_str().to_string()))
+            .cloned()
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
 }
 
 impl ResumeState {
@@ -138,6 +179,12 @@ pub struct DiscordAdapter {
     /// The REST origin. Always [`API_BASE`] in production; swappable in tests
     /// so the whole gateway handshake can run against a loopback fixture.
     api_base: String,
+    /// Target channel -> the instant Discord's own rate-limit headers said
+    /// this route may be used again. Consulted before a send so a bucket the
+    /// provider already reported as spent is not asked again just to buy a
+    /// 429 — nothing has been sent when the check fires, so answering
+    /// `RetryableFailure` with the remaining wait is always safe.
+    route_cooldowns: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl DiscordAdapter {
@@ -159,7 +206,31 @@ impl DiscordAdapter {
             started: tokio::sync::OnceCell::new(),
             blobs: Arc::new(DaemonBlobs),
             api_base: API_BASE.to_string(),
+            route_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Milliseconds until this route's bucket refills, when Discord said it
+    /// was spent and the reset has not passed yet.
+    fn route_cooldown_remaining_ms(&self, route: &str) -> Option<i64> {
+        let cooldowns = self.route_cooldowns.lock().ok()?;
+        let until = cooldowns.get(route)?;
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        (remaining > Duration::ZERO).then_some(remaining.as_millis() as i64)
+    }
+
+    /// Remember what the response headers said about this route's bucket, so
+    /// the next send to it waits instead of buying a 429. Expired entries are
+    /// swept on write, which bounds the map by the number of active routes.
+    fn note_route_cooldown(&self, route: &str, wait: Duration) {
+        if wait.is_zero() {
+            return;
+        }
+        if let Ok(mut cooldowns) = self.route_cooldowns.lock() {
+            let now = std::time::Instant::now();
+            cooldowns.retain(|_, until| *until > now);
+            cooldowns.insert(route.to_string(), now + wait);
+        }
     }
 
     #[cfg(test)]
@@ -236,13 +307,29 @@ impl ChannelAdapter for DiscordAdapter {
                 // The REST identity proves the token; the gateway status is
                 // what proves messages can actually arrive. Both are reported,
                 // and a live token with a down socket is degraded, not
-                // connected — saved credentials are not a connection.
+                // connected — saved credentials are not a connection. The
+                // match is exhaustive on purpose: `Connected` is written for
+                // exactly one status, a live READY/RESUMED session, and every
+                // other value — including one this code has never heard of —
+                // reports the transport as not fully up.
                 match self
                     .shared
                     .gateway_status
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    GATEWAY_RECONNECTING => ChannelHealth {
+                    GATEWAY_CONNECTED => ChannelHealth::connected(
+                        now,
+                        Some(format!("Connected to Discord as {username}")),
+                    ),
+                    GATEWAY_NOT_STARTED => ChannelHealth {
+                        state: little_monkey_lib::channels::types::HealthState::Disconnected,
+                        detail: Some(format!(
+                            "Authenticated to Discord as {username}; the gateway session has not started yet"
+                        )),
+                        last_error: None,
+                        probed_at_ms: now,
+                    },
+                    _ => ChannelHealth {
                         state: little_monkey_lib::channels::types::HealthState::Degraded,
                         detail: Some(format!(
                             "Authenticated to Discord as {username}; the gateway socket is reconnecting"
@@ -250,10 +337,6 @@ impl ChannelAdapter for DiscordAdapter {
                         last_error: None,
                         probed_at_ms: now,
                     },
-                    _ => ChannelHealth::connected(
-                        now,
-                        Some(format!("Connected to Discord as {username}")),
-                    ),
                 }
             }
             Ok(response) => ChannelHealth::error(
@@ -310,6 +393,17 @@ impl ChannelAdapter for DiscordAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        // Discord already named the moment this route's bucket refills; going
+        // to the network before it would spend the request on a certain 429.
+        // Nothing has been sent yet, so a retry with the provider's own wait
+        // is the honest outcome.
+        if let Some(wait_ms) = self.route_cooldown_remaining_ms(target_channel(message)) {
+            return SendOutcome::RetryableFailure {
+                error: "Discord's rate-limit window for this channel has not reset yet"
+                    .to_string(),
+                retry_after_ms: Some(wait_ms),
+            };
+        }
         if !message.attachments.is_empty() {
             let files = match load_attachments(self.blobs.as_ref(), message) {
                 Ok(files) => files,
@@ -342,14 +436,19 @@ impl ChannelAdapter for DiscordAdapter {
             let response = match little_monkey_lib::egress::send(request).await {
                 Ok(response) => response,
                 Err(error) => {
+                    // Only a connect failure proves the request never left
+                    // this machine. A reset mid-response may have delivered
+                    // the message, and retrying that — or anything after a
+                    // chunk already landed — posts it twice.
+                    let is_connect = error.is_connect();
                     let error = scrub(&error.to_string(), &self.token);
-                    return if any_sent {
-                        SendOutcome::NeedsReconciliation { error }
-                    } else {
+                    return if is_connect && !any_sent {
                         SendOutcome::RetryableFailure {
                             error,
                             retry_after_ms: None,
                         }
+                    } else {
+                        SendOutcome::NeedsReconciliation { error }
                     };
                 }
             };
@@ -367,8 +466,17 @@ impl ChannelAdapter for DiscordAdapter {
             // Discord's own bucket accounting, read from the response rather
             // than guessed: when this bucket is out of requests, the next
             // chunk of the same reply waits out the window instead of buying
-            // a 429.
+            // a 429 — and the next *send* to this route waits too.
             let bucket_wait = bucket_exhausted_wait(response.headers());
+            if let Some(wait) = bucket_wait {
+                self.note_route_cooldown(target_channel(message), wait);
+            }
+            if let Some(wait_ms) = retry_after_ms {
+                self.note_route_cooldown(
+                    target_channel(message),
+                    Duration::from_millis(wait_ms.max(0) as u64),
+                );
+            }
             if let Some(outcome) = map_send_status(status.as_u16(), any_sent, retry_after_ms) {
                 return outcome;
             }
@@ -505,6 +613,15 @@ impl DiscordAdapter {
         } else {
             None
         };
+        if let Some(wait) = bucket_exhausted_wait(response.headers()) {
+            self.note_route_cooldown(target_channel(message), wait);
+        }
+        if let Some(wait_ms) = retry_after_ms {
+            self.note_route_cooldown(
+                target_channel(message),
+                Duration::from_millis(wait_ms.max(0) as u64),
+            );
+        }
         if let Some(outcome) = map_send_status(status.as_u16(), any_sent, retry_after_ms) {
             return outcome;
         }
@@ -558,6 +675,18 @@ fn map_send_status(
     any_sent_before: bool,
     retry_after_ms: Option<i64>,
 ) -> Option<SendOutcome> {
+    // Once any chunk of this logical message has been delivered, every
+    // failure — including a rate limit that would otherwise be a plain
+    // retry — parks the row instead: the outbox retries a whole message
+    // from its first chunk, and a blind retry would deliver that chunk
+    // twice. A permanent rejection after a delivered chunk is parked for
+    // the same reason, so the half-delivered message is visible to an
+    // operator rather than silently truncated.
+    if any_sent_before && !(200..=299).contains(&status) {
+        return Some(SendOutcome::NeedsReconciliation {
+            error: format!("Discord returned HTTP {status} after part of the message was sent"),
+        });
+    }
     match status {
         200..=299 => None,
         429 => Some(SendOutcome::RetryableFailure {
@@ -567,15 +696,9 @@ fn map_send_status(
         401 | 403 => Some(SendOutcome::PermanentFailure {
             error: format!("Discord rejected the request: HTTP {status}"),
         }),
-        500..=599 => Some(if any_sent_before {
-            SendOutcome::NeedsReconciliation {
-                error: format!("Discord returned HTTP {status}"),
-            }
-        } else {
-            SendOutcome::RetryableFailure {
-                error: format!("Discord returned HTTP {status}"),
-                retry_after_ms: None,
-            }
+        500..=599 => Some(SendOutcome::RetryableFailure {
+            error: format!("Discord returned HTTP {status}"),
+            retry_after_ms: None,
         }),
         _ => Some(SendOutcome::PermanentFailure {
             error: format!("Discord rejected the message: HTTP {status}"),
@@ -604,16 +727,17 @@ struct GatewayState {
     /// Set by a resumable close/RECONNECT/INVALID_SESSION(resumable=true); read
     /// by the next HELLO to decide RESUME vs a fresh IDENTIFY.
     pending_resume: bool,
-    /// Thread channel id -> parent channel id, learned from THREAD_CREATE /
-    /// THREAD_UPDATE dispatches.
-    ///
-    /// ponytail: populate-on-see, in memory only. A thread that was already
-    /// active before this connection has ever seen it has no parent on record
-    /// until Discord dispatches a THREAD_CREATE/UPDATE for it (or the bot is
-    /// added to it), so its messages resolve as a plain channel until then.
-    /// Upgrade path if that gap matters: on READY, walk each guild's
-    /// active-threads REST endpoint once to seed this map.
-    thread_parents: HashMap<String, String>,
+    /// Thread channel id -> parent channel id: learned from THREAD_CREATE /
+    /// THREAD_UPDATE dispatches, seeded from the persisted [`ResumeState`]
+    /// after a restart, and filled by a REST lookup when a message arrives in
+    /// a guild channel this map has never heard of. Persisted as part of the
+    /// resume cursor, so a thread known before a restart is known after it.
+    thread_parents: std::collections::BTreeMap<String, String>,
+    /// Guild channels the REST API confirmed are not threads, so one plain
+    /// channel does not cost a lookup per message. Memory-only on purpose: a
+    /// wrong entry costs one extra REST call after a restart, never a
+    /// misrouted message.
+    known_non_threads: std::collections::HashSet<String>,
 }
 
 impl GatewayState {
@@ -628,6 +752,7 @@ impl GatewayState {
             resume_gateway_url: resume.resume_gateway_url.clone(),
             bot_user_id: resume.bot_user_id.clone(),
             pending_resume: resume.resumable(),
+            thread_parents: resume.thread_parents.clone(),
             ..Self::default()
         }
     }
@@ -638,6 +763,7 @@ impl GatewayState {
             resume_gateway_url: self.resume_gateway_url.clone(),
             seq: self.seq,
             bot_user_id: self.bot_user_id.clone(),
+            thread_parents: self.thread_parents.clone(),
         }
     }
 }
@@ -656,6 +782,14 @@ enum Action {
     Established,
     SetBotUserId(String),
     Envelope(Box<ChannelEnvelope>),
+    /// A message arrived in a guild channel the thread map has never heard
+    /// of. The I/O loop resolves the channel through the REST API — it might
+    /// be a thread that existed before this process did — records the answer
+    /// in the state, and only then normalizes the carried dispatch.
+    ResolveChannelThenNormalize {
+        channel_id: String,
+        data: Value,
+    },
     PermanentError(String),
     /// Tear the socket down and reconnect after at least `delay_ms` —
     /// non-zero only for INVALID_SESSION, where Discord asks for a short
@@ -752,13 +886,36 @@ fn handle_frame(
                         data.get("id").and_then(Value::as_str),
                         data.get("parent_id").and_then(Value::as_str),
                     ) {
-                        state
-                            .thread_parents
-                            .insert(id.to_string(), parent.to_string());
+                        insert_thread_parent(
+                            &mut state.thread_parents,
+                            id.to_string(),
+                            parent.to_string(),
+                        );
+                    }
+                }
+                "THREAD_DELETE" => {
+                    if let Some(id) = data.get("id").and_then(Value::as_str) {
+                        state.thread_parents.remove(id);
                     }
                 }
                 "MESSAGE_CREATE" => {
-                    if let Some(envelope) = normalize_message_create(
+                    // A guild channel this process has never classified could
+                    // be a thread that predates it — only the REST API can
+                    // say, and the I/O loop is where a REST call can happen.
+                    // DM channels are never threads, and a channel already in
+                    // either map is already answered.
+                    let channel_id = data.get("channel_id").and_then(Value::as_str);
+                    let needs_resolution = data.get("guild_id").is_some()
+                        && channel_id.is_some_and(|id| {
+                            !state.thread_parents.contains_key(id)
+                                && !state.known_non_threads.contains(id)
+                        });
+                    if needs_resolution {
+                        actions.push(Action::ResolveChannelThenNormalize {
+                            channel_id: channel_id.unwrap_or_default().to_string(),
+                            data,
+                        });
+                    } else if let Some(envelope) = normalize_message_create(
                         account_id,
                         &data,
                         state.bot_user_id.as_deref(),
@@ -844,7 +1001,7 @@ fn normalize_message_create(
     account_id: &str,
     data: &Value,
     bot_user_id: Option<&str>,
-    thread_parents: &HashMap<String, String>,
+    thread_parents: &std::collections::BTreeMap<String, String>,
     now_ms: i64,
 ) -> Option<ChannelEnvelope> {
     let id = data.get("id")?.as_str()?.to_string();
@@ -964,11 +1121,62 @@ enum FetchError {
     Permanent(String),
 }
 
+/// Discord's session-start allowance, from `/gateway/bot`'s
+/// `session_start_limit`. Only IDENTIFYs spend it — a RESUME continues an
+/// existing session and costs nothing, which is why the resume path skips
+/// the lookup entirely. `total` and `max_concurrency` are parsed because
+/// they are part of the provider's contract (`max_concurrency` is honored by
+/// [`IDENTIFY_SPACING`]: a single-account client is one shard in bucket
+/// zero); `remaining`/`reset_at` are what admission actually gates on.
+#[derive(Debug, Clone, PartialEq)]
+struct SessionStartBudget {
+    #[allow(dead_code)]
+    total: u64,
+    remaining: u64,
+    reset_at: std::time::Instant,
+    #[allow(dead_code)]
+    max_concurrency: u64,
+}
+
+impl SessionStartBudget {
+    fn parse(body: &Value, now: std::time::Instant) -> Option<Self> {
+        let limit = body.get("session_start_limit")?;
+        Some(Self {
+            total: limit.get("total").and_then(Value::as_u64)?,
+            remaining: limit.get("remaining").and_then(Value::as_u64)?,
+            reset_at: now
+                + Duration::from_millis(limit.get("reset_after").and_then(Value::as_u64)?),
+            max_concurrency: limit
+                .get("max_concurrency")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
+        })
+    }
+
+    /// How long an IDENTIFY must wait for the allowance. Zero while starts
+    /// remain, zero once Discord's own reset time has passed (the next
+    /// `/gateway/bot` fetch re-reads the real numbers), else the time left
+    /// until that reset.
+    fn wait_before_identify(&self, now: std::time::Instant) -> Duration {
+        if self.remaining > 0 {
+            return Duration::ZERO;
+        }
+        self.reset_at.saturating_duration_since(now)
+    }
+
+    /// One IDENTIFY went on the wire; the local mirror of the budget drops
+    /// with it so a reconnect storm cannot outspend what Discord granted
+    /// between two `/gateway/bot` fetches.
+    fn note_identify(&mut self) {
+        self.remaining = self.remaining.saturating_sub(1);
+    }
+}
+
 async fn fetch_gateway_url(
     http: &reqwest::Client,
     api_base: &str,
     token: &str,
-) -> Result<String, FetchError> {
+) -> Result<(String, Option<SessionStartBudget>), FetchError> {
     let request = http
         .get(format!("{api_base}/gateway/bot"))
         .header("Authorization", format!("Bot {token}"));
@@ -990,10 +1198,47 @@ async fn fetch_gateway_url(
         .json()
         .await
         .map_err(|error| FetchError::Retryable(scrub(&error.to_string(), token)))?;
+    let budget = SessionStartBudget::parse(&body, std::time::Instant::now());
     body.get("url")
         .and_then(Value::as_str)
-        .map(str::to_string)
+        .map(|url| (url.to_string(), budget))
         .ok_or_else(|| FetchError::Retryable("Discord gateway response had no url".to_string()))
+}
+
+/// Ask the REST API what a channel is: `Some(parent)` for a thread (types
+/// 10/11/12 all carry their parent channel), `None` for anything else, `Err`
+/// when Discord did not answer — in which case nothing is cached and the
+/// message at hand is treated as a plain channel message.
+async fn resolve_thread_parent(
+    http: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    channel_id: &str,
+) -> Result<Option<String>, String> {
+    let request = http
+        .get(format!("{api_base}/channels/{channel_id}"))
+        .header("Authorization", format!("Bot {token}"));
+    let response = little_monkey_lib::egress::send(request)
+        .await
+        .map_err(|error| scrub(&error.to_string(), token))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Discord returned HTTP {} for the channel lookup",
+            response.status()
+        ));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| scrub(&error.to_string(), token))?;
+    let is_thread = matches!(body.get("type").and_then(Value::as_i64), Some(10..=12));
+    if !is_thread {
+        return Ok(None);
+    }
+    Ok(body
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 enum ConnectionOutcome {
@@ -1010,14 +1255,18 @@ enum ConnectionOutcome {
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_connection(
     account_id: &str,
     token: &str,
     gateway_url: &str,
+    http: &reqwest::Client,
+    api_base: &str,
     tx: &mpsc::Sender<(ChannelEnvelope, ResumeState)>,
     state: &mut GatewayState,
     shared: &Shared,
     last_identify: &mut Option<std::time::Instant>,
+    budget: &mut Option<SessionStartBudget>,
 ) -> ConnectionOutcome {
     let reconnect = |established: bool| ConnectionOutcome::Reconnect {
         established,
@@ -1079,6 +1328,28 @@ async fn run_one_connection(
                             let _ = ws.send(Message::Text(payload.to_string().into())).await;
                         }
                         Action::Identify(payload) => {
+                            // Session-start admission first: an IDENTIFY when
+                            // `session_start_limit.remaining` is spent earns a
+                            // rejected session AND burns the next allowance.
+                            // A short wait is served on the open socket; a
+                            // long one hangs up and waits outside, where the
+                            // next `/gateway/bot` fetch re-reads the budget.
+                            let budget_wait = budget
+                                .as_ref()
+                                .map(|budget| {
+                                    budget.wait_before_identify(std::time::Instant::now())
+                                })
+                                .unwrap_or(Duration::ZERO);
+                            if budget_wait > MAX_IDENTIFY_HOLD {
+                                let _ = ws.close(None).await;
+                                return ConnectionOutcome::Reconnect {
+                                    established,
+                                    delay_ms: budget_wait.as_millis() as u64,
+                                };
+                            }
+                            if budget_wait > Duration::ZERO {
+                                tokio::time::sleep(budget_wait).await;
+                            }
                             // At most one IDENTIFY per five seconds, measured
                             // across reconnects: violating it earns an invalid
                             // session and another reconnect, forever.
@@ -1089,6 +1360,9 @@ async fn run_one_connection(
                                 }
                             }
                             *last_identify = Some(std::time::Instant::now());
+                            if let Some(budget) = budget.as_mut() {
+                                budget.note_identify();
+                            }
                             let _ = ws.send(Message::Text(payload.to_string().into())).await;
                         }
                         Action::StartHeartbeat(interval_ms) => {
@@ -1116,6 +1390,44 @@ async fn run_one_connection(
                         Action::Envelope(envelope) => {
                             // The state rides along, frozen at this dispatch.
                             let _ = tx.send((*envelope, state.resume_snapshot())).await;
+                        }
+                        Action::ResolveChannelThenNormalize { channel_id, data } => {
+                            // The channel might be a thread older than this
+                            // process. Ask once, cache the answer (threads in
+                            // the persisted map, plain channels in memory),
+                            // and treat a lookup failure as a plain channel
+                            // for this message only — uncached, so the next
+                            // message asks again. The hardened client's own
+                            // timeout bounds how long the heartbeat waits.
+                            match resolve_thread_parent(http, api_base, token, &channel_id).await {
+                                Ok(Some(parent)) => {
+                                    insert_thread_parent(
+                                        &mut state.thread_parents,
+                                        channel_id,
+                                        parent,
+                                    );
+                                }
+                                Ok(None) => {
+                                    state.known_non_threads.insert(channel_id);
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "little monkey: discord[{account_id}] channel lookup: {error}"
+                                    );
+                                }
+                            }
+                            if let Ok(mut resume) = shared.resume.lock() {
+                                *resume = state.resume_snapshot();
+                            }
+                            if let Some(envelope) = normalize_message_create(
+                                account_id,
+                                &data,
+                                state.bot_user_id.as_deref(),
+                                &state.thread_parents,
+                                now_ms(),
+                            ) {
+                                let _ = tx.send((envelope, state.resume_snapshot())).await;
+                            }
                         }
                         Action::PermanentError(error) => return ConnectionOutcome::Permanent(error),
                         Action::Reconnect { delay_ms } => {
@@ -1154,16 +1466,52 @@ async fn run_gateway_loop(
     let mut state =
         GatewayState::from_resume(&shared.resume.lock().map(|r| r.clone()).unwrap_or_default());
     let mut last_identify: Option<std::time::Instant> = None;
+    // The session-start allowance, refreshed by every `/gateway/bot` fetch.
+    // A RESUME skips both the fetch and the spend — continuing a session
+    // costs no allowance, which is the whole point of preferring it.
+    let mut budget: Option<SessionStartBudget> = None;
     loop {
         // A RESUME must go to the URL Discord named for this session; only a
         // fresh IDENTIFY goes through the general gateway lookup.
         let resume_url = (state.pending_resume && state.session_id.is_some())
             .then(|| state.resume_gateway_url.clone())
             .flatten();
+        let will_identify = resume_url.is_none();
         let url = match resume_url {
             Some(url) => Ok(url),
-            None => fetch_gateway_url(&http, &api_base, &token).await,
+            None => match fetch_gateway_url(&http, &api_base, &token).await {
+                Ok((url, fresh_budget)) => {
+                    // The fetch is authoritative; a missing block keeps the
+                    // last known numbers rather than forgetting them.
+                    if fresh_budget.is_some() {
+                        budget = fresh_budget;
+                    }
+                    Ok(url)
+                }
+                Err(error) => Err(error),
+            },
         };
+        // Admission before the socket ever opens: a connection whose HELLO
+        // cannot be answered with an IDENTIFY is a connection Discord will
+        // tear down, and opening it anyway is how a reconnect storm spends
+        // the whole session-start budget in one bad minute.
+        if will_identify && url.is_ok() {
+            if let Some(wait) = budget
+                .as_ref()
+                .map(|budget| budget.wait_before_identify(std::time::Instant::now()))
+                .filter(|wait| *wait > Duration::ZERO)
+            {
+                eprintln!(
+                    "little monkey: discord[{account_id}] session-start allowance exhausted; \
+                     waiting {}s before the next IDENTIFY",
+                    wait.as_secs().max(1)
+                );
+                tokio::time::sleep(wait + Duration::from_millis(jitter_ms(500))).await;
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
         let mut delay_hint_ms = 0;
         match url {
             Ok(url) => {
@@ -1171,10 +1519,13 @@ async fn run_gateway_loop(
                     &account_id,
                     &token,
                     &url,
+                    &http,
+                    &api_base,
                     &tx,
                     &mut state,
                     &shared,
                     &mut last_identify,
+                    &mut budget,
                 )
                 .await
                 {
@@ -1291,7 +1642,7 @@ mod tests {
 
     #[test]
     fn normalizes_guild_message_with_mention_and_attachment() {
-        let empty = HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         let envelope = normalize_message_create(
             "acct",
             &message_create_fixture(),
@@ -1320,7 +1671,7 @@ mod tests {
     fn dm_message_has_no_guild_id_and_is_direct() {
         let mut fixture = message_create_fixture();
         fixture.as_object_mut().unwrap().remove("guild_id");
-        let empty = HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         let envelope = normalize_message_create("acct", &fixture, Some("bot-id"), &empty, 1000)
             .expect("envelope");
         assert_eq!(
@@ -1333,7 +1684,7 @@ mod tests {
     fn thread_message_carries_parent_as_conversation() {
         let mut fixture = message_create_fixture();
         fixture["channel_id"] = Value::String("thread-9".to_string());
-        let mut thread_parents = HashMap::new();
+        let mut thread_parents = std::collections::BTreeMap::new();
         thread_parents.insert("thread-9".to_string(), "chan-1".to_string());
         let envelope =
             normalize_message_create("acct", &fixture, Some("bot-id"), &thread_parents, 1000)
@@ -1346,7 +1697,7 @@ mod tests {
     fn self_authored_message_is_flagged_not_dropped() {
         let mut fixture = message_create_fixture();
         fixture["author"]["id"] = Value::String("bot-id".to_string());
-        let empty = HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         let envelope = normalize_message_create("acct", &fixture, Some("bot-id"), &empty, 1000)
             .expect("envelope");
         assert!(envelope.sender.is_self);
@@ -1354,7 +1705,7 @@ mod tests {
 
     #[test]
     fn provider_event_id_is_deterministic() {
-        let empty = HashMap::new();
+        let empty = std::collections::BTreeMap::new();
         let first = normalize_message_create("acct", &message_create_fixture(), None, &empty, 1000)
             .unwrap();
         let second =
@@ -1477,6 +1828,10 @@ mod tests {
             resume_gateway_url: Some("wss://resume.example".into()),
             seq: Some(41),
             bot_user_id: Some("bot-9".into()),
+            thread_parents: std::collections::BTreeMap::from([(
+                "thread-9".to_string(),
+                "chan-1".to_string(),
+            )]),
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let parsed = ResumeState::parse(Some(&json));
@@ -1494,6 +1849,7 @@ mod tests {
             resume_gateway_url: Some("wss://resume.example".into()),
             seq: Some(41),
             bot_user_id: None,
+            thread_parents: Default::default(),
         });
         assert!(seeded.pending_resume);
         // HELLO on a seeded state sends RESUME with the stored ids.
@@ -1529,7 +1885,11 @@ mod tests {
             resume_gateway_url: Some("wss://resume.example".into()),
             seq: Some(41),
             bot_user_id: Some("bot-9".into()),
+            thread_parents: Default::default(),
         });
+        // Already classified as a plain channel, so the frame normalizes
+        // inline instead of asking the REST API first.
+        state.known_non_threads.insert("chan-1".to_string());
         let actions = handle_frame(
             &mut state,
             "acct",
@@ -1717,6 +2077,387 @@ mod tests {
             let _ = stream.write_all(response.as_bytes()).await;
         });
         format!("http://{address}")
+    }
+
+    fn adapter_with_base(base: &str) -> DiscordAdapter {
+        let account = account_fixture(Some("discord/acct-1"));
+        let config = AdapterConfig {
+            account: &account,
+            secret: "bot-token".to_string(),
+        };
+        DiscordAdapter::new(&config)
+            .expect("adapter")
+            .with_base_url(base)
+    }
+
+    // -- health semantics ------------------------------------------------
+
+    #[tokio::test]
+    async fn probe_before_the_gateway_starts_is_not_connected() {
+        let base = fixture_server("200 OK", r#"{"username":"little-monkey"}"#.to_string()).await;
+        let adapter = adapter_with_base(&base);
+        // Never polled: the gateway task has not started. A valid REST token
+        // alone must not read as a live connection.
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Disconnected,
+            "{health:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_while_the_gateway_reconnects_is_degraded() {
+        let base = fixture_server("200 OK", r#"{"username":"little-monkey"}"#.to_string()).await;
+        let adapter = adapter_with_base(&base);
+        adapter
+            .shared
+            .gateway_status
+            .store(GATEWAY_RECONNECTING, std::sync::atomic::Ordering::SeqCst);
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Degraded,
+            "{health:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_with_a_live_session_is_connected() {
+        let base = fixture_server("200 OK", r#"{"username":"little-monkey"}"#.to_string()).await;
+        let adapter = adapter_with_base(&base);
+        adapter
+            .shared
+            .gateway_status
+            .store(GATEWAY_CONNECTED, std::sync::atomic::Ordering::SeqCst);
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Connected,
+            "{health:?}"
+        );
+    }
+
+    // -- partial-send correctness ------------------------------------------
+
+    #[test]
+    fn any_failure_after_a_delivered_chunk_needs_reconciliation() {
+        // A retry of the whole message would deliver chunk 1 twice; a
+        // permanent failure would silently truncate it. Both park instead.
+        for status in [429, 400, 401, 500, 502] {
+            assert!(
+                matches!(
+                    map_send_status(status, true, None),
+                    Some(SendOutcome::NeedsReconciliation { .. })
+                ),
+                "HTTP {status} after a delivered chunk must park the row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_second_chunk_parks_the_message() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (200, r#"{"id":"m1"}"#.to_string()),
+            (429, r#"{"message":"rate limited"}"#.to_string()),
+        ]);
+        let adapter = adapter_with_base(&base);
+        let message = OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Discord,
+            conversation_id: "chan-1".into(),
+            thread_id: None,
+            text: "a".repeat(2500),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_before_anything_was_sent_is_a_plain_retry() {
+        let (base, _requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            429,
+            r#"{"message":"rate limited"}"#.to_string(),
+        )]);
+        let adapter = adapter_with_base(&base);
+        let message = OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Discord,
+            conversation_id: "chan-1".into(),
+            thread_id: None,
+            text: "hi".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        };
+        let outcome = adapter.send(&message).await;
+        assert!(
+            matches!(outcome, SendOutcome::RetryableFailure { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_discord_said_was_spent_is_not_asked_again() {
+        // No fixture server at all: the cooldown must answer before any
+        // request is built, and nothing has been sent so a retry is safe.
+        let adapter = adapter_with_base("http://127.0.0.1:9");
+        adapter.note_route_cooldown("chan-1", Duration::from_secs(30));
+        let message = OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Discord,
+            conversation_id: "chan-1".into(),
+            thread_id: None,
+            text: "hi".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        };
+        match adapter.send(&message).await {
+            SendOutcome::RetryableFailure { retry_after_ms, .. } => {
+                let wait = retry_after_ms.expect("carries the remaining wait");
+                assert!((1..=30_000).contains(&wait), "{wait}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // -- session-start budget ------------------------------------------------
+
+    #[test]
+    fn the_session_start_limit_is_parsed_from_gateway_bot() {
+        let now = std::time::Instant::now();
+        let body: Value = serde_json::json!({
+            "url": "wss://gateway.example",
+            "session_start_limit": {
+                "total": 1000, "remaining": 3, "reset_after": 14_400_000, "max_concurrency": 1
+            }
+        });
+        let budget = SessionStartBudget::parse(&body, now).expect("parsed");
+        assert_eq!(budget.total, 1000);
+        assert_eq!(budget.remaining, 3);
+        assert_eq!(budget.max_concurrency, 1);
+        assert_eq!(budget.wait_before_identify(now), Duration::ZERO);
+        assert!(SessionStartBudget::parse(&serde_json::json!({"url":"wss://x"}), now).is_none());
+    }
+
+    #[test]
+    fn an_exhausted_budget_waits_out_the_reset_before_identifying() {
+        let now = std::time::Instant::now();
+        let body: Value = serde_json::json!({
+            "session_start_limit": {
+                "total": 1000, "remaining": 0, "reset_after": 60_000, "max_concurrency": 1
+            }
+        });
+        let budget = SessionStartBudget::parse(&body, now).expect("parsed");
+        let wait = budget.wait_before_identify(now);
+        assert!(
+            wait > Duration::from_secs(59) && wait <= Duration::from_secs(60),
+            "{wait:?}"
+        );
+        // Once Discord's own reset time has passed the wait collapses to
+        // zero — the next /gateway/bot fetch re-reads the real numbers.
+        assert_eq!(
+            budget.wait_before_identify(now + Duration::from_secs(61)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn each_identify_spends_the_local_budget_mirror() {
+        let now = std::time::Instant::now();
+        let mut budget = SessionStartBudget {
+            total: 1000,
+            remaining: 2,
+            reset_at: now + Duration::from_secs(3600),
+            max_concurrency: 1,
+        };
+        budget.note_identify();
+        assert_eq!(budget.wait_before_identify(now), Duration::ZERO);
+        budget.note_identify();
+        // Spent: a reconnect storm between two /gateway/bot fetches cannot
+        // identify past what Discord granted.
+        assert!(budget.wait_before_identify(now) > Duration::ZERO);
+        budget.note_identify();
+        assert_eq!(budget.remaining, 0, "never underflows");
+    }
+
+    // -- thread topology -----------------------------------------------------
+
+    #[test]
+    fn thread_topology_rides_the_persisted_cursor_across_a_restart() {
+        // The daemon that saw THREAD_CREATE is gone; the new process is
+        // seeded only with what the cursor stored. A message in that thread —
+        // with no fresh THREAD_CREATE — must still resolve its parent.
+        let stored = ResumeState {
+            session_id: Some("sess-9".into()),
+            resume_gateway_url: Some("wss://resume.example".into()),
+            seq: Some(41),
+            bot_user_id: Some("bot-9".into()),
+            thread_parents: std::collections::BTreeMap::from([(
+                "thread-9".to_string(),
+                "chan-1".to_string(),
+            )]),
+        };
+        let json = serde_json::to_string(&stored).expect("serialize");
+        let mut state = GatewayState::from_resume(&ResumeState::parse(Some(&json)));
+        let actions = handle_frame(
+            &mut state,
+            "acct",
+            r#"{"op":0,"t":"MESSAGE_CREATE","s":42,"d":{
+                "id":"msg-1","channel_id":"thread-9","guild_id":"guild-1",
+                "content":"still threaded",
+                "author":{"id":"user-1","username":"ada","bot":false}
+            }}"#,
+            "tok",
+        );
+        match actions.first() {
+            Some(Action::Envelope(envelope)) => {
+                assert_eq!(envelope.conversation.conversation_id, "chan-1");
+                assert_eq!(envelope.conversation.thread_id.as_deref(), Some("thread-9"));
+            }
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+        // And the snapshot that will be persisted next still carries the map.
+        assert_eq!(
+            state.resume_snapshot().thread_parents.get("thread-9"),
+            Some(&"chan-1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_deleted_thread_leaves_the_map() {
+        let mut state = GatewayState::default();
+        handle_frame(
+            &mut state,
+            "acct",
+            r#"{"op":0,"t":"THREAD_CREATE","s":1,"d":{"id":"thread-9","parent_id":"chan-1"}}"#,
+            "tok",
+        );
+        assert_eq!(state.thread_parents.len(), 1);
+        handle_frame(
+            &mut state,
+            "acct",
+            r#"{"op":0,"t":"THREAD_DELETE","s":2,"d":{"id":"thread-9"}}"#,
+            "tok",
+        );
+        assert!(state.thread_parents.is_empty());
+    }
+
+    #[test]
+    fn the_persisted_thread_map_evicts_its_oldest_entry_at_the_bound() {
+        let mut map = std::collections::BTreeMap::new();
+        // Snowflakes grow over time; "100" is older than "99" is false — the
+        // comparison is numeric via (length, string).
+        for index in 0..MAX_PERSISTED_THREADS {
+            insert_thread_parent(&mut map, format!("{}", 1000 + index), "parent".to_string());
+        }
+        assert_eq!(map.len(), MAX_PERSISTED_THREADS);
+        insert_thread_parent(&mut map, "99999".to_string(), "parent".to_string());
+        assert_eq!(map.len(), MAX_PERSISTED_THREADS);
+        assert!(!map.contains_key("1000"), "oldest snowflake evicted");
+        assert!(map.contains_key("99999"));
+        // The bounded map must serialize comfortably under the cursor
+        // column's 4096-byte cap even with realistic 19-digit snowflakes.
+        let mut full = std::collections::BTreeMap::new();
+        for index in 0..MAX_PERSISTED_THREADS {
+            insert_thread_parent(
+                &mut full,
+                format!("11223344556677{index:05}"),
+                "99887766554433221100".to_string(),
+            );
+        }
+        let state = ResumeState {
+            session_id: Some("s".repeat(40)),
+            resume_gateway_url: Some(format!("wss://{}.example", "g".repeat(60))),
+            seq: Some(u64::MAX),
+            bot_user_id: Some("1".repeat(20)),
+            thread_parents: full,
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        assert!(json.len() <= 4096, "cursor value too large: {}", json.len());
+    }
+
+    #[test]
+    fn an_unknown_guild_channel_is_resolved_before_it_is_normalized() {
+        let mut state = GatewayState::default();
+        let frame = r#"{"op":0,"t":"MESSAGE_CREATE","s":1,"d":{
+            "id":"msg-1","channel_id":"mystery-7","guild_id":"guild-1",
+            "content":"hi","author":{"id":"user-1","username":"ada","bot":false}
+        }}"#;
+        match handle_frame(&mut state, "acct", frame, "tok").first() {
+            Some(Action::ResolveChannelThenNormalize { channel_id, .. }) => {
+                assert_eq!(channel_id, "mystery-7");
+            }
+            other => panic!("expected a resolution request, got {other:?}"),
+        }
+        // Once classified as a plain channel, the same frame normalizes
+        // inline — one lookup per channel, not one per message.
+        state.known_non_threads.insert("mystery-7".to_string());
+        match handle_frame(&mut state, "acct", frame, "tok").first() {
+            Some(Action::Envelope(envelope)) => {
+                assert_eq!(envelope.conversation.conversation_id, "mystery-7");
+                assert_eq!(envelope.conversation.thread_id, None);
+            }
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dm_channel_is_never_sent_for_thread_resolution() {
+        let mut state = GatewayState::default();
+        let frame = r#"{"op":0,"t":"MESSAGE_CREATE","s":1,"d":{
+            "id":"msg-1","channel_id":"dm-7",
+            "content":"hi","author":{"id":"user-1","username":"ada","bot":false}
+        }}"#;
+        match handle_frame(&mut state, "acct", frame, "tok").first() {
+            Some(Action::Envelope(envelope)) => {
+                assert_eq!(
+                    envelope.conversation.kind,
+                    little_monkey_lib::channels::types::ConversationKind::Direct
+                );
+            }
+            other => panic!("expected an envelope, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thread_channel_lookup_reads_the_parent_from_the_rest_api() {
+        let base = fixture_server(
+            "200 OK",
+            r#"{"id":"thread-9","type":11,"parent_id":"chan-1"}"#.to_string(),
+        )
+        .await;
+        let client = little_monkey_lib::egress::hardened().build().unwrap();
+        let parent = resolve_thread_parent(&client, &base, "tok", "thread-9")
+            .await
+            .expect("resolved");
+        assert_eq!(parent.as_deref(), Some("chan-1"));
+    }
+
+    #[tokio::test]
+    async fn a_plain_channel_lookup_answers_not_a_thread() {
+        let base = fixture_server("200 OK", r#"{"id":"chan-1","type":0}"#.to_string()).await;
+        let client = little_monkey_lib::egress::hardened().build().unwrap();
+        let parent = resolve_thread_parent(&client, &base, "tok", "chan-1")
+            .await
+            .expect("resolved");
+        assert_eq!(parent, None);
+    }
+
+    #[tokio::test]
+    async fn a_failed_channel_lookup_is_an_error_not_a_cached_answer() {
+        let base = fixture_server("404 Not Found", r#"{"message":"gone"}"#.to_string()).await;
+        let client = little_monkey_lib::egress::hardened().build().unwrap();
+        assert!(resolve_thread_parent(&client, &base, "tok", "gone-1")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
