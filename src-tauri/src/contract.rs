@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.2.0";
+pub const CONTRACT_VERSION: &str = "1.4.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -96,6 +96,10 @@ pub enum RemotePlane {
     /// Placement and live migration (K17/K18) — the only way a run authored
     /// elsewhere starts here.
     Node,
+    /// A paired physical device's own hardware: what it advertises, and the
+    /// durable queue of commands the runner has for it. The only plane whose
+    /// effects happen somewhere other than this machine.
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +243,70 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         plane: RemotePlane::Mobile,
         method: "DELETE",
         path: "/v1/remote/mobile/devices/self",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/surface",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/state",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/next",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/start",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/result",
+        gate: RemoteGate::SelfService,
+    },
+    // A live stream's audio. Unlike the routes above these carry a capability
+    // gate, because they are not self-service: the device is acting on a grant
+    // an operator made, and withdrawing `voice_stream` closes the microphone on
+    // the next chunk.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/chunk",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/close",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/push/key",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/push",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "DELETE",
+        path: "/v1/remote/device/push",
         gate: RemoteGate::SelfService,
     },
     RemoteRouteSpec {
@@ -485,6 +553,10 @@ fn tool_entries() -> Vec<ToolEntry> {
     entries.push(tool_entry(
         &crate::agent_tools::task_tool_def(),
         "subagents_enabled",
+    ));
+    entries.push(tool_entry(
+        &crate::agent_tools::device_action_tool_def(),
+        "paired_device_capable",
     ));
     entries
 }

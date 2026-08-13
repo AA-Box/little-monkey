@@ -244,6 +244,11 @@ pub struct RemotePairRequest {
     /// Empty for a runner-only controller — see the CLI's `--mobile` flag.
     #[serde(default)]
     pub mobile_capabilities: Vec<String>,
+    /// Grants over the device's own hardware (camera, microphone, location, …).
+    /// Empty means this runner can ask the device for nothing physical,
+    /// whatever the device advertises — see the CLI's `--device` flag.
+    #[serde(default)]
+    pub device_capabilities: Vec<String>,
 }
 
 fn cli_path() -> PathBuf {
@@ -346,6 +351,26 @@ fn validate_remote_pair_request(request: &RemotePairRequest) -> Result<(), Strin
         .any(|capability| !allowed_mobile.contains(&capability.as_str()))
     {
         return Err("Unknown mobile companion capability".to_string());
+    }
+    // Must stay in step with `protocol::PHYSICAL_DEVICE_CAPABILITIES`. The CLI
+    // re-checks it against the enum itself, so an unknown value fails there
+    // too; this refuses it before a sidecar process is spawned.
+    let allowed_device = [
+        "device_info",
+        "camera_capture",
+        "microphone_capture",
+        "location_read",
+        "notification_post",
+        "screen_capture",
+        "audio_playback",
+        "voice_stream",
+    ];
+    if request
+        .device_capabilities
+        .iter()
+        .any(|capability| !allowed_device.contains(&capability.as_str()))
+    {
+        return Err("Unknown device hardware capability".to_string());
     }
     if request.run_ids.is_empty() && request.workspace_ids.is_empty() {
         return Err("Pairing requires an exact run id or declared workspace id".to_string());
@@ -1098,6 +1123,9 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
     for capability in request.mobile_capabilities {
         args.extend(["--mobile".into(), capability]);
     }
+    for capability in request.device_capabilities {
+        args.extend(["--device".into(), capability]);
+    }
     command(args).await
 }
 
@@ -1220,6 +1248,163 @@ pub async fn remote_node_label(
     command(args).await
 }
 
+// --- Paired physical devices, for the desktop -----------------------------
+
+#[tauri::command]
+pub async fn remote_device_list() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Replaces one device's physical grant. The CLI refuses anything that is not
+/// a physical capability, so this cannot become a way to widen run access from
+/// the desktop.
+#[tauri::command]
+pub async fn remote_device_grant(
+    device_id: String,
+    capabilities: Vec<String>,
+) -> Result<String, String> {
+    validate_id("device id", &device_id)?;
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-grant".into(),
+        device_id,
+    ];
+    for capability in capabilities {
+        validate_token("device capability", &capability, 64)?;
+        args.extend(["--capability".into(), capability]);
+    }
+    command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_device_commands(device_id: String, limit: u32) -> Result<Value, String> {
+    validate_id("device id", &device_id)?;
+    if !(1..=200).contains(&limit) {
+        return Err("Command limit must be 1..=200".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-commands".into(),
+            device_id,
+            "--limit".into(),
+            limit.to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_device_cancel(command_id: String) -> Result<String, String> {
+    validate_id("command id", &command_id)?;
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-cancel".into(),
+        command_id,
+    ])
+    .await
+}
+
+/// The desktop half of the `device_action` agent tool.
+///
+/// Permission-gated here and then handed to the sidecar, which owns the queue,
+/// the capability intersection and the argument bounds — the desktop does not
+/// get a second, looser copy of any of them. Same division of labour as every
+/// other command in this file, and the reason it is a fixed argument vector
+/// rather than a passthrough: the model's arguments arrive as named parameters
+/// and are re-emitted as named flags, never as a caller-supplied argv.
+// The `allow` precedes the command attribute deliberately: `lib.rs`'s
+// `every_tauri_command_is_reachable_from_the_invoke_handler` scans what sits
+// *between* `#[tauri::command` and `fn`, and anything it does not recognize
+// there makes the command invisible to that guard.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_device_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    action: String,
+    device_id: Option<String>,
+    position: Option<String>,
+    duration_ms: Option<u64>,
+    accuracy: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    text: Option<String>,
+    run_id: Option<String>,
+    artifact_id: Option<String>,
+    wait_ms: Option<u64>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<Value, String> {
+    validate_token("device action", &action, 64)?;
+    let detail = match &device_id {
+        Some(device_id) => format!("{action} on {device_id}"),
+        None => action.clone(),
+    };
+    crate::permissions::request_permission(
+        &app,
+        state.inner(),
+        "device_action",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
+
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-action".into(),
+        action,
+        "--json".into(),
+    ];
+    if let Some(device_id) = device_id {
+        validate_id("device id", &device_id)?;
+        args.extend(["--device-id".into(), device_id]);
+    }
+    for (flag, value) in [
+        ("--position", position),
+        ("--accuracy", accuracy),
+        ("--title", title),
+        ("--body", body),
+        ("--text", text),
+    ] {
+        if let Some(value) = value {
+            validate_token(flag, &value, 1_024)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    // Ids, not free text: an artifact reference reaches the artifact route, so
+    // it goes through the same validation every other id on this bridge does.
+    for (flag, value) in [("--run-id", run_id), ("--artifact-id", artifact_id)] {
+        if let Some(value) = value {
+            validate_id(flag, &value)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    if let Some(duration_ms) = duration_ms {
+        args.extend(["--duration-ms".into(), duration_ms.to_string()]);
+    }
+    if let Some(wait_ms) = wait_ms {
+        args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    }
+    parse_json(&command(args).await?)
+}
+
 #[tauri::command]
 pub async fn remote_audit(limit: u32) -> Result<Value, String> {
     if !(1..=10_000).contains(&limit) {
@@ -1258,6 +1443,7 @@ mod tests {
             workspace_ids: Vec::new(),
             max_artifact_bytes: 8 * 1024 * 1024,
             mobile_capabilities: Vec::new(),
+            device_capabilities: Vec::new(),
         };
         assert!(validate_remote_pair_request(&valid).is_ok());
 

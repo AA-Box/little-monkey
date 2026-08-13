@@ -492,6 +492,31 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Jobs whose state was touched at or after `since_ms`, oldest first.
+    ///
+    /// The notification watcher's read: it needs the *terminal* transitions,
+    /// which `active_jobs` by definition cannot show it, and it needs them
+    /// without scanning the whole table on every tick.
+    pub fn jobs_updated_since(&self, since_ms: u64, limit: u32) -> Result<Vec<DaemonJob>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT job_id, run_id, recipe_snapshot, state, priority, attempt,
+                        max_attempts, created_at_ms, updated_at_ms, started_at_ms,
+                        finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
+                        max_log_bytes, pause_requested, cancel_requested,
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
+                 FROM daemon_jobs WHERE updated_at_ms >= ?1
+                 ORDER BY updated_at_ms ASC, job_id ASC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![to_i64(since_ms)?, i64::from(limit)], read_job)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     /// Returns the most recently updated durable runs owned by this daemon.
     /// The status surface uses a fixed upper bound so frequent desktop polls
     /// cannot grow with unbounded retained history.

@@ -11,8 +11,8 @@ use little_monkey_lib::run_ledger::{
 };
 use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
-    run_security_audit, FindingStatus, NativeSkillSnapshot, SecurityAuditRequest,
-    SecurityRuntimeSnapshot,
+    run_security_audit, DeviceCommandSnapshot, DeviceGrantSnapshot, FindingStatus,
+    NativeSkillSnapshot, PushPrivacySnapshot, SecurityAuditRequest, SecurityRuntimeSnapshot,
 };
 
 #[derive(Subcommand, Debug)]
@@ -167,6 +167,84 @@ fn unnamed_allowed_requests<'a>(
     groups.map(|group| group.dropped).sum()
 }
 
+/// Reads the paired-device half of the audit out of the daemon's own store.
+///
+/// This lives here rather than in `security_doctor.rs` because that module is
+/// in the library and the remote store's schema is owned by this binary. A
+/// second reader in the library would be a second copy of the schema, and the
+/// first migration would make the audit quietly wrong instead of loudly broken.
+fn collect_device_state(runtime: &mut SecurityRuntimeSnapshot) {
+    let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() else {
+        return;
+    };
+    let store = match crate::daemon::remote::store::RemoteStore::open(&paths.root) {
+        Ok(store) => store,
+        Err(error) => {
+            runtime.device_state_error = Some(error);
+            return;
+        }
+    };
+    let devices = match store.devices() {
+        Ok(devices) => devices,
+        Err(error) => {
+            runtime.device_state_error = Some(error);
+            return;
+        }
+    };
+    let registrations = store.push_registrations().unwrap_or_default();
+    for device in devices {
+        let surface = store.device_surface(&device.device_id).ok().flatten();
+        let effective = crate::daemon::remote::protocol::effective_capabilities(
+            &device.capabilities,
+            surface.as_ref(),
+        );
+        let physical = |set: &std::collections::BTreeSet<
+            crate::daemon::remote::protocol::DeviceCapability,
+        >| {
+            set.iter()
+                .filter(|capability| capability.is_physical())
+                .filter_map(|capability| {
+                    serde_json::to_value(capability)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                })
+                .collect::<Vec<_>>()
+        };
+        runtime.devices.push(DeviceGrantSnapshot {
+            push_registered: registrations
+                .iter()
+                .any(|(registered, _, _)| registered == &device.device_id),
+            granted_physical: physical(&device.capabilities),
+            effective_physical: physical(&effective),
+            revoked: !device.active(),
+            last_seen_at_ms: surface.map(|surface| surface.reported_at_ms),
+            device_id: device.device_id,
+            device_name: device.device_name,
+        });
+    }
+    for command in store.active_device_commands().unwrap_or_default() {
+        runtime.device_commands.push(DeviceCommandSnapshot {
+            command_id: command.command_id,
+            device_id: command.device_id,
+            capability: serde_json::to_value(command.capability)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            state: command.state.as_str().to_string(),
+        });
+    }
+    let push = crate::daemon::remote::push::load_config(&paths)
+        .ok()
+        .flatten();
+    runtime.push = Some(PushPrivacySnapshot {
+        configured: push.is_some(),
+        enabled: push.as_ref().is_some_and(|config| config.enabled),
+        include_detail: push.as_ref().is_some_and(|config| config.include_detail),
+        registered_devices: registrations.len(),
+    });
+    runtime.device_state_observed = true;
+}
+
 pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> Result<(), String> {
     match action {
         SecurityCmd::Audit { deep, fix, json } => {
@@ -204,6 +282,7 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 Ok(None) => {}
                 Err(error) => runtime.native_skills_error = Some(error.to_string()),
             }
+            collect_device_state(&mut runtime);
             let mut report = run_security_audit(&SecurityAuditRequest {
                 app_data_dir: data_dir.to_path_buf(),
                 workspace: workspace.map(Path::to_path_buf),
