@@ -214,43 +214,69 @@ pub(crate) async fn sweep_call_limits(
     let overdue = store.overdue_calls(now_ms)?;
     let mut ended = 0;
     for call in overdue {
-        let hangup = match (
+        let closed = hang_up_and_close(
+            store,
             carriers.get(&call.account_id),
+            &call.call_id,
             call.provider_call_id.as_deref(),
-        ) {
-            (Some(carrier), Some(provider_call_id)) => carrier.hangup(provider_call_id).await,
-            // Nothing the carrier ever acknowledged: a ring we recorded but
-            // never got an id for is ours alone to close.
-            (_, None) => Ok(()),
-            (None, Some(_)) => Err("no carrier is loaded for this account".to_string()),
-        };
-        match hangup {
-            Ok(()) => {
-                store.advance_call(
-                    &call.call_id,
-                    match call.breach {
-                        LimitBreach::RingTimeout => CallState::Failed,
-                        LimitBreach::MaxDuration => CallState::Completed,
-                    },
-                    Some(call.breach.detail()),
-                    now_ms,
-                )?;
-                ended += 1;
-            }
-            Err(error) => {
-                store.advance_call(
-                    &call.call_id,
-                    CallState::NeedsReconciliation,
-                    Some(&format!(
-                        "{} but the carrier did not confirm the hangup: {error}",
-                        call.breach.detail()
-                    )),
-                    now_ms,
-                )?;
-            }
+            match call.breach {
+                LimitBreach::RingTimeout => CallState::Failed,
+                LimitBreach::MaxDuration => CallState::Completed,
+            },
+            call.breach.detail(),
+            now_ms,
+        )
+        .await?;
+        if closed {
+            ended += 1;
         }
     }
     Ok(ended)
+}
+
+/// Ask the carrier to hang up one call, then close its row.
+///
+/// The order is the point: a row marked completed while the line is still open
+/// is a bill nobody is watching, so the carrier is asked first and a refusal
+/// leaves the call in `needs_reconciliation` rather than pretending it ended.
+/// `Ok(false)` is that case — the call was settled, but not the way `ended`
+/// asked for.
+///
+/// Every reason to end a live call routes through here: a limit the sweep
+/// found, or a media stream that dropped and never came back.
+pub(crate) async fn hang_up_and_close(
+    store: &mut DaemonStore,
+    carrier: Option<&std::sync::Arc<dyn super::telephony::TelecomProvider>>,
+    call_id: &str,
+    provider_call_id: Option<&str>,
+    ended: CallState,
+    detail: &str,
+    now_ms: i64,
+) -> Result<bool, String> {
+    let hangup = match (carrier, provider_call_id) {
+        (Some(carrier), Some(provider_call_id)) => carrier.hangup(provider_call_id).await,
+        // Nothing the carrier ever acknowledged: a ring we recorded but
+        // never got an id for is ours alone to close.
+        (_, None) => Ok(()),
+        (None, Some(_)) => Err("no carrier is loaded for this account".to_string()),
+    };
+    match hangup {
+        Ok(()) => {
+            store.advance_call(call_id, ended, Some(detail), now_ms)?;
+            Ok(true)
+        }
+        Err(error) => {
+            store.advance_call(
+                call_id,
+                CallState::NeedsReconciliation,
+                Some(&format!(
+                    "{detail} but the carrier did not confirm the hangup: {error}"
+                )),
+                now_ms,
+            )?;
+            Ok(false)
+        }
+    }
 }
 
 /// How often the sweep runs. A call cut at its limit is allowed to overshoot by
