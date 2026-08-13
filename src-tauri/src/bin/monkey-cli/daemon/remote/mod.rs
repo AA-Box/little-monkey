@@ -520,7 +520,9 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                 std::sync::Arc::new(crate::daemon::DaemonMobileChatQueue::new(paths.clone()));
             let placement =
                 std::sync::Arc::new(crate::daemon::DaemonPlacementQueue::new(paths.clone()));
-            server::serve(paths, desktop, mobile_chat, placement).await?
+            let peer_runs =
+                std::sync::Arc::new(crate::daemon::DaemonChannelQueue::new(paths.clone()));
+            server::serve(paths, desktop, mobile_chat, placement, peer_runs).await?
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
@@ -1308,8 +1310,9 @@ pub async fn spawn_if_configured(
     desktop: std::sync::Arc<DesktopControlRuntime>,
     mobile_chat: std::sync::Arc<dyn api::MobileChatQueue>,
     placement: std::sync::Arc<dyn api::PlacementQueue>,
+    peer_runs: std::sync::Arc<dyn crate::daemon::channel_worker::RunQueue>,
 ) -> Result<bool, String> {
-    server::spawn_if_configured(paths, desktop, mobile_chat, placement).await
+    server::spawn_if_configured(paths, desktop, mobile_chat, placement, peer_runs).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {
@@ -1910,6 +1913,123 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
         serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+/// Milliseconds since the epoch, for the peer surface and everything else here.
+pub(crate) fn now_ms_public() -> Result<u64, String> {
+    now_ms()
+}
+
+/// Offer another installation peer standing on this one, and nothing else.
+///
+/// The scope is deliberately empty: no action, no run id, no workspace. A peer
+/// invitation carries the three peer grants the operator chose and nothing that
+/// would let the far side read a run or approve anything here.
+pub(crate) fn create_peer_invitation(
+    paths: &DaemonPaths,
+    label: &str,
+    grants: &BTreeSet<protocol::DeviceCapability>,
+    expires_minutes: u64,
+) -> Result<PairingInvitation, String> {
+    let config = enabled_host(paths)?;
+    let scopes = RemoteScopes {
+        actions: BTreeSet::new(),
+        run_ids: BTreeSet::new(),
+        workspace_ids: BTreeSet::new(),
+        max_artifact_bytes: protocol::MAX_REMOTE_ARTIFACT_BYTES,
+    };
+    let now = now_ms()?;
+    let expires_at_ms = now
+        .checked_add(expires_minutes.saturating_mul(60_000))
+        .ok_or_else(|| "Pairing expiry overflow".to_string())?;
+    let invitation = RemoteStore::open(&paths.root)?.create_invitation_with_capabilities(
+        &scopes,
+        grants,
+        now,
+        expires_at_ms,
+    )?;
+    let certificate = std::fs::read_to_string(&config.certificate_path)
+        .map_err(|error| format!("Could not read remote certificate: {error}"))?;
+    // The label travels as the device name the far side proposes back, so it is
+    // not part of the invitation itself; it is what this side will call the
+    // peer once it accepts.
+    let _ = label;
+    Ok(PairingInvitation {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        runner_id: config.runner_id,
+        runner_url: config.advertise_url,
+        server_certificate_pem: certificate,
+        server_certificate_sha256: config.certificate_sha256,
+        pairing_id: invitation.pairing_id,
+        pairing_token: invitation.token,
+        expires_at_ms: invitation.expires_at_ms,
+        scopes: invitation.scopes,
+        capabilities: invitation.capabilities,
+    })
+}
+
+/// Write an invitation where only this user can read it.
+pub(crate) fn write_invitation_file(
+    path: &Path,
+    invitation: &PairingInvitation,
+) -> Result<(), String> {
+    protected_json(path, invitation)
+}
+
+/// Take up a peer's invitation, so this installation can talk to it.
+pub(crate) async fn accept_peer_invitation(
+    paths: &DaemonPaths,
+    invitation: &Path,
+    alias: &str,
+) -> Result<protocol::ControllerProfile, String> {
+    client::accept_invitation(paths, invitation, alias, &peer_device_name(), now_ms()?).await
+}
+
+/// How this installation introduces itself when accepting a peer invitation.
+fn peer_device_name() -> String {
+    format!(
+        "little-monkey-peer-{}",
+        hostname_label().unwrap_or_else(|| "unnamed".to_string())
+    )
+}
+
+fn hostname_label() -> Option<String> {
+    let raw = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())?;
+    let label: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(32)
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// One signed call to a peer, by the alias it was accepted under.
+pub(crate) async fn peer_call(
+    paths: &DaemonPaths,
+    alias: &str,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+) -> Result<serde_json::Value, String> {
+    client::call(paths, alias, method, path_and_query, body, now_ms()?).await
+}
+
+/// What this installation calls itself in an envelope's origin chain.
+///
+/// The runner id when this machine also hosts, because that is the identity
+/// every peer already knows it by. Otherwise the device id the peer issued at
+/// pairing time: unique, stable, and already meaningful to the receiver — which
+/// is all the loop check and the dedupe key need.
+pub(crate) fn local_instance_id(paths: &DaemonPaths, alias: &str) -> Result<String, String> {
+    if let Some(config) = server::load_host_config(paths)? {
+        return Ok(config.runner_id);
+    }
+    let profile = RemoteStore::open(&paths.root)?
+        .controller(alias)?
+        .ok_or_else(|| format!("Unknown peer '{alias}'"))?;
+    Ok(profile.device_id)
 }
 
 fn now_ms() -> Result<u64, String> {

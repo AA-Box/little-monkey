@@ -1950,6 +1950,68 @@ const DAEMON_V9_SQL: &str = r#"
 ALTER TABLE telecom_calls ADD COLUMN opening_line TEXT;
 "#;
 
+const DAEMON_V10: i64 = 10;
+const DAEMON_V10_CHECKSUM: &str = "daemon-jobs-v10-peer-threads";
+
+/// What two paired installations have said to each other.
+///
+/// The pairing itself lives where every pairing lives — `remote-v1.sqlite3`,
+/// with the device identity, the secret generation and the capability grant.
+/// These tables hold only the traffic, because traffic is daemon state: it is
+/// deduplicated by the daemon, it becomes daemon jobs, and it has to survive a
+/// restart in step with the queue those jobs are in.
+///
+/// # Deduplication
+///
+/// `UNIQUE(sender_instance_id, message_id, direction)` is the durable half of
+/// at-most-once. A peer that retries a delivery — the client retries three
+/// times on a lost connection by design — lands on the row already here, and a
+/// rejected message keeps its row too, so a redelivery cannot re-run a
+/// decision that already went against it.
+///
+/// # Results
+///
+/// A result is a row like any other, with `direction='outbound'` and a message
+/// id derived from the job it reports on, so materializing the same finished
+/// run twice writes one row. Nothing is pushed to the peer: the sender polls
+/// its own thread, which is what keeps this side free of an outbound
+/// connection it would otherwise have to keep alive.
+const DAEMON_V10_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS peer_threads (
+    thread_id TEXT PRIMARY KEY,
+    peer_device_id TEXT NOT NULL,
+    peer_instance_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS peer_threads_recent_idx
+    ON peer_threads(peer_device_id, last_activity_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS peer_messages (
+    row_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES peer_threads(thread_id) ON DELETE CASCADE,
+    peer_device_id TEXT NOT NULL,
+    sender_instance_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact','result')),
+    correlation_id TEXT,
+    disposition TEXT NOT NULL CHECK (disposition IN ('accepted','rejected','delivered')),
+    rejection TEXT,
+    envelope_json TEXT NOT NULL,
+    ingress_id TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    UNIQUE(sender_instance_id, message_id, direction)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS peer_messages_thread_idx
+    ON peer_messages(thread_id, created_at_ms);
+CREATE INDEX IF NOT EXISTS peer_messages_job_idx ON peer_messages(job_id);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1970,12 +2032,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V7, DAEMON_V7_CHECKSUM, DAEMON_V7_SQL),
     (DAEMON_V8, DAEMON_V8_CHECKSUM, DAEMON_V8_SQL),
     (DAEMON_V9, DAEMON_V9_CHECKSUM, DAEMON_V9_SQL),
+    (DAEMON_V10, DAEMON_V10_CHECKSUM, DAEMON_V10_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V9;
+const DAEMON_LATEST: i64 = DAEMON_V10;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
