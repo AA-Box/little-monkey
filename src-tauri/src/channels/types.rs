@@ -501,6 +501,10 @@ pub struct ProviderCapabilities {
     /// Provider-enforced maximum characters in one outbound message.
     pub max_text_chars: usize,
     pub supports_threads: bool,
+    /// This adapter can both fetch an inbound attachment and upload an
+    /// outbound one. Declared `false` unless *both* halves are implemented:
+    /// a provider that claims files and then quietly sends a message without
+    /// one is worse than a provider that says it cannot.
     pub supports_attachments: bool,
     /// Provider exposes explicit mention metadata, so mention gating does not
     /// have to fall back to substring matching.

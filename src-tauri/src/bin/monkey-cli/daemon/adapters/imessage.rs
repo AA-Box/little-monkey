@@ -35,7 +35,9 @@ mod macos {
     use tokio::sync::{mpsc, oneshot, Mutex};
     use tokio::time::Instant;
 
-    use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+    use crate::daemon::channel_adapter::{
+        AdapterConfig, ChannelAdapter, InboundBatch, MAX_ATTACHMENT_BYTES,
+    };
     use little_monkey_lib::channels::types::{
         AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
         ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -556,6 +558,36 @@ mod macos {
                 Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
                 Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
             }
+        }
+
+        /// iMessage attachments are files in the Messages attachment store on
+        /// this machine, so the bytes are read from disk — there is no network
+        /// fetch and no second copy of the file.
+        ///
+        /// The size is taken from the directory entry first, so an oversized
+        /// attachment costs a `stat` rather than the whole file.
+        async fn fetch_attachment(
+            &self,
+            attachment: &ChannelAttachment,
+        ) -> Result<Vec<u8>, String> {
+            let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+                return Err("This iMessage attachment has no path.".to_string());
+            };
+            let path = std::path::Path::new(handle);
+            let metadata = tokio::fs::metadata(path)
+                .await
+                .map_err(|error| format!("That attachment is no longer readable: {error}"))?;
+            if !metadata.is_file() {
+                return Err("That iMessage attachment is not a file".to_string());
+            }
+            if metadata.len() > MAX_ATTACHMENT_BYTES {
+                return Err(format!(
+                    "The attachment is larger than the {MAX_ATTACHMENT_BYTES}-byte limit"
+                ));
+            }
+            tokio::fs::read(path)
+                .await
+                .map_err(|error| format!("That attachment could not be read: {error}"))
         }
     }
 

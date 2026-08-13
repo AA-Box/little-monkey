@@ -40,7 +40,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
+    LoadedAttachment, MAX_ATTACHMENT_BYTES,
+};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -103,6 +106,7 @@ pub struct SignalAdapter {
     /// one-shot cell this allows a *re*start: signal-cli that crashes or is
     /// killed must not leave the account dead until the daemon restarts.
     last_start: Mutex<Option<Instant>>,
+    blobs: Arc<dyn BlobSource>,
 }
 
 impl SignalAdapter {
@@ -136,6 +140,7 @@ impl SignalAdapter {
                 alive: AtomicBool::new(false),
             }),
             last_start: Mutex::new(None),
+            blobs: Arc::new(DaemonBlobs),
         })
     }
 
@@ -425,7 +430,7 @@ impl ChannelAdapter for SignalAdapter {
             inbound_transport: InboundTransport::Helper,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            supports_attachments: false, // inbound only: this adapter does not upload files yet
+            supports_attachments: true,
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
@@ -467,12 +472,112 @@ impl ChannelAdapter for SignalAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         // Signal's `OutboundMessage::conversation_id` carries either a
         // phone number (always `+`-prefixed, E.164) or a base64 group id —
         // never both, and the two alphabets never collide on the leading
         // byte — so that prefix is the entire "which JSON-RPC field" signal
         // this adapter needs.
         let mut params = json!({ "message": message.text });
+        if message.conversation_id.starts_with('+') {
+            params["recipient"] = json!([message.conversation_id]);
+        } else {
+            params["groupId"] = json!(message.conversation_id);
+        }
+        match self.call("send", params).await {
+            Ok(result) => SendOutcome::Sent {
+                provider_message_id: result
+                    .get("timestamp")
+                    .and_then(Value::as_i64)
+                    .map(|timestamp| timestamp.to_string()),
+            },
+            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
+            Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
+        }
+    }
+
+    /// signal-cli keeps received attachments in its own store and hands them
+    /// out by id through `getAttachment`, base64-encoded. Nothing here reads
+    /// that store directly — the helper owns it, the same way it owns the
+    /// account keys.
+    ///
+    /// A helper too old to know the method answers with a JSON-RPC error,
+    /// which surfaces as a refusal rather than an empty file.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let max_bytes = MAX_ATTACHMENT_BYTES;
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Signal attachment has no id.".to_string());
+        };
+        let result = self
+            .call("getAttachment", json!({ "id": handle }))
+            .await
+            .map_err(|error| match error {
+                CallError::NotSent(error)
+                | CallError::Ambiguous(error)
+                | CallError::Remote(error) => error,
+            })?;
+        // signal-cli has returned the payload both as a bare string and inside
+        // a `data` field across versions; both are accepted rather than
+        // pinning one and failing on the other.
+        let encoded = result
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| {
+                result
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| "The helper returned no attachment data".to_string())?;
+        // Base64 inflates by 4/3, so the encoded form is bounded first: this
+        // refuses an oversized attachment before it is decoded into memory.
+        if encoded.len() as u64 > max_bytes.saturating_mul(4).div_ceil(3) + 4 {
+            return Err(format!("The attachment is larger than {max_bytes} bytes."));
+        }
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded.as_bytes(),
+        )
+        .map_err(|_| "The helper returned unreadable attachment data".to_string())?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(format!("The attachment is larger than {max_bytes} bytes."));
+        }
+        Ok(bytes)
+    }
+}
+
+impl SignalAdapter {
+    /// signal-cli takes attachments on the same `send` call, as RFC 2397 data
+    /// URIs (`data:<mime>;filename=<name>;base64,<data>`) rather than paths —
+    /// which means nothing has to write the bytes to a temporary file that a
+    /// crash could leave behind, and the helper never reads a path this daemon
+    /// chose.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        let encoded: Vec<String> = files
+            .iter()
+            .map(|file| {
+                format!(
+                    "data:{};filename={};base64,{}",
+                    file.mime_type,
+                    // A filename with a `;` or `,` would split the data URI
+                    // itself, so the separators are the one thing removed.
+                    file.filename.replace([';', ','], "_"),
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &file.bytes)
+                )
+            })
+            .collect();
+        let mut params = json!({ "message": message.text, "attachments": encoded });
         if message.conversation_id.starts_with('+') {
             params["recipient"] = json!([message.conversation_id]);
         } else {

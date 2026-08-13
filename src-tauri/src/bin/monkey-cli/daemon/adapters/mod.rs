@@ -39,7 +39,16 @@ use super::channel_adapter::{AdapterConfig, ChannelAdapter};
 /// not send them belongs on the false side: the difference is invisible to an
 /// operator, who only sees whether the file arrived.
 pub(crate) fn sends_attachments(kind: ChannelKind) -> bool {
-    matches!(kind, ChannelKind::Telegram | ChannelKind::WhatsApp)
+    matches!(
+        kind,
+        ChannelKind::Telegram
+            | ChannelKind::WhatsApp
+            | ChannelKind::Discord
+            | ChannelKind::Slack
+            | ChannelKind::Mattermost
+            | ChannelKind::Matrix
+            | ChannelKind::Signal
+    )
 }
 
 /// Build the adapter an account's provider needs.
