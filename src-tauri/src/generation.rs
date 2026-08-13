@@ -570,6 +570,86 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the LoRAs a run selected are linked so the engine can resolve them.
+///
+/// `sd-server` resolves `lora[].path` against `--lora-model-dir` and nothing
+/// else: it scans that directory, keys each entry on its path *relative* to
+/// it, and rejects the whole request — `400 invalid generation parameters` —
+/// when a path is not one of them. An absolute path to a file the user picked
+/// anywhere on disk never matches, so every run carrying a LoRA failed. The
+/// user's files stay where they are; [`stage_loras`] links them in here. A
+/// model id may not start with a dot, so this cannot collide with one.
+pub fn lora_dir(model_root: &Path) -> PathBuf {
+    model_root.join(".loras")
+}
+
+/// Extensions `sd-server` will even look at when it scans the LoRA directory.
+const LORA_EXTENSIONS: [&str; 4] = ["gguf", "pt", "pth", "safetensors"];
+
+/// Links every selected LoRA into [`lora_dir`] and rewrites its path to the
+/// name it has there, which is the only form the engine resolves.
+///
+/// The staged name carries a hash of the source path because sharing a
+/// filename across directories is the normal case, not the exotic one — half
+/// the LoRAs on Hugging Face are `pytorch_lora_weights.safetensors`.
+pub fn stage_loras(model_root: &Path, request: &mut GenerationRequest) -> Result<(), String> {
+    if request.loras.is_empty() {
+        return Ok(());
+    }
+    let dir = lora_dir(model_root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
+    for lora in &mut request.loras {
+        let source = PathBuf::from(&lora.path);
+        if !source.is_file() {
+            return Err(format!("LoRA file is missing: {}", lora.path));
+        }
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|value| LORA_EXTENSIONS.contains(&value.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "A LoRA must be a {} file: {}",
+                    LORA_EXTENSIONS.join(", "),
+                    lora.path
+                )
+            })?;
+        // Names a directory entry, not a security boundary, so the standard
+        // hasher is enough: the worst a rehash across builds can do is leave
+        // one extra link behind.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&lora.path, &mut hasher);
+        let name = format!("{:016x}.{extension}", std::hash::Hasher::finish(&hasher));
+        let staged = dir.join(&name);
+        // The link's target is the path just checked, so an existing entry —
+        // link or hard link — is never a stale one.
+        if staged.symlink_metadata().is_err() {
+            link_lora(&source, &staged)?;
+        }
+        lora.path = name;
+    }
+    Ok(())
+}
+
+/// Symlinks first because it crosses volumes; hard links are the fallback for
+/// a Windows without the privilege a symlink needs there.
+fn link_lora(source: &Path, staged: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(source, staged);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(source, staged);
+    linked
+        .or_else(|_| std::fs::hard_link(source, staged))
+        .map_err(|error| {
+            format!(
+                "Failed to link {} into the LoRA directory: {error}",
+                source.display()
+            )
+        })
+}
+
 /// Builds the `sd-server` command line for a model. Every weight path is
 /// absolute and app-owned; nothing is read from a user shell or PATH.
 pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> Vec<String> {
@@ -578,6 +658,11 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
         "127.0.0.1".to_string(),
         "--listen-port".to_string(),
         port.to_string(),
+        // The engine reads this directory per request, so it does not have to
+        // exist yet — but without the flag it defaults to empty and no LoRA
+        // can ever resolve.
+        "--lora-model-dir".to_string(),
+        lora_dir(model_root).to_string_lossy().to_string(),
     ];
     for component in &spec.components {
         // Speech slots belong to `llama-tts`; handing one of their flags to
@@ -3165,6 +3250,108 @@ mod tests {
         let mut too_many = request.clone();
         too_many.loras = std::iter::repeat_n(request.loras[0].clone(), MAX_LORAS + 1).collect();
         assert!(validate_request(&wan, &too_many).is_err());
+    }
+
+    /// The engine matches `lora[].path` against the names it finds under
+    /// `--lora-model-dir` and rejects the whole request when one is unknown, so
+    /// an absolute path — the only kind the library holds — has to be linked in
+    /// and replaced with its name there before the body is built.
+    #[test]
+    fn selected_loras_are_linked_into_the_directory_the_engine_scans() {
+        let root = std::env::temp_dir().join(format!("lm-lora-{}", uuid::Uuid::new_v4()));
+        let library = root.join("library");
+        std::fs::create_dir_all(library.join("a")).unwrap();
+        std::fs::create_dir_all(library.join("b")).unwrap();
+        // The collision that makes a plain filename unusable as the staged
+        // name: one filename, two directories, two different LoRAs.
+        for parent in ["a", "b"] {
+            std::fs::write(
+                library
+                    .join(parent)
+                    .join("pytorch_lora_weights.safetensors"),
+                vec![7u8; 8],
+            )
+            .unwrap();
+        }
+
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.loras = ["a", "b"]
+            .iter()
+            .map(|parent| LoraSelection {
+                path: library
+                    .join(parent)
+                    .join("pytorch_lora_weights.safetensors")
+                    .to_string_lossy()
+                    .to_string(),
+                multiplier: 1.0,
+                is_high_noise: false,
+            })
+            .collect();
+        stage_loras(&root, &mut request).unwrap();
+
+        let dir = lora_dir(&root);
+        assert!(launch_args(&video_model(), &root, 1)
+            .windows(2)
+            .any(|pair| pair
+                == [
+                    "--lora-model-dir".to_string(),
+                    dir.to_string_lossy().to_string()
+                ]));
+        assert_ne!(request.loras[0].path, request.loras[1].path);
+        for lora in &request.loras {
+            assert!(!Path::new(&lora.path).is_absolute(), "{}", lora.path);
+            assert!(lora.path.ends_with(".safetensors"), "{}", lora.path);
+            // What the engine resolves: the name, joined onto the scanned
+            // directory, reaching the user's bytes.
+            assert_eq!(std::fs::read(dir.join(&lora.path)).unwrap(), vec![7u8; 8]);
+        }
+
+        // Staging the same request again is a no-op, not a second link.
+        let names: Vec<String> = request.loras.iter().map(|lora| lora.path.clone()).collect();
+        let mut again = video_request(GenerationTask::TextToVideo);
+        again.loras = request.loras.clone();
+        again.loras[0].path = library
+            .join("a/pytorch_lora_weights.safetensors")
+            .to_string_lossy()
+            .to_string();
+        again.loras[1].path = library
+            .join("b/pytorch_lora_weights.safetensors")
+            .to_string_lossy()
+            .to_string();
+        stage_loras(&root, &mut again).unwrap();
+        assert_eq!(
+            again
+                .loras
+                .iter()
+                .map(|lora| lora.path.clone())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        // A file that is gone, and one the engine would not even look at, fail
+        // here with their own reason rather than as "invalid parameters".
+        let mut missing = video_request(GenerationTask::TextToVideo);
+        missing.loras = vec![LoraSelection {
+            path: library
+                .join("a/gone.safetensors")
+                .to_string_lossy()
+                .to_string(),
+            multiplier: 1.0,
+            is_high_noise: false,
+        }];
+        assert!(stage_loras(&root, &mut missing).is_err());
+
+        std::fs::write(library.join("a/notes.txt"), b"x").unwrap();
+        let mut wrong_kind = video_request(GenerationTask::TextToVideo);
+        wrong_kind.loras = vec![LoraSelection {
+            path: library.join("a/notes.txt").to_string_lossy().to_string(),
+            multiplier: 1.0,
+            is_high_noise: false,
+        }];
+        assert!(stage_loras(&root, &mut wrong_kind).is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// A user-added model is stored as JSON and read back on the next launch,
