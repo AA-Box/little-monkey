@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::sync::LazyLock;
 
+use little_monkey_lib::channels::mutation::{MutationOutcome, MUTATION_VERIFICATION_NAME};
 use little_monkey_lib::checkpoints;
 use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::run_protocol::{
@@ -1382,6 +1383,60 @@ pub async fn run_turn(
     .await
 }
 
+/// Everything one turn's own tool calls proved about the workspace.
+///
+/// Separate from `mutated_files` (which a verification round deliberately
+/// clears, so that only edits made in response to *that* failure are verified
+/// again) because the workspace-mutation contract is a statement about the whole
+/// turn: a file changed in round two is still a file changed.
+#[derive(Debug, Default)]
+struct ObservedMutations {
+    /// Paths a `write_file`/`edit_file` call — this turn's own, or a subagent's
+    /// on its behalf — reported as written.
+    mutated_paths: std::collections::BTreeSet<String>,
+    /// Mutation targets whose last outcome was a failure or a denial, keyed by
+    /// path so a later success on the same file resolves it. A failure on one
+    /// file is not resolved by a success on another.
+    unresolved: std::collections::BTreeMap<String, String>,
+}
+
+impl ObservedMutations {
+    fn succeeded(&mut self, path: &str) {
+        self.mutated_paths.insert(path.to_string());
+        self.unresolved.remove(path);
+    }
+
+    fn failed(&mut self, key: String, reason: String) {
+        self.unresolved.insert(key, reason);
+    }
+
+    /// The contract-facing outcome, preferring the checkpoint's own measurement
+    /// of what changed on disk over the tools' claim that they wrote something.
+    fn outcome(&self, files_changed: &[String]) -> MutationOutcome {
+        MutationOutcome {
+            mutated: !files_changed.is_empty() || !self.mutated_paths.is_empty(),
+            changed_paths: if files_changed.is_empty() {
+                self.mutated_paths.iter().cloned().collect()
+            } else {
+                files_changed.to_vec()
+            },
+            unresolved_failure: self.unresolved.values().next().cloned(),
+        }
+    }
+}
+
+/// The error a failed mutation tool reported, if it named one. Rust port of
+/// `workspaceMutation.ts`'s `mutationToolFailureReason`.
+fn mutation_tool_failure_reason(result_content: &str) -> Option<String> {
+    let error = serde_json::from_str::<serde_json::Value>(result_content)
+        .ok()?
+        .get("error")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!error.is_empty()).then(|| error.chars().take(500).collect())
+}
+
 /// Same as [`run_turn`], but lets a caller cap the tool-calling loop below
 /// (or, in principle, above) the default [`MAX_ITERATIONS`] — `monkey-cli
 /// task run` uses this to honor a recipe's own `max_iterations` field
@@ -1419,6 +1474,7 @@ pub async fn run_turn_with_max_iterations(
         mcp_entries,
         attached_stacks,
         max_iterations_override,
+        false,
     )
     .await
 }
@@ -1429,6 +1485,12 @@ pub async fn run_turn_with_max_iterations(
 /// shapes are consumed exactly as captured instead of being flattened into a
 /// second prompt. The ordinary CLI path above remains the sole builder for
 /// interactive text/image prompts.
+///
+/// `mutation_required` is the turn's frozen workspace-mutation contract. When
+/// it is set, the outcome — what changed, and whether a requested edit was left
+/// failing — is reported as a durable run event before this returns, because the
+/// process that decides what to do about an unmet contract is not this one. See
+/// [`little_monkey_lib::channels::mutation`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_prepared_turn_with_max_iterations(
     client: &reqwest::Client,
@@ -1441,6 +1503,7 @@ pub async fn run_prepared_turn_with_max_iterations(
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
+    mutation_required: bool,
 ) -> Result<Vec<String>, String> {
     if history
         .last()
@@ -1501,6 +1564,8 @@ pub async fn run_prepared_turn_with_max_iterations(
     }
 
     let mut usage = zero_usage();
+    let mut observed = ObservedMutations::default();
+    let started = std::time::Instant::now();
 
     let result = run_tool_loop(
         client,
@@ -1514,6 +1579,7 @@ pub async fn run_prepared_turn_with_max_iterations(
         attached_stacks,
         max_iterations_override,
         &mut usage,
+        &mut observed,
     )
     .await;
 
@@ -1522,6 +1588,24 @@ pub async fn run_prepared_turn_with_max_iterations(
         .and_then(|id| checkpoints::end_impl(state, id).ok())
         .map(|summary| summary.files)
         .unwrap_or_default();
+
+    // Reported before the error is returned, and on every exit path, because an
+    // unmet contract is exactly what a failed turn produces: the policy that
+    // decides whether to correct it reads durable events, not this return value.
+    if mutation_required {
+        let outcome = observed.outcome(&files_changed);
+        let _ = emit_run_event(
+            perms,
+            RunEvent::VerificationFinished {
+                verification_id: safe_protocol_id("verification", MUTATION_VERIFICATION_NAME),
+                name: MUTATION_VERIFICATION_NAME.to_string(),
+                passed: outcome.satisfied(),
+                summary: outcome.summary(),
+                artifact_ids: Vec::new(),
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
+            },
+        );
+    }
 
     result.map(|()| files_changed)
 }
@@ -1542,6 +1626,7 @@ async fn run_tool_loop(
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
     usage: &mut UsageSnapshot,
+    observed: &mut ObservedMutations,
 ) -> Result<(), String> {
     // Built once per turn (mirroring `agentLoop.ts`'s two `attemptStream`
     // call sites recomputing `mcpToolDefs()` per turn, not per streaming
@@ -1847,12 +1932,34 @@ async fn run_tool_loop(
             // succeeded (the "Wrote…"/"Edited…" string shape, not
             // `{"error": ...}`). Mirrors `agentLoop.ts`'s equivalent check
             // right after `executeToolCall`.
-            if (call.name == "write_file" || call.name == "edit_file")
-                && is_successful_mutation_result(&content)
-            {
-                if let Some(path) = tool_call_path_arg(&call.arguments) {
-                    mutated_files.insert(path);
+            //
+            // `observed` gets the same facts and one more: a mutation that
+            // *failed*. The verification set is cleared between rounds and only
+            // holds successes, but the workspace-mutation contract has to be
+            // able to say "a requested edit was not applied", which is a
+            // different answer from "nothing was asked".
+            if call.name == "write_file" || call.name == "edit_file" {
+                let path = tool_call_path_arg(&call.arguments);
+                if is_successful_mutation_result(&content) {
+                    if let Some(path) = path {
+                        mutated_files.insert(path.clone());
+                        observed.succeeded(&path);
+                    }
+                } else {
+                    observed.failed(
+                        path.unwrap_or_else(|| format!("tool-call:{}", call.id)),
+                        mutation_tool_failure_reason(&content)
+                            .unwrap_or_else(|| "The file-mutation tool returned an error.".into()),
+                    );
                 }
+            }
+            // A `task` subagent's own writes are recorded into `mutated_files`
+            // from inside `execute_tool_call`, where this loop cannot see the
+            // individual paths. Folding the set in here is what keeps a child's
+            // edit counted as this turn's mutation — the same reason
+            // `agentLoop.ts` threads `onMutatedPath` into its subagents.
+            for path in &mutated_files {
+                observed.mutated_paths.insert(path.clone());
             }
 
             let model_content = protect_tool_result(&call.name, &content);

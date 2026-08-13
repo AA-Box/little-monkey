@@ -258,6 +258,12 @@ function activeModelDescription(): string {
   return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
 }
 
+/** How much of a session's transcript exists right now — the evidence for
+ * whether a failed send ever became a turn. */
+function messageCount(sessionId: string): number {
+  return useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.messages.length ?? 0;
+}
+
 export async function switchModelFromSlash(selector: string): Promise<string> {
   const state = useModelStore.getState();
   const providerModelFilters = useSettingsStore.getState().providerModelFilters;
@@ -640,6 +646,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     });
   }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
+  // One finalized spoken utterance, sent as its own turn.
+  //
+  // `utteranceId` is the recognition job's id, minted before the audio was
+  // transcribed, and it travels all the way to the durable ingress row as the
+  // turn's dedupe identity: a submission retried after a timeout lands on the
+  // run the first attempt made instead of starting a second one. Only the
+  // final transcript gets here — partial recognition never becomes a turn.
+  const sendVoiceTurn = useCallback((text: string, utteranceId: string) => {
+    setError(null);
+    void runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, "voice")
+      .catch((err: unknown) => {
+        setError(errorMessage(err));
+      });
+  }, [sessionId]);
+
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
   // the currently active primary composer accepts it here for user review
@@ -649,6 +670,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     let unlisten: (() => void) | null = null;
     void companionClient.onCompose((payload) => {
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
+      // A finalized hands-free utterance is a turn the operator already made,
+      // out loud. It becomes a durable `voice` ingress turn under the
+      // recognition job's own id, rather than text waiting in the box — see
+      // `sendVoiceTurn`. Everything else still waits for Send.
+      if (payload.utteranceId) {
+        sendVoiceTurn(payload.text, payload.utteranceId);
+        return;
+      }
       setInput(payload.text);
       if (payload.imageDataUrl) {
         setAttachments((current) => [
@@ -673,7 +702,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       disposed = true;
       unlisten?.();
     };
-  }, [resizeTextarea, sessionId]);
+  }, [resizeTextarea, sendVoiceTurn, sessionId]);
 
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);
@@ -790,9 +819,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
     // any skill not already explicitly invoked above — see
     // `settingsStore.skillAutoInvokeEnabled`.
+    const messagesBefore = messageCount(sessionId);
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
         setError(errorMessage(err));
+        // A send refused before it was accepted — an unavailable resident
+        // runner is the usual reason — leaves nothing behind: no transcript
+        // entry, no durable turn, no run. The typed message is the only thing
+        // that would be lost, so it goes back in the box, and pressing Send
+        // again once the runner is up is the same send rather than a retyped
+        // one. A turn that got far enough to write to the transcript owns its
+        // own failure and the composer stays as the user left it.
+        if (messageCount(sessionId) !== messagesBefore) return;
+        setInput((current) => current || text);
+        setAttachments((current) => (current.length > 0 ? current : pendingAttachments));
       })
       .finally(() => {
         textareaRef.current?.focus();

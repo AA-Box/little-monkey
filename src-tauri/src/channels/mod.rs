@@ -51,6 +51,7 @@ pub fn telecom_credential_ref(account_id: &str) -> String {
 }
 
 pub mod ingress;
+pub mod mutation;
 pub mod policy;
 pub mod routing;
 pub mod types;

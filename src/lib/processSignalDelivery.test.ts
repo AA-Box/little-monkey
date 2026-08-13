@@ -500,6 +500,37 @@ describe("cooperative pause delivery", () => {
     expect(outcome).toBe("no-live-target");
   });
 
+  /**
+   * The resume could not be handed to the durable backend at all, so it has not
+   * been delivered — reporting it as delivered would be this module's own
+   * version of the lie above. The frozen image, the suspended row and the
+   * Resume's request id are all intact, so the next sweep sends the identical
+   * request rather than a second one.
+   */
+  it("reports a resume the durable backend never took as still pending", async () => {
+    resumeFrozenTurnMock.mockResolvedValue("deferred");
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-frozen", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("deferred");
+  });
+
+  /** A resume that threw on the way to the backend is the same case: nothing is
+   * known, so nothing is claimed. */
+  it("reports a resume that failed on the way out as still pending", async () => {
+    resumeFrozenTurnMock.mockRejectedValue(new Error("the bridge is gone"));
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-frozen", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("deferred");
+  });
+
   /** Only a chat turn writes an image: the freeze is the agent loop's own safe
    * point, and a subagent or crew actor has no checkpoint to write one into. */
   it("does not look for an image for a kind that never writes one", async () => {

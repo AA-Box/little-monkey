@@ -27,6 +27,7 @@ import {
   needsPublicCallback,
 } from "../../lib/channelsClient";
 import { Button } from "../ui";
+import { IngressTurnsSection } from "./IngressTurnsSection";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
 
@@ -452,6 +453,8 @@ export function ChannelsPanel() {
           >{t("ChannelsPanel.addRoute")}</Button>
         </div>
       </section>
+
+      <IngressTurnsSection />
     </div>
   );
 }

@@ -51,9 +51,10 @@ pub trait MobileChatQueue: Send + Sync {
         client_key: &str,
         prompt: &str,
     ) -> Result<String, String>;
-    /// Resolves the durable run id previously queued for `client_key`, if
-    /// the job has one yet.
-    fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String>;
+    /// Resolves the durable run id previously queued for this turn, if the job
+    /// has one yet. Both halves of the turn's identity are needed: the job id
+    /// is a digest over them and cannot be inverted.
+    fn chat_run_id(&self, session_id: &str, client_key: &str) -> Result<Option<String>, String>;
 }
 
 /// Seam through which the placement route reaches this node's own queue
@@ -1577,7 +1578,10 @@ impl RemoteApi {
         }
         let ledger = self.run_ledger()?;
         for message in pending {
-            let Some(run_id) = queue.chat_run_id(&message.message_id).map_err(internal)? else {
+            let Some(run_id) = queue
+                .chat_run_id(session_id, &message.message_id)
+                .map_err(internal)?
+            else {
                 continue;
             };
             let events = match ledger.load_events(&run_id, 0, 1_000) {
@@ -3806,7 +3810,11 @@ mod tests {
             Ok(format!("run-{client_key}"))
         }
 
-        fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
+        fn chat_run_id(
+            &self,
+            _session_id: &str,
+            client_key: &str,
+        ) -> Result<Option<String>, String> {
             Ok(self
                 .queued
                 .lock()
@@ -4197,6 +4205,15 @@ mod tests {
     }
 
     impl crate::daemon::channel_worker::RunQueue for FakePeerRuns {
+        fn freeze_execution(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+            Ok(crate::daemon::channel_worker::test_frozen_execution(
+                ingress,
+            ))
+        }
+
         fn submit(
             &self,
             ingress: &little_monkey_lib::channels::ingress::ConversationIngress,

@@ -552,7 +552,24 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                 });
         }
         let params = super::channel_ingress::run_params_for(&self.target, &ingress);
-        self.queue.submit(&ingress, params)
+        // The same durable service every other origin uses. A call turn is
+        // recorded before it is queued, so a crash mid-call leaves something
+        // recovery can finish rather than a sentence the caller said into a
+        // machine that forgot it.
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| "call store lock poisoned".to_string())?;
+        match super::channel_ingress::submit_conversation_turn(
+            &mut store, self.queue, &ingress, &params, now_ms,
+        )? {
+            super::channel_ingress::SubmitOutcome::Queued { job_id, .. }
+            | super::channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => Ok(job_id),
+            super::channel_ingress::SubmitOutcome::Deferred { error, .. } => Err(error),
+            super::channel_ingress::SubmitOutcome::Parked { .. } => {
+                Err("This call turn could not be queued and was parked".to_string())
+            }
+        }
     }
 }
 

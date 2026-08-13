@@ -220,6 +220,15 @@ pub struct DesktopTurnSnapshot {
     pub attached_stack_names: Vec<String>,
     #[serde(default)]
     pub attachments: Vec<DesktopAttachmentSnapshot>,
+    /// Whether this turn promised the workspace would be different afterwards.
+    ///
+    /// Decided by the surface that took the send, frozen here, and checked by
+    /// the runtime against what the turn actually changed — see
+    /// [`crate::channels::mutation`]. Defaults to `false` so a turn submitted by
+    /// an older webview is an ordinary answer rather than acquiring a promise it
+    /// never made.
+    #[serde(default)]
+    pub workspace_mutation_required: bool,
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -1555,6 +1564,7 @@ mod tests {
                 size_bytes: content.len() as u64,
                 content,
             }],
+            workspace_mutation_required: true,
         });
         recipe
     }

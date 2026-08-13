@@ -23,7 +23,22 @@ const MAX_SUBMISSION_BYTES: usize = 48 * 1024 * 1024;
 pub struct DesktopTurnSubmitRequest {
     pub turn_id: String,
     pub recipe: Recipe,
+    /// Which of the operator's own surfaces this turn came from: `desktop`
+    /// (the chat composer) or `voice` (a finalized hands-free utterance).
+    ///
+    /// Both are the operator speaking, and both take the same durable path;
+    /// the distinction is what a listing shows and how the turn deduplicates.
+    /// Absent means desktop, so an older webview keeps working.
+    #[serde(default)]
+    pub source: Option<String>,
 }
+
+/// The origins this bridge may claim.
+///
+/// A closed list rather than a passthrough: the webview must not be able to
+/// have its turn recorded as a paired peer or an authenticated phone, which
+/// would make the ingress listing lie about who asked for something.
+const BRIDGE_SOURCES: [&str; 2] = ["desktop", "voice"];
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -34,6 +49,14 @@ pub struct DesktopTurnSubmitResponse {
 }
 
 fn validate_id(value: &str) -> Result<(), String> {
+    named_id(value, "turn")
+}
+
+/// Path- and argv-safe identifier check.
+///
+/// The session id needs it for the same reason the turn id does: both become
+/// part of the durable ingress identity and one of them becomes a filename.
+fn named_id(value: &str, what: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 256
         || value.contains("..")
@@ -41,14 +64,27 @@ fn validate_id(value: &str) -> Result<(), String> {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        Err("Desktop turn id is invalid".to_string())
+        Err(format!("Desktop {what} id is invalid"))
     } else {
         Ok(())
     }
 }
 
+/// The conversation origin this request claims, defaulting to the composer.
+fn request_source(request: &DesktopTurnSubmitRequest) -> Result<&str, String> {
+    let source = request.source.as_deref().unwrap_or("desktop");
+    if !BRIDGE_SOURCES.contains(&source) {
+        return Err(format!(
+            "A desktop submission may only originate from {}, not '{source}'",
+            BRIDGE_SOURCES.join(" or ")
+        ));
+    }
+    Ok(source)
+}
+
 fn validate_request(request: &DesktopTurnSubmitRequest) -> Result<Vec<u8>, String> {
     validate_id(&request.turn_id)?;
+    request_source(request)?;
     recipes::validate_recipe(&request.recipe)?;
     let snapshot =
         request.recipe.desktop_turn.as_ref().ok_or_else(|| {
@@ -57,6 +93,7 @@ fn validate_request(request: &DesktopTurnSubmitRequest) -> Result<Vec<u8>, Strin
     if snapshot.turn_id != request.turn_id {
         return Err("Desktop turn id differs from its immutable recipe snapshot".to_string());
     }
+    named_id(&snapshot.session_id, "session")?;
     let bytes = serde_json::to_vec_pretty(&request.recipe).map_err(|error| error.to_string())?;
     if bytes.len() > MAX_SUBMISSION_BYTES {
         return Err("Desktop daemon submission exceeds the 48 MiB transport limit".to_string());
@@ -64,7 +101,19 @@ fn validate_request(request: &DesktopTurnSubmitRequest) -> Result<Vec<u8>, Strin
     Ok(bytes)
 }
 
-fn publish_private_snapshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// What publishing a submission did, so the caller knows whether the file is
+/// its own to clean up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Published {
+    /// This call created the file.
+    Created,
+    /// An in-flight submission of the identical turn already published it. The
+    /// retry rides on that one; deleting it here would pull the snapshot out
+    /// from under a `daemon run` that is still reading it.
+    AlreadyPublishedIdentically,
+}
+
+fn publish_private_snapshot(path: &Path, bytes: &[u8]) -> Result<Published, String> {
     let parent = path
         .parent()
         .ok_or_else(|| "Desktop submission path has no parent".to_string())?;
@@ -82,7 +131,18 @@ fn publish_private_snapshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|error| format!("Failed to protect desktop submission directory: {error}"))?;
     }
     match std::fs::symlink_metadata(path) {
-        Ok(_) => {
+        Ok(metadata) => {
+            // A retry of the same send after a timed-out response must not be
+            // an error: the whole point of a stable turn id is that the second
+            // attempt collapses onto the first. It only collapses when it is
+            // genuinely the same submission, byte for byte — a *different*
+            // turn claiming an existing id is still refused, and so is anything
+            // that is not the regular file this function writes.
+            if metadata.file_type().is_file()
+                && std::fs::read(path).is_ok_and(|existing| existing == bytes)
+            {
+                return Ok(Published::AlreadyPublishedIdentically);
+            }
             return Err(format!(
                 "Desktop submission '{}' already exists; refusing to overwrite it",
                 path.display()
@@ -147,7 +207,7 @@ fn publish_private_snapshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("Failed to sync desktop submission directory: {error}"))?;
     #[cfg(not(unix))]
     let _ = parent;
-    Ok(())
+    Ok(Published::Created)
 }
 
 fn daemon_ready(value: &Value) -> Result<(), String> {
@@ -207,14 +267,31 @@ pub async fn m6a_desktop_turn_submit(
         .join("daemon")
         .join("desktop-submissions")
         .join(format!("{}.json", request.turn_id));
-    publish_private_snapshot(&path, &bytes)?;
+    let published = publish_private_snapshot(&path, &bytes)?;
 
+    // Submitted as a conversation turn rather than straight onto the queue: the
+    // operator pressing Send is an origin like any other, and the turn is
+    // durably accepted — under the turn id the webview generated and keeps
+    // across retries — before the agent starts.
+    let session_id = request
+        .recipe
+        .desktop_turn
+        .as_ref()
+        .map(|snapshot| snapshot.session_id.clone())
+        .unwrap_or_default();
+    let source = request_source(&request)?;
     let output = crate::daemon_commands::command(vec![
         "daemon".to_string(),
         "run".to_string(),
         path.to_string_lossy().into_owned(),
-        "--run-key".to_string(),
-        format!("desktop-turn:{}", request.turn_id),
+        "--ingress-source".to_string(),
+        source.to_string(),
+        "--ingress-account".to_string(),
+        session_id.clone(),
+        "--ingress-event".to_string(),
+        request.turn_id.clone(),
+        "--ingress-session".to_string(),
+        format!("{source}:{session_id}"),
         "--priority".to_string(),
         "100".to_string(),
         "--max-attempts".to_string(),
@@ -234,8 +311,11 @@ pub async fn m6a_desktop_turn_submit(
     .await;
     // The daemon has copied the source into its own protected snapshot before
     // it prints a successful queue response, so this transport copy is never
-    // needed after the fixed command returns.
-    let _ = std::fs::remove_file(&path);
+    // needed after the fixed command returns. A retry that found the file
+    // already there leaves it to whoever created it.
+    if published == Published::Created {
+        let _ = std::fs::remove_file(&path);
+    }
     let value: Value = serde_json::from_str(output?.trim())
         .map_err(|error| format!("Invalid desktop queue JSON: {error}"))?;
     serde_json::from_value(value)
@@ -329,12 +409,68 @@ mod tests {
     fn private_publish_refuses_destination_collisions() {
         let directory = test_directory();
         let destination = directory.join("submissions").join("turn.json");
-        publish_private_snapshot(&destination, b"first").unwrap();
+        assert_eq!(
+            publish_private_snapshot(&destination, b"first").unwrap(),
+            Published::Created
+        );
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
         let error = publish_private_snapshot(&destination, b"second").unwrap_err();
         assert!(error.contains("refusing to overwrite"));
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The retry case the stable turn id exists for.
+    ///
+    /// A bridge call can time out after the daemon already took the turn, so
+    /// the webview submits the identical request again under the same id. That
+    /// second attempt has to get as far as the daemon — which answers with the
+    /// job it already has — instead of dying on a file that the first attempt
+    /// is still using.
+    #[test]
+    fn resubmitting_the_identical_turn_rides_on_the_attempt_already_in_flight() {
+        let directory = test_directory();
+        let destination = directory.join("submissions").join("turn.json");
+        assert_eq!(
+            publish_private_snapshot(&destination, b"same bytes").unwrap(),
+            Published::Created
+        );
+        assert_eq!(
+            publish_private_snapshot(&destination, b"same bytes").unwrap(),
+            Published::AlreadyPublishedIdentically
+        );
+        // A different turn claiming that id is still refused: collapsing on the
+        // id alone would let one send overwrite another's snapshot.
+        assert!(publish_private_snapshot(&destination, b"other bytes")
+            .unwrap_err()
+            .contains("refusing to overwrite"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_bridge_may_only_claim_the_operators_own_surfaces() {
+        let request = |source: Option<&str>| DesktopTurnSubmitRequest {
+            turn_id: "turn-1".into(),
+            recipe: serde_json::from_value(serde_json::json!({
+                "version": 1,
+                "name": "desktop-turn-1",
+                "target": {"ollama": "qwen2.5:7b"},
+                "permission_mode": "readonly",
+                "prompt": "hello",
+            }))
+            .expect("recipe"),
+            source: source.map(str::to_string),
+        };
+
+        assert_eq!(request_source(&request(None)).unwrap(), "desktop");
+        assert_eq!(request_source(&request(Some("voice"))).unwrap(), "voice");
+        // A webview must not be able to have its turn recorded as an
+        // authenticated phone or a paired peer.
+        for forged in ["peer", "mobile", "telephone", "messaging_channel"] {
+            assert!(request_source(&request(Some(forged)))
+                .unwrap_err()
+                .contains(forged));
+        }
     }
 
     #[cfg(unix)]
