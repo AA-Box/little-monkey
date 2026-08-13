@@ -1,10 +1,20 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const invoke = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
+
 import {
   PROVIDER_GUIDES,
   buildProviderConfig,
-  callbackPath,
+  channelsAddRoute,
+  channelsCallbackUrl,
+  channelsSetConfig,
+  channelsUpdateRoute,
+  configFormValues,
+  mergeProviderConfig,
   missingRequiredConfig,
   needsPublicCallback,
+  routeSpecificity,
 } from "./channelsClient";
 
 describe("channels setup guidance", () => {
@@ -20,8 +30,17 @@ describe("channels setup guidance", () => {
     expect(needsPublicCallback("nonsense")).toBe(false);
   });
 
-  it("points a webhook provider at the account's own path", () => {
-    expect(callbackPath("chan-abc")).toBe("/v1/channels/chan-abc");
+  it("asks the daemon for a callback URL rather than composing one", () => {
+    // The frontend cannot know what the daemon is reachable as: a guessed
+    // host is how an operator ends up pasting a URL that nothing answers.
+    invoke.mockResolvedValueOnce({
+      account_id: "chan-abc",
+      configured: true,
+      url: "https://hooks.example.com/v1/channels/chan-abc",
+      path: "/v1/channels/chan-abc",
+    });
+    void channelsCallbackUrl("chan-abc");
+    expect(invoke).toHaveBeenCalledWith("channels_callback_url", { accountId: "chan-abc" });
   });
 
   it("tells the operator where every credential comes from", () => {
@@ -146,5 +165,112 @@ describe("provider settings", () => {
   it("has no duplicate providers", () => {
     const kinds = PROVIDER_GUIDES.map((guide) => guide.kind);
     expect(new Set(kinds).size).toBe(kinds.length);
+  });
+});
+
+describe("editing an existing account's settings", () => {
+  const irc = PROVIDER_GUIDES.find((guide) => guide.kind === "irc")!.configFields;
+
+  it("starts the form from what is actually stored", () => {
+    expect(
+      configFormValues(irc, {
+        server: "irc.libera.chat",
+        port: 6697,
+        channels: ["#one", "#two"],
+        use_sasl: true,
+      }),
+    ).toEqual({
+      server: "irc.libera.chat",
+      port: "6697",
+      nick: "",
+      channels: "#one, #two",
+      use_sasl: "true",
+    });
+  });
+
+  it("carries across settings the panel has no input for", () => {
+    // `set-config` replaces the object wholesale, and an account configured
+    // from the terminal can hold keys no guide describes. Losing them because
+    // someone edited an unrelated field would be a silent downgrade.
+    const merged = mergeProviderConfig(
+      { server: "irc.old.example", nick: "monkey", max_attachment_bytes: 1024 },
+      irc,
+      { server: "irc.new.example", nick: "monkey" },
+    );
+    expect(merged).toEqual({
+      server: "irc.new.example",
+      nick: "monkey",
+      max_attachment_bytes: 1024,
+    });
+  });
+
+  it("clears a setting the operator emptied rather than resurrecting it", () => {
+    const merged = mergeProviderConfig({ server: "irc.example.org", nick: "monkey" }, irc, {
+      server: "irc.example.org",
+      nick: "",
+    });
+    expect(merged).toEqual({ server: "irc.example.org" });
+  });
+
+  it("sends settings and label without ever carrying a credential", () => {
+    invoke.mockResolvedValueOnce({});
+    void channelsSetConfig("chan-1", '{"server":"irc.example.org"}', "Team IRC");
+    expect(invoke).toHaveBeenCalledWith("channels_set_config", {
+      accountId: "chan-1",
+      config: '{"server":"irc.example.org"}',
+      label: "Team IRC",
+    });
+    const [, args] = invoke.mock.calls[invoke.mock.calls.length - 1];
+    expect(Object.keys(args as object)).toEqual(["accountId", "config", "label"]);
+  });
+});
+
+describe("the routing ladder", () => {
+  it("reads a scope's rung the way the daemon does", () => {
+    expect(routeSpecificity({})).toBe("global_default");
+    expect(routeSpecificity({ kind: "telegram" })).toBe("channel_default");
+    expect(routeSpecificity({ account_id: "chan-1" })).toBe("account");
+    expect(routeSpecificity({ account_id: "chan-1", conversation_id: "c" })).toBe("conversation");
+    expect(routeSpecificity({ account_id: "chan-1", conversation_id: "c", thread_id: "t" })).toBe("thread");
+    expect(
+      routeSpecificity({ account_id: "chan-1", conversation_id: "c", thread_id: "t", sender_id: "s" }),
+    ).toBe("sender");
+  });
+
+  it("passes the whole scope to the daemon as one options object", () => {
+    invoke.mockResolvedValueOnce({ route: {} });
+    void channelsAddRoute("chat", {
+      account_id: "chan-1",
+      conversation_id: "-100123",
+      thread_id: "42",
+      sender_id: "user-7",
+      session_scope: "conversation",
+      priority: 5,
+      reply: false,
+      enabled: true,
+    });
+    expect(invoke).toHaveBeenCalledWith("channels_add_route", {
+      recipe: "chat",
+      options: {
+        account_id: "chan-1",
+        conversation_id: "-100123",
+        thread_id: "42",
+        sender_id: "user-7",
+        session_scope: "conversation",
+        priority: 5,
+        reply: false,
+        enabled: true,
+      },
+    });
+  });
+
+  it("edits a route in place rather than replacing its identity", () => {
+    invoke.mockResolvedValueOnce({ route: {} });
+    void channelsUpdateRoute("route-1", "triage", { account_id: "chan-1" });
+    expect(invoke).toHaveBeenCalledWith("channels_update_route", {
+      routeId: "route-1",
+      recipe: "triage",
+      options: { account_id: "chan-1" },
+    });
   });
 });

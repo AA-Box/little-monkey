@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { AlertTriangle, Check, Ban, ExternalLink, KeyRound, Loader2, Plug, Power, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, Check, Ban, Copy, ExternalLink, KeyRound, Loader2, Plug, Power, RefreshCw, Save, Trash2 } from "lucide-react";
 import {
   type AccessPolicy,
   type ChannelAccount,
+  type ChannelCallback,
   type ChannelEvent,
   type ChannelHealthState,
   type GroupActivation,
   type PendingSender,
   PROVIDER_GUIDES,
   buildProviderConfig,
-  callbackPath,
   channelsAdd,
-  channelsAddRoute,
+  channelsCallbackUrl,
   channelsDecideSender,
   channelsEnable,
   channelsEvents,
@@ -21,12 +21,17 @@ import {
   channelsRemove,
   channelsRoutes,
   channelsSenders,
+  channelsSetConfig,
   channelsSetCredential,
   channelsSetPolicy,
+  channelsSetPublicUrl,
+  configFormValues,
+  mergeProviderConfig,
   missingRequiredConfig,
   needsPublicCallback,
 } from "../../lib/channelsClient";
 import { Button } from "../ui";
+import { ChannelRoutesSection } from "./ChannelRoutesSection";
 import { IngressTurnsSection } from "./IngressTurnsSection";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
@@ -55,8 +60,8 @@ function configLabel(kind: string, key: string): string {
   return field?.label ?? key;
 }
 
-/** Settings are shown, not edited, so a value only has to be legible.
- * Objects are rendered as JSON rather than `[object Object]`. */
+/** Settings the panel has no input for — keys an account picked up from the
+ * terminal — are still shown, so an edit never hides what is configured. */
 function formatConfigValue(value: unknown): string {
   if (Array.isArray(value)) return value.join(", ");
   if (typeof value === "string") return value;
@@ -77,7 +82,14 @@ export function ChannelsPanel() {
   const [configDraft, setConfigDraft] = useState<Record<string, string>>({});
   const [secret, setSecret] = useState("");
   const [secretParts, setSecretParts] = useState<Record<string, string>>({});
-  const [routeDraft, setRouteDraft] = useState({ recipe: "", scope: "account" as "account" | "global" });
+  /** The selected account's canonical callback URL, as the daemon composes it.
+   * Never assembled here: only the daemon knows what it is reachable as. */
+  const [callback, setCallback] = useState<ChannelCallback | null>(null);
+  const [publicUrlDraft, setPublicUrlDraft] = useState("");
+  /** Open editor for the selected account's non-secret settings, or null while
+   * they are only being displayed. */
+  const [settingsDraft, setSettingsDraft] = useState<Record<string, string> | null>(null);
+  const [labelDraft, setLabelDraft] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -93,23 +105,30 @@ export function ChannelsPanel() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const loadDetail = useCallback(async (accountId: string) => {
+  const loadDetail = useCallback(async (accountId: string, kind: string) => {
     try {
       const [waiting, recent] = await Promise.all([channelsSenders(accountId), channelsEvents(accountId, 20)]);
       setSenders(waiting.pending);
       setEvents(recent.events);
+      // Only webhook providers have a callback to show, and asking the daemon
+      // is the only way to learn whether one is reachable at all.
+      setCallback(needsPublicCallback(kind) ? await channelsCallbackUrl(accountId) : null);
     } catch (reason) {
       setError(errorMessage(reason));
     }
   }, []);
 
   // Anything typed for one account is dropped when another is selected: a
-  // half-entered credential must never be saved against a different account.
+  // half-entered credential must never be saved against a different account,
+  // and neither must half-edited settings.
+  const selectedKind = accounts?.find((entry) => entry.account_id === selected)?.kind ?? null;
   useEffect(() => {
     setSecret("");
     setSecretParts({});
-    if (selected) void loadDetail(selected);
-  }, [selected, loadDetail]);
+    setSettingsDraft(null);
+    setCallback(null);
+    if (selected && selectedKind) void loadDetail(selected, selectedKind);
+  }, [selected, selectedKind, loadDetail]);
 
   const run = useCallback(async (key: string, action: () => Promise<unknown>, done?: string) => {
     setBusy(key);
@@ -119,13 +138,13 @@ export function ChannelsPanel() {
       await action();
       if (done) setNotice(done);
       await load();
-      if (selected) await loadDetail(selected);
+      if (selected && selectedKind) await loadDetail(selected, selectedKind);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }
-  }, [load, loadDetail, selected]);
+  }, [load, loadDetail, selected, selectedKind]);
 
   const account = accounts?.find((entry) => entry.account_id === selected) ?? null;
   const guide = PROVIDER_GUIDES.find((entry) => entry.kind === (account?.kind ?? draft.kind));
@@ -207,7 +226,7 @@ export function ChannelsPanel() {
               {account.credential_required && !account.has_credential && (
                 <p className="mt-1 text-xs text-warning">{t("ChannelsPanel.needsCredential")}</p>
               )}
-              {Object.keys(account.non_secret_config).length > 0 && (
+              {settingsDraft === null && Object.keys(account.non_secret_config).length > 0 && (
                 <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 text-xs text-faint">
                   {Object.entries(account.non_secret_config).map(([key, value]) => (
                     <div key={key} className="contents">
@@ -221,6 +240,20 @@ export function ChannelsPanel() {
             <div className="flex flex-wrap gap-2">
               <Button size="sm" disabled={busy !== null} onClick={() => void run("probe", () => channelsProbe(account.account_id))}>
                 {busy === "probe" ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}{t("ChannelsPanel.testConnection")}
+              </Button>
+              <Button
+                size="sm"
+                disabled={busy !== null}
+                onClick={() => {
+                  if (settingsDraft) {
+                    setSettingsDraft(null);
+                    return;
+                  }
+                  setLabelDraft(account.label);
+                  setSettingsDraft(configFormValues(guide?.configFields ?? [], account.non_secret_config));
+                }}
+              >
+                <Save size={14} />{settingsDraft ? t("ChannelsPanel.cancel") : t("ChannelsPanel.editSettings")}
               </Button>
               <Button size="sm" disabled={busy !== null} onClick={() => void run("enable", () => channelsEnable(account.account_id, !account.enabled))}>
                 <Power size={14} />{account.enabled ? t("ChannelsPanel.disable") : t("ChannelsPanel.enable")}
@@ -278,11 +311,106 @@ export function ChannelsPanel() {
             </p>
           )}
 
+          {/* Editing what an account is configured against, not just reading
+              it. The settings replace the stored object wholesale, so keys
+              this panel has no input for are carried across untouched rather
+              than dropped; the daemon validates the result against what the
+              provider's adapter actually reads. */}
+          {settingsDraft !== null && (
+            <div className="mt-3 border-t border-border pt-3">
+              <h5 className="text-xs font-semibold">{t("ChannelsPanel.settings")}</h5>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <label className="text-xs text-muted">{t("ChannelsPanel.label")}
+                  <input className={`${INPUT} mt-1`} value={labelDraft} onChange={(event) => setLabelDraft(event.target.value)} />
+                </label>
+                {(guide?.configFields ?? []).map((field) => (
+                  <label key={field.key} className="text-xs text-muted">
+                    {field.label}{field.required ? " *" : ""}
+                    {field.type === "boolean" ? (
+                      <select
+                        className={`${INPUT} mt-1`}
+                        value={settingsDraft[field.key] ?? "false"}
+                        onChange={(event) => setSettingsDraft({ ...settingsDraft, [field.key]: event.target.value })}
+                      >
+                        <option value="false">{t("ChannelsPanel.no")}</option>
+                        <option value="true">{t("ChannelsPanel.yes")}</option>
+                      </select>
+                    ) : (
+                      <input
+                        className={`${INPUT} mt-1`}
+                        inputMode={field.type === "number" ? "numeric" : undefined}
+                        value={settingsDraft[field.key] ?? ""}
+                        onChange={(event) => setSettingsDraft({ ...settingsDraft, [field.key]: event.target.value })}
+                        placeholder={field.placeholder ?? ""}
+                      />
+                    )}
+                    {field.hint && <span className="mt-1 block text-faint">{field.hint}</span>}
+                  </label>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-faint">{t("ChannelsPanel.settingsReprobeHint")}</p>
+              <Button
+                className="mt-2"
+                size="sm"
+                disabled={
+                  busy !== null ||
+                  labelDraft.trim().length === 0 ||
+                  missingRequiredConfig(guide?.configFields ?? [], settingsDraft).length > 0
+                }
+                onClick={() => void run("settings", async () => {
+                  const merged = mergeProviderConfig(
+                    account.non_secret_config,
+                    guide?.configFields ?? [],
+                    settingsDraft,
+                  );
+                  await channelsSetConfig(account.account_id, JSON.stringify(merged), labelDraft.trim());
+                  setSettingsDraft(null);
+                }, t("ChannelsPanel.settingsSaved"))}
+              ><Save size={14} />{t("ChannelsPanel.saveSettings")}</Button>
+            </div>
+          )}
+
           {needsPublicCallback(account.kind) && (
-            <p className="mt-3 rounded-md border border-border bg-background p-2 text-xs text-muted">
-              {t("ChannelsPanel.callbackHint")} <code className="text-foreground">{callbackPath(account.account_id)}</code>
-              {account.kind === "whatsapp" && <span className="mt-1 block">{t("ChannelsPanel.callbackVerifyHint")}</span>}
-            </p>
+            <div className="mt-3 rounded-md border border-border bg-background p-2 text-xs text-muted">
+              {callback?.configured && callback.url ? (
+                <>
+                  <p>{t("ChannelsPanel.callbackHint")}</p>
+                  <p className="mt-1 flex flex-wrap items-center gap-2">
+                    <code className="min-w-0 break-all text-foreground">{callback.url}</code>
+                    <Button size="sm" onClick={() => void navigator.clipboard.writeText(callback.url ?? "")}>
+                      <Copy size={12} />{t("ChannelsPanel.copy")}
+                    </Button>
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-warning">{t("ChannelsPanel.callbackUnconfigured")}</p>
+                  <p className="mt-1">
+                    {t("ChannelsPanel.callbackPathIs")} <code className="text-foreground">{callback?.path ?? ""}</code>
+                  </p>
+                  <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end">
+                    <label className="min-w-0 flex-1 text-xs text-muted">{t("ChannelsPanel.publicBaseUrl")}
+                      <input
+                        className={`${INPUT} mt-1`}
+                        value={publicUrlDraft}
+                        onChange={(event) => setPublicUrlDraft(event.target.value)}
+                        placeholder="https://hooks.example.com"
+                      />
+                    </label>
+                    <Button
+                      size="sm"
+                      disabled={busy !== null || publicUrlDraft.trim().length === 0}
+                      onClick={() => void run("public-url", async () => {
+                        await channelsSetPublicUrl(publicUrlDraft.trim());
+                        setPublicUrlDraft("");
+                      }, t("ChannelsPanel.publicBaseUrlSaved"))}
+                    >{t("ChannelsPanel.savePublicBaseUrl")}</Button>
+                  </div>
+                  <p className="mt-1 text-faint">{t("ChannelsPanel.publicBaseUrlHint")}</p>
+                </>
+              )}
+              {account.kind === "whatsapp" && <p className="mt-1">{t("ChannelsPanel.callbackVerifyHint")}</p>}
+            </div>
           )}
 
           <div className="mt-3 grid gap-2 border-t border-border pt-3 sm:grid-cols-3">
@@ -348,7 +476,7 @@ export function ChannelsPanel() {
           <div className="mt-3 border-t border-border pt-3">
             <div className="flex items-center justify-between">
               <h5 className="text-xs font-semibold">{t("ChannelsPanel.activity")}</h5>
-              <Button size="sm" disabled={busy !== null} onClick={() => void loadDetail(account.account_id)}><RefreshCw size={12} />{t("ChannelsPanel.refresh")}</Button>
+              <Button size="sm" disabled={busy !== null} onClick={() => void loadDetail(account.account_id, account.kind)}><RefreshCw size={12} />{t("ChannelsPanel.refresh")}</Button>
             </div>
             {events.length === 0 ? (
               <p className="mt-1 text-xs text-faint">{t("ChannelsPanel.noActivity")}</p>
@@ -433,26 +561,7 @@ export function ChannelsPanel() {
         >{t("ChannelsPanel.add")}</Button>
       </section>
 
-      <section className="rounded-lg border border-border bg-surface p-4">
-        <h4 className="text-sm font-semibold">{t("ChannelsPanel.routes")}</h4>
-        <p className="mt-1 text-xs text-muted">{t("ChannelsPanel.routesIntro")}</p>
-        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-end">
-          <label className="min-w-0 flex-1 text-xs text-muted">{t("ChannelsPanel.recipe")}
-            <input className={`${INPUT} mt-1`} value={routeDraft.recipe} onChange={(event) => setRouteDraft({ ...routeDraft, recipe: event.target.value })} placeholder="chat" />
-          </label>
-          <label className="text-xs text-muted">{t("ChannelsPanel.scope")}
-            <select className={`${INPUT} mt-1`} value={routeDraft.scope} onChange={(event) => setRouteDraft({ ...routeDraft, scope: event.target.value as "account" | "global" })}>
-              <option value="account">{t("ChannelsPanel.scopeAccount")}</option>
-              <option value="global">{t("ChannelsPanel.scopeGlobal")}</option>
-            </select>
-          </label>
-          <Button
-            size="sm"
-            disabled={busy !== null || routeDraft.recipe.trim().length === 0 || (routeDraft.scope === "account" && !selected)}
-            onClick={() => void run("route", () => channelsAddRoute(routeDraft.recipe.trim(), routeDraft.scope === "account" ? selected : null, null, null, null), t("ChannelsPanel.routeAdded"))}
-          >{t("ChannelsPanel.addRoute")}</Button>
-        </div>
-      </section>
+      <ChannelRoutesSection accounts={accounts} onChanged={load} />
 
       <IngressTurnsSection />
     </div>

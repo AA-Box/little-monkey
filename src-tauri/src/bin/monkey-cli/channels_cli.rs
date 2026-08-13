@@ -45,6 +45,20 @@ pub enum ChannelsCmd {
     /// Store the account's credential, read from stdin so it never lands in a
     /// shell history or a process listing.
     SetToken { account_id: String },
+    /// Edit an existing account's non-secret settings and label. Validated
+    /// against what the provider's adapter actually reads; changing settings
+    /// marks the connection unverified until the next probe.
+    SetConfig {
+        account_id: String,
+        /// Replacement non-secret settings as a JSON object.
+        #[arg(long)]
+        config: Option<String>,
+        /// New display label.
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Enable or disable an account.
     Enable {
         account_id: String,
@@ -97,16 +111,26 @@ pub enum ChannelsCmd {
     AddRoute {
         /// Recipe an inbound message runs as.
         recipe: String,
+        #[command(flatten)]
+        options: RouteOptions,
         #[arg(long)]
-        account: Option<String>,
+        json: bool,
+    },
+    /// Replace a route's scope and target, keeping its id.
+    UpdateRoute {
+        route_id: String,
+        /// Recipe an inbound message runs as.
+        recipe: String,
+        #[command(flatten)]
+        options: RouteOptions,
         #[arg(long)]
-        conversation: Option<String>,
-        /// Provider-wide default, e.g. `--kind telegram`.
+        json: bool,
+    },
+    /// Enable or disable a route without editing it.
+    EnableRoute {
+        route_id: String,
         #[arg(long)]
-        kind: Option<String>,
-        /// Workspace the run gets.
-        #[arg(long)]
-        repository: Option<String>,
+        off: bool,
     },
     /// Remove a route.
     RemoveRoute { route_id: String },
@@ -118,11 +142,69 @@ pub enum ChannelsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Set or clear the public base URL webhook callbacks are advertised
+    /// under, e.g. `https://hooks.example.com`. The daemon still listens on
+    /// loopback only; reaching it from that URL is the operator's tunnel or
+    /// reverse proxy.
+    SetPublicUrl {
+        /// The base URL. Omit with `--clear` to remove it.
+        url: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// The complete callback URL to paste into a webhook provider's console,
+    /// or a clear statement that no public base URL is configured.
+    CallbackUrl {
+        account_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Record that a credential was stored for this account by the app. The
     /// secret itself never travels through an argument.
     MarkCredential { account_id: String },
     /// Remove an account and its stored credential.
     Remove { account_id: String },
+}
+
+/// The scope and target of one route, shared by `add-route` and
+/// `update-route` so the two can never drift apart.
+#[derive(clap::Args, Debug)]
+pub struct RouteOptions {
+    /// Scope: account the route is pinned to.
+    #[arg(long)]
+    pub account: Option<String>,
+    /// Scope: conversation inside `--account`.
+    #[arg(long)]
+    pub conversation: Option<String>,
+    /// Scope: thread inside `--conversation`.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Scope: sender inside `--conversation`.
+    #[arg(long)]
+    pub sender: Option<String>,
+    /// Scope: provider-wide default, e.g. `--kind telegram`.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Workspace the run gets.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Recipe parameter as `name=value`. Repeatable.
+    #[arg(long = "param")]
+    pub params: Vec<String>,
+    /// Which durable session the conversation maps onto:
+    /// thread | conversation | sender | account.
+    #[arg(long)]
+    pub session_scope: Option<String>,
+    /// Queue priority for runs this route produces.
+    #[arg(long)]
+    pub priority: Option<i32>,
+    /// Do not grant runs of this route the authority to answer the
+    /// conversation they came from.
+    #[arg(long)]
+    pub no_reply: bool,
+    /// Create or leave the route disabled.
+    #[arg(long)]
+    pub disabled: bool,
 }
 
 pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
@@ -135,6 +217,12 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             json,
         } => add(kind, label, config.as_deref(), *json),
         ChannelsCmd::SetToken { account_id } => set_token(account_id),
+        ChannelsCmd::SetConfig {
+            account_id,
+            config,
+            label,
+            json,
+        } => set_config(account_id, config.as_deref(), label.as_deref(), *json),
         ChannelsCmd::Enable { account_id, off } => enable(account_id, !*off),
         ChannelsCmd::Probe { account_id, json } => probe(account_id, *json).await,
         ChannelsCmd::Policy {
@@ -160,23 +248,24 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
         ChannelsCmd::Routes { json } => routes(*json),
         ChannelsCmd::AddRoute {
             recipe,
-            account,
-            conversation,
-            kind,
-            repository,
-        } => add_route(
+            options,
+            json,
+        } => add_route(recipe, options, *json),
+        ChannelsCmd::UpdateRoute {
+            route_id,
             recipe,
-            account.as_deref(),
-            conversation.as_deref(),
-            kind.as_deref(),
-            repository.as_deref(),
-        ),
+            options,
+            json,
+        } => update_route(route_id, recipe, options, *json),
+        ChannelsCmd::EnableRoute { route_id, off } => enable_route(route_id, !*off),
         ChannelsCmd::RemoveRoute { route_id } => remove_route(route_id),
         ChannelsCmd::Events {
             account_id,
             limit,
             json,
         } => events(account_id, *limit, *json),
+        ChannelsCmd::SetPublicUrl { url, clear } => set_public_url(url.as_deref(), *clear),
+        ChannelsCmd::CallbackUrl { account_id, json } => callback_url(account_id, *json),
         ChannelsCmd::MarkCredential { account_id } => mark_credential(account_id),
         ChannelsCmd::Remove { account_id } => remove(account_id),
     }
@@ -261,9 +350,7 @@ pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Re
             .map_err(|error| format!("--config must be a JSON object: {error}"))?,
         None => serde_json::json!({}),
     };
-    if !non_secret_config.is_object() {
-        return Err("--config must be a JSON object".to_string());
-    }
+    crate::daemon::adapters::validate_non_secret_config(kind, &non_secret_config)?;
     let account_id = format!("chan-{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
     let record = ChannelAccountRecord {
@@ -291,6 +378,71 @@ pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Re
         println!(
             "Added {} account {account_id}. Set its credential with `monkey channels set-token {account_id}`, then enable it.",
             kind.label()
+        );
+    }
+    Ok(())
+}
+
+/// Edit an existing account's non-secret settings.
+///
+/// The settings replace the stored object wholesale — the caller shows the
+/// current values and sends back the edited whole, so there is no merge
+/// semantics to misremember. Secrets are not touched here and never could be:
+/// this writes `non_secret_config` and `label`, nothing else.
+///
+/// A config change moves health to `Disconnected`: the old probe result
+/// described a configuration that no longer exists, and claiming its
+/// connectivity would be the lie the health field exists to prevent. The
+/// running adapter is rebuilt from the new row within the worker's normal
+/// reload interval.
+pub fn set_config(
+    account_id: &str,
+    config_json: Option<&str>,
+    label: Option<&str>,
+    json: bool,
+) -> Result<(), String> {
+    if config_json.is_none() && label.is_none() {
+        return Err("Pass --config, --label, or both.".to_string());
+    }
+    let mut store = store()?;
+    let mut account = store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    if let Some(label) = label {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err("--label must not be empty.".to_string());
+        }
+        account.label = label.to_string();
+    }
+    let mut config_changed = false;
+    if let Some(raw) = config_json {
+        let config: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("--config must be a JSON object: {error}"))?;
+        crate::daemon::adapters::validate_non_secret_config(account.kind, &config)?;
+        config_changed = config != account.non_secret_config;
+        account.non_secret_config = config;
+    }
+    if config_changed {
+        account.health = ChannelHealth {
+            state: HealthState::Disconnected,
+            detail: Some("Settings changed; run a probe to verify the connection.".to_string()),
+            last_error: None,
+            probed_at_ms: now_ms(),
+        };
+    }
+    account.updated_at_ms = now_ms();
+    store.upsert_channel_account(&account)?;
+    if json {
+        println!("{}", account_json(&account));
+    } else {
+        println!(
+            "Updated {account_id}.{}",
+            if config_changed {
+                " The change takes effect within about 30 seconds; run `monkey channels probe` to verify the connection."
+            } else {
+                ""
+            }
         );
     }
     Ok(())
@@ -526,34 +678,168 @@ pub fn routes(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn add_route(
-    recipe: &str,
-    account_id: Option<&str>,
-    conversation_id: Option<&str>,
-    kind: Option<&str>,
-    repository: Option<&str>,
-) -> Result<(), String> {
-    let scope = match (account_id, conversation_id, kind) {
-        (Some(account), Some(conversation), _) => RouteScope::conversation(account, conversation),
-        (Some(account), None, _) => RouteScope::account(account),
-        (None, _, Some(kind)) => RouteScope::channel_default(
-            ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
-        ),
-        (None, _, None) => RouteScope::global_default(),
+/// The route scope the flags describe. `RouteScope::validate` (run by the
+/// store) is what rejects off-ladder combinations; this only assembles.
+fn route_scope(options: &RouteOptions) -> Result<RouteScope, String> {
+    let mut scope = match (options.account.as_deref(), options.conversation.as_deref()) {
+        (Some(account), Some(conversation)) => RouteScope::conversation(account, conversation),
+        (Some(account), None) => RouteScope::account(account),
+        (None, _) => match options.kind.as_deref() {
+            Some(kind) => RouteScope::channel_default(
+                ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
+            ),
+            None => RouteScope::global_default(),
+        },
     };
+    if let Some(thread) = &options.thread {
+        scope = scope.with_thread(thread);
+    }
+    if let Some(sender) = &options.sender {
+        scope = scope.with_sender(sender);
+    }
+    Ok(scope)
+}
+
+/// The route target the flags describe.
+fn route_target(recipe: &str, options: &RouteOptions) -> Result<RouteTarget, String> {
+    if recipe.trim().is_empty() {
+        return Err("A route must name the task an incoming message runs as.".to_string());
+    }
     let mut target = RouteTarget::new(recipe);
-    target.repository = repository.map(str::to_string);
+    target.repository = options.repository.clone();
+    for param in &options.params {
+        let (name, value) = param
+            .split_once('=')
+            .ok_or_else(|| format!("--param '{param}' must be name=value"))?;
+        if name.is_empty() {
+            return Err(format!("--param '{param}' has an empty name"));
+        }
+        target.params.insert(name.to_string(), value.to_string());
+    }
+    if let Some(session_scope) = &options.session_scope {
+        target.session_scope = match session_scope.as_str() {
+            "thread" => little_monkey_lib::channels::routing::SessionScope::Thread,
+            "conversation" => little_monkey_lib::channels::routing::SessionScope::Conversation,
+            "sender" => little_monkey_lib::channels::routing::SessionScope::Sender,
+            "account" => little_monkey_lib::channels::routing::SessionScope::Account,
+            other => {
+                return Err(format!(
+                    "Unknown session scope '{other}' (expected thread, conversation, sender or account)"
+                ))
+            }
+        };
+    }
+    if let Some(priority) = options.priority {
+        target.priority = priority;
+    }
+    target.reply_to_conversation = !options.no_reply;
+    Ok(target)
+}
+
+pub fn add_route(recipe: &str, options: &RouteOptions, json: bool) -> Result<(), String> {
     let now = now_ms();
     let route = ChannelRoute {
         route_id: format!("route-{}", uuid::Uuid::new_v4().simple()),
-        scope,
-        target,
-        enabled: true,
+        scope: route_scope(options)?,
+        target: route_target(recipe, options)?,
+        enabled: !options.disabled,
         created_at_ms: now,
         updated_at_ms: now,
     };
     store()?.insert_channel_route(&route)?;
-    println!("Added route {} -> {recipe}.", route.route_id);
+    if json {
+        println!("{}", serde_json::json!({ "route": route }));
+    } else {
+        println!("Added route {} -> {recipe}.", route.route_id);
+    }
+    Ok(())
+}
+
+pub fn update_route(
+    route_id: &str,
+    recipe: &str,
+    options: &RouteOptions,
+    json: bool,
+) -> Result<(), String> {
+    let mut store = store()?;
+    let existing = store
+        .channel_routes()?
+        .into_iter()
+        .find(|route| route.route_id == route_id)
+        .ok_or_else(|| format!("No such route '{route_id}'"))?;
+    let route = ChannelRoute {
+        route_id: route_id.to_string(),
+        scope: route_scope(options)?,
+        target: route_target(recipe, options)?,
+        enabled: !options.disabled,
+        created_at_ms: existing.created_at_ms,
+        updated_at_ms: now_ms(),
+    };
+    store.update_channel_route(&route)?;
+    if json {
+        println!("{}", serde_json::json!({ "route": route }));
+    } else {
+        println!("Updated route {route_id} -> {recipe}.");
+    }
+    Ok(())
+}
+
+pub fn enable_route(route_id: &str, enabled: bool) -> Result<(), String> {
+    if store()?.set_channel_route_enabled(route_id, enabled, now_ms())? {
+        println!(
+            "Route {route_id} is now {}.",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    } else {
+        Err(format!("No such route '{route_id}'"))
+    }
+}
+
+pub fn set_public_url(url: Option<&str>, clear: bool) -> Result<(), String> {
+    match (url, clear) {
+        (Some(url), false) => {
+            store()?.set_channel_public_base_url(Some(url))?;
+            println!("Webhook callbacks are now advertised under {url}.");
+            Ok(())
+        }
+        (None, true) => {
+            store()?.set_channel_public_base_url(None)?;
+            println!("Public base URL cleared; webhook providers cannot reach this daemon until one is configured.");
+            Ok(())
+        }
+        (Some(_), true) => Err("Pass a URL or --clear, not both.".to_string()),
+        (None, false) => Err("Pass the base URL, or --clear to remove it.".to_string()),
+    }
+}
+
+pub fn callback_url(account_id: &str, json: bool) -> Result<(), String> {
+    let store = store()?;
+    store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    let path = crate::daemon::channel_store::channel_callback_path(account_id);
+    let url = store.channel_callback_url(account_id)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "account_id": account_id,
+                "configured": url.is_some(),
+                "url": url,
+                "path": path,
+            })
+        );
+        return Ok(());
+    }
+    match url {
+        Some(url) => println!("{url}"),
+        None => println!(
+            "No public base URL is configured. The listener path is {path}; run \
+             `monkey channels set-public-url <https://your-public-host>` once a tunnel or \
+             reverse proxy exposes the daemon."
+        ),
+    }
     Ok(())
 }
 

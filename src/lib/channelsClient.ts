@@ -70,6 +70,94 @@ export interface ChannelEvent {
   received_at_ms: number;
 }
 
+/** Which durable session a conversation maps onto. Matches the daemon's
+ * `SessionScope`. */
+export type SessionScope = "thread" | "conversation" | "sender" | "account";
+
+/** How much of a message's identity a route pins down. Every field is
+ * optional; which ones are set decides the rung the route sits on, and the
+ * daemon rejects the combinations that are not on the ladder. */
+export interface ChannelRouteScope {
+  account_id?: string;
+  kind?: string;
+  conversation_id?: string;
+  thread_id?: string;
+  sender_id?: string;
+}
+
+/** What a matching message runs as. Mirrors the daemon's `RouteTarget`. */
+export interface ChannelRouteTarget {
+  recipe: string;
+  params?: Record<string, string>;
+  repository?: string;
+  session_scope: SessionScope;
+  priority: number;
+  reply_to_conversation: boolean;
+}
+
+export interface ChannelRoute {
+  route_id: string;
+  scope: ChannelRouteScope;
+  target: ChannelRouteTarget;
+  enabled: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** The rungs of the routing ladder, most specific first — the same order
+ * `resolve_route` walks. */
+export const ROUTE_SPECIFICITY = [
+  "sender",
+  "thread",
+  "conversation",
+  "account",
+  "channel_default",
+  "global_default",
+] as const;
+
+export type RouteSpecificity = (typeof ROUTE_SPECIFICITY)[number];
+
+/** Which rung a scope sits on, computed the same way the daemon computes it.
+ * Display only — the daemon remains the authority on what a scope means. */
+export function routeSpecificity(scope: ChannelRouteScope): RouteSpecificity {
+  if (scope.sender_id) return "sender";
+  if (scope.thread_id) return "thread";
+  if (scope.conversation_id) return "conversation";
+  if (scope.account_id) return "account";
+  if (scope.kind) return "channel_default";
+  return "global_default";
+}
+
+/** The scope and target fields `channels_add_route`/`channels_update_route`
+ * accept, exactly the daemon's `RouteOptionArgs`. Sent as one object, so the
+ * keys stay the daemon's snake_case rather than being renamed in flight. */
+export interface RouteOptions {
+  account_id?: string | null;
+  conversation_id?: string | null;
+  thread_id?: string | null;
+  sender_id?: string | null;
+  kind?: string | null;
+  repository?: string | null;
+  /** Recipe parameters as `name=value` strings. */
+  params?: string[];
+  session_scope?: SessionScope | null;
+  priority?: number | null;
+  /** Whether runs of this route may answer their conversation. Defaults on. */
+  reply?: boolean | null;
+  /** Whether the route is active. Defaults on. */
+  enabled?: boolean | null;
+}
+
+/** The complete callback URL for one webhook account, as the daemon composes
+ * it. `configured: false` means no public base URL is set — the frontend shows
+ * `path` and says so, and never glues a host on itself. */
+export interface ChannelCallback {
+  account_id: string;
+  configured: boolean;
+  url: string | null;
+  path: string;
+}
+
 /** One non-secret setting an account needs, collected as its own input.
  *
  * `type` is what the value becomes in the account row, not how it is typed:
@@ -239,18 +327,29 @@ export const channelsSenders = (accountId: string) =>
   invoke<{ pending: PendingSender[] }>("channels_senders", { accountId });
 export const channelsDecideSender = (accountId: string, senderId: string, approve: boolean) =>
   invoke<void>("channels_decide_sender", { accountId, senderId, approve });
-export const channelsRoutes = () => invoke<{ routes: unknown[] }>("channels_routes");
-export const channelsAddRoute = (
-  recipe: string,
-  accountId: string | null,
-  conversationId: string | null,
-  kind: string | null,
-  repository: string | null,
-) => invoke<void>("channels_add_route", { recipe, accountId, conversationId, kind, repository });
+export const channelsRoutes = () => invoke<{ routes: ChannelRoute[] }>("channels_routes");
+export const channelsAddRoute = (recipe: string, options: RouteOptions) =>
+  invoke<{ route: ChannelRoute }>("channels_add_route", { recipe, options });
+export const channelsUpdateRoute = (routeId: string, recipe: string, options: RouteOptions) =>
+  invoke<{ route: ChannelRoute }>("channels_update_route", { routeId, recipe, options });
+export const channelsEnableRoute = (routeId: string, enabled: boolean) =>
+  invoke<void>("channels_enable_route", { routeId, enabled });
 export const channelsRemoveRoute = (routeId: string) => invoke<void>("channels_remove_route", { routeId });
 export const channelsEvents = (accountId: string, limit = 20) =>
   invoke<{ events: ChannelEvent[] }>("channels_events", { accountId, limit });
 export const channelsRemove = (accountId: string) => invoke<void>("channels_remove", { accountId });
+/** Replace an existing account's non-secret settings and/or label. The
+ * credential is untouched: it does not travel through this command in either
+ * direction. */
+export const channelsSetConfig = (
+  accountId: string,
+  config: string | null,
+  label: string | null,
+) => invoke<ChannelAccount>("channels_set_config", { accountId, config, label });
+export const channelsCallbackUrl = (accountId: string) =>
+  invoke<ChannelCallback>("channels_callback_url", { accountId });
+export const channelsSetPublicUrl = (url: string | null) =>
+  invoke<void>("channels_set_public_url", { url });
 
 /** Whether this provider needs the operator to expose a public callback URL.
  * Setup asks for one only when it is genuinely required. */
@@ -258,8 +357,41 @@ export function needsPublicCallback(kind: string): boolean {
   return PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport === "webhook";
 }
 
-/** The callback path a webhook provider must be pointed at, under whatever
- * public base URL the operator configured. */
-export function callbackPath(accountId: string): string {
-  return `/v1/channels/${accountId}`;
+/** Merge edited guide fields back over an account's stored settings.
+ *
+ * `channels set-config` replaces the settings object wholesale, so anything
+ * the panel does not render has to be carried across explicitly — an account
+ * configured from the terminal can hold keys no provider guide describes
+ * (per-account attachment limits, say), and silently dropping them on an
+ * unrelated edit would be a data loss the operator never asked for. */
+export function mergeProviderConfig(
+  existing: Record<string, unknown>,
+  fields: ProviderConfigField[],
+  values: Record<string, string>,
+): Record<string, unknown> {
+  const edited = buildProviderConfig(fields, values);
+  const untouched = Object.fromEntries(
+    Object.entries(existing).filter(([key]) => !fields.some((field) => field.key === key)),
+  );
+  return { ...untouched, ...edited };
+}
+
+/** An account's stored settings as the edit form's string values, so the form
+ * starts from what is actually configured rather than blank. */
+export function configFormValues(
+  fields: ProviderConfigField[],
+  config: Record<string, unknown>,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const field of fields) {
+    const value = config[field.key];
+    if (value === undefined || value === null) {
+      values[field.key] = field.type === "boolean" ? "false" : "";
+    } else if (Array.isArray(value)) {
+      values[field.key] = value.join(", ");
+    } else {
+      values[field.key] = String(value);
+    }
+  }
+  return values;
 }

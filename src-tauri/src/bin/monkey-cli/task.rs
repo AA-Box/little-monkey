@@ -816,6 +816,7 @@ fn permission_policy(mode: PermissionMode, approval_timeout_ms: u64) -> Permissi
             .as_deref()
             == Some(std::ffi::OsStr::new("1")),
         egress_allowlist: None,
+        channel_send: None,
     }
 }
 
@@ -1092,7 +1093,14 @@ async fn run_inner(
     let frozen_policy = match (&recipe.placed_run, &recipe.desktop_turn) {
         (Some(placed), _) => placed.permission_policy.clone(),
         (_, Some(snapshot)) => snapshot.permission_policy.clone(),
-        _ => permission_policy(mode, approval_timeout_ms),
+        _ => {
+            let mut policy = permission_policy(mode, approval_timeout_ms);
+            // A hand-authored/scheduled recipe is the only carrier of a
+            // cross-conversation messaging grant on this path; the snapshot
+            // records it so the run's authority is auditable after the fact.
+            policy.channel_send = recipe.channel_send.clone();
+            policy
+        }
     };
     let input_artifact_ids = recipe
         .desktop_turn
@@ -1272,6 +1280,13 @@ async fn run_inner(
     perms.set_allow_external_mutations(match &recipe.desktop_turn {
         Some(snapshot) => snapshot.permission_policy.allow_external_mutations,
         None => permission_policy(mode, approval_timeout_ms).allow_external_mutations,
+    });
+    // The cross-conversation/cross-account messaging grant, from the same
+    // snapshot precedence as `allow_external_mutations`: a desktop turn's
+    // recorded policy wins, a hand-authored recipe may carry its own.
+    perms.set_channel_send(match &recipe.desktop_turn {
+        Some(snapshot) => snapshot.permission_policy.channel_send.clone(),
+        None => recipe.channel_send.clone(),
     });
     let mut history: Vec<serde_json::Value> = recipe
         .desktop_turn
@@ -1875,6 +1890,7 @@ mod tests {
             max_iterations: None,
             timeout_seconds: None,
             output: recipes::RecipeOutput::default(),
+            channel_send: None,
             desktop_turn: None,
             placed_run: None,
         }

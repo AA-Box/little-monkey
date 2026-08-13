@@ -214,33 +214,42 @@ pub fn present_plan_tool_def() -> serde_json::Value {
     })
 }
 
-/// The agent's reply-to-the-conversation tool, offered only on a run that
-/// arrived from a messaging channel.
+/// The agent's provider-independent messaging tool.
 ///
-/// It takes a message and nothing else. There is deliberately no account,
-/// conversation, thread or provider parameter: the destination is the origin
-/// the daemon durably recorded for this run, so the model cannot redirect a
-/// reply to a different conversation, a different account or a different
-/// person — including when the message it is answering asks it to. The
-/// transport is not the model's to choose.
+/// By default it answers the conversation the run came from: with every
+/// optional field omitted, the destination is the origin the daemon durably
+/// recorded for this run, so the message being answered cannot redirect the
+/// reply. `account`/`to`/`thread`/`reply_to` may name another destination,
+/// but each is honored only when the run's immutable permission snapshot
+/// granted it — naming an account id is not authority to use it, and the
+/// tool refuses rather than prompts when the grant is absent.
 ///
 /// Like [`present_plan_tool_def`], excluded from [`tool_definitions`]'s base
-/// array: a run with no channel origin has nowhere to send anything, and
-/// offering the tool there would only invite a failed call.
+/// array: a run with no channel origin and no cross-send grant has nowhere to
+/// send anything, and offering the tool there would only invite a failed call.
 pub fn send_message_tool_def() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
         "function": {
             "name": "send_message",
-            "description": "Send a message back to the conversation this run came from. The destination is fixed to that conversation — you cannot choose the account, thread, or recipient. Requires user permission.",
+            "description": "Send a message over a configured messaging channel. With no destination fields it replies to the conversation this run came from. Destinations other than that conversation work only if this run was explicitly granted them. Requires user permission.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "The message to send." },
+                    "account": { "type": "string", "description": "Optional configured account id to send through. Defaults to the account this run's conversation arrived on." },
+                    "to": { "type": "string", "description": "Optional destination conversation id. Defaults to the conversation this run came from." },
+                    "thread": { "type": "string", "description": "Optional provider thread id inside the destination conversation." },
+                    "reply_to": { "type": "string", "description": "Optional provider message id to reply to. Defaults to the message that produced this run when replying to it." },
                     "attachments": {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional files to send with the message, as paths inside this run's own directory. At most 4, each under 16 MB. Not every provider can carry files."
+                    },
+                    "artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional durable artifact ids of stored files to send, such as an image this conversation received earlier."
                     }
                 },
                 "required": ["text"],

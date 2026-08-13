@@ -875,31 +875,70 @@ async fn execute_tool_call(
     // - the destination comes from the durable event that produced this job, so
     //   there is no argument for the model to redirect.
     if name == "send_message" {
-        if !perms.allow_external_mutations() {
+        let authority = crate::daemon::channel_tool::send_authority(
+            perms.allow_external_mutations(),
+            perms.channel_send(),
+        );
+        if !authority.allows_anything() {
             return serde_json::json!({
                 "error": "This run's permission snapshot does not allow sending messages outside this machine."
             })
             .to_string();
         }
-        let text = args["text"].as_str().unwrap_or_default().to_string();
-        let attachments: Vec<String> = args["attachments"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Attaching a file sends its contents to someone outside this machine,
-        // so the approval prompt names every file. A preview of the text alone
-        // would ask the operator to approve the one part that is not the risk.
-        let mut preview: String = text.chars().take(120).collect();
-        if !attachments.is_empty() {
-            preview.push_str(&format!(" [files: {}]", attachments.join(", ")));
+        let string_arg = |key: &str| {
+            args[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let string_list = |key: &str| -> Vec<String> {
+            args[key]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: string_arg("account"),
+            conversation_id: string_arg("to"),
+            thread_id: string_arg("thread"),
+            reply_to_provider_id: string_arg("reply_to"),
+            text: args["text"].as_str().unwrap_or_default().to_string(),
+            attachment_paths: string_list("attachments"),
+            artifact_ids: string_list("artifacts"),
+        };
+        // The approval prompt names everything that makes this send what it
+        // is: an explicit destination (a reply to the origin conversation
+        // stays implicit, as before), every file, and the first line of text.
+        // A preview of the text alone would ask the operator to approve the
+        // one part that is not the risk.
+        let mut preview = String::new();
+        if let Some(account) = &request.account_id {
+            preview.push_str(&format!("[account: {account}] "));
+        }
+        if let Some(to) = &request.conversation_id {
+            preview.push_str(&format!("[to: {to}] "));
+        }
+        preview.extend(request.text.chars().take(120));
+        if !request.attachment_paths.is_empty() {
+            preview.push_str(&format!(
+                " [files: {}]",
+                request.attachment_paths.join(", ")
+            ));
+        }
+        if !request.artifact_ids.is_empty() {
+            preview.push_str(&format!(
+                " [artifacts: {}]",
+                request.artifact_ids.join(", ")
+            ));
         }
         return match perms.request("send_message", &preview).await {
-            Ok(()) => match crate::daemon::channel_tool::send_message(&text, &attachments) {
+            Ok(()) => match crate::daemon::channel_tool::send_message(&request, &authority) {
                 Ok(value) => value.to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
             },
@@ -1662,14 +1701,21 @@ async fn run_tool_loop(
     if perms.mode() == PermissionMode::Plan {
         tools_vec.push(tools_def::present_plan_tool_def());
     }
-    // `send_message` is offered only on a run that arrived from a messaging
-    // conversation and was granted the authority to answer it. A run with no
-    // origin has nowhere to send anything, and one without the grant would only
-    // be offered a tool that refuses.
-    if perms.allow_external_mutations()
-        && crate::daemon::channel_tool::current_channel_origin().is_some()
+    // `send_message` is offered only on a run that can actually reach
+    // somewhere: one that arrived from a messaging conversation and may answer
+    // it, or one whose snapshot grants another destination outright. A run
+    // with neither would only be offered a tool that refuses.
     {
-        tools_vec.push(tools_def::send_message_tool_def());
+        let authority = crate::daemon::channel_tool::send_authority(
+            perms.allow_external_mutations(),
+            perms.channel_send(),
+        );
+        let has_origin = crate::daemon::channel_tool::current_channel_origin().is_some();
+        let reachable = ((authority.reply || authority.cross_conversation) && has_origin)
+            || !authority.accounts.is_empty();
+        if reachable {
+            tools_vec.push(tools_def::send_message_tool_def());
+        }
     }
     // `peer_message` is offered only when this installation is paired with
     // another as a peer. Nothing to reach, nothing to offer.

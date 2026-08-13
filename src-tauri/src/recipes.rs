@@ -659,6 +659,13 @@ pub struct Recipe {
     pub timeout_seconds: Option<u64>,
     #[serde(default)]
     pub output: RecipeOutput,
+    /// Messaging destinations a run of this recipe may reach beyond answering
+    /// its own conversation — see [`crate::run_protocol::ChannelSendPolicy`].
+    /// Absent means reply-only, which is what every recipe written before this
+    /// field existed keeps meaning. Rejected alongside `desktop_turn`, whose
+    /// own permission policy carries the same grant.
+    #[serde(default)]
+    pub channel_send: Option<crate::run_protocol::ChannelSendPolicy>,
     /// Present only for immutable desktop turns submitted to the resident
     /// daemon. Hand-authored/scheduled recipes remain unchanged.
     #[serde(default)]
@@ -735,6 +742,16 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
     }
     if recipe.prompt.trim().is_empty() {
         return Err("recipe prompt must not be empty".to_string());
+    }
+    if let Some(channel_send) = &recipe.channel_send {
+        if recipe.desktop_turn.is_some() {
+            return Err(
+                "recipe channel_send is not allowed alongside desktop_turn — the desktop \
+                 turn's own permission policy carries that grant"
+                    .to_string(),
+            );
+        }
+        channel_send.validate().map_err(|error| error.to_string())?;
     }
     if let Some(snapshot) = &recipe.desktop_turn {
         snapshot.validate_for_recipe(recipe)?;
@@ -1402,6 +1419,7 @@ mod tests {
             max_iterations: None,
             timeout_seconds: None,
             output: RecipeOutput::default(),
+            channel_send: None,
             desktop_turn: None,
             placed_run: None,
         }
@@ -1532,6 +1550,7 @@ mod tests {
                 allow_network: false,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             generation: DesktopGenerationSettingsSnapshot {
                 temperature: None,
