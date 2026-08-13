@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use little_monkey_lib::channels::ingress::ConversationIngress;
+use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
@@ -42,8 +42,68 @@ const OUTBOX_BATCH: u32 = 16;
 /// testable without a configured daemon, while production does the real
 /// enqueue.
 pub(crate) trait RunQueue: Send + Sync {
+    /// Resolves what this turn will execute with, so it can be frozen onto the
+    /// durable row before anything runs.
+    ///
+    /// Separate from [`Self::submit`] because it happens at a different moment:
+    /// resolution is part of *accepting* a turn, submission is what happens to
+    /// an already-accepted one. Recovery calls only the second, which is what
+    /// stops a configuration edit from retargeting a message already promised a
+    /// run.
+    fn freeze_execution(
+        &self,
+        ingress: &ConversationIngress,
+    ) -> Result<FrozenExecutionContext, String>;
+
     /// Queues one accepted turn. Returns the daemon job id.
     fn submit(&self, ingress: &ConversationIngress, params: Vec<String>) -> Result<String, String>;
+}
+
+/// A frozen execution context for the test doubles that stand in for the
+/// daemon's queue.
+///
+/// Shared so every fake freezes the same shape, and so a test that asserts on
+/// what recovery replays is asserting on something with a real recipe in it.
+/// Never reachable from production: `DaemonChannelQueue` resolves the
+/// operator's own recipe instead.
+#[cfg(test)]
+pub(crate) fn test_frozen_execution(ingress: &ConversationIngress) -> FrozenExecutionContext {
+    use little_monkey_lib::channels::ingress::FrozenExecutionContextV1;
+
+    let recipe = little_monkey_lib::recipes::Recipe {
+        version: 1,
+        name: ingress.target.recipe.clone(),
+        description: None,
+        target: little_monkey_lib::recipes::RecipeTarget {
+            ollama: Some("qwen2.5:7b".to_string()),
+            ..Default::default()
+        },
+        workspace: Some("/tmp".to_string()),
+        permission_mode: "readonly".to_string(),
+        system: None,
+        prompt: "{{message}}".to_string(),
+        params: Default::default(),
+        max_iterations: None,
+        timeout_seconds: None,
+        output: Default::default(),
+        desktop_turn: None,
+        placed_run: None,
+    };
+    FrozenExecutionContext::V1(
+        FrozenExecutionContextV1 {
+            recipe_ref: ingress.target.recipe.clone(),
+            recipe_json: serde_json::to_string(&recipe).expect("serialize test recipe"),
+            recipe_source_path: Some("/tmp/test-recipe.json".to_string()),
+            workspace_path: Some("/tmp".to_string()),
+            model_target: "ollama:qwen2.5:7b".to_string(),
+            permission_mode: "readonly".to_string(),
+            credential_ref: None,
+            route_id: ingress.route_id.clone(),
+            route_digest: ingress.route_digest.clone(),
+            ..Default::default()
+        }
+        .seal(),
+    )
 }
 
 /// What one inbound pass did, for the caller's logs and for tests.
@@ -83,7 +143,9 @@ pub(crate) fn ingest_batch(
                     // leaves a row `recover_pending_ingress` finishes, rather
                     // than a message the provider considers delivered and the
                     // event log would refuse as a duplicate.
-                    match channel_ingress::submit_ingress(store, queue, &ingress, &params, now_ms) {
+                    match channel_ingress::submit_conversation_turn(
+                        store, queue, &ingress, &params, now_ms,
+                    ) {
                         Ok(SubmitOutcome::Queued { job_id, .. })
                         | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
                             report.accepted += 1;
@@ -264,6 +326,26 @@ const IDLE_TICK_MS: u64 = 2_000;
 /// account in the UI takes effect without restarting the daemon.
 const RELOAD_INTERVAL_MS: u64 = 30_000;
 
+/// How often accepted-but-unqueued turns are retried. Slow on purpose: what it
+/// retries are local failures — a full queue, an engaged kill switch — and
+/// hammering them buys nothing. The submission attempt budget bounds it.
+const RECOVERY_INTERVAL_MS: u64 = 60_000;
+
+/// One recovery pass, reporting only when it did something.
+fn recover_accepted_turns(paths: &super::store::DaemonPaths, queue: &dyn RunQueue) {
+    let (Ok(mut store), Ok(now)) = (DaemonStore::open(paths), current_ms()) else {
+        return;
+    };
+    match channel_ingress::recover_pending_ingress(&mut store, queue, now) {
+        Ok(recovery) if recovery.resubmitted + recovery.parked > 0 => eprintln!(
+            "monkey daemon: resumed {} accepted turn(s), parked {}",
+            recovery.resubmitted, recovery.parked
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!("monkey daemon: could not resume accepted turns: {error}"),
+    }
+}
+
 /// Run the channel subsystem for as long as the daemon lives.
 ///
 /// One task for every account rather than one per account: polling is a
@@ -289,22 +371,10 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
 
-        // Turns that were accepted but never queued are the other half of a
-        // crash: the provider considers them delivered, so nobody else will
-        // ever send them again.
-        if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
-            match channel_ingress::recover_pending_ingress(&mut store, queue.as_ref(), now) {
-                Ok(recovery) if recovery.resubmitted + recovery.parked > 0 => eprintln!(
-                    "monkey daemon: resumed {} accepted turn(s) after a restart, parked {}",
-                    recovery.resubmitted, recovery.parked
-                ),
-                Ok(_) => {}
-                Err(error) => eprintln!("monkey daemon: could not resume accepted turns: {error}"),
-            }
-        }
-
         let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
+        // Zero, so the first pass through the loop is the startup recovery.
+        let mut next_recovery_ms = 0_u64;
 
         loop {
             let now = match current_ms() {
@@ -315,6 +385,22 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
                 }
             };
             let now_u64 = u64::try_from(now).unwrap_or(0);
+
+            // Turns that were accepted but never queued are the other half of
+            // a crash: whoever sent them considers them delivered, so nobody
+            // else will ever send them again. Every origin's turns land in the
+            // same table, so this covers all six — and it runs before the
+            // adapters load, because a node with no messaging account at all
+            // still has desktop, voice, mobile, peer and phone turns to finish.
+            //
+            // Repeated rather than done once at startup: a turn the queue
+            // refused stays accepted, and leaving it until the next restart is
+            // not what "recovery will try again" means to whoever is waiting
+            // for an answer.
+            if now_u64 >= next_recovery_ms {
+                next_recovery_ms = now_u64.saturating_add(RECOVERY_INTERVAL_MS);
+                recover_accepted_turns(&paths, queue.as_ref());
+            }
 
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
@@ -492,6 +578,13 @@ mod tests {
     }
 
     impl RunQueue for FakeQueue {
+        fn freeze_execution(
+            &self,
+            ingress: &ConversationIngress,
+        ) -> Result<FrozenExecutionContext, String> {
+            Ok(super::test_frozen_execution(ingress))
+        }
+
         fn submit(
             &self,
             ingress: &ConversationIngress,

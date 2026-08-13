@@ -87,6 +87,10 @@ pub struct StoredIngressTurn {
     pub job_id: Option<String>,
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// Which frozen-context shape this turn was accepted with, and its digest.
+    /// Both absent for a turn accepted before execution contexts were frozen.
+    pub execution_version: Option<u32>,
+    pub execution_digest: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -128,8 +132,10 @@ impl DaemonStore {
                 "INSERT INTO ingress_turns (
                     ingress_id, dedupe_key, source, source_account_id, source_event_id,
                     session_key, state, ingress_json, params_json, job_id, attempts,
-                    last_error, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, NULL, 0, NULL, ?9, ?9)
+                    last_error, execution_version, execution_digest,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, NULL, 0, NULL,
+                           ?9, ?10, ?11, ?11)
                  ON CONFLICT(dedupe_key) DO NOTHING",
                 params![
                     ingress_id,
@@ -140,6 +146,14 @@ impl DaemonStore {
                     ingress.session_key,
                     ingress_json,
                     params_json,
+                    ingress
+                        .execution
+                        .as_ref()
+                        .map(|execution| i64::from(execution.version())),
+                    ingress
+                        .execution
+                        .as_ref()
+                        .map(|execution| execution.digest().to_string()),
                     now_ms,
                 ],
             )
@@ -261,7 +275,8 @@ impl DaemonStore {
             .connection
             .prepare(
                 "SELECT ingress_id, source, source_account_id, source_event_id, session_key,
-                        state, job_id, attempts, last_error, created_at_ms, updated_at_ms
+                        state, job_id, attempts, last_error, execution_version, execution_digest,
+                        created_at_ms, updated_at_ms
                  FROM ingress_turns ORDER BY created_at_ms DESC LIMIT ?1",
             )
             .map_err(|error| error.to_string())?;
@@ -279,7 +294,8 @@ impl DaemonStore {
         self.connection
             .query_row(
                 "SELECT ingress_id, source, source_account_id, source_event_id, session_key,
-                        state, job_id, attempts, last_error, created_at_ms, updated_at_ms
+                        state, job_id, attempts, last_error, execution_version, execution_digest,
+                        created_at_ms, updated_at_ms
                  FROM ingress_turns WHERE ingress_id=?1",
                 [ingress_id],
                 read_ingress_turn,
@@ -312,8 +328,12 @@ fn read_ingress_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<IngressRow> {
         job_id: row.get(6)?,
         attempts: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(u32::MAX),
         last_error: row.get(8)?,
-        created_at_ms: row.get(9)?,
-        updated_at_ms: row.get(10)?,
+        execution_version: row
+            .get::<_, Option<i64>>(9)?
+            .and_then(|version| u32::try_from(version).ok()),
+        execution_digest: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
     }))
 }
 

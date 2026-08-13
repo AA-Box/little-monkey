@@ -613,9 +613,28 @@ pub fn m7_overlay_submit(
     text: String,
     image_data_url: Option<String>,
     source: String,
+    // Present only for a finalized hands-free utterance: the id of the
+    // recognition job that produced this text.
+    //
+    // It is what makes the spoken turn durable *and* exactly-once — it becomes
+    // the turn's ingress dedupe identity, so a submission retried after a
+    // timeout lands on the run the first attempt made. Absent means the text
+    // goes to the composer for the operator to read and send, which is the
+    // push-to-talk behavior and stays unchanged.
+    utterance_id: Option<String>,
 ) -> Result<(), String> {
     if window.label() != "companion-overlay" {
         return Err("Only the companion overlay can submit companion context".to_string());
+    }
+    if let Some(utterance_id) = &utterance_id {
+        if utterance_id.is_empty()
+            || utterance_id.len() > 128
+            || !utterance_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        {
+            return Err("Companion utterance id is invalid".to_string());
+        }
     }
     let text = text.trim().to_string();
     if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
@@ -632,7 +651,12 @@ pub fn m7_overlay_submit(
     app.emit_to(
         "main",
         "m7://compose",
-        json!({"text": text, "imageDataUrl": image_data_url, "source": source}),
+        json!({
+            "text": text,
+            "imageDataUrl": image_data_url,
+            "source": source,
+            "utteranceId": utterance_id,
+        }),
     )
     .map_err(|error| error.to_string())?;
     window.hide().map_err(|error| error.to_string())?;

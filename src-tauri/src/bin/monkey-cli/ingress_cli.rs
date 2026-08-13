@@ -67,13 +67,27 @@ pub fn list(source: Option<&str>, limit: u32, json: bool) -> Result<(), String> 
         return Ok(());
     }
     for turn in &turns {
+        // Enough to answer "did this arrive, what did it become, and under
+        // which configuration" without reaching for --json. The frozen-context
+        // digest is truncated the way a commit hash is: long enough to compare
+        // two turns by eye, short enough to fit on the line.
         println!(
-            "{}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  attempts={}  {}{}",
             turn.created_at_ms,
             turn.source.as_str(),
+            turn.source_account_id,
+            turn.source_event_id,
             turn.state.as_str(),
             turn.job_id.as_deref().unwrap_or("-"),
-            turn.session_key
+            turn.attempts,
+            match (&turn.execution_version, &turn.execution_digest) {
+                (Some(version), Some(digest)) => format!("cfg=v{version}:{}", &digest[..12]),
+                _ => "cfg=-".to_string(),
+            },
+            match &turn.last_error {
+                Some(error) => format!("  {error}"),
+                None => String::new(),
+            }
         );
     }
     Ok(())
@@ -105,6 +119,11 @@ fn turn_json(store: &DaemonStore, turn: &StoredIngressTurn) -> Result<serde_json
         "state": turn.state.as_str(),
         "attempts": turn.attempts,
         "last_error": turn.last_error,
+        // Which configuration this turn was accepted under. The digest is what
+        // an operator compares when a recovered run behaves like a different
+        // one; the definition behind it is deliberately not exposed here.
+        "execution_version": turn.execution_version,
+        "execution_digest": turn.execution_digest,
         "job_id": turn.job_id,
         "run_id": job.as_ref().and_then(|job| job.run_id.clone()),
         "run_state": job.as_ref().map(|job| job.state.token()),

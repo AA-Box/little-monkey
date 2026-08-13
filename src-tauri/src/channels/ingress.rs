@@ -110,6 +110,132 @@ impl UntrustedText {
     }
 }
 
+/// Everything an accepted turn will execute with, resolved once at the moment
+/// it was accepted.
+///
+/// A route reference is not enough. A route names a recipe, and a recipe is a
+/// file an operator can edit — so a message accepted on Monday and recovered on
+/// Tuesday would run whatever Tuesday's configuration says, which is not what
+/// was accepted. This carries the resolved definition itself, so recovery
+/// replays the turn rather than re-resolving it.
+///
+/// Versioned as an enum rather than a struct with a number inside it: a future
+/// shape is a new variant, and a row written by an older build keeps
+/// deserializing into the variant it was written as.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version")]
+pub enum FrozenExecutionContext {
+    #[serde(rename = "1")]
+    V1(FrozenExecutionContextV1),
+}
+
+impl FrozenExecutionContext {
+    pub fn version(&self) -> u32 {
+        match self {
+            FrozenExecutionContext::V1(_) => 1,
+        }
+    }
+
+    /// Digest of the whole frozen context. What an operator compares when they
+    /// need to prove which configuration a run was accepted under.
+    pub fn digest(&self) -> &str {
+        match self {
+            FrozenExecutionContext::V1(context) => &context.digest,
+        }
+    }
+
+    pub fn as_v1(&self) -> &FrozenExecutionContextV1 {
+        match self {
+            FrozenExecutionContext::V1(context) => context,
+        }
+    }
+}
+
+/// The first frozen shape.
+///
+/// # What is deliberately absent
+///
+/// A credential. `credential_ref` names *which* credential the run will need —
+/// a provider id, an Ollama or managed-runtime model, a local origin — and the
+/// secret behind it is resolved at execution time from the operator's own
+/// store. If it has been deleted by then the run fails saying so, which is the
+/// only honest outcome: silently picking a model the operator did not choose
+/// would make a frozen context a lie.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenExecutionContextV1 {
+    /// What the route asked for: a recipe name, or a path to a snapshot.
+    pub recipe_ref: String,
+    /// The resolved recipe, serialized exactly as it was read. This — not
+    /// `recipe_ref` — is what executes.
+    pub recipe_json: String,
+    /// sha256 of `recipe_json`.
+    pub recipe_digest: String,
+    /// Where the recipe resolved from. Diagnostic only; never re-read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_source_path: Option<String>,
+    /// Canonical workspace the run executes in, resolved at accept time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// The model the recipe named, in one line a listing can show.
+    pub model_target: String,
+    pub permission_mode: String,
+    /// Identifier for the credential the model needs, never the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_id: Option<String>,
+    pub route_digest: String,
+    /// sha256 over every field above. Filled in by [`Self::seal`].
+    pub digest: String,
+}
+
+impl FrozenExecutionContextV1 {
+    /// Compute the two digests and hand back the sealed context.
+    ///
+    /// Separate from construction so the caller writes a struct literal with
+    /// the fields it resolved and cannot forget one; calling this twice is
+    /// harmless because it overwrites rather than accumulates.
+    pub fn seal(mut self) -> Self {
+        self.recipe_digest = hex_digest(&[self.recipe_json.as_bytes()]);
+        self.digest = String::new();
+        self.digest = hex_digest(&[
+            self.recipe_ref.as_bytes(),
+            self.recipe_digest.as_bytes(),
+            self.recipe_source_path.as_deref().unwrap_or("").as_bytes(),
+            self.workspace_path.as_deref().unwrap_or("").as_bytes(),
+            self.model_target.as_bytes(),
+            self.permission_mode.as_bytes(),
+            self.credential_ref.as_deref().unwrap_or("").as_bytes(),
+            self.route_id.as_deref().unwrap_or("").as_bytes(),
+            self.route_digest.as_bytes(),
+        ]);
+        self
+    }
+
+    /// Whether `recipe_json` is still the text `recipe_digest` was taken over.
+    ///
+    /// Checked before a recovered turn executes: a frozen context that no
+    /// longer matches its own digest is corruption, and running it anyway would
+    /// defeat the point of freezing it.
+    pub fn recipe_matches_digest(&self) -> bool {
+        hex_digest(&[self.recipe_json.as_bytes()]) == self.recipe_digest
+    }
+}
+
+/// sha256 over the parts, separated so two different splits cannot collide.
+fn hex_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// A durable, deduplicated, route-frozen external turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationIngress {
@@ -138,6 +264,14 @@ pub struct ConversationIngress {
     /// own target (mobile, peer) instead of resolving a channel route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_id: Option<String>,
+    /// The resolved execution configuration, frozen when the turn was accepted.
+    ///
+    /// Absent only between building the record and submitting it — the
+    /// submission service fills it in before the row is written, so every
+    /// stored turn has one, and recovery executes from it rather than from
+    /// whatever the operator's configuration says by then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<FrozenExecutionContext>,
     /// How many automated replies deep this turn is. Zero for a turn a human
     /// originated; incremented when an agent's own output triggers another turn.
     #[serde(default)]
@@ -166,6 +300,7 @@ impl ConversationIngress {
             route_digest: route.target.digest(),
             target: route.target.clone(),
             route_id: Some(route.route_id.clone()),
+            execution: None,
             reply_depth: 0,
             automation_origin: false,
             received_at_ms: envelope.received_at_ms,
@@ -194,11 +329,18 @@ impl ConversationIngress {
             route_digest: target.digest(),
             target,
             route_id: None,
+            execution: None,
             reply_depth: 0,
             automation_origin: false,
             received_at_ms,
             metadata: BoundedMetadata::new(),
         }
+    }
+
+    /// Attach the execution configuration resolved for this turn.
+    pub fn with_execution(mut self, execution: FrozenExecutionContext) -> Self {
+        self.execution = Some(execution);
+        self
     }
 
     /// Mark this turn as automation-originated at the given reply depth.

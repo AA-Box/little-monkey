@@ -18,6 +18,8 @@ function turn(overrides: Partial<IngressTurn> = {}): IngressTurn {
     state: "queued",
     attempts: 1,
     last_error: null,
+    execution_version: 1,
+    execution_digest: "d".repeat(64),
     job_id: "ingress-abc",
     run_id: "run-1",
     run_state: "running",

@@ -436,9 +436,10 @@ pub(super) fn queue_options_for(
         deterministic_job_id: Some(ingress.deterministic_job_id()),
         priority: ingress.target.priority,
         max_attempts: 1,
-        // Half an hour, matching the mobile turn. A conversation nobody is
-        // watching should not be able to hold a slot for a week.
-        max_runtime_ms: 30 * 60 * 1_000,
+        // Half an hour unless the frozen recipe asked for less. A conversation
+        // nobody is watching should not be able to hold a slot for a week, and
+        // a recipe that wants longer than the ceiling does not get it.
+        max_runtime_ms: frozen_timeout_ms(ingress).unwrap_or(DEFAULT_TURN_RUNTIME_MS),
         max_memory_bytes: None,
         owned_worktree: false,
         repository: ingress.target.repository.as_ref().map(PathBuf::from),
@@ -454,7 +455,32 @@ pub(super) fn queue_options_for(
         // strangers, never merged with whatever rules sit in the daemon
         // process's working directory.
         snapshot_is_frozen: true,
+        // The definition resolved when the turn was accepted, so the queue
+        // never re-reads a recipe file that may have changed since.
+        frozen_execution: ingress
+            .execution
+            .as_ref()
+            .map(|execution| execution.as_v1().clone()),
     }
+}
+
+/// How long a turn runs when its recipe does not say. Half an hour: a
+/// conversation nobody is watching should not hold a slot indefinitely.
+const DEFAULT_TURN_RUNTIME_MS: u64 = 30 * 60 * 1_000;
+
+/// The longest any conversational turn may run, whatever its recipe asks for.
+const MAX_TURN_RUNTIME_MS: u64 = 24 * 60 * 60 * 1_000;
+
+/// What the frozen recipe asked for, capped at the ceiling.
+fn frozen_timeout_ms(ingress: &ConversationIngress) -> Option<u64> {
+    let recipe: little_monkey_lib::recipes::Recipe =
+        serde_json::from_str(&ingress.execution.as_ref()?.as_v1().recipe_json).ok()?;
+    Some(
+        recipe
+            .timeout_seconds?
+            .saturating_mul(1_000)
+            .min(MAX_TURN_RUNTIME_MS),
+    )
 }
 
 /// How many times a turn may fail to reach the queue before it is parked.
@@ -481,24 +507,46 @@ pub(crate) enum SubmitOutcome {
     Deferred { ingress_id: String, error: String },
 }
 
-/// Accept a turn durably, then queue it.
+/// Turn one accepted conversational turn into a durable run.
 ///
-/// The order is the whole point. The row goes in first, so a crash before the
-/// queue write leaves a turn that recovery can finish rather than a message
-/// that was acknowledged to the provider and then lost. The queue write is
-/// deterministic-id'd, so a recovery pass that runs while the original
-/// submission is still in flight cannot produce a second run.
+/// **This is the only way a conversation becomes work.** Desktop, mobile, a
+/// messaging channel, a peer node, a voice utterance and a phone call differ in
+/// how they authenticate a sender and how they *build* a
+/// [`ConversationIngress`]; from here on they are the same thing, and no origin
+/// may reach the queue any other way.
 ///
-/// Every origin uses this: a messaging adapter, an inbound call, a peer
-/// handover and a voice utterance differ in how they *build* a
-/// [`ConversationIngress`], never in how it becomes a run.
-pub(crate) fn submit_ingress(
+/// The steps, in the order that makes a crash survivable:
+///
+/// 1. validate the ingress — a turn with no dedupe identity cannot be made
+///    exactly-once, so it is refused rather than run;
+/// 2. resolve its execution target and freeze it, if the caller has not already;
+/// 3. persist the accepted turn, with that frozen context, before anything runs;
+/// 4. submit it under its deterministic job id;
+/// 5. mark it queued.
+///
+/// A crash between any two of those leaves a row [`recover_pending_ingress`]
+/// finishes. The queue write is deterministic-id'd, so a recovery pass that
+/// races the original submission produces one run, not two.
+pub(crate) fn submit_conversation_turn(
     store: &mut DaemonStore,
     queue: &dyn super::channel_worker::RunQueue,
     ingress: &ConversationIngress,
     params: &[String],
     now_ms: i64,
 ) -> Result<SubmitOutcome, String> {
+    validate_ingress(ingress)?;
+    // Resolved once, here, and never again: recovery replays what this froze.
+    // An origin that resolved its own context (the desktop bridge reads the
+    // recipe to build the turn's text from it) keeps the one it resolved.
+    let frozen;
+    let ingress = if ingress.execution.is_some() {
+        ingress
+    } else {
+        frozen = ingress
+            .clone()
+            .with_execution(queue.freeze_execution(ingress)?);
+        &frozen
+    };
     let ingress_id = match store.accept_ingress_turn(ingress, params, now_ms)? {
         IngressAcceptance::Accepted { ingress_id } => ingress_id,
         IngressAcceptance::Existing {
@@ -527,6 +575,32 @@ pub(crate) fn submit_ingress(
         0,
         now_ms,
     ))
+}
+
+/// What every origin has to supply before a turn can be made exactly-once.
+///
+/// Checked here rather than at each origin because the guarantee is this
+/// function's: a blank `source_event_id` would make `dedupe_key` collide across
+/// unrelated turns of the same account, which is worse than refusing.
+fn validate_ingress(ingress: &ConversationIngress) -> Result<(), String> {
+    if ingress.source_account_id.trim().is_empty() {
+        return Err("A conversation turn must name the account it arrived on".to_string());
+    }
+    if ingress.source_event_id.trim().is_empty() {
+        return Err(
+            "A conversation turn must carry its origin's own event id, or it cannot be deduplicated"
+                .to_string(),
+        );
+    }
+    if ingress.session_key.trim().is_empty() {
+        return Err("A conversation turn must name the session it continues".to_string());
+    }
+    if !ingress.has_content() {
+        return Err(
+            "A conversation turn with no text and no attachments has nothing to run".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Re-submit turns that were accepted before the process stopped.
@@ -963,6 +1037,15 @@ mod tests {
     }
 
     impl super::super::channel_worker::RunQueue for FakeQueue {
+        fn freeze_execution(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+            Ok(crate::daemon::channel_worker::test_frozen_execution(
+                ingress,
+            ))
+        }
+
         fn submit(
             &self,
             ingress: &ConversationIngress,
@@ -1005,7 +1088,8 @@ mod tests {
             ConversationSource::Desktop,
         ] {
             let ingress = ingress_for(source, "e-1");
-            let outcome = submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+            let outcome =
+                submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW).expect("submit");
             assert_eq!(
                 outcome,
                 SubmitOutcome::Queued {
@@ -1029,7 +1113,7 @@ mod tests {
         let ingress = ingress_for(ConversationSource::Telephone, "call-1");
 
         let SubmitOutcome::Deferred { ingress_id, error } =
-            submit_ingress(&mut store, &queue, &ingress, &["message=hi".into()], NOW)
+            submit_conversation_turn(&mut store, &queue, &ingress, &["message=hi".into()], NOW)
                 .expect("submit")
         else {
             panic!("expected the turn to be deferred");
@@ -1051,7 +1135,14 @@ mod tests {
 
         let submissions = queue.submissions();
         assert_eq!(submissions.len(), 1);
-        assert_eq!(submissions[0].0, ingress);
+        assert_eq!(
+            submissions[0].0,
+            ingress
+                .clone()
+                .with_execution(super::super::channel_worker::test_frozen_execution(
+                    &ingress
+                ))
+        );
         assert_eq!(submissions[0].1, ["message=hi"]);
 
         let stored = store.ingress_turn(&ingress_id).unwrap().expect("row");
@@ -1068,7 +1159,7 @@ mod tests {
         let queue = FakeQueue::default();
         let ingress = ingress_for(ConversationSource::Peer, "handover-1");
 
-        submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW).expect("submit");
         let recovery = recover_pending_ingress(&mut store, &queue, NOW + 1).expect("recover");
 
         assert_eq!(recovery, IngressRecovery::default());
@@ -1081,9 +1172,10 @@ mod tests {
         let queue = FakeQueue::default();
         let ingress = ingress_for(ConversationSource::MessagingChannel, "e-1");
 
-        let first = submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
-        let second =
-            submit_ingress(&mut store, &queue, &ingress, &[], NOW + 60_000).expect("resubmit");
+        let first =
+            submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        let second = submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW + 60_000)
+            .expect("resubmit");
 
         let (
             SubmitOutcome::Queued { ingress_id, job_id },
@@ -1108,7 +1200,7 @@ mod tests {
         let PlannedDecision::Run { ingress, params } = planned.decision else {
             panic!("expected a run");
         };
-        submit_ingress(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+        submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
         // The operator edits the route, and the sender loses access, while the
         // turn is sitting in the accepted state.
@@ -1141,7 +1233,7 @@ mod tests {
         let queue = FakeQueue::failing();
         let ingress = ingress_for(ConversationSource::Voice, "utt-1");
 
-        submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("submit");
+        submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW).expect("submit");
         for _ in 1..MAX_SUBMIT_ATTEMPTS {
             recover_pending_ingress(&mut store, &queue, NOW).expect("recover");
         }
@@ -1154,7 +1246,7 @@ mod tests {
         // A parked turn stays parked: a redelivery must not restart the loop.
         queue.recover();
         assert!(matches!(
-            submit_ingress(&mut store, &queue, &ingress, &[], NOW).expect("resubmit"),
+            submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW).expect("resubmit"),
             SubmitOutcome::Parked { .. }
         ));
         assert!(queue.submissions().is_empty());
@@ -1169,7 +1261,7 @@ mod tests {
         else {
             panic!("expected a run");
         };
-        submit_ingress(&mut store, &queue, &ingress, &params, NOW).expect("submit");
+        submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
         let listed = &store.recent_ingress_turns(10).unwrap()[0];
         assert_eq!(listed.source, ConversationSource::MessagingChannel);

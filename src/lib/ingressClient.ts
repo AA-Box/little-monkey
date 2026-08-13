@@ -43,6 +43,11 @@ export interface IngressTurn {
   attempts: number;
   /** Why the last submission attempt failed, if one did. */
   last_error: string | null;
+  /** Which frozen-execution shape the turn was accepted with, and its digest.
+   * Both null for a turn accepted before contexts were frozen. The digest is
+   * what proves two runs of the same turn used the same configuration. */
+  execution_version: number | null;
+  execution_digest: string | null;
   job_id: string | null;
   run_id: string | null;
   run_state: string | null;

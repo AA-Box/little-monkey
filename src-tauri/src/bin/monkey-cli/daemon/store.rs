@@ -2012,6 +2012,26 @@ CREATE INDEX IF NOT EXISTS peer_messages_thread_idx
 CREATE INDEX IF NOT EXISTS peer_messages_job_idx ON peer_messages(job_id);
 "#;
 
+const DAEMON_V11: i64 = 11;
+const DAEMON_V11_CHECKSUM: &str = "daemon-jobs-v11-ingress-execution-snapshot";
+
+/// The frozen execution context's identity, alongside the turn it belongs to.
+///
+/// The context itself lives inside `ingress_json`, where it is what the turn
+/// executes. These two columns are the *observability* half: an operator asking
+/// "which configuration was this accepted under?" gets an answer without the
+/// listing having to parse a recipe out of a JSON blob, and two turns that
+/// disagree about their digest are visible side by side.
+///
+/// Nullable because turns accepted by an earlier build have no frozen context.
+/// Those rows keep working — they resolve their recipe at execution time, the
+/// behavior they were accepted with — and nothing backfills a digest for a
+/// configuration nobody recorded.
+const DAEMON_V11_SQL: &str = r#"
+ALTER TABLE ingress_turns ADD COLUMN execution_version INTEGER;
+ALTER TABLE ingress_turns ADD COLUMN execution_digest TEXT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2033,12 +2053,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V8, DAEMON_V8_CHECKSUM, DAEMON_V8_SQL),
     (DAEMON_V9, DAEMON_V9_CHECKSUM, DAEMON_V9_SQL),
     (DAEMON_V10, DAEMON_V10_CHECKSUM, DAEMON_V10_SQL),
+    (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V10;
+const DAEMON_LATEST: i64 = DAEMON_V11;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2133,6 +2154,58 @@ mod tests {
         assert_eq!(job.state, JobState::Running, "the row survives the upgrade");
         assert_eq!(job.hold_reason, None, "the new column reads as unset");
         assert!(store.committed_reservations().unwrap().is_empty());
+    }
+
+    /// A turn accepted before execution contexts were frozen has to survive the
+    /// upgrade, and read back as a turn with no frozen context — not as one
+    /// with today's configuration stamped onto it.
+    #[test]
+    fn an_ingress_row_written_before_the_execution_columns_upgrades_in_place() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V10 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, attempts,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-old', 'peer:node-1:handover-1', 'peer', 'node-1',
+                           'handover-1', 'peer:node-1', 'accepted', '{}', '[]', 0, 1, 1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let turn = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(turn.ingress_id, "ingr-old");
+        assert_eq!(
+            turn.state,
+            crate::daemon::ingress_store::IngressState::Accepted
+        );
+        assert_eq!(turn.execution_version, None);
+        assert_eq!(turn.execution_digest, None);
     }
 
     /// Re-running the loop is a no-op, and a checksum that no longer matches its

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   daemonCancel: vi.fn(async () => "ok"),
+  daemonDesktopTurnSubmit: vi.fn(),
   loadRunEvents: vi.fn(),
   getRun: vi.fn(),
 }));
@@ -9,6 +10,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("./daemonClient", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./daemonClient")>()),
   daemonCancel: mocks.daemonCancel,
+  daemonDesktopTurnSubmit: mocks.daemonDesktopTurnSubmit,
 }));
 
 vi.mock("./runProtocol", async (importOriginal) => ({
@@ -28,6 +30,7 @@ import {
   projectDaemonTurnEvents,
   removeActiveDaemonTurn,
   saveActiveDaemonTurn,
+  submitDaemonDesktopTurn,
   watchDaemonDesktopTurn,
   type DaemonTurnProjection,
 } from "./daemonDesktopTurn";
@@ -268,5 +271,46 @@ describe("daemon desktop routing and event replay", () => {
     expect(mocks.daemonCancel).toHaveBeenCalledWith("r", "Stopped from desktop chat");
     expect(final).toMatchObject({ terminal: true, terminalStatus: "cancelled", lastSequence: 2 });
     expect(projections).toHaveLength(1);
+  });
+});
+
+describe("submitting one turn", () => {
+  beforeEach(() => {
+    mocks.daemonDesktopTurnSubmit.mockReset();
+  });
+
+  it("keeps the same turn id across a retried bridge call, so one send is one run", async () => {
+    const queued = { job_id: "job-1", run_id: "run-1", state: "queued" };
+    mocks.daemonDesktopTurnSubmit
+      .mockRejectedValueOnce(new Error("the bridge timed out"))
+      .mockResolvedValueOnce(queued);
+
+    const recipe = { name: "desktop-turn-1" } as never;
+    await expect(submitDaemonDesktopTurn("turn-1", recipe)).resolves.toEqual(queued);
+
+    expect(mocks.daemonDesktopTurnSubmit).toHaveBeenCalledTimes(2);
+    for (const call of mocks.daemonDesktopTurnSubmit.mock.calls) {
+      // The dedupe identity is generated once, by the client, and reused. A
+      // fresh id per attempt would turn one send into two runs.
+      expect(call[0]).toMatchObject({ turnId: "turn-1", source: "desktop" });
+    }
+  });
+
+  it("labels a finalized spoken utterance as a voice turn", async () => {
+    mocks.daemonDesktopTurnSubmit.mockResolvedValue({ job_id: "j", run_id: "r", state: "queued" });
+    await submitDaemonDesktopTurn("microphone-abc", { name: "desktop-microphone-abc" } as never, "voice");
+    expect(mocks.daemonDesktopTurnSubmit).toHaveBeenCalledWith({
+      turnId: "microphone-abc",
+      recipe: { name: "desktop-microphone-abc" },
+      source: "voice",
+    });
+  });
+
+  it("surfaces the last failure once the attempts are spent", async () => {
+    mocks.daemonDesktopTurnSubmit.mockRejectedValue(new Error("the runner is gone"));
+    await expect(submitDaemonDesktopTurn("turn-1", { name: "x" } as never)).rejects.toThrow(
+      "the runner is gone",
+    );
+    expect(mocks.daemonDesktopTurnSubmit).toHaveBeenCalledTimes(3);
   });
 });

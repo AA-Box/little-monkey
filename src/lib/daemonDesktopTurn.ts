@@ -394,8 +394,38 @@ export async function daemonDesktopRoute(): Promise<"fallback" | "daemon"> {
   return daemonRouteFromStatus(await daemonStatus());
 }
 
-export function submitDaemonDesktopTurn(turnId: string, recipe: DesktopTurnRecipe): Promise<DaemonTurnSubmitResponse> {
-  return daemonDesktopTurnSubmit({ turnId, recipe });
+/** Which of the operator's own surfaces a turn was spoken or typed on. */
+export type DesktopTurnSource = "desktop" | "voice";
+
+/** How many times one send may reach the bridge. */
+const SUBMIT_ATTEMPTS = 3;
+
+/**
+ * Hands one turn to the resident runner, retrying a transport failure under
+ * the SAME turn id.
+ *
+ * The id is what makes the retry safe. A bridge call can time out after the
+ * daemon has already accepted the turn, so a second attempt has to be able to
+ * land on the run the first one created — which it does, because the turn id
+ * is the ingress dedupe identity and the daemon answers a repeat with the job
+ * it already has. Minting a fresh id per attempt is the bug this exists to
+ * prevent: it would turn one send into two runs.
+ */
+export async function submitDaemonDesktopTurn(
+  turnId: string,
+  recipe: DesktopTurnRecipe,
+  source: DesktopTurnSource = "desktop",
+): Promise<DaemonTurnSubmitResponse> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < SUBMIT_ATTEMPTS; attempt += 1) {
+    try {
+      return await daemonDesktopTurnSubmit({ turnId, recipe, source });
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < SUBMIT_ATTEMPTS) await wait(POLL_INTERVAL_MS * (attempt + 1));
+    }
+  }
+  throw lastError;
 }
 
 function emptyProjection(link: ActiveDaemonDesktopTurn): DaemonTurnProjection {

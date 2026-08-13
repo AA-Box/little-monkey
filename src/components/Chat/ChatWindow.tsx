@@ -640,6 +640,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     });
   }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
+  // One finalized spoken utterance, sent as its own turn.
+  //
+  // `utteranceId` is the recognition job's id, minted before the audio was
+  // transcribed, and it travels all the way to the durable ingress row as the
+  // turn's dedupe identity: a submission retried after a timeout lands on the
+  // run the first attempt made instead of starting a second one. Only the
+  // final transcript gets here — partial recognition never becomes a turn.
+  const sendVoiceTurn = useCallback((text: string, utteranceId: string) => {
+    setError(null);
+    void runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, "voice")
+      .catch((err: unknown) => {
+        setError(errorMessage(err));
+      });
+  }, [sessionId]);
+
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
   // the currently active primary composer accepts it here for user review
@@ -649,6 +664,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     let unlisten: (() => void) | null = null;
     void companionClient.onCompose((payload) => {
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
+      // A finalized hands-free utterance is a turn the operator already made,
+      // out loud. It becomes a durable `voice` ingress turn under the
+      // recognition job's own id, rather than text waiting in the box — see
+      // `sendVoiceTurn`. Everything else still waits for Send.
+      if (payload.utteranceId) {
+        sendVoiceTurn(payload.text, payload.utteranceId);
+        return;
+      }
       setInput(payload.text);
       if (payload.imageDataUrl) {
         setAttachments((current) => [
@@ -673,7 +696,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       disposed = true;
       unlisten?.();
     };
-  }, [resizeTextarea, sessionId]);
+  }, [resizeTextarea, sendVoiceTurn, sessionId]);
 
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);

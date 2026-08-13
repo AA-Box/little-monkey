@@ -25,6 +25,11 @@ export function CompanionOverlay() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [recording, setRecording] = useState<"microphone" | "meeting" | null>(null);
+  // Hands-free: a finalized microphone utterance is sent as its own turn
+  // instead of landing in the box for the operator to read first. Off by
+  // default — speaking into a machine that acts without showing you what it
+  // heard is a thing to opt into, not a default.
+  const [handsFree, setHandsFree] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -155,9 +160,16 @@ export function CompanionOverlay() {
                 transcript,
               ].join("\n\n");
               setText((current) => current ? `${current}\n\n${request}` : request);
+            } else if (handsFree && result.text.trim()) {
+              // The recognition job id, minted before the audio was sent, is
+              // this utterance's stable identity. Reusing it is what stops a
+              // resubmitted turn from becoming a second run — see
+              // `ConversationSource::Voice`.
+              return companionClient.submitOverlay(result.text.trim(), "voice", null, jobId);
             } else {
               setText((current) => current ? `${current}\n${result.text}` : result.text);
             }
+            return undefined;
           })
           .catch((reason) => setError(message(reason)))
           .finally(() => setBusy(null));
@@ -169,7 +181,7 @@ export function CompanionOverlay() {
       setRecording(null);
       setError(message(reason));
     }
-  }, [busy, ensureGrant, recording]);
+  }, [busy, ensureGrant, handsFree, recording]);
 
   const emergencyStop = useCallback(async () => {
     recorderRef.current?.stop();
@@ -275,6 +287,16 @@ export function CompanionOverlay() {
           </Button>
           <Button size="sm" disabled={!text.trim() || busy !== null} onClick={() => void speak()}><Volume2 size={14} />Read aloud</Button>
         </div>
+
+        <label className="flex items-center gap-2 text-xs text-muted">
+          <input
+            type="checkbox"
+            checked={handsFree}
+            disabled={recording !== null}
+            onChange={(event) => setHandsFree(event.target.checked)}
+          />
+          Send what I say straight to the chat, without showing it to me first
+        </label>
 
         <p className="text-[11px] leading-relaxed text-faint">
           Active grants: {activeKinds.size === 0 ? "none" : [...activeKinds].join(", ")}. Grants expire after 15 minutes and are revoked on emergency stop or app exit.

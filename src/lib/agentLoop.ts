@@ -126,6 +126,7 @@ import {
   submitDaemonDesktopTurn,
   watchDaemonDesktopTurn,
   type ActiveDaemonDesktopTurn,
+  type DesktopTurnSource,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
 import {
@@ -1491,6 +1492,12 @@ export async function runAgentTurn(
   // transcript, because whoever reads the continuation is the person who needs
   // to know what a resume does not reproduce.
   resume: ResumedTurn | null = null,
+  // Which of the operator's own surfaces this turn was made on. `voice` is a
+  // finalized hands-free utterance the companion overlay auto-sent; everything
+  // else is the composer. Both are the operator, both take the same durable
+  // ingress path, and the value only decides how the turn is labelled in the
+  // ingress listing — see `ConversationSource` on the Rust side.
+  origin: DesktopTurnSource = 'desktop',
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1573,7 +1580,7 @@ export async function runAgentTurn(
     // daemon path composes its history Rust-side from a task string it was never
     // given here.
     if (route === 'daemon' && !mutationRequired && resume === null) {
-      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations, origin);
     } else {
       await runTurnGuarded(
         sessionId,
@@ -1674,6 +1681,7 @@ async function runDaemonAgentTurn(
   signal: AbortSignal,
   turnId: string,
   skillInvocations: SkillInvocationSnapshot[],
+  origin: DesktopTurnSource,
 ): Promise<void> {
   const store = useSessionStore.getState();
   const priorMessages = sessionMessages(sessionId);
@@ -1881,7 +1889,7 @@ async function runDaemonAgentTurn(
     attachedStackNames: attachedStacks.map((stack) => stack.name),
     attachments: frozenAttachments,
   });
-  const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  const queued = await submitDaemonDesktopTurn(turnId, recipe, origin);
   // Create the daemon job's process record here, with this turn as its parent.
   // The daemon's own per-tick reconcile then finds this record and only moves
   // its state, which is how the lineage edge survives crossing the process
