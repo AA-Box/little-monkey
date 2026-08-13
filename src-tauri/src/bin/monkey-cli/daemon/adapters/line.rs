@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use little_monkey_lib::channels::types::{
-    BoundedMetadata, ChannelConversation, ChannelEnvelope, ChannelHealth, ChannelKind,
-    ChannelSender, InboundTransport, OutboundMessage, ProviderCapabilities, SendOutcome,
+    AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
+    ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -25,6 +26,9 @@ use crate::daemon::channel_adapter::{
 };
 
 const LINE_API_BASE: &str = "https://api.line.me";
+/// LINE serves message content (images, video, audio, files) from its own
+/// data host rather than the API host.
+const LINE_CONTENT_BASE: &str = "https://api-data.line.me";
 /// LINE's own per-message character cap.
 const MAX_TEXT_CHARS: usize = 5000;
 
@@ -44,6 +48,9 @@ pub struct LineAdapter {
     /// swappable in tests so `send`/`probe` can be exercised against a
     /// loopback fixture instead of the real network.
     api_base: String,
+    /// Where message *content* lives, which LINE serves from a different host
+    /// than its API. Always [`LINE_CONTENT_BASE`] in production.
+    content_base: String,
 }
 
 impl LineAdapter {
@@ -63,6 +70,7 @@ impl LineAdapter {
             channel_secret: secrets.channel_secret,
             channel_access_token: secrets.channel_access_token,
             api_base: LINE_API_BASE.to_string(),
+            content_base: LINE_CONTENT_BASE.to_string(),
         })
     }
 
@@ -222,6 +230,29 @@ impl ChannelAdapter for LineAdapter {
             error: error_message,
         }
     }
+
+    /// LINE keeps a message's media on a separate host: the Messaging API
+    /// answers on `api.line.me`, but the bytes come from
+    /// `api-data.line.me/v2/bot/message/{id}/content`, authorized with the same
+    /// channel access token.
+    async fn fetch_attachment(
+        &self,
+        attachment: &ChannelAttachment,
+    ) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This LINE attachment has no message id.".to_string());
+        };
+        // The id is concatenated into a URL and it arrives inside a webhook
+        // body, so anything that is not LINE's own id alphabet is refused.
+        if handle.is_empty() || !handle.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Err("That LINE message id is not usable".to_string());
+        }
+        crate::daemon::channel_adapter::fetch_url(
+            &format!("{}/v2/bot/message/{handle}/content", self.content_base),
+            Some(&self.channel_access_token),
+        )
+        .await
+    }
 }
 
 /// Verifies the base64 HMAC-SHA256 in `X-Line-Signature` with a
@@ -350,7 +381,11 @@ fn normalize_event(
         .unwrap_or(conversation.conversation_id.as_str())
         .to_string();
 
-    let text = if message.get("type").and_then(JsonValue::as_str) == Some("text") {
+    let message_type = message
+        .get("type")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default();
+    let text = if message_type == "text" {
         message
             .get("text")
             .and_then(JsonValue::as_str)
@@ -358,6 +393,43 @@ fn normalize_event(
             .to_string()
     } else {
         String::new()
+    };
+    // A photo, video, audio clip or file is carried by its message id: LINE
+    // does not put the bytes in the webhook, and the id is what the content
+    // endpoint takes. Without this, a media message normalized to empty text
+    // and was dropped by the gate as having no content at all.
+    let attachments = match message_type {
+        "image" | "video" | "audio" | "file" => {
+            let kind = match message_type {
+                "image" => AttachmentKind::Image,
+                "video" => AttachmentKind::Video,
+                "audio" => AttachmentKind::Audio,
+                _ => AttachmentKind::Document,
+            };
+            message
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .map(|id| {
+                    vec![ChannelAttachment {
+                        provider_id: Some(id.to_string()),
+                        kind,
+                        filename: message
+                            .get("fileName")
+                            .and_then(JsonValue::as_str)
+                            .map(str::to_string),
+                        mime_type: None,
+                        declared_size_bytes: message.get("fileSize").and_then(JsonValue::as_u64),
+                        source: AttachmentSource::ProviderHandle {
+                            handle: id.to_string(),
+                        },
+                        stored_artifact_id: None,
+                        fetch_error: None,
+                        text_excerpt: None,
+                    }]
+                })
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
     };
 
     let received_at_ms = event
@@ -371,7 +443,7 @@ fn normalize_event(
     if let Some(reply_token) = event.get("replyToken").and_then(JsonValue::as_str) {
         metadata.insert("line_reply_token", reply_token);
     }
-    if let Some(message_type) = message.get("type").and_then(JsonValue::as_str) {
+    if !message_type.is_empty() {
         metadata.insert("line_message_type", message_type);
     }
 
@@ -382,7 +454,7 @@ fn normalize_event(
         conversation,
         sender: ChannelSender::new(sender_id),
         text,
-        attachments: Vec::new(),
+        attachments,
         reply_to_provider_id: None,
         mentions_self: false,
         received_at_ms,
@@ -392,6 +464,26 @@ fn normalize_event(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_photo_message_becomes_an_attachment_rather_than_an_empty_turn() {
+        let event = serde_json::json!({
+            "type": "message",
+            "message": {"id": "466273", "type": "image"},
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "user", "userId": "U1"},
+            "replyToken": "tok"
+        });
+        let envelope = normalize_event(&event, "acct-1", 0).expect("an envelope");
+
+        assert_eq!(envelope.attachments.len(), 1, "the image is carried");
+        match &envelope.attachments[0].source {
+            AttachmentSource::ProviderHandle { handle } => assert_eq!(handle, "466273"),
+            other => panic!("expected a provider handle, got {other:?}"),
+        }
+        assert_eq!(envelope.attachments[0].kind, AttachmentKind::Image);
+        assert!(envelope.text.is_empty(), "an image message has no text");
+    }
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use little_monkey_lib::channels::policy::ChannelAccessPolicy;

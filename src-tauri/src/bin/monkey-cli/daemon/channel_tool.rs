@@ -368,16 +368,24 @@ mod tests {
         assert!(super::super::adapters::sends_attachments(
             ChannelKind::WhatsApp
         ));
+        for kind in [
+            ChannelKind::Matrix,
+            ChannelKind::Signal,
+            ChannelKind::Slack,
+            ChannelKind::Discord,
+            ChannelKind::Mattermost,
+        ] {
+            assert!(super::super::adapters::sends_attachments(kind), "{kind:?}");
+        }
         // Inbound attachments are normalized for these, but nothing uploads
         // one, and the tool refuses rather than queueing a reply that would
         // arrive with the file missing.
         for kind in [
-            ChannelKind::Matrix,
-            ChannelKind::Signal,
             ChannelKind::IMessage,
             ChannelKind::Teams,
-            ChannelKind::Slack,
-            ChannelKind::Discord,
+            ChannelKind::Line,
+            ChannelKind::GoogleChat,
+            ChannelKind::Irc,
         ] {
             assert!(!super::super::adapters::sends_attachments(kind), "{kind:?}");
         }

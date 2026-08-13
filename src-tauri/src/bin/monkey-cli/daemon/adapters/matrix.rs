@@ -39,7 +39,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
+    InboundBatch, LoadedAttachment,
+};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, ConversationKind, InboundTransport, OutboundMessage,
@@ -70,6 +73,7 @@ pub struct MatrixAdapter {
     /// be started at all — the adapter still runs, and encrypted rooms then
     /// behave as they did before: counted, never guessed at.
     crypto: tokio::sync::OnceCell<Option<std::sync::Arc<super::matrix_crypto::MatrixCrypto>>>,
+    blobs: std::sync::Arc<dyn BlobSource>,
 }
 
 impl MatrixAdapter {
@@ -100,6 +104,7 @@ impl MatrixAdapter {
             encrypted_skipped: AtomicU64::new(0),
             account_id: config.account.account_id.clone(),
             crypto: tokio::sync::OnceCell::new(),
+            blobs: std::sync::Arc::new(DaemonBlobs),
         })
     }
 
@@ -425,7 +430,7 @@ impl ChannelAdapter for MatrixAdapter {
             inbound_transport: InboundTransport::LongPoll,
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
-            supports_attachments: false, // inbound only: this adapter does not upload files yet
+            supports_attachments: true,
             supports_mention_metadata: true,
             // The PUT txn_id below is a real caller-supplied idempotency key
             // the homeserver dedupes on.
@@ -527,6 +532,13 @@ impl ChannelAdapter for MatrixAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
+        if !message.attachments.is_empty() {
+            let files = match load_attachments(self.blobs.as_ref(), message) {
+                Ok(files) => files,
+                Err(outcome) => return outcome,
+            };
+            return self.send_with_attachments(message, &files).await;
+        }
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
@@ -617,11 +629,209 @@ impl ChannelAdapter for MatrixAdapter {
             },
         }
     }
+
+    /// Matrix identifies media by an `mxc://` URI, which is not fetchable on
+    /// its own. Since Matrix 1.11 the download endpoint is authenticated and
+    /// lives under `/_matrix/client/v1/media`; homeservers older than that only
+    /// answer on the unauthenticated `/_matrix/media/v3` path, so a 404 or 401
+    /// on the first falls back to the second rather than losing the file.
+    async fn fetch_attachment(&self, attachment: &ChannelAttachment) -> Result<Vec<u8>, String> {
+        let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+            return Err("This Matrix attachment has no mxc URI.".to_string());
+        };
+        let (server_name, media_id) =
+            parse_mxc(handle).ok_or_else(|| format!("'{handle}' is not a usable mxc:// URI"))?;
+        let authenticated = format!(
+            "{}/_matrix/client/v1/media/download/{server_name}/{media_id}",
+            self.homeserver_url
+        );
+        match fetch_url(&authenticated, Some(&self.access_token)).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.contains("404") || error.contains("401") => {
+                let legacy = format!(
+                    "{}/_matrix/media/v3/download/{server_name}/{media_id}",
+                    self.homeserver_url
+                );
+                fetch_url(&legacy, Some(&self.access_token)).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl MatrixAdapter {
+    /// Matrix sends a file as its own event: the bytes are uploaded to the
+    /// homeserver's media repository first, and the `mxc://` URI it returns
+    /// becomes an `m.image`/`m.file` message. The text, if any, is a separate
+    /// `m.text` event, because Matrix has no caption field — a room shows the
+    /// two in order.
+    ///
+    /// Each event carries its own transaction id derived from the outbox key,
+    /// so a retried send is deduplicated by the homeserver rather than posting
+    /// the file twice.
+    async fn send_with_attachments(
+        &self,
+        message: &OutboundMessage,
+        files: &[LoadedAttachment],
+    ) -> SendOutcome {
+        // An encrypted room takes encrypted events only. Uploading the file to
+        // the media repository unencrypted and posting a cleartext m.file event
+        // would put in the clear exactly what the room asked to be encrypted,
+        // so the file is refused by name instead.
+        if self.room_is_encrypted(&message.conversation_id).await {
+            return SendOutcome::PermanentFailure {
+                error: "Little Monkey cannot attach files to an encrypted Matrix room yet."
+                    .to_string(),
+            };
+        }
+        let client = match self.client() {
+            Ok(client) => client,
+            Err(error) => return SendOutcome::PermanentFailure { error },
+        };
+        let mut any_sent = false;
+        let mut last_event_id = None;
+        if !message.text.is_empty() {
+            let text_only = OutboundMessage {
+                attachments: Vec::new(),
+                ..message.clone()
+            };
+            match self.send(&text_only).await {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => {
+                    any_sent = true;
+                    last_event_id = provider_message_id;
+                }
+                other => return other,
+            }
+        }
+        for (index, file) in files.iter().enumerate() {
+            let upload = format!(
+                "{}/_matrix/media/v3/upload?filename={}",
+                self.homeserver_url,
+                encode_path_segment(&file.filename)
+            );
+            let request = self.authorize(
+                client
+                    .post(upload)
+                    .header(reqwest::header::CONTENT_TYPE, file.mime_type.clone())
+                    .body(file.bytes.clone()),
+            );
+            let response = match little_monkey_lib::egress::send(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return if error.is_connect() && !any_sent {
+                        SendOutcome::RetryableFailure {
+                            error: format!("Could not connect to the Matrix homeserver: {error}"),
+                            retry_after_ms: None,
+                        }
+                    } else {
+                        SendOutcome::NeedsReconciliation {
+                            error: format!("Matrix upload outcome unknown: {error}"),
+                        }
+                    }
+                }
+            };
+            if !response.status().is_success() {
+                let error = format!("Matrix returned {} for the upload", response.status());
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation { error }
+                } else {
+                    SendOutcome::PermanentFailure { error }
+                };
+            }
+            let content_uri = match response.json::<UploadResponse>().await {
+                Ok(parsed) => parsed.content_uri,
+                Err(_) => {
+                    return SendOutcome::NeedsReconciliation {
+                        error: "Matrix accepted the upload but returned no media URI".to_string(),
+                    }
+                }
+            };
+            let msgtype = if file.mime_type.starts_with("image/") {
+                "m.image"
+            } else if file.mime_type.starts_with("video/") {
+                "m.video"
+            } else if file.mime_type.starts_with("audio/") {
+                "m.audio"
+            } else {
+                "m.file"
+            };
+            let body = serde_json::json!({
+                "msgtype": msgtype,
+                "body": file.filename,
+                "url": content_uri,
+                "info": {
+                    "mimetype": file.mime_type,
+                    "size": file.bytes.len(),
+                },
+            });
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                self.homeserver_url,
+                encode_path_segment(&message.conversation_id),
+                encode_path_segment(&format!("{}-file{index}", message.idempotency_key)),
+            );
+            let request = self.authorize(client.put(url).json(&body));
+            let response = match little_monkey_lib::egress::send(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    return SendOutcome::NeedsReconciliation {
+                        error: format!("Matrix send outcome unknown: {error}"),
+                    }
+                }
+            };
+            if !response.status().is_success() {
+                let error = format!("Matrix returned {} for the file event", response.status());
+                return if any_sent {
+                    SendOutcome::NeedsReconciliation { error }
+                } else {
+                    SendOutcome::PermanentFailure { error }
+                };
+            }
+            any_sent = true;
+            last_event_id = response
+                .json::<SendResponse>()
+                .await
+                .ok()
+                .map(|parsed| parsed.event_id)
+                .or(last_event_id);
+        }
+        SendOutcome::Sent {
+            provider_message_id: last_event_id,
+        }
+    }
+}
+
+/// Splits `mxc://<server>/<media-id>` into its two halves.
+///
+/// Both halves are checked for path separators and `..` before they are
+/// concatenated into a download URL: the URI arrives inside a room event, which
+/// means anyone in the room can choose it.
+fn parse_mxc(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("mxc://")?;
+    let (server_name, media_id) = rest.split_once('/')?;
+    let usable = |part: &str| {
+        !part.is_empty()
+            && part != ".."
+            && !part.contains('/')
+            && !part.contains('\\')
+            && !part.contains('?')
+            && !part.contains('#')
+    };
+    (usable(server_name) && usable(media_id))
+        .then(|| (server_name.to_string(), media_id.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
 struct WhoAmI {
     user_id: String,
+}
+
+/// What `/_matrix/media/v3/upload` answers with.
+#[derive(Debug, Deserialize)]
+struct UploadResponse {
+    content_uri: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +1023,17 @@ fn normalize_message_event(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_mxc_uri_splits_only_when_both_halves_are_usable() {
+        assert_eq!(
+            parse_mxc("mxc://example.org/AbCdEf"),
+            Some(("example.org".to_string(), "AbCdEf".to_string()))
+        );
+        assert_eq!(parse_mxc("mxc://example.org/../../secret"), None);
+        assert_eq!(parse_mxc("https://example.org/AbCdEf"), None);
+        assert_eq!(parse_mxc("mxc://example.org/"), None);
+    }
+
     use super::*;
 
     const SELF_ID: &str = "@self:example.org";
@@ -1121,7 +1342,7 @@ mod tests {
         // Inbound attachments are normalized, but nothing here uploads one, and
         // the capability says what this adapter does rather than what Matrix
         // could do.
-        assert!(!capabilities.supports_attachments);
+        assert!(capabilities.supports_attachments);
     }
 
     #[test]
