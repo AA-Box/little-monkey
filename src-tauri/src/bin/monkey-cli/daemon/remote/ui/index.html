@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light">
     <meta name="theme-color" content="#0f172a">
     <meta name="description" content="Securely inspect and control scoped Little Monkey runs on your own runner.">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
     <title>Little Monkey Remote</title>
     <link rel="manifest" href="/v1/remote/ui/manifest.webmanifest">
     <link rel="icon" href="/v1/remote/ui/icon.svg" type="image/svg+xml">
@@ -57,8 +57,12 @@
           <input id="deviceName" name="deviceName" autocomplete="nickname" maxlength="80" required placeholder="Ahmad's phone">
 
           <label for="invitationFile">Pairing invitation</label>
-          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json" required>
+          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json">
           <p class="field-help">Choose the protected JSON created by <code>remote pair-create</code>.</p>
+
+          <label for="pairingCode">Or paste a pairing code</label>
+          <input id="pairingCode" name="pairingCode" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="littlemonkey://pair/…">
+          <p class="field-help">The short code from <code>remote pair-create --qr</code>. It carries the same one-time token and the same certificate pin.</p>
 
           <div id="invitationPreview" class="preview-card" hidden>
             <dl>
@@ -78,6 +82,8 @@
       </section>
 
       <section id="dashboardView" hidden>
+        <p id="staleBanner" class="stale-banner" role="status" hidden></p>
+
         <div class="dashboard-toolbar">
           <div>
             <p class="eyebrow">Scoped controller</p>
@@ -90,6 +96,33 @@
             <button id="forgetButton" class="button ghost" type="button">Forget browser</button>
           </div>
         </div>
+
+        <section id="devicePanel" class="panel device-panel" aria-labelledby="deviceTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">This device</p>
+              <h2 id="deviceTitle">Hardware the runner may use</h2>
+            </div>
+          </div>
+          <dl class="device-grid">
+            <div><dt>Little Monkey granted</dt><dd id="deviceGranted">—</dd></div>
+            <div><dt>This device supports</dt><dd id="deviceSupported">—</dd></div>
+            <div><dt>Operating system permits</dt><dd id="devicePermissions">—</dd></div>
+            <div><dt>Effective</dt><dd id="deviceEffective">—</dd></div>
+          </dl>
+          <p class="field-help">
+            An action needs all three. Anything missing from “effective” is refused with the reason,
+            and nothing here can grant itself.
+          </p>
+          <div class="device-push">
+            <button id="pushButton" class="button secondary" type="button">Enable notifications</button>
+            <p id="pushStatus" class="field-help"></p>
+          </div>
+          <div class="device-push">
+            <button id="screenShareButton" class="button secondary" type="button">Allow screen capture</button>
+            <p id="screenShareStatus" class="field-help"></p>
+          </div>
+        </section>
 
         <div class="workspace-grid">
           <aside class="panel run-sidebar" aria-labelledby="runsTitle">

@@ -289,6 +289,42 @@ fn content_store(
     .map_err(|error| format!("Failed to open the content store: {error}"))
 }
 
+/// One outbound attachment with its bytes already read, which is the shape
+/// every provider's upload needs: a filename, a type to declare, and the file.
+pub struct LoadedAttachment {
+    pub filename: String,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Read every attachment on a message, or the outcome the outbox should record.
+///
+/// A blob that cannot be read is a permanent failure rather than a retry: the
+/// bytes were copied into the content store when the reply was queued, so a
+/// read failing now fails the same way every time after.
+pub fn load_attachments(
+    blobs: &dyn BlobSource,
+    message: &OutboundMessage,
+) -> Result<Vec<LoadedAttachment>, SendOutcome> {
+    message
+        .attachments
+        .iter()
+        .map(|attachment| {
+            let bytes = blobs
+                .read(&attachment.artifact_id)
+                .map_err(|error| SendOutcome::PermanentFailure { error })?;
+            Ok(LoadedAttachment {
+                filename: attachment
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| "attachment".to_string()),
+                mime_type: attachment_mime(attachment).to_string(),
+                bytes,
+            })
+        })
+        .collect()
+}
+
 /// Read one outbound attachment's bytes out of the content store.
 ///
 /// Attachments are copied into the store when the reply is queued, not read

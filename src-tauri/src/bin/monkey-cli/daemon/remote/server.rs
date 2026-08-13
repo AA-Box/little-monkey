@@ -240,15 +240,20 @@ async fn handle_http(
             )))
         }
     };
-    let response = api.handle(
-        ApiRequest {
-            method,
-            path_and_query,
-            body,
-            auth: auth.ok(),
-        },
-        now_ms(),
-    );
+    // `handle_waiting`, not `handle`: identical for every route except the
+    // device command lease, which is allowed to hold this connection for its
+    // bounded long poll instead of making phones poll on a timer.
+    let response = api
+        .handle_waiting(
+            ApiRequest {
+                method,
+                path_and_query,
+                body,
+                auth: auth.ok(),
+            },
+            now_ms(),
+        )
+        .await;
     Ok(to_http(response))
 }
 

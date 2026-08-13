@@ -22,14 +22,16 @@ use little_monkey_lib::run_protocol::OutputChannel;
 use super::desktop::DesktopControlRuntime;
 use super::migrate::land_migration;
 use super::protocol::{
-    canonical_request, legacy_capabilities, sha256_hex, ApprovalRequestBody, CancelRequestBody,
-    DesktopControlActionRequest, DesktopControlStartRequest, DesktopControlStopRequest,
-    DeviceCapability, MigrationAcceptRequest, MigrationPreflightRequest, MigrationReceipt,
-    PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
-    SignedRequestHeaders, MAX_REMOTE_BODY_BYTES, REMOTE_PROTOCOL_VERSION,
+    canonical_request, effective_capabilities, legacy_capabilities, sha256_hex,
+    ApprovalRequestBody, CancelRequestBody, DesktopControlActionRequest,
+    DesktopControlStartRequest, DesktopControlStopRequest, DeviceCapability, DeviceCommand,
+    DeviceCommandResult, DeviceCommandState, DeviceSurface, MigrationAcceptRequest,
+    MigrationPreflightRequest, MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig,
+    RemoteScopes, RunSummary, SignedRequestHeaders, VoiceChunkRequest, VoiceCloseRequest,
+    DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
-    CommandReservation, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
+    CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
     MobileMessageRecord, MobileWorkflowRunRecord, RemoteSecretStore, RemoteStore,
 };
 
@@ -374,6 +376,56 @@ impl RemoteApi {
         response
     }
 
+    /// [`Self::handle`], plus the one route that is allowed to wait.
+    ///
+    /// A phone that polled for work every few seconds would either burn its
+    /// battery or answer commands late. Long-polling the lease route fixes both
+    /// without a second general-purpose socket: the request is an ordinary
+    /// signed one, it returns the moment a command exists, and it gives up at
+    /// `wait_ms` (capped at the lease length) so no connection is held open
+    /// indefinitely. Every other route is the unchanged synchronous path.
+    pub async fn handle_waiting(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
+        let deadline_ms = match long_poll_wait_ms(&request) {
+            Some(wait_ms) => wait_ms,
+            None => return self.handle(request, now_ms),
+        };
+        // The wait happens BEFORE dispatch, and the signed request is answered
+        // exactly once at the end. Re-running it per tick would hit the replay
+        // guard on the second pass and hand back the first tick's cached "no
+        // work" answer for the rest of the wait.
+        let Some(device_id) = request
+            .auth
+            .as_ref()
+            .map(|headers| headers.device_id.clone())
+        else {
+            return self.handle(request, now_ms);
+        };
+        let started = std::time::Instant::now();
+        let mut elapsed = 0u64;
+        while elapsed < deadline_ms {
+            // An unverified device id is enough to decide *whether to wait*: it
+            // grants nothing, and the answer below still goes through the full
+            // signature, revocation and replay checks.
+            if self.has_pending_device_command(&device_id, now_ms.saturating_add(elapsed)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                LONG_POLL_TICK_MS.min(deadline_ms - elapsed),
+            ))
+            .await;
+            elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        }
+        self.handle(request, now_ms.saturating_add(elapsed))
+    }
+
+    fn has_pending_device_command(&self, device_id: &str, now_ms: u64) -> bool {
+        self.store
+            .lock()
+            .ok()
+            .and_then(|store| store.pending_device_command_count(device_id, now_ms).ok())
+            .is_some_and(|count| count > 0)
+    }
+
     fn handle_request(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
         if request.body.len() > MAX_REMOTE_BODY_BYTES {
             return ApiResponse::error(413, "Remote request body exceeds 1 MiB");
@@ -638,6 +690,56 @@ impl RemoteApi {
                     self.mobile_capture_post(&request.body, device, request_sha256, now_ms)
                 })
             }
+            // --- Versioned `/v1/remote/device/*` plane: the runner asking the
+            // phone's own hardware for something.
+            //
+            // The first three routes are gated by device authentication alone
+            // and by no capability. That is deliberate and is not a hole:
+            // advertising a surface can only ever *narrow* what is effective
+            // (see `protocol::effective_capabilities`), reading one's own grant
+            // record discloses nothing the device was not already told at
+            // pairing, and the queue hands out only commands already queued
+            // *for this device* — each of which was capability-checked when it
+            // was queued and is re-checked at lease time below. Requiring a
+            // grant to advertise would instead deadlock the design: a device
+            // granted only `camera_capture` could never advertise a camera, so
+            // the camera would never become effective.
+            ("POST", ["v1", "remote", "device", "surface"]) => {
+                self.device_surface_post(&request.body, device, now_ms)
+            }
+            ("GET", ["v1", "remote", "device", "state"]) => self.device_state(device),
+            ("GET", ["v1", "remote", "device", "commands", "next"]) => {
+                self.device_command_lease(device, now_ms)
+            }
+            ("POST", ["v1", "remote", "device", "commands", command_id, "start"]) => {
+                self.device_command_start(device_id, command_id, now_ms)
+            }
+            ("POST", ["v1", "remote", "device", "commands", command_id, "result"]) => {
+                self.device_command_result(&request.body, device, command_id, now_ms)
+            }
+            // The audio of a live stream, while its control command is still
+            // running. Gated on the grant — an operator who revokes
+            // `voice_stream` mid-stream closes the microphone with the next
+            // chunk — and on owning the session, which the device was told
+            // about in the command it leased and never invents for itself.
+            ("POST", ["v1", "remote", "device", "voice", session_id, "chunk"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.voice_chunk(&request.body, device, session_id, now_ms))
+            }
+            ("POST", ["v1", "remote", "device", "voice", session_id, "close"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.voice_close(&request.body, device, session_id, now_ms))
+            }
+            // Registering where to reach this device, and withdrawing it. Both
+            // self-service for the same reason as the routes above: a push
+            // address grants nothing — a woken device still has to make an
+            // ordinary signed request — and a device must always be able to
+            // stop being woken.
+            ("GET", ["v1", "remote", "device", "push", "key"]) => self.device_push_key(),
+            ("POST", ["v1", "remote", "device", "push"]) => {
+                self.device_push_register(&request.body, device_id, now_ms)
+            }
+            ("DELETE", ["v1", "remote", "device", "push"]) => self.device_push_forget(device_id),
             // --- Versioned `/v1/remote/node/*` placement plane (roadmap K17).
             // A second plane beside the control plane above, sharing only this
             // transport. The control-plane routes act on runs the node already
@@ -1828,6 +1930,373 @@ impl RemoteApi {
         ))
     }
 
+    // --- `/v1/remote/device/*` handlers ------------------------------------
+
+    /// The device reporting what it is and what its OS currently permits.
+    fn device_surface_post(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let mut surface: DeviceSurface = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid device surface: {error}")))?;
+        // The runner timestamps the report itself. A device clock that is
+        // wrong (or flattering) must not decide how fresh the operator's view
+        // of it looks.
+        surface.reported_at_ms = now_ms;
+        surface.validate().map_err(|error| (400, error))?;
+        self.locked_store()?
+            .save_device_surface(&device.device_id, &surface, now_ms)
+            .map_err(internal)?;
+        Ok((
+            200,
+            device_state_json(device, Some(&surface)),
+            Some(device.device_id.clone()),
+        ))
+    }
+
+    /// What this device may actually do, as the runner sees it — the same three
+    /// sets the operator's device card shows, so the phone and the desktop can
+    /// never disagree about why something is unavailable.
+    fn device_state(
+        &self,
+        device: &DeviceRecord,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let surface = self
+            .locked_store()?
+            .device_surface(&device.device_id)
+            .map_err(internal)?;
+        Ok((
+            200,
+            device_state_json(device, surface.as_ref()),
+            Some(device.device_id.clone()),
+        ))
+    }
+
+    /// Leases the next command, re-checking authority at the moment of handing
+    /// it over.
+    ///
+    /// A grant revoked, or an OS permission withdrawn, between queueing and
+    /// leasing must stop the command — so the check is here and not only at
+    /// enqueue. Such a command fails with an explicit reason rather than
+    /// silently vanishing, because a run is waiting on an answer.
+    fn device_command_lease(
+        &self,
+        device: &DeviceRecord,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let mut store = self.locked_store()?;
+        // A stream whose deadline passed is closed here, on the same sweep that
+        // expires stale commands: the device that abandoned it is by definition
+        // not the one asking for work, so this is where someone else notices.
+        super::voice::expire(&mut store, now_ms).map_err(internal)?;
+        let surface = store.device_surface(&device.device_id).map_err(internal)?;
+        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        // Bounded: each iteration retires exactly one now-unauthorized command,
+        // so this cannot spin.
+        for _ in 0..64 {
+            let Some(record) = store
+                .lease_device_command(&device.device_id, DEVICE_LEASE_MS, now_ms)
+                .map_err(internal)?
+            else {
+                return Ok((204, serde_json::json!({}), None));
+            };
+            if !effective.contains(&record.capability) {
+                store
+                    .complete_device_command(
+                        &device.device_id,
+                        &record.command_id,
+                        DeviceCommandState::Failed,
+                        None,
+                        None,
+                        Some(
+                            "The capability this command needs is no longer granted, advertised \
+                             or permitted by the device's operating system",
+                        ),
+                        now_ms,
+                    )
+                    .map_err(internal)?;
+                continue;
+            }
+            let command = DeviceCommand {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                command_id: record.command_id.clone(),
+                capability: record.capability,
+                arguments: record.arguments.clone(),
+                arguments_sha256: record.arguments_sha256.clone(),
+                expires_at_ms: record.expires_at_ms,
+                lease_expires_at_ms: record.lease_expires_at_ms.unwrap_or(record.expires_at_ms),
+                cancel_requested: record.cancel_requested,
+            };
+            let body = serde_json::to_value(&command)
+                .map_err(|error| internal(format!("Could not encode device command: {error}")))?;
+            return Ok((200, body, Some(record.command_id)));
+        }
+        Ok((204, serde_json::json!({}), None))
+    }
+
+    /// The device declaring it is about to touch hardware. `started: false`
+    /// means this command was already running — the device must not repeat the
+    /// action, and this is the reply a reconnect gets.
+    fn device_command_start(
+        &self,
+        device_id: &str,
+        command_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let started = self
+            .locked_store()?
+            .start_device_command(device_id, command_id, now_ms)
+            .map_err(|error| (409, error))?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "command_id": command_id,
+                "started": started,
+            }),
+            Some(command_id.to_string()),
+        ))
+    }
+
+    /// The device's terminal report, with any artifact it produced.
+    fn device_command_result(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        command_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let result: DeviceCommandResult = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid device command result: {error}")))?;
+        // The device's own declared bound never widens the operator's: the
+        // artifact budget on the pairing is the ceiling either way.
+        result
+            .validate(device.scopes.max_artifact_bytes)
+            .map_err(|error| (400, error))?;
+        let artifact = match (&result.artifact_base64, &result.artifact_media_type) {
+            (Some(encoded), Some(media_type)) => {
+                let bytes = STANDARD
+                    .decode(encoded)
+                    .map_err(|_| (400, "Device artifact is not valid base64".to_string()))?;
+                if bytes.len() as u64 > device.scopes.max_artifact_bytes {
+                    return Err((
+                        413,
+                        "Device artifact exceeds this pairing's artifact budget".to_string(),
+                    ));
+                }
+                let directory = self.paths.root.join("device-artifacts");
+                std::fs::create_dir_all(&directory).map_err(|error| {
+                    internal(format!(
+                        "Could not create device artifact directory: {error}"
+                    ))
+                })?;
+                // The command id names the file, so a retried report overwrites
+                // its own bytes and can never create a second artifact.
+                std::fs::write(directory.join(command_id), &bytes).map_err(|error| {
+                    internal(format!("Could not persist device artifact: {error}"))
+                })?;
+                Some(DeviceArtifact {
+                    sha256: sha256_hex(&bytes),
+                    bytes: bytes.len() as u64,
+                    media_type: media_type.clone(),
+                })
+            }
+            _ => None,
+        };
+        let record = self
+            .locked_store()?
+            .complete_device_command(
+                &device.device_id,
+                command_id,
+                result.outcome,
+                result.result.as_ref(),
+                artifact.as_ref(),
+                result.error.as_deref(),
+                now_ms,
+            )
+            .map_err(|error| (409, error))?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "command_id": record.command_id,
+                "state": record.state.as_str(),
+            }),
+            Some(record.command_id),
+        ))
+    }
+
+    /// One chunk of a live microphone stream.
+    ///
+    /// The store lock is taken once and held across the disk write on purpose:
+    /// that is what makes "check the sequence, append, move the counter" atomic,
+    /// and therefore what stops two concurrent posts of the same chunk from
+    /// writing the audio twice.
+    fn voice_chunk(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: VoiceChunkRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid voice chunk: {error}")))?;
+        request.validate().map_err(|error| (400, error))?;
+        let audio = STANDARD
+            .decode(&request.audio_base64)
+            .map_err(|_| (400, "Voice chunk audio is not valid base64".to_string()))?;
+        if audio.len() > MAX_VOICE_CHUNK_BYTES {
+            return Err((413, "Voice chunk exceeds the per-chunk ceiling".to_string()));
+        }
+        let mut store = self.locked_store()?;
+        let outcome = super::voice::accept_chunk(
+            &self.paths.root,
+            &mut store,
+            &device.device_id,
+            session_id,
+            &request,
+            &audio,
+            now_ms,
+        )?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "session_id": session_id,
+                "accepted": outcome.accepted,
+                "next_sequence": outcome.next_sequence,
+                "bytes": outcome.bytes,
+                // The device's stop signal, on the reply to a request it is
+                // already making. No second poll exists for a cancellation to
+                // be missed on.
+                "stop": outcome.stop,
+            }),
+            Some(session_id.to_string()),
+        ))
+    }
+
+    /// The device ending a stream, and with it the control command it rode on.
+    fn voice_close(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: VoiceCloseRequest = if body.is_empty() {
+            VoiceCloseRequest {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                error: None,
+            }
+        } else {
+            serde_json::from_slice(body)
+                .map_err(|error| (400, format!("Invalid voice close: {error}")))?
+        };
+        request.validate().map_err(|error| (400, error))?;
+        let mut store = self.locked_store()?;
+        let record = super::voice::close(
+            &mut store,
+            &device.device_id,
+            session_id,
+            request.error.as_deref(),
+            now_ms,
+        )?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "session_id": record.session_id,
+                "state": record.state.as_str(),
+                "chunks": record.next_sequence,
+                "bytes": record.bytes,
+            }),
+            Some(record.session_id),
+        ))
+    }
+
+    /// The `applicationServerKey` a browser needs before it can subscribe.
+    ///
+    /// Public by construction — it is the *public* half of this runner's VAPID
+    /// identity, and a push service checks signatures against it. Answering 404
+    /// when Web Push is not configured is what tells the client not to offer
+    /// notifications at all.
+    fn device_push_key(&self) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        match super::push::application_server_key(&self.paths, self.secrets.as_ref()) {
+            Ok(Some(key)) => Ok((
+                200,
+                serde_json::json!({
+                    "protocol_version": REMOTE_PROTOCOL_VERSION,
+                    "backend": "web_push",
+                    "application_server_key": key,
+                }),
+                None,
+            )),
+            Ok(None) => Err((404, "This runner does not send Web Push".to_string())),
+            Err(error) => Err((503, error)),
+        }
+    }
+
+    fn device_push_register(
+        &self,
+        body: &[u8],
+        device_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let parsed: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid push registration: {error}")))?;
+        let backend = parsed
+            .get("backend")
+            .and_then(|value| value.as_str())
+            .ok_or((400, "A push registration needs a 'backend'".to_string()))?;
+        // A Web Push registration is the browser's whole subscription — the
+        // endpoint plus the two keys it will be encrypted to. It is validated
+        // here, before storage, so an unusable subscription is refused at the
+        // moment the device can still be told about it.
+        let token = if backend == "web_push" {
+            let subscription: super::push::WebPushSubscription =
+                serde_json::from_value(parsed.get("subscription").cloned().unwrap_or_default())
+                    .map_err(|error| (400, format!("Invalid push subscription: {error}")))?;
+            subscription.validate().map_err(|error| (400, error))?;
+            serde_json::to_string(&subscription).map_err(internal)?
+        } else {
+            parsed
+                .get("token")
+                .and_then(|value| value.as_str())
+                .ok_or((400, "A push registration needs a 'token'".to_string()))?
+                .to_string()
+        };
+        self.locked_store()?
+            .save_push_registration(device_id, backend, &token, now_ms)
+            .map_err(|error| (400, error))?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "registered": true,
+            }),
+            Some(device_id.to_string()),
+        ))
+    }
+
+    fn device_push_forget(
+        &self,
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        self.locked_store()?
+            .delete_push_registration(device_id)
+            .map_err(internal)?;
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "registered": false,
+            }),
+            Some(device_id.to_string()),
+        ))
+    }
+
     fn mobile_revoke_self(
         &self,
         device_id: &str,
@@ -2004,7 +2473,7 @@ impl RemoteApi {
         if store.kill_switch().map_err(internal)? {
             return Err((409, "Global kill switch is engaged".to_string()));
         }
-        let granted = effective_capabilities(device);
+        let granted = granted_capabilities(device);
         let context = crate::daemon::peer_ingress::PeerContext {
             device_id: &device.device_id,
             granted: &granted,
@@ -2376,6 +2845,56 @@ impl RemoteApi {
     }
 }
 
+/// How often the long-poll checks for work. Short enough that a queued command
+/// reaches a waiting phone promptly, long enough that a held connection costs
+/// nothing measurable.
+const LONG_POLL_TICK_MS: u64 = 500;
+
+/// The `wait_ms` a lease request asked for, capped at the lease length, or
+/// `None` when this request is not a lease at all.
+fn long_poll_wait_ms(request: &ApiRequest) -> Option<u64> {
+    if request.method != "GET" {
+        return None;
+    }
+    let (path, query) = request
+        .path_and_query
+        .split_once('?')
+        .map_or((request.path_and_query.as_str(), ""), |value| value);
+    if path.trim_end_matches('/') != "/v1/remote/device/commands/next" {
+        return None;
+    }
+    let wait_ms = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "wait_ms")
+        .and_then(|(_, value)| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    (wait_ms > 0).then(|| wait_ms.min(DEVICE_LEASE_MS))
+}
+
+/// The three sets an operator (and the phone) must be able to tell apart:
+/// what Little Monkey granted, what the build supports, what the OS permits —
+/// and the intersection that actually decides. Computed in one place so the
+/// desktop card and the phone's own screen cannot drift.
+fn device_state_json(device: &DeviceRecord, surface: Option<&DeviceSurface>) -> serde_json::Value {
+    let granted = if device.capabilities.is_empty() {
+        legacy_capabilities(&device.scopes)
+    } else {
+        device.capabilities.clone()
+    };
+    serde_json::json!({
+        "protocol_version": REMOTE_PROTOCOL_VERSION,
+        "device_id": device.device_id,
+        "device_name": device.device_name,
+        "granted": granted,
+        "advertised": surface.map(|surface| surface.capabilities.clone()),
+        "os_permissions": surface.map(|surface| surface.permissions.clone()),
+        "effective": effective_capabilities(&granted, surface),
+        "surface": surface,
+        "max_artifact_bytes": device.scopes.max_artifact_bytes,
+    })
+}
+
 fn require_action(scopes: &RemoteScopes, action: RemoteAction) -> Result<(), (u16, String)> {
     if scopes.permits(action) {
         Ok(())
@@ -2412,9 +2931,13 @@ fn require_capability(
 /// gate, because that depends on what the envelope contains — but a pairing
 /// with no peer standing whatsoever never gets that far, and never gets to
 /// create a thread row.
-/// The grants that actually apply to this device, resolving the legacy
-/// empty-set convention the same way `require_capability` does.
-fn effective_capabilities(device: &DeviceRecord) -> std::collections::BTreeSet<DeviceCapability> {
+/// The grants recorded for this device, resolving the legacy empty-set
+/// convention the same way `require_capability` does.
+///
+/// Not [`protocol::effective_capabilities`], which additionally drops a
+/// physical capability the device's own surface cannot serve: a peer grant is
+/// never physical, and a peer has no surface to ask.
+fn granted_capabilities(device: &DeviceRecord) -> std::collections::BTreeSet<DeviceCapability> {
     if device.capabilities.is_empty() {
         legacy_capabilities(&device.scopes)
     } else {
@@ -2603,8 +3126,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::daemon::remote::protocol::{sign_request, RemoteAction};
-    use crate::daemon::remote::store::RemoteSecretStore;
+    use crate::daemon::remote::protocol::{
+        sign_request, DeviceConstraints, OsPermission, RemoteAction,
+    };
+    use crate::daemon::remote::store::{DeviceCommandRequest, RemoteSecretStore};
     use crate::daemon::store::DaemonConfig;
     use crate::durable_run::DurableRunRecorder;
     use little_monkey_lib::contract;
@@ -4660,5 +5185,631 @@ mod tests {
         assert!(String::from_utf8_lossy(&response.body).contains("digest"));
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(origin);
+    }
+
+    // --- `/v1/remote/device/*` -------------------------------------------
+
+    fn grant(api: &RemoteApi, device_id: &str, extra: &[DeviceCapability]) {
+        let mut store = api.store.lock().unwrap();
+        let mut capabilities = store.device(device_id).unwrap().unwrap().capabilities;
+        capabilities.extend(extra.iter().copied());
+        store
+            .set_device_capabilities(device_id, &capabilities, 2_000)
+            .unwrap();
+    }
+
+    fn advertise(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        capabilities: &[DeviceCapability],
+        permissions: &[(DeviceCapability, OsPermission)],
+    ) -> ApiResponse {
+        let surface = DeviceSurface {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            platform: "android".into(),
+            platform_version: "15".into(),
+            app_version: "1.3.0".into(),
+            device_model: "Pixel 9".into(),
+            capabilities: capabilities.iter().copied().collect(),
+            permissions: permissions.iter().copied().collect(),
+            constraints: DeviceConstraints::default(),
+            reported_at_ms: 0,
+        };
+        let body = serde_json::to_vec(&surface).unwrap();
+        api.handle(
+            signed(
+                device_id,
+                secret,
+                sequence,
+                &format!("cmd-surface-{sequence}"),
+                "POST",
+                "/v1/remote/device/surface",
+                &body,
+            ),
+            2_000,
+        )
+    }
+
+    /// A whole voice stream over the signed plane: leased, started, audio
+    /// posted in order, stopped by an operator, closed by the device.
+    ///
+    /// The two properties worth having a test for are both about what happens
+    /// when the link is unreliable. A chunk delivered twice must be stored once
+    /// — otherwise a phone on a bad connection produces stuttering audio that
+    /// nothing downstream can detect. And an operator's stop must reach the
+    /// microphone, which it does on the answer to a chunk the device is already
+    /// posting rather than on a poll it might not make.
+    #[test]
+    fn a_voice_stream_survives_a_retry_and_stops_when_an_operator_says_so() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+        );
+        assert_eq!(
+            advertise(
+                &api,
+                &device_id,
+                &secret,
+                1,
+                &[
+                    DeviceCapability::MicrophoneCapture,
+                    DeviceCapability::VoiceStream
+                ],
+                &[
+                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+                    (DeviceCapability::VoiceStream, OsPermission::Granted),
+                ],
+            )
+            .status,
+            200
+        );
+
+        let session_id = "vs-testsessionidentifier".to_string();
+        let command_id = {
+            let mut store = api.store.lock().unwrap();
+            let command = store
+                .enqueue_device_command(
+                    &DeviceCommandRequest {
+                        device_id: device_id.clone(),
+                        capability: DeviceCapability::VoiceStream,
+                        arguments: serde_json::json!({
+                            "session_id": session_id,
+                            "duration_ms": 60_000,
+                            "chunk_ms": 1_000,
+                        }),
+                        source_run_id: None,
+                        source_session_id: None,
+                        source_tool_call_id: None,
+                        expires_at_ms: 300_000,
+                    },
+                    2_000,
+                )
+                .unwrap();
+            store
+                .open_voice_session(
+                    &session_id,
+                    &device_id,
+                    &command.command_id,
+                    None,
+                    None,
+                    200_000,
+                    2_000,
+                )
+                .unwrap();
+            command.command_id
+        };
+
+        // Lease and start, exactly as a photograph would.
+        let leased = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                2,
+                "cmd-vlease",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(leased.status, 200);
+        let start_path = format!("/v1/remote/device/commands/{command_id}/start");
+        assert_eq!(
+            api.handle(
+                signed(
+                    &device_id,
+                    &secret,
+                    3,
+                    "cmd-vstart",
+                    "POST",
+                    &start_path,
+                    b"{}"
+                ),
+                2_000,
+            )
+            .status,
+            200
+        );
+
+        let chunk_path = format!("/v1/remote/device/voice/{session_id}/chunk");
+        let chunk = |sequence: u64, audio: &[u8], first: bool| {
+            serde_json::to_vec(&VoiceChunkRequest {
+                protocol_version: REMOTE_PROTOCOL_VERSION,
+                sequence,
+                audio_base64: STANDARD.encode(audio),
+                media_type: first.then(|| "audio/webm".to_string()),
+                last: false,
+            })
+            .unwrap()
+        };
+        let first = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                4,
+                "cmd-vchunk-0",
+                "POST",
+                &chunk_path,
+                &chunk(0, b"opus-one", true),
+            ),
+            2_100,
+        );
+        assert_eq!(first.status, 200);
+        let first: serde_json::Value = serde_json::from_slice(&first.body).unwrap();
+        assert_eq!(first["accepted"], serde_json::json!(true));
+        assert_eq!(first["next_sequence"], serde_json::json!(1));
+        assert_eq!(first["stop"], serde_json::json!(false));
+
+        // The device's reply was lost, so it sends chunk 0 again. The runner
+        // already holds it: the answer says so, and nothing is appended.
+        let retry = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                5,
+                "cmd-vchunk-0b",
+                "POST",
+                &chunk_path,
+                &chunk(0, b"opus-one", false),
+            ),
+            2_200,
+        );
+        let retry: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
+        assert_eq!(retry["accepted"], serde_json::json!(false));
+        assert_eq!(retry["bytes"], serde_json::json!(8));
+
+        // An operator stops the stream. The device has not asked for anything
+        // since, so this is the moment nothing has told it yet.
+        api.store
+            .lock()
+            .unwrap()
+            .request_device_cancel(&command_id, 2_300)
+            .unwrap();
+
+        let second = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                6,
+                "cmd-vchunk-1",
+                "POST",
+                &chunk_path,
+                &chunk(1, b"opus-two", false),
+            ),
+            2_400,
+        );
+        let second: serde_json::Value = serde_json::from_slice(&second.body).unwrap();
+        assert_eq!(
+            second["stop"],
+            serde_json::json!(true),
+            "an operator's stop must reach the microphone on the next chunk"
+        );
+        // Still accepted: the audio already recorded is not thrown away just
+        // because someone asked for the stream to end.
+        assert_eq!(second["accepted"], serde_json::json!(true));
+
+        let close_path = format!("/v1/remote/device/voice/{session_id}/close");
+        let closed = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                7,
+                "cmd-vclose",
+                "POST",
+                &close_path,
+                br#"{"protocol_version":1}"#,
+            ),
+            2_500,
+        );
+        assert_eq!(closed.status, 200);
+        let closed: serde_json::Value = serde_json::from_slice(&closed.body).unwrap();
+        assert_eq!(closed["state"], serde_json::json!("closed"));
+        assert_eq!(closed["chunks"], serde_json::json!(2));
+
+        // Exactly the bytes that were recorded, once each, in order.
+        assert_eq!(
+            std::fs::read(super::super::voice::audio_path(
+                &api.paths.root,
+                &session_id
+            ))
+            .unwrap(),
+            b"opus-oneopus-two"
+        );
+
+        // A closed session takes nothing more.
+        let late = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                8,
+                "cmd-vchunk-late",
+                "POST",
+                &chunk_path,
+                &chunk(2, b"opus-three", false),
+            ),
+            2_600,
+        );
+        assert_eq!(late.status, 409);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The end-to-end shape task 06 is judged on: a device advertises, a
+    /// command is queued, it is leased exactly once, started once, and its
+    /// result comes back with an artifact.
+    #[test]
+    fn a_device_receives_a_queued_command_exactly_once_and_returns_its_artifact() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(&api, &device_id, &[DeviceCapability::CameraCapture]);
+        assert_eq!(
+            advertise(
+                &api,
+                &device_id,
+                &secret,
+                1,
+                &[DeviceCapability::CameraCapture],
+                &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
+            )
+            .status,
+            200
+        );
+
+        let queued = api
+            .store
+            .lock()
+            .unwrap()
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::CameraCapture,
+                    arguments: serde_json::json!({ "position": "back" }),
+                    source_run_id: Some("run-one".into()),
+                    source_session_id: None,
+                    source_tool_call_id: Some("call-1".into()),
+                    expires_at_ms: 300_000,
+                },
+                2_000,
+            )
+            .unwrap();
+
+        let leased = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                2,
+                "cmd-lease-1",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(leased.status, 200);
+        let command: DeviceCommand = serde_json::from_slice(&leased.body).unwrap();
+        assert_eq!(command.command_id, queued.command_id);
+        assert_eq!(command.capability, DeviceCapability::CameraCapture);
+
+        // A second connection finds nothing: the command is leased, not shared.
+        let empty = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                3,
+                "cmd-lease-2",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(empty.status, 204);
+
+        let start_path = format!("/v1/remote/device/commands/{}/start", command.command_id);
+        let started = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                4,
+                "cmd-start-1",
+                "POST",
+                &start_path,
+                b"{}",
+            ),
+            2_000,
+        );
+        assert_eq!(started.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&started.body).unwrap()["started"],
+            serde_json::json!(true)
+        );
+        // The reconnect case: the device retries `start` because it lost the
+        // reply. It must be told the action already began, not allowed to
+        // repeat it.
+        let again = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                5,
+                "cmd-start-2",
+                "POST",
+                &start_path,
+                b"{}",
+            ),
+            2_000,
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&again.body).unwrap()["started"],
+            serde_json::json!(false),
+            "a reconnecting device must not perform the physical action twice"
+        );
+
+        let result = DeviceCommandResult {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            outcome: DeviceCommandState::Succeeded,
+            result: Some(serde_json::json!({ "width": 4, "height": 3 })),
+            artifact_base64: Some(STANDARD.encode(b"jpeg-bytes")),
+            artifact_media_type: Some("image/jpeg".into()),
+            error: None,
+        };
+        let result_path = format!("/v1/remote/device/commands/{}/result", command.command_id);
+        let reported = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                6,
+                "cmd-result-1",
+                "POST",
+                &result_path,
+                &serde_json::to_vec(&result).unwrap(),
+            ),
+            2_000,
+        );
+        assert_eq!(reported.status, 200);
+        let stored = api
+            .store
+            .lock()
+            .unwrap()
+            .device_command(&command.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, DeviceCommandState::Succeeded);
+        let artifact = stored.artifact.unwrap();
+        assert_eq!(artifact.bytes, 10);
+        assert_eq!(artifact.media_type, "image/jpeg");
+        assert!(root
+            .join("daemon/device-artifacts")
+            .join(&command.command_id)
+            .exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Authority is re-checked at the moment the command is handed over, not
+    /// only when it was queued — an OS permission the user switched off in
+    /// between must stop it, with a reason the waiting run can read.
+    #[test]
+    fn a_permission_withdrawn_after_queueing_fails_the_command_at_lease_time() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(&api, &device_id, &[DeviceCapability::LocationRead]);
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[DeviceCapability::LocationRead],
+            &[(DeviceCapability::LocationRead, OsPermission::Granted)],
+        );
+        let queued = api
+            .store
+            .lock()
+            .unwrap()
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::LocationRead,
+                    arguments: serde_json::json!({}),
+                    source_run_id: None,
+                    source_session_id: None,
+                    source_tool_call_id: None,
+                    expires_at_ms: 300_000,
+                },
+                2_000,
+            )
+            .unwrap();
+        // The user revokes location in the OS and the app re-advertises.
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            2,
+            &[DeviceCapability::LocationRead],
+            &[(DeviceCapability::LocationRead, OsPermission::Denied)],
+        );
+        let leased = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                3,
+                "cmd-lease-1",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(leased.status, 204, "a denied capability yields no command");
+        let stored = api
+            .store
+            .lock()
+            .unwrap()
+            .device_command(&queued.command_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, DeviceCommandState::Failed);
+        assert!(stored.error.unwrap().contains("no longer granted"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Advertising is not authority: a device that claims every capability
+    /// gains none it was not granted.
+    #[test]
+    fn advertising_a_capability_never_grants_it() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let response = advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::CameraCapture,
+                DeviceCapability::ScreenCapture,
+                DeviceCapability::MicrophoneCapture,
+            ],
+            &[
+                (DeviceCapability::CameraCapture, OsPermission::Granted),
+                (DeviceCapability::ScreenCapture, OsPermission::Granted),
+                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+            ],
+        );
+        assert_eq!(response.status, 200);
+        let state: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let effective = state["effective"].as_array().unwrap();
+        assert!(
+            !effective
+                .iter()
+                .any(|value| value == "camera_capture" || value == "screen_capture"),
+            "a self-declared capability must not become effective: {effective:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The long poll waits for work and returns as soon as it exists, and it
+    /// never holds a connection longer than the lease.
+    #[tokio::test]
+    async fn the_lease_long_poll_waits_for_work_and_gives_up_on_time() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(&api, &device_id, &[DeviceCapability::NotificationPost]);
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[DeviceCapability::NotificationPost],
+            &[(DeviceCapability::NotificationPost, OsPermission::Granted)],
+        );
+
+        let started = std::time::Instant::now();
+        let empty = api
+            .handle_waiting(
+                signed(
+                    &device_id,
+                    &secret,
+                    2,
+                    "cmd-poll-1",
+                    "GET",
+                    "/v1/remote/device/commands/next?wait_ms=1200",
+                    b"",
+                ),
+                2_000,
+            )
+            .await;
+        assert_eq!(empty.status, 204);
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(1_000),
+            "an empty poll must actually wait, not spin: {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_millis(10_000),
+            "the poll must give up well inside the lease: {waited:?}"
+        );
+
+        // With work already queued, the same request returns immediately.
+        api.store
+            .lock()
+            .unwrap()
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::NotificationPost,
+                    arguments: serde_json::json!({ "title": "hi", "body": "there" }),
+                    source_run_id: None,
+                    source_session_id: None,
+                    source_tool_call_id: None,
+                    expires_at_ms: 300_000,
+                },
+                2_000,
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let leased = api
+            .handle_waiting(
+                signed(
+                    &device_id,
+                    &secret,
+                    3,
+                    "cmd-poll-2",
+                    "GET",
+                    "/v1/remote/device/commands/next?wait_ms=20000",
+                    b"",
+                ),
+                2_000,
+            )
+            .await;
+        assert_eq!(leased.status, 200);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(2_000),
+            "a queued command must not wait for the poll deadline"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A revoked device gets nothing, including on the device plane.
+    #[test]
+    fn a_revoked_device_cannot_lease_or_report() {
+        let (root, api, secrets, device_id, secret) = fixture();
+        grant(&api, &device_id, &[DeviceCapability::DeviceInfo]);
+        api.store
+            .lock()
+            .unwrap()
+            .revoke_device(&device_id, "lost", 2_000, secrets.as_ref(), None)
+            .unwrap();
+        for (sequence, command, method, path) in [
+            (1u64, "cmd-a", "GET", "/v1/remote/device/state"),
+            (2, "cmd-b", "GET", "/v1/remote/device/commands/next"),
+            (3, "cmd-c", "POST", "/v1/remote/device/surface"),
+        ] {
+            let response = api.handle(
+                signed(&device_id, &secret, sequence, command, method, path, b"{}"),
+                2_000,
+            );
+            assert_eq!(response.status, 401, "{path} answered a revoked device");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

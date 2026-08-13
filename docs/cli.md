@@ -110,7 +110,23 @@ monkey daemon retry <run-id> [--acknowledge-side-effects]
 monkey daemon kill-switch engage|release|status
 monkey daemon trigger --help
 monkey daemon remote --help
+monkey daemon remote pair-create --output <file> --run <run-id> --device <capability> [--qr]
+monkey daemon remote device-list [--json]
+monkey daemon remote device-grant <device-id> [--capability <capability>]...
+monkey daemon remote device-action <action> [--device-id <id>] [--wait-ms <n>] [--json]
+monkey daemon remote device-commands <device-id> [--limit <n>] [--json]
+monkey daemon remote device-cancel <command-id>
+monkey daemon remote voice-start [--device-id <id>] [--duration-ms <n>]
+monkey daemon remote voice-list [--device-id <id>] [--limit <n>] [--json]
+monkey daemon remote voice-stop <session-id>
+monkey daemon remote voice-save <session-id> --output <file>
+monkey daemon remote push-configure --web-push [--vapid-subject <url>] [--include-detail]
+monkey daemon remote push-configure --project-id <id> --service-account <file> [--include-detail]
+monkey daemon remote push-status [--json] | push-disable | push-test <device-id>
 ```
+
+The `device-*`, `voice-*` and `push-*` commands are documented in
+[Paired devices](paired-devices.md).
 
 In the REPL, `/help` lists terminal-only controls such as `/set`, `/show`, `/save`, `/load`, `/revert`, `/persona`, `/prompts`, `/verify`, `/clear`, and `/bye`. Installed skill invocations use the same frozen, turn-scoped prompt composition as desktop chat.
 

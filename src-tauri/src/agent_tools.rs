@@ -345,6 +345,59 @@ pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
     })
 }
 
+/// The `device_action` tool — asks a paired physical device for one bounded
+/// thing.
+///
+/// Like [`present_plan_tool_def`] and [`search_docs_tool_def`], deliberately
+/// excluded from [`tool_definitions`]'s base array: it is appended only when
+/// this machine actually has a paired device with an effective physical
+/// capability. A model that is offered a camera it cannot reach will try to use
+/// one, and the honest failure ("no paired device can do this") is a worse
+/// answer than never having offered it.
+///
+/// `voice_stream` is absent on purpose. A continuous stream is not a discrete
+/// command, and routing it through this tool would spend a grant meant for the
+/// Talk surface.
+pub fn device_action_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "device_action",
+            "description": "Ask a paired phone or tablet to do one bounded thing with its own hardware and return the result. Every action needs the operator's grant, the device's support, and the device's OS permission; anything else is refused with a reason. The device shows what it is doing. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "device_info",
+                            "camera_capture",
+                            "microphone_capture",
+                            "location_read",
+                            "notification_post",
+                            "screen_capture",
+                            "audio_playback"
+                        ],
+                        "description": "device_info reads the device's own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud."
+                    },
+                    "device_id": { "type": "string", "description": "Which paired device. Omit when exactly one device can perform this action; if several can, the call fails and lists them." },
+                    "position": { "type": "string", "enum": ["front", "back"], "description": "camera_capture only. Defaults to back." },
+                    "duration_ms": { "type": "integer", "description": "microphone_capture only: how long to record, 1-300000 ms. Defaults to 10000." },
+                    "accuracy": { "type": "string", "enum": ["coarse", "precise"], "description": "location_read only. Defaults to coarse." },
+                    "title": { "type": "string", "description": "notification_post only: up to 128 characters." },
+                    "body": { "type": "string", "description": "notification_post only: up to 512 characters." },
+                    "text": { "type": "string", "description": "audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both." },
+                    "run_id": { "type": "string", "description": "audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant." },
+                    "artifact_id": { "type": "string", "description": "audio_playback only: which audio artifact of that run to play." },
+                    "wait_ms": { "type": "integer", "description": "How long to wait for the device before returning, 1000-120000 ms (default 60000). A device that is asleep may answer later; the result then says the command is still queued or running rather than that it failed." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// The `task` tool — delegates a scoped subtask to a subagent with its own
 /// isolated tool-calling loop and explicit explore/code tool profiles — a Rust port of
 /// `src/lib/tools.ts`'s `TASK_TOOL`. Like [`present_plan_tool_def`] and
