@@ -83,8 +83,8 @@ pub enum RouteScopeError {
     MissingAccount,
     /// A thread or sender was named without a conversation.
     MissingConversation,
-    /// A sender-scoped route needs the thread rung populated or absent
-    /// consistently; see [`RouteScope::validate`].
+    /// A sender was named without the thread it speaks in. The sender rung is
+    /// `account + conversation + thread + sender`; see [`RouteScope::validate`].
     MissingThreadForSender,
     /// A channel-default route names a provider and nothing else; anything more
     /// specific must name the account instead.
@@ -184,11 +184,13 @@ impl RouteScope {
 
     /// Reject scopes that are not on the ladder.
     ///
-    /// The sender rung is `account + conversation + thread + sender`, but a
-    /// provider without threads has no thread id to give, so a sender route in a
-    /// thread-less conversation is accepted with `thread_id: None` and matches
-    /// only thread-less messages. What is never accepted is a sender or thread
-    /// floating free of its conversation.
+    /// The sender rung is `account + conversation + thread + sender`, all four,
+    /// because that is the rung the ladder declares. A sender without a thread
+    /// would be a seventh rung nothing documents, and — since [`Self::matches`]
+    /// only constrains fields that are set — it would match that sender in
+    /// *every* thread of the conversation while claiming to be the most
+    /// specific route there is. Refused rather than silently reinterpreted, so
+    /// an operator who meant one thread does not get all of them.
     pub fn validate(&self) -> Result<(), RouteScopeError> {
         // A present-but-blank id first: every rule below asks whether a field
         // is set, and `Some("")` answers yes to all of them while naming
@@ -211,6 +213,9 @@ impl RouteScope {
         if (self.thread_id.is_some() || self.sender_id.is_some()) && self.conversation_id.is_none()
         {
             return Err(RouteScopeError::MissingConversation);
+        }
+        if self.sender_id.is_some() && self.thread_id.is_none() {
+            return Err(RouteScopeError::MissingThreadForSender);
         }
         if self.kind.is_some() && self.account_id.is_some() {
             // A kind-scoped route is the provider-wide default. Once an account
@@ -788,6 +793,77 @@ mod tests {
             .with_sender("s")
             .validate()
             .is_ok());
+    }
+
+    /// The sender rung is all four ids. Each missing one is named on its own,
+    /// widest first, so the operator is told the one thing to add next rather
+    /// than a generic "invalid scope".
+    #[test]
+    fn a_sender_route_needs_every_id_above_it_named_one_at_a_time() {
+        let sender_only = RouteScope {
+            sender_id: Some("U1".into()),
+            ..RouteScope::default()
+        };
+        assert_eq!(sender_only.validate(), Err(RouteScopeError::MissingAccount));
+
+        let account_and_sender = RouteScope {
+            account_id: Some("acct-1".into()),
+            sender_id: Some("U1".into()),
+            ..RouteScope::default()
+        };
+        assert_eq!(
+            account_and_sender.validate(),
+            Err(RouteScopeError::MissingConversation)
+        );
+
+        // The rung this used to accept: it would have matched U1 in every
+        // thread of C1 while sitting on the ladder's most specific rung.
+        assert_eq!(
+            RouteScope::conversation("acct-1", "C1")
+                .with_sender("U1")
+                .validate(),
+            Err(RouteScopeError::MissingThreadForSender)
+        );
+
+        assert_eq!(
+            RouteScope::conversation("acct-1", "C1")
+                .with_thread("T1")
+                .with_sender("U1")
+                .validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_sender_route_does_not_follow_its_sender_into_another_thread() {
+        let routes = vec![route(
+            "sender",
+            RouteScope::conversation("acct-1", "C1")
+                .with_thread("T1")
+                .with_sender("U1"),
+        )];
+        // The same sender, the same conversation, a different thread.
+        let mut elsewhere = envelope();
+        elsewhere.conversation.thread_id = Some("T2".into());
+        assert_eq!(
+            resolve_route(&routes, &elsewhere).unwrap_err(),
+            RouteError::NoRoute
+        );
+        // And in a thread-less message, which is what a provider without
+        // threads sends.
+        let mut threadless = envelope();
+        threadless.conversation.thread_id = None;
+        assert_eq!(
+            resolve_route(&routes, &threadless).unwrap_err(),
+            RouteError::NoRoute
+        );
+        // The thread it was scoped to still resolves.
+        assert_eq!(
+            resolve_route(&routes, &envelope())
+                .expect("a route")
+                .route_id,
+            "sender"
+        );
     }
 
     #[test]

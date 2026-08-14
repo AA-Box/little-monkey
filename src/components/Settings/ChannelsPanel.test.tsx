@@ -317,6 +317,9 @@ describe("route management", () => {
     fireEvent.change(await screen.findByLabelText("Account"), { target: { value: "chan-1" } });
     fireEvent.change(await screen.findByLabelText("Conversation"), { target: { value: "conv-7" } });
     fireEvent.change(screen.getByLabelText("Sender"), { target: { value: "+15550000000" } });
+    // The sender rung is account + conversation + thread + sender, all four:
+    // the daemon refuses anything less, so the form cannot submit it either.
+    fireEvent.change(screen.getByLabelText("Thread"), { target: { value: "thread-2" } });
     fireEvent.click(screen.getByText("Save route"));
 
     await waitFor(() =>
@@ -325,6 +328,7 @@ describe("route management", () => {
         options: expect.objectContaining({
           account_id: "chan-1",
           conversation_id: "conv-7",
+          thread_id: "thread-2",
           sender_id: "+15550000000",
           kind: null,
         }),
