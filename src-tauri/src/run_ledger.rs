@@ -7599,6 +7599,143 @@ mod tests {
             .is_some());
     }
 
+    /// A database a previous release wrote gains V21 and V22 without losing a row.
+    ///
+    /// V21 is the only process migration that rebuilds the table rather than
+    /// adding to it — it widens the `kind` vocabulary for `foreground_shell` and
+    /// adds the five typed breach columns with an all-or-none `CHECK` — so it is
+    /// the one where an upgrade can silently drop a shipped user's history. The
+    /// probe is the same shape as the pre-V11 one above: wind the schema back to
+    /// what V20 left, reopen, and assert the ladder replays over real rows.
+    ///
+    /// What it pins beyond "the rows are still there": a row written before the
+    /// breach columns existed reads back as a row with *no* breach rather than one
+    /// with zeros, which is the difference between "this process was not stopped
+    /// by a limit" and "it was stopped by a limit configured at 0 bytes".
+    #[test]
+    fn a_v20_database_gains_the_breach_columns_and_keeps_its_rows() {
+        let database = TempDb::new("process-v21-upgrade");
+        // The V20 column set, which is also what V21's `INSERT ... SELECT` names.
+        const V20_COLUMNS: &str = "process_id, parent_process_id, kind, external_id, state, \
+             run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, \
+             max_output_bytes, max_child_processes, exit_status, exit_code, exit_signal, \
+             exit_reason, created_at_ms, updated_at_ms, started_at_ms, exited_at_ms, \
+             stop_requested, suspend_requested, signal_reason, signal_requested_at_ms, \
+             kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read, bytes_written, \
+             bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms, \
+             usage_unavailable_json, egress_destinations_dropped, context_tokens_reused, \
+             max_context_tokens, context_tokens_evaluated";
+
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .connection
+                .execute(
+                    "INSERT INTO agent_processes (
+                         process_id, kind, external_id, state, created_at_ms, updated_at_ms,
+                         started_at_ms, exited_at_ms, native_pid, max_memory_bytes,
+                         exit_status, exit_code, exit_reason
+                     ) VALUES (
+                         'shell-v20', 'background_shell', 'ext-v20', 'exited', 10, 40,
+                         12, 40, 4242, 536870912,
+                         'failed', 1, 'the build failed'
+                     )",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Back to V20: a table with the old column set and none of the new
+        // constraints, which is all V21's rebuild reads from. Dropping is the only
+        // way there — the release that wrote the original is gone.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE agent_processes_v20 AS SELECT {V20_COLUMNS} FROM agent_processes;
+                     DROP TABLE agent_processes;
+                     ALTER TABLE agent_processes_v20 RENAME TO agent_processes;
+                     DELETE FROM schema_migrations WHERE version IN (21, 22);
+                     PRAGMA user_version = 20;"
+                ))
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
+            "opening a V20 database must apply every migration above it"
+        );
+
+        // The row survived, value for value, and its breach columns are absent
+        // rather than zeroed.
+        let (kind, pid, memory, status, reason, limit_kind, configured, start_time): (
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = ledger
+            .connection
+            .query_row(
+                "SELECT kind, native_pid, max_memory_bytes, exit_status, exit_reason,
+                        limit_kind, limit_configured, native_start_time
+                 FROM agent_processes WHERE process_id = 'shell-v20'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, "background_shell");
+        assert_eq!(pid, 4242);
+        assert_eq!(memory, 536_870_912);
+        assert_eq!(status, "failed");
+        assert_eq!(reason, "the build failed");
+        assert_eq!(limit_kind, None, "a legacy row states no breach");
+        assert_eq!(configured, None, "and no number for one");
+        assert_eq!(start_time, None, "V22's identity is unknown for it");
+
+        // The vocabulary V21 exists for is accepted…
+        ledger
+            .connection
+            .execute(
+                "INSERT INTO agent_processes
+                     (process_id, kind, external_id, state, created_at_ms, updated_at_ms)
+                 VALUES ('fg-1', 'foreground_shell', 'ext-fg-1', 'running', 50, 50)",
+                [],
+            )
+            .unwrap();
+        // …and the all-or-none breach guard is a constraint, not merely absent.
+        assert!(
+            ledger
+                .connection
+                .execute(
+                    "UPDATE agent_processes SET limit_kind = 'max_memory_bytes'
+                     WHERE process_id = 'shell-v20'",
+                    [],
+                )
+                .is_err(),
+            "half a breach must be refused by the rebuilt table's CHECK"
+        );
+    }
+
     /// The bug K12's acceptance names: before this table, a gated tool call
     /// outside a ledger-registered run — deleting a model from Settings, a local
     /// app definition run over HTTP, a triage reply posted to Slack — produced no

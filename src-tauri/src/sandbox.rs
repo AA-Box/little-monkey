@@ -1388,6 +1388,31 @@ fn build_seatbelt_profile_inner(
 /// tail it produced.
 const SANDBOX_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
 
+/// What bounds one sandboxed run's process tree, resolved once for every host.
+///
+/// A separate function rather than an expression inside the spawn branches
+/// because Windows leaves the shared `Command` path entirely (see
+/// [`execute_in_sandbox`]) and would otherwise resolve its own numbers. It did:
+/// the Windows arm built the fixed 4 GiB / 512-process job while every other
+/// host installed the class defaults intersected with this run's deadline, so
+/// the same panel button meant two different bounds depending on the machine.
+fn sandbox_run_limits(timeout: Duration) -> EffectiveLimits {
+    EffectiveLimits::resolve(&[
+        LimitLayer::new(
+            LimitSource::ClassDefault,
+            ProcessKind::ForegroundShell.default_limits(),
+        ),
+        LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_wall_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                max_output_bytes: Some(u64::try_from(SANDBOX_OUTPUT_CAP).unwrap_or(u64::MAX)),
+                ..ProcessLimits::default()
+            },
+        ),
+    ])
+}
+
 pub struct SandboxExecOutcome {
     pub isolation: Isolation,
     pub exit_code: Option<i32>,
@@ -1520,7 +1545,14 @@ pub async fn execute_in_sandbox(
     // second, unconfined child.
     #[cfg(target_os = "windows")]
     {
-        let job = crate::sandbox_windows::create_job()?;
+        // Through a controller, so this run's job carries the *effective* memory
+        // and process ceilings rather than the fixed platform guardrail: a caller
+        // may tighten them and can never widen them, which is the rule
+        // `EffectiveLimits` holds for every other host. The controller is kept
+        // alive for the block because it owns the original job handle; the one
+        // handed to the spawn is a duplicate.
+        let controller = ResourceController::new(sandbox_run_limits(timeout));
+        let job = controller.windows_job_for_spawn()?;
         // The container is the filesystem boundary; the job is the process-tree
         // one. A machine that cannot give us the container still gets the job,
         // and says so, rather than failing the run or overstating it.
@@ -1623,20 +1655,7 @@ pub async fn execute_in_sandbox(
         // order, and the cgroup migration writes through a descriptor opened
         // before the fork, so it must be queued before anything starts denying
         // opens.
-        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
-            LimitLayer::new(
-                LimitSource::ClassDefault,
-                ProcessKind::ForegroundShell.default_limits(),
-            ),
-            LimitLayer::new(
-                LimitSource::UserOverride,
-                ProcessLimits {
-                    max_wall_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
-                    max_output_bytes: Some(u64::try_from(SANDBOX_OUTPUT_CAP).unwrap_or(u64::MAX)),
-                    ..ProcessLimits::default()
-                },
-            ),
-        ]));
+        let mut controller = ResourceController::new(sandbox_run_limits(timeout));
         controller.prepare_tokio(&mut command)?;
         // Linux's boundary is installed the same way, and *after* `os_limits` on
         // purpose: `pre_exec` closures run in registration order, so the `setrlimit`

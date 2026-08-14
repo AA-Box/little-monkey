@@ -517,10 +517,18 @@ impl ResourceController {
     ///
     /// The ordering rule K4 turns on: where a platform offers a pre-execution
     /// mechanism, there must be no window in which user code runs outside it.
-    /// On Linux the child joins its cgroup between `fork` and `exec`; on Windows
-    /// the process is created suspended and assigned before it is resumed. The
+    /// On Linux the child joins its cgroup between `fork` and `exec`. The
     /// supervisor has no pre-execution mechanism, which is exactly why it reports
     /// itself as supervised.
+    ///
+    /// **Windows installs nothing here**, and that is the platform's shape rather
+    /// than an omission: a job is applied to a process, not carried into one by a
+    /// `Command`. A spawn site that calls `CreateProcessW` itself gets the strong
+    /// ordering — created suspended, assigned, then resumed, which is what
+    /// [`Self::windows_job_for_spawn`] exists for and what every agent shell uses.
+    /// A site that spawns through `tokio::process` cannot, so [`Self::attach`]
+    /// makes the assignment immediately after creation and
+    /// [`Self::adopt`] states the window that leaves.
     pub fn prepare_tokio(&self, command: &mut tokio::process::Command) -> io::Result<()> {
         match &self.backend {
             #[cfg(target_os = "linux")]
@@ -577,14 +585,20 @@ impl ResourceController {
     /// window at all. Every shell path uses them and must keep using them.
     ///
     /// This is for an owner that cannot build its child's `Command` through those
-    /// entry points — today the browser session, whose Chromium is launched by a
-    /// long-standing spawn site with its own argv, environment and stdio, and
-    /// which on Windows has no pre-creation hook to hang a job assignment on.
-    /// There the assignment is made from the parent immediately after
-    /// `CreateProcess` returns, which leaves a window measured in microseconds
-    /// during which a descendant created by the new process would be outside the
-    /// job. That is a narrower guarantee than the shells get and it is stated as
-    /// such in `docs/limitations.md` rather than glossed as equivalent.
+    /// entry points — the browser session, whose Chromium is launched by a
+    /// long-standing spawn site with its own argv, environment and stdio — and,
+    /// on Windows, for every owner that spawns through `tokio::process`, because
+    /// there is no pre-creation hook there to hang a job assignment on. There the
+    /// assignment is made from the parent immediately after `CreateProcess`
+    /// returns, which leaves a window measured in microseconds during which a
+    /// descendant created by the new process would be outside the job. That is a
+    /// narrower guarantee than the shells get on Windows — they go through
+    /// `spawn_confined_child`, which assigns the job while the process is still
+    /// suspended — and it is stated as such in `docs/limitations.md` rather than
+    /// glossed as equivalent.
+    ///
+    /// [`Self::attach`] calls this itself, so an owner only needs it directly
+    /// when the assignment has to happen earlier than the attach.
     ///
     /// On Unix there is no such window: the cgroup migration and the process
     /// group are both installed by `prepare_std` before `exec`, and this call is
@@ -645,6 +659,29 @@ impl ResourceController {
         self.root = Some(identity);
         self.started_at = Instant::now();
         self.owned.insert(pid, identity.start_time);
+
+        // Install the containment for the backends that cannot install it before
+        // the first instruction, then read it back below.
+        //
+        // On Unix this is an idempotent re-assertion: `prepare_std`/`prepare_tokio`
+        // already joined the cgroup and set the process group from inside the
+        // child, before `exec`. On Windows it is the assignment itself, because
+        // there is nothing a `Command` can carry into `CreateProcess` — the job is
+        // applied either between `CREATE_SUSPENDED` and `ResumeThread` at a spawn
+        // site that builds the process itself, or from here.
+        //
+        // It lives in `attach` rather than at each call site because leaving it to
+        // the caller is a bug that only appears on one platform: `prepare_tokio`
+        // returns `Ok` on Windows with nothing installed, so an owner that called
+        // prepare/spawn/attach — the documented order — got a child in no job at
+        // all, and the `confirm_containment` below correctly refused to start it.
+        // Every owner that builds its own `Command` was in that state.
+        //
+        // The error is deliberately dropped: a process already inside this job or
+        // scope answers a second assignment with a refusal on some hosts, and the
+        // question that decides whether the workload may run is the membership
+        // read below, not this write.
+        let _ = self.adopt(pid);
 
         if let Err(error) = self.confirm_containment(pid) {
             // A process that exited between the spawn and this check cannot be a
@@ -1797,6 +1834,78 @@ mod tests {
             .expect("the job takes the process it is about to bound");
         controller.attach(child.id()).expect("the job contains it");
         child
+    }
+
+    /// An owner that only prepares, spawns and attaches gets a contained child.
+    ///
+    /// The regression this pins is Windows-shaped and was invisible everywhere
+    /// else. `prepare_tokio`/`prepare_std` install the containment on Linux and
+    /// under the supervisor, and on Windows there is nothing they *can* install —
+    /// a job is applied to a process, not carried into one by a `Command`. So an
+    /// owner that followed the documented order and did not also call `adopt`
+    /// spawned a child in no job at all, `attach` correctly refused to let it run,
+    /// and the whole path failed closed with "no kernel bound is holding it".
+    /// Every owner with its own `Command` was in that state: the verify runner,
+    /// the hook runner, and any added later.
+    ///
+    /// The helpers above call `adopt` explicitly, which is why the job tests
+    /// passed while the production paths did not — so this test deliberately does
+    /// not, and spawns through `tokio::process` because that is what those owners
+    /// build.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_owner_that_only_prepares_and_attaches_gets_a_contained_child() {
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(512 * 1024 * 1024),
+                max_child_processes: Some(8),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        assert_eq!(
+            controller.capabilities().backend,
+            "windows job object",
+            "every Windows host can create a job; a fallback here is a real failure"
+        );
+
+        let executable = std::env::current_exe().expect("the test binary knows its own path");
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "resource_control::tests::windows_idle_child",
+                "--test-threads=1",
+            ])
+            .env("LITTLE_MONKEY_WINDOWS_IDLE_MS", "4000")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        controller
+            .prepare_tokio(&mut command)
+            .expect("a Windows job needs nothing before the spawn");
+        let mut child = command.spawn().expect("the workload spawns");
+        let pid = child.id().expect("a freshly spawned child has a pid");
+
+        controller
+            .attach(pid)
+            .expect("attaching a running child must contain it, not refuse it");
+        // Not merely "attach returned Ok": the sample comes from the job's own
+        // accounting, so a non-empty one is the kernel agreeing that the process
+        // is inside the bound.
+        let sample = controller
+            .sample()
+            .expect("the job reports its accounting")
+            .expect("a running child is not a gone workload");
+        assert!(
+            sample.process_count.is_some_and(|count| count >= 1),
+            "the job should be accounting for the child it contains: {sample:?}"
+        );
+
+        controller.terminate_tree().expect("the tree is reclaimed");
+        let _ = child.wait().await;
     }
 
     /// Poll the controller until it reports a breach, or give up.

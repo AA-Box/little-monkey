@@ -2404,10 +2404,13 @@ a caller receives rather than a paragraph a reader has to find.
 and K8 on the theory that admission without a universal quota was a guess. Both are
 now built against measured reservations, so K4 no longer blocks their mechanics;
 ~~their existence does not close K4's declaration and platform-enforcement gaps.~~
-~~**Those gaps are closed by the slice above.**~~ **The declaration gap is closed;
+~~**Those gaps are closed by the slice above.**~~ ~~**The declaration gap is closed;
 the platform gaps are not — see the open list at the top of this section. K7/K8
 still do not block on it, but their reservations have not been re-audited against
-the resource controller either.**
+the resource controller either.**~~ **The declaration gap is closed, the platform
+gaps are the two named at the top of this section, and the K7/K8 audit is done:
+what it found and what now asserts it is under *Scheduler reservations had not
+been re-audited* above.**
 
 ## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
