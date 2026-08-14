@@ -892,6 +892,19 @@ async fn run_diffusion(
     let binary = engine_binary(app)?;
     let engine = &state.generation_engine;
 
+    // The engine only resolves a LoRA by its name inside `--lora-model-dir`,
+    // so the absolute paths the request carries are linked in and replaced
+    // with those names. Only a run that selected one pays for the clone.
+    let staged;
+    let request = if request.loras.is_empty() {
+        request
+    } else {
+        let mut owned = request.clone();
+        generation::stage_loras(&root, &mut owned)?;
+        staged = owned;
+        &staged
+    };
+
     let _ = app.emit(
         "studio://progress",
         GenerationProgressEvent::new("", "loading"),
