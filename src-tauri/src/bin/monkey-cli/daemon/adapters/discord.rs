@@ -54,6 +54,10 @@ const IDENTIFY_SPACING: Duration = Duration::from_secs(5);
 /// before hanging up and waiting outside instead. Discord tolerates a short
 /// pause between HELLO and IDENTIFY but not minutes of one.
 const MAX_IDENTIFY_HOLD: Duration = Duration::from_secs(10);
+/// The longest rate-limit wait served in place between chunks of one logical
+/// message. Anything longer parks the row for reconciliation instead of
+/// pinning an outbox worker to a sleep.
+const MAX_INTRA_MESSAGE_WAIT_MS: u64 = 10_000;
 /// How many thread-to-parent mappings ride the persisted cursor. The cursor
 /// column caps its value at 4096 bytes, and 64 snowflake pairs plus the
 /// resume fields stay safely under that; threads evicted past the cap are
@@ -184,12 +188,196 @@ pub struct DiscordAdapter {
     /// The REST origin. Always [`API_BASE`] in production; swappable in tests
     /// so the whole gateway handshake can run against a loopback fixture.
     api_base: String,
-    /// Target channel -> the instant Discord's own rate-limit headers said
-    /// this route may be used again. Consulted before a send so a bucket the
-    /// provider already reported as spent is not asked again just to buy a
-    /// 429 — nothing has been sent when the check fires, so answering
-    /// `RetryableFailure` with the remaining wait is always safe.
-    route_cooldowns: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// Provider-side rate accounting, consulted before every REST send and
+    /// fed by every REST response. One coordinator per adapter because the
+    /// limits it mirrors are per bot account, not per call site.
+    rate_limiter: std::sync::Mutex<RateLimiter>,
+}
+
+/// The provider accounts for rate limits the way it says it does, not per
+/// channel: each response names the bucket the request drew from, and several
+/// routes can share one bucket — so spending it through one channel must
+/// gate the others too. A global 429 is wider still: it closes the whole
+/// account until its retry window passes. Per-channel cooldowns capture
+/// neither, which is why this coordinator replaces them.
+///
+/// Time is always passed in rather than read here, so tests can drive the
+/// clock with constructed instants instead of sleeping.
+#[derive(Default)]
+struct RateLimiter {
+    /// Route key ("POST:{channel_id}") -> the bucket id the provider named in
+    /// X-RateLimit-Bucket for it. Learned from every response, so the mapping
+    /// tracks the provider's own (re)grouping of routes.
+    route_buckets: std::collections::HashMap<String, String>,
+    /// Gate key -> when sends through it may resume. The key is the bucket id
+    /// once one has been learned for the route, and the bare route key until
+    /// then — an exhaustion recorded before the bucket was known is migrated
+    /// forward rather than lost.
+    gates: std::collections::HashMap<String, std::time::Instant>,
+    /// Set by a global 429. Every route on this account waits it out,
+    /// whatever bucket it maps to.
+    global_until: Option<std::time::Instant>,
+}
+
+/// Hard cap on each limiter map. An adapter talks to a bounded set of live
+/// channels, so the cap is never hit in practice; it exists so a pathological
+/// spread of one-off routes cannot grow the state without bound.
+const RATE_LIMIT_MAP_CAP: usize = 256;
+
+/// Whole milliseconds until `until`, rounded up to at least one so a gate
+/// that is still in the future never reports a zero wait.
+fn ms_until(until: std::time::Instant, now: std::time::Instant) -> Option<u64> {
+    let remaining = until.saturating_duration_since(now);
+    (remaining > Duration::ZERO).then(|| (remaining.as_millis() as u64).max(1))
+}
+
+impl RateLimiter {
+    /// The gate this route currently answers to.
+    fn gate_key<'a>(&'a self, route: &'a str) -> &'a str {
+        self.route_buckets
+            .get(route)
+            .map(String::as_str)
+            .unwrap_or(route)
+    }
+
+    /// How long this route must wait before its next request, `None` when it
+    /// is clear. The account-wide gate is checked first — it outranks any
+    /// bucket — and the longer of the two waits is reported.
+    fn wait_ms(&self, route: &str, now: std::time::Instant) -> Option<u64> {
+        let global = self.global_until.and_then(|until| ms_until(until, now));
+        let bucket = self
+            .gates
+            .get(self.gate_key(route))
+            .and_then(|until| ms_until(*until, now));
+        match (global, bucket) {
+            (None, None) => None,
+            (global, bucket) => Some(global.unwrap_or(0).max(bucket.unwrap_or(0))),
+        }
+    }
+
+    /// Fold one response's verdict into the state: remember which bucket the
+    /// route draws from, close the gate when the bucket is spent or the
+    /// request was refused, and close the whole account on a global 429.
+    #[allow(clippy::too_many_arguments)]
+    fn on_response(
+        &mut self,
+        route: &str,
+        status: u16,
+        bucket: Option<&str>,
+        remaining: Option<u64>,
+        reset_after_ms: Option<u64>,
+        retry_after_ms: Option<u64>,
+        is_global: bool,
+        now: std::time::Instant,
+    ) {
+        if let Some(bucket) = bucket {
+            if self.route_buckets.get(route).map(String::as_str) != Some(bucket) {
+                // An exhaustion recorded while the bucket was still unknown
+                // lives under the bare route key; carry it to the bucket key
+                // so learning the mapping cannot reopen a closed gate.
+                if let Some(until) = self.gates.remove(route) {
+                    let slot = self.gates.entry(bucket.to_string()).or_insert(until);
+                    if *slot < until {
+                        *slot = until;
+                    }
+                }
+                self.insert_route_bucket(route, bucket, now);
+            }
+        }
+        if remaining == Some(0) {
+            if let Some(reset_after_ms) = reset_after_ms {
+                self.insert_gate(
+                    self.gate_key(route).to_string(),
+                    now + Duration::from_millis(reset_after_ms),
+                    now,
+                );
+            }
+        }
+        if status == 429 {
+            if let Some(retry_after_ms) = retry_after_ms {
+                let until = now + Duration::from_millis(retry_after_ms);
+                if is_global {
+                    self.global_until = Some(until);
+                } else {
+                    self.insert_gate(self.gate_key(route).to_string(), until, now);
+                }
+            }
+        }
+        // A passed global gate is dead state; drop it while we hold the
+        // write lock anyway.
+        if self.global_until.is_some_and(|until| until <= now) {
+            self.global_until = None;
+        }
+    }
+
+    fn insert_gate(&mut self, key: String, until: std::time::Instant, now: std::time::Instant) {
+        // Passed gates are inert; sweeping them on write keeps the map sized
+        // to what is actually still closed.
+        self.gates.retain(|_, gate| *gate > now);
+        if self.gates.len() >= RATE_LIMIT_MAP_CAP && !self.gates.contains_key(&key) {
+            // Sacrifice the gate that opens soonest: losing it risks at most
+            // one premature request near its own reset.
+            if let Some(soonest) = self
+                .gates
+                .iter()
+                .min_by_key(|(_, gate)| **gate)
+                .map(|(key, _)| key.clone())
+            {
+                self.gates.remove(&soonest);
+            }
+        }
+        self.gates.insert(key, until);
+    }
+
+    fn insert_route_bucket(&mut self, route: &str, bucket: &str, now: std::time::Instant) {
+        if self.route_buckets.len() >= RATE_LIMIT_MAP_CAP && !self.route_buckets.contains_key(route)
+        {
+            // A dropped mapping is the cheapest loss here — the very next
+            // response on that route teaches it again — so evict the one
+            // whose gate opens soonest (or is already open).
+            let victim = self
+                .route_buckets
+                .iter()
+                .min_by_key(|(_, bucket)| self.gates.get(bucket.as_str()).copied().unwrap_or(now))
+                .map(|(route, _)| route.clone());
+            if let Some(victim) = victim {
+                self.route_buckets.remove(&victim);
+            }
+        }
+        self.route_buckets
+            .insert(route.to_string(), bucket.to_string());
+    }
+}
+
+/// What one REST response said about rate limiting, in one place so both
+/// send paths feed the limiter identically.
+#[derive(Default)]
+struct RateLimitInfo {
+    bucket: Option<String>,
+    remaining: Option<u64>,
+    reset_after_ms: Option<u64>,
+    retry_after_ms: Option<u64>,
+    is_global: bool,
+}
+
+/// Read the rate-limit headers off a response. Reset and retry windows come
+/// as fractional seconds and are widened to milliseconds; the global flag
+/// counts as set by presence, since it only ever accompanies a global 429.
+fn parse_rate_limit_headers(headers: &reqwest::header::HeaderMap) -> RateLimitInfo {
+    let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    RateLimitInfo {
+        bucket: text("X-RateLimit-Bucket").map(str::to_string),
+        remaining: text("X-RateLimit-Remaining").and_then(|value| value.parse().ok()),
+        reset_after_ms: text("X-RateLimit-Reset-After")
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(|seconds| (seconds * 1000.0).max(0.0) as u64),
+        retry_after_ms: text("Retry-After")
+            .and_then(|value| value.parse::<f64>().ok())
+            .map(|seconds| (seconds * 1000.0).round().max(0.0) as u64),
+        is_global: text("X-RateLimit-Global")
+            .map(|value| !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(false),
+    }
 }
 
 impl DiscordAdapter {
@@ -211,30 +399,83 @@ impl DiscordAdapter {
             started: tokio::sync::OnceCell::new(),
             blobs: Arc::new(DaemonBlobs),
             api_base: API_BASE.to_string(),
-            route_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rate_limiter: std::sync::Mutex::new(RateLimiter::default()),
         })
     }
 
-    /// Milliseconds until this route's bucket refills, when Discord said it
-    /// was spent and the reset has not passed yet.
-    fn route_cooldown_remaining_ms(&self, route: &str) -> Option<i64> {
-        let cooldowns = self.route_cooldowns.lock().ok()?;
-        let until = cooldowns.get(route)?;
-        let remaining = until.saturating_duration_since(std::time::Instant::now());
-        (remaining > Duration::ZERO).then_some(remaining.as_millis() as i64)
+    /// Consult the limiter before one HTTP request goes out. `None` means
+    /// clear to send. While nothing has been sent, a gated route is a clean
+    /// retry carrying the provider's own wait. Once a chunk of this message
+    /// has landed, a retry would deliver that chunk twice — so a short wait
+    /// is served in place and a longer one parks the row as partially
+    /// delivered.
+    async fn gate_or_wait(&self, route: &str, any_sent: bool) -> Option<SendOutcome> {
+        let wait_ms = {
+            let limiter = self.rate_limiter.lock().ok()?;
+            limiter.wait_ms(route, std::time::Instant::now())?
+        };
+        if !any_sent {
+            return Some(SendOutcome::RetryableFailure {
+                error: "Discord's rate-limit window for this route has not reset yet".to_string(),
+                retry_after_ms: Some(wait_ms as i64),
+            });
+        }
+        if wait_ms <= MAX_INTRA_MESSAGE_WAIT_MS {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+            return None;
+        }
+        Some(SendOutcome::NeedsReconciliation {
+            error: format!(
+                "Discord's rate limit holds the rest of the message for {wait_ms}ms \
+                 after part of it was delivered"
+            ),
+        })
     }
 
-    /// Remember what the response headers said about this route's bucket, so
-    /// the next send to it waits instead of buying a 429. Expired entries are
-    /// swept on write, which bounds the map by the number of active routes.
-    fn note_route_cooldown(&self, route: &str, wait: Duration) {
-        if wait.is_zero() {
-            return;
+    /// Feed one response's rate-limit verdict to the limiter and classify its
+    /// status. Success hands the response back so the caller can read the
+    /// created message out of it; any failure is returned as the mapped
+    /// outcome. A 429's body is read here — it repeats `retry_after` and
+    /// carries `global` when the headers do not, and a 429 never has a
+    /// message id to preserve.
+    async fn observe_response(
+        &self,
+        route: &str,
+        any_sent: bool,
+        response: reqwest::Response,
+    ) -> Result<reqwest::Response, SendOutcome> {
+        let status = response.status().as_u16();
+        let mut info = parse_rate_limit_headers(response.headers());
+        let response = if status == 429 {
+            if let Ok(body) = response.json::<Value>().await {
+                if info.retry_after_ms.is_none() {
+                    info.retry_after_ms = body
+                        .get("retry_after")
+                        .and_then(Value::as_f64)
+                        .map(|seconds| (seconds * 1000.0).round().max(0.0) as u64);
+                }
+                info.is_global =
+                    info.is_global || body.get("global").and_then(Value::as_bool).unwrap_or(false);
+            }
+            None
+        } else {
+            Some(response)
+        };
+        if let Ok(mut limiter) = self.rate_limiter.lock() {
+            limiter.on_response(
+                route,
+                status,
+                info.bucket.as_deref(),
+                info.remaining,
+                info.reset_after_ms,
+                info.retry_after_ms,
+                info.is_global,
+                std::time::Instant::now(),
+            );
         }
-        if let Ok(mut cooldowns) = self.route_cooldowns.lock() {
-            let now = std::time::Instant::now();
-            cooldowns.retain(|_, until| *until > now);
-            cooldowns.insert(route.to_string(), now + wait);
+        match map_send_status(status, any_sent, info.retry_after_ms.map(|ms| ms as i64)) {
+            None => Ok(response.expect("only a 2xx maps to None, and a 2xx keeps its response")),
+            Some(outcome) => Err(outcome),
         }
     }
 
@@ -418,15 +659,13 @@ impl ChannelAdapter for DiscordAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
-        // Discord already named the moment this route's bucket refills; going
-        // to the network before it would spend the request on a certain 429.
-        // Nothing has been sent yet, so a retry with the provider's own wait
-        // is the honest outcome.
-        if let Some(wait_ms) = self.route_cooldown_remaining_ms(target_channel(message)) {
-            return SendOutcome::RetryableFailure {
-                error: "Discord's rate-limit window for this channel has not reset yet".to_string(),
-                retry_after_ms: Some(wait_ms),
-            };
+        // The limiter already knows when this route's bucket — or the whole
+        // account — reopens; going to the network before then would spend the
+        // request on a certain 429. Nothing has been sent yet, so a retry
+        // with the provider's own wait is the honest outcome.
+        let route = format!("POST:{}", target_channel(message));
+        if let Some(outcome) = self.gate_or_wait(&route, false).await {
+            return outcome;
         }
         if !message.attachments.is_empty() {
             let files = match load_attachments(self.blobs.as_ref(), message) {
@@ -442,6 +681,13 @@ impl ChannelAdapter for DiscordAdapter {
         let mut any_sent = false;
         let mut last_id = None;
         for (index, chunk) in chunks.iter().enumerate() {
+            // The earlier chunks may have spent the bucket; ask again before
+            // each one rather than walking into the 429.
+            if index > 0 {
+                if let Some(outcome) = self.gate_or_wait(&route, any_sent).await {
+                    return outcome;
+                }
+            }
             let mut body = serde_json::json!({ "content": chunk });
             if index == 0 {
                 if let Some(reply_to) = &message.reply_to_provider_id {
@@ -476,45 +722,19 @@ impl ChannelAdapter for DiscordAdapter {
                     };
                 }
             };
-            let status = response.status();
-            let retry_after_ms = if status.as_u16() == 429 {
-                parse_retry_after_seconds(
-                    response
-                        .headers()
-                        .get("Retry-After")
-                        .and_then(|value| value.to_str().ok()),
-                )
-            } else {
-                None
+            // Whatever the response said about the bucket lands in the
+            // limiter before the status is classified, so even a failed
+            // request teaches the next one when to go.
+            let response = match self.observe_response(&route, any_sent, response).await {
+                Ok(response) => response,
+                Err(outcome) => return outcome,
             };
-            // Discord's own bucket accounting, read from the response rather
-            // than guessed: when this bucket is out of requests, the next
-            // chunk of the same reply waits out the window instead of buying
-            // a 429 — and the next *send* to this route waits too.
-            let bucket_wait = bucket_exhausted_wait(response.headers());
-            if let Some(wait) = bucket_wait {
-                self.note_route_cooldown(target_channel(message), wait);
-            }
-            if let Some(wait_ms) = retry_after_ms {
-                self.note_route_cooldown(
-                    target_channel(message),
-                    Duration::from_millis(wait_ms.max(0) as u64),
-                );
-            }
-            if let Some(outcome) = map_send_status(status.as_u16(), any_sent, retry_after_ms) {
-                return outcome;
-            }
             any_sent = true;
             last_id = response
                 .json::<Value>()
                 .await
                 .ok()
                 .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_string));
-            if index + 1 < chunks.len() {
-                if let Some(wait) = bucket_wait {
-                    tokio::time::sleep(wait).await;
-                }
-            }
         }
         SendOutcome::Sent {
             provider_message_id: last_id,
@@ -531,29 +751,6 @@ fn target_channel(message: &OutboundMessage) -> &str {
         .thread_id
         .as_deref()
         .unwrap_or(&message.conversation_id)
-}
-
-/// How long to wait before reusing this route, when Discord says the bucket
-/// is spent: `X-RateLimit-Remaining: 0` plus `X-RateLimit-Reset-After`
-/// (seconds, fractional). `None` when requests remain or the headers are
-/// absent — never an invented fixed delay.
-fn bucket_exhausted_wait(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    let remaining: u64 = headers
-        .get("X-RateLimit-Remaining")?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()?;
-    if remaining > 0 {
-        return None;
-    }
-    let reset_after: f64 = headers
-        .get("X-RateLimit-Reset-After")?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()?;
-    Some(Duration::from_millis((reset_after * 1000.0).max(0.0) as u64))
 }
 
 impl DiscordAdapter {
@@ -581,6 +778,13 @@ impl DiscordAdapter {
                 SendOutcome::Sent { .. } => any_sent = true,
                 other => return other,
             }
+        }
+        // The head chunks above may have spent the bucket, and this multipart
+        // request is a REST send like any other — it must not skip the gate
+        // just because it carries files.
+        let route = format!("POST:{}", target_channel(message));
+        if let Some(outcome) = self.gate_or_wait(&route, any_sent).await {
+            return outcome;
         }
         let mut body = serde_json::json!({ "content": last });
         if !any_sent {
@@ -626,29 +830,10 @@ impl DiscordAdapter {
                 };
             }
         };
-        let status = response.status();
-        let retry_after_ms = if status.as_u16() == 429 {
-            parse_retry_after_seconds(
-                response
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|value| value.to_str().ok()),
-            )
-        } else {
-            None
+        let response = match self.observe_response(&route, any_sent, response).await {
+            Ok(response) => response,
+            Err(outcome) => return outcome,
         };
-        if let Some(wait) = bucket_exhausted_wait(response.headers()) {
-            self.note_route_cooldown(target_channel(message), wait);
-        }
-        if let Some(wait_ms) = retry_after_ms {
-            self.note_route_cooldown(
-                target_channel(message),
-                Duration::from_millis(wait_ms.max(0) as u64),
-            );
-        }
-        if let Some(outcome) = map_send_status(status.as_u16(), any_sent, retry_after_ms) {
-            return outcome;
-        }
         SendOutcome::Sent {
             provider_message_id: response
                 .json::<Value>()
@@ -728,12 +913,6 @@ fn map_send_status(
             error: format!("Discord rejected the message: HTTP {status}"),
         }),
     }
-}
-
-/// Parses Discord's `Retry-After` header (seconds, float) into milliseconds.
-fn parse_retry_after_seconds(header_value: Option<&str>) -> Option<i64> {
-    let seconds: f64 = header_value?.parse().ok()?;
-    Some((seconds * 1000.0).round() as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1423,9 +1602,20 @@ async fn run_one_connection(
                             // the persisted map, plain channels in memory),
                             // and treat a lookup failure as a plain channel
                             // for this message only — uncached, so the next
-                            // message asks again. The hardened client's own
-                            // timeout bounds how long the heartbeat waits.
-                            match resolve_thread_parent(http, api_base, token, &channel_id).await {
+                            // message asks again. This await runs inside the
+                            // select loop, so heartbeats stall until it
+                            // returns; the explicit timeout here is the real
+                            // bound on that stall — the HTTP client's own
+                            // read timeout is minutes, far past the ~41s
+                            // heartbeat interval.
+                            match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                resolve_thread_parent(http, api_base, token, &channel_id),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err("the channel lookup timed out".to_string())
+                            }) {
                                 Ok(Some(parent)) => {
                                     insert_thread_parent(
                                         &mut state.thread_parents,
@@ -2023,10 +2213,29 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_header_parses_fractional_seconds() {
-        assert_eq!(parse_retry_after_seconds(Some("1.5")), Some(1500));
-        assert_eq!(parse_retry_after_seconds(None), None);
-        assert_eq!(parse_retry_after_seconds(Some("garbage")), None);
+    fn rate_limit_headers_parse_fractional_seconds_into_milliseconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Retry-After", "1.5".parse().unwrap());
+        headers.insert("X-RateLimit-Bucket", "b1".parse().unwrap());
+        headers.insert("X-RateLimit-Remaining", "0".parse().unwrap());
+        headers.insert("X-RateLimit-Reset-After", "2.25".parse().unwrap());
+        headers.insert("X-RateLimit-Global", "true".parse().unwrap());
+        let info = parse_rate_limit_headers(&headers);
+        assert_eq!(info.retry_after_ms, Some(1500));
+        assert_eq!(info.bucket.as_deref(), Some("b1"));
+        assert_eq!(info.remaining, Some(0));
+        assert_eq!(info.reset_after_ms, Some(2250));
+        assert!(info.is_global);
+        // Absent or garbage headers degrade to nothing, never a panic.
+        let mut garbage = reqwest::header::HeaderMap::new();
+        garbage.insert("Retry-After", "soon".parse().unwrap());
+        let info = parse_rate_limit_headers(&garbage);
+        assert_eq!(info.retry_after_ms, None);
+        assert!(!info.is_global);
+        assert_eq!(
+            parse_rate_limit_headers(&Default::default()).remaining,
+            None
+        );
     }
 
     #[test]
@@ -2117,6 +2326,78 @@ mod tests {
         DiscordAdapter::new(&config)
             .expect("adapter")
             .with_base_url(base)
+    }
+
+    fn outbound_to(channel: &str) -> OutboundMessage {
+        OutboundMessage {
+            account_id: "acct".into(),
+            kind: ChannelKind::Discord,
+            conversation_id: channel.into(),
+            thread_id: None,
+            text: "hi".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: "k".into(),
+        }
+    }
+
+    /// Serve `responses` in order, one connection each, carrying the given
+    /// extra headers — the shared test_http helper cannot speak rate-limit
+    /// headers — and count how many requests actually reached the wire.
+    fn serve_with_headers(
+        responses: Vec<(u16, Vec<(&'static str, &'static str)>, String)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            for (status, headers, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // Every request here is a JSON POST, so the body length is
+                // always announced; read until it has arrived in full.
+                let mut received = Vec::new();
+                let mut scratch = [0u8; 4096];
+                loop {
+                    match stream.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            received.extend_from_slice(&scratch[..count]);
+                            let text = String::from_utf8_lossy(&received).to_string();
+                            if let Some(index) = text.find("\r\n\r\n") {
+                                let content_length = text[..index]
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                                    })
+                                    .unwrap_or(0);
+                                if received.len() >= index + 4 + content_length {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let extra: String = headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}\r\n"))
+                    .collect();
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), hits)
     }
 
     // -- health semantics ------------------------------------------------
@@ -2234,27 +2515,233 @@ mod tests {
 
     #[tokio::test]
     async fn a_route_discord_said_was_spent_is_not_asked_again() {
-        // No fixture server at all: the cooldown must answer before any
+        // No fixture server at all: the limiter must answer before any
         // request is built, and nothing has been sent so a retry is safe.
         let adapter = adapter_with_base("http://127.0.0.1:9");
-        adapter.note_route_cooldown("chan-1", Duration::from_secs(30));
-        let message = OutboundMessage {
-            account_id: "acct".into(),
-            kind: ChannelKind::Discord,
-            conversation_id: "chan-1".into(),
-            thread_id: None,
-            text: "hi".into(),
-            attachments: Vec::new(),
-            reply_to_provider_id: None,
-            idempotency_key: "k".into(),
-        };
-        match adapter.send(&message).await {
+        adapter.rate_limiter.lock().unwrap().on_response(
+            "POST:chan-1",
+            429,
+            None,
+            None,
+            None,
+            Some(30_000),
+            false,
+            std::time::Instant::now(),
+        );
+        match adapter.send(&outbound_to("chan-1")).await {
             SendOutcome::RetryableFailure { retry_after_ms, .. } => {
                 let wait = retry_after_ms.expect("carries the remaining wait");
                 assert!((1..=30_000).contains(&wait), "{wait}");
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    // -- rate limiting ---------------------------------------------------
+
+    #[test]
+    fn an_exhausted_bucket_gates_every_route_that_shares_it() {
+        let mut limiter = RateLimiter::default();
+        let now = std::time::Instant::now();
+        // Both routes have been taught the same bucket; only one response
+        // reported the bucket as spent.
+        limiter.on_response(
+            "POST:chan-2",
+            200,
+            Some("b1"),
+            Some(5),
+            Some(60_000),
+            None,
+            false,
+            now,
+        );
+        limiter.on_response(
+            "POST:chan-1",
+            200,
+            Some("b1"),
+            Some(0),
+            Some(5_000),
+            None,
+            false,
+            now,
+        );
+        let wait = limiter
+            .wait_ms("POST:chan-2", now)
+            .expect("the sibling route shares the spent bucket");
+        assert!((1..=5_000).contains(&wait), "{wait}");
+    }
+
+    #[test]
+    fn a_global_rate_limit_blocks_an_unrelated_route() {
+        let mut limiter = RateLimiter::default();
+        let now = std::time::Instant::now();
+        limiter.on_response("POST:chan-1", 429, None, None, None, Some(3_000), true, now);
+        let wait = limiter
+            .wait_ms("POST:elsewhere", now)
+            .expect("a global 429 gates every route");
+        assert!((1..=3_000).contains(&wait), "{wait}");
+    }
+
+    #[test]
+    fn gates_reopen_once_the_reset_has_passed() {
+        let mut limiter = RateLimiter::default();
+        let now = std::time::Instant::now();
+        limiter.on_response(
+            "POST:chan-2",
+            200,
+            Some("b1"),
+            Some(5),
+            Some(60_000),
+            None,
+            false,
+            now,
+        );
+        limiter.on_response(
+            "POST:chan-1",
+            200,
+            Some("b1"),
+            Some(0),
+            Some(5_000),
+            None,
+            false,
+            now,
+        );
+        limiter.on_response("POST:chan-3", 429, None, None, None, Some(3_000), true, now);
+        let later = now + Duration::from_millis(5_001);
+        assert_eq!(limiter.wait_ms("POST:chan-1", later), None);
+        assert_eq!(limiter.wait_ms("POST:chan-2", later), None);
+        assert_eq!(limiter.wait_ms("POST:chan-3", later), None);
+    }
+
+    #[test]
+    fn a_gate_learned_before_the_bucket_id_survives_the_mapping() {
+        let mut limiter = RateLimiter::default();
+        let now = std::time::Instant::now();
+        // A 429 with no bucket header gates the bare route key.
+        limiter.on_response(
+            "POST:chan-1",
+            429,
+            None,
+            None,
+            None,
+            Some(10_000),
+            false,
+            now,
+        );
+        assert!(limiter.wait_ms("POST:chan-1", now).is_some());
+        // The next response names the bucket; the recorded exhaustion must
+        // move with the route, not vanish under the old key.
+        limiter.on_response(
+            "POST:chan-1",
+            200,
+            Some("b1"),
+            Some(3),
+            None,
+            None,
+            false,
+            now,
+        );
+        let wait = limiter
+            .wait_ms("POST:chan-1", now)
+            .expect("the gate migrated to the bucket key");
+        assert!((1..=10_000).contains(&wait), "{wait}");
+    }
+
+    #[test]
+    fn the_limiter_maps_never_outgrow_their_cap() {
+        let mut limiter = RateLimiter::default();
+        let now = std::time::Instant::now();
+        for index in 0..(RATE_LIMIT_MAP_CAP * 2) {
+            let bucket = format!("b{index}");
+            limiter.on_response(
+                &format!("POST:chan-{index}"),
+                200,
+                Some(bucket.as_str()),
+                Some(0),
+                Some(600_000),
+                None,
+                false,
+                now,
+            );
+        }
+        assert!(limiter.route_buckets.len() <= RATE_LIMIT_MAP_CAP);
+        assert!(limiter.gates.len() <= RATE_LIMIT_MAP_CAP);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_shared_bucket_refuses_the_sibling_route_before_the_wire() {
+        let (base, hits) = serve_with_headers(vec![
+            (
+                200,
+                vec![
+                    ("X-RateLimit-Bucket", "b1"),
+                    ("X-RateLimit-Remaining", "5"),
+                    ("X-RateLimit-Reset-After", "60"),
+                ],
+                r#"{"id":"m1"}"#.to_string(),
+            ),
+            (
+                200,
+                vec![
+                    ("X-RateLimit-Bucket", "b1"),
+                    ("X-RateLimit-Remaining", "0"),
+                    ("X-RateLimit-Reset-After", "5"),
+                ],
+                r#"{"id":"m2"}"#.to_string(),
+            ),
+        ]);
+        let adapter = adapter_with_base(&base);
+        // The first response teaches the limiter that chan-2 draws from b1;
+        // the second spends b1 through chan-1.
+        assert!(matches!(
+            adapter.send(&outbound_to("chan-2")).await,
+            SendOutcome::Sent { .. }
+        ));
+        assert!(matches!(
+            adapter.send(&outbound_to("chan-1")).await,
+            SendOutcome::Sent { .. }
+        ));
+        match adapter.send(&outbound_to("chan-2")).await {
+            SendOutcome::RetryableFailure { retry_after_ms, .. } => {
+                let wait = retry_after_ms.expect("carries the bucket's remaining wait");
+                assert!((1..=5_000).contains(&wait), "{wait}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the gated send must never reach the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_global_429_blocks_a_send_to_another_channel_without_a_request() {
+        let (base, hits) = serve_with_headers(vec![(
+            429,
+            vec![("Retry-After", "3"), ("X-RateLimit-Global", "true")],
+            r#"{"message":"you are being rate limited","retry_after":3.0,"global":true}"#
+                .to_string(),
+        )]);
+        let adapter = adapter_with_base(&base);
+        match adapter.send(&outbound_to("chan-1")).await {
+            SendOutcome::RetryableFailure { retry_after_ms, .. } => {
+                assert_eq!(retry_after_ms, Some(3_000));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match adapter.send(&outbound_to("chan-2")).await {
+            SendOutcome::RetryableFailure { retry_after_ms, .. } => {
+                let wait = retry_after_ms.expect("carries the global wait");
+                assert!((1..=3_000).contains(&wait), "{wait}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the globally gated send must never reach the wire"
+        );
     }
 
     // -- session-start budget ------------------------------------------------
