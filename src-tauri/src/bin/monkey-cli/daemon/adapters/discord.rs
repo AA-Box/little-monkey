@@ -169,6 +169,20 @@ impl Shared {
         let state = self.resume.lock().ok()?.clone();
         serde_json::to_string(&state).ok()
     }
+
+    /// The current state, but only once it names no session to resume.
+    ///
+    /// The ordinary snapshot is taken before a poll waits, so the sequence it
+    /// publishes can only lag the dispatches still in flight. A *cleared*
+    /// state has no such hazard — it leads nothing and asks for nothing — so
+    /// it is safe to publish at the end of a poll instead. That matters:
+    /// clearing is how a session the provider discarded stops being resumed
+    /// again after every restart.
+    fn snapshot_discarded_resume_json(&self) -> Option<String> {
+        let json = self.snapshot_resume_json()?;
+        let state = self.resume.lock().ok()?.clone();
+        (!state.resumable()).then_some(json)
+    }
 }
 
 pub struct DiscordAdapter {
@@ -653,7 +667,14 @@ impl ChannelAdapter for DiscordAdapter {
         }
         let cursor = match last_state {
             Some(state) => serde_json::to_string(&state).ok(),
-            None => early_snapshot,
+            // A session discarded during this very wait is published now
+            // rather than next time: the pre-wait snapshot still names it, and
+            // persisting that would have the next restart resume a session
+            // the provider has already refused.
+            None => self
+                .shared
+                .snapshot_discarded_resume_json()
+                .or(early_snapshot),
         };
         Ok(InboundBatch { envelopes, cursor })
     }
@@ -1151,6 +1172,7 @@ fn handle_frame(
             if !resumable {
                 state.session_id = None;
                 state.seq = None;
+                state.resume_gateway_url = None;
             }
             vec![Action::Reconnect {
                 delay_ms: 1_000 + jitter_ms(4_000),
@@ -1175,25 +1197,90 @@ fn jitter_ms(range_ms: u64) -> u64 {
         % range_ms.max(1)
 }
 
-/// Handles a WebSocket close code. Only 4004 (authentication failed) and 4014
-/// (disallowed intents) are permanent per Discord's own close-code table —
-/// both mean this credential/config cannot succeed no matter how many times
-/// the gateway task reconnects. Everything else, including an ordinary
-/// network drop (which never reaches here as a close frame at all — the
-/// caller treats a read error or stream end the same as a resumable close),
-/// is worth retrying.
-fn handle_close(state: &mut GatewayState, code: u16) -> Vec<Action> {
+/// What one Gateway close code means for the connection after it.
+///
+/// Three outcomes, because the provider's close-code table has exactly three
+/// kinds of entry, and collapsing any two of them costs something real:
+/// resuming a session the provider has already discarded burns a reconnect and
+/// earns the same close again, and reconnecting at all after a configuration
+/// rejection spends session-start allowance on an attempt that cannot succeed.
+///
+/// Decided here, away from any socket, so every code can be asserted directly.
+#[derive(Debug, Clone, PartialEq)]
+enum CloseDisposition {
+    /// The session outlives the drop: reconnect to its resume URL and RESUME.
+    Resume,
+    /// The session is gone but the credential is fine: discard the stored
+    /// session and sequence, then IDENTIFY a fresh one.
+    Reidentify,
+    /// Nothing about this account can connect until an operator changes
+    /// something. The gateway task stops and health says why.
+    Fatal { reason: String },
+}
+
+/// The provider's close-code table, as a decision.
+///
+/// An ordinary network drop never arrives here as a close frame at all — the
+/// caller treats a read error or a stream end as [`CloseDisposition::Resume`],
+/// which is what those are.
+fn close_disposition(code: u16) -> CloseDisposition {
+    let fatal = |reason: &str| CloseDisposition::Fatal {
+        reason: reason.to_string(),
+    };
     match code {
-        4004 => vec![Action::PermanentError(
-            "Discord rejected the bot token (close code 4004: authentication failed)".to_string(),
-        )],
-        4014 => vec![Action::PermanentError(
+        // The session's own identity is what the provider rejected: its
+        // sequence is unusable, or it has already been reaped. Resuming it
+        // again would earn the same close, forever.
+        4007 => CloseDisposition::Reidentify,
+        4009 => CloseDisposition::Reidentify,
+        // Sent before IDENTIFY was accepted, so there is no session to resume.
+        4003 => CloseDisposition::Reidentify,
+        4004 => fatal(
+            "Discord rejected the bot token (close code 4004: authentication failed). Set a \
+             valid bot token for this account and re-enable it",
+        ),
+        4010 => fatal(
+            "Discord refused the shard this connection identified with (close code 4010: \
+             invalid shard). This adapter connects one unsharded session per account",
+        ),
+        4011 => fatal(
+            "This bot is on too many guilds for a single gateway connection and Discord now \
+             requires it to shard (close code 4011). Sharding is not supported for a channel \
+             account; use a bot in fewer guilds",
+        ),
+        4012 => fatal(
+            "Discord refused the gateway API version this build requests (close code 4012: \
+             invalid API version). Update Little Monkey",
+        ),
+        4013 => fatal(
+            "Discord refused the gateway intents this build requests as malformed (close code \
+             4013: invalid intents). Update Little Monkey",
+        ),
+        4014 => fatal(
             "Discord refused the requested gateway intents (close code 4014). If the bot should \
              read message text, enable the Message Content intent for it in the Discord \
-             developer portal under Bot → Privileged Gateway Intents, then re-enable this account"
-                .to_string(),
-        )],
-        _ => {
+             developer portal under Bot → Privileged Gateway Intents, then re-enable this account",
+        ),
+        _ => CloseDisposition::Resume,
+    }
+}
+
+/// Applies a close code to the state and says what the I/O loop should do.
+///
+/// A `Reidentify` clears the stored session here, in the state the caller
+/// mirrors into the durable cursor — so a session the provider has discarded
+/// cannot come back after a restart and ask to be resumed again.
+fn handle_close(state: &mut GatewayState, code: u16) -> Vec<Action> {
+    match close_disposition(code) {
+        CloseDisposition::Fatal { reason } => vec![Action::PermanentError(reason)],
+        CloseDisposition::Reidentify => {
+            state.pending_resume = false;
+            state.session_id = None;
+            state.seq = None;
+            state.resume_gateway_url = None;
+            vec![Action::Reconnect { delay_ms: 0 }]
+        }
+        CloseDisposition::Resume => {
             state.pending_resume = true;
             vec![Action::Reconnect { delay_ms: 0 }]
         }
@@ -1506,7 +1593,15 @@ async fn run_one_connection(
                     Some(Ok(Message::Text(text))) => text.to_string(),
                     Some(Ok(Message::Close(close_frame))) => {
                         let code = close_frame.map(|f| f.code.into()).unwrap_or(1000u16);
-                        return match handle_close(state, code).into_iter().next() {
+                        let actions = handle_close(state, code);
+                        // A close that discarded the session cleared it in
+                        // `state`; mirroring here is what carries that to the
+                        // durable cursor, so a restart identifies fresh
+                        // instead of resuming what the provider threw away.
+                        if let Ok(mut resume) = shared.resume.lock() {
+                            *resume = state.resume_snapshot();
+                        }
+                        return match actions.into_iter().next() {
                             Some(Action::PermanentError(error)) => ConnectionOutcome::Permanent(error),
                             _ => reconnect(established),
                         };
@@ -2003,21 +2098,106 @@ mod tests {
         }
     }
 
+    /// A state that looks like a healthy live session, so a close code's
+    /// effect on it is visible.
+    fn live_session() -> GatewayState {
+        GatewayState {
+            seq: Some(77),
+            session_id: Some("sess-live".into()),
+            resume_gateway_url: Some("wss://resume.example".into()),
+            pending_resume: false,
+            ..GatewayState::default()
+        }
+    }
+
     #[test]
-    fn non_resumable_close_is_permanent() {
-        let mut state = GatewayState::default();
-        let actions = handle_close(&mut state, 4004);
-        assert!(matches!(&actions[0], Action::PermanentError(_)));
-        let actions = handle_close(&mut state, 4014);
-        assert!(matches!(&actions[0], Action::PermanentError(_)));
+    fn every_unrecoverable_close_code_stops_the_gateway_with_a_reason() {
+        // The provider's whole permanent column. Each must stop the loop
+        // rather than spend another reconnect and another session start.
+        for code in [4004u16, 4010, 4011, 4012, 4013, 4014] {
+            let mut state = live_session();
+            let actions = handle_close(&mut state, code);
+            match &actions[0] {
+                Action::PermanentError(reason) => assert!(
+                    !reason.trim().is_empty(),
+                    "close {code} stopped the gateway without saying why"
+                ),
+                other => panic!("close {code} must be permanent, got {other:?}"),
+            }
+            assert_eq!(
+                actions.len(),
+                1,
+                "close {code} asked for something besides stopping"
+            );
+        }
+    }
+
+    #[test]
+    fn a_discarded_session_is_forgotten_rather_than_resumed_again() {
+        // 4007 (invalid seq) and 4009 (session timed out) both mean the
+        // provider no longer has the session. Asking to resume it again earns
+        // the same close, so the stored identity must go.
+        for code in [4007u16, 4009] {
+            let mut state = live_session();
+            let actions = handle_close(&mut state, code);
+            assert!(
+                matches!(&actions[0], Action::Reconnect { .. }),
+                "close {code} must reconnect, got {:?}",
+                actions[0]
+            );
+            assert!(
+                !state.pending_resume,
+                "close {code} left the connection asking to RESUME"
+            );
+            assert_eq!(state.session_id, None, "close {code} kept the session id");
+            assert_eq!(state.seq, None, "close {code} kept the sequence");
+            assert_eq!(
+                state.resume_gateway_url, None,
+                "close {code} kept the resume URL"
+            );
+            // And the state that gets persisted says the same thing.
+            assert!(
+                !state.resume_snapshot().resumable(),
+                "close {code} would still be resumed after a restart"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleared_session_identifies_on_the_next_hello_instead_of_resuming() {
+        let mut state = live_session();
+        handle_close(&mut state, 4007);
+        let actions = handle_frame(
+            &mut state,
+            "acct",
+            r#"{"op":10,"d":{"heartbeat_interval":41250}}"#,
+            "tok",
+        );
+        // The frame that actually goes out, not a flag: an IDENTIFY, and no
+        // RESUME carrying the sequence the provider just rejected.
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Identify(_))),
+            "{actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::SendJson(value) if value["op"] == 6
+            )),
+            "a RESUME was sent for a session the provider discarded: {actions:?}"
+        );
     }
 
     #[test]
     fn other_close_codes_reconnect() {
-        let mut state = GatewayState::default();
+        let mut state = live_session();
         let actions = handle_close(&mut state, 1006);
         assert!(matches!(&actions[0], Action::Reconnect { .. }));
         assert!(state.pending_resume);
+        // A resumable drop keeps everything a RESUME needs.
+        assert!(state.resume_snapshot().resumable());
     }
 
     #[test]

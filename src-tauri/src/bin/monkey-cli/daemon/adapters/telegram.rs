@@ -177,8 +177,10 @@ impl TelegramAdapter {
         if let Some(thread_id) = message.thread_id.clone() {
             form = form.text("message_thread_id", thread_id);
         }
-        if let Some(reply_to) = message.reply_to_provider_id.clone() {
-            form = form.text("reply_to_message_id", reply_to);
+        if let Some(parameters) = reply_parameters(message) {
+            // Multipart carries the object as its JSON text, which is how the
+            // Bot API accepts every non-scalar field in a form-encoded request.
+            form = form.text("reply_parameters", parameters.to_string());
         }
 
         let request = client.post(self.method_url(method)).multipart(form);
@@ -285,6 +287,23 @@ fn upload_limit(method: &str) -> u64 {
         "sendPhoto" => TELEGRAM_MAX_PHOTO_BYTES,
         _ => TELEGRAM_MAX_FILE_BYTES,
     }
+}
+
+/// Translates the provider-independent `reply_to_provider_id` into the field
+/// the current Bot API reads.
+///
+/// One helper for both request shapes, because the text and upload paths must
+/// not drift: a message that replies when it is text and does not when it
+/// carries a file is the kind of difference nobody notices until a thread
+/// reads wrong. `None` when there is nothing to reply to, or when the stored
+/// id is not a message number this provider could have issued.
+fn reply_parameters(message: &OutboundMessage) -> Option<serde_json::Value> {
+    let message_id = message
+        .reply_to_provider_id
+        .as_deref()?
+        .parse::<i64>()
+        .ok()?;
+    Some(serde_json::json!({ "message_id": message_id }))
 }
 
 fn now_ms() -> i64 {
@@ -535,12 +554,8 @@ impl ChannelAdapter for TelegramAdapter {
             {
                 body["message_thread_id"] = serde_json::Value::from(thread_id);
             }
-            if let Some(reply_to) = message
-                .reply_to_provider_id
-                .as_deref()
-                .and_then(|value| value.parse::<i64>().ok())
-            {
-                body["reply_to_message_id"] = serde_json::Value::from(reply_to);
+            if let Some(parameters) = reply_parameters(message) {
+                body["reply_parameters"] = parameters;
             }
             let request = client.post(self.method_url("sendMessage")).json(&body);
             let response = match little_monkey_lib::egress::send(request).await {
@@ -1052,6 +1067,25 @@ mod tests {
         ))
     }
 
+    /// One multipart request replies to `message_id` the way the current Bot
+    /// API reads a reply, and says so in no other way. The negative half is
+    /// the point: a form carrying both fields would satisfy a looser check
+    /// while still asking the provider to honour the retired one.
+    fn assert_reply_parameters(request: &str, message_id: i64) {
+        assert!(
+            request.contains("name=\"reply_parameters\""),
+            "no reply_parameters part: {request}"
+        );
+        assert!(
+            request.contains(&format!(r#"{{"message_id":{message_id}}}"#)),
+            "reply_parameters does not name message {message_id}: {request}"
+        );
+        assert!(
+            !request.contains("reply_to_message_id"),
+            "the retired reply field is still on the wire: {request}"
+        );
+    }
+
     fn message_with_file(filename: &str) -> OutboundMessage {
         OutboundMessage {
             account_id: "acct-tg".into(),
@@ -1093,7 +1127,7 @@ mod tests {
         assert!(text.contains("name=\"photo\""), "{text}");
         assert!(text.contains("filename=\"shot.png\""), "{text}");
         assert!(text.contains("name=\"chat_id\""), "{text}");
-        assert!(text.contains("name=\"reply_to_message_id\""), "{text}");
+        assert_reply_parameters(&text, 42);
         // The file the store held is what went on the wire, not a placeholder.
         assert!(
             request
@@ -1391,7 +1425,70 @@ mod tests {
             .expect("request");
         let text = String::from_utf8_lossy(&request);
         assert!(text.contains("name=\"message_thread_id\""), "{text}");
-        assert!(text.contains("name=\"reply_to_message_id\""), "{text}");
+        // Topic targeting and a reply travel together, in the current fields.
+        assert_reply_parameters(&text, 42);
+    }
+
+    #[tokio::test]
+    async fn a_text_reply_names_its_target_in_reply_parameters() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":103,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"unused");
+        let message = OutboundMessage {
+            text: "answering you".into(),
+            attachments: Vec::new(),
+            thread_id: Some("42".into()),
+            ..message_with_file("unused.txt")
+        };
+        assert!(matches!(
+            adapter.send(&message).await,
+            SendOutcome::Sent { .. }
+        ));
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(text.starts_with("POST /botbot-token/sendMessage"), "{text}");
+        assert!(text.contains(r#""message_thread_id":42"#), "{text}");
+        assert!(
+            text.contains(r#""reply_parameters":{"message_id":42}"#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("reply_to_message_id"),
+            "the retired reply field is still on the wire: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_with_no_reply_target_sends_no_reply_field_at_all() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![(
+            200,
+            r#"{"ok":true,"result":{"message_id":104,"chat":{"id":7,"type":"private"}}}"#
+                .to_string(),
+        )]);
+        let adapter = upload_adapter(&base, b"unused");
+        let message = OutboundMessage {
+            text: "unprompted".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            ..message_with_file("unused.txt")
+        };
+        assert!(matches!(
+            adapter.send(&message).await,
+            SendOutcome::Sent { .. }
+        ));
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(!text.contains("reply_parameters"), "{text}");
+        assert!(!text.contains("reply_to_message_id"), "{text}");
     }
 
     #[tokio::test]

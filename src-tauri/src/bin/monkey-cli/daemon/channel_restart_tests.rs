@@ -119,6 +119,25 @@ struct WsFixture {
     url: String,
     received: Arc<StdMutex<Vec<(usize, Value)>>>,
     inject: mpsc::UnboundedSender<String>,
+    /// Connections opened so far, so a test can prove the client did NOT come
+    /// back after a close it should have treated as final.
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A close code injected as a real WebSocket close frame. `inject` carries
+/// text frames; a close is a different frame type, so it needs its own door.
+const CLOSE_PREFIX: &str = "__close__:";
+
+impl WsFixture {
+    fn close_with(&self, code: u16) {
+        self.inject
+            .send(format!("{CLOSE_PREFIX}{code}"))
+            .expect("inject close");
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
@@ -129,6 +148,8 @@ fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
     let (inject_tx, inject_rx) = mpsc::unbounded_channel::<String>();
     let inject_rx = Arc::new(tokio::sync::Mutex::new(inject_rx));
     let log = received.clone();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let opened = connections.clone();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
         for (index, greeting) in greetings.into_iter().enumerate() {
@@ -138,6 +159,7 @@ fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
             let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                 return;
             };
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for frame in greeting {
                 let _ = ws.send(Message::Text(frame.into())).await;
             }
@@ -157,7 +179,23 @@ fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
                         Some(Ok(_)) => {}
                     },
                     frame = inject.recv() => match frame {
-                        Some(text) => { let _ = ws.send(Message::Text(text.into())).await; }
+                        Some(text) => match text.strip_prefix(CLOSE_PREFIX) {
+                            Some(code) => {
+                                let code = code.parse::<u16>().expect("close code");
+                                let _ = ws
+                                    .send(Message::Close(Some(
+                                        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                                            code: code.into(),
+                                            reason: Default::default(),
+                                        },
+                                    )))
+                                    .await;
+                                break;
+                            }
+                            None => {
+                                let _ = ws.send(Message::Text(text.into())).await;
+                            }
+                        },
                         None => break,
                     },
                 }
@@ -168,6 +206,7 @@ fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
         url: format!("ws://127.0.0.1:{port}"),
         received,
         inject: inject_tx,
+        connections,
     }
 }
 
@@ -963,6 +1002,192 @@ async fn discord_invalid_session_falls_back_to_identify() {
     assert!(batch.expect("poll").envelopes.is_empty());
 }
 
+/// A close code that discards the session must not be answered with a RESUME
+/// for it. Driven through the real socket so what is asserted is the frame
+/// that actually went out, not a flag.
+async fn discord_close_starts_a_fresh_session(code: u16) {
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()], vec![discord_hello()]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+    ]);
+    let stored = serde_json::json!({
+        "session_id": "sess-stale",
+        "resume_gateway_url": ws.url,
+        "seq": 41,
+    })
+    .to_string();
+
+    let adapter = discord_adapter(&api_base);
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(Some(&stored)).await;
+        (adapter, batch)
+    });
+    // First connection resumes the stored session; the provider refuses it.
+    wait_for_frame(&ws.received, 20, "RESUME", |connection, frame| {
+        connection == 0 && frame_op(frame) == 6
+    })
+    .await;
+    ws.close_with(code);
+
+    let identify = wait_for_frame(&ws.received, 30, "fresh IDENTIFY", |connection, frame| {
+        connection == 1 && frame_op(frame) == 2
+    })
+    .await;
+    assert_eq!(identify["d"]["token"], "bot-token");
+    // The negative half: the second connection must not have asked to resume
+    // the session the provider just discarded.
+    let frames = ws.received.lock().unwrap().clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|(connection, frame)| *connection == 1 && frame_op(frame) == 6),
+        "close {code} resumed a session the provider discarded: {frames:?}"
+    );
+    let (_adapter, batch) = poll.await.expect("poll task");
+    assert!(batch.expect("poll").envelopes.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_invalid_sequence_close_starts_a_fresh_session() {
+    discord_close_starts_a_fresh_session(4007).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_timed_out_session_close_starts_a_fresh_session() {
+    discord_close_starts_a_fresh_session(4009).await;
+}
+
+/// A close code naming an account/configuration problem must stop the gateway
+/// for good: no second connection, and health that names the cause.
+async fn discord_close_stops_the_gateway(code: u16, expected: &str) {
+    // Two greetings are offered on purpose — the fixture will accept a second
+    // connection if the adapter makes one, which is exactly what must not
+    // happen.
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()], vec![discord_hello()]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, r#"{"id":"bot-1","username":"monkey"}"#.to_string()),
+    ]);
+
+    let adapter = Arc::new(discord_adapter(&api_base));
+    let polling = adapter.clone();
+    let poll = tokio::spawn(async move { polling.poll(None).await });
+    wait_for_frame(&ws.received, 20, "IDENTIFY", |connection, frame| {
+        connection == 0 && frame_op(frame) == 2
+    })
+    .await;
+    ws.close_with(code);
+    assert!(poll.await.expect("poll task").is_ok());
+
+    // Health is an actionable error, not "reconnecting".
+    let health = adapter.probe().await;
+    assert_eq!(
+        health.state,
+        little_monkey_lib::channels::types::HealthState::Error,
+        "close {code} left health at {:?}",
+        health.state
+    );
+    let reported = format!(
+        "{} {}",
+        health.detail.unwrap_or_default(),
+        health.last_error.unwrap_or_default()
+    );
+    assert!(
+        reported.contains(expected),
+        "close {code} health does not say what to do: {reported}"
+    );
+    // Long enough for the shortest backoff plus jitter to have fired.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+    assert_eq!(
+        ws.connections(),
+        1,
+        "close {code} reconnected after a failure backoff cannot fix"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_rejected_token_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4004, "bot token").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_invalid_shard_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4010, "shard").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_sharding_required_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4011, "shard").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_invalid_api_version_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4012, "API version").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_invalid_intents_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4013, "intents").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_disallowed_intents_close_stops_the_gateway() {
+    discord_close_stops_the_gateway(4014, "Message Content").await;
+}
+
+/// The cleared session must not come back after a restart: what the adapter
+/// hands the durable cursor after a session-discarding close is a state that
+/// identifies fresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discarded_discord_session_is_not_resurrected_by_the_cursor() {
+    let mut store = seeded_store("acct-dc", ChannelKind::Discord);
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()], vec![discord_hello()]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+    ]);
+    let stored = serde_json::json!({
+        "session_id": "sess-stale",
+        "resume_gateway_url": ws.url,
+        "seq": 41,
+    })
+    .to_string();
+
+    let adapter = discord_adapter(&api_base);
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(Some(&stored)).await;
+        (adapter, batch)
+    });
+    wait_for_frame(&ws.received, 20, "RESUME", |connection, frame| {
+        connection == 0 && frame_op(frame) == 6
+    })
+    .await;
+    ws.close_with(4009);
+    wait_for_frame(&ws.received, 30, "fresh IDENTIFY", |connection, frame| {
+        connection == 1 && frame_op(frame) == 2
+    })
+    .await;
+    let (_adapter, batch) = poll.await.expect("poll task");
+    let cursor = batch.expect("poll").cursor.expect("a resume snapshot");
+    store
+        .set_channel_cursor("acct-dc", "inbound", &cursor, NOW)
+        .expect("persist cursor");
+
+    let persisted: Value = serde_json::from_str(
+        &store
+            .channel_cursor("acct-dc", "inbound")
+            .unwrap()
+            .expect("cursor"),
+    )
+    .expect("cursor is JSON");
+    assert!(
+        persisted.get("session_id").is_none(),
+        "the discarded session survived into the durable cursor: {persisted}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Slack: the ACK waits for durable receipt
 // ---------------------------------------------------------------------------
@@ -1371,7 +1596,16 @@ async fn telegram_full_path_from_wire_to_wire() {
     );
     assert!(reply.contains(r#""chat_id":"-999""#), "{reply}");
     assert!(reply.contains(r#""message_thread_id":42"#), "{reply}");
-    assert!(reply.contains(r#""reply_to_message_id":9"#), "{reply}");
+    // The current reply contract, and only it: a topic and a reply target
+    // travel together in one request.
+    assert!(
+        reply.contains(r#""reply_parameters":{"message_id":9}"#),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("reply_to_message_id"),
+        "the retired reply field is still on the wire: {reply}"
+    );
     assert!(reply.contains("on it"), "{reply}");
 
     // The provider's message id is stored on the outbound event.
@@ -1963,6 +2197,7 @@ async fn a_granted_cross_conversation_send_reaches_the_named_conversation() {
     let wire = String::from_utf8_lossy(&wire);
     assert!(wire.contains(r#""chat_id":"777777""#), "{wire}");
     // An explicit destination inherits nothing from the origin message.
+    assert!(!wire.contains("reply_parameters"), "{wire}");
     assert!(!wire.contains("reply_to_message_id"), "{wire}");
 }
 
