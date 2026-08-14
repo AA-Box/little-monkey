@@ -1819,6 +1819,63 @@ mod tests {
         assert_eq!(output.stderr_total_bytes, 400 * 40);
     }
 
+    /// `max_output_bytes` is a *retention* bound, and a command that exceeds it
+    /// finishes.
+    ///
+    /// The two concepts §K4 keeps apart, asserted rather than described. A
+    /// retained-tail cap holds this app's heap while the child runs; a process
+    /// resource limit ends the workload. `max_output_bytes` is the first, on
+    /// purpose: a verbose build printing past a model's context cap has done
+    /// nothing wrong, and killing it would make the bound something people turn
+    /// off. What the record carries instead is both numbers — what was produced,
+    /// and that what is kept was truncated.
+    ///
+    /// The counter-assertion matters as much as the first: no breach. If the
+    /// controller ever started terminating on output, this fails and whoever made
+    /// that change has to decide it deliberately.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_command_past_its_output_bound_is_truncated_and_still_completes() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        const BOUND: u64 = 2 * 1024;
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            "i=0; while [ $i -lt 200 ]; do \
+                 printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; i=$((i+1)); \
+             done",
+            Duration::from_secs(60),
+            Some(BOUND as usize),
+            ProcessLimits {
+                max_output_bytes: Some(BOUND),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a noisy command is still a command");
+
+        assert_eq!(
+            output.limits.output_bytes.map(|resolved| resolved.value),
+            Some(BOUND)
+        );
+        assert!(
+            output.breach.is_none(),
+            "producing more output than is retained is not a resource kill: {:?}",
+            output.breach
+        );
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.truncated);
+        assert!(output.stdout.len() <= BOUND as usize);
+        assert_eq!(output.stdout_total_bytes, 200 * 40);
+    }
+
     /// A descendant that leaves the process group is still terminated.
     ///
     /// The one escape a POSIX process group cannot close on its own, and the

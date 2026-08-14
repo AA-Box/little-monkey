@@ -686,6 +686,24 @@ impl ResourceController {
     }
 
     /// Feed the controller the byte count only the pipe reader can know.
+    ///
+    /// # Retention and termination are two bounds, and this is not the second one
+    ///
+    /// `max_output_bytes` is a **retention** bound in every production path: the
+    /// capture buffer is front-truncated as bytes arrive, both pipes keep
+    /// draining, and a command that prints past it finishes normally with the
+    /// record carrying what it produced alongside what was kept. A verbose build
+    /// printing past a model's context cap has done nothing wrong, and ending it
+    /// would make the bound something people switch off.
+    ///
+    /// So nothing in production calls this, and that is a decision rather than an
+    /// omission — [`Self::breach`] would terminate the tree on the next tick if it
+    /// did. The entry point exists because the *choice* belongs to the owner: a
+    /// caller that genuinely wants "stop producing at N bytes" can feed the
+    /// running total and get exactly that, and the mechanism should not have to be
+    /// invented at that point.
+    /// `workspace_shell::a_command_past_its_output_bound_is_truncated_and_still_completes`
+    /// pins the policy that ships.
     pub fn record_output_bytes(&mut self, bytes: u64) {
         self.output_bytes = Some(bytes);
     }
@@ -1899,6 +1917,43 @@ mod tests {
             evidence.contains("JOB_OBJECT_MSG_JOB_MEMORY_LIMIT"),
             "{evidence}"
         );
+    }
+
+    /// A Windows child that finishes instantly is gone, not uncontained.
+    ///
+    /// The same distinction the Unix suite pins, on the backend where the
+    /// membership read is a different syscall: `IsProcessInJob` against a pid the
+    /// kernel has already released cannot say yes, and treating that as an escape
+    /// would refuse every short command — a `printf`, an `exec` the confinement
+    /// denied — while the record claimed a containment failure that never
+    /// happened.
+    #[cfg(windows)]
+    #[test]
+    fn attaching_to_a_finished_windows_child_reports_it_gone_not_uncontained() {
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_child_processes: Some(8),
+                ..ProcessLimits::default()
+            },
+        )]));
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a trivial child spawns");
+        let pid = child.id();
+        let _ = child.wait();
+
+        match controller.attach(pid) {
+            Err(AttachFailure::AlreadyExited) | Ok(()) => {}
+            Err(AttachFailure::Containment(error)) => panic!(
+                "a command that finished before the check must read as gone, not as a spawn \
+                 that escaped its containment: {error}"
+            ),
+        }
     }
 
     /// A Windows workload inside every bound must finish, with nothing reported.

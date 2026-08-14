@@ -2326,6 +2326,51 @@ mod foreground_process_row {
         assert!(exit.breach.is_none(), "{exit:?}");
     }
 
+    /// A user's Stop is a cancellation, never a resource kill.
+    ///
+    /// The counter-test that keeps the two apart in the direction the panel cares
+    /// about. A command stopped by a person and a command stopped for holding
+    /// 9 GiB are different facts, and a row that called both the same is what made
+    /// a working budget look like an unexplained disappearance — and would equally
+    /// make a user's own Stop look like the app policing them.
+    #[tokio::test]
+    async fn a_user_s_stop_is_cancelled_and_never_a_limit_kill() {
+        if !confinement_available() {
+            return;
+        }
+        let harness = Harness::create();
+        let state = harness.handle.state::<AppState>();
+        // The same channel `tool_run_shell` selects on, keyed by the turn this
+        // harness passes.
+        let cancel = state
+            .tool_cancel
+            .lock()
+            .unwrap()
+            .entry("turn-under-test".to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.notify_waiters();
+        });
+
+        let error = harness
+            .run("sleep 30", ProcessLimits::default())
+            .await
+            .err()
+            .expect("a cancelled command ends the call");
+        let _ = stop.await;
+        assert!(error.contains("cancelled"), "{error}");
+
+        let exit = harness.only_row().exit.expect("exit");
+        assert_eq!(
+            exit.status,
+            ExitStatus::Cancelled,
+            "a person stopping a command is not the system enforcing a limit: {exit:?}"
+        );
+        assert!(exit.breach.is_none(), "{exit:?}");
+    }
+
     /// A limit kill: the row is `limit_exceeded` and carries the typed breach,
     /// and the whole tree — including the grandchild holding the memory — is
     /// gone.
