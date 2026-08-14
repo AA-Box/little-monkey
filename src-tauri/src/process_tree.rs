@@ -428,24 +428,20 @@ fn process_start_time(pid: u32) -> Option<u64> {
     if handle.is_null() {
         return None;
     }
-    let mut created = FILETIME {
+    const EMPTY: FILETIME = FILETIME {
         dwLowDateTime: 0,
         dwHighDateTime: 0,
     };
-    let mut zero = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
+    // Four distinct outputs rather than one reused four times: `GetProcessTimes`
+    // writes through every pointer it is given, so aliasing them is a borrow
+    // error — and would be three writes to the same slot if it compiled. Only
+    // the creation time is read; the other three exist because the API has no
+    // way to decline them.
+    let mut created = EMPTY;
+    let (mut exited, mut kernel, mut user) = (EMPTY, EMPTY, EMPTY);
     // Safe: writes four FILETIMEs this stack owns, through the handle above.
-    let ok = unsafe {
-        GetProcessTimes(
-            handle,
-            &mut created,
-            &mut zero,
-            &mut zero.clone(),
-            &mut zero,
-        )
-    } != 0;
+    let ok =
+        unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
     // Safe: closes the handle this function opened, exactly once.
     unsafe { CloseHandle(handle) };
     ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
