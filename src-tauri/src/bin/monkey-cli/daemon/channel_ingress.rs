@@ -1418,6 +1418,231 @@ mod tests {
         assert_eq!(store.recent_channel_events("acct-1", 10).unwrap().len(), 1);
     }
 
+    // -----------------------------------------------------------------------
+    // The acceptance boundary: all of it, or none of it.
+    // -----------------------------------------------------------------------
+
+    /// The window the old two-transaction design left open, injected exactly
+    /// where it used to be: between the committed event and the accepted turn.
+    /// One transaction means the event goes with it, so nothing is left to
+    /// suppress the provider's redelivery.
+    #[test]
+    fn an_acceptance_interrupted_after_the_event_commits_nothing() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::AfterEventInsert);
+        let interrupted =
+            accept_channel_envelope_with(&mut store, &queue, &dm("ship it", "1"), NOW, "P".into());
+
+        assert!(interrupted.is_err(), "{interrupted:?}");
+        assert!(super::super::fail_points::fired());
+        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store.recent_ingress_turns(10).unwrap().is_empty());
+
+        // The provider redelivers, because nothing told it not to.
+        let ChannelAcceptance::Run {
+            event_id,
+            ingress_id,
+            ..
+        } = plan(&mut store, &dm("ship it", "1"))
+        else {
+            panic!("expected the redelivery to run");
+        };
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, event_id);
+        assert_eq!(events[0].ingress_id.as_deref(), Some(ingress_id.as_str()));
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+    }
+
+    /// The same, one step later: the turn is written and the commit never
+    /// happens.
+    #[test]
+    fn an_acceptance_interrupted_before_the_commit_commits_nothing() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::BeforeAcceptCommit);
+        let interrupted =
+            accept_channel_envelope_with(&mut store, &queue, &dm("ship it", "1"), NOW, "P".into());
+
+        assert!(interrupted.is_err(), "{interrupted:?}");
+        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store.recent_ingress_turns(10).unwrap().is_empty());
+        assert!(matches!(
+            plan(&mut store, &dm("ship it", "1")),
+            ChannelAcceptance::Run { .. }
+        ));
+    }
+
+    /// A challenge is three writes — the event, the sender's pending state and
+    /// the reply carrying the code — and a crash must not be able to keep the
+    /// first two while losing the third. That state would be a sender
+    /// permanently silenced by a code that was never sent.
+    #[test]
+    fn an_interrupted_challenge_leaves_no_sender_waiting_for_a_code() {
+        let mut store = store_with_account(ChannelAccessPolicy::default());
+        let queue = FakeQueue::default();
+
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::BeforeAcceptCommit);
+        let interrupted = accept_channel_envelope_with(
+            &mut store,
+            &queue,
+            &dm("let me in", "1"),
+            NOW,
+            "PAIR1234".into(),
+        );
+
+        assert!(interrupted.is_err(), "{interrupted:?}");
+        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store.channel_sender("acct-1", "user-3").unwrap().is_none());
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+
+        // The redelivery mints the challenge, and all three land together.
+        assert!(matches!(
+            plan(&mut store, &dm("let me in", "1")),
+            ChannelAcceptance::Challenge { .. }
+        ));
+        assert_eq!(
+            store
+                .channel_sender("acct-1", "user-3")
+                .unwrap()
+                .expect("sender")
+                .state,
+            SenderState::Pending
+        );
+        let queued = store.claim_outbox_batch(NOW, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        let payload: OutboxPayload = serde_json::from_str(&queued[0].payload_json).unwrap();
+        assert!(payload.message.text.contains("PAIR1234"));
+    }
+
+    /// A redelivery that arrives before the first delivery's submission
+    /// finished is handed the turn that was frozen then — not a duplicate, and
+    /// not a second decision.
+    #[test]
+    fn a_redelivery_before_the_submission_finishes_drives_the_same_turn() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+        let ChannelAcceptance::Run {
+            ingress_id,
+            ingress,
+            ..
+        } = plan(&mut store, &dm("ship it", "1"))
+        else {
+            panic!("expected a run");
+        };
+
+        // The submission never happened; the turn is durable and unqueued.
+        let redelivered = plan(&mut store, &dm("ship it", "1"));
+        let ChannelAcceptance::Run {
+            ingress_id: same_id,
+            ingress: same_ingress,
+            ..
+        } = redelivered
+        else {
+            panic!("expected the redelivery to drive the accepted turn");
+        };
+        assert_eq!(ingress_id, same_id);
+        assert_eq!(
+            same_ingress.deterministic_job_id(),
+            ingress.deterministic_job_id()
+        );
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+        assert_eq!(store.recent_channel_events("acct-1", 10).unwrap().len(), 1);
+    }
+
+    /// The defensive half: a row an older build left accepted with no turn is
+    /// re-decided from the envelope it still carries, rather than reported as a
+    /// finished duplicate while the provider is told the message was handled.
+    #[test]
+    fn an_event_left_accepted_without_a_turn_is_recovered_not_acknowledged() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+        let envelope = dm("ship it", "1");
+        // Exactly what the old path committed first, and could crash after.
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "1".into(),
+                conversation_id: "chat-7".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: serde_json::to_string(&envelope).unwrap(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: NOW,
+            })
+            .expect("legacy event");
+
+        // Left alone, that row is what the provider's redelivery would hit.
+        assert_eq!(store.orphaned_accepted_events(10).unwrap().len(), 1);
+
+        let recovery =
+            recover_orphaned_channel_events(&mut store, &queue, NOW + 1).expect("recover");
+        assert_eq!(
+            recovery,
+            OrphanRecovery {
+                recovered: 1,
+                deferred: 0,
+                parked: 0
+            }
+        );
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].ingress_id.is_some());
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+        assert_eq!(queue.submissions().len(), 1);
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+
+        // And the provider's own redelivery, arriving after the repair, is now
+        // a duplicate of a message that really did run.
+        assert!(matches!(
+            plan(&mut store, &envelope),
+            ChannelAcceptance::Duplicate { .. }
+        ));
+        assert_eq!(queue.submissions().len(), 1);
+    }
+
+    /// The same repair, for a row whose envelope cannot be read back: parked as
+    /// failed, where an operator sees it. Never silently counted as handled.
+    #[test]
+    fn an_orphan_that_cannot_be_read_back_is_parked_rather_than_dropped() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "1".into(),
+                conversation_id: "chat-7".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: "{not an envelope".into(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: NOW,
+            })
+            .expect("legacy event");
+
+        let recovery =
+            recover_orphaned_channel_events(&mut store, &queue, NOW + 1).expect("recover");
+        assert_eq!(recovery.parked, 1);
+        assert_eq!(recovery.recovered, 0);
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events[0].disposition, EventDisposition::Failed);
+        assert!(events[0]
+            .ignore_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no turn was ever created"));
+        assert!(queue.submissions().is_empty());
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+    }
+
     #[test]
     fn an_ignored_message_is_still_deduplicated() {
         let mut store = store_with_account(ChannelAccessPolicy {

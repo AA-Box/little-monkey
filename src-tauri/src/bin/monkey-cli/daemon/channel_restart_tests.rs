@@ -201,6 +201,39 @@ fn frame_op(frame: &Value) -> i64 {
     frame.get("op").and_then(Value::as_i64).unwrap_or(-1)
 }
 
+/// The runs a queue was actually asked to create, counted by identity rather
+/// than by call: a recovery pass that races the original submission calls the
+/// queue twice with the same deterministic job id, and that is one run.
+fn distinct_runs(queue: &FakeQueue) -> usize {
+    let submitted = queue.submitted.lock().unwrap();
+    let unique: std::collections::BTreeSet<&String> = submitted.iter().collect();
+    unique.len()
+}
+
+/// The invariant every crash test ends on: one provider event, one durable
+/// turn that the event points at, and one run.
+fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, account_id: &str) {
+    let events = store.recent_channel_events(account_id, 10).unwrap();
+    assert_eq!(events.len(), 1, "expected one durable event: {events:?}");
+    let turns = store.recent_ingress_turns(10).unwrap();
+    assert_eq!(turns.len(), 1, "expected one durable turn");
+    assert_eq!(
+        events[0].ingress_id.as_deref(),
+        Some(turns[0].ingress_id.as_str()),
+        "the event must name the turn it became"
+    );
+    assert_eq!(distinct_runs(queue), 1, "expected exactly one run");
+    assert!(
+        store.orphaned_accepted_events(10).unwrap().is_empty(),
+        "an accepted event with no turn behind it"
+    );
+}
+
+/// Arm one durable boundary for the next time this thread reaches it.
+fn arm(point: super::fail_points::FailPoint) {
+    super::fail_points::arm(point);
+}
+
 // ---------------------------------------------------------------------------
 // Telegram: crash before cursor commit
 // ---------------------------------------------------------------------------
@@ -291,6 +324,217 @@ async fn telegram_crash_before_cursor_commit_dedupes_the_redelivery() {
     let events = store.recent_channel_events("acct-tg", 10).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+    assert_eq!(
+        store.channel_cursor("acct-tg", "inbound").unwrap(),
+        Some("500".to_string())
+    );
+}
+
+/// Crash A: the update is in hand and the process dies before anything is
+/// written. Telegram still owns it, because nothing advanced the offset.
+#[tokio::test]
+async fn telegram_crash_before_any_durable_write_loses_nothing() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let batch = adapter.poll(None).await.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    // CRASH: the batch is in memory only.
+    drop(adapter);
+    assert!(store
+        .recent_channel_events("acct-tg", 10)
+        .unwrap()
+        .is_empty());
+    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll after restart");
+
+    assert_eq!(report.accepted, 1);
+    assert_one_of_everything(&store, &queue, "acct-tg");
+    assert_eq!(
+        store.channel_cursor("acct-tg", "inbound").unwrap(),
+        Some("500".to_string())
+    );
+}
+
+/// Crash B, the case the old design could not survive: the provider event is
+/// written and the process dies before the turn is. The whole acceptance rolls
+/// back, so the offset holds and the redelivery is a first delivery.
+#[tokio::test]
+async fn telegram_crash_between_the_event_and_the_turn_keeps_the_message() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    arm(super::fail_points::FailPoint::AfterEventInsert);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll");
+
+    assert!(super::fail_points::fired(), "the boundary was never reached");
+    assert_eq!(report.unrecorded, 1);
+    assert_eq!(report.accepted, 0);
+    // Nothing at all: no event to suppress the redelivery, no turn, and — the
+    // part that makes the message recoverable — no offset.
+    assert!(store
+        .recent_channel_events("acct-tg", 10)
+        .unwrap()
+        .is_empty());
+    assert!(store.recent_ingress_turns(10).unwrap().is_empty());
+    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+    drop(adapter);
+
+    let (base, requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW + 1)
+        .await
+        .expect("poll after restart");
+
+    assert_eq!(report.accepted, 1);
+    assert_one_of_everything(&store, &queue, "acct-tg");
+    let _get_me = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("getMe request");
+    let request = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("getUpdates request");
+    assert!(
+        !String::from_utf8_lossy(&request).contains("offset="),
+        "the second life must not confirm an update it never accepted"
+    );
+}
+
+/// Crash C: the acceptance is committed and the process dies before the run
+/// reaches the queue. Recovery submits it, exactly once.
+#[tokio::test]
+async fn telegram_crash_before_the_queue_submit_recovers_exactly_one_run() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    arm(super::fail_points::FailPoint::BeforeQueueSubmit);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll");
+
+    assert!(super::fail_points::fired());
+    assert_eq!(report.deferred, 1);
+    assert!(queue.submitted.lock().unwrap().is_empty());
+    // Durably accepted, so the offset may advance: the message is this
+    // installation's problem now, not Telegram's.
+    let events = store.recent_channel_events("acct-tg", 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].ingress_id.is_some());
+    assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 1);
+    assert_eq!(
+        store.channel_cursor("acct-tg", "inbound").unwrap(),
+        Some("500".to_string())
+    );
+
+    // RESTART: the startup sweep finishes what the crash interrupted.
+    let recovery = super::channel_ingress::recover_pending_ingress(&mut store, &queue, NOW + 1)
+        .expect("recover");
+    assert_eq!(recovery.resubmitted, 1);
+    assert_one_of_everything(&store, &queue, "acct-tg");
+    assert_eq!(
+        store.recent_ingress_turns(10).unwrap()[0].state,
+        super::ingress_store::IngressState::Queued
+    );
+}
+
+/// Crash D: the queue took the run and the process dies before the turn is
+/// marked queued. The recovery pass resubmits under the same deterministic job
+/// id, and the queue collapses it onto the run it already has.
+#[tokio::test]
+async fn telegram_crash_before_the_queued_state_does_not_duplicate_the_run() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    arm(super::fail_points::FailPoint::BeforeQueuedState);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll");
+
+    assert!(super::fail_points::fired());
+    assert_eq!(report.deferred, 1);
+    assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+    // The run exists and the row does not know it, which is the only state
+    // recovery may not be able to tell from "never submitted".
+    assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 1);
+
+    let recovery = super::channel_ingress::recover_pending_ingress(&mut store, &queue, NOW + 1)
+        .expect("recover");
+    assert_eq!(recovery.resubmitted, 1);
+    assert_eq!(
+        queue.submitted.lock().unwrap().len(),
+        2,
+        "the queue was asked twice"
+    );
+    assert_one_of_everything(&store, &queue, "acct-tg");
+}
+
+/// Crash E: every local write is durable and the process dies before the
+/// offset is confirmed. Telegram redelivers, the event log collapses it, and
+/// the offset advances on the next pass.
+#[tokio::test]
+async fn telegram_crash_before_the_cursor_commit_dedupes_and_then_advances() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    arm(super::fail_points::FailPoint::BeforeCursorCommit);
+    let interrupted = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW).await;
+
+    assert!(interrupted.is_err(), "{interrupted:?}");
+    assert!(super::fail_points::fired());
+    assert_one_of_everything(&store, &queue, "acct-tg");
+    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+    drop(adapter);
+
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let report = poll_account_once(&mut store, &queue, "acct-tg", &adapter, NOW + 1)
+        .await
+        .expect("poll after restart");
+
+    assert_eq!(report.duplicates, 1);
+    assert_eq!(report.accepted, 0);
+    assert_one_of_everything(&store, &queue, "acct-tg");
     assert_eq!(
         store.channel_cursor("acct-tg", "inbound").unwrap(),
         Some("500".to_string())
@@ -529,6 +773,100 @@ async fn discord_resume_state_survives_a_daemon_restart() {
     assert_eq!(queue.submitted.lock().unwrap().len(), 2);
 }
 
+/// The persisted gateway sequence may never lead a message that did not cross
+/// the durable acceptance boundary. A RESUME from the sequence that *was*
+/// persisted replays it, and it runs exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_sequence_never_outruns_the_durable_acceptance() {
+    let mut store = seeded_store("acct-dc", ChannelKind::Discord);
+    let queue = FakeQueue::default();
+
+    let ws = spawn_ws_fixture(vec![vec![discord_hello()], vec![discord_hello()]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, format!(r#"{{"url":"{}"}}"#, ws.url)),
+        (200, r#"{"id":"chan-1","type":0}"#.to_string()),
+        (200, r#"{"id":"chan-1","type":0}"#.to_string()),
+    ]);
+    // An earlier life of the daemon got as far as sequence 4.
+    let stored = serde_json::json!({
+        "session_id": "sess-77",
+        "resume_gateway_url": ws.url,
+        "seq": 4,
+    })
+    .to_string();
+    store
+        .set_channel_cursor("acct-dc", "inbound", &stored, NOW)
+        .expect("seed the resume state");
+
+    // This life RESUMEs, is dispatched the message at sequence 5, and its
+    // acceptance is interrupted between the event and the turn.
+    let message = serde_json::json!({
+        "op": 0, "t": "MESSAGE_CREATE", "s": 5,
+        "d": {
+            "id": "msg-1", "channel_id": "chan-1", "guild_id": "guild-1",
+            "content": "did this survive?",
+            "author": { "id": "user-1", "username": "ada", "bot": false },
+        }
+    })
+    .to_string();
+    let received = ws.received.clone();
+    let inject = ws.inject.clone();
+    let replay = message.clone();
+    tokio::spawn(async move {
+        wait_for_frame(&received, 20, "RESUME", |connection, frame| {
+            connection == 0 && frame_op(frame) == 6
+        })
+        .await;
+        let _ = inject.send(serde_json::json!({ "op": 0, "t": "RESUMED", "s": 4 }).to_string());
+        let _ = inject.send(replay);
+    });
+    let adapter = discord_adapter(&api_base);
+    arm(super::fail_points::FailPoint::AfterEventInsert);
+    let report = poll_account_once(&mut store, &queue, "acct-dc", &adapter, NOW)
+        .await
+        .expect("poll");
+
+    assert!(super::fail_points::fired());
+    assert_eq!(report.unrecorded, 1);
+    assert!(store
+        .recent_channel_events("acct-dc", 10)
+        .unwrap()
+        .is_empty());
+    let held: Value =
+        serde_json::from_str(&store.channel_cursor("acct-dc", "inbound").unwrap().unwrap())
+            .expect("resume state");
+    assert_eq!(
+        held["seq"].as_u64(),
+        Some(4),
+        "the sequence advanced past a message that was never accepted"
+    );
+    drop(adapter);
+
+    // RESTART: the RESUME asks from 4, so Discord replays sequence 5.
+    let received = ws.received.clone();
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        wait_for_frame(&received, 20, "second RESUME", |connection, frame| {
+            connection == 1 && frame_op(frame) == 6
+        })
+        .await;
+        let _ = inject.send(serde_json::json!({ "op": 0, "t": "RESUMED", "s": 4 }).to_string());
+        let _ = inject.send(message);
+    });
+    let adapter = discord_adapter(&api_base);
+    let report = poll_account_once(&mut store, &queue, "acct-dc", &adapter, NOW + 1)
+        .await
+        .expect("poll after restart");
+
+    assert_eq!(report.accepted, 1);
+    assert_one_of_everything(&store, &queue, "acct-dc");
+    let advanced: Value =
+        serde_json::from_str(&store.channel_cursor("acct-dc", "inbound").unwrap().unwrap())
+            .expect("resume state");
+    assert_eq!(advanced["session_id"], "sess-77");
+    assert!(advanced["seq"].as_u64().unwrap_or(0) >= 4);
+}
+
 /// An INVALID_SESSION (resumable=false) answer to the RESUME falls back to a
 /// fresh IDENTIFY instead of looping on the dead session.
 #[tokio::test(flavor = "multi_thread")]
@@ -729,6 +1067,80 @@ async fn slack_poll_account_once_releases_the_ack_after_ingest() {
     })
     .await;
     assert_eq!(store.recent_channel_events("acct-sl", 10).unwrap().len(), 1);
+}
+
+/// The ACK means durable acceptance, not "the insert started". An acceptance
+/// that rolls back leaves the envelope unacknowledged, and Slack's redelivery
+/// is what makes the message run.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_withholds_the_ack_when_the_acceptance_rolls_back() {
+    let mut store = seeded_store("acct-sl", ChannelKind::Slack);
+    let queue = FakeQueue::default();
+    let ws = spawn_ws_fixture(vec![vec![
+        serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string(),
+    ]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+    ]);
+    let adapter = slack_adapter(&api_base);
+
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = inject.send(slack_event_envelope("env-1", "3000.001", "ship it"));
+    });
+    arm(super::fail_points::FailPoint::AfterEventInsert);
+    let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW)
+        .await
+        .expect("poll");
+
+    assert!(super::fail_points::fired());
+    assert_eq!(report.unrecorded, 1);
+    assert!(report.ack_safe.is_empty());
+    assert!(store
+        .recent_channel_events("acct-sl", 10)
+        .unwrap()
+        .is_empty());
+    // Give a wrong ACK time to appear before ruling it out.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    assert!(
+        ws.received
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, frame)| frame.get("envelope_id").is_none()),
+        "an unaccepted envelope was acknowledged: {:?}",
+        ws.received.lock().unwrap()
+    );
+
+    // Slack redelivers it — under a fresh envelope id, as it does when an ACK
+    // never came — and this time the acceptance commits.
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let _ = inject.send(slack_event_envelope("env-2", "3000.001", "ship it"));
+    });
+    let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW + 1)
+        .await
+        .expect("poll after redelivery");
+
+    assert_eq!(report.accepted, 1);
+    wait_for_frame(&ws.received, 10, "ACK for env-2", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-2")
+    })
+    .await;
+    // Both deliveries of the one message are acknowledged now, and only now:
+    // the ACK is parked per provider message, so accepting it releases every
+    // delivery of it — which is what stops Slack from redelivering forever.
+    wait_for_frame(&ws.received, 10, "ACK for env-1", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-1")
+    })
+    .await;
+    assert_one_of_everything(&store, &queue, "acct-sl");
 }
 
 // ---------------------------------------------------------------------------

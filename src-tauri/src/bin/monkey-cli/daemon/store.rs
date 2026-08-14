@@ -2344,6 +2344,85 @@ mod tests {
         assert!(turn.mutation_state.is_none());
     }
 
+    /// V13 links a provider event to the turn it became. An installation
+    /// upgrading into it carries two kinds of accepted event: ones whose turn
+    /// was created (the pair is recoverable, and the link is derivable from the
+    /// dedupe key they already share) and ones whose turn never was — the crash
+    /// window this whole change exists to close. The first must be linked; the
+    /// second must stay visible as unfinished rather than be linked to
+    /// something, or quietly counted as complete.
+    #[test]
+    fn events_written_before_the_ingress_link_are_paired_or_left_visible() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V12 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json,
+                    credential_ref, access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES ('acct-1', 'telegram', 'Ops bot', 1, '{}', NULL, '{}',
+                           'connected', 1, 1);
+
+                 INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, attempts,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-paired', 'messaging_channel:acct-1:evt-1',
+                           'messaging_channel', 'acct-1', 'evt-1', 'tg:chat-7',
+                           'queued', '{}', '[]', 0, 1, 1);
+
+                 INSERT INTO channel_events (
+                    event_id, account_id, source, direction, provider_event_id,
+                    conversation_id, thread_id, sender_id, envelope_json, disposition,
+                    ignore_reason, job_id, received_at_ms
+                 ) VALUES
+                    ('evt-paired', 'acct-1', 'messaging_channel', 'inbound', 'evt-1',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 1),
+                    ('evt-orphan', 'acct-1', 'messaging_channel', 'inbound', 'evt-2',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 2);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        let paired = events
+            .iter()
+            .find(|event| event.event_id == "evt-paired")
+            .expect("the paired event");
+        assert_eq!(paired.ingress_id.as_deref(), Some("ingr-paired"));
+        let orphan = events
+            .iter()
+            .find(|event| event.event_id == "evt-orphan")
+            .expect("the orphaned event");
+        assert_eq!(orphan.ingress_id, None);
+        let unfinished = store.orphaned_accepted_events(10).unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].event_id, "evt-orphan");
+    }
+
     /// Re-running the loop is a no-op, and a checksum that no longer matches its
     /// recorded version is the mistake worth failing on.
     #[test]
