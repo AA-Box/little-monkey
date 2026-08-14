@@ -720,17 +720,26 @@ pub fn routes(json: bool) -> Result<(), String> {
 
 /// The route scope the flags describe. `RouteScope::validate` (run by the
 /// store) is what rejects off-ladder combinations; this only assembles.
+///
+/// Every flag that was passed lands in the scope, including a `--kind` that
+/// sits alongside an account: dropping it here would store a narrower route
+/// than the operator typed and report success. Validation refuses the pair,
+/// which is the honest answer.
 fn route_scope(options: &RouteOptions) -> Result<RouteScope, String> {
     let mut scope = match (options.account.as_deref(), options.conversation.as_deref()) {
         (Some(account), Some(conversation)) => RouteScope::conversation(account, conversation),
         (Some(account), None) => RouteScope::account(account),
-        (None, _) => match options.kind.as_deref() {
-            Some(kind) => RouteScope::channel_default(
-                ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
-            ),
-            None => RouteScope::global_default(),
+        (None, Some(conversation)) => RouteScope {
+            conversation_id: Some(conversation.to_string()),
+            ..RouteScope::default()
         },
+        (None, None) => RouteScope::default(),
     };
+    if let Some(kind) = options.kind.as_deref() {
+        scope.kind = Some(
+            ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
+        );
+    }
     if let Some(thread) = &options.thread {
         scope = scope.with_thread(thread);
     }
@@ -1071,6 +1080,82 @@ mod tests {
         assert!(!changed_again);
     }
 
+    /// Settings → row → adapter, end to end.
+    ///
+    /// Editing configuration is only worth anything if the *next* adapter is
+    /// built from what was saved. Mattermost is the honest subject: its
+    /// server URL is read out of the account row at build time and validated
+    /// there, so an edit that the adapter would refuse proves the build is
+    /// reading the edited row rather than a value captured earlier.
+    #[test]
+    fn an_edited_setting_is_what_the_next_adapter_is_built_from() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let account = ChannelAccountRecord {
+            account_id: "chan-mm".into(),
+            kind: ChannelKind::Mattermost,
+            label: "Team".into(),
+            enabled: true,
+            non_secret_config: serde_json::json!({ "base_url": "https://chat.example.com" }),
+            credential_ref: Some("channel:chan-mm".into()),
+            access_policy: ChannelAccessPolicy::default(),
+            health: ChannelHealth::connected(1, None),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.upsert_channel_account(&account).expect("account");
+        let built = |account: &ChannelAccountRecord| {
+            crate::daemon::adapters::build_adapter(&AdapterConfig {
+                account,
+                secret: "token".to_string(),
+            })
+        };
+        built(&account).expect("the configured server builds");
+
+        // A server this adapter refuses: the failure is the proof that the
+        // edited value is the one being read.
+        let (edited, changed) = apply_account_edit(
+            &mut store,
+            "chan-mm",
+            Some(r#"{"base_url": "http://chat.example.com"}"#),
+            None,
+        )
+        .expect("edited");
+        assert!(changed);
+        assert_eq!(edited.health.state, HealthState::Disconnected);
+        let error = match built(&edited) {
+            Ok(_) => panic!("plain http against a remote host must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("https"), "{error}");
+
+        // And an edit to another real server builds again — from the stored
+        // row, read back, not from anything held in memory.
+        apply_account_edit(
+            &mut store,
+            "chan-mm",
+            Some(r#"{"base_url": "https://chat.elsewhere.example"}"#),
+            None,
+        )
+        .expect("edited");
+        let stored = store
+            .channel_account("chan-mm")
+            .expect("read")
+            .expect("account");
+        assert_eq!(
+            stored.non_secret_config["base_url"],
+            "https://chat.elsewhere.example"
+        );
+        built(&stored).expect("the new server builds");
+        // The credential never travelled through the edit in either
+        // direction; only a probe can claim connectivity again.
+        assert_eq!(
+            stored.credential_ref.as_deref(),
+            Some("channel:chan-mm"),
+            "an edit must not disturb the credential"
+        );
+        assert_ne!(stored.health.state, HealthState::Connected);
+    }
+
     /// Every option the CLI, the bridge and the UI can set, all at once.
     fn fully_populated_options() -> RouteOptions {
         RouteOptions {
@@ -1170,6 +1255,74 @@ mod tests {
         let disabled = read(&store);
         assert!(!disabled.enabled);
         assert_eq!(disabled.target, after_edit.target);
+    }
+
+    /// A flag that was typed must reach the scope. Anything dropped here is
+    /// stored as a *different*, broader route than the operator asked for and
+    /// reported as success — the failure mode this assembly must not have.
+    #[test]
+    fn every_scope_flag_reaches_the_scope_even_when_the_combination_is_illegal() {
+        let scoped = |account: Option<&str>, conversation: Option<&str>, kind: Option<&str>| {
+            route_scope(&RouteOptions {
+                account: account.map(str::to_string),
+                conversation: conversation.map(str::to_string),
+                kind: kind.map(str::to_string),
+                thread: None,
+                sender: None,
+                repository: None,
+                params: Vec::new(),
+                session_scope: None,
+                priority: None,
+                no_reply: false,
+                disabled: false,
+            })
+        };
+
+        // A conversation with no account used to fall through to the global
+        // default: the operator asked for one conversation and would have got
+        // every message on the installation.
+        let orphan = scoped(None, Some("C1"), None).expect("assembled");
+        assert_eq!(orphan.conversation_id.as_deref(), Some("C1"));
+        assert_eq!(
+            orphan.validate(),
+            Err(little_monkey_lib::channels::routing::RouteScopeError::MissingAccount)
+        );
+
+        // A provider-wide default alongside an account used to drop the
+        // provider and store the account route silently.
+        let both = scoped(Some("chan-1"), None, Some("telegram")).expect("assembled");
+        assert_eq!(both.kind, Some(ChannelKind::Telegram));
+        assert_eq!(both.account_id.as_deref(), Some("chan-1"));
+        assert!(both.validate().is_err());
+
+        // The legal shapes still assemble to exactly their rung.
+        assert_eq!(
+            scoped(None, None, Some("slack")).expect("kind").kind,
+            Some(ChannelKind::Slack)
+        );
+        assert_eq!(scoped(None, None, None).expect("global"), RouteScope::default());
+        assert!(scoped(None, None, Some("nonesuch")).is_err());
+    }
+
+    /// The sender rung the daemon declares is all four ids, and the CLI is
+    /// one of the two front ends that must not be able to store anything
+    /// else.
+    #[test]
+    fn a_sender_route_without_a_thread_is_refused_by_the_store() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let mut options = fully_populated_options();
+        options.thread = None;
+        let route = ChannelRoute {
+            route_id: "route-sender".to_string(),
+            scope: route_scope(&options).expect("scope"),
+            target: route_target("triage", &options).expect("target"),
+            enabled: true,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let error = store.insert_channel_route(&route).expect_err("no thread");
+        assert!(error.contains("thread"), "{error}");
+        assert!(store.channel_routes().expect("routes").is_empty());
     }
 
     #[test]

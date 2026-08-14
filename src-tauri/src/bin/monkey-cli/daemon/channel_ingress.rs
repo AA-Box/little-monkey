@@ -611,6 +611,10 @@ fn outbound_row(
         payload_digest: sha256_hex(payload_json.as_bytes()),
         payload_json,
         idempotency_key,
+        // Keyed to the provider event it answers, not to a tool invocation:
+        // this reply is the daemon's own, and the account-scoped key it has
+        // always used is the identity that fits it.
+        invocation_id: None,
         max_attempts: PAIRING_REPLY_MAX_ATTEMPTS,
         job_id,
         created_at_ms: now_ms,

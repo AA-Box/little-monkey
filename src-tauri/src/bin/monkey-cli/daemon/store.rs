@@ -2066,7 +2066,35 @@ CREATE INDEX IF NOT EXISTS ingress_turns_parent_idx
 "#;
 
 const DAEMON_V13: i64 = 13;
-const DAEMON_V13_CHECKSUM: &str = "daemon-jobs-v13-channel-event-ingress-link";
+const DAEMON_V13_CHECKSUM: &str = "daemon-jobs-v13-outbox-invocation-identity";
+
+/// One durable tool invocation, at most one outbound intent.
+///
+/// `channel_outbox` has always been unique on `(account_id, idempotency_key)`,
+/// which asks "has this account already been told this?" — the right question
+/// for a reply keyed to a provider event, and the wrong one for an agent's
+/// `send_message`. There the identity is the tool invocation itself, so the
+/// same job and tool-call id replayed against a *different* account cleared
+/// the account-scoped constraint and queued a second message to a second
+/// person. The account is part of what the invocation asked to send, not part
+/// of which invocation asked.
+///
+/// `invocation_id` is that identity — job plus tool-call id — and the index
+/// makes it unique across every account. Partial on NOT NULL because only
+/// agent sends have an invocation behind them: an inbound auto-reply is keyed
+/// to the event it answers and keeps the account-scoped constraint it has
+/// always had, so no historical row is reinterpreted and no existing key can
+/// collide into the new index.
+const DAEMON_V13_SQL: &str = r#"
+ALTER TABLE channel_outbox ADD COLUMN invocation_id TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS channel_outbox_invocation_idx
+    ON channel_outbox(invocation_id)
+    WHERE invocation_id IS NOT NULL;
+"#;
+
+const DAEMON_V14: i64 = 14;
+const DAEMON_V14_CHECKSUM: &str = "daemon-jobs-v14-channel-event-ingress-link";
 
 /// The durable relation between a provider event and the turn it became.
 ///
@@ -2086,7 +2114,7 @@ const DAEMON_V13_CHECKSUM: &str = "daemon-jobs-v13-channel-event-ingress-link";
 /// invent a turn for an event that never got one: those rows stay NULL and are
 /// picked up by the orphan sweep at daemon start, which re-decides them from
 /// the envelope they still carry rather than pretending they completed.
-const DAEMON_V13_SQL: &str = r#"
+const DAEMON_V14_SQL: &str = r#"
 ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
 
 UPDATE channel_events
@@ -2128,12 +2156,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
     (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
     (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
+    (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V13;
+const DAEMON_LATEST: i64 = DAEMON_V14;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2228,6 +2257,74 @@ mod tests {
         assert_eq!(job.state, JobState::Running, "the row survives the upgrade");
         assert_eq!(job.hold_reason, None, "the new column reads as unset");
         assert!(store.committed_reservations().unwrap().is_empty());
+    }
+
+    /// The invocation index arrives on a database that already has outbox
+    /// rows, and those rows were keyed per account.
+    ///
+    /// Two accounts holding the same idempotency key was legal before V13 and
+    /// stays legal: a unique index over the key itself would have refused to
+    /// build here and left the installation unable to open its own state. The
+    /// index is over `invocation_id`, which no historical row has, so there is
+    /// nothing for it to collide with and nothing to backfill — an old row
+    /// keeps the account-scoped identity it was written with.
+    #[test]
+    fn outbox_rows_written_before_the_invocation_index_upgrade_in_place() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V12 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json, credential_ref,
+                    access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES
+                    ('acct-1','telegram','One',1,'{}',NULL,'{}','connected',1,1),
+                    ('acct-2','telegram','Two',1,'{}',NULL,'{}','connected',1,1);
+                 INSERT INTO channel_outbox (
+                    outbox_id, account_id, conversation_id, state, payload_json,
+                    payload_digest, idempotency_key, attempt, max_attempts, created_at_ms,
+                    updated_at_ms
+                 ) VALUES
+                    ('out-1','acct-1','c1','queued','{}','d1','reply-job-1-1',0,3,1,1),
+                    ('out-2','acct-2','c1','queued','{}','d2','reply-job-1-1',0,3,1,1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM channel_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "both historical rows survive");
+        let unset: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox WHERE invocation_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 2, "nothing is backfilled into the new identity");
     }
 
     /// A turn accepted before execution contexts were frozen has to survive the

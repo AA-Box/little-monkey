@@ -51,7 +51,9 @@ use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
 use super::channel_restart_tests::{queue_reply_for_job, seeded_store, temp_daemon_paths};
 use super::channel_store::{ChannelAccountRecord, EventDirection};
-use super::channel_tool::{plan_send, queue_send, ChannelSendRequest, SendAuthority};
+use super::channel_tool::{
+    plan_send, queue_send, ChannelSendRequest, SendAuthority, SendInvocation,
+};
 use super::channel_worker::{drain_outbox_once, poll_account_once, RunQueue};
 use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, HealthState};
@@ -133,7 +135,18 @@ async fn outbox_smoke(kind: ChannelKind, adapter: Arc<dyn ChannelAdapter>, desti
         accounts: vec![ACCOUNT_ID.into()],
     };
     let plan = plan_send(&request, &authority, None).expect("the smoke send is allowed");
-    queue_send(&mut store, &paths, &request, &plan, None, None, now).expect("enqueue");
+    // No run and no tool call behind this send, so it carries no durable
+    // invocation: nothing will ever legitimately resubmit it.
+    queue_send(
+        &mut store,
+        &paths,
+        &request,
+        &plan,
+        None,
+        &SendInvocation::default(),
+        now,
+    )
+    .expect("enqueue");
     let mut adapters: std::collections::BTreeMap<String, Arc<dyn ChannelAdapter>> =
         std::collections::BTreeMap::new();
     adapters.insert(ACCOUNT_ID.to_string(), adapter);

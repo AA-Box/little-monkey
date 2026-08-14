@@ -1453,6 +1453,7 @@ pub(crate) fn send_via_tool_seam(
     store: &mut DaemonStore,
     paths: &super::store::DaemonPaths,
     job_id: &str,
+    tool_call_id: &str,
     request: &super::channel_tool::ChannelSendRequest,
     policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
 ) -> Result<serde_json::Value, String> {
@@ -1465,7 +1466,12 @@ pub(crate) fn send_via_tool_seam(
         request,
         &plan,
         origin.as_ref(),
-        Some(job_id),
+        // The durable identity the agent loop supplies: the job and the
+        // runtime's tool-call id, never anything derived from the message.
+        &super::channel_tool::SendInvocation {
+            job_id: Some(job_id.to_string()),
+            tool_call_id: Some(tool_call_id.to_string()),
+        },
         NOW,
     )
 }
@@ -1477,7 +1483,8 @@ pub(crate) fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &
         text: text.to_string(),
         ..Default::default()
     };
-    send_via_tool_seam(store, &paths, job_id, &request, None).expect("the reply is queued");
+    send_via_tool_seam(store, &paths, job_id, "call-reply-1", &request, None)
+        .expect("the reply is queued");
 }
 
 fn adapters_map(
@@ -2148,7 +2155,7 @@ async fn a_cross_conversation_send_without_the_grant_leaves_no_outbox_row() {
         text: "psst".into(),
         ..Default::default()
     };
-    let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
+    let refused = send_via_tool_seam(&mut store, &paths, &job_id, "call-1", &request, None);
     assert!(refused.is_err(), "the send must be refused: {refused:?}");
     assert!(
         store
@@ -2178,8 +2185,15 @@ async fn a_granted_cross_conversation_send_reaches_the_named_conversation() {
         text: "heads up".into(),
         ..Default::default()
     };
-    send_via_tool_seam(&mut store, &paths, &job_id, &request, Some(&policy))
-        .expect("the granted send is queued");
+    send_via_tool_seam(
+        &mut store,
+        &paths,
+        &job_id,
+        "call-2",
+        &request,
+        Some(&policy),
+    )
+    .expect("the granted send is queued");
 
     let (base, requests) = super::channel_adapter::test_http::serve(vec![(
         200,
@@ -2219,7 +2233,7 @@ async fn a_cross_account_send_needs_the_account_grant() {
         text: "over here".into(),
         ..Default::default()
     };
-    let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
+    let refused = send_via_tool_seam(&mut store, &paths, &job_id, "call-1", &request, None);
     assert!(refused.is_err(), "the send must be refused: {refused:?}");
     assert!(
         store
@@ -2233,8 +2247,15 @@ async fn a_cross_account_send_needs_the_account_grant() {
         cross_conversation: false,
         accounts: vec!["acct-tg2".into()],
     };
-    send_via_tool_seam(&mut store, &paths, &job_id, &request, Some(&policy))
-        .expect("the granted send is queued");
+    send_via_tool_seam(
+        &mut store,
+        &paths,
+        &job_id,
+        "call-2",
+        &request,
+        Some(&policy),
+    )
+    .expect("the granted send is queued");
 
     let (base, requests) = super::channel_adapter::test_http::serve(vec![(
         200,
@@ -2320,7 +2341,7 @@ async fn a_forwarded_artifact_travels_by_id_and_lands_as_a_real_upload() {
         artifact_ids: vec![blob.id.clone()],
         ..Default::default()
     };
-    send_via_tool_seam(&mut store, &paths, &job_id, &request, None)
+    send_via_tool_seam(&mut store, &paths, &job_id, "call-1", &request, None)
         .expect("the reply with the artifact is queued");
 
     // The provider sees a real multipart upload carrying the stored bytes:

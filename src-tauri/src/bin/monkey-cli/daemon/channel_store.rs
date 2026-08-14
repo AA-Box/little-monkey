@@ -227,6 +227,13 @@ pub struct NewOutboxMessage {
     pub payload_json: String,
     pub payload_digest: String,
     pub idempotency_key: String,
+    /// The durable tool invocation this send *is*, when one asked for it:
+    /// the job and the runtime's tool-call id, and nothing about where or
+    /// what is being sent. Unique across every account, so one invocation
+    /// can never become two outbound intents however its destination is
+    /// recomputed on a replay. `None` for sends with no invocation behind
+    /// them — an inbound auto-reply is identified by the event it answers.
+    pub invocation_id: Option<String>,
     pub max_attempts: u32,
     pub job_id: Option<String>,
     pub created_at_ms: i64,
@@ -1303,9 +1310,14 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
-    /// How many outbound rows this job already queued. The reply tool uses it
-    /// to build a stable idempotency key per call, so a retried run does not
-    /// send the same reply twice.
+    /// How many outbound rows this job queued.
+    ///
+    /// Test-only: the send path used to derive its idempotency key from this
+    /// count, which shifted under a replayed run and let the first message go
+    /// out twice. The key is derived from the invocation identity now, and
+    /// this remains only as the assertion tests make about how many rows a
+    /// run produced.
+    #[cfg(test)]
     pub fn outbox_count_for_job(&self, job_id: &str) -> Result<u32, String> {
         self.connection
             .query_row(
@@ -1716,8 +1728,9 @@ fn upsert_sender(
     Ok(())
 }
 
-/// Queue one outbound message, or report the one already queued under this
-/// idempotency key.
+/// Queue one outbound message, or report the one already queued under the
+/// identity it carries — its tool invocation, or its account-scoped
+/// idempotency key when no invocation asked for it.
 fn insert_outbox_message(
     connection: &rusqlite::Connection,
     row: &NewOutboxMessage,
@@ -1725,16 +1738,20 @@ fn insert_outbox_message(
     let outbox_id = new_outbox_id();
     let changed = connection
         .execute(
+            // `DO NOTHING` with no conflict target on purpose: the row has
+            // two durable identities and either may be the one already
+            // taken — the account-scoped key, and the invocation, which is
+            // unique across all accounts.
             "INSERT INTO channel_outbox (
                 outbox_id, account_id, conversation_id, thread_id, reply_to_provider_id,
-                state, payload_json, payload_digest, idempotency_key, provider_message_id,
-                attempt, max_attempts, next_attempt_at_ms, last_error, job_id,
-                created_at_ms, updated_at_ms, sent_at_ms
+                state, payload_json, payload_digest, idempotency_key, invocation_id,
+                provider_message_id, attempt, max_attempts, next_attempt_at_ms, last_error,
+                job_id, created_at_ms, updated_at_ms, sent_at_ms
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, NULL, 0, ?9, NULL, NULL, ?10,
-                ?11, ?11, NULL
+                ?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, NULL, 0, ?10, NULL, NULL,
+                ?11, ?12, ?12, NULL
              )
-             ON CONFLICT(account_id, idempotency_key) DO NOTHING",
+             ON CONFLICT DO NOTHING",
             params![
                 outbox_id,
                 row.account_id,
@@ -1744,6 +1761,7 @@ fn insert_outbox_message(
                 row.payload_json,
                 row.payload_digest,
                 row.idempotency_key,
+                row.invocation_id,
                 row.max_attempts,
                 row.job_id,
                 row.created_at_ms,
@@ -1753,13 +1771,46 @@ fn insert_outbox_message(
     if changed == 1 {
         return Ok(OutboxEnqueue::Queued { outbox_id });
     }
-    let existing_id: String = connection
-        .query_row(
-            "SELECT outbox_id FROM channel_outbox WHERE account_id=?1 AND idempotency_key=?2",
-            params![row.account_id, row.idempotency_key],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
+    // Found by whichever identity the row carries. An invocation is looked
+    // up across every account — that is the point of it, and an
+    // account-scoped lookup here would miss the row a replay is colliding
+    // with precisely when the replay changed the account, turning the fault
+    // below into a bare "no rows".
+    let (identity, existing) = match row.invocation_id.as_deref() {
+        Some(invocation_id) => (
+            format!("invocation '{invocation_id}'"),
+            connection.query_row(
+                "SELECT outbox_id, payload_digest FROM channel_outbox
+                 WHERE invocation_id=?1",
+                params![invocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        ),
+        None => (
+            format!("idempotency key '{}'", row.idempotency_key),
+            connection.query_row(
+                "SELECT outbox_id, payload_digest FROM channel_outbox
+                 WHERE account_id=?1 AND idempotency_key=?2",
+                params![row.account_id, row.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        ),
+    };
+    let (existing_id, existing_digest): (String, String) =
+        existing.map_err(|error| error.to_string())?;
+    // The identity names one durable invocation; the digest pins what that
+    // invocation asked to send — account and destination included. The same
+    // identity carrying different bytes is a consistency fault, not a retry
+    // — fail closed rather than overwrite the original or queue a second
+    // row, because there is no way to know which version should reach a
+    // person.
+    if existing_digest != row.payload_digest {
+        return Err(format!(
+            "Internal consistency error: outbox row {existing_id} already holds \
+             {identity} with a different payload digest; refusing to overwrite or \
+             duplicate it."
+        ));
+    }
     Ok(OutboxEnqueue::AlreadyQueued {
         outbox_id: existing_id,
     })
@@ -2103,6 +2154,156 @@ mod tests {
         assert_eq!(store.channel_routes().expect("routes").len(), 3);
     }
 
+    /// Every rung of the declared ladder, stored together and resolved
+    /// against one message. The six coexist — different rungs never tie — and
+    /// disabling the winner hands the message to the next one down, all the
+    /// way to the global default.
+    #[test]
+    fn the_whole_ladder_stores_and_resolves_in_order() {
+        use little_monkey_lib::channels::routing::resolve_route;
+        use little_monkey_lib::channels::types::{
+            ChannelConversation, ChannelEnvelope, ChannelSender, ConversationKind,
+        };
+
+        let mut store = seeded();
+        let rungs = [
+            (
+                "r-sender",
+                RouteScope::conversation("acct-1", "C1")
+                    .with_thread("T1")
+                    .with_sender("U1"),
+            ),
+            (
+                "r-thread",
+                RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            ),
+            ("r-conversation", RouteScope::conversation("acct-1", "C1")),
+            ("r-account", RouteScope::account("acct-1")),
+            (
+                "r-provider",
+                RouteScope::channel_default(ChannelKind::Telegram),
+            ),
+            ("r-global", RouteScope::global_default()),
+        ];
+        for (id, scope) in rungs.clone() {
+            store
+                .insert_channel_route(&route(id, scope))
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+        }
+
+        let message = ChannelEnvelope {
+            account_id: "acct-1".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "evt-1".into(),
+            conversation: ChannelConversation {
+                conversation_id: "C1".into(),
+                kind: ConversationKind::Channel,
+                thread_id: Some("T1".into()),
+                title: None,
+            },
+            sender: ChannelSender::new("U1"),
+            text: "hello".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            mentions_self: true,
+            received_at_ms: 1_000,
+            metadata: Default::default(),
+        };
+
+        // Turn the winner off and the next rung down takes it, in order.
+        for (id, _) in rungs {
+            let routes = store.channel_routes().expect("routes");
+            let resolved = resolve_route(&routes, &message).unwrap_or_else(|error| {
+                panic!("expected {id} to win, got {error}");
+            });
+            assert_eq!(resolved.route_id, id);
+            store
+                .set_channel_route_enabled(id, false, 2_000)
+                .expect("disable");
+        }
+        // With every rung disabled nothing routes — silently dropping the
+        // message instead would be the failure this reports.
+        assert!(resolve_route(&store.channel_routes().expect("routes"), &message).is_err());
+    }
+
+    /// Ambiguity is refused on every rung, not just the one that had a test.
+    /// Two routes tie the moment nothing in their scopes separates them, and
+    /// the rung they sit on does not change that.
+    #[test]
+    fn a_second_route_on_any_rung_with_the_same_scope_is_refused() {
+        for (index, scope) in [
+            RouteScope::global_default(),
+            RouteScope::channel_default(ChannelKind::Telegram),
+            RouteScope::account("acct-1"),
+            RouteScope::conversation("acct-1", "C1"),
+            RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            RouteScope::conversation("acct-1", "C1")
+                .with_thread("T1")
+                .with_sender("U1"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut store = seeded();
+            store
+                .insert_channel_route(&route("first", scope.clone()))
+                .unwrap_or_else(|error| panic!("rung {index}: {error}"));
+            let error = store
+                .insert_channel_route(&route("second", scope.clone()))
+                .unwrap_err();
+            assert!(error.contains("first"), "rung {index}: {error}");
+            // And an edit into the same conflict fails exactly like insertion.
+            store
+                .insert_channel_route(&route("other", RouteScope::account("acct-2")))
+                .expect("a route on a different scope");
+            let error = store
+                .update_channel_route(&route("other", scope))
+                .unwrap_err();
+            assert!(error.contains("first"), "rung {index}: {error}");
+            assert_eq!(store.channel_routes().expect("routes").len(), 2);
+        }
+    }
+
+    /// The rung the daemon declares is `account + conversation + thread +
+    /// sender`; a sender route without a thread is not a narrower rung, it is
+    /// a route that would match that sender in every thread of the
+    /// conversation while claiming to be the most specific one there is.
+    #[test]
+    fn a_sender_scope_with_no_thread_never_reaches_the_table() {
+        let mut store = seeded();
+        let error = store
+            .insert_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1").with_sender("U1"),
+            ))
+            .unwrap_err();
+        assert!(error.contains("thread"), "{error}");
+        assert!(store.channel_routes().expect("routes").is_empty());
+
+        // Nor by editing a legal route into one.
+        store
+            .insert_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1")
+                    .with_thread("T1")
+                    .with_sender("U1"),
+            ))
+            .expect("the legal sender rung");
+        assert!(store
+            .update_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1").with_sender("U1"),
+            ))
+            .is_err());
+        assert_eq!(
+            store.channel_routes().expect("routes")[0]
+                .scope
+                .thread_id
+                .as_deref(),
+            Some("T1")
+        );
+    }
+
     #[test]
     fn a_route_is_edited_in_place_and_can_be_turned_off() {
         let mut store = seeded();
@@ -2238,6 +2439,7 @@ mod tests {
             payload_json: "{}".into(),
             payload_digest: "digest".into(),
             idempotency_key: idempotency_key.into(),
+            invocation_id: None,
             max_attempts: 3,
             job_id: None,
             created_at_ms: 1_000,
@@ -2254,6 +2456,90 @@ mod tests {
         };
         let second = store.enqueue_channel_message(&row).expect("second");
         assert_eq!(second, OutboxEnqueue::AlreadyQueued { outbox_id });
+    }
+
+    /// The unique constraint names one durable invocation; the digest pins
+    /// what it asked to send. The same key with different bytes must neither
+    /// overwrite the original nor queue a second row.
+    #[test]
+    fn enqueue_fails_closed_when_the_same_key_carries_a_different_payload() {
+        let mut store = seeded();
+        let row = new_outbox("acct-1", "idem-1");
+        store.enqueue_channel_message(&row).expect("first");
+
+        let mut changed = new_outbox("acct-1", "idem-1");
+        changed.payload_json = r#"{"text":"different"}"#.into();
+        changed.payload_digest = "another-digest".into();
+        let error = store
+            .enqueue_channel_message(&changed)
+            .expect_err("a changed payload under the same key");
+        assert!(error.contains("consistency"), "{error}");
+
+        // The original row is untouched and still the only one.
+        let claimed = store.claim_outbox_batch(1_000, 10).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].payload_json, "{}");
+    }
+
+    /// One invocation, one row — across every account.
+    ///
+    /// The table's own `UNIQUE(account_id, idempotency_key)` cannot say this:
+    /// the same key on a second account is a different pair and inserts
+    /// happily. The invocation index is what makes the second enqueue collide
+    /// at all, and the digest then refuses it rather than overwriting the
+    /// first. Enforced by the database inside the transaction, not by a
+    /// read-then-write check that two daemons could interleave.
+    #[test]
+    fn an_invocation_is_unique_across_accounts_not_within_one() {
+        let mut store = seeded();
+        store
+            .upsert_channel_account(&account("acct-2"))
+            .expect("second account");
+
+        let mut first = new_outbox("acct-1", "channel-send:job-1:tool-1-2");
+        first.invocation_id = Some("channel-send:job-1:tool-1-2".into());
+        store.enqueue_channel_message(&first).expect("first");
+
+        // Same invocation, another account, and a payload that says so.
+        let mut elsewhere = new_outbox("acct-2", "channel-send:job-1:tool-1-2");
+        elsewhere.invocation_id = Some("channel-send:job-1:tool-1-2".into());
+        elsewhere.payload_json = r#"{"account":"acct-2"}"#.into();
+        elsewhere.payload_digest = "another-digest".into();
+        let error = store
+            .enqueue_channel_message(&elsewhere)
+            .expect_err("the same invocation on another account");
+        assert!(error.contains("consistency"), "{error}");
+
+        // Byte-identical on the other account is the same invocation being
+        // replayed, not a second message: it finds the first row.
+        let mut replay = new_outbox("acct-2", "channel-send:job-1:tool-1-2");
+        replay.invocation_id = Some("channel-send:job-1:tool-1-2".into());
+        let again = store.enqueue_channel_message(&replay).expect("replay");
+        assert!(matches!(again, OutboxEnqueue::AlreadyQueued { .. }));
+
+        let claimed = store.claim_outbox_batch(1_000, 10).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].account_id, "acct-1");
+    }
+
+    /// A send with no invocation behind it keeps the account-scoped identity
+    /// it has always had: an inbound auto-reply on two accounts is two
+    /// replies, and nothing about this change may collapse them.
+    #[test]
+    fn an_account_scoped_key_without_an_invocation_still_belongs_to_its_account() {
+        let mut store = seeded();
+        store
+            .upsert_channel_account(&account("acct-2"))
+            .expect("second account");
+
+        store
+            .enqueue_channel_message(&new_outbox("acct-1", "reply:msg-42"))
+            .expect("first account");
+        store
+            .enqueue_channel_message(&new_outbox("acct-2", "reply:msg-42"))
+            .expect("second account");
+
+        assert_eq!(store.claim_outbox_batch(1_000, 10).expect("claim").len(), 2);
     }
 
     #[test]

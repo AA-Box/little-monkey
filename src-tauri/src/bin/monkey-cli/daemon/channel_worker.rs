@@ -1262,6 +1262,7 @@ mod tests {
                 payload_digest: "digest".into(),
                 payload_json,
                 idempotency_key: idempotency_key.to_string(),
+                invocation_id: None,
                 max_attempts: 3,
                 job_id: None,
                 created_at_ms: NOW,
@@ -1672,8 +1673,19 @@ mod tests {
 
     // -- The agent tool, end to end -----------------------------------------
 
-    use super::super::channel_tool::{plan_send, queue_send, ChannelSendRequest, SendAuthority};
+    use super::super::channel_tool::{
+        plan_send, queue_send, ChannelSendRequest, SendAuthority, SendInvocation,
+    };
     use super::super::store::DaemonPaths;
+
+    /// The durable identity of one tool invocation, as the agent loop passes
+    /// it down: the daemon's job id plus the runtime-assigned tool-call id.
+    fn invocation(job_id: &str, tool_call_id: &str) -> SendInvocation {
+        SendInvocation {
+            job_id: Some(job_id.to_string()),
+            tool_call_id: Some(tool_call_id.to_string()),
+        }
+    }
 
     /// A throwaway app-data root, per test, so nothing here can reach the
     /// daemon state or the shared ledger of the machine running the suite.
@@ -1723,7 +1735,7 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect("queued");
@@ -1746,8 +1758,10 @@ mod tests {
         assert_eq!(sent[0].account_id, "acct-1");
         assert_eq!(sent[0].conversation_id, "chat-9");
         assert_eq!(sent[0].text, "the build passed");
-        // Keyed on the job, so a retried run cannot duplicate the send.
-        assert_eq!(sent[0].idempotency_key, "send-job-1-0");
+        // Keyed on the job and the tool-call id and nothing else, so a run
+        // replaying this exact call recomputes the same key rather than a
+        // second message.
+        assert_eq!(sent[0].idempotency_key, "channel-send:job-1:call-1");
 
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events[0].direction, EventDirection::Outbound);
@@ -1797,7 +1811,7 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect_err("disabled");
@@ -1833,7 +1847,7 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect_err("over the account limit");
@@ -1849,7 +1863,7 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect("within the raised limit");
@@ -1872,7 +1886,7 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect_err("over the account's count limit");
@@ -1893,12 +1907,516 @@ mod tests {
             &request,
             &plan,
             None,
-            Some("job-1"),
+            &invocation("job-1", "call-1"),
             NOW,
         )
         .expect_err("no such artifact");
         assert!(error.contains("no stored artifact"), "{error}");
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    /// A file on its own is a message. The tool's schema stopped requiring
+    /// text for exactly this: "here is the chart" is often the chart.
+    #[tokio::test]
+    async fn an_artifact_with_no_text_is_a_message_and_reaches_the_adapter() {
+        let mut store = seeded_store();
+        let root = scratch_root();
+        let paths = DaemonPaths::under(&root);
+        let blobs = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            root.join("content-v1"),
+            16 * 1024 * 1024,
+        )
+        .expect("store");
+        let blob = blobs.put(b"a rendered chart").expect("blob");
+
+        let mut request = send_to("chat-9", "");
+        request.artifact_ids = vec![blob.id.clone()];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &request, &plan, None, &invocation("job-a", "call-1"), NOW).expect("queued");
+
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent[0].text, "");
+        assert_eq!(sent[0].attachments.len(), 1);
+        assert_eq!(sent[0].attachments[0].artifact_id, blob.id);
+
+        // Text alongside the same file is the other half of the contract.
+        drop(sent);
+        let mut with_text = request.clone();
+        with_text.text = "the chart you asked for".to_string();
+        let plan = plan_send(&with_text, &account_authority(), None).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &with_text,
+            &plan,
+            None,
+            &invocation("job-b", "call-1"),
+            NOW,
+        )
+        .expect("queued");
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 120_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].text, "the chart you asked for");
+        assert_eq!(sent[1].attachments.len(), 1);
+    }
+
+    /// An origin reply inherits the thread and the message it answers, and an
+    /// explicit destination inherits neither: a provider id from one
+    /// conversation means nothing in another.
+    #[tokio::test]
+    async fn a_reply_carries_the_origin_thread_and_message_and_a_redirect_does_not() {
+        use super::super::channel_store::ChannelOrigin;
+
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let origin = ChannelOrigin {
+            account_id: "acct-1".to_string(),
+            conversation_id: "chat-7".to_string(),
+            thread_id: Some("thread-3".to_string()),
+            provider_event_id: "msg-42".to_string(),
+        };
+        let reply_authority = SendAuthority {
+            reply: true,
+            cross_conversation: true,
+            ..SendAuthority::default()
+        };
+
+        // Everything omitted: the destination is the origin, in full.
+        let bare = ChannelSendRequest {
+            text: "on it".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&bare, &reply_authority, Some(&origin)).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &bare,
+            &plan,
+            Some(&origin),
+            &invocation("job-reply", "call-1"),
+            NOW,
+        )
+        .expect("queued");
+
+        // Another conversation on the same account: no borrowed thread, no
+        // borrowed reply target.
+        let elsewhere = send_to("chat-other", "heads up");
+        let plan = plan_send(&elsewhere, &reply_authority, Some(&origin)).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &elsewhere,
+            &plan,
+            Some(&origin),
+            &invocation("job-reply", "call-2"),
+            NOW,
+        )
+        .expect("queued");
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        let reply = sent
+            .iter()
+            .find(|message| message.conversation_id == "chat-7")
+            .expect("the reply");
+        assert_eq!(reply.thread_id.as_deref(), Some("thread-3"));
+        assert_eq!(reply.reply_to_provider_id.as_deref(), Some("msg-42"));
+        // Keyed on the invocation alone. Being an origin reply is what this
+        // send *is*, not which invocation asked for it, so it leaves no mark
+        // on the key; the redirect is a different tool call and gets its own.
+        assert_eq!(reply.idempotency_key, "channel-send:job-reply:call-1");
+
+        let redirected = sent
+            .iter()
+            .find(|message| message.conversation_id == "chat-other")
+            .expect("the redirect");
+        assert_eq!(redirected.thread_id, None);
+        assert_eq!(redirected.reply_to_provider_id, None);
+        // Two different sends from one job are two rows: the key separates
+        // them by tool invocation, not by a counter.
+        assert_ne!(redirected.idempotency_key, reply.idempotency_key);
+    }
+
+    /// The same run queueing the same message twice — a retried job replaying
+    /// its tool calls — must not put a second message on the wire.
+    #[tokio::test]
+    async fn a_replayed_run_queues_one_message_not_two() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let request = send_to("chat-9", "the build passed");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+
+        let first =
+            queue_send(&mut store, &paths, &request, &plan, None, &invocation("job-x", "call-4"), NOW).expect("first");
+        assert_eq!(first["status"], "queued");
+
+        // The replay carries the same invocation identity, so it recomputes
+        // the same key and the first row is still the only one.
+        let second = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &invocation("job-x", "call-4"),
+            NOW + 5,
+        )
+        .expect("second");
+        assert_eq!(second["status"], "already_queued");
+        assert_eq!(second["outbox_id"], first["outbox_id"]);
+        assert_eq!(store.outbox_count_for_job("job-x").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
+    }
+
+    /// "Reminder!" sent twice on purpose is two tool calls, and two tool
+    /// calls are two messages — identical words are not a reason to swallow
+    /// the second one. Only the invocation identity, never the content,
+    /// decides whether a send is a duplicate.
+    #[tokio::test]
+    async fn two_intentional_identical_sends_from_one_run_are_two_deliveries() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let request = send_to("chat-9", "Reminder!");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+
+        let first = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &invocation("job-1", "call-4"),
+            NOW,
+        )
+        .expect("first call");
+        let second = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &invocation("job-1", "call-7"),
+            NOW + 5,
+        )
+        .expect("second call");
+        assert_eq!(first["status"], "queued");
+        assert_eq!(second["status"], "queued");
+        assert_ne!(first["outbox_id"], second["outbox_id"]);
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 2);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].text, "Reminder!");
+        assert_eq!(sent[1].text, "Reminder!");
+        assert_ne!(sent[0].idempotency_key, sent[1].idempotency_key);
+    }
+
+    /// The same invocation identity arriving with different bytes is a
+    /// consistency fault, not a retry: nothing overwrites the original row,
+    /// nothing new is queued, and the error says so. The person still gets
+    /// exactly the message the first enqueue made durable.
+    #[tokio::test]
+    async fn a_changed_payload_under_the_same_invocation_fails_closed() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let same_call = invocation("job-1", "call-4");
+
+        let original = send_to("chat-9", "the build passed");
+        let plan = plan_send(&original, &account_authority(), None).expect("authorized");
+        let queued = queue_send(&mut store, &paths, &original, &plan, None, &same_call, NOW)
+            .expect("queued");
+        assert_eq!(queued["status"], "queued");
+
+        let changed = send_to("chat-9", "the build FAILED");
+        let plan = plan_send(&changed, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &changed,
+            &plan,
+            None,
+            &same_call,
+            NOW + 5,
+        )
+        .expect_err("a changed payload under the same invocation");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].text, "the build passed");
+    }
+
+    /// The invocation is the identity, so the account cannot be part of it.
+    ///
+    /// A replay that recomputes its destination onto another account is the
+    /// same tool call asking for the same thing, and one tool call may become
+    /// at most one outbound intent. Account-scoped uniqueness answered "has
+    /// this account been told this?" and cheerfully queued a second message
+    /// to a second person; the invocation index answers the question that
+    /// matters, across every account.
+    #[tokio::test]
+    async fn the_same_invocation_replayed_onto_another_account_queues_nothing_new() {
+        let mut store = seeded_store();
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "acct-2".into(),
+                kind: ChannelKind::Telegram,
+                label: "Second".into(),
+                enabled: true,
+                non_secret_config: serde_json::json!({}),
+                credential_ref: Some("channel:acct-2".into()),
+                access_policy: ChannelAccessPolicy::default(),
+                health: ChannelHealth::connected(NOW, None),
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("second account");
+        let paths = scratch_paths();
+        let both = SendAuthority {
+            accounts: vec!["acct-1".to_string(), "acct-2".to_string()],
+            ..SendAuthority::default()
+        };
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = send_to("C1", "hello");
+        let plan = plan_send(&first, &both, None).expect("authorized");
+        let queued = queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW)
+            .expect("queued");
+        assert_eq!(queued["status"], "queued");
+
+        let elsewhere = ChannelSendRequest {
+            account_id: Some("acct-2".to_string()),
+            conversation_id: Some("C1".to_string()),
+            text: "hello".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&elsewhere, &both, None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &elsewhere,
+            &plan,
+            None,
+            &same_call,
+            NOW + 5,
+        )
+        .expect_err("the same invocation on another account");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        // And no second person hears from it.
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].account_id, "acct-1");
+    }
+
+    /// Answering the origin and addressing a conversation explicitly are two
+    /// things one invocation may be, not two invocations. The key carried a
+    /// `reply-`/`send-` prefix, so a replay that reclassified itself became a
+    /// second identity and a second message; the classification lives in the
+    /// payload now, where a changed one is caught as changed intent.
+    #[tokio::test]
+    async fn the_same_invocation_replayed_as_an_explicit_send_queues_nothing_new() {
+        use super::super::channel_store::ChannelOrigin;
+
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let origin = ChannelOrigin {
+            account_id: "acct-1".to_string(),
+            conversation_id: "chat-7".to_string(),
+            thread_id: Some("thread-3".to_string()),
+            provider_event_id: "msg-42".to_string(),
+        };
+        let authority = SendAuthority {
+            reply: true,
+            cross_conversation: true,
+            ..SendAuthority::default()
+        };
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let bare = ChannelSendRequest {
+            text: "on it".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&bare, &authority, Some(&origin)).expect("authorized");
+        let queued = queue_send(
+            &mut store,
+            &paths,
+            &bare,
+            &plan,
+            Some(&origin),
+            &same_call,
+            NOW,
+        )
+        .expect("queued");
+        assert_eq!(queued["status"], "queued");
+
+        let explicit = send_to("chat-other", "on it");
+        let plan = plan_send(&explicit, &authority, Some(&origin)).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &explicit,
+            &plan,
+            Some(&origin),
+            &same_call,
+            NOW + 5,
+        )
+        .expect_err("the same invocation reclassified as an explicit send");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].conversation_id, "chat-7");
+    }
+
+    /// The destination is what the invocation asked to send, so changing it
+    /// under the same identity is changed intent — caught by the digest, on
+    /// the same account as anywhere else.
+    #[test]
+    fn the_same_invocation_replayed_to_another_conversation_queues_nothing_new() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = send_to("C1", "hello");
+        let plan = plan_send(&first, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW).expect("queued");
+
+        let moved = send_to("C2", "hello");
+        let plan = plan_send(&moved, &account_authority(), None).expect("authorized");
+        let error = queue_send(&mut store, &paths, &moved, &plan, None, &same_call, NOW + 5)
+            .expect_err("the same invocation to another conversation");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+    }
+
+    /// The thread and the message being answered are part of the intent too:
+    /// the same words in a different thread reach different people.
+    #[test]
+    fn the_same_invocation_replayed_into_another_thread_queues_nothing_new() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = ChannelSendRequest {
+            account_id: Some("acct-1".to_string()),
+            conversation_id: Some("C1".to_string()),
+            thread_id: Some("T1".to_string()),
+            reply_to_provider_id: Some("msg-1".to_string()),
+            text: "hello".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&first, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW).expect("queued");
+
+        for changed in [
+            ChannelSendRequest {
+                thread_id: Some("T2".to_string()),
+                ..first.clone()
+            },
+            ChannelSendRequest {
+                reply_to_provider_id: Some("msg-2".to_string()),
+                ..first.clone()
+            },
+        ] {
+            let plan = plan_send(&changed, &account_authority(), None).expect("authorized");
+            let error = queue_send(&mut store, &paths, &changed, &plan, None, &same_call, NOW + 5)
+                .expect_err("the same invocation with a changed target");
+            assert!(error.contains("consistency"), "{error}");
+        }
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+    }
+
+    /// A replay does not need the process that wrote the row: the invocation
+    /// identity is recomputed against the reopened store and finds the
+    /// existing row, exactly as it would in one process lifetime.
+    #[tokio::test]
+    async fn a_replayed_invocation_after_a_restart_finds_its_existing_row() {
+        let paths = DaemonPaths::under(&scratch_root());
+        let request = send_to("chat-9", "queued before the crash");
+        let same_call = invocation("job-r", "call-2");
+
+        let first_id = {
+            let mut store = DaemonStore::open(&paths).expect("open");
+            store
+                .upsert_channel_account(&ChannelAccountRecord {
+                    account_id: "acct-1".into(),
+                    kind: ChannelKind::Telegram,
+                    label: "Ops".into(),
+                    enabled: true,
+                    non_secret_config: serde_json::json!({}),
+                    credential_ref: Some("channel:acct-1".into()),
+                    access_policy: ChannelAccessPolicy::default(),
+                    health: ChannelHealth::connected(NOW, None),
+                    created_at_ms: NOW,
+                    updated_at_ms: NOW,
+                })
+                .expect("account");
+            let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+            let queued = queue_send(&mut store, &paths, &request, &plan, None, &same_call, NOW)
+                .expect("queued");
+            queued["outbox_id"].as_str().expect("id").to_string()
+        }; // the daemon stops here
+
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let replayed = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &same_call,
+            NOW + 60_000,
+        )
+        .expect("replay");
+        assert_eq!(replayed["status"], "already_queued");
+        assert_eq!(replayed["outbox_id"].as_str().unwrap(), first_id);
+        assert_eq!(store.outbox_count_for_job("job-r").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        let report =
+            drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 120_000)
+                .await
+                .expect("drain");
+        assert_eq!(report.sent, 1);
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1932,7 +2450,7 @@ mod tests {
                 &request,
                 &plan,
                 None,
-                Some("job-restart"),
+                &invocation("job-restart", "call-1"),
                 NOW,
             )
             .expect("queued");
