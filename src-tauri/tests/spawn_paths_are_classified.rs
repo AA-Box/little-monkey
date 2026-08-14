@@ -128,6 +128,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         Class::ResourceInfrastructure,
         "Landlock and seccomp confinement; spawns only in its own tests",
     ),
+    (
+        "process_tree.rs",
+        Class::ResourceInfrastructure,
+        "the tree enumeration and liveness the supervisor measures and signals through; \
+         spawns only in its own tests, to prove a real child's states against the kernel",
+    ),
     // --- Managed services with owner-sourced lifecycles ----------------------
     (
         "llama.rs",
