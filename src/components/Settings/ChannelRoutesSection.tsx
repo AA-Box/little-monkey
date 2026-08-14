@@ -178,6 +178,26 @@ export function draftOptions(draft: RouteDraft): RouteOptions {
   };
 }
 
+/** Whether the draft is still missing something the daemon needs.
+ *
+ * Every id the chosen rung carries must be present: the daemon refuses a
+ * scope missing one, and refusing here says so while the operator is still
+ * looking at the field. It is deliberately the *same* list as
+ * `scopeFields` — a rung that renders a field but does not require it is how
+ * a Thread route silently saves as a Conversation route, and a Sender route
+ * as one that follows its sender into every thread. */
+export function draftIncomplete(draft: RouteDraft): boolean {
+  const uses = scopeFields(draft.level);
+  return (
+    draft.recipe.trim().length === 0 ||
+    paramsProblem(draft.params) !== null ||
+    (uses.account && draft.accountId.trim().length === 0) ||
+    (uses.conversation && draft.conversationId.trim().length === 0) ||
+    (uses.thread && draft.threadId.trim().length === 0) ||
+    (uses.sender && draft.senderId.trim().length === 0)
+  );
+}
+
 /** A one-line description of what a route matches, in the operator's terms. */
 function scopeSummary(scope: ChannelRouteScope, accounts: ChannelAccount[]): string {
   const parts: string[] = [];
@@ -290,17 +310,7 @@ export function ChannelRoutesSection({
 
   const uses = draft ? scopeFields(draft.level) : null;
   const paramError = draft ? paramsProblem(draft.params) : null;
-  // Every id the chosen rung needs must be present before the daemon is asked:
-  // a scope missing its account is refused there, and refusing here says so
-  // while the operator is still looking at the field.
-  const incomplete =
-    draft !== null &&
-    uses !== null &&
-    (draft.recipe.trim().length === 0 ||
-      paramError !== null ||
-      (uses.account && draft.accountId.trim().length === 0) ||
-      (uses.conversation && draft.conversationId.trim().length === 0) ||
-      (uses.sender && draft.senderId.trim().length === 0));
+  const incomplete = draft !== null && draftIncomplete(draft);
 
   return (
     <section className="rounded-lg border border-border bg-surface p-4">
@@ -474,7 +484,6 @@ export function ChannelRoutesSection({
             {uses.thread && (
               <label className="text-xs text-muted">
                 {t("ChannelsPanel.thread")}
-                {draft.level === "sender" && <span className="text-faint"> ({t("ChannelsPanel.optional")})</span>}
                 <input
                   className={`${INPUT} mt-1`}
                   list="channel-threads"

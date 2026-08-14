@@ -236,7 +236,7 @@ pub fn send_message_tool_def() -> serde_json::Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": { "type": "string", "description": "The message to send." },
+                    "text": { "type": "string", "description": "The message to send. May be omitted when 'artifacts' names at least one file to send on its own." },
                     "account": { "type": "string", "description": "Optional configured account id to send through. Defaults to the account this run's conversation arrived on." },
                     "to": { "type": "string", "description": "Optional destination conversation id. Defaults to the conversation this run came from." },
                     "thread": { "type": "string", "description": "Optional provider thread id inside the destination conversation." },
@@ -247,7 +247,12 @@ pub fn send_message_tool_def() -> serde_json::Value {
                         "description": "Optional durable artifact ids of stored files to send, such as an image this conversation received earlier. Files travel only by artifact id — there is no path parameter."
                     }
                 },
-                "required": ["text"],
+                // Nothing is unconditionally required: a message may be text,
+                // files, or both, and the daemon refuses the empty case. A
+                // schema demanding `text` would make an image reply
+                // impossible to express, which is a contract the send path
+                // has always accepted.
+                "required": [],
                 "additionalProperties": false
             }
         }
