@@ -2093,6 +2093,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS channel_outbox_invocation_idx
     WHERE invocation_id IS NOT NULL;
 "#;
 
+const DAEMON_V14: i64 = 14;
+const DAEMON_V14_CHECKSUM: &str = "daemon-jobs-v14-channel-event-ingress-link";
+
+/// The durable relation between a provider event and the turn it became.
+///
+/// Before this column the two facts were only *correlated* — an event and a
+/// turn that happened to share an account and an event id — and they were
+/// committed by two separate transactions, so a crash between them left an
+/// event row that permanently suppressed the provider's redelivery with no
+/// accepted turn behind it. The column is what lets the acceptance be one
+/// transaction and what lets an operator ask, from SQLite alone, which turn
+/// owns an event and whether one was ever created.
+///
+/// # Existing rows
+///
+/// The backfill links every inbound accepted event that already has a turn, by
+/// the dedupe key that turn was stored under — `source:account:event_id`, the
+/// same three columns the event carries. What it deliberately cannot do is
+/// invent a turn for an event that never got one: those rows stay NULL and are
+/// picked up by the orphan sweep at daemon start, which re-decides them from
+/// the envelope they still carry rather than pretending they completed.
+const DAEMON_V14_SQL: &str = r#"
+ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
+
+UPDATE channel_events
+   SET ingress_id = (
+       SELECT ingress_turns.ingress_id FROM ingress_turns
+        WHERE ingress_turns.dedupe_key =
+              channel_events.source || ':' || channel_events.account_id || ':' ||
+              channel_events.provider_event_id
+   )
+ WHERE direction = 'inbound' AND disposition = 'accepted' AND ingress_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS channel_events_ingress_idx
+    ON channel_events(ingress_id);
+CREATE INDEX IF NOT EXISTS channel_events_orphan_idx
+    ON channel_events(direction, disposition, ingress_id, received_at_ms);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2117,12 +2156,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
     (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
     (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
+    (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V13;
+const DAEMON_LATEST: i64 = DAEMON_V14;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2399,6 +2439,85 @@ mod tests {
         assert_eq!(turn.execution_digest.as_deref(), Some("deadbeef"));
         assert!(!turn.mutation_required);
         assert!(turn.mutation_state.is_none());
+    }
+
+    /// V13 links a provider event to the turn it became. An installation
+    /// upgrading into it carries two kinds of accepted event: ones whose turn
+    /// was created (the pair is recoverable, and the link is derivable from the
+    /// dedupe key they already share) and ones whose turn never was — the crash
+    /// window this whole change exists to close. The first must be linked; the
+    /// second must stay visible as unfinished rather than be linked to
+    /// something, or quietly counted as complete.
+    #[test]
+    fn events_written_before_the_ingress_link_are_paired_or_left_visible() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V12 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json,
+                    credential_ref, access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES ('acct-1', 'telegram', 'Ops bot', 1, '{}', NULL, '{}',
+                           'connected', 1, 1);
+
+                 INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, attempts,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-paired', 'messaging_channel:acct-1:evt-1',
+                           'messaging_channel', 'acct-1', 'evt-1', 'tg:chat-7',
+                           'queued', '{}', '[]', 0, 1, 1);
+
+                 INSERT INTO channel_events (
+                    event_id, account_id, source, direction, provider_event_id,
+                    conversation_id, thread_id, sender_id, envelope_json, disposition,
+                    ignore_reason, job_id, received_at_ms
+                 ) VALUES
+                    ('evt-paired', 'acct-1', 'messaging_channel', 'inbound', 'evt-1',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 1),
+                    ('evt-orphan', 'acct-1', 'messaging_channel', 'inbound', 'evt-2',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 2);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        let paired = events
+            .iter()
+            .find(|event| event.event_id == "evt-paired")
+            .expect("the paired event");
+        assert_eq!(paired.ingress_id.as_deref(), Some("ingr-paired"));
+        let orphan = events
+            .iter()
+            .find(|event| event.event_id == "evt-orphan")
+            .expect("the orphaned event");
+        assert_eq!(orphan.ingress_id, None);
+        let unfinished = store.orphaned_accepted_events(10).unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].event_id, "evt-orphan");
     }
 
     /// Re-running the loop is a no-op, and a checksum that no longer matches its

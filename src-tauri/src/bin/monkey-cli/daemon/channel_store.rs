@@ -142,6 +142,8 @@ pub struct StoredChannelEvent {
     pub ignore_reason: Option<String>,
     pub job_id: Option<String>,
     pub received_at_ms: i64,
+    /// The accepted turn this event became, for an event that became one.
+    pub ingress_id: Option<String>,
 }
 
 /// Outcome of [`DaemonStore::record_channel_event`].
@@ -149,6 +151,70 @@ pub struct StoredChannelEvent {
 pub enum EventRecording {
     Recorded { event_id: String },
     Duplicate { event_id: String },
+}
+
+/// A provider event this account has already recorded, as much of it as the
+/// dedupe decision needs.
+///
+/// `envelope_json` rides along because the one case that cannot be answered
+/// from identifiers alone — an accepted event with no turn behind it, written
+/// by a build that committed the two separately — is recoverable only from the
+/// envelope the row still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingChannelEvent {
+    pub event_id: String,
+    pub disposition: EventDisposition,
+    pub ingress_id: Option<String>,
+    pub job_id: Option<String>,
+    pub envelope_json: String,
+}
+
+/// What the caller decided one inbound envelope means, with everything that
+/// decision has to write.
+///
+/// The adapters never see this: they produce a normalized envelope and nothing
+/// else. It exists so the *decision* — which needs the policy, the route table
+/// and a resolved execution context — can be made outside the transaction and
+/// committed inside one.
+pub enum EnvelopeDecision<'a> {
+    /// Run it. The turn carries its own frozen route and execution context.
+    Run {
+        ingress: &'a little_monkey_lib::channels::ingress::ConversationIngress,
+        params: &'a [String],
+    },
+    /// Ask the sender to pair. The authorization and the challenge reply are
+    /// committed with the event, so a crash cannot leave a sender recorded as
+    /// challenged with no challenge on its way.
+    Challenge {
+        sender: &'a StoredSenderAuthorization,
+        reply: &'a NewOutboxMessage,
+    },
+    /// Recorded and dropped, with the reason.
+    Ignore { reason: &'a str },
+    /// Recorded as failed: an operator problem — no route, or a message this
+    /// build cannot act on — that the sender is deliberately not told about.
+    Refuse { error: &'a str },
+}
+
+/// What one durable acceptance committed.
+///
+/// Both variants mean the same thing to a transport: this delivery is safe to
+/// acknowledge. They differ in whether anything still has to reach the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DurableAcceptance {
+    /// The event and an accepted turn are committed. `existing` is set when the
+    /// turn was already there — a redelivery arriving before the first
+    /// submission finished — and carries where that turn had got to.
+    Runnable {
+        event_id: String,
+        ingress_id: String,
+        existing: Option<(super::ingress_store::IngressState, Option<String>)>,
+    },
+    /// The event and a final decision are committed. Nothing runs.
+    Settled {
+        event_id: String,
+        disposition: EventDisposition,
+    },
 }
 
 /// A row to insert into `channel_outbox`.
@@ -389,38 +455,7 @@ impl DaemonStore {
         sender_id: &str,
         record: &StoredSenderAuthorization,
     ) -> Result<(), String> {
-        let metadata_json = serde_json::to_string(&record.metadata.iter().collect::<Vec<_>>())
-            .map_err(|error| error.to_string())?;
-        self.connection
-            .execute(
-                "INSERT INTO channel_sender_authorizations (
-                    account_id, sender_id, state, pairing_code_digest, requested_at_ms,
-                    expires_at_ms, approved_at_ms, blocked_at_ms, display_label, metadata_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(account_id, sender_id) DO UPDATE SET
-                    state = excluded.state,
-                    pairing_code_digest = excluded.pairing_code_digest,
-                    requested_at_ms = excluded.requested_at_ms,
-                    expires_at_ms = excluded.expires_at_ms,
-                    approved_at_ms = excluded.approved_at_ms,
-                    blocked_at_ms = excluded.blocked_at_ms,
-                    display_label = excluded.display_label,
-                    metadata_json = excluded.metadata_json",
-                params![
-                    account_id,
-                    sender_id,
-                    record.state.as_str(),
-                    record.pairing_code_digest,
-                    record.requested_at_ms,
-                    record.expires_at_ms,
-                    record.approved_at_ms,
-                    record.blocked_at_ms,
-                    record.display_label,
-                    metadata_json,
-                ],
-            )
-            .map_err(|error| format!("Failed to upsert channel sender: {error}"))?;
-        Ok(())
+        upsert_sender(&self.connection, account_id, sender_id, record)
     }
 
     pub fn pending_channel_senders(
@@ -665,44 +700,15 @@ impl DaemonStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT session_id FROM channel_session_map WHERE session_key=?1",
-                [session_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let bound = if let Some(existing_session_id) = existing {
-            // Never overwrite: the binding is the source of truth for which
-            // durable session a conversation continues, and clobbering it
-            // would fork history a caller has already replied into.
-            transaction
-                .execute(
-                    "UPDATE channel_session_map SET last_used_at_ms=?2 WHERE session_key=?1",
-                    params![session_key, now_ms],
-                )
-                .map_err(|error| error.to_string())?;
-            existing_session_id
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO channel_session_map (
-                        session_key, account_id, conversation_id, thread_id, session_id,
-                        created_at_ms, last_used_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![
-                        session_key,
-                        account_id,
-                        conversation_id,
-                        thread_id,
-                        session_id,
-                        now_ms,
-                    ],
-                )
-                .map_err(|error| error.to_string())?;
-            session_id.to_string()
-        };
+        let bound = bind_session(
+            &transaction,
+            session_key,
+            account_id,
+            conversation_id,
+            thread_id,
+            session_id,
+            now_ms,
+        )?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(bound)
     }
@@ -713,54 +719,11 @@ impl DaemonStore {
         &mut self,
         event: &NewChannelEvent,
     ) -> Result<EventRecording, String> {
-        let event_id = new_event_id();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let changed = transaction
-            .execute(
-                "INSERT INTO channel_events (
-                    event_id, account_id, source, direction, provider_event_id, conversation_id,
-                    thread_id, sender_id, envelope_json, disposition, ignore_reason, job_id,
-                    received_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11)
-                 ON CONFLICT(source, account_id, direction, provider_event_id) DO NOTHING",
-                params![
-                    event_id,
-                    event.account_id,
-                    event.source.as_str(),
-                    event.direction.as_str(),
-                    event.provider_event_id,
-                    event.conversation_id,
-                    event.thread_id,
-                    event.sender_id,
-                    event.envelope_json,
-                    event.disposition.as_str(),
-                    event.received_at_ms,
-                ],
-            )
-            .map_err(|error| format!("Failed to record channel event: {error}"))?;
-        let result = if changed == 1 {
-            EventRecording::Recorded { event_id }
-        } else {
-            let existing_id: String = transaction
-                .query_row(
-                    "SELECT event_id FROM channel_events
-                     WHERE source=?1 AND account_id=?2 AND direction=?3 AND provider_event_id=?4",
-                    params![
-                        event.source.as_str(),
-                        event.account_id,
-                        event.direction.as_str(),
-                        event.provider_event_id,
-                    ],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
-            EventRecording::Duplicate {
-                event_id: existing_id,
-            }
-        };
+        let result = insert_channel_event(&transaction, event)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
@@ -786,6 +749,249 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// What this account already recorded for one provider event id, if
+    /// anything.
+    ///
+    /// The read half of provider dedupe, and deliberately richer than a
+    /// boolean: "we have seen this" is not the same fact as "this was fully
+    /// handled", and an ACK owed to the provider depends on the second.
+    pub fn existing_channel_event(
+        &self,
+        source: ConversationSource,
+        account_id: &str,
+        direction: EventDirection,
+        provider_event_id: &str,
+    ) -> Result<Option<ExistingChannelEvent>, String> {
+        self.connection
+            .query_row(
+                "SELECT event_id, disposition, ingress_id, job_id, envelope_json
+                 FROM channel_events
+                 WHERE source=?1 AND account_id=?2 AND direction=?3 AND provider_event_id=?4",
+                params![
+                    source.as_str(),
+                    account_id,
+                    direction.as_str(),
+                    provider_event_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(
+                |(event_id, disposition, ingress_id, job_id, envelope_json)| {
+                    Ok(ExistingChannelEvent {
+                        event_id,
+                        disposition: EventDisposition::parse(&disposition)?,
+                        ingress_id,
+                        job_id,
+                        envelope_json,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    /// Inbound events that were recorded as accepted but own no turn.
+    ///
+    /// A row here is the shape this subsystem now makes impossible — it can
+    /// only come from a database an older build wrote, where the event and the
+    /// accepted turn were two transactions and a crash could land between them.
+    /// The daemon re-decides these from the envelope they still carry rather
+    /// than letting the event log go on suppressing a provider redelivery for a
+    /// message that never ran.
+    pub fn orphaned_accepted_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExistingChannelEvent>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT event_id, disposition, ingress_id, job_id, envelope_json
+                 FROM channel_events
+                 WHERE direction='inbound' AND disposition='accepted'
+                   AND ingress_id IS NULL AND job_id IS NULL
+                   AND source='messaging_channel'
+                 ORDER BY received_at_ms ASC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([i64::from(limit)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (event_id, disposition, ingress_id, job_id, envelope_json) =
+                row.map_err(|error| error.to_string())?;
+            events.push(ExistingChannelEvent {
+                event_id,
+                disposition: EventDisposition::parse(&disposition)?,
+                ingress_id,
+                job_id,
+                envelope_json,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Record one inbound provider event and everything its decision implies,
+    /// in a single transaction.
+    ///
+    /// **This is the durable acceptance boundary.** Before it, nothing is
+    /// committed and the provider must redeliver; after it, enough state exists
+    /// to finish the work from a cold start, so the provider may be
+    /// acknowledged and its cursor advanced. There is no state in between: an
+    /// event recorded as accepted and the turn it became are committed
+    /// together, which is what stops a crash from leaving a row that suppresses
+    /// redelivery for a message nothing will ever run.
+    ///
+    /// Everything the decision needed — the access policy, the route, the
+    /// frozen execution context — is resolved by the caller *before* this is
+    /// called, so no file, keychain or network read happens with the
+    /// transaction open. What happens after it is the queue submission, which
+    /// is recoverable precisely because this committed first.
+    pub fn accept_channel_envelope(
+        &mut self,
+        event: &NewChannelEvent,
+        decision: &EnvelopeDecision<'_>,
+        now_ms: i64,
+    ) -> Result<DurableAcceptance, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        // An id already here is adopted rather than refused: this is reached
+        // only when the caller has established that the existing row's decision
+        // never completed, and re-inserting is not one of the options.
+        let event_id = match insert_channel_event(&transaction, event)? {
+            EventRecording::Recorded { event_id } => event_id,
+            EventRecording::Duplicate { event_id } => event_id,
+        };
+        super::fail_points::fire(super::fail_points::FailPoint::AfterEventInsert)?;
+
+        let accepted = match decision {
+            EnvelopeDecision::Run { ingress, params } => {
+                let acceptance = super::ingress_store::insert_ingress_turn(
+                    &transaction,
+                    ingress,
+                    params,
+                    now_ms,
+                )?;
+                let (ingress_id, existing) = match acceptance {
+                    super::ingress_store::IngressAcceptance::Accepted { ingress_id } => {
+                        (ingress_id, None)
+                    }
+                    super::ingress_store::IngressAcceptance::Existing {
+                        ingress_id,
+                        state,
+                        job_id,
+                    } => (ingress_id, Some((state, job_id))),
+                };
+                bind_session(
+                    &transaction,
+                    &ingress.session_key,
+                    &event.account_id,
+                    &event.conversation_id,
+                    event.thread_id.as_deref(),
+                    &ingress.session_key,
+                    now_ms,
+                )?;
+                finalize_event(
+                    &transaction,
+                    &event_id,
+                    EventDisposition::Accepted,
+                    None,
+                    Some(&ingress_id),
+                    None,
+                )?;
+                DurableAcceptance::Runnable {
+                    event_id,
+                    ingress_id,
+                    existing,
+                }
+            }
+            EnvelopeDecision::Challenge { sender, reply } => {
+                upsert_sender(&transaction, &event.account_id, &sender.sender_id, sender)?;
+                insert_outbox_message(&transaction, reply)?;
+                finalize_event(
+                    &transaction,
+                    &event_id,
+                    EventDisposition::Challenged,
+                    None,
+                    None,
+                    None,
+                )?;
+                DurableAcceptance::Settled {
+                    event_id,
+                    disposition: EventDisposition::Challenged,
+                }
+            }
+            EnvelopeDecision::Ignore { reason } => {
+                finalize_event(
+                    &transaction,
+                    &event_id,
+                    EventDisposition::Ignored,
+                    Some(reason),
+                    None,
+                    None,
+                )?;
+                DurableAcceptance::Settled {
+                    event_id,
+                    disposition: EventDisposition::Ignored,
+                }
+            }
+            EnvelopeDecision::Refuse { error } => {
+                finalize_event(
+                    &transaction,
+                    &event_id,
+                    EventDisposition::Failed,
+                    Some(error),
+                    None,
+                    None,
+                )?;
+                DurableAcceptance::Settled {
+                    event_id,
+                    disposition: EventDisposition::Failed,
+                }
+            }
+        };
+        super::fail_points::fire(super::fail_points::FailPoint::BeforeAcceptCommit)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(accepted)
+    }
+
+    /// Point an already recorded event at the turn that owns it.
+    ///
+    /// Only ever used to repair a link a previous build never wrote; the
+    /// acceptance path writes both in one transaction and never needs this.
+    pub fn link_channel_event_to_ingress(
+        &mut self,
+        event_id: &str,
+        ingress_id: &str,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE channel_events SET ingress_id=?2 WHERE event_id=?1",
+                params![event_id, ingress_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn recent_channel_events(
         &self,
         account_id: &str,
@@ -796,7 +1002,7 @@ impl DaemonStore {
             .prepare(
                 "SELECT event_id, account_id, source, direction, provider_event_id, conversation_id,
                         thread_id, sender_id, envelope_json, disposition, ignore_reason, job_id,
-                        received_at_ms
+                        received_at_ms, ingress_id
                  FROM channel_events WHERE account_id=?1
                  ORDER BY received_at_ms DESC LIMIT ?2",
             )
@@ -816,90 +1022,11 @@ impl DaemonStore {
         &mut self,
         row: &NewOutboxMessage,
     ) -> Result<OutboxEnqueue, String> {
-        let outbox_id = new_outbox_id();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let changed = transaction
-            .execute(
-                // `DO NOTHING` with no conflict target on purpose: the row has
-                // two durable identities and either may be the one already
-                // taken — the account-scoped key, and the invocation, which is
-                // unique across all accounts.
-                "INSERT INTO channel_outbox (
-                    outbox_id, account_id, conversation_id, thread_id, reply_to_provider_id,
-                    state, payload_json, payload_digest, idempotency_key, invocation_id,
-                    provider_message_id, attempt, max_attempts, next_attempt_at_ms, last_error,
-                    job_id, created_at_ms, updated_at_ms, sent_at_ms
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, NULL, 0, ?10, NULL, NULL,
-                    ?11, ?12, ?12, NULL
-                 )
-                 ON CONFLICT DO NOTHING",
-                params![
-                    outbox_id,
-                    row.account_id,
-                    row.conversation_id,
-                    row.thread_id,
-                    row.reply_to_provider_id,
-                    row.payload_json,
-                    row.payload_digest,
-                    row.idempotency_key,
-                    row.invocation_id,
-                    row.max_attempts,
-                    row.job_id,
-                    row.created_at_ms,
-                ],
-            )
-            .map_err(|error| format!("Failed to enqueue channel message: {error}"))?;
-        let result = if changed == 1 {
-            OutboxEnqueue::Queued { outbox_id }
-        } else {
-            // Found by whichever identity the row carries. An invocation is
-            // looked up across every account — that is the point of it, and an
-            // account-scoped lookup here would miss the row a replay is
-            // colliding with precisely when the replay changed the account,
-            // turning the fault below into a bare "no rows".
-            let (identity, existing) = match row.invocation_id.as_deref() {
-                Some(invocation_id) => (
-                    format!("invocation '{invocation_id}'"),
-                    transaction.query_row(
-                        "SELECT outbox_id, payload_digest FROM channel_outbox
-                         WHERE invocation_id=?1",
-                        params![invocation_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    ),
-                ),
-                None => (
-                    format!("idempotency key '{}'", row.idempotency_key),
-                    transaction.query_row(
-                        "SELECT outbox_id, payload_digest FROM channel_outbox
-                         WHERE account_id=?1 AND idempotency_key=?2",
-                        params![row.account_id, row.idempotency_key],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    ),
-                ),
-            };
-            let (existing_id, existing_digest): (String, String) =
-                existing.map_err(|error| error.to_string())?;
-            // The identity names one durable invocation; the digest pins what
-            // that invocation asked to send — account and destination
-            // included. The same identity carrying different bytes is a
-            // consistency fault, not a retry — fail closed rather than
-            // overwrite the original or queue a second row, because there is
-            // no way to know which version should reach a person.
-            if existing_digest != row.payload_digest {
-                return Err(format!(
-                    "Internal consistency error: outbox row {existing_id} already holds \
-                     {identity} with a different payload digest; refusing to overwrite or \
-                     duplicate it."
-                ));
-            }
-            OutboxEnqueue::AlreadyQueued {
-                outbox_id: existing_id,
-            }
-        };
+        let result = insert_outbox_message(&transaction, row)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
@@ -1067,6 +1194,35 @@ impl DaemonStore {
         }
     }
 
+    /// Put a claimed row back without spending its attempt.
+    ///
+    /// The claim itself incremented `attempt`, but the drain never tried the
+    /// send — its account's adapter was not loaded. Handing the attempt back
+    /// is what keeps a temporarily disabled account from burning through
+    /// `max_attempts` and permanently failing replies nothing ever sent.
+    pub fn release_outbox_claim(
+        &mut self,
+        outbox_id: &str,
+        delay_ms: i64,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE channel_outbox
+                 SET state='queued',
+                     attempt=CASE WHEN attempt>0 THEN attempt-1 ELSE 0 END,
+                     next_attempt_at_ms=?2, updated_at_ms=?3
+                 WHERE outbox_id=?1 AND state='sending'",
+                params![outbox_id, now_ms.saturating_add(delay_ms), now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!("Unknown or unclaimed outbox message '{outbox_id}'"));
+        }
+        Ok(())
+    }
+
     pub fn cancel_outbox_message(&mut self, outbox_id: &str, now_ms: i64) -> Result<bool, String> {
         self.connection
             .execute(
@@ -1105,17 +1261,34 @@ impl DaemonStore {
     pub fn channel_origin_for_job(&self, job_id: &str) -> Result<Option<ChannelOrigin>, String> {
         self.connection
             .query_row(
-                "SELECT account_id, conversation_id, thread_id, provider_event_id
+                "SELECT account_id, conversation_id, thread_id, provider_event_id, envelope_json
                  FROM channel_events
                  WHERE job_id=?1 AND direction='inbound'
                  ORDER BY received_at_ms DESC LIMIT 1",
                 [job_id],
                 |row| {
+                    let event_id: String = row.get(3)?;
+                    // The id a reply anchors to is not always the id the log
+                    // dedupes by: Telegram polls by update_id but addresses
+                    // replies by chat-scoped message_id. An adapter whose two
+                    // ids differ records the reply anchor in envelope metadata.
+                    let envelope_json: Option<String> = row.get(4)?;
+                    let anchor = envelope_json
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                        .and_then(|envelope| {
+                            envelope
+                                .get("metadata")?
+                                .get("provider_message_id")?
+                                .as_str()
+                                .map(str::to_string)
+                        })
+                        .unwrap_or(event_id);
                     Ok(ChannelOrigin {
                         account_id: row.get(0)?,
                         conversation_id: row.get(1)?,
                         thread_id: row.get(2)?,
-                        provider_event_id: row.get(3)?,
+                        provider_event_id: anchor,
                     })
                 },
             )
@@ -1373,7 +1546,274 @@ fn read_channel_event(
         ignore_reason: row.get(10)?,
         job_id: row.get(11)?,
         received_at_ms: row.get(12)?,
+        ingress_id: row.get(13)?,
     }))
+}
+
+// -- The durable bodies, shared by the single-statement methods and by the
+//    one transaction that has to hold several of them at once ----------------
+
+/// Insert one event, or report the one already there.
+fn insert_channel_event(
+    connection: &rusqlite::Connection,
+    event: &NewChannelEvent,
+) -> Result<EventRecording, String> {
+    let event_id = new_event_id();
+    let changed = connection
+        .execute(
+            "INSERT INTO channel_events (
+                event_id, account_id, source, direction, provider_event_id, conversation_id,
+                thread_id, sender_id, envelope_json, disposition, ignore_reason, job_id,
+                received_at_ms, ingress_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, ?11, NULL)
+             ON CONFLICT(source, account_id, direction, provider_event_id) DO NOTHING",
+            params![
+                event_id,
+                event.account_id,
+                event.source.as_str(),
+                event.direction.as_str(),
+                event.provider_event_id,
+                event.conversation_id,
+                event.thread_id,
+                event.sender_id,
+                event.envelope_json,
+                event.disposition.as_str(),
+                event.received_at_ms,
+            ],
+        )
+        .map_err(|error| format!("Failed to record channel event: {error}"))?;
+    if changed == 1 {
+        return Ok(EventRecording::Recorded { event_id });
+    }
+    let existing_id: String = connection
+        .query_row(
+            "SELECT event_id FROM channel_events
+             WHERE source=?1 AND account_id=?2 AND direction=?3 AND provider_event_id=?4",
+            params![
+                event.source.as_str(),
+                event.account_id,
+                event.direction.as_str(),
+                event.provider_event_id,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(EventRecording::Duplicate {
+        event_id: existing_id,
+    })
+}
+
+/// Write an event's decision, including the turn it became.
+fn finalize_event(
+    connection: &rusqlite::Connection,
+    event_id: &str,
+    disposition: EventDisposition,
+    ignore_reason: Option<&str>,
+    ingress_id: Option<&str>,
+    job_id: Option<&str>,
+) -> Result<(), String> {
+    // The link and the job id are only ever added, never cleared: a decision
+    // that owns no turn must not be able to take one away from a row that has
+    // one. Two passes can only ever disagree about an event that was already
+    // accepted — a policy edit between a worker and a recovery sweep — and the
+    // turn behind it is what recovery needs to find.
+    let changed = connection
+        .execute(
+            "UPDATE channel_events
+                SET disposition=?2, ignore_reason=?3,
+                    ingress_id=COALESCE(?4, ingress_id), job_id=COALESCE(?5, job_id)
+              WHERE event_id=?1",
+            params![
+                event_id,
+                disposition.as_str(),
+                ignore_reason,
+                ingress_id,
+                job_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed != 1 {
+        return Err(format!("Unknown channel event '{event_id}'"));
+    }
+    Ok(())
+}
+
+/// Bind a conversation to a durable session, never overwriting an existing one.
+fn bind_session(
+    connection: &rusqlite::Connection,
+    session_key: &str,
+    account_id: &str,
+    conversation_id: &str,
+    thread_id: Option<&str>,
+    session_id: &str,
+    now_ms: i64,
+) -> Result<String, String> {
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT session_id FROM channel_session_map WHERE session_key=?1",
+            [session_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    // Never overwrite: the binding is the source of truth for which durable
+    // session a conversation continues, and clobbering it would fork history a
+    // caller has already replied into.
+    if let Some(existing_session_id) = existing {
+        connection
+            .execute(
+                "UPDATE channel_session_map SET last_used_at_ms=?2 WHERE session_key=?1",
+                params![session_key, now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(existing_session_id);
+    }
+    connection
+        .execute(
+            "INSERT INTO channel_session_map (
+                session_key, account_id, conversation_id, thread_id, session_id,
+                created_at_ms, last_used_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                session_key,
+                account_id,
+                conversation_id,
+                thread_id,
+                session_id,
+                now_ms,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(session_id.to_string())
+}
+
+/// Insert or replace one sender's authorization state.
+fn upsert_sender(
+    connection: &rusqlite::Connection,
+    account_id: &str,
+    sender_id: &str,
+    record: &StoredSenderAuthorization,
+) -> Result<(), String> {
+    let metadata_json = serde_json::to_string(&record.metadata.iter().collect::<Vec<_>>())
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute(
+            "INSERT INTO channel_sender_authorizations (
+                account_id, sender_id, state, pairing_code_digest, requested_at_ms,
+                expires_at_ms, approved_at_ms, blocked_at_ms, display_label, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(account_id, sender_id) DO UPDATE SET
+                state = excluded.state,
+                pairing_code_digest = excluded.pairing_code_digest,
+                requested_at_ms = excluded.requested_at_ms,
+                expires_at_ms = excluded.expires_at_ms,
+                approved_at_ms = excluded.approved_at_ms,
+                blocked_at_ms = excluded.blocked_at_ms,
+                display_label = excluded.display_label,
+                metadata_json = excluded.metadata_json",
+            params![
+                account_id,
+                sender_id,
+                record.state.as_str(),
+                record.pairing_code_digest,
+                record.requested_at_ms,
+                record.expires_at_ms,
+                record.approved_at_ms,
+                record.blocked_at_ms,
+                record.display_label,
+                metadata_json,
+            ],
+        )
+        .map_err(|error| format!("Failed to upsert channel sender: {error}"))?;
+    Ok(())
+}
+
+/// Queue one outbound message, or report the one already queued under the
+/// identity it carries — its tool invocation, or its account-scoped
+/// idempotency key when no invocation asked for it.
+fn insert_outbox_message(
+    connection: &rusqlite::Connection,
+    row: &NewOutboxMessage,
+) -> Result<OutboxEnqueue, String> {
+    let outbox_id = new_outbox_id();
+    let changed = connection
+        .execute(
+            // `DO NOTHING` with no conflict target on purpose: the row has
+            // two durable identities and either may be the one already
+            // taken — the account-scoped key, and the invocation, which is
+            // unique across all accounts.
+            "INSERT INTO channel_outbox (
+                outbox_id, account_id, conversation_id, thread_id, reply_to_provider_id,
+                state, payload_json, payload_digest, idempotency_key, invocation_id,
+                provider_message_id, attempt, max_attempts, next_attempt_at_ms, last_error,
+                job_id, created_at_ms, updated_at_ms, sent_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, NULL, 0, ?10, NULL, NULL,
+                ?11, ?12, ?12, NULL
+             )
+             ON CONFLICT DO NOTHING",
+            params![
+                outbox_id,
+                row.account_id,
+                row.conversation_id,
+                row.thread_id,
+                row.reply_to_provider_id,
+                row.payload_json,
+                row.payload_digest,
+                row.idempotency_key,
+                row.invocation_id,
+                row.max_attempts,
+                row.job_id,
+                row.created_at_ms,
+            ],
+        )
+        .map_err(|error| format!("Failed to enqueue channel message: {error}"))?;
+    if changed == 1 {
+        return Ok(OutboxEnqueue::Queued { outbox_id });
+    }
+    // Found by whichever identity the row carries. An invocation is looked
+    // up across every account — that is the point of it, and an
+    // account-scoped lookup here would miss the row a replay is colliding
+    // with precisely when the replay changed the account, turning the fault
+    // below into a bare "no rows".
+    let (identity, existing) = match row.invocation_id.as_deref() {
+        Some(invocation_id) => (
+            format!("invocation '{invocation_id}'"),
+            connection.query_row(
+                "SELECT outbox_id, payload_digest FROM channel_outbox
+                 WHERE invocation_id=?1",
+                params![invocation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        ),
+        None => (
+            format!("idempotency key '{}'", row.idempotency_key),
+            connection.query_row(
+                "SELECT outbox_id, payload_digest FROM channel_outbox
+                 WHERE account_id=?1 AND idempotency_key=?2",
+                params![row.account_id, row.idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ),
+        ),
+    };
+    let (existing_id, existing_digest): (String, String) =
+        existing.map_err(|error| error.to_string())?;
+    // The identity names one durable invocation; the digest pins what that
+    // invocation asked to send — account and destination included. The same
+    // identity carrying different bytes is a consistency fault, not a retry
+    // — fail closed rather than overwrite the original or queue a second
+    // row, because there is no way to know which version should reach a
+    // person.
+    if existing_digest != row.payload_digest {
+        return Err(format!(
+            "Internal consistency error: outbox row {existing_id} already holds \
+             {identity} with a different payload digest; refusing to overwrite or \
+             duplicate it."
+        ));
+    }
+    Ok(OutboxEnqueue::AlreadyQueued {
+        outbox_id: existing_id,
+    })
 }
 
 /// `daemon_meta` key holding the operator's public base URL for webhook

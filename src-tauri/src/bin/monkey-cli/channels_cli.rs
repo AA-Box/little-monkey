@@ -511,7 +511,10 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
         return Err("No credential was supplied on stdin".to_string());
     }
 
-    KeyringChannelSecrets.put(&little_monkey_lib::channels::credential_ref(account_id), secret)?;
+    KeyringChannelSecrets.put(
+        &little_monkey_lib::channels::credential_ref(account_id),
+        secret,
+    )?;
     record_credential_change(&mut store, account_id)?;
     println!("Credential stored for {account_id}. Run `monkey channels probe {account_id}` to verify it.");
     Ok(())
@@ -912,6 +915,11 @@ pub fn events(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
                     "sender_id": event.sender_id,
                     "disposition": event.disposition.as_str(),
                     "ignore_reason": event.ignore_reason,
+                    // Which accepted turn owns this event, and which run that
+                    // turn became: together they answer, without opening the
+                    // database, whether a message that arrived was ever acted
+                    // on.
+                    "ingress_id": event.ingress_id,
                     "job_id": event.job_id,
                     "received_at_ms": event.received_at_ms,
                 })
@@ -1021,7 +1029,12 @@ mod tests {
         let account = record_credential_change(&mut store, "chan-1").expect("recorded");
         assert_eq!(account.health.state, HealthState::Disconnected);
         assert!(
-            account.health.detail.as_deref().unwrap_or("").contains("probe"),
+            account
+                .health
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("probe"),
             "{:?}",
             account.health.detail
         );
@@ -1193,8 +1206,14 @@ mod tests {
         assert_eq!(stored.scope.sender_id.as_deref(), Some("user-9"));
         assert_eq!(stored.target.recipe, "triage");
         assert_eq!(stored.target.repository.as_deref(), Some("/work/repo"));
-        assert_eq!(stored.target.params.get("focus").map(String::as_str), Some("deps"));
-        assert_eq!(stored.target.params.get("depth").map(String::as_str), Some("3"));
+        assert_eq!(
+            stored.target.params.get("focus").map(String::as_str),
+            Some("deps")
+        );
+        assert_eq!(
+            stored.target.params.get("depth").map(String::as_str),
+            Some("3")
+        );
         assert_eq!(
             stored.target.session_scope,
             little_monkey_lib::channels::routing::SessionScope::Sender

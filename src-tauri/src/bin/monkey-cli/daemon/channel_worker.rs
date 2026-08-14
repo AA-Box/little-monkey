@@ -26,7 +26,7 @@ use little_monkey_lib::channels::ingress::{
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
-use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision, SubmitOutcome};
+use super::channel_ingress::{self, ChannelAcceptance, OutboxPayload, SubmitOutcome};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
 
@@ -139,6 +139,19 @@ pub(crate) struct InboundReport {
     /// Turns that are durably accepted but did not reach the queue this pass.
     /// Not lost — the next recovery pass re-submits them.
     pub deferred: u32,
+    /// Envelopes that never crossed the durable acceptance boundary (a storage
+    /// failure, or a decision that could not be committed). Tracked separately
+    /// from `failed` because the cursor must not advance past them: everything
+    /// in `failed` has a durable row a human can see, these have nothing, and
+    /// only redelivery from the provider can bring them back.
+    pub unrecorded: u32,
+    /// The provider event ids that *did* cross it, in arrival order.
+    ///
+    /// This is the list a transport with its own delivery handshake may
+    /// acknowledge, and it is deliberately not "everything in the batch": one
+    /// envelope that failed to commit must not take the acknowledgement of its
+    /// siblings with it, and must not be acknowledged itself.
+    pub ack_safe: Vec<String>,
 }
 
 /// Feed one adapter batch through the ingress gate.
@@ -155,64 +168,85 @@ pub(crate) fn ingest_batch(
 ) -> InboundReport {
     let mut report = InboundReport::default();
     for envelope in envelopes {
-        match channel_ingress::plan_channel_ingress(store, envelope, now_ms) {
-            Ok(IngressPlan { event_id, decision }) => match decision {
-                PlannedDecision::Run { ingress, params } => {
-                    // Durable accept first, queue second. A crash in between
-                    // leaves a row `recover_pending_ingress` finishes, rather
-                    // than a message the provider considers delivered and the
-                    // event log would refuse as a duplicate.
-                    match channel_ingress::submit_conversation_turn(
-                        store, queue, &ingress, &params, now_ms,
-                    ) {
-                        Ok(SubmitOutcome::Queued { job_id, .. })
-                        | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
-                            report.accepted += 1;
-                            // Best effort: the run is already queued, and
-                            // failing to annotate the event must not undo it.
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Accepted,
-                                None,
-                                Some(&job_id),
-                            );
-                        }
-                        Ok(SubmitOutcome::Deferred { error, .. }) => {
-                            // Accepted durably, not queued yet. Counted as a
-                            // failure of this pass, but the turn is not lost.
-                            report.deferred += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Accepted,
-                                Some(&error),
-                                None,
-                            );
-                        }
-                        Ok(SubmitOutcome::Parked { .. }) => {
-                            report.failed += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Failed,
-                                Some("The turn could not be queued and was parked"),
-                                None,
-                            );
-                        }
-                        Err(error) => {
-                            report.failed += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Failed,
-                                Some(&error),
-                                None,
-                            );
-                        }
-                    }
+        let accepted =
+            match channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms) {
+                Ok(accepted) => accepted,
+                // Nothing was committed. Not `failed`: that bucket has a durable
+                // row an operator can see, this one has nothing at all, so the
+                // provider must be left to redeliver it.
+                Err(_) => {
+                    report.unrecorded += 1;
+                    continue;
                 }
-                PlannedDecision::Challenge => report.challenged += 1,
-                PlannedDecision::Ignore(_) => report.ignored += 1,
-                PlannedDecision::Duplicate => report.duplicates += 1,
+            };
+        // Everything below this line is already durable. Whatever happens to
+        // the queue submission, the message is recoverable and the provider may
+        // be told we have it.
+        report.ack_safe.push(envelope.provider_event_id.clone());
+        match accepted {
+            ChannelAcceptance::Run {
+                event_id,
+                ingress_id,
+                ingress,
+                params,
+                attempts,
+            } => match channel_ingress::submit_accepted_turn(
+                store,
+                queue,
+                &ingress,
+                &params,
+                &ingress_id,
+                attempts,
+                now_ms,
+            ) {
+                Ok(SubmitOutcome::Queued { job_id, .. })
+                | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
+                    report.accepted += 1;
+                    // Best effort: the run is already queued, and failing to
+                    // annotate the event must not undo it.
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        None,
+                        Some(&job_id),
+                    );
+                }
+                Ok(SubmitOutcome::Deferred { error, .. }) => {
+                    // Durably accepted, not queued yet. Counted as a failure of
+                    // this pass, but the turn is not lost.
+                    report.deferred += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        Some(&error),
+                        None,
+                    );
+                }
+                Ok(SubmitOutcome::Parked { .. }) => {
+                    report.failed += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Failed,
+                        Some("The turn could not be queued and was parked"),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    // The submission never happened; the accepted turn is still
+                    // durable, so recovery owns it and the event keeps saying so.
+                    report.deferred += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        Some(&error),
+                        None,
+                    );
+                }
             },
-            Err(_) => report.failed += 1,
+            ChannelAcceptance::Challenge { .. } => report.challenged += 1,
+            ChannelAcceptance::Ignore { .. } => report.ignored += 1,
+            ChannelAcceptance::Refused { .. } => report.failed += 1,
+            ChannelAcceptance::Duplicate { .. } => report.duplicates += 1,
         }
     }
     report
@@ -228,6 +262,12 @@ pub(crate) async fn poll_account_once(
 ) -> Result<InboundReport, String> {
     let cursor = store.channel_cursor(account_id, POLL_CURSOR_KEY)?;
     let mut batch = adapter.poll(cursor.as_deref()).await?;
+    // The worker knows which account it polled; the adapter does not get a
+    // vote. This both fills the field for adapters that leave it blank and
+    // stops a confused adapter from writing into another account's event log.
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = account_id.to_string();
+    }
     // Files are fetched before the turn becomes durable, so the stored event is
     // the turn as the agent will see it rather than a promise to look later.
     let limits = store
@@ -246,8 +286,29 @@ pub(crate) async fn poll_account_once(
     )
     .await;
     let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
-    if let Some(next) = batch.cursor {
-        store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
+    // An envelope that never crossed the acceptance boundary has no durable
+    // trace, so the cursor holds and the provider redelivers the whole batch;
+    // the ones that did land collapse as duplicates. Advancing here would skip
+    // the unaccepted message forever — a cursor is ordinal, and there is no way
+    // to say "everything past this except that one".
+    if report.unrecorded == 0 {
+        super::fail_points::fire(super::fail_points::FailPoint::BeforeCursorCommit)
+            .map_err(|error| error.to_string())?;
+        if let Some(next) = batch.cursor {
+            store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
+        }
+    }
+    // A transport with its own per-message handshake is not ordinal, so it
+    // acknowledges exactly what became durable and leaves the rest to be
+    // redelivered — even when a sibling in the same batch held the cursor back.
+    if !report.ack_safe.is_empty() {
+        let acknowledged: Vec<ChannelEnvelope> = batch
+            .envelopes
+            .iter()
+            .filter(|envelope| report.ack_safe.contains(&envelope.provider_event_id))
+            .cloned()
+            .collect();
+        adapter.commit_batch(&acknowledged).await;
     }
     Ok(report)
 }
@@ -276,15 +337,11 @@ pub(crate) async fn drain_outbox_once(
     for row in claimed {
         let Some(adapter) = adapters.get(&row.account_id).cloned() else {
             report.skipped += 1;
-            // Back to queued with a short delay: nothing was attempted.
-            store.complete_outbox_send(
-                &row.outbox_id,
-                &SendOutcome::RetryableFailure {
-                    error: "No adapter is loaded for this account".to_string(),
-                    retry_after_ms: Some(60_000),
-                },
-                now_ms,
-            )?;
+            // Back to queued with a short delay, and with the claim's attempt
+            // handed back: nothing was attempted, and an account that stays
+            // disabled for an hour must not exhaust max_attempts without a
+            // single real send.
+            store.release_outbox_claim(&row.outbox_id, 60_000, now_ms)?;
             continue;
         };
         let payload: OutboxPayload = match serde_json::from_str(&row.payload_json) {
@@ -365,13 +422,32 @@ fn recover_accepted_turns(paths: &super::store::DaemonPaths, queue: &dyn RunQueu
     }
 }
 
+/// One account's inbound worker: the live adapter plus the task polling it.
+///
+/// The fingerprint is what makes a reload cheap and safe: an unchanged account
+/// keeps its adapter — and therefore its gateway/socket session — instead of
+/// being torn down and rebuilt every [`RELOAD_INTERVAL_MS`], which for a
+/// socket transport would mean a fresh provider session every thirty seconds
+/// and a lingering old one beside it.
+struct AccountWorker {
+    fingerprint: String,
+    adapter: Arc<dyn ChannelAdapter>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AccountWorker {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Run the channel subsystem for as long as the daemon lives.
 ///
-/// One task for every account rather than one per account: polling is a
-/// blocking wait, not a busy loop, and a handful of accounts cost a handful of
-/// awaits.
-// ponytail: sequential per-account polling. If one slow provider starves the
-// others, give each account its own task and keep this as the supervisor.
+/// One inbound task per account: a long-polling adapter blocks inside `poll`
+/// for its own window (Telegram waits 25 seconds on a quiet chat), and in a
+/// shared loop that wait would also be the latency ceiling for every other
+/// account's acknowledgements. The supervisor task keeps the account list
+/// fresh, drains the outbox, and re-submits accepted-but-unqueued turns.
 pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
     tokio::spawn(async move {
         // A send that was in flight when the process died cannot be retried
@@ -390,16 +466,31 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
 
-        let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+        // Inbound events an older build recorded as accepted without ever
+        // creating the turn they promised. Once, at start: this build cannot
+        // produce one, so a sweep on every tick would be a query looking for a
+        // state its own code makes impossible.
+        if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
+            match channel_ingress::recover_orphaned_channel_events(&mut store, queue.as_ref(), now)
+            {
+                Ok(recovery) if recovery.recovered + recovery.deferred + recovery.parked > 0 => {
+                    eprintln!(
+                        "monkey daemon: recovered {} inbound message(s) left unfinished by an earlier build, {} parked",
+                        recovery.recovered + recovery.deferred,
+                        recovery.parked
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("monkey daemon: could not check for unfinished messages: {error}")
+                }
+            }
+        }
+
+        let mut workers: BTreeMap<String, AccountWorker> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
         // Zero, so the first pass through the loop is the startup recovery.
         let mut next_recovery_ms = 0_u64;
-        // The health state each account last had written for it, so the loop
-        // records transitions — a socket dying, a token being revoked, the
-        // provider coming back — without rewriting an unchanged row every
-        // tick.
-        let mut posted_health: BTreeMap<String, little_monkey_lib::channels::types::HealthState> =
-            BTreeMap::new();
 
         loop {
             let now = match current_ms() {
@@ -430,12 +521,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(mut store) => {
-                        adapters = load_adapters(&paths, &mut store, now);
-                        // Forget what was last written so the fresh adapter
-                        // set re-asserts its state once per reload at most.
-                        posted_health.clear();
-                    }
+                    Ok(mut store) => reconcile_workers(&paths, &mut store, &queue, &mut workers),
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -449,53 +535,11 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
                 }
             };
 
+            let adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = workers
+                .iter()
+                .map(|(account_id, worker)| (account_id.clone(), worker.adapter.clone()))
+                .collect();
             let mut worked = false;
-            for (account_id, adapter) in &adapters {
-                match poll_account_once(
-                    &mut store,
-                    queue.as_ref(),
-                    account_id,
-                    adapter.as_ref(),
-                    now,
-                )
-                .await
-                {
-                    Ok(report) => {
-                        worked |= report.accepted + report.challenged + report.duplicates > 0;
-                        // A poll that actually spoke to the provider is the
-                        // "authenticated live transport" that may claim
-                        // Connected — and the only thing here that may. A
-                        // socket adapter answers for its own connection, and
-                        // a webhook adapter's no-op poll says nothing at all.
-                        if let Some(state) = health_after_poll(adapter.as_ref()) {
-                            record_health_transition(
-                                &mut store,
-                                &mut posted_health,
-                                account_id,
-                                state,
-                                None,
-                                now,
-                            );
-                        }
-                    }
-                    // One provider being unreachable must not stop the others,
-                    // and must not stop the outbox either. It must show up,
-                    // though: stored health saying Connected while every poll
-                    // fails is the lie the health column exists to prevent.
-                    Err(error) => {
-                        record_health_transition(
-                            &mut store,
-                            &mut posted_health,
-                            account_id,
-                            little_monkey_lib::channels::types::HealthState::Degraded,
-                            Some(&error),
-                            now,
-                        );
-                        eprintln!("monkey daemon: channel {account_id} poll: {error}")
-                    }
-                }
-            }
-
             match drain_outbox_once(&mut store, &adapters, now).await {
                 Ok(report) => worked |= report.sent + report.retrying > 0,
                 Err(error) => eprintln!("monkey daemon: channel outbox: {error}"),
@@ -507,6 +551,11 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
         }
     });
 }
+
+/// How often an unchanged health state is re-asserted anyway, so a row some
+/// other writer (a manual `channels probe`, an operator edit) overwrote does
+/// not stay stale behind the debounce forever.
+const HEALTH_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a successful poll says about an account's health, if anything.
 ///
@@ -568,27 +617,164 @@ fn record_health_transition(
     }
 }
 
-/// Build an adapter for every enabled account, resolving each credential from
-/// the keychain at load time so no adapter ever reads it itself.
+/// One account's inbound loop: poll, ingest, repeat until aborted.
 ///
-/// An account that cannot be built — unreadable credential, config its
-/// adapter refuses — has that failure written to its stored health rather
-/// than only to the daemon's log: the operator looking at the Channels panel
-/// is the one who can fix it.
-fn load_adapters(
+/// Poll failures back off exponentially per account — a provider outage or a
+/// rate-limited `getUpdates` must not turn into a hammer — and recover to full
+/// speed on the first success. Health is derived from the transport after
+/// every poll: a socket adapter answers for its own connection via
+/// `live_transport`, a long-polling adapter's returned poll IS the proof, and
+/// a failing poll is recorded as degraded with its reason.
+async fn run_account_inbound(
+    paths: super::store::DaemonPaths,
+    queue: Arc<dyn RunQueue>,
+    account_id: String,
+    adapter: Arc<dyn ChannelAdapter>,
+) {
+    const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+    let mut error_backoff = MIN_ERROR_BACKOFF;
+    // This task's one account, but the shared debounce helper wants a map.
+    let mut posted_health: BTreeMap<String, little_monkey_lib::channels::types::HealthState> =
+        BTreeMap::new();
+    let mut last_asserted = std::time::Instant::now();
+    loop {
+        let Ok(now) = current_ms() else {
+            tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+            continue;
+        };
+        let mut store = match DaemonStore::open(&paths) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("monkey daemon: channel {account_id} paused: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                continue;
+            }
+        };
+        // Periodically forget what was posted so the true state is re-asserted
+        // even if something else rewrote the row in between.
+        if last_asserted.elapsed() >= HEALTH_REASSERT_INTERVAL {
+            last_asserted = std::time::Instant::now();
+            posted_health.clear();
+        }
+        let started = std::time::Instant::now();
+        match poll_account_once(
+            &mut store,
+            queue.as_ref(),
+            &account_id,
+            adapter.as_ref(),
+            now,
+        )
+        .await
+        {
+            Ok(_) => {
+                error_backoff = MIN_ERROR_BACKOFF;
+                if let Some(state) = health_after_poll(adapter.as_ref()) {
+                    record_health_transition(
+                        &mut store,
+                        &mut posted_health,
+                        &account_id,
+                        state,
+                        None,
+                        now,
+                    );
+                }
+                // A long-polling adapter paces this loop itself by blocking
+                // inside `poll`. One that returns immediately forever — a
+                // webhook adapter, or a broken one — must not busy-spin.
+                if started.elapsed() < std::time::Duration::from_millis(500) {
+                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
+                }
+            }
+            Err(error) => {
+                // Stored health saying Connected while every poll fails is
+                // the lie the health column exists to prevent.
+                record_health_transition(
+                    &mut store,
+                    &mut posted_health,
+                    &account_id,
+                    little_monkey_lib::channels::types::HealthState::Degraded,
+                    Some(&error),
+                    now,
+                );
+                eprintln!("monkey daemon: channel {account_id} poll: {error}");
+                tokio::time::sleep(error_backoff).await;
+                error_backoff = (error_backoff * 2).min(MAX_ERROR_BACKOFF);
+            }
+        }
+    }
+}
+
+/// What actually feeds a live adapter: the transport-relevant parts of the
+/// account row plus the resolved secret. Deliberately NOT the row's
+/// updated-at stamp — an operator renaming an account or tightening its
+/// access policy must not tear down a live gateway session, while rotating
+/// the credential or editing the provider config must.
+fn worker_fingerprint(
+    account: &super::channel_store::ChannelAccountRecord,
+    secret: &str,
+) -> String {
+    // A digest rather than the secret itself: the fingerprint is held for
+    // the daemon's lifetime and compared every reload, and there is no
+    // reason for a copy of the token to sit in it.
+    super::trigger::sha256_hex(
+        format!(
+            "{}|{:?}|{}|{}",
+            account.account_id,
+            account.kind,
+            super::trigger::sha256_hex(account.non_secret_config.to_string().as_bytes()),
+            super::trigger::sha256_hex(secret.as_bytes()),
+        )
+        .as_bytes(),
+    )
+}
+
+/// Bring the worker set in line with the enabled accounts, touching only what
+/// changed.
+///
+/// The fingerprint covers what the adapter is built from — provider config
+/// and the resolved secret — so rotating a token rebuilds that one adapter
+/// while every other account keeps its live session, and editing a label
+/// rebuilds nothing. Removing (or disabling) an account aborts its task and
+/// drops its adapter, which is what tells a socket adapter's background task
+/// to hang up. An account that cannot be built — unreadable credential,
+/// config its adapter refuses — has that failure written to its stored
+/// health rather than only to the daemon's log: the operator looking at the
+/// Channels panel is the one who can fix it.
+fn reconcile_workers(
     paths: &super::store::DaemonPaths,
     store: &mut DaemonStore,
-    now_ms: i64,
-) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
-    use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
+    queue: &Arc<dyn RunQueue>,
+    workers: &mut BTreeMap<String, AccountWorker>,
+) {
+    reconcile_workers_with(
+        &super::channel_adapter::KeyringChannelSecrets,
+        paths,
+        store,
+        queue,
+        workers,
+    );
+}
 
-    let secrets = KeyringChannelSecrets;
-    let mut adapters: BTreeMap<String, Arc<dyn ChannelAdapter>> = BTreeMap::new();
+/// [`reconcile_workers`] with the secret store injected, so the lifecycle —
+/// spawn, keep, rebuild, stop — is provable against a store a test owns.
+fn reconcile_workers_with(
+    secrets: &dyn super::channel_adapter::ChannelSecrets,
+    paths: &super::store::DaemonPaths,
+    store: &mut DaemonStore,
+    queue: &Arc<dyn RunQueue>,
+    workers: &mut BTreeMap<String, AccountWorker>,
+) {
+    use super::channel_adapter::AdapterConfig;
+
+    let Ok(now_ms) = current_ms() else {
+        return;
+    };
     let accounts = match store.channel_accounts() {
         Ok(accounts) => accounts,
         Err(error) => {
             eprintln!("monkey daemon: could not read channel accounts: {error}");
-            return adapters;
+            return;
         }
     };
     // Written only on a state change, like the poll loop's transitions: a
@@ -617,56 +803,95 @@ fn load_adapters(
             );
         }
     };
+    let mut desired = std::collections::BTreeSet::new();
     for account in accounts.into_iter().filter(|account| account.enabled) {
+        let is_sms = account.kind == little_monkey_lib::channels::types::ChannelKind::Sms;
         // An SMS account's carrier credential lives on the telephony account of
-        // the same id, not on this row, so it is built from there.
-        if account.kind == little_monkey_lib::channels::types::ChannelKind::Sms {
-            match build_sms_adapter(paths, store, &secrets, &account.account_id) {
-                Ok(adapter) => {
-                    adapters.insert(account.account_id.clone(), adapter);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "monkey daemon: SMS account {} cannot send: {error}",
-                        account.account_id
-                    );
-                    mark_failed(store, &account, &error);
-                }
+        // the same id, not on this row, so it is resolved from there.
+        let secret = if is_sms {
+            match store
+                .telecom_account(&account.account_id)
+                .ok()
+                .flatten()
+                .and_then(|telecom| telecom.credential_ref)
+            {
+                Some(reference) => match secrets.get(&reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: SMS account {} cannot send: {error}",
+                            account.account_id
+                        );
+                        mark_failed(store, &account, &error);
+                        continue;
+                    }
+                },
+                None => String::new(),
             }
+        } else {
+            match &account.credential_ref {
+                Some(reference) => match secrets.get(reference) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        eprintln!(
+                            "monkey daemon: channel account {} has no usable credential: {error}",
+                            account.account_id
+                        );
+                        mark_failed(store, &account, &error);
+                        continue;
+                    }
+                },
+                None => String::new(),
+            }
+        };
+        let fingerprint = worker_fingerprint(&account, &secret);
+        desired.insert(account.account_id.clone());
+        if workers
+            .get(&account.account_id)
+            .map(|worker| worker.fingerprint.as_str())
+            == Some(fingerprint.as_str())
+        {
             continue;
         }
-        let secret = match &account.credential_ref {
-            Some(reference) => match secrets.get(reference) {
-                Ok(secret) => secret,
-                Err(error) => {
-                    eprintln!(
-                        "monkey daemon: channel account {} has no usable credential: {error}",
-                        account.account_id
-                    );
-                    mark_failed(store, &account, &error);
-                    continue;
-                }
-            },
-            None => String::new(),
+        let built = if is_sms {
+            build_sms_adapter(paths, store, secrets, &account.account_id)
+        } else {
+            super::adapters::build_adapter(&AdapterConfig {
+                account: &account,
+                secret,
+            })
         };
-        let config = AdapterConfig {
-            account: &account,
-            secret,
-        };
-        match super::adapters::build_adapter(&config) {
-            Ok(adapter) => {
-                adapters.insert(account.account_id.clone(), adapter);
-            }
+        let adapter = match built {
+            Ok(adapter) => adapter,
             Err(error) => {
                 eprintln!(
                     "monkey daemon: channel account {} is not runnable: {error}",
                     account.account_id
                 );
                 mark_failed(store, &account, &error);
+                // A broken replacement must not keep the stale adapter running
+                // on the old credential.
+                workers.remove(&account.account_id);
+                continue;
             }
-        }
+        };
+        let handle = tokio::spawn(run_account_inbound(
+            paths.clone(),
+            queue.clone(),
+            account.account_id.clone(),
+            adapter.clone(),
+        ));
+        // Dropping the replaced worker aborts its task via `Drop`.
+        workers.insert(
+            account.account_id.clone(),
+            AccountWorker {
+                fingerprint,
+                adapter,
+                handle,
+            },
+        );
     }
-    adapters
+    workers.retain(|account_id, _| desired.contains(account_id));
 }
 
 /// Build the adapter that answers texts for one telephony account.
@@ -920,6 +1145,62 @@ mod tests {
         assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 2);
     }
 
+    /// A message this daemon deliberately drops is finished the moment its
+    /// decision is committed: nothing runs, and the provider may be told we
+    /// have it. A challenge is the same, with its reply already queued.
+    #[test]
+    fn a_decision_never_to_run_is_still_durably_final_and_ack_safe() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.enabled = false;
+        store.upsert_channel_account(&account).unwrap();
+
+        let report = ingest_batch(&mut store, &queue, &[envelope("1")], NOW);
+
+        assert_eq!(report.ignored, 1);
+        assert_eq!(report.ack_safe, vec!["1".to_string()]);
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events[0].disposition, EventDisposition::Ignored);
+        assert!(events[0].ingress_id.is_none());
+        assert!(queue.submitted.lock().unwrap().is_empty());
+        // Nothing for a recovery pass to find: the decision is the whole story.
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+    }
+
+    /// One envelope that could not be committed holds the ordinal cursor for
+    /// the whole batch — a cursor cannot say "everything but that one" — and
+    /// still must not take its siblings' per-message acknowledgements with it.
+    #[tokio::test]
+    async fn an_uncommitted_envelope_holds_the_cursor_but_not_its_siblings_ack() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        let adapter = FakeAdapter::new();
+        adapter.batches.lock().unwrap().push(InboundBatch {
+            envelopes: vec![envelope("1"), envelope("2")],
+            cursor: Some("42".to_string()),
+        });
+
+        // Armed once, so it fires on the first envelope and the second is
+        // accepted normally.
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::AfterEventInsert);
+        let report = poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
+            .await
+            .expect("poll");
+
+        assert_eq!(report.unrecorded, 1);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.ack_safe, vec!["2".to_string()]);
+        assert_eq!(
+            store.channel_cursor("acct-1", POLL_CURSOR_KEY).unwrap(),
+            None,
+            "the cursor must not skip the envelope that was never accepted"
+        );
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].provider_event_id, "2");
+    }
+
     #[tokio::test]
     async fn the_cursor_only_advances_after_the_batch_is_recorded() {
         let mut store = seeded_store();
@@ -1078,6 +1359,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_running_daemon_writes_health_from_the_transport_not_from_the_config() {
+        use little_monkey_lib::channels::types::HealthState;
+        let mut store = seeded_store();
+        // A stored credential on its own proves nothing, so the account starts
+        // out in the state a fresh configuration leaves it in.
+        store
+            .set_channel_account_health("acct-1", &ChannelHealth::error(NOW, "never probed"), NOW)
+            .expect("seed health");
+
+        // The same sequence the per-account loop performs after a poll.
+        let adapter = FakeAdapter::new();
+        let mut posted = BTreeMap::new();
+        if let Some(state) = health_after_poll(&adapter) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+
+        let account = store
+            .channel_account("acct-1")
+            .expect("read")
+            .expect("account");
+        assert_eq!(account.health.state, HealthState::Connected);
+    }
+
+    #[tokio::test]
     async fn a_message_for_an_unloaded_account_waits_rather_than_failing() {
         let mut store = seeded_store();
         queue_reply(&mut store, "reply-1");
@@ -1091,6 +1396,169 @@ mod tests {
             .claim_outbox_batch(NOW + 120_000, 10)
             .unwrap()
             .is_empty());
+    }
+
+    // -- worker lifecycle ---------------------------------------------------
+
+    /// A LINE account: webhook-delivered, so its spawned inbound task's poll
+    /// is a local no-op — the one adapter whose worker can run in a test
+    /// without a provider fixture behind it.
+    fn line_account(updated_at_ms: i64, label: &str) -> ChannelAccountRecord {
+        ChannelAccountRecord {
+            account_id: "acct-line".into(),
+            kind: ChannelKind::Line,
+            label: label.into(),
+            enabled: true,
+            non_secret_config: serde_json::json!({}),
+            credential_ref: Some("line-cred".into()),
+            access_policy: Default::default(),
+            health: ChannelHealth::error(0, "unused"),
+            created_at_ms: NOW,
+            updated_at_ms,
+        }
+    }
+
+    fn line_secret() -> String {
+        r#"{"channel_secret":"line-secret","channel_access_token":"line-token"}"#.to_string()
+    }
+
+    fn lifecycle_world() -> (
+        DaemonStore,
+        super::super::channel_adapter::MemoryChannelSecrets,
+        super::super::store::DaemonPaths,
+        Arc<dyn RunQueue>,
+    ) {
+        use super::super::channel_adapter::ChannelSecrets;
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        store
+            .upsert_channel_account(&line_account(NOW, "Ops"))
+            .expect("account");
+        let secrets = super::super::channel_adapter::MemoryChannelSecrets::default();
+        secrets.put("line-cred", &line_secret()).expect("secret");
+        let paths = super::super::channel_restart_tests::temp_daemon_paths();
+        let queue: Arc<dyn RunQueue> = Arc::new(FakeQueue::default());
+        (store, secrets, paths, queue)
+    }
+
+    #[tokio::test]
+    async fn a_label_edit_does_not_rebuild_a_live_worker() {
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1);
+        let before = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+
+        // A rename touches the row (and its updated-at stamp) but nothing the
+        // transport is built from: the live session must survive it.
+        store
+            .upsert_channel_account(&line_account(NOW + 5_000, "Renamed"))
+            .expect("rename");
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1);
+        let after = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(
+            std::ptr::eq(before, after),
+            "a label edit must not tear down a live worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotated_credential_replaces_the_worker_exactly_once() {
+        use super::super::channel_adapter::ChannelSecrets;
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        let before = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+
+        secrets
+            .put(
+                "line-cred",
+                r#"{"channel_secret":"rotated","channel_access_token":"rotated-token"}"#,
+            )
+            .expect("rotate");
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1, "one account, one worker");
+        let after = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(
+            !std::ptr::eq(before, after),
+            "a rotated credential must rebuild the worker"
+        );
+
+        // Reconciling again with nothing changed keeps the rebuilt worker.
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        let settled = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(std::ptr::eq(after, settled));
+    }
+
+    #[tokio::test]
+    async fn rapid_enable_disable_cycles_leave_at_most_one_consumer() {
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        for round in 0..5 {
+            let mut account = line_account(NOW + round, "Ops");
+            account.enabled = round % 2 == 0;
+            store.upsert_channel_account(&account).expect("account");
+            reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+            assert!(
+                workers.len() <= 1,
+                "round {round} left {} workers",
+                workers.len()
+            );
+            assert_eq!(
+                workers.contains_key("acct-line"),
+                account.enabled,
+                "round {round}: the worker set must mirror the enabled flag"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_transport_inputs_and_nothing_else() {
+        let account = line_account(NOW, "Ops");
+        let base = worker_fingerprint(&account, "secret-1");
+
+        let mut renamed = line_account(NOW + 99, "Renamed");
+        renamed.access_policy = ChannelAccessPolicy {
+            direct: AccessPolicy::Open,
+            group: AccessPolicy::Open,
+            group_activation: GroupActivation::Always,
+        };
+        assert_eq!(
+            worker_fingerprint(&renamed, "secret-1"),
+            base,
+            "labels, timestamps and access policy are not transport inputs"
+        );
+
+        assert_ne!(worker_fingerprint(&account, "secret-2"), base);
+        let mut reconfigured = line_account(NOW, "Ops");
+        reconfigured.non_secret_config = serde_json::json!({"base_url": "http://other"});
+        assert_ne!(worker_fingerprint(&reconfigured, "secret-1"), base);
+    }
+
+    #[tokio::test]
+    async fn skipped_claims_never_exhaust_the_attempt_budget() {
+        // The account's adapter stays unloaded for far more drains than the
+        // row has attempts. Each claim spends an attempt; each skip must hand
+        // it back — otherwise a disabled account permanently fails replies
+        // nothing ever tried to send.
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let mut now = NOW;
+        for _ in 0..6 {
+            let report = drain_outbox_once(&mut store, &BTreeMap::new(), now)
+                .await
+                .expect("drain");
+            assert_eq!(report.skipped, 1, "row must stay claimable");
+            assert_eq!(report.failed, 0);
+            now += 61_000;
+        }
+        // The adapter comes back; the message still sends.
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), now)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 
     #[test]
