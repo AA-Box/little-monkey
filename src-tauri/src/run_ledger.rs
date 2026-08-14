@@ -3879,7 +3879,7 @@ CREATE TABLE agent_processes_v21 (
     limit_level TEXT CHECK (limit_level IS NULL OR limit_level IN
         ('kernel', 'supervised', 'owner-sourced')),
     limit_observed_at_ms INTEGER
-        CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms > 0),
+        CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
     -- Which layer supplied each effective limit, as a compact JSON object. One
     -- column rather than five, because nothing queries by source; it exists so
     -- the UI can answer "where did this number come from" without the reader

@@ -95,6 +95,13 @@ pub struct BackgroundShellView {
 struct BackgroundProcess {
     view: Mutex<BackgroundShellView>,
     child: Mutex<crate::workspace_shell::BackgroundShellChild>,
+    /// What is holding this command's process tree.
+    ///
+    /// Owned here for the same reason the child is: the containment's lifetime
+    /// has to be the command's lifetime. On Windows the job handle carries
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping this kills the tree —
+    /// which is correct at teardown and catastrophic anywhere earlier.
+    controller: Mutex<crate::resource_control::ResourceController>,
     /// Byte offset into `view.output` already returned by
     /// `background_shell_output` in draining mode — the "only new output"
     /// cursor the model's polling tool reads through. Kept out of the view so
@@ -227,7 +234,21 @@ fn append_bounded(buffer: &mut String, chunk: &str, truncated: &mut bool) -> usi
 /// than clearing it (see `process_table.rs`'s `reconcile`: it writes
 /// `native_pid` only when the projection supplies `Some`).
 fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView, native_pid: Option<i64>) {
-    project_process(app, &view, native_pid);
+    project_process(app, &view, native_pid, None);
+    let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
+}
+
+/// [`emit_status`] for the one status change that carries a resource cause.
+///
+/// A separate entry point rather than a parameter on `emit_status` because every
+/// other call site would have to pass `None`, and a `None` at forty call sites is
+/// how a caller eventually passes the wrong thing.
+fn emit_status_with_breach(
+    app: &tauri::AppHandle,
+    view: BackgroundShellView,
+    breach: Option<crate::resource_control::LimitBreach>,
+) {
+    project_process(app, &view, None, breach);
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
 }
 
@@ -239,7 +260,12 @@ fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView, native_pid: Op
 ///
 /// Fail-soft, like every other adopter: a shell must not fail to report its
 /// status because a bookkeeping row could not be written.
-fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pid: Option<i64>) {
+fn project_process(
+    app: &tauri::AppHandle,
+    view: &BackgroundShellView,
+    native_pid: Option<i64>,
+    breach: Option<crate::resource_control::LimitBreach>,
+) {
     use crate::process_table::{
         ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
     };
@@ -255,6 +281,7 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
                 code: view.exit_code,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         BackgroundShellStatus::Killed => (
@@ -264,15 +291,23 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
                 code: view.exit_code,
                 signal: None,
                 reason: Some("killed".to_string()),
+                breach: None,
             }),
         ),
+        // A resource kill also arrives as `Error`, and the two must not look the
+        // same: one is the command's own failure and the other is the system
+        // working. The breach is what tells them apart.
         BackgroundShellStatus::Error => (
             ProcessState::Exited,
-            Some(ProcessExit {
-                status: ExitStatus::Failed,
-                code: view.exit_code,
-                signal: None,
-                reason: None,
+            Some(match &breach {
+                Some(breach) => ProcessExit::limit_exceeded(breach.clone()),
+                None => ProcessExit {
+                    status: ExitStatus::Failed,
+                    code: view.exit_code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                },
             }),
         ),
     };
@@ -458,6 +493,47 @@ fn split_event_chunks(chunk: &str) -> Vec<String> {
 /// first to notice. See [`USAGE_FLUSH_TICKS`] for why sampling and writing run at
 /// different rates, and `process_usage` for why sampling has to happen at all
 /// (peak resident size cannot be read from a pid that is gone).
+/// Sample this command's tree and report the first limit it has crossed.
+///
+/// `None` covers three different situations on purpose — no limit configured,
+/// nothing measurable, and inside every bound — because the watcher's next action
+/// is the same for all three: keep waiting. Only a breach changes what happens.
+fn check_resource_limits(
+    process: &Arc<BackgroundProcess>,
+) -> Option<crate::resource_control::LimitBreach> {
+    let mut controller = process.controller.lock().ok()?;
+    let sample = controller.sample().ok()??;
+    let breach = controller.breach(&sample, now_ms().ok()? as i64)?;
+    // The tree, before anything is recorded: a bound that reports a breach and
+    // leaves the workload running has reclaimed nothing.
+    if let Err(error) = controller.terminate_tree() {
+        eprintln!("background shell: could not terminate a tree past its limit: {error}");
+    }
+    Some(breach)
+}
+
+/// Close the row out as `limit_exceeded`, naming the limit and both numbers.
+///
+/// Deliberately not `Killed`: a command stopped for holding 9 GiB and a command
+/// a user stopped are different facts, and the panel showing the same word for
+/// both is what made a working budget look like an unexplained disappearance.
+fn record_limit_breach(
+    app: &tauri::AppHandle,
+    process: &Arc<BackgroundProcess>,
+    usage: &crate::process_usage::ProcessUsageAccumulator,
+    breach: crate::resource_control::LimitBreach,
+) {
+    let external_id = process.view().map(|view| view.id).unwrap_or_default();
+    flush_usage(app, &external_id, usage);
+    if let Ok(mut view) = process.view.lock() {
+        view.status = BackgroundShellStatus::Error;
+        view.finished_at_ms = now_ms().ok();
+        view.output
+            .push_str(&format!("\n[{}]\n", breach.describe()));
+        emit_status_with_breach(app, view.clone(), Some(breach));
+    }
+}
+
 fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
     std::thread::spawn(move || {
         let external_id = process.view().map(|view| view.id).unwrap_or_default();
@@ -487,6 +563,15 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
             };
             match waited {
                 Ok(None) => {
+                    // The same tick that samples for the ledger also asks the
+                    // controller whether a bound has been crossed. A background
+                    // command has no caller blocked on it, so this loop is the
+                    // only thing that can notice — and a limit nobody checks is
+                    // a limit that never fires.
+                    if let Some(breach) = check_resource_limits(&process) {
+                        record_limit_breach(&app, &process, &usage, breach);
+                        break;
+                    }
                     ticks = ticks.wrapping_add(1);
                     if ticks % USAGE_FLUSH_TICKS == 0 {
                         flush_usage(&app, &external_id, &usage);
@@ -607,11 +692,17 @@ pub async fn tool_run_shell_background(
         },
     };
 
-    let spawned = crate::workspace_shell::spawn_background(&workspace_root, &cwd_path, &command)
-        .map_err(|error| format!("Failed to spawn shell: {error}"))?;
+    let spawned = crate::workspace_shell::spawn_background(
+        &workspace_root,
+        &cwd_path,
+        &command,
+        crate::process_table::ProcessLimits::default(),
+    )
+    .map_err(|error| format!("Failed to spawn shell: {error}"))?;
     let native_pid = i64::try_from(spawned.child.id()).ok();
     let crate::workspace_shell::BackgroundSpawn {
         child,
+        controller,
         stdout,
         stderr,
     } = spawned;
@@ -630,6 +721,11 @@ pub async fn tool_run_shell_background(
     let process = Arc::new(BackgroundProcess {
         view: Mutex::new(view.clone()),
         child: Mutex::new(child),
+        // Held for the life of the background process, not dropped at the end of
+        // this function: on Windows the job handle *is* the containment, so
+        // releasing it here would free the tree the moment the command was
+        // registered.
+        controller: Mutex::new(controller),
         read_cursor: Mutex::new(0),
     });
     state
@@ -897,6 +993,12 @@ mod tests {
                             child,
                         ),
                     ),
+                    // Unbounded on purpose: this test asserts the *lifecycle*
+                    // (suspend, resume, exit), and a limit here would add a
+                    // second reason the child could disappear.
+                    controller: Mutex::new(crate::resource_control::ResourceController::new(
+                        crate::resource_control::EffectiveLimits::default(),
+                    )),
                     read_cursor: Mutex::new(0),
                 }),
             )

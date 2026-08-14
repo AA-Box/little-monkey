@@ -998,6 +998,7 @@ impl OwnedBrowser {
                 code: None,
                 signal: None,
                 reason: self.cancel_reason().map(|reason| format!("{reason:?}")),
+                breach: None,
             },
         });
         if let Err(error) = projector.project(&projection) {

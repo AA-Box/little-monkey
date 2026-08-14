@@ -1092,6 +1092,17 @@ pub struct ProcessExit {
     /// Human-readable reason. For [`ExitStatus::LimitExceeded`] this must name
     /// the limit that fired.
     pub reason: Option<String>,
+    /// The structured form of that reason, when a resource controller made the
+    /// kill: which limit, what was configured, what was measured, which backend
+    /// noticed, and whether it was kernel-held or supervised.
+    ///
+    /// Beside `reason` rather than instead of it. The prose is what a person
+    /// reads and what older surfaces already show; this is what a query filters
+    /// on and what a UI formats. Before V21 only the prose existed, so "how much
+    /// memory did it actually hold" could be answered only by parsing a sentence
+    /// — which the daemon genuinely did, with a marker string.
+    #[serde(default)]
+    pub breach: Option<crate::resource_control::LimitBreach>,
 }
 
 impl ProcessExit {
@@ -1101,6 +1112,19 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: None,
+            breach: None,
+        }
+    }
+
+    /// The exit a resource controller produces. The prose reason is derived from
+    /// the breach rather than written separately, so the two can never disagree.
+    pub fn limit_exceeded(breach: crate::resource_control::LimitBreach) -> Self {
+        ProcessExit {
+            status: ExitStatus::LimitExceeded,
+            code: None,
+            signal: None,
+            reason: Some(breach.describe()),
+            breach: Some(breach),
         }
     }
 
@@ -1110,6 +1134,7 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: Some(reason.into()),
+            breach: None,
         }
     }
 
@@ -1119,6 +1144,7 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: Some(reason.into()),
+            breach: None,
         }
     }
 }
@@ -1978,6 +2004,7 @@ impl<'a> ProcessTable<'a> {
             .map(ProcessUsage::measured)
             .unwrap_or_default();
 
+        let breach = exit.as_ref().and_then(|exit| exit.breach.clone());
         self.connection.execute(
             "UPDATE agent_processes
                 SET state = ?2,
@@ -1997,7 +2024,13 @@ impl<'a> ProcessTable<'a> {
                     tokens_out = COALESCE(?16, tokens_out),
                     gpu_resident_bytes = COALESCE(?17, gpu_resident_bytes),
                     gpu_device_ms = COALESCE(?18, gpu_device_ms),
-                    usage_unavailable_json = COALESCE(?19, usage_unavailable_json)
+                    usage_unavailable_json = COALESCE(?19, usage_unavailable_json),
+                    limit_kind = ?20,
+                    limit_configured = ?21,
+                    limit_observed = ?22,
+                    limit_backend = ?23,
+                    limit_level = ?24,
+                    limit_observed_at_ms = ?25
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -2019,6 +2052,19 @@ impl<'a> ProcessTable<'a> {
                 to_sql_u64(measured.gpu_resident_bytes),
                 to_sql_u64(measured.gpu_device_ms),
                 unavailable_json,
+                // The typed breach, which is why V21 exists: a limit kill used to
+                // survive only as prose in `exit_reason` and, for the daemon, as a
+                // marker encoded into `last_error` and parsed back out.
+                breach.as_ref().map(|breach| breach.limit.clone()),
+                breach
+                    .as_ref()
+                    .map(|breach| to_sql_u64(Some(breach.configured))),
+                breach
+                    .as_ref()
+                    .map(|breach| to_sql_u64(Some(breach.observed))),
+                breach.as_ref().map(|breach| breach.backend.clone()),
+                breach.as_ref().map(|breach| breach.level.clone()),
+                breach.as_ref().map(|breach| breach.observed_at_ms),
             ],
         )?;
 
@@ -2898,6 +2944,7 @@ impl<'a> ProcessTable<'a> {
                     code: None,
                     signal: None,
                     reason: Some(reason.to_string()),
+                    breach: None,
                 }),
                 now_ms,
             )?);
@@ -2958,6 +3005,7 @@ impl<'a> ProcessTable<'a> {
                     code: None,
                     signal: None,
                     reason: Some(reason.to_string()),
+                    breach: None,
                 }),
                 now_ms,
             )?);
@@ -3415,7 +3463,9 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
-     signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens \
+     signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens, \
+     limit_kind, limit_configured, limit_observed, limit_backend, limit_level, \
+     limit_observed_at_ms \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -3544,6 +3594,20 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
                 code: row.get(14)?,
                 signal: row.get(15)?,
                 reason: row.get(16)?,
+                // Present only for a row a resource controller closed. Read as a
+                // group: the SQL constrains the five columns to arrive together,
+                // so a partial read here would mean the schema was bypassed.
+                breach: match row.get::<_, Option<String>>(27)? {
+                    Some(limit) => Some(crate::resource_control::LimitBreach {
+                        limit,
+                        configured: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u64,
+                        observed: row.get::<_, Option<i64>>(29)?.unwrap_or(0) as u64,
+                        backend: row.get::<_, Option<String>>(30)?.unwrap_or_default(),
+                        level: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
+                        observed_at_ms: row.get::<_, Option<i64>>(32)?.unwrap_or(0),
+                    }),
+                    None => None,
+                },
             }),
             Err(error) => return Ok(Err(error)),
         },
@@ -4663,6 +4727,7 @@ mod tests {
                         code: Some(3),
                         signal: Some("SIGTERM".to_string()),
                         reason: Some("because".to_string()),
+                        breach: None,
                     }),
                     T0 + 1,
                 )
@@ -5115,6 +5180,7 @@ mod tests {
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             });
         }
         table.reconcile(&projection, T0).unwrap().0
@@ -5233,6 +5299,7 @@ mod tests {
                     code: None,
                     signal: None,
                     reason: None,
+                    breach: None,
                 }),
                 T0 + 1,
             )

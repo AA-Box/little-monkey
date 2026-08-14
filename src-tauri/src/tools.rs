@@ -17,7 +17,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
-use crate::output_cap::{drain_capped, CappedStream};
+use crate::output_cap::CappedStream;
 use crate::workspace::display_relative_path;
 use crate::{
     artifact_commands, artifact_store::ArtifactStore, checkpoints, memory, native_skill_commands,
@@ -923,8 +923,17 @@ pub async fn tool_run_shell(
     // before the first byte arrives.
     let cap = stream_cap(full_output);
 
-    let mut child = crate::workspace_shell::spawn_foreground(&workspace_root, &cwd_path, &command)
-        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    // No caller override today: the shell tool exposes no limit argument, so the
+    // class defaults are what apply. Passing the empty record rather than
+    // skipping the parameter keeps one resolution path — a future per-call
+    // override lands here and cannot accidentally take a different one.
+    let mut child = crate::workspace_shell::spawn_foreground(
+        &workspace_root,
+        &cwd_path,
+        &command,
+        crate::process_table::ProcessLimits::default(),
+    )
+    .map_err(|e| format!("Failed to spawn shell: {}", e))?;
     // Captured before the capture future borrows the child. With
     // `process_group(0)` above, the child's own pid is also its group id.
     let child_pgid = child.id();
@@ -961,8 +970,23 @@ pub async fn tool_run_shell(
     });
 
     let outcome = tokio::select! {
-        result = capture_bounded(child.wait(), stdout_pipe, stderr_pipe, cap) => {
-            result.map_err(|e| format!("Failed to run command: {}", e))
+        result = child.wait_supervised(stdout_pipe, stderr_pipe, cap) => {
+            match result {
+                // A limit fired: the tree is already down, and the message names
+                // which limit with both numbers so a reader can tell a wrong
+                // budget from a wrong command.
+                Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+                    Err(breach.describe())
+                }
+                Ok(crate::resource_control::Supervised::Completed(captured, _)) => captured
+                    .map(|captured| ShellCapture {
+                        status: captured.status,
+                        stdout: captured.stdout,
+                        stderr: captured.stderr,
+                    })
+                    .map_err(|e| format!("Failed to run command: {}", e)),
+                Err(e) => Err(format!("Failed to run command: {}", e)),
+            }
         }
         _ = cancel.notified() => {
             Err("Command cancelled by the user".to_string())
@@ -1070,50 +1094,6 @@ struct ShellCapture {
     status: std::process::ExitStatus,
     stdout: CappedStream,
     stderr: CappedStream,
-}
-
-
-/// Waits for `child` while draining both of its pipes, holding each to `cap`.
-///
-/// This is the fix for the last unbounded buffer on the shell path.
-/// `wait_with_output` materialized *both* streams in full before any cap applied,
-/// so `sh -c 'cat /dev/urandom | base64'` had the whole 120-second timeout to grow
-/// the app's own heap — the returned string was capped, the heap behind it was
-/// not.
-///
-/// The three futures are joined rather than sequenced, and that is the part with a
-/// failure mode: reading stdout to EOF *before* touching stderr deadlocks a child
-/// with a chatty stderr as soon as the 64 KiB stderr pipe buffer fills, and
-/// waiting for exit before reading either deadlocks on the first full pipe.
-/// `try_join!` polls all three, which is the service `wait_with_output` performed
-/// and the reason it could not simply be dropped.
-///
-/// Cancellation safety is inherited rather than argued: the caller races this
-/// whole future in a `tokio::select!`, and dropping it drops the two pipe readers
-/// (closing the read ends) and stops the wait. The child itself is killed by the
-/// caller's process-group terminate, with `kill_on_drop` as the backstop — the
-/// same two mechanisms as before this change.
-async fn capture_bounded<W, O, E>(
-    wait: W,
-    stdout_pipe: O,
-    stderr_pipe: E,
-    cap: Option<usize>,
-) -> std::io::Result<ShellCapture>
-where
-    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
-    O: tokio::io::AsyncRead + Unpin,
-    E: tokio::io::AsyncRead + Unpin,
-{
-    let (status, stdout, stderr) = tokio::try_join!(
-        wait,
-        drain_capped(stdout_pipe, cap),
-        drain_capped(stderr_pipe, cap),
-    )?;
-    Ok(ShellCapture {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1655,60 +1635,6 @@ mod tests {
     ///
     /// A child that fills stderr while stdout is still open wedges any reader
     /// that drains one pipe to EOF before touching the other: the 64 KiB stderr
-    /// pipe buffer fills, the child blocks writing to it, and stdout never sees
-    /// EOF. Both streams here are far past that buffer, and both are past the
-    /// cap, so this also proves the bounded read still lets the child *finish*
-    /// rather than stopping early and hanging it.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap() {
-        use std::process::Stdio;
-
-        const CAP: usize = 4_096;
-
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            // ~200 KiB down each pipe, interleaved, so neither can be drained
-            // to completion before the other is read.
-            .arg(
-                "i=0; while [ $i -lt 200 ]; do \
-                   printf 'o%.0s' $(seq 1 1024); \
-                   printf 'e%.0s' $(seq 1 1024) >&2; \
-                   i=$((i+1)); \
-                 done; exit 3",
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the flooding child");
-
-        let stdout_pipe = child.stdout.take().expect("stdout pipe");
-        let stderr_pipe = child.stderr.take().expect("stderr pipe");
-
-        let captured = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, Some(CAP)),
-        )
-        .await
-        .expect("draining both pipes concurrently must not deadlock")
-        .expect("the child ran to completion");
-
-        assert_eq!(
-            captured.status.code(),
-            Some(3),
-            "the child's own exit code must survive a truncated capture"
-        );
-        assert!(captured.stdout.as_bytes().len() <= CAP);
-        assert!(captured.stderr.as_bytes().len() <= CAP);
-
-        let (stdout, stdout_truncated) = captured.stdout.into_string();
-        let (stderr, stderr_truncated) = captured.stderr.into_string();
-        assert!(stdout_truncated && stderr_truncated);
-        assert!(stdout.ends_with('o'), "the tail is what is kept");
-        assert!(stderr.ends_with('e'), "the tail is what is kept");
-    }
-
     /// The uncapped path still returns the whole document, because
     /// `securityAutofix.ts` `JSON.parse`s it and a truncated tail there reads as
     /// zero vulnerabilities.
@@ -1728,10 +1654,13 @@ mod tests {
         let stdout_pipe = child.stdout.take().expect("stdout pipe");
         let stderr_pipe = child.stderr.take().expect("stderr pipe");
 
-        let captured = super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, None)
-            .await
-            .expect("the child ran");
-        let (stdout, truncated) = captured.stdout.into_string();
+        let (_, stdout, _) = tokio::try_join!(
+            child.wait(),
+            crate::output_cap::drain_capped(stdout_pipe, None),
+            crate::output_cap::drain_capped(stderr_pipe, None),
+        )
+        .expect("the child ran");
+        let (stdout, truncated) = stdout.into_string();
         assert_eq!(stdout.len(), 100_000);
         assert!(!truncated);
     }

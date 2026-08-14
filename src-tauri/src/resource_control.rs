@@ -596,6 +596,102 @@ impl ResourceController {
     }
 }
 
+/// Wall-clock milliseconds, for stamping a breach.
+///
+/// A clock that will not read is not a reason to refuse to record a limit kill,
+/// so this degrades to zero rather than erroring: an unstamped breach still names
+/// the limit, the configured value and the measurement, which is what the record
+/// is for.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// How often the supervising loop measures.
+///
+/// # Why half a second, and what it costs
+///
+/// This is the granularity of every *supervised* bound, and it is a real
+/// limitation rather than a tuning preference: a workload can allocate several
+/// gigabytes inside one interval, so a supervised memory limit is "terminated
+/// shortly after exceeding" and not "cannot exceed". A kernel-held bound —
+/// cgroup `memory.max`, a job object's `JobMemoryLimit` — has no such window,
+/// which is exactly why those backends are preferred where a host offers them
+/// and why [`EnforcementLevel`] is reported rather than assumed.
+///
+/// Half a second rather than the daemon watchdog's thirty: that watchdog governs
+/// jobs measured in minutes, while an agent shell's whole lifetime is often under
+/// a second, and a bound first checked after thirty seconds would never fire for
+/// most of the processes this supervises. The cost is one process-table read per
+/// interval per supervised workload, which is a few milliseconds.
+pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The outcome of running work under a controller.
+#[derive(Debug)]
+pub enum Supervised<T> {
+    /// The work finished on its own terms. Carries the final sample so a caller
+    /// can record peak usage even when nothing was breached.
+    Completed(T, ResourceSample),
+    /// A limit fired. The owned tree has already been terminated.
+    Breached(LimitBreach, ResourceSample),
+}
+
+/// Run `work` while sampling the controller, terminating the whole owned tree
+/// the moment a limit is exceeded.
+///
+/// The termination happens *here*, before returning, rather than being left to
+/// the caller. A bound that fires and returns without tearing down the workload
+/// is the failure this codebase has already had twice: the browser action quota
+/// latched `cancelled` without killing Chromium, and a workflow past its wall
+/// budget was left claiming to be running. Both reported success while leaking
+/// the thing they existed to reclaim.
+///
+/// `work` is dropped on a breach, which for a `tokio` child with `kill_on_drop`
+/// reaps the direct child — but that is not what contains the tree, and it must
+/// not be mistaken for it. [`ResourceController::terminate_tree`] is what reaches
+/// the grandchild holding the memory.
+pub async fn run_under<F>(
+    controller: &mut ResourceController,
+    work: F,
+) -> io::Result<Supervised<F::Output>>
+where
+    F: std::future::Future,
+{
+    let mut work = std::pin::pin!(work);
+    let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
+    // The first tick of a tokio interval completes immediately, which is wanted:
+    // a workload already over its wall limit at attach should not get a free
+    // interval before anyone looks.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last = ResourceSample::default();
+    loop {
+        tokio::select! {
+            // Biased so a completed workload is never reported as breached on the
+            // same poll: a command that exits at its deadline finished, and
+            // relabelling that would make the limit look responsible for an
+            // outcome it did not cause.
+            biased;
+            output = &mut work => return Ok(Supervised::Completed(output, last)),
+            _ = ticker.tick() => {
+                let Some(sample) = controller.sample()? else {
+                    // The workload is gone but `work` has not resolved yet —
+                    // usually a pipe still draining. Keep waiting for it rather
+                    // than reporting a breach against a corpse.
+                    continue;
+                };
+                last = sample;
+                if let Some(breach) = controller.breach(&sample, now_ms()) {
+                    controller.terminate_tree()?;
+                    return Ok(Supervised::Breached(breach, sample));
+                }
+            }
+        }
+    }
+}
+
 /// What a supervisor can and cannot promise.
 ///
 /// Written out per resource rather than as one summary, because the four answers

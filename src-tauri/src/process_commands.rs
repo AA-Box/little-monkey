@@ -330,6 +330,7 @@ pub fn process_transition(
             code: args.exit_code,
             signal: args.exit_signal,
             reason: args.exit_reason,
+            breach: None,
         }),
         None => None,
     };
@@ -448,6 +449,7 @@ pub fn process_reconcile(
             code: None,
             signal: None,
             reason: args.exit_reason,
+            breach: None,
         }),
         None => None,
     };

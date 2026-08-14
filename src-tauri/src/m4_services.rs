@@ -1880,6 +1880,7 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         WorkflowRunStatus::Failed => (
@@ -1889,6 +1890,7 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         WorkflowRunStatus::Cancelled => (
@@ -1898,6 +1900,7 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         WorkflowRunStatus::NeedsReconciliation => (
@@ -1907,6 +1910,7 @@ fn workflow_run_projection(history: &WorkflowRunHistory) -> Option<ProcessProjec
                 code: None,
                 signal: None,
                 reason: Some("workflow run left effects that cannot be safely undone".to_string()),
+                breach: None,
             }),
         ),
     };
@@ -1942,6 +1946,7 @@ fn workflow_node_projection(
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         NodeRunStatus::Failed { class, message } => (
@@ -1951,6 +1956,7 @@ fn workflow_node_projection(
                 code: None,
                 signal: None,
                 reason: Some(format!("{class:?}: {message}")),
+                breach: None,
             }),
         ),
         NodeRunStatus::Skipped { reason } => (
@@ -1963,6 +1969,7 @@ fn workflow_node_projection(
                 code: None,
                 signal: None,
                 reason: Some(format!("skipped: {reason}")),
+                breach: None,
             }),
         ),
         NodeRunStatus::NeedsReconciliation { receipt } => (
@@ -1972,6 +1979,7 @@ fn workflow_node_projection(
                 code: None,
                 signal: None,
                 reason: Some(format!("{receipt:?}")),
+                breach: None,
             }),
         ),
         NodeRunStatus::Reused { source_run_id } => (
@@ -1981,6 +1989,7 @@ fn workflow_node_projection(
                 code: None,
                 signal: None,
                 reason: Some(format!("reused from run {source_run_id}")),
+                breach: None,
             }),
         ),
     };
@@ -2499,6 +2508,7 @@ impl WorkflowService {
                 code: None,
                 signal: None,
                 reason: Some(error.to_string()),
+                breach: None,
             },
         );
         if let Err(projection_error) = projector.project(&projection) {

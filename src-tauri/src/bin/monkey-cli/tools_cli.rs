@@ -337,6 +337,10 @@ pub async fn run_shell(
         // The same ceiling the desktop shell tool uses, and for the same reason:
         // this output goes straight into a model's context window.
         Some(little_monkey_lib::output_cap::MODEL_OUTPUT_CAP),
+        // No per-call override from the CLI either, so the shell class defaults
+        // are what apply — the same bounds the desktop tool runs under, which is
+        // the point of both clients sharing this entry point.
+        little_monkey_lib::process_table::ProcessLimits::default(),
     )
     .await
     .map_err(|error| {
