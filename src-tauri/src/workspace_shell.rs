@@ -1415,6 +1415,35 @@ mod tests {
     /// Seatbelt/Landlock and then pass for the wrong reason — the workload would
     /// exit instantly, no limit would fire, and the assertion would read as "the
     /// bound did not work".
+    /// Records which mechanism actually held a limit, and refuses an answer that
+    /// is neither.
+    ///
+    /// Without this, "green on Linux" cannot distinguish a cgroup from the
+    /// supervised fallback, and the cross-platform requirement is precisely that
+    /// a green build means *the primary mechanism worked or the production
+    /// fallback worked* — never that a test quietly did neither. The backend is
+    /// printed so the CI log answers which one, per platform, without anyone
+    /// having to reproduce the run.
+    #[cfg(unix)]
+    fn assert_enforced_by_a_real_backend(breach: &crate::resource_control::LimitBreach) {
+        assert!(
+            !breach.backend.is_empty(),
+            "a breach must name the mechanism that made it: {breach:?}"
+        );
+        assert!(
+            ["kernel", "supervised"].contains(&breach.level.as_str()),
+            "a limit fired on this process must be held by the kernel or by the supervisor, \
+             not sourced from an owner: {breach:?}"
+        );
+        // Deliberately `println!` rather than an assertion on a specific backend:
+        // which one is correct depends on the host, and pinning it here would
+        // fail a perfectly good machine that offers a weaker mechanism.
+        println!(
+            "[k4] {} enforced by {} ({})",
+            breach.limit, breach.backend, breach.level
+        );
+    }
+
     #[cfg(unix)]
     fn place_test_binary_in(workspace: &Path, name: &str) -> PathBuf {
         let placed = workspace.join(name);
@@ -1470,6 +1499,7 @@ mod tests {
             .breach
             .expect("512 MiB of touched pages must exceed a 192 MiB tree budget");
         assert_eq!(breach.limit, "max_memory_bytes");
+        assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 192 * 1024 * 1024);
         assert!(
             breach.observed > breach.configured,
@@ -1529,6 +1559,7 @@ mod tests {
             .breach
             .expect("forty concurrent children must exceed a twelve-process tree budget");
         assert_eq!(breach.limit, "max_child_processes");
+        assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 12);
         assert!(breach.observed > 12, "{breach:?}");
         assert!(
@@ -1570,6 +1601,7 @@ mod tests {
 
         let breach = output.breach.expect("a 30s command past a 1s wall budget");
         assert_eq!(breach.limit, "max_wall_ms");
+        assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 1_000);
         assert!(breach.observed >= 1_000, "{breach:?}");
         assert!(
