@@ -24,6 +24,8 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::app_paths;
+use crate::process_table::{ProcessKind, ProcessLimitKind, ProcessLimits};
+use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 use crate::AppState;
 
 /// Hard wall-clock ceiling for one hook execution — a hook is glue, not a
@@ -135,17 +137,57 @@ pub async fn hook_exec(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    // Its own process group, so the timeout kill below can end the hook's
-    // whole tree rather than orphaning grandchildren — mirrors
-    // `tools::tool_run_shell`'s spawn.
+    // Its own process group, so a limit can end the hook's whole tree rather than
+    // orphaning grandchildren. Set here as well as by the controller's supervised
+    // backend, exactly as `workspace_shell` does: a cgroup scope does not install
+    // one, and the group is what a later session's startup reclaim can reach.
     #[cfg(unix)]
     builder.process_group(0);
     crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut builder);
 
+    // The same resource controller every agent shell runs under. A hook is
+    // user-authored rather than model-authored, which is why it is never
+    // permission-prompted — but it is still an arbitrary command run on the
+    // agent's behalf, and the thing it usually starts (a formatter, a test run)
+    // is a grandchild of this shell. The controller supplies the tree primitive
+    // the timeout kill needs, and the memory and process ceilings the deadline
+    // never expressed.
+    let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
+        LimitLayer::new(
+            LimitSource::ClassDefault,
+            ProcessKind::ForegroundShell.default_limits(),
+        ),
+        LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_wall_ms: Some(u64::try_from(HOOK_TIMEOUT.as_millis()).unwrap_or(u64::MAX)),
+                max_output_bytes: Some(u64::try_from(HOOK_OUTPUT_CAP).unwrap_or(u64::MAX)),
+                ..ProcessLimits::default()
+            },
+        ),
+    ]));
+    // Before the spawn: the containment has to exist before the hook's first
+    // instruction, not be applied to a process already running.
+    controller
+        .prepare_tokio(&mut builder)
+        .map_err(|error| format!("Failed to bound hook: {error}"))?;
+
     let mut child = builder
         .spawn()
         .map_err(|error| format!("Failed to spawn hook: {}", error))?;
-    let child_pgid = child.id();
+
+    // Fail closed: a hook that is running and cannot be shown to be inside its
+    // containment is reclaimed rather than reported as bounded. One that simply
+    // finished first is not a containment failure.
+    if let Some(pid) = child.id() {
+        match controller.attach(pid) {
+            Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+            Err(crate::resource_control::AttachFailure::Containment(error)) => {
+                let _ = controller.terminate_tree();
+                return Err(format!("Failed to bound hook: {error}"));
+            }
+        }
+    }
 
     // Payload first, then the pipe is CLOSED (dropped) — a hook that reads
     // stdin to EOF must not hang waiting for more.
@@ -174,22 +216,38 @@ pub async fn hook_exec(
         Ok::<_, std::io::Error>((status, stdout, stderr))
     };
 
-    tokio::select! {
-        result = capture => {
-            let (status, stdout, stderr) = result.map_err(|error| format!("Failed to run hook: {}", error))?;
-            Ok(HookExecOutcome { exit_code: status.code(), stdout, stderr, timed_out: false })
+    // The deadline is a wall limit now rather than a `sleep` racing the capture,
+    // so it is reclaimed by the same code that reclaims a hook that runs out of
+    // memory — and the tree, not just the shell, whichever bound fired.
+    match crate::resource_control::run_under(&mut controller, capture).await {
+        Ok(crate::resource_control::Supervised::Completed(result, _)) => {
+            let (status, stdout, stderr) =
+                result.map_err(|error| format!("Failed to run hook: {}", error))?;
+            Ok(HookExecOutcome {
+                exit_code: status.code(),
+                stdout,
+                stderr,
+                timed_out: false,
+            })
         }
-        _ = tokio::time::sleep(HOOK_TIMEOUT) => {
-            // End the whole tree, not just the shell (`kill_on_drop` reaps the
-            // direct child as the backstop) — same lesson as tool_run_shell's
-            // timeout path.
-            if let Some(pgid) = child_pgid {
-                if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                    eprintln!("hook_exec: could not terminate process group {pgid}: {error}");
-                }
-            }
-            Ok(HookExecOutcome { exit_code: None, stdout: String::new(), stderr: String::new(), timed_out: true })
+        Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+            // A wall breach *is* the deadline this hook was given, so it keeps
+            // reporting as one. Any other limit says which, with both numbers and
+            // the mechanism that held it — a hook that was stopped for holding
+            // 9 GiB and one that ran long are different things to fix.
+            let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+            Ok(HookExecOutcome {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: if timed_out {
+                    String::new()
+                } else {
+                    breach.describe()
+                },
+                timed_out,
+            })
         }
+        Err(error) => Err(format!("Failed to run hook: {}", error)),
     }
 }
 

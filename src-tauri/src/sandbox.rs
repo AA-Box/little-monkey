@@ -54,7 +54,9 @@ use std::io::{Read, Seek, SeekFrom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::process_table::{ProcessKind, ProcessLimitKind, ProcessLimits};
 use crate::profiles::ProfileScopedPaths;
+use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 use crate::run_protocol::{
     ArtifactKind, CapabilityAssessment, CapabilityState, CheckpointKind, ClientIdentity,
     ModelCapabilitiesSnapshot, ModelTargetSnapshot, MutationKind, PermissionMode,
@@ -1377,6 +1379,15 @@ fn build_seatbelt_profile_inner(
     )
 }
 
+/// What one sandboxed run retains of each stream.
+///
+/// The same number the shell tool and the verify runner keep, and for the same
+/// reason: this output is read by a person and by a model, and neither can use a
+/// gigabyte of it. The child is never stopped for producing more — both pipes go
+/// on being drained past the cap — so a chatty run completes normally with the
+/// tail it produced.
+const SANDBOX_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
+
 pub struct SandboxExecOutcome {
     pub isolation: Isolation,
     pub exit_code: Option<i32>,
@@ -1599,6 +1610,34 @@ pub async fn execute_in_sandbox(
         // enforcement the OS applies to the child at all. Inherited across the
         // `sandbox-exec` exec, so it reaches the sandboxed program itself.
         crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+        // The same resource controller every agent shell runs under. A sandboxed
+        // run is confined in *space* — it cannot read the real workspace or reach
+        // the network — and until now it was bounded in time by a `timeout` and in
+        // nothing else: a command inside the sandbox could still take the whole
+        // machine's memory, and the process group was the only thing that would
+        // end its descendants. The class defaults supply the tree's memory and
+        // process ceilings and the deadline becomes a wall limit.
+        //
+        // Registered after `os_limits` and before Landlock, on the same ordering
+        // rule the block below states: `pre_exec` closures run in registration
+        // order, and the cgroup migration writes through a descriptor opened
+        // before the fork, so it must be queued before anything starts denying
+        // opens.
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
+            LimitLayer::new(
+                LimitSource::ClassDefault,
+                ProcessKind::ForegroundShell.default_limits(),
+            ),
+            LimitLayer::new(
+                LimitSource::UserOverride,
+                ProcessLimits {
+                    max_wall_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                    max_output_bytes: Some(u64::try_from(SANDBOX_OUTPUT_CAP).unwrap_or(u64::MAX)),
+                    ..ProcessLimits::default()
+                },
+            ),
+        ]));
+        controller.prepare_tokio(&mut command)?;
         // Linux's boundary is installed the same way, and *after* `os_limits` on
         // purpose: `pre_exec` closures run in registration order, so the `setrlimit`
         // bounds are already in place before anything starts denying syscalls.
@@ -1628,40 +1667,85 @@ pub async fn execute_in_sandbox(
         };
 
         // Windows never reaches here — it returned above, from its own
-        // `CreateProcessW` path.
-        let child = command.spawn()?;
+        // `CreateProcessW` path, where the job object is the containment.
+        let mut child = command.spawn()?;
 
-        // Captured before `wait_with_output` consumes the child; with
-        // `process_group(0)` the child's own pid is also its group id.
-        let child_pgid = child.id();
-        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if result.is_err() {
-            if let Some(pgid) = child_pgid {
-                if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                    eprintln!("sandbox: could not terminate process group {pgid}: {error}");
+        // Fail closed, on the same terms as every other controlled spawn: a run
+        // that is still going and cannot be shown to be inside its containment is
+        // reclaimed rather than reported as bounded. One that finished first is
+        // not a containment failure.
+        if let Some(pid) = child.id() {
+            match controller.attach(pid) {
+                Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+                Err(crate::resource_control::AttachFailure::Containment(error)) => {
+                    let _ = controller.terminate_tree();
+                    return Err(io::Error::other(format!(
+                        "sandboxed command could not be bounded: {error}"
+                    )));
                 }
             }
         }
 
-        match result {
-            Ok(Ok(output)) => Ok(SandboxExecOutcome {
-                isolation,
-                exit_code: output.status.code(),
-                timed_out: false,
-                stdout: output.stdout,
-                stderr: output.stderr,
-                duration_ms,
-            }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(SandboxExecOutcome {
-                isolation,
-                exit_code: None,
-                timed_out: true,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms,
-            }),
+        // Bounded as the bytes arrive rather than collected whole and trimmed
+        // afterwards. `wait_with_output` retains both streams in full before
+        // returning any of them, so a sandboxed command that printed a gigabyte
+        // took a gigabyte of this app's heap — and the caller has no cap of its
+        // own to save it. The two drains run concurrently with the wait for the
+        // older reason: a child that fills a 64 KiB pipe while nothing reads it
+        // blocks forever.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let capture = async {
+            let (status, stdout, stderr) = tokio::try_join!(
+                child.wait(),
+                crate::output_cap::drain_capped(
+                    stdout_pipe.expect("stdout was piped at spawn"),
+                    Some(SANDBOX_OUTPUT_CAP)
+                ),
+                crate::output_cap::drain_capped(
+                    stderr_pipe.expect("stderr was piped at spawn"),
+                    Some(SANDBOX_OUTPUT_CAP)
+                ),
+            )?;
+            Ok::<_, io::Error>((status, stdout, stderr))
+        };
+
+        let supervised = crate::resource_control::run_under(&mut controller, capture).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        match supervised? {
+            crate::resource_control::Supervised::Completed(result, _) => {
+                let (status, stdout, stderr) = result?;
+                Ok(SandboxExecOutcome {
+                    isolation,
+                    exit_code: status.code(),
+                    timed_out: false,
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                    duration_ms,
+                })
+            }
+            // The deadline is a wall limit now rather than a `timeout` racing the
+            // wait, so it reclaims the tree through the same call as a memory or
+            // process-count kill. `timed_out` keeps naming the wall case, which is
+            // the only one this outcome type has ever been able to express; the
+            // rest surface as a failed run with the breach on stderr, which beats
+            // an unexplained missing exit code.
+            crate::resource_control::Supervised::Breached(breach, _) => {
+                let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+                Ok(SandboxExecOutcome {
+                    isolation,
+                    exit_code: None,
+                    timed_out,
+                    stdout: Vec::new(),
+                    stderr: if timed_out {
+                        Vec::new()
+                    } else {
+                        breach.describe().into_bytes()
+                    },
+                    duration_ms,
+                })
+            }
         }
     }
 }

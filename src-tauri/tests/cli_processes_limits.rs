@@ -26,10 +26,22 @@ use std::process::Command;
 
 /// A HOME/profile root of this test's own.
 ///
-/// `app_data_dir()` follows the platform's data directory, which follows `HOME`
-/// (and `LOCALAPPDATA` on Windows). Left alone, a test run would resolve the
-/// developer's real ledger directory — harmless for this read-only command, and
-/// exactly the habit that makes some later test destructive.
+/// `app_data_dir()` follows the platform's data directory, which follows `HOME`.
+/// Left alone, a test run would resolve the developer's real ledger directory —
+/// harmless for this read-only command, and exactly the habit that makes some
+/// later test destructive.
+///
+/// # Windows needs the profile to exist, not just to be named
+///
+/// `dirs::data_dir()` there is `SHGetKnownFolderPath(FOLDERID_RoamingAppData)`,
+/// and the shell resolves that folder from a registry value of the literal form
+/// `%USERPROFILE%\AppData\Roaming`, expanded against **this process's**
+/// environment. Pointing `USERPROFILE` at an empty temp directory therefore names
+/// a folder that does not exist, and the call fails rather than inventing one —
+/// so the CLI exited with "could not resolve the app data directory" and the
+/// Windows leg of this test failed for a reason that had nothing to do with what
+/// it was checking. The directories are created here so the isolation stays real
+/// and the command still has somewhere to resolve.
 fn isolated_home() -> PathBuf {
     let root = std::env::temp_dir().join(format!(
         "little-monkey-cli-limits-{}-{}",
@@ -40,6 +52,10 @@ fn isolated_home() -> PathBuf {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&root).expect("a temp home");
+    #[cfg(windows)]
+    for leaf in ["AppData/Roaming", "AppData/Local"] {
+        std::fs::create_dir_all(root.join(leaf)).expect("a temp profile");
+    }
     root
 }
 
@@ -49,8 +65,17 @@ fn run_limits(extra: &[&str]) -> std::process::Output {
     command.arg("processes").arg("limits").args(extra);
     command.env("HOME", &home);
     command.env("USERPROFILE", &home);
-    command.env("LOCALAPPDATA", &home);
+    command.env("APPDATA", home.join("AppData/Roaming"));
+    command.env("LOCALAPPDATA", home.join("AppData/Local"));
     command.env("XDG_DATA_HOME", home.join("data"));
+    // The authored home is resolved from `FOLDERID_Profile` on Windows, which is
+    // the registry's real profile path and not the variable above — so without
+    // this the test would still create `.littlemonkey` in the developer's actual
+    // home directory while believing it was isolated.
+    command.env(
+        little_monkey_lib::app_paths::AGENT_HOME_ENV,
+        home.join("agent-home"),
+    );
     let output = command.output().expect("the CLI binary runs");
     let _ = std::fs::remove_dir_all(&home);
     output

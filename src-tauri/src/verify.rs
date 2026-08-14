@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+use crate::process_table::{ProcessKind, ProcessLimitKind, ProcessLimits};
 use crate::profiles::ProfileScopedPaths;
+use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 use crate::{workspace, AppState};
 
 const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
@@ -230,7 +232,10 @@ pub async fn run_command_impl(
         .kill_on_drop(true);
     // Its own process group, so a timeout can end the whole tree rather than the
     // shell alone — `kill_on_drop` reaps one pid, which for `sh -c "npm test"`
-    // leaves the test runner alive. Mirrors `tools.rs`'s own spawn.
+    // leaves the test runner alive. Set here as well as by the controller's
+    // supervised backend, exactly as `workspace_shell` does: a cgroup scope does
+    // not install one, and the group is what a later session's startup reclaim
+    // can still reach.
     #[cfg(unix)]
     command_builder.process_group(0);
     // Kernel-held bounds that outlive this app's supervision — see `os_limits`
@@ -248,21 +253,61 @@ pub async fn run_command_impl(
             .max(1),
     );
 
+    // The same resource controller every agent shell runs under, for the same
+    // reason: a verify command is a build or a test runner, so the process that
+    // holds the machine is a *grandchild* of this `sh -c` and the deadline above
+    // is the only bound this path used to have. The class defaults supply the
+    // tree's memory and process ceilings; the command's own timeout is the wall
+    // bound, stated as a limit rather than as a `sleep` racing the wait, so a
+    // verify command that runs out of time is reclaimed by the same code that
+    // reclaims one that runs out of memory.
+    let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
+        LimitLayer::new(
+            LimitSource::ClassDefault,
+            ProcessKind::ForegroundShell.default_limits(),
+        ),
+        LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_wall_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                max_output_bytes: Some(u64::try_from(VERIFY_OUTPUT_CAP).unwrap_or(u64::MAX)),
+                ..ProcessLimits::default()
+            },
+        ),
+    ]));
+    let failed_to_start = |message: String| VerifyResult {
+        command_id: cmd.id.clone(),
+        label: cmd.label.clone(),
+        kind: cmd.kind.clone(),
+        code: None,
+        stdout: String::new(),
+        stderr: message,
+        duration_ms: started.elapsed().as_millis() as u64,
+        timed_out: false,
+    };
+    // Before the spawn, so the containment exists before the command's first
+    // instruction rather than being applied to a process already running.
+    if let Err(error) = controller.prepare_tokio(&mut command_builder) {
+        return failed_to_start(format!("Failed to bound command: {error}"));
+    }
+
     let mut child = match command_builder.spawn() {
         Ok(child) => child,
-        Err(e) => {
-            return VerifyResult {
-                command_id: cmd.id.clone(),
-                label: cmd.label.clone(),
-                kind: cmd.kind.clone(),
-                code: None,
-                stdout: String::new(),
-                stderr: format!("Failed to spawn command: {}", e),
-                duration_ms: started.elapsed().as_millis() as u64,
-                timed_out: false,
-            };
-        }
+        Err(e) => return failed_to_start(format!("Failed to spawn command: {}", e)),
     };
+
+    // Fail closed: a command that is *running* and cannot be shown to be inside
+    // its containment is reclaimed rather than reported as bounded. A command
+    // that simply finished first is not a containment failure.
+    if let Some(pid) = child.id() {
+        match controller.attach(pid) {
+            Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+            Err(crate::resource_control::AttachFailure::Containment(error)) => {
+                let _ = controller.terminate_tree();
+                return failed_to_start(format!("Failed to bound command: {error}"));
+            }
+        }
+    }
 
     // Each turn gets its own cancellation channel so Stop in one pane never
     // kills a command the other pane's turn is still running — exact
@@ -274,10 +319,6 @@ pub async fn run_command_impl(
             .or_insert_with(|| Arc::new(Notify::new()))
             .clone()
     });
-
-    // Captured before the wait below; with `process_group(0)` above, the child's
-    // own pid is also its group id.
-    let child_pgid = child.id();
 
     // Bounded as the bytes arrive rather than trimmed after the child exits.
     // `wait_with_output` collected both pipes whole, so a verify command that
@@ -306,29 +347,51 @@ pub async fn run_command_impl(
         })
     };
 
-    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = match &cancel {
-        Some(cancel) => tokio::select! {
-            result = collect => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
-            _ = cancel.notified() => (Err("Command cancelled by the user".to_string()), false),
-            _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
-        },
-        // Lock poisoned — extremely unlikely, and cancellation simply isn't
-        // available for this run; the timeout still applies.
-        None => tokio::select! {
-            result = collect => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
-            _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
-        },
+    // The wall bound, the memory bound and the process-count bound are all held
+    // by the controller now, and a breach of any of them has already reclaimed
+    // the whole tree by the time this returns. What is left for the `select` is
+    // the user's Stop, which is a different fact from a limit and stays one.
+    let supervised = async {
+        match crate::resource_control::run_under(&mut controller, collect).await {
+            Ok(crate::resource_control::Supervised::Completed(result, _)) => (
+                result.map_err(|e| format!("Failed to run command: {}", e)),
+                false,
+            ),
+            Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+                // A wall breach *is* the timeout this command declared, so it
+                // keeps reporting as one. Any other limit is reported with both
+                // numbers and the mechanism that held it, because "the build
+                // failed" and "the build asked for 9 GiB" are different things
+                // for a reader to do something about.
+                let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+                let message = if timed_out {
+                    format!("Command timed out after {} seconds", timeout.as_secs())
+                } else {
+                    breach.describe()
+                };
+                (Err(message), timed_out)
+            }
+            Err(error) => (Err(format!("Failed to run command: {}", error)), false),
+        }
     };
 
-    // End the tree on a timeout or a cancel. A verify command is typically a
-    // build or a test runner, so the process that matters is almost always a
-    // grandchild of the `sh -c` this spawned — exactly the process `kill_on_drop`
-    // does not touch.
+    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = match &cancel {
+        Some(cancel) => tokio::select! {
+            result = supervised => result,
+            _ = cancel.notified() => (Err("Command cancelled by the user".to_string()), false),
+        },
+        // Lock poisoned — extremely unlikely, and cancellation simply isn't
+        // available for this run; every limit still applies.
+        None => supervised.await,
+    };
+
+    // A cancel is the one exit that leaves the tree standing: the limits all
+    // reclaim it themselves. A verify command is typically a build or a test
+    // runner, so the process that matters is almost always a grandchild of the
+    // `sh -c` this spawned — exactly the process `kill_on_drop` does not touch.
     if outcome.is_err() {
-        if let Some(pgid) = child_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                eprintln!("verify: could not terminate process group {pgid}: {error}");
-            }
+        if let Err(error) = controller.terminate_tree() {
+            eprintln!("verify: could not terminate the command's process tree: {error}");
         }
     }
 
@@ -613,6 +676,55 @@ mod tests {
         // The whole call returned near the 1s timeout, not the 30s sleep —
         // proof the child was actually killed rather than awaited out.
         assert!(started.elapsed() < Duration::from_secs(10));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A verify command's deadline ends the *tree*, not the shell it named.
+    ///
+    /// The property the resource controller brought to this path. A verify
+    /// command is a build or a test runner, so the process holding the machine is
+    /// a grandchild of the `sh -c` this spawns — and `kill_on_drop` reaps exactly
+    /// one pid. The backgrounded `sleep` is that grandchild: before the deadline
+    /// was a wall limit, it survived its own run by twenty-nine seconds.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_verify_deadline_ends_the_grandchild_and_not_only_the_shell() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_tree_timeout");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // The grandchild reports its own pid, because by the time the assertion
+        // runs the shell is gone and there is no tree left to walk down from.
+        let pid_file = cwd.join("grandchild.pid");
+        let mut cmd = command(
+            "c1",
+            &format!(
+                "sleep 30 & echo $! > {}; sleep 30",
+                pid_file.to_string_lossy()
+            ),
+        );
+        cmd.timeout_secs = Some(1);
+
+        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        assert!(result.timed_out);
+
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the command wrote its background pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Settle rather than assert on the kill's timing: a wall breach reclaims
+        // the tree before returning, and a loaded host still takes a moment.
+        for _ in 0..50 {
+            if !crate::os_signal::process_is_alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !crate::os_signal::process_is_alive(grandchild),
+            "the backgrounded grandchild outlived the deadline that was supposed to end it"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

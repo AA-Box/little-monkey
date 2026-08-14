@@ -79,28 +79,22 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
     (
         "verify.rs",
         Class::AgentShell,
-        "verify commands come from the user's Settings rather than from a model, but they \
-         are executed on the agent's behalf and are unbounded except by their own timeout: \
-         this file builds its own `Command` and is NOT routed through the resource \
-         controller yet. Recorded rather than hidden — see the K4 roadmap entry",
+        "verify commands come from the user's Settings rather than from a model, and are \
+         executed on the agent's behalf after a turn writes files; the command's own \
+         timeout is its wall limit and the class defaults bound the tree",
     ),
     (
         "hooks.rs",
         Class::AgentShell,
-        "user-configured hook commands, run at agent lifecycle points. Same gap as \
-         `verify.rs`: bounded by a timeout, not by the resource controller",
+        "user-configured hook commands, run at agent lifecycle points; same controller and \
+         same class defaults as `verify.rs`, with the hook deadline as the wall limit",
     ),
     (
         "sandbox.rs",
         Class::AgentShell,
-        "the opt-in disposable-copy sandbox run; carries the same kernel confinement and \
-         `os_limits` baseline, and is not routed through the resource controller",
-    ),
-    (
-        "native_skills.rs",
-        Class::AgentShell,
-        "a skill's own executable, named by an installed skill manifest rather than by a \
-         model, and not routed through the resource controller",
+        "the opt-in disposable-copy run; the Seatbelt/Landlock boundary confines it in \
+         space and the controller bounds it in memory, process count and time. Windows \
+         reaches its own job object through `sandbox_windows::run_confined`",
     ),
     // --- The machinery itself ------------------------------------------------
     (
@@ -117,6 +111,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "process_table.rs",
         Class::ResourceInfrastructure,
         "spawns only in its own tests, to prove a lifecycle against a real child",
+    ),
+    (
+        "process_commands.rs",
+        Class::ResourceInfrastructure,
+        "the startup reclaim; spawns only in its own tests, to prove it never signals a pid \
+         whose identity it cannot check",
     ),
     (
         "sandbox_windows.rs",
@@ -231,6 +231,15 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "agent_worktrees.rs",
         Class::HostUtility,
         "`git worktree`, host-owned precisely so the model-authored shell never manages it",
+    ),
+    (
+        "native_skills.rs",
+        Class::HostUtility,
+        "`git clone`/`fetch` for installing a skill, with a hardened config this file \
+         composes: no system config, no hooks, HTTPS only, no credential prompt. It was \
+         classified as an agent shell on the reading that it runs a skill's own \
+         executable, and it does not — a skill's program is invoked through the shell \
+         tool like anything else, and `git` is the only process this file creates",
     ),
     (
         "system.rs",
@@ -479,30 +488,21 @@ fn every_agent_controlled_spawn_path_reaches_the_resource_infrastructure() {
         }
     }
 
-    // `verify.rs`, `hooks.rs`, `sandbox.rs` and `native_skills.rs` are the known
-    // exceptions, and they are listed here rather than excluded from the class:
-    // calling them host utilities would make this test pass by reclassifying the
-    // problem, which is the move K4's own history warns about. When one is
-    // routed, it drops out of this list and the assertion tightens by itself.
-    const KNOWN_UNROUTED: &[&str] = &["verify.rs", "hooks.rs", "sandbox.rs", "native_skills.rs"];
-    let unexpected: Vec<&&str> = unrouted
-        .iter()
-        .filter(|path| !KNOWN_UNROUTED.contains(path))
-        .collect();
+    // There is no exception list. There was one — `verify.rs`, `hooks.rs`,
+    // `sandbox.rs` and `native_skills.rs` — and it is worth recording what
+    // emptying it took, because three of the four were real and one was a
+    // misreading. The verify runner, the hook runner and the sandboxed run each
+    // had a deadline and nothing else: a `sleep` racing the capture, and a
+    // process-group kill if it won. Each now resolves the same `EffectiveLimits`,
+    // installs the same containment before the first instruction, fails closed if
+    // it cannot confirm it, and gets its deadline as a wall limit so one call
+    // reclaims the tree whichever bound fired. `native_skills.rs` was never an
+    // agent shell at all: its only child is `git`, and it is classified as the
+    // host utility it is.
     assert!(
-        unexpected.is_empty(),
+        unrouted.is_empty(),
         "these agent-controlled spawn paths do not reach the resource infrastructure: \
-         {unexpected:?}"
-    );
-
-    let fixed: Vec<&&str> = KNOWN_UNROUTED
-        .iter()
-        .filter(|path| !unrouted.contains(path))
-        .collect();
-    assert!(
-        fixed.is_empty(),
-        "these are now routed through the resource controller; remove them from \
-         KNOWN_UNROUTED so the exception cannot outlive the gap: {fixed:?}"
+         {unrouted:?}"
     );
 }
 
@@ -621,6 +621,9 @@ fn the_bounded_capture_paths_never_collect_a_whole_stream() {
         "background_shell.rs",
         "output_cap.rs",
         "tools.rs",
+        "verify.rs",
+        "hooks.rs",
+        "sandbox.rs",
     ];
     let root = source_root();
     let mut offenders = Vec::new();
