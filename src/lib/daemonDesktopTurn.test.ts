@@ -33,6 +33,7 @@ import {
   buildDaemonDesktopRecipe,
   daemonRouteFromStatus,
   historyForDaemonTarget,
+  isExecutionServiceUnavailable,
   loadActiveDaemonTurns,
   projectDaemonTurnEvents,
   removeActiveDaemonTurn,
@@ -206,10 +207,29 @@ describe("daemon desktop routing and event replay", () => {
     expect(daemonRouteFromStatus(healthy)).toBe("daemon");
     // A missing runner is a refusal, not a different place to execute. This is
     // the case that used to hand the turn back to the app process.
-    expect(() => daemonRouteFromStatus({ ...healthy, installed: false })).toThrow(/required for conversations/i);
+    expect(() => daemonRouteFromStatus({ ...healthy, installed: false })).toThrow(/isn't installed/i);
     expect(() => daemonRouteFromStatus({ ...healthy, serviceRunning: false })).toThrow(/not healthy/i);
     expect(() => daemonRouteFromStatus({ ...healthy, heartbeatFresh: false })).toThrow(/not healthy/i);
     expect(() => daemonRouteFromStatus({ ...healthy, killSwitch: true })).toThrow(/kill switch/i);
+  });
+
+  /** A missing or unhealthy service is the app's own runtime being broken, and
+   * the surfaces offer to fix it in place. A kill switch and backpressure are
+   * states somebody chose, so they must NOT come back repairable — reinstalling
+   * the service is the wrong answer to both. */
+  it("marks only the repairable faults as repairable", () => {
+    const thrown = (patch: Partial<typeof healthy>) => {
+      try {
+        daemonRouteFromStatus({ ...healthy, ...patch });
+      } catch (error) {
+        return error;
+      }
+      return null;
+    };
+    expect(isExecutionServiceUnavailable(thrown({ installed: false }))).toBe(true);
+    expect(isExecutionServiceUnavailable(thrown({ serviceRunning: false }))).toBe(true);
+    expect(isExecutionServiceUnavailable(thrown({ heartbeatFresh: false }))).toBe(true);
+    expect(isExecutionServiceUnavailable(thrown({ killSwitch: true }))).toBe(false);
   });
 
   it("refuses an interactive turn on closed backpressure and lets slow through", () => {

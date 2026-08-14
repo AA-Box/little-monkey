@@ -1003,6 +1003,23 @@ pub fn run() {
                 let _ = cli_install::install_if_needed();
             });
 
+            // Install, upgrade and start the resident execution service. Chat
+            // cannot run a single turn without it, so it is brought up as part
+            // of launching rather than left for the user to discover under
+            // Background Agents — that panel manages it, it does not gate it.
+            // Idempotent and best-effort: an already-healthy service is left
+            // alone, and a failure surfaces where it matters, as a Repair
+            // action on the chat surface that could not send.
+            //
+            // Release builds only. The published service definition names the
+            // executable that installed it, so a machine that runs both a
+            // packaged app and a dev build would have each launch decide the
+            // other's definition is stale and restart the daemon to claim it.
+            // A developer's own service is theirs to manage: the Repair action
+            // and Background Agents both still work from a dev build.
+            #[cfg(not(debug_assertions))]
+            daemon_commands::ensure_resident_service_at_startup(app.handle().clone());
+
             // Idempotently migrate the exact legacy JSON snapshot into the
             // transactional profile/index while preserving that file and its
             // first recovery copy. A corrupt source is left untouched and
@@ -1622,6 +1639,7 @@ pub fn run() {
             daemon_commands::daemon_desktop_status,
             daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,
+            daemon_commands::daemon_desktop_ensure,
             daemon_commands::daemon_desktop_start,
             daemon_commands::daemon_desktop_stop,
             daemon_commands::daemon_desktop_uninstall,
