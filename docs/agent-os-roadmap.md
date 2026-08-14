@@ -1485,11 +1485,14 @@ assertions in the test suite.
 
 **Two limits remain, and both are platform-fundamental rather than unfinished
 work.** macOS offers no kernel-owned process tree to an unprivileged process, so
-its bound is supervised and says so; and a browser session's Chromium is assigned
-to its Windows job immediately after creation rather than before it is resumed,
-because that spawn site has no pre-creation hook. Both are stated at the end of
-this section, reported truthfully by the capability API, and shown as such in the
-UI and the CLI. Neither is a resource left unbounded.
+its bound is supervised and says so; and on Windows the owners that do not call
+`CreateProcessW` themselves — a browser session's Chromium, the verify runner, the
+hook runner — are assigned to their job immediately after creation rather than
+before the process is resumed, because a job cannot be carried into a process by a
+`Command` and those spawn sites have no pre-creation hook. Agent shells and the
+sandbox run do call it themselves and get the stronger ordering. Both limits are
+stated at the end of this section, reported truthfully by the capability API, and
+shown as such in the UI and the CLI. Neither is a resource left unbounded.
 
 ### Shipped — one resource-control contract, and limits that fire
 
@@ -1666,6 +1669,49 @@ deleted, because what they say about *how the gap was found* is the useful part.
   else. The classification says so, and the note says what the old one got wrong,
   because a wrong reason on a correct-looking line is what an exception list is
   for.
+
+- **Two of those three then failed closed on Windows, which is how the fix was
+  found.** `prepare_tokio`/`prepare_std` are the strong ordering everywhere they
+  can be — the child joins its cgroup between `fork` and `exec` — and on Windows
+  they can install nothing at all, because a job object is applied *to* a process
+  and cannot be carried into one by a `Command`. They returned `Ok` regardless, so
+  the verify runner and the hook runner spawned a child in no job, `attach` read
+  the membership back, found none, and refused to run the command. Every one of
+  their tests failed on the Windows leg and passed everywhere else.
+
+  The refusal was the design working: a workload whose containment cannot be
+  proved does not run. What was missing was the containment. `attach` now makes
+  the assignment itself before reading it back, which fixes the two owners that
+  exist and the ones added later, and a regression test spawns through
+  `tokio::process` with no explicit `adopt` — the shape the existing job tests
+  did not have, which is exactly why they were green while production was not.
+  Windows shells and the sandbox run keep the strong ordering: they call
+  `CreateProcessW` themselves and assign the job while the process is suspended.
+
+  The sandbox run's Windows arm was also still building the fixed 4 GiB /
+  512-process job while every other host installed the class defaults intersected
+  with the run's deadline — the same button meaning two different bounds
+  depending on the machine. Both arms resolve one `EffectiveLimits` now.
+
+- **The mechanisms' crash semantics were described but not asserted.** Startup
+  reclaim is written against three different answers to "what survives this app
+  dying", and nothing tested any of them. They are opposite and both now pinned by
+  a test: a cgroup scope keeps `memory.max` after the process that wrote it is
+  gone, so the tree runs on bounded and unwatched — `mem::forget` on the
+  controller is the crash, because `Drop` is precisely what a `SIGKILL` does not
+  get to run — while a Windows job carries `KILL_ON_JOB_CLOSE` and the kernel
+  closes a dead process's handles, so the tree dies with the app and there is
+  nothing left to reclaim. Supervised is the third: the bound dies with the
+  supervisor, which is the case reclaim mostly exists for.
+
+- **V21 had no upgrade probe over a database the previous release wrote.** It is
+  the one process migration that rebuilds the table rather than adding to it, so
+  it is the one where a shipped user's process history can be dropped silently.
+  The probe winds a real database back to V20, reopens, and asserts the ladder
+  replays: the row survives value for value, `foreground_shell` becomes a legal
+  kind, the all-or-none breach `CHECK` is a constraint rather than merely absent,
+  and the legacy row reads back with *no* breach rather than one configured at
+  zero.
 
 ### The bug this slice existed to fix
 

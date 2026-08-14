@@ -374,7 +374,22 @@ fn source_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// Every `.rs` file under `root` that mentions `Command::new`, relative to `root`.
+/// How a file betrays that it creates a native process.
+///
+/// `Command::new` is how both `std::process` and `tokio::process` build one, so
+/// one marker covers the ordinary case however the type was imported or aliased.
+/// The three below it are the ways to make a process *without* that builder — the
+/// syscalls the confinement backends call directly — and they are listed because
+/// a new file that reached for one of them would otherwise be a spawn site this
+/// scan does not see, which is the exact failure the scan exists to prevent.
+const SPAWN_MARKERS: &[&str] = &[
+    "Command::new",
+    "CreateProcessW",
+    "posix_spawn",
+    "libc::fork",
+];
+
+/// Every `.rs` file under `root` that creates a native process, relative to `root`.
 fn files_that_spawn(root: &Path, skip_dir: Option<&str>) -> BTreeSet<String> {
     fn walk(dir: &Path, root: &Path, skip_dir: Option<&str>, found: &mut BTreeSet<String>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -395,7 +410,7 @@ fn files_that_spawn(root: &Path, skip_dir: Option<&str>) -> BTreeSet<String> {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if text.contains("Command::new") {
+            if SPAWN_MARKERS.iter().any(|marker| text.contains(marker)) {
                 found.insert(
                     path.strip_prefix(root)
                         .unwrap_or(&path)

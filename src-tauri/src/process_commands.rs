@@ -1066,13 +1066,24 @@ pub(crate) fn project_process_record<R: tauri::Runtime>(
 /// # What survives a crash, and what does not
 ///
 /// A shell's *bound* and a shell's *supervisor* have different lifetimes, and the
-/// distinction is the whole reason this exists. A cgroup scope's `memory.max`
-/// and `pids.max` keep holding after the app dies — the kernel does not care that
-/// the process which created them is gone — and a Windows job's limits die with
-/// the last handle, which the crash closed. A supervised bound dies with the
-/// supervisor on every platform. So after a restart there may be a tree that is
-/// still running, may or may not still be bounded, and has nothing watching it.
-/// None of those is a state to leave a machine in.
+/// distinction is the whole reason this exists. Each platform answers it
+/// differently, and only one of the three leaves anything here to do:
+///
+/// - **Linux.** A cgroup scope's `memory.max` and `pids.max` keep holding after
+///   the app dies; the kernel does not care that the process which wrote them is
+///   gone. The tree is still running and still bounded, and has nothing watching
+///   it.
+/// - **Windows.** The job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the
+///   kernel closes the handles a dead process held — so the tree died with the
+///   app and there is nothing to find. Both are asserted in
+///   `resource_control`'s own tests rather than assumed here.
+/// - **Supervised, on every platform.** The bound died with the supervisor. The
+///   tree is running under no limit at all, which is the case this most exists
+///   for.
+///
+/// So after a restart there may be a tree that is still running, may or may not
+/// still be bounded, and has nothing watching it. None of those is a state to
+/// leave a machine in.
 ///
 /// Reclaiming goes through the recorded identity, never through the pid alone:
 /// see [`crate::process_table::still_the_recorded_process`] for why a row that

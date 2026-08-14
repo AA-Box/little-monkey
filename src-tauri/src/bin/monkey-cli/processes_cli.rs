@@ -494,12 +494,6 @@ fn print_detail(record: &ProcessRecord) {
     }
 }
 
-fn option_or_dash<T: std::fmt::Display>(value: Option<T>) -> String {
-    value
-        .map(|inner| inner.to_string())
-        .unwrap_or_else(|| "-".to_string())
-}
-
 fn truncate(value: &str, width: usize) -> String {
     if value.chars().count() <= width {
         return value.to_string();

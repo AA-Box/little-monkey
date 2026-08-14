@@ -1836,6 +1836,156 @@ mod tests {
         child
     }
 
+    /// A cgroup bound outlives the supervisor that created it.
+    ///
+    /// The restart question, asked of the mechanism rather than of the process
+    /// table: after this app disappears, is a shell tree it left running still
+    /// bounded? On Linux the answer is yes and it is the reason startup reclaim
+    /// exists — the kernel does not care that the process which wrote `memory.max`
+    /// is gone, so the tree keeps its ceiling and loses only its supervisor.
+    ///
+    /// `mem::forget` is the crash: `CgroupScope::drop` terminates the tree and
+    /// removes the directory, which is what an *orderly* exit does and exactly
+    /// what a `SIGKILL` does not get to do. Skipped where no delegated hierarchy
+    /// exists, since there is then no kernel scope whose survival to ask about.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cgroup_scope_outlives_the_supervisor_that_created_it() {
+        const MEMORY: u64 = 512 * 1024 * 1024;
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(MEMORY),
+                max_child_processes: Some(16),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        if controller.capabilities().backend != "cgroup v2" {
+            return;
+        }
+
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        controller
+            .prepare_std(&mut command)
+            .expect("the scope joins before exec");
+        let mut child = command.spawn().expect("the workload spawns");
+        controller
+            .attach(child.id())
+            .expect("the scope contains it");
+
+        // The scope's own directory, read from the kernel's record of where the
+        // child actually is rather than from anything this process remembers.
+        let membership = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id()))
+            .expect("a running child has a cgroup line");
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("cgroup v2 puts the unified hierarchy on the 0:: line")
+            .trim()
+            .to_string();
+        let scope =
+            std::path::PathBuf::from("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        let installed =
+            std::fs::read_to_string(scope.join("memory.max")).expect("memory.max reads");
+        assert_eq!(
+            installed.trim(),
+            MEMORY.to_string(),
+            "the scope must hold the effective number, not the kernel's default"
+        );
+
+        // The supervisor disappears without unwinding.
+        std::mem::forget(controller);
+
+        let after = std::fs::read_to_string(scope.join("memory.max"))
+            .expect("the scope survives the process that made it");
+        assert_eq!(
+            after.trim(),
+            MEMORY.to_string(),
+            "a kernel-held bound is still held once nothing is watching it"
+        );
+        assert!(
+            crate::os_signal::process_is_alive(child.id()),
+            "the workload is still running; what it lost is its supervisor, not its ceiling"
+        );
+
+        // What startup reclaim would do, done by hand because this test is the
+        // session that crashed.
+        let _ = child.kill();
+        let _ = child.wait();
+        for _ in 0..50 {
+            if std::fs::remove_dir(&scope).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A Windows job takes its tree with it when the last handle closes.
+    ///
+    /// The other half of the restart question, and the opposite answer to
+    /// Linux's: `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means an app that dies —
+    /// crash included, because the kernel closes handles a dead process held —
+    /// leaves no unmanaged descendants behind at all. There is nothing for a later
+    /// session to reclaim, which is a stronger property than "the bound is gone"
+    /// and is why it is asserted rather than assumed.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_takes_its_tree_with_it_when_the_supervisor_goes() {
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(512 * 1024 * 1024),
+                max_child_processes: Some(8),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        assert_eq!(
+            controller.capabilities().backend,
+            "windows job object",
+            "every Windows host can create a job; a fallback here is a real failure"
+        );
+        // Twenty seconds of doing nothing, so anything that ends it inside the
+        // wait below is the job closing rather than the workload finishing.
+        let mut child = windows_child_under(
+            &mut controller,
+            "windows_idle_child",
+            "LITTLE_MONKEY_WINDOWS_IDLE_MS",
+            "20000",
+        );
+        let pid = child.id();
+        assert!(
+            crate::os_signal::process_is_alive(pid),
+            "the workload has to be running before the handle closes, or this proves nothing"
+        );
+
+        drop(controller);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ended = loop {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            ended,
+            "closing the last job handle must end the tree; a survivor here is a descendant no \
+             later session could find"
+        );
+    }
+
     /// An owner that only prepares, spawns and attaches gets a contained child.
     ///
     /// The regression this pins is Windows-shaped and was invisible everywhere
