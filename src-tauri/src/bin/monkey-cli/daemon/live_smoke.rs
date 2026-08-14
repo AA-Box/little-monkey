@@ -13,9 +13,9 @@
 //! cargo test --bin monkey-cli -- daemon::live_smoke --nocapture
 //! ```
 //!
-//! Two levels exist:
+//! Two levels exist, and neither is the architecture proof:
 //!
-//! - **Level A (automated outbound smoke).** With a token set, the test
+//! - **Level A (outbound transport smoke).** With a token set, the test
 //!   probes (a read-only identity call). With the matching destination
 //!   variable also set, it queues one message through the same
 //!   `plan_send`/`queue_send` seam the `send_message` tool uses and drains it
@@ -23,12 +23,21 @@
 //!   reply takes — asserting the provider returned a message id. Nothing
 //!   calls the adapter send primitive directly, and nothing reconstructs an
 //!   outbox row by hand.
-//! - **Level B (interactive full roundtrip).** Additionally gated on
-//!   `LM_TEST_INTERACTIVE=1` because it needs a human: the test starts the
-//!   real account worker path, prints a nonce, waits for the operator to send
-//!   it through the provider, and then proves the entire chain — durable
-//!   inbound event, run submission, durable reply, outbox drain, provider
-//!   message id — with a clear timeout.
+//! - **Level B (inbound transport and durable-ingress smoke).** Additionally
+//!   gated on `LM_TEST_INTERACTIVE=1` because it needs a human: the test
+//!   prints a nonce, waits for the operator to send it through the provider,
+//!   and proves the inbound half against a real account — durable inbound
+//!   event, durable turn, run submission — then queues a controlled reply
+//!   through the production reply seam and drains it.
+//!
+//! What Level B deliberately does **not** prove is the agent boundary: its
+//! run queue records the submission rather than executing it, and the reply
+//! it drains is the test's, not a model's. That proof lives in
+//! `channel_agent_e2e`, which crosses the real `DaemonChannelQueue`, a real
+//! daemon child and the real agent loop against protocol fixtures. These two
+//! answer different questions — whether a real provider account behaves as
+//! the adapter expects, and whether the architecture holds end to end — and
+//! neither substitutes for the other.
 //!
 //! The tests fail closed: no destination, no message, ever. No credential is
 //! bundled, defaulted, or read from any file; the environment is the single
@@ -155,17 +164,20 @@ async fn outbox_smoke(kind: ChannelKind, adapter: Arc<dyn ChannelAdapter>, desti
     );
 }
 
-/// Level B: the interactive full roundtrip. Prints a nonce, waits for the
-/// operator to send it through the real provider, then proves the whole
-/// chain: durable inbound event → run submission → durable reply → outbox
-/// drain → provider message id. Times out loudly rather than hanging.
-async fn interactive_roundtrip(kind: ChannelKind, adapter: Arc<dyn ChannelAdapter>) {
+/// Level B: the interactive inbound smoke. Prints a nonce, waits for the
+/// operator to send it through the real provider, then proves the inbound
+/// half against a live account: durable inbound event → durable turn → run
+/// submission. The reply it then drains is queued by this test through the
+/// production reply seam, not produced by an agent — the run queue here
+/// records submissions rather than executing them. Times out loudly rather
+/// than hanging.
+async fn interactive_inbound_smoke(kind: ChannelKind, adapter: Arc<dyn ChannelAdapter>) {
     const WAIT: std::time::Duration = std::time::Duration::from_secs(180);
     let mut store = seeded_store(ACCOUNT_ID, kind);
     let queue = RecordingQueue::default();
     let nonce = format!("lm-e2e-{}-{}", std::process::id(), now_ms());
     eprintln!("==============================================================");
-    eprintln!("{} interactive roundtrip:", kind.as_str());
+    eprintln!("{} interactive inbound smoke:", kind.as_str());
     eprintln!("  Send a message containing exactly this nonce to the bot now:");
     eprintln!("      {nonce}");
     eprintln!("  Waiting up to {}s ...", WAIT.as_secs());
@@ -175,7 +187,7 @@ async fn interactive_roundtrip(kind: ChannelKind, adapter: Arc<dyn ChannelAdapte
     let job_id = loop {
         if std::time::Instant::now() > deadline {
             panic!(
-                "{} interactive roundtrip timed out: no message containing '{nonce}' arrived",
+                "{} interactive inbound smoke timed out: no message containing '{nonce}' arrived",
                 kind.as_str()
             );
         }
@@ -220,8 +232,10 @@ async fn interactive_roundtrip(kind: ChannelKind, adapter: Arc<dyn ChannelAdapte
         "the run recorded on the event was never submitted to the queue"
     );
 
-    // The controlled "run result": a reply queued through the same production
-    // reply seam the send_message tool uses, then drained by the real adapter.
+    // A controlled stand-in for the run's result: a reply queued through the
+    // same production reply seam the send_message tool uses, then drained by
+    // the real adapter. The agent did not produce it, and this test does not
+    // claim it did — see the module doc.
     queue_reply_for_job(
         &mut store,
         &job_id,
@@ -243,7 +257,7 @@ async fn interactive_roundtrip(kind: ChannelKind, adapter: Arc<dyn ChannelAdapte
         .provider_event_id;
     assert!(!provider_id.starts_with("local:"), "no provider message id");
     eprintln!(
-        "{} interactive roundtrip complete: reply delivered, provider id {provider_id}",
+        "{} interactive inbound smoke complete: reply delivered, provider id {provider_id}",
         kind.as_str()
     );
 }
@@ -291,16 +305,16 @@ async fn telegram_live_outbox_smoke() {
 }
 
 #[tokio::test]
-async fn telegram_interactive_full_roundtrip() {
+async fn telegram_interactive_inbound_smoke() {
     if !interactive_enabled() {
-        eprintln!("telegram interactive roundtrip: skipped (LM_TEST_INTERACTIVE != 1)");
+        eprintln!("telegram interactive inbound smoke: skipped (LM_TEST_INTERACTIVE != 1)");
         return;
     }
     let Some(adapter) = telegram_adapter() else {
-        eprintln!("telegram interactive roundtrip: skipped (no token)");
+        eprintln!("telegram interactive inbound smoke: skipped (no token)");
         return;
     };
-    interactive_roundtrip(ChannelKind::Telegram, adapter).await;
+    interactive_inbound_smoke(ChannelKind::Telegram, adapter).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,16 +360,16 @@ async fn discord_live_outbox_smoke() {
 }
 
 #[tokio::test]
-async fn discord_interactive_full_roundtrip() {
+async fn discord_interactive_inbound_smoke() {
     if !interactive_enabled() {
-        eprintln!("discord interactive roundtrip: skipped (LM_TEST_INTERACTIVE != 1)");
+        eprintln!("discord interactive inbound smoke: skipped (LM_TEST_INTERACTIVE != 1)");
         return;
     }
     let Some(adapter) = discord_adapter() else {
-        eprintln!("discord interactive roundtrip: skipped (no token)");
+        eprintln!("discord interactive inbound smoke: skipped (no token)");
         return;
     };
-    interactive_roundtrip(ChannelKind::Discord, adapter).await;
+    interactive_inbound_smoke(ChannelKind::Discord, adapter).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,14 +420,14 @@ async fn slack_live_outbox_smoke() {
 }
 
 #[tokio::test]
-async fn slack_interactive_full_roundtrip() {
+async fn slack_interactive_inbound_smoke() {
     if !interactive_enabled() {
-        eprintln!("slack interactive roundtrip: skipped (LM_TEST_INTERACTIVE != 1)");
+        eprintln!("slack interactive inbound smoke: skipped (LM_TEST_INTERACTIVE != 1)");
         return;
     }
     let Some(adapter) = slack_adapter() else {
-        eprintln!("slack interactive roundtrip: skipped (no tokens)");
+        eprintln!("slack interactive inbound smoke: skipped (no tokens)");
         return;
     };
-    interactive_roundtrip(ChannelKind::Slack, adapter).await;
+    interactive_inbound_smoke(ChannelKind::Slack, adapter).await;
 }

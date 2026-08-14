@@ -39,7 +39,7 @@ const MAX_REPLY_CHARS: usize = 16_000;
 /// Environment variable the daemon sets on a task child so it knows which job
 /// it is. Absent for every other kind of run, which is exactly how this tool
 /// knows it has nothing to reply to.
-const JOB_ID_ENV: &str = "LITTLE_MONKEY_DAEMON_JOB_ID";
+pub(crate) const JOB_ID_ENV: &str = "LITTLE_MONKEY_DAEMON_JOB_ID";
 
 /// The origin of the current process's run, if it has one.
 pub(crate) fn current_channel_origin() -> Option<(String, ChannelOrigin)> {

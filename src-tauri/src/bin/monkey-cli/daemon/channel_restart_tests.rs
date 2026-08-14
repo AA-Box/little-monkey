@@ -115,13 +115,13 @@ fn account_record(account_id: &str, kind: ChannelKind) -> ChannelAccountRecord {
 /// On each accepted connection it immediately sends `greetings[i]`, then
 /// relays: every text frame the client sends is logged as `(connection, frame)`,
 /// and every frame pushed through `inject` goes to the *current* connection.
-struct WsFixture {
-    url: String,
-    received: Arc<StdMutex<Vec<(usize, Value)>>>,
-    inject: mpsc::UnboundedSender<String>,
+pub(crate) struct WsFixture {
+    pub(crate) url: String,
+    pub(crate) received: Arc<StdMutex<Vec<(usize, Value)>>>,
+    pub(crate) inject: mpsc::UnboundedSender<String>,
     /// Connections opened so far, so a test can prove the client did NOT come
     /// back after a close it should have treated as final.
-    connections: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A close code injected as a real WebSocket close frame. `inject` carries
@@ -129,18 +129,18 @@ struct WsFixture {
 const CLOSE_PREFIX: &str = "__close__:";
 
 impl WsFixture {
-    fn close_with(&self, code: u16) {
+    pub(crate) fn close_with(&self, code: u16) {
         self.inject
             .send(format!("{CLOSE_PREFIX}{code}"))
             .expect("inject close");
     }
 
-    fn connections(&self) -> usize {
+    pub(crate) fn connections(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
-fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
+pub(crate) fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ws fixture");
     listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("addr").port();
@@ -211,7 +211,7 @@ fn spawn_ws_fixture(greetings: Vec<Vec<String>>) -> WsFixture {
 }
 
 /// Wait until a logged frame satisfies `predicate`, or panic after `seconds`.
-async fn wait_for_frame(
+pub(crate) async fn wait_for_frame(
     received: &Arc<StdMutex<Vec<(usize, Value)>>>,
     seconds: u64,
     what: &str,
@@ -236,7 +236,7 @@ async fn wait_for_frame(
     }
 }
 
-fn frame_op(frame: &Value) -> i64 {
+pub(crate) fn frame_op(frame: &Value) -> i64 {
     frame.get("op").and_then(Value::as_i64).unwrap_or(-1)
 }
 

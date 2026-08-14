@@ -4,6 +4,8 @@ mod call_audio;
 pub(crate) mod call_media;
 pub(crate) mod call_socket;
 pub(crate) mod channel_adapter;
+#[cfg(test)]
+mod channel_agent_e2e;
 pub(crate) mod channel_ingress;
 #[cfg(test)]
 mod channel_restart_tests;
@@ -2017,13 +2019,32 @@ fn daemon_paths_match_profile(paths: &DaemonPaths, profile_root: &Path) -> bool 
     paths.root == profile_root.join("daemon")
 }
 
+/// The binary a daemon child is launched from: this one.
+///
+/// Every child the daemon starts is another `monkey-cli` invocation, so the
+/// running executable is the answer — there is nothing to look up and nothing
+/// an environment can redirect.
+///
+/// Under `cargo test` the running executable is a test harness rather than the
+/// CLI, so the end-to-end test that needs a real daemon child resolves the
+/// binary cargo built beside it. That branch does not exist in a release
+/// build; production always launches itself.
+pub(crate) fn monkey_executable() -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve monkey executable: {error}"))?;
+    #[cfg(test)]
+    if let Some(built) = channel_agent_e2e::cli_beside_test_binary(&current) {
+        return Ok(built);
+    }
+    Ok(current)
+}
+
 fn submit_queued_snapshot(
     snapshot: &Path,
     job_id: &str,
     repository_policy_json: Option<&str>,
 ) -> Result<String, String> {
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve monkey executable: {error}"))?;
+    let executable = monkey_executable()?;
     let mut command = Command::new(executable);
     command
         .arg("--no-rules")
