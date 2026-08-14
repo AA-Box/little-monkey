@@ -180,14 +180,32 @@ pub fn measure_tree_in(nodes: &[ProcessNode], root_pid: u32) -> Option<TreeUsage
 ///
 /// `None` for an empty set, on the same reasoning as [`measure_tree_in`]: zero
 /// processes holding zero bytes is a budget satisfied forever.
+///
+/// # A corpse is not a member
+///
+/// A member that has exited and not yet been collected holds no memory, runs no
+/// code and cannot fork, so it is skipped — and a set containing nothing else
+/// measures as `None`, meaning *the workload is gone*. Without that, the answer
+/// depended on which platform was asking: macOS's `proc_pidinfo` refuses a
+/// zombie outright, so it never appeared in a snapshot there, while a Linux
+/// zombie keeps its `/proc` entry until its parent reaps it and a Windows one
+/// keeps its whole process object until the last handle closes. The reaper is
+/// somebody else — `tokio`'s orphan queue, `init` — and it is not synchronous
+/// with the kill, so "the tree is reclaimed" was true on one platform and a race
+/// on the other two.
 #[must_use]
 pub fn measure_members(members: &BTreeSet<u32>) -> Option<TreeUsage> {
+    let members: BTreeSet<u32> = members
+        .iter()
+        .copied()
+        .filter(|pid| is_executing(*pid))
+        .collect();
     if members.is_empty() {
         return None;
     }
     let mut rss_bytes: Option<u64> = None;
     let mut unmeasured_members = 0u32;
-    for pid in members {
+    for pid in &members {
         match resident_bytes(*pid) {
             Some(bytes) => rss_bytes = Some(rss_bytes.unwrap_or(0).saturating_add(bytes)),
             // A member that exited between the snapshot and this read is not an
@@ -319,6 +337,18 @@ pub fn child_exited_unreaped(_pid: u32) -> bool {
 
 // --- Zombie detection --------------------------------------------------------
 
+/// Whether `pid` is a process that is still *executing*.
+///
+/// [`ProcessIdentity::is_running`] without the identity, for the one caller that
+/// has a bare pid and no recorded start time to check it against. The two
+/// clauses cover the same case on different platforms and neither is redundant:
+/// Darwin stops answering `PROC_PIDTBSDINFO` for a zombie, so the first clause
+/// is what rules it out there, while Linux and Windows keep answering for a
+/// corpse and it takes the second.
+fn is_executing(pid: u32) -> bool {
+    process_start_time(pid).is_some() && !is_zombie(pid)
+}
+
 #[cfg(target_os = "linux")]
 fn is_zombie(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -344,10 +374,54 @@ fn is_zombie(pid: u32) -> bool {
     proc_bsd_info(pid).is_some_and(|info| info.pbi_status == SZOMB)
 }
 
-/// Windows has no zombie state: a process object outlives its exit only as a
-/// handle, and the pid is released at exit, so nothing can be both gone and
-/// reported alive.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows keeps a terminated process's object — and therefore its pid, and
+/// therefore its creation time — for as long as anybody holds a handle to it.
+///
+/// This is Windows' zombie, and it is not a corner case here: the handle that
+/// keeps it is the one `std::process::Child` holds over every child this app
+/// spawns. So between a child's exit and the `Child` being dropped,
+/// `OpenProcess` succeeds and [`process_start_time`] returns the same value it
+/// always did — which made [`ProcessIdentity::is_still_alive`] answer `true` for
+/// a corpse, and with it every supervised measurement, every ownership sweep and
+/// the startup reclaim. A background command that finished would have been
+/// sampled as a running tree until its owner let go of the handle.
+///
+/// A process handle is *signalled* exactly when the process terminates, so a
+/// zero-timeout wait is the direct question. `GetExitCodeProcess` is the usual
+/// answer and the wrong one: it reports `STILL_ACTIVE` (259) for a running
+/// process and cannot distinguish it from a process that exited with code 259,
+/// which `exit 259` produces on purpose.
+///
+/// `SYNCHRONIZE` is requested alongside the query right rather than instead of
+/// it: a refusal to open leaves the pid unidentifiable, which the callers
+/// already read as "gone".
+#[cfg(windows)]
+fn is_zombie(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    // `SYNCHRONIZE` is a standard access right shared by every waitable object,
+    // which is why `windows-sys` files it under file access rights rather than
+    // under process ones; both are `u32`.
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // Safe: opens a query-and-wait handle, or null on refusal.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    // Safe: waits zero milliseconds on the handle opened above, which never
+    // blocks and only reports whether it is already signalled.
+    let signalled = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
+    // Safe: closes the handle this function opened, exactly once.
+    unsafe { CloseHandle(handle) };
+    signalled
+}
+
+/// A platform with neither a process table nor a handle model reports nothing,
+/// so nothing can be both gone and reported alive.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn is_zombie(_pid: u32) -> bool {
     false
 }
@@ -835,6 +909,82 @@ mod tests {
         assert!(
             identity.is_still_alive(),
             "an unreaped process still exists on Linux"
+        );
+        child.wait().expect("reaped");
+    }
+
+    /// Windows' zombie, which is the handle this app is itself holding.
+    ///
+    /// The regression CI found: a terminated process keeps its object — and so
+    /// its pid, and so its creation time — while anybody holds a handle, and the
+    /// holder here is the `Child` of every command this app spawns. Liveness read
+    /// from `OpenProcess` alone therefore answered "running" for a finished
+    /// command until its owner let go, which made a background command that had
+    /// exited sample as a live tree and made the startup reclaim willing to
+    /// signal a corpse.
+    #[cfg(windows)]
+    #[test]
+    fn a_finished_child_whose_handle_is_still_open_is_alive_and_not_running() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("a trivial child spawns");
+        let identity = ProcessIdentity::of(child.id()).expect("the child has an identity");
+        child.wait().expect("the child finishes");
+        // `child` is deliberately still in scope: dropping it closes the handle
+        // and releases the pid, which is the case this test is *not* about.
+        assert!(
+            identity.is_still_alive(),
+            "an open handle keeps the process object, its pid and its creation time"
+        );
+        assert!(
+            !identity.is_running(),
+            "a terminated process runs no code and cannot fork, whoever is still holding a \
+             handle to it"
+        );
+        drop(child);
+    }
+
+    /// A corpse is not a member, so a set of nothing else measures as gone.
+    ///
+    /// The predicate every "the tree was reclaimed" assertion rests on. Before
+    /// this, the answer depended on the platform: Darwin refuses `proc_pidinfo`
+    /// for a zombie so it never reached the measurement, while a Linux zombie
+    /// kept its `/proc` entry until its parent reaped it — and the parent is
+    /// `tokio`'s orphan queue, which reaps whenever it next hears `SIGCHLD`. A
+    /// termination that had reclaimed everything read as one that had not.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclaimed_tree_measures_as_gone_before_anybody_reaps_it() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep spawns");
+        let pid = child.id();
+        let identity = ProcessIdentity::of(pid).expect("the child has an identity");
+        child.kill().expect("kill");
+        for _ in 0..200 {
+            if !identity.is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Not reaped: this is the window in which the pid still has an entry.
+        assert_eq!(
+            measure_members(&BTreeSet::from([pid])),
+            None,
+            "a killed-but-uncollected member holds no memory and cannot fork, so a tree of \
+             nothing else is gone"
         );
         child.wait().expect("reaped");
     }

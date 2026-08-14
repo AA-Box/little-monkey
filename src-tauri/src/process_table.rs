@@ -945,7 +945,10 @@ fn upgrade_a_budget_kill(
 /// - no start time — a pre-V22 row, or a host that would not report one, so the
 ///   pid cannot be tied to a process;
 /// - a start time that does not match — the pid was reused, and the process
-///   behind it is somebody else's.
+///   behind it is somebody else's;
+/// - the process is no longer *executing* — it exited and is waiting to be
+///   collected, so there is no tree left to reclaim and the next thing to occupy
+///   that pid will be somebody else's.
 ///
 /// The asymmetry is the safety property: failing to reclaim one stale process is
 /// recoverable, and killing an unrelated one is not.
@@ -964,7 +967,7 @@ pub fn still_the_recorded_process(record: &ProcessRecord) -> bool {
         pid,
         start_time: recorded,
     }
-    .is_still_alive()
+    .is_running()
 }
 
 /// The limit set attached to a process.
