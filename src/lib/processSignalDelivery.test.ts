@@ -285,6 +285,12 @@ describe("who delivers what", () => {
     remote_run: false,
     // Cancelling a node means cancelling its run, which is a different request.
     workflow_node: false,
+    // Both own a real OS process, and the Rust side that spawned it is what
+    // signals it: a foreground shell through its resource controller, a browser
+    // session through its worker. Claiming delivery here would latch an intent
+    // this window has no primitive to act on.
+    foreground_shell: false,
+    browser_session: false,
   } satisfies Record<ProcessKind, boolean>;
 
   it("scopes the sweep to exactly the kinds it can deliver to", () => {

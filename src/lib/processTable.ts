@@ -27,7 +27,12 @@ export type ProcessKind =
   | "workflow_node"
   | "remote_run"
   | "background_shell"
-  | "side_task";
+  // The agent shell a turn blocks on. Every native process a tool call
+  // creates is one of these, which is why its limits are the ones K4's
+  // memory and process-count bounds are installed on.
+  | "foreground_shell"
+  | "side_task"
+  | "browser_session";
 
 export type ProcessState = "admitted" | "running" | "suspended" | "exited";
 

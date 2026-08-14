@@ -68,6 +68,21 @@ pub enum ProcessKind {
     RemoteRun,
     /// A backgrounded `run_shell` command.
     BackgroundShell,
+    /// A foreground `run_shell`/verify command — the agent shell a turn blocks
+    /// on.
+    ///
+    /// The most common native process this app creates, and until now the only
+    /// one with no row at all. A turn's shell is where the compiler, the test
+    /// runner and the model server actually live, so "what is this machine
+    /// doing on behalf of the agent" was answerable for a backgrounded shell and
+    /// not for the foreground one beside it. It also meant the process holding
+    /// the memory had no record to carry a limit, which is why K4's memory and
+    /// child-process legs had nowhere to land.
+    ///
+    /// Short-lived by construction — bounded by the caller's timeout — so its
+    /// rows are numerous and brief. That is a property of the work, not a reason
+    /// to keep it invisible: the same is true of a subagent.
+    ForegroundShell,
     /// A side task running beside the main conversation.
     SideTask,
     /// An isolated Chromium the browser tool owns (`browser_worker.rs`).
@@ -119,6 +134,42 @@ pub enum ProcessKind {
 /// which is exactly what these kinds do not have.
 pub const WEBVIEW_WALL_BUDGET_MS: u64 = 6 * 60 * 60 * 1_000;
 
+/// The resident-memory ceiling an agent shell's whole process tree carries by
+/// default.
+///
+/// # Why 8 GiB, and why one number for both shell kinds
+///
+/// A class default is not a tuning knob; it is the answer to "what is so far
+/// outside normal that it is certainly a runaway". The legitimate heavy cases
+/// here are a Rust or LLVM build and a local model server, and both fit inside
+/// 8 GiB on the machines this app targets — a 16 GiB laptop is the floor, and a
+/// tree past half of it is not a build, it is a leak or a fork bomb's memory
+/// twin.
+///
+/// A *tight* number is the failure mode to avoid. A limit that kills working
+/// commands gets turned off, and a limit that is off bounds nothing; a limit that
+/// only ever fires on genuine runaways stays on. Callers who know their command's
+/// real appetite tighten it per call, which the resolution in
+/// [`crate::resource_control::EffectiveLimits`] always allows.
+///
+/// It bounds the **tree**, not the shell process: the shell itself holds a few
+/// hundred kilobytes and the compiler underneath it holds everything.
+pub const SHELL_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Live processes an agent shell's tree may hold at once.
+///
+/// Sized against the widest legitimate case rather than the common one: a
+/// parallel build on a high-core machine is the shape that spawns most, and
+/// `make -j64` with a compiler and a linker per job is comfortably inside 512.
+/// A fork bomb is not near 512, it is unbounded, so the two are not close enough
+/// for the exact number to be load-bearing.
+///
+/// This is the same figure the Windows shell job has always used as a fixed
+/// guardrail. It becomes a *class default* here — a number a caller can tighten
+/// and the row records — while the fixed job ceiling stays as an independent
+/// defence in depth that a caller cannot widen.
+pub const SHELL_PROCESS_BUDGET: u32 = 512;
+
 impl ProcessKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -130,6 +181,7 @@ impl ProcessKind {
             ProcessKind::WorkflowNode => "workflow_node",
             ProcessKind::RemoteRun => "remote_run",
             ProcessKind::BackgroundShell => "background_shell",
+            ProcessKind::ForegroundShell => "foreground_shell",
             ProcessKind::SideTask => "side_task",
             ProcessKind::BrowserSession => "browser_session",
         }
@@ -148,6 +200,7 @@ impl ProcessKind {
             ProcessKind::WorkflowNode => "wfn",
             ProcessKind::RemoteRun => "remote",
             ProcessKind::BackgroundShell => "sh",
+            ProcessKind::ForegroundShell => "fgsh",
             ProcessKind::SideTask => "side",
             ProcessKind::BrowserSession => "browser",
         }
@@ -163,6 +216,7 @@ impl ProcessKind {
             "workflow_node" => ProcessKind::WorkflowNode,
             "remote_run" => ProcessKind::RemoteRun,
             "background_shell" => ProcessKind::BackgroundShell,
+            "foreground_shell" => ProcessKind::ForegroundShell,
             "side_task" => ProcessKind::SideTask,
             "browser_session" => ProcessKind::BrowserSession,
             other => {
@@ -191,6 +245,7 @@ impl ProcessKind {
         ProcessKind::Subagent,
         ProcessKind::CrewMember,
         ProcessKind::BackgroundShell,
+        ProcessKind::ForegroundShell,
         ProcessKind::SideTask,
         // Its Chromium is spawned by this app and dies with it — but only if the
         // app got to run its teardown. The reap is what covers the crash, and
@@ -255,6 +310,11 @@ impl ProcessKind {
             | ProcessKind::Subagent
             | ProcessKind::CrewMember
             | ProcessKind::BackgroundShell
+            // A foreground shell is a *tool call's* process: the turn that
+            // blocked on it is what decides whether to run the command again,
+            // and re-running it from out here would repeat a side effect the
+            // model never asked for twice.
+            | ProcessKind::ForegroundShell
             | ProcessKind::SideTask => RestartPolicy::Never,
             // A browser session is a *tool call's* resource, not work in its own
             // right: relaunching Chromium would restore a blank profile with no
@@ -347,9 +407,15 @@ impl ProcessKind {
             (K::BrowserSession, L::Wall) => {
                 E::OwnerSourced("the browser watchdog enforces its session's own `max_session_ms`")
             }
-            (K::BackgroundShell, L::Wall) => E::Unavailable(
-                "a background shell is spawned to outlive its turn, with neither a timeout \
-                 nor `kill_on_drop`",
+            // The two native shell kinds. Both now run under a
+            // `ResourceController`, whose sampling loop reads this row's field —
+            // so a value set here is the value that fires, which is what
+            // `Enforced` means. A background shell is still spawned to outlive
+            // its turn, so its class default states no wall bound; a caller that
+            // sets one now gets it.
+            (K::BackgroundShell | K::ForegroundShell, L::Wall) => E::Enforced(
+                "the resource controller's sampling loop compares elapsed time against this \
+                 row's `max_wall_ms` and terminates the whole owned tree",
             ),
             (K::WorkflowNode, L::Wall) => E::OwnerSourced(
                 "a node is bounded by its own `timeout_ms`, which the definition validates \
@@ -365,6 +431,19 @@ impl ProcessKind {
                 "the daemon's sampling watchdog measures the job's whole process group \
                  against the recipe's own `max_memory_bytes`",
             ),
+            // The kinds that own a native process tree read this field through
+            // the resource controller: a cgroup v2 `memory.max` where the host
+            // delegates one, a job object's `JobMemoryLimit` on Windows, and a
+            // supervised sum over the owned tree everywhere else. All three
+            // measure the *tree*, so a shell whose grandchild holds the memory is
+            // bounded by the number on this row.
+            (K::BackgroundShell | K::ForegroundShell | K::BrowserSession, L::Memory) => {
+                E::Enforced(
+                    "the resource controller bounds the owned process tree at this row's \
+                 `max_memory_bytes`, kernel-held where the host offers a mechanism and \
+                 supervised otherwise",
+                )
+            }
             (_, L::Memory) => E::Unavailable(NO_MEMORY_MECHANISM),
 
             // --- Output ----------------------------------------------------
@@ -372,6 +451,10 @@ impl ProcessKind {
             (K::BackgroundShell, L::Output) => E::Enforced(
                 "the in-memory tail is front-truncated at this many bytes by \
                  `background_shell`",
+            ),
+            (K::ForegroundShell, L::Output) => E::Enforced(
+                "both pipes are drained concurrently into a buffer front-truncated at this \
+                 many bytes, so the bound holds while the child is still producing",
             ),
             (K::DaemonJob, L::Output) => E::OwnerSourced(
                 "the daemon watchdog enforces the recipe's own `max_log_bytes` against the \
@@ -393,6 +476,17 @@ impl ProcessKind {
             // Nothing, anywhere. The Windows shell job's fixed 512-process
             // ceiling is a containment guardrail on one spawn site, not a
             // per-class policy this field could express.
+            // Per *tree*, which is what makes this expressible at all: cgroup
+            // v2's `pids` controller, a job object's `ActiveProcessLimit`, or a
+            // supervised count of the owned tree's live members. None of them is
+            // `RLIMIT_NPROC`, which counts per real uid and so fires whenever the
+            // logged-in user's own session is busy.
+            (K::BackgroundShell | K::ForegroundShell | K::BrowserSession, L::ChildProcesses) => {
+                E::Enforced(
+                    "the resource controller counts the owned tree's live members against this \
+                 row's `max_child_processes`, per tree rather than per uid",
+                )
+            }
             (_, L::ChildProcesses) => E::Unavailable(NO_PIDS_MECHANISM),
 
             // --- Context tokens --------------------------------------------
@@ -413,6 +507,7 @@ impl ProcessKind {
                 | K::WorkflowNode
                 | K::RemoteRun
                 | K::BackgroundShell
+                | K::ForegroundShell
                 | K::BrowserSession,
                 L::ContextTokens,
             ) => E::Unavailable(NO_MODEL_REQUEST),
@@ -433,9 +528,10 @@ impl ProcessKind {
             // do, and it is the reason this kind exists at all: its `native_pid`
             // leads a real process group, so a terminate reaches Chromium's
             // renderer and GPU children rather than orphaning them.
-            (K::DaemonJob | K::BackgroundShell | K::BrowserSession, S::Kill) => {
-                SignalSupport::Honoured
-            }
+            (
+                K::DaemonJob | K::BackgroundShell | K::ForegroundShell | K::BrowserSession,
+                S::Kill,
+            ) => SignalSupport::Honoured,
             (K::RemoteRun, S::Kill | S::Suspend | S::Resume) => SignalSupport::Refused(
                 "a remote run records the request, not the work: it owns no process of its \
                  own and is closed as soon as the job is queued; signal the daemon job it \
@@ -450,7 +546,9 @@ impl ProcessKind {
             // where the loop now checks a durable latch at a safe point, or a
             // blocking wait at a coarse boundary for a workflow run.
             (K::DaemonJob, S::Suspend | S::Resume) => SignalSupport::Honoured,
-            (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::BackgroundShell | K::ForegroundShell, S::Suspend | S::Resume) => {
+                SignalSupport::Honoured
+            }
             (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
                 SignalSupport::Honoured
@@ -495,6 +593,7 @@ impl ProcessKind {
         ProcessKind::WorkflowNode,
         ProcessKind::RemoteRun,
         ProcessKind::BackgroundShell,
+        ProcessKind::ForegroundShell,
         ProcessKind::SideTask,
         ProcessKind::BrowserSession,
     ];
@@ -536,10 +635,37 @@ impl ProcessKind {
             // the lesser evil: a second copy of the number could drift from the
             // code that enforces it, and a declaration that disagrees with the
             // enforcement is worse than a slightly untidy dependency.
+            // The agent shell a turn blocks on, and the first kind whose class
+            // default states a memory and a process-count bound — because it is
+            // the first kind with a mechanism that holds them.
+            //
+            // Both numbers are deliberately generous rather than tuned. The
+            // question a class default answers is "what is so far outside normal
+            // that it is certainly a runaway", not "what should a build need":
+            // this is the site that legitimately compiles a Rust workspace and
+            // downloads a 40 GB model, so a number chosen to be *tight* would
+            // break working commands, which is the failure mode that makes people
+            // turn a limit off. A per-command override tightens it where a caller
+            // knows better.
+            ProcessKind::ForegroundShell => ProcessLimits {
+                max_wall_ms: None,
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::output_cap::MODEL_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
             ProcessKind::BackgroundShell => ProcessLimits {
                 max_output_bytes: Some(
                     u64::try_from(crate::background_shell::MAX_OUTPUT_BYTES).unwrap_or(u64::MAX),
                 ),
+                // The same two class bounds as the foreground shell, for the same
+                // reason and through the same controller. A backgrounded command
+                // is if anything the one more worth bounding: nothing is blocked
+                // on it, so a runaway is noticed later.
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
                 // No wall bound on purpose: a background shell is meant to
                 // outlive the turn that started it, so it is spawned with
                 // neither a timeout nor `kill_on_drop`.
@@ -4246,8 +4372,40 @@ mod tests {
         }
     }
 
+    /// `ProcessKind::ALL` is hand-maintained, and nothing made adding a variant
+    /// fail without it.
+    ///
+    /// That is not a tidiness point. `ALL` is what `monkey processes limits`
+    /// enumerates and what every "for each kind" invariant in this file iterates,
+    /// so a variant missing from it is a kind whose limit matrix, signal matrix
+    /// and class defaults are simply never checked — and the check that would
+    /// have caught it passes, because it never looked. `ForegroundShell` was
+    /// added and every one of those invariants still passed until this existed.
+    ///
+    /// Checked against the SQL vocabulary rather than against a second Rust list,
+    /// because two copies of the same list agree by construction. The `CHECK`
+    /// constraint is written by a different author for a different reason, so its
+    /// agreement is evidence.
+    #[test]
+    fn the_kind_list_and_the_stored_vocabulary_name_the_same_kinds() {
+        let database = crate::run_ledger::RunLedger::open(temp_ledger_path("kind-vocab"))
+            .expect("ledger opens");
+        let stored = database
+            .stored_process_kinds()
+            .expect("the CHECK is readable");
+        let declared: std::collections::BTreeSet<String> = ProcessKind::ALL
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect();
+        assert_eq!(
+            stored, declared,
+            "ProcessKind::ALL and the agent_processes.kind CHECK disagree; a kind in one and \
+             not the other is either unstorable or silently exempt from every per-kind invariant"
+        );
+    }
+
     /// The declaration must match what the app really enforces, so this asserts
-    /// the *shape of the honesty*: exactly one kind carries a bound, and its
+    /// the *shape of the honesty*: which kinds carry a bound, and that each
     /// number is the constant the enforcing code uses.
     #[test]
     fn every_kind_declares_the_bounds_it_is_actually_subject_to() {
@@ -4263,6 +4421,7 @@ mod tests {
                 ProcessKind::Subagent,
                 ProcessKind::CrewMember,
                 ProcessKind::BackgroundShell,
+                ProcessKind::ForegroundShell,
                 ProcessKind::SideTask,
                 ProcessKind::BrowserSession
             ],
@@ -4290,7 +4449,41 @@ mod tests {
         // A background shell is meant to outlive its turn, so it is spawned with
         // no timeout at all. Declaring a wall bound here would be a lie.
         assert_eq!(shell.max_wall_ms, None);
-        assert_eq!(shell.max_memory_bytes, None);
+
+        // The two native shell kinds carry the same tree bounds, because they are
+        // the same process under the same controller — the only difference is who
+        // is waiting for it. Asserted per field rather than as a whole record so
+        // the two output ceilings, which genuinely differ, stay visible: a
+        // background shell's tail is read by a human and a foreground shell's by
+        // a model.
+        let foreground = ProcessKind::ForegroundShell.default_limits();
+        for (kind, limits) in [
+            (ProcessKind::BackgroundShell, shell),
+            (ProcessKind::ForegroundShell, foreground),
+        ] {
+            assert_eq!(
+                limits.max_memory_bytes,
+                Some(SHELL_MEMORY_BUDGET_BYTES),
+                "{} must declare the tree memory bound its controller holds",
+                kind.as_str()
+            );
+            assert_eq!(
+                limits.max_child_processes,
+                Some(SHELL_PROCESS_BUDGET),
+                "{} must declare the per-tree process bound its controller holds",
+                kind.as_str()
+            );
+            assert_eq!(limits.max_context_tokens, None);
+        }
+        assert_eq!(
+            foreground.max_output_bytes,
+            Some(u64::try_from(crate::output_cap::MODEL_OUTPUT_CAP).unwrap()),
+            "a foreground shell's output reaches a model, so it takes the model ceiling"
+        );
+        // Bounded by the caller's own tool timeout rather than by a class number:
+        // `SHELL_TIMEOUT` and `DEFAULT_VERIFY_TIMEOUT_SECS` differ by more than
+        // twice, so one class default would be wrong for one of them.
+        assert_eq!(foreground.max_wall_ms, None);
 
         // The four WebView kinds all carry the same wall budget, and only that:
         // one number for four kinds because they are the same shape of process,
@@ -5696,6 +5889,10 @@ mod tests {
             ProcessKind::WorkflowNode => "m4_services.rs — WorkflowService::append_history",
             ProcessKind::RemoteRun => "bin/monkey-cli/daemon/mod.rs — project_queue_origin",
             ProcessKind::BackgroundShell => "background_shell.rs — emit_status",
+            ProcessKind::ForegroundShell => {
+                "workspace_shell.rs — GuardedShell::spawn, for every foreground shell and \
+                 verify command on either client"
+            }
             ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
             ProcessKind::BrowserSession => "browser_worker.rs — OwnedBrowser::project",
         }
@@ -6231,10 +6428,12 @@ mod tests {
                 kind.as_str()
             );
         }
-        // `ALL` must itself be exhaustive, or the loop above proves nothing.
+        // `ALL` must itself be exhaustive, or the loop above proves nothing. The
+        // count is the cheap half; `the_kind_list_and_the_stored_vocabulary_name_
+        // the_same_kinds` is the half that says *which* kind is missing.
         assert_eq!(
             ProcessKind::ALL.len(),
-            10,
+            11,
             "ProcessKind::ALL is out of sync with the enum"
         );
     }
@@ -6355,14 +6554,29 @@ mod tests {
         assert!(!ProcessKind::DaemonJob
             .limit_support(ProcessLimitKind::Memory)
             .honours_caller_value());
-        // Nothing, anywhere, holds a per-tree process count.
+        // A per-tree process count is held exactly where a resource controller
+        // owns a native tree, and nowhere else. Both halves are asserted: the
+        // first is the capability this item added, and the second is what stops
+        // it from being claimed for a kind that owns no OS process at all.
         for kind in ProcessKind::ALL {
-            assert!(
-                matches!(
-                    kind.limit_support(ProcessLimitKind::ChildProcesses),
-                    LimitEnforcement::Unavailable(_)
-                ),
-                "{} claims a child-process ceiling",
+            let owns_a_tree = matches!(
+                kind,
+                ProcessKind::BackgroundShell
+                    | ProcessKind::ForegroundShell
+                    | ProcessKind::BrowserSession
+            );
+            assert_eq!(
+                kind.limit_support(ProcessLimitKind::ChildProcesses)
+                    .honours_caller_value(),
+                owns_a_tree,
+                "{} disagrees with whether it owns a process tree a count can bound",
+                kind.as_str()
+            );
+            assert_eq!(
+                kind.limit_support(ProcessLimitKind::Memory)
+                    .honours_caller_value(),
+                owns_a_tree,
+                "{} disagrees with whether it owns a process tree memory can be summed over",
                 kind.as_str()
             );
         }
