@@ -1650,6 +1650,18 @@ pub async fn run_prepared_turn_with_max_iterations(
     result.map(|()| files_changed)
 }
 
+/// The loop's own id for one tool invocation: where the call sits in the run,
+/// never a value drawn fresh per attempt.
+///
+/// `send_message` keys durable deliveries on this id, so a run that replays a
+/// tool call has to arrive at the id its earlier attempt used — otherwise the
+/// outbox sees a new invocation and the message goes out a second time. The
+/// call's position is the one thing a replay reproduces exactly and two
+/// distinct calls never share.
+fn tool_call_id_for(round_index: usize, call_index: usize) -> String {
+    format!("tool-{}-{}", round_index + 1, call_index + 1)
+}
+
 /// The tool-calling loop itself, factored out of `run_turn` so the
 /// checkpoint's `end_impl` above can run unconditionally regardless of how
 /// this returns (a model error via `?`, the safety cap, or a plain answer).
@@ -1909,7 +1921,7 @@ async fn run_tool_loop(
         history.push(assistant_message);
 
         for (call_index, call) in result.tool_calls.iter().enumerate() {
-            let observed_tool_call_id = format!("tool-{}-{}", round_index + 1, call_index + 1);
+            let observed_tool_call_id = tool_call_id_for(round_index, call_index);
             let tool_name = safe_protocol_id("tool", &call.name);
             let (arguments, arguments_sha256) =
                 redacted_tool_arguments(&call.name, &call.arguments);
@@ -2042,6 +2054,19 @@ mod tests {
             ToolOutcome::Failed
         );
         assert_eq!(tool_outcome("read 12 bytes"), ToolOutcome::Succeeded);
+    }
+
+    /// The id a replayed run recomputes. `send_message` keys durable
+    /// deliveries on the job plus this id, so drawing it fresh per attempt —
+    /// a uuid, a clock, a counter over surviving rows — would make every
+    /// replayed tool call a second message to a person, while two distinct
+    /// calls in one run must never collide onto one delivery.
+    #[test]
+    fn a_tool_call_id_is_the_call_position_a_replay_reproduces() {
+        assert_eq!(tool_call_id_for(0, 0), "tool-1-1");
+        assert_eq!(tool_call_id_for(0, 0), tool_call_id_for(0, 0));
+        assert_ne!(tool_call_id_for(0, 0), tool_call_id_for(0, 1));
+        assert_ne!(tool_call_id_for(0, 1), tool_call_id_for(1, 0));
     }
 
     #[test]
