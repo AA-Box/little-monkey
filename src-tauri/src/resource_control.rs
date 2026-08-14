@@ -1862,6 +1862,14 @@ mod tests {
         )]);
         let mut controller = ResourceController::new(effective);
         if controller.capabilities().backend != "cgroup v2" {
+            // A skip, except on the leg whose whole purpose is this path: there a
+            // fallback means the kernel backend was never exercised, and a silent
+            // return would report that as a pass.
+            assert!(
+                required_backend().is_none(),
+                "this host was provisioned to exercise cgroup v2 and fell back to {}",
+                controller.capabilities().backend
+            );
             return;
         }
 
