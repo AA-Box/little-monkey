@@ -17,10 +17,12 @@
 //!
 //! - **Level A (automated outbound smoke).** With a token set, the test
 //!   probes (a read-only identity call). With the matching destination
-//!   variable also set, it queues one message in a durable outbox and drains
-//!   it through the production `drain_outbox_once` — the same path every
-//!   normal reply takes — asserting the provider returned a message id.
-//!   Nothing calls the adapter send primitive directly.
+//!   variable also set, it queues one message through the same
+//!   `plan_send`/`queue_send` seam the `send_message` tool uses and drains it
+//!   through the production `drain_outbox_once` — the same path every normal
+//!   reply takes — asserting the provider returned a message id. Nothing
+//!   calls the adapter send primitive directly, and nothing reconstructs an
+//!   outbox row by hand.
 //! - **Level B (interactive full roundtrip).** Additionally gated on
 //!   `LM_TEST_INTERACTIVE=1` because it needs a human: the test starts the
 //!   real account worker path, prints a nonce, waits for the operator to send
@@ -38,14 +40,12 @@ use super::adapters::discord::DiscordAdapter;
 use super::adapters::slack::SlackAdapter;
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
-use super::channel_restart_tests::{queue_reply_for_job, seeded_store};
-use super::channel_store::{ChannelAccountRecord, EventDirection, NewOutboxMessage};
+use super::channel_restart_tests::{queue_reply_for_job, seeded_store, temp_daemon_paths};
+use super::channel_store::{ChannelAccountRecord, EventDirection};
+use super::channel_tool::{plan_send, queue_send, ChannelSendRequest, SendAuthority};
 use super::channel_worker::{drain_outbox_once, poll_account_once, RunQueue};
-use super::store::DaemonStore;
 use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
-use little_monkey_lib::channels::types::{
-    ChannelHealth, ChannelKind, HealthState, OutboundMessage,
-};
+use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, HealthState};
 
 const ACCOUNT_ID: &str = "live-smoke";
 
@@ -101,44 +101,30 @@ impl RunQueue for RecordingQueue {
     }
 }
 
-/// Level A: queue one message in a durable outbox and drain it through the
-/// production path with the real adapter. Panics unless the provider
+/// Level A: queue one message through the same `plan_send`/`queue_send` seam
+/// the `send_message` tool uses — an ad-hoc send under an explicit account
+/// grant, since no run is behind it — and drain it through the production
+/// `drain_outbox_once` with the real adapter. Panics unless the provider
 /// answered with a message id.
 async fn outbox_smoke(kind: ChannelKind, adapter: Arc<dyn ChannelAdapter>, destination: &str) {
     let mut store = seeded_store(ACCOUNT_ID, kind);
-    let text = "Little Monkey live smoke test: this message proves the outbound path.".to_string();
-    let message = OutboundMessage {
-        account_id: ACCOUNT_ID.into(),
-        kind,
-        conversation_id: destination.to_string(),
-        thread_id: None,
-        text,
-        attachments: Vec::new(),
-        reply_to_provider_id: None,
-        // Per kind AND per process, so the three provider tests in one run
-        // never collide on the outbox's idempotency key.
-        idempotency_key: format!("live-smoke-{}-{}", kind.as_str(), std::process::id()),
-    };
-    let payload = super::channel_ingress::OutboxPayload {
-        message,
-        reply_depth: 0,
-    };
-    let payload_json = serde_json::to_string(&payload).expect("payload");
+    let paths = temp_daemon_paths();
     let now = now_ms();
-    store
-        .enqueue_channel_message(&NewOutboxMessage {
-            account_id: ACCOUNT_ID.into(),
-            conversation_id: destination.to_string(),
-            thread_id: None,
-            reply_to_provider_id: None,
-            payload_digest: super::trigger::sha256_hex(payload_json.as_bytes()),
-            payload_json,
-            idempotency_key: format!("live-smoke-{}-{}", kind.as_str(), std::process::id()),
-            max_attempts: 1,
-            job_id: None,
-            created_at_ms: now,
-        })
-        .expect("enqueue");
+    let request = ChannelSendRequest {
+        account_id: Some(ACCOUNT_ID.into()),
+        conversation_id: Some(destination.to_string()),
+        text: "Little Monkey live smoke test: this message proves the outbound path.".into(),
+        ..Default::default()
+    };
+    // No run, no origin: the authority names the account explicitly, the
+    // same shape a cross-account grant takes.
+    let authority = SendAuthority {
+        reply: false,
+        cross_conversation: false,
+        accounts: vec![ACCOUNT_ID.into()],
+    };
+    let plan = plan_send(&request, &authority, None).expect("the smoke send is allowed");
+    queue_send(&mut store, &paths, &request, &plan, None, None, now).expect("enqueue");
     let mut adapters: std::collections::BTreeMap<String, Arc<dyn ChannelAdapter>> =
         std::collections::BTreeMap::new();
     adapters.insert(ACCOUNT_ID.to_string(), adapter);

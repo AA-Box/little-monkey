@@ -20,14 +20,13 @@ use super::adapters::discord::DiscordAdapter;
 use super::adapters::slack::SlackAdapter;
 use super::adapters::telegram::TelegramAdapter;
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
-use super::channel_ingress::OutboxPayload;
-use super::channel_store::{ChannelAccountRecord, EventDirection, NewOutboxMessage};
+use super::channel_store::{ChannelAccountRecord, EventDirection};
 use super::channel_worker::{drain_outbox_once, ingest_batch, poll_account_once, RunQueue};
 use super::store::DaemonStore;
 use little_monkey_lib::channels::ingress::{ConversationIngress, FrozenExecutionContext};
 use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, GroupActivation};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
-use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind, OutboundMessage};
+use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
 
 const NOW: i64 = 1_700_000_000_000;
 
@@ -737,48 +736,62 @@ async fn slack_poll_account_once_releases_the_ack_after_ingest() {
 // durable outbox → drain → provider fixture
 // ---------------------------------------------------------------------------
 
-/// Queue a reply to the run `job_id` exactly the way the `send_message` tool
-/// does — same origin lookup, same payload shape, same idempotency scheme,
-/// same durable enqueue. Only the model behind the tool is this test.
-pub(crate) fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &str) {
+/// Daemon paths rooted in a throwaway directory, for the parts of the send
+/// seam that touch the filesystem (the content store holding outbound
+/// artifacts). Nothing here reads the operator's real data directory.
+pub(crate) fn temp_daemon_paths() -> super::store::DaemonPaths {
+    let root = std::env::temp_dir()
+        .join(format!("lm-restart-{}", uuid::Uuid::new_v4().simple()))
+        .join("daemon");
+    std::fs::create_dir_all(&root).expect("temp daemon root");
+    super::store::DaemonPaths {
+        config: root.join("config.json"),
+        state_db: root.join("state.db"),
+        ledger_db: root.join("ledger.db"),
+        snapshots: root.join("snapshots"),
+        logs: root.join("logs"),
+        worktrees: root.join("worktrees"),
+        lock: root.join("daemon.lock"),
+        root,
+    }
+}
+
+/// Send from the run `job_id` through the actual production tool seam: the
+/// same authority derivation, the same [`plan_send`] admission and the same
+/// [`queue_send`] durable write the `send_message` tool performs — against
+/// the test-owned store. Only the model deciding to call the tool is this
+/// test; nothing about the outbox row is reconstructed here.
+pub(crate) fn send_via_tool_seam(
+    store: &mut DaemonStore,
+    paths: &super::store::DaemonPaths,
+    job_id: &str,
+    request: &super::channel_tool::ChannelSendRequest,
+    policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
+) -> Result<serde_json::Value, String> {
+    let authority = super::channel_tool::send_authority_for_job(store, job_id, false, policy);
     let origin = store
         .channel_origin_for_job(job_id)
-        .expect("origin lookup")
-        .expect("the run has a channel origin");
-    let account = store
-        .channel_account(&origin.account_id)
-        .expect("account lookup")
-        .expect("account");
-    let sequence = store.outbox_count_for_job(job_id).expect("sequence");
-    let idempotency_key = format!("reply-{job_id}-{sequence}");
-    let payload = OutboxPayload {
-        message: OutboundMessage {
-            account_id: origin.account_id.clone(),
-            kind: account.kind,
-            conversation_id: origin.conversation_id.clone(),
-            thread_id: origin.thread_id.clone(),
-            text: text.to_string(),
-            attachments: Vec::new(),
-            reply_to_provider_id: Some(origin.provider_event_id.clone()),
-            idempotency_key: idempotency_key.clone(),
-        },
-        reply_depth: 1,
+        .expect("origin lookup");
+    let plan = super::channel_tool::plan_send(request, &authority, origin.as_ref())?;
+    super::channel_tool::queue_send(
+        store,
+        paths,
+        request,
+        &plan,
+        origin.as_ref(),
+        Some(job_id),
+        NOW,
+    )
+}
+
+/// An origin reply through the tool seam, as every wire-to-wire test sends it.
+pub(crate) fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &str) {
+    let paths = temp_daemon_paths();
+    let request = super::channel_tool::ChannelSendRequest {
+        text: text.to_string(),
+        ..Default::default()
     };
-    let payload_json = serde_json::to_string(&payload).expect("payload");
-    store
-        .enqueue_channel_message(&NewOutboxMessage {
-            account_id: origin.account_id,
-            conversation_id: origin.conversation_id,
-            thread_id: origin.thread_id,
-            reply_to_provider_id: Some(origin.provider_event_id),
-            payload_digest: super::trigger::sha256_hex(payload_json.as_bytes()),
-            payload_json,
-            idempotency_key,
-            max_attempts: 3,
-            job_id: Some(job_id.to_string()),
-            created_at_ms: NOW,
-        })
-        .expect("enqueue");
+    send_via_tool_seam(store, &paths, job_id, &request, None).expect("the reply is queued");
 }
 
 fn adapters_map(
@@ -1323,8 +1336,24 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
             || name == "channel_restart_tests.rs"
             || name == "live_smoke.rs"
     };
+    // The outbox enqueue has exactly three legitimate writers: the store
+    // itself (definition), the send tool's `queue_send`, and the ingress
+    // pairing challenge. Everything else — tests included — must go through
+    // `plan_send`/`queue_send`, so a second hand-rolled send path cannot
+    // creep in behind the tool's authority checks.
+    let enqueue_allowed = |path: &std::path::Path| {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        name == "channel_store.rs"
+            || name == "channel_tool.rs"
+            || name == "channel_ingress.rs"
+            || name == "channel_worker.rs"
+    };
     let mut offenders = Vec::new();
+    let mut enqueue_offenders = Vec::new();
     let mut drain_seen = false;
+    let mut tool_enqueue_seen = false;
+    // Assembled at runtime so this file's own scan code does not match it.
+    let enqueue_needle = format!("enqueue_channel_message{}", "(");
     for path in files {
         let Ok(source) = std::fs::read_to_string(&path) else {
             continue;
@@ -1334,7 +1363,15 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
                 drain_seen = true;
             }
             if !allowed(&path) {
-                offenders.push(path);
+                offenders.push(path.clone());
+            }
+        }
+        if source.contains(&enqueue_needle) {
+            if path.file_name().and_then(|n| n.to_str()) == Some("channel_tool.rs") {
+                tool_enqueue_seen = true;
+            }
+            if !enqueue_allowed(&path) {
+                enqueue_offenders.push(path);
             }
         }
     }
@@ -1345,6 +1382,14 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
     assert!(
         offenders.is_empty(),
         "adapter.send is called outside the outbox drain: {offenders:?}"
+    );
+    assert!(
+        tool_enqueue_seen,
+        "queue_send's enqueue in channel_tool.rs moved; update this scan so it keeps guarding the invariant"
+    );
+    assert!(
+        enqueue_offenders.is_empty(),
+        "the durable outbox is written outside the sanctioned producers: {enqueue_offenders:?}"
     );
 }
 
@@ -1373,4 +1418,485 @@ async fn the_worker_stamps_the_polled_account_onto_every_envelope() {
     assert_eq!(report.accepted, 1);
     let events = store.recent_channel_events("acct-tg", 10).unwrap();
     assert_eq!(events.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Send authority through the real tool seam
+// ---------------------------------------------------------------------------
+
+/// One accepted Telegram turn, ready to send from: the run's job id and the
+/// store that accepted it.
+async fn accepted_telegram_turn(store: &mut DaemonStore, queue: &FakeQueue) -> String {
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, TELEGRAM_UPDATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let report = poll_account_once(store, queue, "acct-tg", &adapter, NOW)
+        .await
+        .expect("poll");
+    assert_eq!(report.accepted, 1);
+    queue.submitted.lock().unwrap()[0].clone()
+}
+
+/// Without the cross-conversation grant the send is refused and nothing —
+/// not even a parked row — reaches the durable outbox.
+#[tokio::test]
+async fn a_cross_conversation_send_without_the_grant_leaves_no_outbox_row() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+    let job_id = accepted_telegram_turn(&mut store, &queue).await;
+
+    let paths = temp_daemon_paths();
+    let request = super::channel_tool::ChannelSendRequest {
+        conversation_id: Some("777777".into()),
+        text: "psst".into(),
+        ..Default::default()
+    };
+    let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
+    assert!(refused.is_err(), "the send must be refused: {refused:?}");
+    assert!(
+        store.claim_outbox_batch(NOW + 60_000, 10).unwrap().is_empty(),
+        "a refused send must not leave an outbox row"
+    );
+}
+
+/// With the frozen snapshot's cross-conversation grant the same send is
+/// queued, and the drain delivers it to the conversation that was named —
+/// not the origin.
+#[tokio::test]
+async fn a_granted_cross_conversation_send_reaches_the_named_conversation() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+    let job_id = accepted_telegram_turn(&mut store, &queue).await;
+
+    let paths = temp_daemon_paths();
+    let policy = little_monkey_lib::run_protocol::ChannelSendPolicy {
+        cross_conversation: true,
+        accounts: Vec::new(),
+    };
+    let request = super::channel_tool::ChannelSendRequest {
+        conversation_id: Some("777777".into()),
+        text: "heads up".into(),
+        ..Default::default()
+    };
+    send_via_tool_seam(&mut store, &paths, &job_id, &request, Some(&policy))
+        .expect("the granted send is queued");
+
+    let (base, requests) = super::channel_adapter::test_http::serve(vec![(
+        200,
+        r#"{"ok":true,"result":{"message_id":55,"chat":{"id":777777,"type":"private"}}}"#
+            .to_string(),
+    )]);
+    let adapter = telegram_adapter(&base);
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-tg", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1);
+    let wire = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the send request");
+    let wire = String::from_utf8_lossy(&wire);
+    assert!(wire.contains(r#""chat_id":"777777""#), "{wire}");
+    // An explicit destination inherits nothing from the origin message.
+    assert!(!wire.contains("reply_to_message_id"), "{wire}");
+}
+
+/// Cross-account: refused without the account grant, queued onto the named
+/// account with it, and delivered through that account's adapter.
+#[tokio::test]
+async fn a_cross_account_send_needs_the_account_grant() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    store
+        .upsert_channel_account(&account_record("acct-tg2", ChannelKind::Telegram))
+        .expect("second account");
+    let queue = FakeQueue::default();
+    let job_id = accepted_telegram_turn(&mut store, &queue).await;
+
+    let paths = temp_daemon_paths();
+    let request = super::channel_tool::ChannelSendRequest {
+        account_id: Some("acct-tg2".into()),
+        conversation_id: Some("888888".into()),
+        text: "over here".into(),
+        ..Default::default()
+    };
+    let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
+    assert!(refused.is_err(), "the send must be refused: {refused:?}");
+    assert!(
+        store.claim_outbox_batch(NOW + 60_000, 10).unwrap().is_empty(),
+        "a refused cross-account send must not leave an outbox row"
+    );
+
+    let policy = little_monkey_lib::run_protocol::ChannelSendPolicy {
+        cross_conversation: false,
+        accounts: vec!["acct-tg2".into()],
+    };
+    send_via_tool_seam(&mut store, &paths, &job_id, &request, Some(&policy))
+        .expect("the granted send is queued");
+
+    let (base, requests) = super::channel_adapter::test_http::serve(vec![(
+        200,
+        r#"{"ok":true,"result":{"message_id":56,"chat":{"id":888888,"type":"private"}}}"#
+            .to_string(),
+    )]);
+    let adapter = telegram_adapter(&base);
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-tg2", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1, "the row must drain through acct-tg2");
+    let wire = requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the send request");
+    let wire = String::from_utf8_lossy(&wire);
+    assert!(wire.contains(r#""chat_id":"888888""#), "{wire}");
+}
+
+/// An inbound file becomes a durable artifact; the run forwards the artifact
+/// id through the tool seam; the provider receives the artifact's actual
+/// bytes as a real multipart upload. At no point does a filesystem path cross
+/// the tool boundary.
+#[tokio::test]
+async fn a_forwarded_artifact_travels_by_id_and_lands_as_a_real_upload() {
+    let mut store = seeded_store("acct-tg", ChannelKind::Telegram);
+    let queue = FakeQueue::default();
+    let paths = temp_daemon_paths();
+
+    // The durable artifact, in the same content store `queue_send` resolves
+    // ids against.
+    let app_data = paths.root.parent().unwrap();
+    let blob = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        super::channel_adapter::MAX_ATTACHMENT_BYTES,
+    )
+    .expect("content store")
+    .put(b"PNGDATA")
+    .expect("blob");
+
+    // The inbound turn whose message carried the file: the durable envelope
+    // records the artifact id and the name/type it arrived with, which is
+    // where a forwarded id gets its filename back from.
+    const PHOTO_UPDATE_TEMPLATE: &str = r#"{
+        "ok": true,
+        "result": [{
+            "update_id": 900,
+            "message": {
+                "message_id": 31,
+                "date": 1700000000,
+                "chat": {"id": 606, "type": "private"},
+                "from": {"id": 606, "is_bot": false, "first_name": "Cy"},
+                "text": "keep this",
+                "photo": [{"file_id": "PH2", "width": 4, "height": 4, "file_size": 7}]
+            }
+        }]
+    }"#;
+    let (base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (200, TELEGRAM_GET_ME.to_string()),
+        (200, PHOTO_UPDATE_TEMPLATE.to_string()),
+    ]);
+    let adapter = telegram_adapter(&base);
+    let mut batch = adapter.poll(None).await.expect("poll");
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-tg".to_string();
+        for attachment in &mut envelope.attachments {
+            // What hydration records once the bytes are stored.
+            attachment.stored_artifact_id = Some(blob.id.clone());
+            attachment.filename = Some("photo.png".to_string());
+            attachment.mime_type = Some("image/png".to_string());
+        }
+    }
+    let report = ingest_batch(&mut store, &queue, &batch.envelopes, NOW);
+    assert_eq!(report.accepted, 1);
+    let job_id = queue.submitted.lock().unwrap()[0].clone();
+
+    // The run forwards the artifact by id — no path, no bytes.
+    let request = super::channel_tool::ChannelSendRequest {
+        text: "as requested".into(),
+        artifact_ids: vec![blob.id.clone()],
+        ..Default::default()
+    };
+    send_via_tool_seam(&mut store, &paths, &job_id, &request, None)
+        .expect("the reply with the artifact is queued");
+
+    // The provider sees a real multipart upload carrying the stored bytes:
+    // the text lands first as its own message, then the photo uploads.
+    let (send_base, send_requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"result":{"message_id":57,"chat":{"id":606,"type":"private"}}}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"ok":true,"result":{"message_id":58,"chat":{"id":606,"type":"private"}}}"#
+                .to_string(),
+        ),
+    ]);
+    let account = account_record("acct-tg", ChannelKind::Telegram);
+    let adapter = TelegramAdapter::new(&AdapterConfig {
+        account: &account,
+        secret: "bot-token".into(),
+    })
+    .expect("adapter")
+    .with_base_url(&send_base)
+    .with_blobs(Arc::new(super::channel_adapter::test_http::FixtureBlobs(
+        b"PNGDATA".to_vec(),
+    )));
+    let drained = drain_outbox_once(&mut store, &adapters_map("acct-tg", Arc::new(adapter)), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(drained.sent, 1);
+    let text_leg = send_requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the text request");
+    assert!(
+        String::from_utf8_lossy(&text_leg).contains("as requested"),
+        "the text leg must land first"
+    );
+    let wire = send_requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the upload request");
+    let wire = String::from_utf8_lossy(&wire);
+    assert!(wire.contains("/sendPhoto"), "{wire}");
+    assert!(wire.contains("PNGDATA"), "{wire}");
+    assert!(wire.contains("photo.png"), "{wire}");
+}
+
+// ---------------------------------------------------------------------------
+// Slack: provider-directed reconnect handoff
+// ---------------------------------------------------------------------------
+
+/// Like [`spawn_ws_fixture`] but accepting connections CONCURRENTLY, so a
+/// replacement socket can complete its handshake while the previous one is
+/// still open — the overlap Slack's connection refresh performs. Every
+/// connection is greeted with `hello`; frames are logged and injected per
+/// connection index.
+struct HandoffWsFixture {
+    url: String,
+    received: Arc<StdMutex<Vec<(usize, Value)>>>,
+    senders: Arc<StdMutex<Vec<mpsc::UnboundedSender<String>>>>,
+    closed: Arc<StdMutex<Vec<usize>>>,
+}
+
+impl HandoffWsFixture {
+    fn inject(&self, connection: usize, text: String) {
+        let senders = self.senders.lock().unwrap();
+        senders[connection].send(text).expect("inject");
+    }
+
+    async fn wait_connections(&self, count: usize, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.senders.lock().unwrap().len() < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_closed(&self, connection: usize, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.closed.lock().unwrap().contains(&connection) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+}
+
+fn spawn_handoff_ws_fixture() -> HandoffWsFixture {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ws fixture");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let received: Arc<StdMutex<Vec<(usize, Value)>>> = Arc::default();
+    let senders: Arc<StdMutex<Vec<mpsc::UnboundedSender<String>>>> = Arc::default();
+    let closed: Arc<StdMutex<Vec<usize>>> = Arc::default();
+    let (log, injectors, ended) = (received.clone(), senders.clone(), closed.clone());
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        let mut index = 0usize;
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<String>();
+            injectors.lock().unwrap().push(inject_tx);
+            let connection = index;
+            index += 1;
+            let log = log.clone();
+            let ended = ended.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    ended.lock().unwrap().push(connection);
+                    return;
+                };
+                let hello =
+                    serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string();
+                let _ = ws.send(Message::Text(hello.into())).await;
+                loop {
+                    tokio::select! {
+                        frame = ws.next() => match frame {
+                            Some(Ok(Message::Text(text))) => {
+                                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                    log.lock().unwrap().push((connection, value));
+                                }
+                            }
+                            Some(Ok(Message::Ping(payload))) => {
+                                let _ = ws.send(Message::Pong(payload)).await;
+                            }
+                            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                            Some(Ok(_)) => {}
+                        },
+                        frame = inject_rx.recv() => match frame {
+                            Some(text) => { let _ = ws.send(Message::Text(text.into())).await; }
+                            None => break,
+                        },
+                    }
+                }
+                ended.lock().unwrap().push(connection);
+            });
+        }
+    });
+    HandoffWsFixture {
+        url: format!("ws://127.0.0.1:{port}"),
+        received,
+        senders,
+        closed,
+    }
+}
+
+/// Slack names a replacement URL in its disconnect frame → the adapter
+/// connects it while the old socket is still open, retires the old socket
+/// only once the replacement is live, keeps consuming on the replacement —
+/// and never spends a second `apps.connections.open` call. A redelivery of
+/// an already-durable event across the handoff is deduplicated, not re-run.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_provider_directed_reconnect_hands_off_without_a_receive_gap() {
+    let mut store = seeded_store("acct-sl", ChannelKind::Slack);
+    let queue = FakeQueue::default();
+    let ws = spawn_handoff_ws_fixture();
+    // auth.test, then exactly ONE apps.connections.open: the replacement must
+    // come from the disconnect frame's URL, not a second open.
+    let (api_base, requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+    ]);
+    let adapter = slack_adapter(&api_base);
+
+    // First connection up; one message ingested and ACKed on it.
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    ws.wait_connections(1, "the first socket").await;
+    ws.inject(0, slack_event_envelope("env-1", "3000.001", "before the refresh"));
+    let (adapter, batch) = poll.await.expect("poll task");
+    let mut batch = batch.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-sl".to_string();
+    }
+    assert_eq!(ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted, 1);
+    adapter.commit_batch(&batch.envelopes).await;
+    wait_for_frame(&ws.received, 10, "ACK for env-1", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-1")
+    })
+    .await;
+
+    // The provider-directed refresh, naming the replacement URL.
+    let disconnect = serde_json::json!({
+        "type": "disconnect",
+        "reason": "refresh_requested",
+        "payload": { "connection_url": ws.url },
+    })
+    .to_string();
+    ws.inject(0, disconnect);
+    ws.wait_connections(2, "the replacement socket").await;
+    ws.wait_closed(0, "the old socket to be retired").await;
+
+    // The replacement carries traffic; a redelivery of the event that is
+    // already durable collapses to a duplicate and still gets its ACK.
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    ws.inject(1, slack_event_envelope("env-1b", "3000.001", "before the refresh"));
+    let (adapter, batch) = poll.await.expect("poll task");
+    let mut batch = batch.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1);
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-sl".to_string();
+    }
+    let report = ingest_batch(&mut store, &queue, &batch.envelopes, NOW + 1);
+    assert_eq!(report.duplicates, 1);
+    assert_eq!(report.accepted, 0);
+    adapter.commit_batch(&batch.envelopes).await;
+    wait_for_frame(&ws.received, 10, "ACK for env-1b on the replacement", |connection, frame| {
+        connection == 1 && frame.get("envelope_id").and_then(Value::as_str) == Some("env-1b")
+    })
+    .await;
+
+    // One run despite two sockets and two deliveries; and the fixture saw
+    // exactly the two HTTP calls above — no second connections.open.
+    assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+    requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("auth.test");
+    requests
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("apps.connections.open");
+    assert!(
+        requests
+            .recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "the handoff must not mint a second apps.connections.open URL"
+    );
+}
+
+/// A disconnect frame that names no replacement URL falls back to a fresh
+/// `apps.connections.open`, and the account keeps receiving.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_reconnect_without_a_url_falls_back_to_a_fresh_open() {
+    let mut store = seeded_store("acct-sl", ChannelKind::Slack);
+    let queue = FakeQueue::default();
+    let ws = spawn_handoff_ws_fixture();
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+        // The fallback open minted by the URL-less disconnect.
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+    ]);
+    let adapter = slack_adapter(&api_base);
+
+    let poll = tokio::spawn(async move {
+        let batch = adapter.poll(None).await;
+        (adapter, batch)
+    });
+    ws.wait_connections(1, "the first socket").await;
+    ws.inject(
+        0,
+        serde_json::json!({ "type": "disconnect", "reason": "refresh_requested" }).to_string(),
+    );
+    ws.wait_connections(2, "the fallback socket").await;
+    ws.inject(1, slack_event_envelope("env-7", "4000.001", "after the fallback"));
+    let (adapter, batch) = poll.await.expect("poll task");
+    let mut batch = batch.expect("poll");
+    assert_eq!(batch.envelopes.len(), 1, "the fallback socket must deliver");
+    for envelope in &mut batch.envelopes {
+        envelope.account_id = "acct-sl".to_string();
+    }
+    assert_eq!(ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted, 1);
+    adapter.commit_batch(&batch.envelopes).await;
+    wait_for_frame(&ws.received, 10, "ACK for env-7", |connection, frame| {
+        connection == 1 && frame.get("envelope_id").and_then(Value::as_str) == Some("env-7")
+    })
+    .await;
 }
