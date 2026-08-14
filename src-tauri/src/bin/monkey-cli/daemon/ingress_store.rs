@@ -181,77 +181,15 @@ impl DaemonStore {
         params: &[String],
         now_ms: i64,
     ) -> Result<IngressAcceptance, String> {
-        let ingress_json = serde_json::to_string(ingress).map_err(|error| error.to_string())?;
-        let params_json = serde_json::to_string(params).map_err(|error| error.to_string())?;
-        let dedupe_key = ingress.dedupe_key();
-        let ingress_id = format!("ingr-{}", uuid::Uuid::new_v4().simple());
-        let now_ms = now_ms.max(1);
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        let changed = transaction
-            .execute(
-                "INSERT INTO ingress_turns (
-                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
-                    session_key, state, ingress_json, params_json, job_id, attempts,
-                    last_error, execution_version, execution_digest,
-                    mutation_required, parent_ingress_id, continuation_kind,
-                    continuation_attempt, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, NULL, 0, NULL,
-                           ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
-                 ON CONFLICT(dedupe_key) DO NOTHING",
-                params![
-                    ingress_id,
-                    dedupe_key,
-                    ingress.source.as_str(),
-                    ingress.source_account_id,
-                    ingress.source_event_id,
-                    ingress.session_key,
-                    ingress_json,
-                    params_json,
-                    ingress
-                        .execution
-                        .as_ref()
-                        .map(|execution| i64::from(execution.version())),
-                    ingress
-                        .execution
-                        .as_ref()
-                        .map(|execution| execution.digest().to_string()),
-                    i64::from(ingress.mutation_required),
-                    ingress
-                        .continuation
-                        .as_ref()
-                        .map(|continuation| continuation.parent_ingress_id.clone()),
-                    ingress
-                        .continuation
-                        .as_ref()
-                        .map(|continuation| continuation.kind.as_str().to_string()),
-                    i64::from(ingress.continuation_attempt()),
-                    now_ms,
-                ],
-            )
-            .map_err(|error| format!("Failed to record the accepted turn: {error}"))?;
-        let acceptance = if changed == 1 {
-            IngressAcceptance::Accepted { ingress_id }
-        } else {
-            let (ingress_id, state, job_id): (String, String, Option<String>) = transaction
-                .query_row(
-                    "SELECT ingress_id, state, job_id FROM ingress_turns WHERE dedupe_key=?1",
-                    [&dedupe_key],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            IngressAcceptance::Existing {
-                ingress_id,
-                state: IngressState::parse(&state)?,
-                job_id,
-            }
-        };
+        let acceptance = insert_ingress_turn(&transaction, ingress, params, now_ms)?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(acceptance)
     }
+
 
     /// Record that the queue took this turn. Idempotent: replaying it with the
     /// same job id changes nothing.
@@ -579,6 +517,82 @@ impl DaemonStore {
             .map_err(|error| error.to_string())?;
         Ok(changed == 1)
     }
+}
+
+/// Record one accepted turn on an open connection.
+///
+/// `pub(super)` rather than private because the channel acceptance path has to
+/// hold this in the *same* transaction as the provider event that produced it:
+/// two transactions is exactly the crash window this table exists to close.
+pub(super) fn insert_ingress_turn(
+    connection: &rusqlite::Connection,
+    ingress: &ConversationIngress,
+    params: &[String],
+    now_ms: i64,
+) -> Result<IngressAcceptance, String> {
+    let ingress_json = serde_json::to_string(ingress).map_err(|error| error.to_string())?;
+    let params_json = serde_json::to_string(params).map_err(|error| error.to_string())?;
+    let dedupe_key = ingress.dedupe_key();
+    let ingress_id = format!("ingr-{}", uuid::Uuid::new_v4().simple());
+    let now_ms = now_ms.max(1);
+
+    let changed = connection
+        .execute(
+            "INSERT INTO ingress_turns (
+                ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                session_key, state, ingress_json, params_json, job_id, attempts,
+                last_error, execution_version, execution_digest,
+                mutation_required, parent_ingress_id, continuation_kind,
+                continuation_attempt, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, ?8, NULL, 0, NULL,
+                       ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+             ON CONFLICT(dedupe_key) DO NOTHING",
+            params![
+                ingress_id,
+                dedupe_key,
+                ingress.source.as_str(),
+                ingress.source_account_id,
+                ingress.source_event_id,
+                ingress.session_key,
+                ingress_json,
+                params_json,
+                ingress
+                    .execution
+                    .as_ref()
+                    .map(|execution| i64::from(execution.version())),
+                ingress
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.digest().to_string()),
+                i64::from(ingress.mutation_required),
+                ingress
+                    .continuation
+                    .as_ref()
+                    .map(|continuation| continuation.parent_ingress_id.clone()),
+                ingress
+                    .continuation
+                    .as_ref()
+                    .map(|continuation| continuation.kind.as_str().to_string()),
+                i64::from(ingress.continuation_attempt()),
+                now_ms,
+            ],
+        )
+        .map_err(|error| format!("Failed to record the accepted turn: {error}"))?;
+    if changed == 1 {
+        return Ok(IngressAcceptance::Accepted { ingress_id });
+    }
+    let (ingress_id, state, job_id): (String, String, Option<String>) = connection
+        .query_row(
+            "SELECT ingress_id, state, job_id FROM ingress_turns WHERE dedupe_key=?1",
+            [&dedupe_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(IngressAcceptance::Existing {
+        ingress_id,
+        state: IngressState::parse(&state)?,
+        job_id,
+    })
 }
 
 /// Longest a recorded outcome may be. It is diagnostic text an operator reads

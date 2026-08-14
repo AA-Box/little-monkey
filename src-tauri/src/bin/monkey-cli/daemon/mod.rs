@@ -11,6 +11,7 @@ pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
 pub(crate) mod channel_worker;
 mod engine;
+pub(crate) mod fail_points;
 /// The cross-origin contract: every conversational turn, one durable path.
 #[cfg(test)]
 mod ingress_contract;

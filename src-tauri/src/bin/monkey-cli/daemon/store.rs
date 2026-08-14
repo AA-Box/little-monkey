@@ -2065,6 +2065,45 @@ CREATE INDEX IF NOT EXISTS ingress_turns_parent_idx
     ON ingress_turns(parent_ingress_id);
 "#;
 
+const DAEMON_V13: i64 = 13;
+const DAEMON_V13_CHECKSUM: &str = "daemon-jobs-v13-channel-event-ingress-link";
+
+/// The durable relation between a provider event and the turn it became.
+///
+/// Before this column the two facts were only *correlated* — an event and a
+/// turn that happened to share an account and an event id — and they were
+/// committed by two separate transactions, so a crash between them left an
+/// event row that permanently suppressed the provider's redelivery with no
+/// accepted turn behind it. The column is what lets the acceptance be one
+/// transaction and what lets an operator ask, from SQLite alone, which turn
+/// owns an event and whether one was ever created.
+///
+/// # Existing rows
+///
+/// The backfill links every inbound accepted event that already has a turn, by
+/// the dedupe key that turn was stored under — `source:account:event_id`, the
+/// same three columns the event carries. What it deliberately cannot do is
+/// invent a turn for an event that never got one: those rows stay NULL and are
+/// picked up by the orphan sweep at daemon start, which re-decides them from
+/// the envelope they still carry rather than pretending they completed.
+const DAEMON_V13_SQL: &str = r#"
+ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
+
+UPDATE channel_events
+   SET ingress_id = (
+       SELECT ingress_turns.ingress_id FROM ingress_turns
+        WHERE ingress_turns.dedupe_key =
+              channel_events.source || ':' || channel_events.account_id || ':' ||
+              channel_events.provider_event_id
+   )
+ WHERE direction = 'inbound' AND disposition = 'accepted' AND ingress_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS channel_events_ingress_idx
+    ON channel_events(ingress_id);
+CREATE INDEX IF NOT EXISTS channel_events_orphan_idx
+    ON channel_events(direction, disposition, ingress_id, received_at_ms);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2088,12 +2127,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V10, DAEMON_V10_CHECKSUM, DAEMON_V10_SQL),
     (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
     (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
+    (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V12;
+const DAEMON_LATEST: i64 = DAEMON_V13;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,

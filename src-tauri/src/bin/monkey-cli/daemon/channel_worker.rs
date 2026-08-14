@@ -26,7 +26,7 @@ use little_monkey_lib::channels::ingress::{
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
-use super::channel_ingress::{self, IngressPlan, OutboxPayload, PlannedDecision, SubmitOutcome};
+use super::channel_ingress::{self, ChannelAcceptance, OutboxPayload, SubmitOutcome};
 use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
 use super::store::DaemonStore;
 
@@ -139,12 +139,19 @@ pub(crate) struct InboundReport {
     /// Turns that are durably accepted but did not reach the queue this pass.
     /// Not lost — the next recovery pass re-submits them.
     pub deferred: u32,
-    /// Envelopes that never reached the durable event log at all (a storage
-    /// failure inside planning). Tracked separately from `failed` because the
-    /// cursor must not advance past them: everything in `failed` has a durable
-    /// row a human can see, these have nothing, and only redelivery from the
-    /// provider can bring them back.
+    /// Envelopes that never crossed the durable acceptance boundary (a storage
+    /// failure, or a decision that could not be committed). Tracked separately
+    /// from `failed` because the cursor must not advance past them: everything
+    /// in `failed` has a durable row a human can see, these have nothing, and
+    /// only redelivery from the provider can bring them back.
     pub unrecorded: u32,
+    /// The provider event ids that *did* cross it, in arrival order.
+    ///
+    /// This is the list a transport with its own delivery handshake may
+    /// acknowledge, and it is deliberately not "everything in the batch": one
+    /// envelope that failed to commit must not take the acknowledgement of its
+    /// siblings with it, and must not be acknowledged itself.
+    pub ack_safe: Vec<String>,
 }
 
 /// Feed one adapter batch through the ingress gate.
@@ -161,66 +168,85 @@ pub(crate) fn ingest_batch(
 ) -> InboundReport {
     let mut report = InboundReport::default();
     for envelope in envelopes {
-        match channel_ingress::plan_channel_ingress(store, envelope, now_ms) {
-            Ok(IngressPlan { event_id, decision }) => match decision {
-                PlannedDecision::Run { ingress, params } => {
-                    // Durable accept first, queue second. A crash in between
-                    // leaves a row `recover_pending_ingress` finishes, rather
-                    // than a message the provider considers delivered and the
-                    // event log would refuse as a duplicate.
-                    match channel_ingress::submit_conversation_turn(
-                        store, queue, &ingress, &params, now_ms,
-                    ) {
-                        Ok(SubmitOutcome::Queued { job_id, .. })
-                        | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
-                            report.accepted += 1;
-                            // Best effort: the run is already queued, and
-                            // failing to annotate the event must not undo it.
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Accepted,
-                                None,
-                                Some(&job_id),
-                            );
-                        }
-                        Ok(SubmitOutcome::Deferred { error, .. }) => {
-                            // Accepted durably, not queued yet. Counted as a
-                            // failure of this pass, but the turn is not lost.
-                            report.deferred += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Accepted,
-                                Some(&error),
-                                None,
-                            );
-                        }
-                        Ok(SubmitOutcome::Parked { .. }) => {
-                            report.failed += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Failed,
-                                Some("The turn could not be queued and was parked"),
-                                None,
-                            );
-                        }
-                        Err(error) => {
-                            report.failed += 1;
-                            let _ = store.set_channel_event_disposition(
-                                &event_id,
-                                EventDisposition::Failed,
-                                Some(&error),
-                                None,
-                            );
-                        }
-                    }
+        let accepted = match channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms)
+        {
+            Ok(accepted) => accepted,
+            // Nothing was committed. Not `failed`: that bucket has a durable
+            // row an operator can see, this one has nothing at all, so the
+            // provider must be left to redeliver it.
+            Err(_) => {
+                report.unrecorded += 1;
+                continue;
+            }
+        };
+        // Everything below this line is already durable. Whatever happens to
+        // the queue submission, the message is recoverable and the provider may
+        // be told we have it.
+        report.ack_safe.push(envelope.provider_event_id.clone());
+        match accepted {
+            ChannelAcceptance::Run {
+                event_id,
+                ingress_id,
+                ingress,
+                params,
+                attempts,
+            } => match channel_ingress::submit_accepted_turn(
+                store,
+                queue,
+                &ingress,
+                &params,
+                &ingress_id,
+                attempts,
+                now_ms,
+            ) {
+                Ok(SubmitOutcome::Queued { job_id, .. })
+                | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
+                    report.accepted += 1;
+                    // Best effort: the run is already queued, and failing to
+                    // annotate the event must not undo it.
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        None,
+                        Some(&job_id),
+                    );
                 }
-                PlannedDecision::Challenge => report.challenged += 1,
-                PlannedDecision::Ignore(_) => report.ignored += 1,
-                PlannedDecision::Duplicate => report.duplicates += 1,
+                Ok(SubmitOutcome::Deferred { error, .. }) => {
+                    // Durably accepted, not queued yet. Counted as a failure of
+                    // this pass, but the turn is not lost.
+                    report.deferred += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        Some(&error),
+                        None,
+                    );
+                }
+                Ok(SubmitOutcome::Parked { .. }) => {
+                    report.failed += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Failed,
+                        Some("The turn could not be queued and was parked"),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    // The submission never happened; the accepted turn is still
+                    // durable, so recovery owns it and the event keeps saying so.
+                    report.deferred += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        Some(&error),
+                        None,
+                    );
+                }
             },
-            // Planning failed before anything was recorded. Not `failed`:
-            // that bucket has a durable row, this one has nothing at all.
-            Err(_) => report.unrecorded += 1,
+            ChannelAcceptance::Challenge { .. } => report.challenged += 1,
+            ChannelAcceptance::Ignore { .. } => report.ignored += 1,
+            ChannelAcceptance::Refused { .. } => report.failed += 1,
+            ChannelAcceptance::Duplicate { .. } => report.duplicates += 1,
         }
     }
     report
@@ -260,17 +286,29 @@ pub(crate) async fn poll_account_once(
     )
     .await;
     let report = ingest_batch(store, queue, &batch.envelopes, now_ms);
-    // An envelope that never reached the event log has no durable trace, so
-    // the cursor holds and the provider redelivers the whole batch; the rows
-    // that did land collapse as duplicates. Advancing here would skip the
-    // unrecorded message forever.
+    // An envelope that never crossed the acceptance boundary has no durable
+    // trace, so the cursor holds and the provider redelivers the whole batch;
+    // the ones that did land collapse as duplicates. Advancing here would skip
+    // the unaccepted message forever — a cursor is ordinal, and there is no way
+    // to say "everything past this except that one".
     if report.unrecorded == 0 {
+        super::fail_points::fire(super::fail_points::FailPoint::BeforeCursorCommit)
+            .map_err(|error| error.to_string())?;
         if let Some(next) = batch.cursor {
             store.set_channel_cursor(account_id, POLL_CURSOR_KEY, &next, now_ms)?;
         }
-        // Only now — events recorded, cursor persisted — may a transport with
-        // its own delivery handshake acknowledge the batch to the provider.
-        adapter.commit_batch(&batch.envelopes).await;
+    }
+    // A transport with its own per-message handshake is not ordinal, so it
+    // acknowledges exactly what became durable and leaves the rest to be
+    // redelivered — even when a sibling in the same batch held the cursor back.
+    if !report.ack_safe.is_empty() {
+        let acknowledged: Vec<ChannelEnvelope> = batch
+            .envelopes
+            .iter()
+            .filter(|envelope| report.ack_safe.contains(&envelope.provider_event_id))
+            .cloned()
+            .collect();
+        adapter.commit_batch(&acknowledged).await;
     }
     Ok(report)
 }
@@ -427,6 +465,26 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
         }
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
+
+        // Inbound events an older build recorded as accepted without ever
+        // creating the turn they promised. Once, at start: this build cannot
+        // produce one, so a sweep on every tick would be a query looking for a
+        // state its own code makes impossible.
+        if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
+            match channel_ingress::recover_orphaned_channel_events(&mut store, queue.as_ref(), now) {
+                Ok(recovery) if recovery.recovered + recovery.deferred + recovery.parked > 0 => {
+                    eprintln!(
+                        "monkey daemon: recovered {} inbound message(s) left unfinished by an earlier build, {} parked",
+                        recovery.recovered + recovery.deferred,
+                        recovery.parked
+                    )
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("monkey daemon: could not check for unfinished messages: {error}")
+                }
+            }
+        }
 
         let mut workers: BTreeMap<String, AccountWorker> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
