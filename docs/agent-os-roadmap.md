@@ -1565,11 +1565,24 @@ claim something false.
    libtest captures a passing test's output and no assertion inside one can say
    which of two acceptable answers it got.
 
-2. **`monkey processes limits` crashes on Windows** with `STATUS_STACK_OVERFLOW`
-   (0xc00000fd), found by that same step. Not the controller: a unit test
-   constructs one and reads its capabilities on Windows and passes. The host
-   block this item added to that command is the new code in the path, and the
-   cause is not yet identified. The command is Unix-verified only.
+2. **`monkey-cli` could not start at all on Windows in a debug build**, and this
+   item's CI step is what finally ran one. `STATUS_STACK_OVERFLOW` (0xc00000fd)
+   before `main`'s first statement: Windows sizes the main thread's stack from a
+   PE header field whose linker default reserve is 1 MiB against Unix's 8 MiB,
+   and constructing clap's command tree unoptimized does not fit in it. Fixed by
+   reserving a Unix-sized main stack for that binary at link time.
+
+   **Recorded here because the first diagnosis in this file was wrong, and wrong
+   in the self-serving direction.** It read as "the host block this item added is
+   the new code in that path, cause unidentified" — blaming the change that
+   happened to be nearby. The crash had nothing to do with the resource
+   controller, was not specific to `processes limits`, and predated this work:
+   it looked like that subcommand only because that is the one CI ran. The
+   isolating repro is `(ulimit -s 1024; monkey-cli --version)`, which reproduces
+   on any host and shows the variable is stack size, not subcommand. A unit test
+   constructing a controller and reading its capabilities passed on Windows
+   throughout, because libtest gives each test its own spawned thread rather than
+   the 1 MiB main one — which is also why no test suite could have caught this.
 3. **A browser session owns a process tree and is not routed through the
    controller.** Its Chromium is bounded by `browser_worker`'s own session quotas,
    which are real; wiring it means reconciling two enforcement paths rather than
