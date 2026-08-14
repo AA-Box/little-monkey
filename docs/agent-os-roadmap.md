@@ -1646,6 +1646,27 @@ deleted, because what they say about *how the gap was found* is the useful part.
   would have added 8 GiB of phantom reservation per agent shell and stopped the
   queue for a reason no operator could see.
 
+- **Four agent-controlled spawn paths were classified and still unbounded.** The
+  source contract that lists every file creating a native process carried an
+  exception list — `verify.rs`, `hooks.rs`, `sandbox.rs`, `native_skills.rs` —
+  which recorded the gap honestly and did not close it. Three were real: the
+  verify runner, the hook runner and the sandboxed run each had a deadline and
+  nothing else, implemented as a `sleep` racing the capture and a process-group
+  kill if the sleep won. Nothing bounded memory or process count on the three
+  sites whose whole purpose is running a build, a formatter and an arbitrary
+  command, and the deadline reached only as far as a process group reaches. Each
+  resolves the same `EffectiveLimits` now, installs the containment before the
+  child's first instruction, fails closed when it cannot confirm it, and takes
+  its own deadline as the wall limit. The sandboxed run also stopped collecting
+  both streams whole — it was the one runner with no downstream cap to save it.
+
+  The fourth was a misreading rather than a gap: `native_skills.rs` was called an
+  agent shell on the belief that it runs a skill's own executable, and its only
+  child is `git`. A skill's program goes through the shell tool like anything
+  else. The classification says so, and the note says what the old one got wrong,
+  because a wrong reason on a correct-looking line is what an exception list is
+  for.
+
 ### The bug this slice existed to fix
 
 **A kernel-held bound does not announce itself by making a measurement exceed a
