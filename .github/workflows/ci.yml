@@ -219,9 +219,18 @@ jobs:
         # `/proc/self/cgroup` points somewhere `CgroupScope` can create under.
         # Falls through unchanged when the provisioning step found no v2
         # hierarchy, which keeps the supervised fallback the tested path there.
+        #
+        # The migration goes through `sudo` because cgroup v2 requires write
+        # permission on the *common ancestor* of the source and destination, not
+        # only on the destination: this shell starts in the root cgroup, so the
+        # ancestor is the root, which is root-owned. Chowning the leaf is not
+        # enough and the first attempt failed here with EACCES. Root provisions,
+        # exactly as the btrfs step above needs `sudo mount`; nothing the app
+        # does at runtime is privileged, and it still creates its own scope as
+        # the unprivileged user under a subtree it owns.
         run: |
-          if [ -n "${LITTLE_MONKEY_CI_CGROUP:-}" ] && [ -w "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" ]; then
-            echo $$ > "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs"
+          if [ -n "${LITTLE_MONKEY_CI_CGROUP:-}" ]; then
+            echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
             echo "running under $(cat /proc/self/cgroup)"
           fi
           pnpm test:rust
