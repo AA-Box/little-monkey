@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
 const PRIVATE_HOME: &str = "home";
 const PRIVATE_TMP: &str = "tmp";
@@ -702,31 +702,44 @@ pub struct ShellOutput {
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// What the child produced, as opposed to what was retained. Equal to the
+    /// buffer lengths when nothing was dropped.
+    pub stdout_total_bytes: u64,
+    pub stderr_total_bytes: u64,
+    pub truncated: bool,
 }
 
 /// AppHandle-free entry point used by `monkey-cli`; desktop foreground and
 /// background tools use the same `spawn_*` primitives above so the authority
 /// boundary cannot drift by client.
+///
+/// `output_cap` is the ceiling each stream is held to **as it arrives**. `None`
+/// keeps everything and is for the callers whose correctness needs the whole
+/// document; every other caller passes a number, because this used to
+/// `read_to_end` both pipes and a command printing a gigabyte took a gigabyte of
+/// this process's heap with it.
 pub async fn run_to_output(
     workspace_root: &Path,
     cwd: &Path,
     shell_command: &str,
     timeout: Duration,
+    output_cap: Option<usize>,
 ) -> io::Result<ShellOutput> {
     let mut shell = spawn_foreground(workspace_root, cwd, shell_command)?;
-    let mut stdout = shell
+    let stdout = shell
         .take_stdout()
         .ok_or_else(|| io::Error::other("confined shell had no stdout pipe"))?;
-    let mut stderr = shell
+    let stderr = shell
         .take_stderr()
         .ok_or_else(|| io::Error::other("confined shell had no stderr pipe"))?;
     let result = tokio::time::timeout(timeout, async {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let (status, _, _) = tokio::try_join!(
+        // Concurrently, always: a child that fills stderr while this awaits
+        // stdout deadlocks on a full pipe buffer, and a bounded reader makes that
+        // more likely rather than less because it never stops reading early.
+        let (status, out, err) = tokio::try_join!(
             shell.wait(),
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
+            crate::output_cap::drain_capped(stdout, output_cap),
+            crate::output_cap::drain_capped(stderr, output_cap),
         )?;
         Ok::<_, io::Error>((status, out, err))
     })
@@ -734,8 +747,11 @@ pub async fn run_to_output(
     match result {
         Ok(Ok((status, stdout, stderr))) => Ok(ShellOutput {
             exit_code: status.code(),
-            stdout,
-            stderr,
+            stdout_total_bytes: stdout.total_bytes(),
+            stderr_total_bytes: stderr.total_bytes(),
+            truncated: stdout.was_truncated() || stderr.was_truncated(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
         }),
         Ok(Err(error)) => {
             shell.terminate_tree();
@@ -996,6 +1012,7 @@ mod tests {
             &workspace,
             "/bin/launchctl print system >\"$TMPDIR/launchctl-out\" 2>&1 && printf ESCAPE_MACH || printf DENIED_MACH",
             Duration::from_secs(20),
+            None,
         )
         .await
         .expect("run confined launchd probe");
@@ -1032,7 +1049,7 @@ mod tests {
             quote(&log_file),
             quote(&pid_file),
         );
-        run_to_output(&workspace, &workspace, &command, Duration::from_secs(20))
+        run_to_output(&workspace, &workspace, &command, Duration::from_secs(20), None)
             .await
             .expect("run group-escape probe");
         let pid: libc::pid_t = fs::read_to_string(pid_file)
@@ -1185,7 +1202,7 @@ mod tests {
             outside.display(),
         );
 
-        let output = run_to_output(&workspace, &workspace, &command, Duration::from_secs(20))
+        let output = run_to_output(&workspace, &workspace, &command, Duration::from_secs(20), None)
             .await
             .expect("run confined shell");
         let stdout = String::from_utf8_lossy(&output.stdout);

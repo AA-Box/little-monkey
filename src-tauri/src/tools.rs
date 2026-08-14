@@ -17,6 +17,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::output_cap::{drain_capped, CappedStream};
 use crate::workspace::display_relative_path;
 use crate::{
     artifact_commands, artifact_store::ArtifactStore, checkpoints, memory, native_skill_commands,
@@ -1064,69 +1065,6 @@ fn stream_cap(full_output: Option<bool>) -> Option<usize> {
     }
 }
 
-/// One captured stream, already held to its ceiling.
-///
-/// Bytes rather than a `String` because the cap is enforced during the read, when
-/// a chunk boundary can land inside a multi-byte character and there is no whole
-/// string to decode yet. [`Self::into_string`] does the one decode, at the end,
-/// over a buffer that is bounded by construction.
-#[derive(Debug, Default)]
-struct CappedStream {
-    /// The kept tail. At most `cap` bytes once a cap is in force.
-    bytes: Vec<u8>,
-    /// Whether anything was dropped from the front to stay inside the cap.
-    truncated: bool,
-}
-
-impl CappedStream {
-    /// Appends `chunk`, dropping whole bytes off the *front* once `cap` is
-    /// exceeded.
-    ///
-    /// Tail, not head, for the reason [`crate::output_cap::cap_tail`] gives: a
-    /// failing command prints its diagnostic last. Front-dropping is what makes
-    /// this bounded in the first place — a head-keeping cap could stop reading,
-    /// but then the child blocks forever on a full pipe instead of running to
-    /// completion, which turns a noisy command into a timeout.
-    fn push(&mut self, chunk: &[u8], cap: Option<usize>) {
-        self.bytes.extend_from_slice(chunk);
-        let Some(cap) = cap else { return };
-        if self.bytes.len() <= cap {
-            return;
-        }
-        let overflow = self.bytes.len() - cap;
-        self.bytes.drain(..overflow);
-        self.truncated = true;
-    }
-
-    /// Decodes the kept tail, prefixing the shared truncation marker if the front
-    /// was dropped.
-    ///
-    /// The leading continuation bytes are shed first, so a cut that landed inside
-    /// a character widens the kept region forward to the next boundary instead of
-    /// decoding to a replacement character. That is exactly what `cap_tail` did
-    /// when it worked on a whole `String`, and keeping the behaviour identical is
-    /// why it is done here rather than left to `from_utf8_lossy`.
-    fn into_string(mut self) -> (String, bool) {
-        if self.truncated {
-            let keep = self
-                .bytes
-                .iter()
-                .position(|byte| (byte & 0b1100_0000) != 0b1000_0000)
-                .unwrap_or(self.bytes.len());
-            self.bytes.drain(..keep);
-        }
-        let decoded = String::from_utf8_lossy(&self.bytes).to_string();
-        if self.truncated {
-            (
-                format!("{}{decoded}", crate::output_cap::TRUNCATION_MARKER),
-                true,
-            )
-        } else {
-            (decoded, false)
-        }
-    }
-}
-
 /// What a finished `run_shell` child produced, with both streams already bounded.
 struct ShellCapture {
     status: std::process::ExitStatus,
@@ -1134,30 +1072,6 @@ struct ShellCapture {
     stderr: CappedStream,
 }
 
-/// Reads one pipe to EOF, keeping at most `cap` bytes of its tail.
-///
-/// Reading to EOF rather than stopping at the cap is the whole point: an
-/// early-returning reader leaves the child blocked on a full pipe buffer, so a
-/// command that merely printed too much would report a timeout instead of its
-/// exit code.
-async fn drain_capped<R>(mut reader: R, cap: Option<usize>) -> std::io::Result<CappedStream>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut stream = CappedStream::default();
-    // 8 KiB: larger than the 64 KiB pipe buffer would not help (the kernel hands
-    // over what it has), and smaller would just mean more syscalls.
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(stream);
-        }
-        stream.push(&chunk[..read], cap);
-    }
-}
 
 /// Waits for `child` while draining both of its pipes, holding each to `cap`.
 ///
@@ -1695,9 +1609,9 @@ mod tests {
         for _ in 0..4_096 {
             stream.push(&[b'x'; 1_000], Some(CAP));
             assert!(
-                stream.bytes.len() <= CAP,
+                stream.as_bytes().len() <= CAP,
                 "the buffer grew to {} bytes past a {CAP}-byte cap",
-                stream.bytes.len()
+                stream.as_bytes().len()
             );
         }
         let (value, truncated) = stream.into_string();
@@ -1785,8 +1699,8 @@ mod tests {
             Some(3),
             "the child's own exit code must survive a truncated capture"
         );
-        assert!(captured.stdout.bytes.len() <= CAP);
-        assert!(captured.stderr.bytes.len() <= CAP);
+        assert!(captured.stdout.as_bytes().len() <= CAP);
+        assert!(captured.stderr.as_bytes().len() <= CAP);
 
         let (stdout, stdout_truncated) = captured.stdout.into_string();
         let (stderr, stderr_truncated) = captured.stderr.into_string();

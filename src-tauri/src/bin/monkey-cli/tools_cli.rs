@@ -334,6 +334,9 @@ pub async fn run_shell(
         &cwd_path,
         command,
         SHELL_TIMEOUT,
+        // The same ceiling the desktop shell tool uses, and for the same reason:
+        // this output goes straight into a model's context window.
+        Some(little_monkey_lib::output_cap::MODEL_OUTPUT_CAP),
     )
     .await
     .map_err(|error| {

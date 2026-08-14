@@ -176,14 +176,19 @@ fn find_command<'a>(config: &'a VerifyConfig, command_id: &str) -> Option<&'a Ve
     config.commands.iter().find(|c| c.id == command_id)
 }
 
-/// Tail-caps `s` at [`VERIFY_OUTPUT_CAP`] bytes.
+/// A finished verify command, with both streams already held to
+/// [`VERIFY_OUTPUT_CAP`] as they arrived.
 ///
-/// A thin wrapper over [`crate::output_cap::cap_tail`], kept so this module's two
-/// call sites stay readable. `VerifyResult` has no truncation flag on the wire, so
-/// the marker in the text is the only signal here — unlike the shell tool, whose
-/// callers may need to parse the output as a whole document.
-fn cap_output(s: String) -> String {
-    crate::output_cap::cap_tail(s, VERIFY_OUTPUT_CAP).0
+/// Replaces `std::process::Output` here so the type itself carries the bound:
+/// `Output` holds two unbounded `Vec<u8>`s, which is what
+/// `wait_with_output` filled before anything trimmed them. `VerifyResult` has no
+/// truncation flag on the wire, so the marker in the text is the only signal —
+/// unlike the shell tool, whose callers may need to parse the output as a whole
+/// document.
+struct CapturedVerifyOutput {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 /// Core, `AppHandle`-free execution logic — a near-copy of
@@ -243,7 +248,7 @@ pub async fn run_command_impl(
             .max(1),
     );
 
-    let child = match command_builder.spawn() {
+    let mut child = match command_builder.spawn() {
         Ok(child) => child,
         Err(e) => {
             return VerifyResult {
@@ -270,20 +275,47 @@ pub async fn run_command_impl(
             .clone()
     });
 
-    // Captured before `wait_with_output` consumes the child; with
-    // `process_group(0)` above, the child's own pid is also its group id.
+    // Captured before the wait below; with `process_group(0)` above, the child's
+    // own pid is also its group id.
     let child_pgid = child.id();
 
-    let (outcome, timed_out): (Result<std::process::Output, String>, bool) = match &cancel {
+    // Bounded as the bytes arrive rather than trimmed after the child exits.
+    // `wait_with_output` collected both pipes whole, so a verify command that
+    // printed a gigabyte — a `-v` build, a test runner in debug mode — took a
+    // gigabyte of this app's heap before `cap_output` looked at any of it. The
+    // two drains run concurrently with the wait for the older reason: a child
+    // that fills one pipe while nothing reads it blocks forever.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let collect = async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            crate::output_cap::drain_capped(
+                stdout_pipe.expect("stdout was piped at spawn"),
+                Some(VERIFY_OUTPUT_CAP)
+            ),
+            crate::output_cap::drain_capped(
+                stderr_pipe.expect("stderr was piped at spawn"),
+                Some(VERIFY_OUTPUT_CAP)
+            ),
+        )?;
+        Ok::<_, std::io::Error>(CapturedVerifyOutput {
+            code: status.code(),
+            stdout: stdout.into_string().0,
+            stderr: stderr.into_string().0,
+        })
+    };
+
+    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = match &cancel {
         Some(cancel) => tokio::select! {
-            result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
+            result = collect => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
             _ = cancel.notified() => (Err("Command cancelled by the user".to_string()), false),
             _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
         },
         // Lock poisoned — extremely unlikely, and cancellation simply isn't
         // available for this run; the timeout still applies.
         None => tokio::select! {
-            result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
+            result = collect => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
             _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
         },
     };
@@ -320,9 +352,9 @@ pub async fn run_command_impl(
             command_id: cmd.id.clone(),
             label: cmd.label.clone(),
             kind: cmd.kind.clone(),
-            code: output.status.code(),
-            stdout: cap_output(String::from_utf8_lossy(&output.stdout).to_string()),
-            stderr: cap_output(String::from_utf8_lossy(&output.stderr).to_string()),
+            code: output.code,
+            stdout: output.stdout,
+            stderr: output.stderr,
             duration_ms,
             timed_out: false,
         },
