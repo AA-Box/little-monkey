@@ -1278,8 +1278,13 @@ mod tests {
         assert_eq!(sent[0].account_id, "acct-1");
         assert_eq!(sent[0].conversation_id, "chat-9");
         assert_eq!(sent[0].text, "the build passed");
-        // Keyed on the job, so a retried run cannot duplicate the send.
-        assert_eq!(sent[0].idempotency_key, "send-job-1-0");
+        // Keyed on the job and what was sent, so a run replaying this call
+        // recomputes the same key rather than a second message.
+        assert!(
+            sent[0].idempotency_key.starts_with("send-job-1-"),
+            "{}",
+            sent[0].idempotency_key
+        );
 
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events[0].direction, EventDirection::Outbound);
@@ -1431,6 +1436,179 @@ mod tests {
         .expect_err("no such artifact");
         assert!(error.contains("no stored artifact"), "{error}");
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    /// A file on its own is a message. The tool's schema stopped requiring
+    /// text for exactly this: "here is the chart" is often the chart.
+    #[tokio::test]
+    async fn an_artifact_with_no_text_is_a_message_and_reaches_the_adapter() {
+        let mut store = seeded_store();
+        let root = scratch_root();
+        let paths = DaemonPaths::under(&root);
+        let blobs = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            root.join("content-v1"),
+            16 * 1024 * 1024,
+        )
+        .expect("store");
+        let blob = blobs.put(b"a rendered chart").expect("blob");
+
+        let mut request = send_to("chat-9", "");
+        request.artifact_ids = vec![blob.id.clone()];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &request, &plan, None, Some("job-a"), NOW).expect("queued");
+
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent[0].text, "");
+        assert_eq!(sent[0].attachments.len(), 1);
+        assert_eq!(sent[0].attachments[0].artifact_id, blob.id);
+
+        // Text alongside the same file is the other half of the contract.
+        drop(sent);
+        let mut with_text = request.clone();
+        with_text.text = "the chart you asked for".to_string();
+        let plan = plan_send(&with_text, &account_authority(), None).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &with_text,
+            &plan,
+            None,
+            Some("job-b"),
+            NOW,
+        )
+        .expect("queued");
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 120_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].text, "the chart you asked for");
+        assert_eq!(sent[1].attachments.len(), 1);
+    }
+
+    /// An origin reply inherits the thread and the message it answers, and an
+    /// explicit destination inherits neither: a provider id from one
+    /// conversation means nothing in another.
+    #[tokio::test]
+    async fn a_reply_carries_the_origin_thread_and_message_and_a_redirect_does_not() {
+        use super::super::channel_store::ChannelOrigin;
+
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let origin = ChannelOrigin {
+            account_id: "acct-1".to_string(),
+            conversation_id: "chat-7".to_string(),
+            thread_id: Some("thread-3".to_string()),
+            provider_event_id: "msg-42".to_string(),
+        };
+        let reply_authority = SendAuthority {
+            reply: true,
+            cross_conversation: true,
+            ..SendAuthority::default()
+        };
+
+        // Everything omitted: the destination is the origin, in full.
+        let bare = ChannelSendRequest {
+            text: "on it".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&bare, &reply_authority, Some(&origin)).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &bare,
+            &plan,
+            Some(&origin),
+            Some("job-reply"),
+            NOW,
+        )
+        .expect("queued");
+
+        // Another conversation on the same account: no borrowed thread, no
+        // borrowed reply target.
+        let elsewhere = send_to("chat-other", "heads up");
+        let plan = plan_send(&elsewhere, &reply_authority, Some(&origin)).expect("authorized");
+        queue_send(
+            &mut store,
+            &paths,
+            &elsewhere,
+            &plan,
+            Some(&origin),
+            Some("job-reply"),
+            NOW,
+        )
+        .expect("queued");
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        let reply = sent
+            .iter()
+            .find(|message| message.conversation_id == "chat-7")
+            .expect("the reply");
+        assert_eq!(reply.thread_id.as_deref(), Some("thread-3"));
+        assert_eq!(reply.reply_to_provider_id.as_deref(), Some("msg-42"));
+        // Keyed as a reply to this job; the redirect is a different send and
+        // gets its own key.
+        assert!(
+            reply.idempotency_key.starts_with("reply-job-reply-"),
+            "{}",
+            reply.idempotency_key
+        );
+
+        let redirected = sent
+            .iter()
+            .find(|message| message.conversation_id == "chat-other")
+            .expect("the redirect");
+        assert_eq!(redirected.thread_id, None);
+        assert_eq!(redirected.reply_to_provider_id, None);
+        // Two different sends from one job are two rows: the key separates
+        // them by content, not by a counter.
+        assert_ne!(redirected.idempotency_key, reply.idempotency_key);
+    }
+
+    /// The same run queueing the same message twice — a retried job replaying
+    /// its tool calls — must not put a second message on the wire.
+    #[tokio::test]
+    async fn a_replayed_run_queues_one_message_not_two() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let request = send_to("chat-9", "the build passed");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+
+        let first =
+            queue_send(&mut store, &paths, &request, &plan, None, Some("job-x"), NOW).expect("first");
+        assert_eq!(first["status"], "queued");
+
+        // The replay recomputes the same key: the row count for the job is
+        // what numbers it, and the first row is still the only one.
+        let second = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-x"),
+            NOW + 5,
+        )
+        .expect("second");
+        assert_eq!(second["status"], "already_queued");
+        assert_eq!(second["outbox_id"], first["outbox_id"]);
+        assert_eq!(store.outbox_count_for_job("job-x").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

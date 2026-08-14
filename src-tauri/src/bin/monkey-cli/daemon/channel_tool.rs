@@ -14,8 +14,9 @@
 //!   tool returns as soon as the row is durable, so a crash between "the model
 //!   said it" and "the provider has it" resolves the same way every other
 //!   outbound message does. This file never calls a provider adapter.
-//! - The idempotency key is derived from the job and the number of messages it
-//!   has already queued, so a retried run cannot duplicate a send.
+//! - The idempotency key is derived from the job and from what is being sent,
+//!   so a run that re-executes its tool calls recomputes the same key and the
+//!   outbox recognizes the row instead of queueing a second message.
 //! - Reply depth is carried forward, which is what lets the inbound gate stop
 //!   two agents from talking to each other forever.
 
@@ -233,7 +234,7 @@ pub(crate) fn plan_send(
 ) -> Result<SendPlan, String> {
     let text = request.text.trim();
     if text.is_empty() && request.artifact_ids.is_empty() {
-        return Err("A message must contain some text.".to_string());
+        return Err("A message must carry some text or at least one artifact.".to_string());
     }
     if text.chars().count() > MAX_REPLY_CHARS {
         return Err(format!(
@@ -356,10 +357,32 @@ pub(crate) fn queue_send(
         _ => 0,
     };
     let idempotency_key = match job_id {
+        // Derived from the job and from *what is being sent*, never from how
+        // many sends came before it. A counter would shift under a run that
+        // re-executes its tool calls — the earlier rows are still there, so
+        // the replayed first message would take the second slot and go out
+        // twice. Keyed by content, the replay recomputes the key the outbox
+        // already holds and the row is recognized rather than duplicated.
+        //
+        // The cost is deliberate: one run that sends byte-identical messages
+        // to the same destination twice gets one message and an
+        // `already_queued` answer telling it so. An accidental double-send
+        // reaches a person and cannot be taken back; a suppressed identical
+        // repeat is visible in the tool's own result.
         Some(job_id) => {
-            let sequence = store.outbox_count_for_job(job_id)?;
             let prefix = if is_origin_reply { "reply" } else { "send" };
-            format!("{prefix}-{job_id}-{sequence}")
+            let digest = sha256_hex(
+                send_fingerprint(
+                    &account_id,
+                    &conversation_id,
+                    thread_id.as_deref(),
+                    reply_to_provider_id.as_deref(),
+                    text,
+                    &attachments,
+                )
+                .as_bytes(),
+            );
+            format!("{prefix}-{job_id}-{}", &digest[..32])
         }
         // No durable job to be retried under: a fresh key per call is the
         // honest statement that nothing will ever legitimately resubmit it.
@@ -421,6 +444,36 @@ pub(crate) fn queue_send(
     })
 }
 
+/// Everything that makes one send different from another, in one string.
+///
+/// Length-prefixed rather than delimited, so no id containing the separator
+/// can be arranged to collide with a different set of fields.
+fn send_fingerprint(
+    account_id: &str,
+    conversation_id: &str,
+    thread_id: Option<&str>,
+    reply_to_provider_id: Option<&str>,
+    text: &str,
+    attachments: &[OutboundAttachment],
+) -> String {
+    let mut fingerprint = String::new();
+    let mut field = |value: &str| {
+        fingerprint.push_str(&value.len().to_string());
+        fingerprint.push(':');
+        fingerprint.push_str(value);
+        fingerprint.push('|');
+    };
+    field(account_id);
+    field(conversation_id);
+    field(thread_id.unwrap_or_default());
+    field(reply_to_provider_id.unwrap_or_default());
+    field(text);
+    for attachment in attachments {
+        field(&attachment.artifact_id);
+    }
+    fingerprint
+}
+
 /// A resolved destination: concrete account and conversation, and whether the
 /// pair is exactly where this run came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,23 +527,36 @@ fn resolve_destination(
 /// The authorization ladder. Each refusal names the missing grant rather than
 /// a generic "denied", because the operator reading it in the transcript is
 /// the one who could add the grant.
+///
+/// The three rules do not overlap: exactly one applies to any destination.
+/// Answering the origin conversation needs `reply`; another conversation on
+/// the origin account needs `cross_conversation`; another account needs that
+/// account named in `accounts`. In particular, naming the *origin* account in
+/// `accounts` grants nothing extra — it is already the account this run
+/// arrived on, and letting it stand in for `cross_conversation` would widen a
+/// run's reach inside its own account by a grant that says nothing about
+/// conversations.
 fn authorize(
     account_id: &str,
     is_origin_reply: bool,
     origin_on_this_account: bool,
     authority: &SendAuthority,
 ) -> Result<SendRule, &'static str> {
-    let account_granted = authority.accounts.iter().any(|id| id == account_id);
     if is_origin_reply {
         if authority.reply {
             return Ok(SendRule::OriginReply);
         }
         return Err("This run was not granted the authority to answer its conversation.");
     }
-    if origin_on_this_account && (authority.cross_conversation || account_granted) {
-        return Ok(SendRule::CrossConversation);
+    if origin_on_this_account {
+        if authority.cross_conversation {
+            return Ok(SendRule::CrossConversation);
+        }
+        return Err(
+            "This run's permission snapshot does not grant other conversations on this account.",
+        );
     }
-    if !origin_on_this_account && account_granted {
+    if authority.accounts.iter().any(|id| id == account_id) {
         return Ok(SendRule::CrossAccount);
     }
     Err("This run's permission snapshot does not grant that destination.")
@@ -790,6 +856,69 @@ mod tests {
         assert!(authorize("chan-origin", true, true, &authority).is_err());
     }
 
+    /// Naming the run's *own* account in the account grant must not stand in
+    /// for the conversation grant. The two answer different questions — "which
+    /// accounts may this run use" and "may it leave its own conversation" —
+    /// and folding one into the other let a run reach every conversation on
+    /// the account it arrived on without anyone granting that.
+    #[test]
+    fn granting_the_origin_account_does_not_open_its_other_conversations() {
+        let authority = SendAuthority {
+            reply: true,
+            cross_conversation: false,
+            accounts: vec!["chan-origin".to_string()],
+        };
+        assert_eq!(
+            authorize("chan-origin", true, true, &authority),
+            Ok(SendRule::OriginReply)
+        );
+        let refused =
+            authorize("chan-origin", false, true, &authority).expect_err("no conversation grant");
+        assert!(refused.contains("other conversations"), "{refused}");
+    }
+
+    /// The three grants, each on its own, against every destination shape.
+    /// One table, because what matters is as much what each grant does *not*
+    /// reach as what it does.
+    #[test]
+    fn each_grant_reaches_exactly_what_it_names() {
+        // reply only: the origin conversation, nothing else.
+        let reply = reply_authority();
+        assert_eq!(
+            authorize("chan-origin", true, true, &reply),
+            Ok(SendRule::OriginReply)
+        );
+        assert!(authorize("chan-origin", false, true, &reply).is_err());
+        assert!(authorize("chan-second", false, false, &reply).is_err());
+
+        // cross_conversation only: other conversations on the origin account,
+        // and still no other account.
+        let cross = SendAuthority {
+            reply: false,
+            cross_conversation: true,
+            accounts: Vec::new(),
+        };
+        assert_eq!(
+            authorize("chan-origin", false, true, &cross),
+            Ok(SendRule::CrossConversation)
+        );
+        assert!(authorize("chan-second", false, false, &cross).is_err());
+        // Without `reply` it cannot even answer its own conversation.
+        assert!(authorize("chan-origin", true, true, &cross).is_err());
+
+        // A named account: that account, and no neighbouring one.
+        let named = SendAuthority {
+            reply: false,
+            cross_conversation: false,
+            accounts: vec!["chan-second".to_string()],
+        };
+        assert_eq!(
+            authorize("chan-second", false, false, &named),
+            Ok(SendRule::CrossAccount)
+        );
+        assert!(authorize("chan-third", false, false, &named).is_err());
+    }
+
     #[test]
     fn a_malformed_artifact_id_is_refused() {
         let base =
@@ -861,5 +990,29 @@ mod tests {
         assert!(properties.get("attachments").is_none());
         assert!(properties.get("paths").is_none());
         assert_eq!(schema["function"]["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn the_schema_offers_every_destination_field_and_demands_none_of_them() {
+        // The model-visible contract, field by field: account, destination,
+        // thread, reply target and artifacts are all expressible, and `text`
+        // is not required — an artifact-only message is a legal send, and a
+        // schema demanding text would make it unsayable.
+        let schema = little_monkey_lib::agent_tools::send_message_tool_def();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in ["text", "account", "to", "thread", "reply_to", "artifacts"] {
+            assert!(properties.get(field).is_some(), "missing '{field}'");
+        }
+        assert_eq!(
+            schema["function"]["parameters"]["required"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        // And the daemon, not the schema, is what refuses a message carrying
+        // neither.
+        let error = plan_send(&request("  "), &reply_authority(), Some(&origin()))
+            .expect_err("nothing to send");
+        assert!(error.contains("text or at least one artifact"), "{error}");
     }
 }

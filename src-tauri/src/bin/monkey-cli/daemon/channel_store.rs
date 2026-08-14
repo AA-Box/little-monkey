@@ -1092,9 +1092,13 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
-    /// How many outbound rows this job already queued. The reply tool uses it
-    /// to build a stable idempotency key per call, so a retried run does not
-    /// send the same reply twice.
+    /// How many outbound rows this job queued.
+    ///
+    /// Test-only: the send path used to derive its idempotency key from this
+    /// count, which shifted under a replayed run and let the first message go
+    /// out twice. The key is content-derived now, and this remains only as
+    /// the assertion tests make about how many rows a run produced.
+    #[cfg(test)]
     pub fn outbox_count_for_job(&self, job_id: &str) -> Result<u32, String> {
         self.connection
             .query_row(
@@ -1662,6 +1666,156 @@ mod tests {
             .insert_channel_route(&route("r4", RouteScope::conversation("acct-1", "C1")))
             .expect("conversation route");
         assert_eq!(store.channel_routes().expect("routes").len(), 3);
+    }
+
+    /// Every rung of the declared ladder, stored together and resolved
+    /// against one message. The six coexist — different rungs never tie — and
+    /// disabling the winner hands the message to the next one down, all the
+    /// way to the global default.
+    #[test]
+    fn the_whole_ladder_stores_and_resolves_in_order() {
+        use little_monkey_lib::channels::routing::resolve_route;
+        use little_monkey_lib::channels::types::{
+            ChannelConversation, ChannelEnvelope, ChannelSender, ConversationKind,
+        };
+
+        let mut store = seeded();
+        let rungs = [
+            (
+                "r-sender",
+                RouteScope::conversation("acct-1", "C1")
+                    .with_thread("T1")
+                    .with_sender("U1"),
+            ),
+            (
+                "r-thread",
+                RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            ),
+            ("r-conversation", RouteScope::conversation("acct-1", "C1")),
+            ("r-account", RouteScope::account("acct-1")),
+            (
+                "r-provider",
+                RouteScope::channel_default(ChannelKind::Telegram),
+            ),
+            ("r-global", RouteScope::global_default()),
+        ];
+        for (id, scope) in rungs.clone() {
+            store
+                .insert_channel_route(&route(id, scope))
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+        }
+
+        let message = ChannelEnvelope {
+            account_id: "acct-1".into(),
+            kind: ChannelKind::Telegram,
+            provider_event_id: "evt-1".into(),
+            conversation: ChannelConversation {
+                conversation_id: "C1".into(),
+                kind: ConversationKind::Channel,
+                thread_id: Some("T1".into()),
+                title: None,
+            },
+            sender: ChannelSender::new("U1"),
+            text: "hello".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            mentions_self: true,
+            received_at_ms: 1_000,
+            metadata: Default::default(),
+        };
+
+        // Turn the winner off and the next rung down takes it, in order.
+        for (id, _) in rungs {
+            let routes = store.channel_routes().expect("routes");
+            let resolved = resolve_route(&routes, &message).unwrap_or_else(|error| {
+                panic!("expected {id} to win, got {error}");
+            });
+            assert_eq!(resolved.route_id, id);
+            store
+                .set_channel_route_enabled(id, false, 2_000)
+                .expect("disable");
+        }
+        // With every rung disabled nothing routes — silently dropping the
+        // message instead would be the failure this reports.
+        assert!(resolve_route(&store.channel_routes().expect("routes"), &message).is_err());
+    }
+
+    /// Ambiguity is refused on every rung, not just the one that had a test.
+    /// Two routes tie the moment nothing in their scopes separates them, and
+    /// the rung they sit on does not change that.
+    #[test]
+    fn a_second_route_on_any_rung_with_the_same_scope_is_refused() {
+        for (index, scope) in [
+            RouteScope::global_default(),
+            RouteScope::channel_default(ChannelKind::Telegram),
+            RouteScope::account("acct-1"),
+            RouteScope::conversation("acct-1", "C1"),
+            RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            RouteScope::conversation("acct-1", "C1")
+                .with_thread("T1")
+                .with_sender("U1"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut store = seeded();
+            store
+                .insert_channel_route(&route("first", scope.clone()))
+                .unwrap_or_else(|error| panic!("rung {index}: {error}"));
+            let error = store
+                .insert_channel_route(&route("second", scope.clone()))
+                .unwrap_err();
+            assert!(error.contains("first"), "rung {index}: {error}");
+            // And an edit into the same conflict fails exactly like insertion.
+            store
+                .insert_channel_route(&route("other", RouteScope::account("acct-2")))
+                .expect("a route on a different scope");
+            let error = store
+                .update_channel_route(&route("other", scope))
+                .unwrap_err();
+            assert!(error.contains("first"), "rung {index}: {error}");
+            assert_eq!(store.channel_routes().expect("routes").len(), 2);
+        }
+    }
+
+    /// The rung the daemon declares is `account + conversation + thread +
+    /// sender`; a sender route without a thread is not a narrower rung, it is
+    /// a route that would match that sender in every thread of the
+    /// conversation while claiming to be the most specific one there is.
+    #[test]
+    fn a_sender_scope_with_no_thread_never_reaches_the_table() {
+        let mut store = seeded();
+        let error = store
+            .insert_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1").with_sender("U1"),
+            ))
+            .unwrap_err();
+        assert!(error.contains("thread"), "{error}");
+        assert!(store.channel_routes().expect("routes").is_empty());
+
+        // Nor by editing a legal route into one.
+        store
+            .insert_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1")
+                    .with_thread("T1")
+                    .with_sender("U1"),
+            ))
+            .expect("the legal sender rung");
+        assert!(store
+            .update_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1").with_sender("U1"),
+            ))
+            .is_err());
+        assert_eq!(
+            store.channel_routes().expect("routes")[0]
+                .scope
+                .thread_id
+                .as_deref(),
+            Some("T1")
+        );
     }
 
     #[test]
