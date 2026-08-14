@@ -190,7 +190,6 @@ impl DaemonStore {
         Ok(acceptance)
     }
 
-
     /// Record that the queue took this turn. Idempotent: replaying it with the
     /// same job id changes nothing.
     pub fn mark_ingress_queued(

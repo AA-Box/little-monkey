@@ -168,17 +168,17 @@ pub(crate) fn ingest_batch(
 ) -> InboundReport {
     let mut report = InboundReport::default();
     for envelope in envelopes {
-        let accepted = match channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms)
-        {
-            Ok(accepted) => accepted,
-            // Nothing was committed. Not `failed`: that bucket has a durable
-            // row an operator can see, this one has nothing at all, so the
-            // provider must be left to redeliver it.
-            Err(_) => {
-                report.unrecorded += 1;
-                continue;
-            }
-        };
+        let accepted =
+            match channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms) {
+                Ok(accepted) => accepted,
+                // Nothing was committed. Not `failed`: that bucket has a durable
+                // row an operator can see, this one has nothing at all, so the
+                // provider must be left to redeliver it.
+                Err(_) => {
+                    report.unrecorded += 1;
+                    continue;
+                }
+            };
         // Everything below this line is already durable. Whatever happens to
         // the queue submission, the message is recoverable and the provider may
         // be told we have it.
@@ -471,7 +471,8 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
         // produce one, so a sweep on every tick would be a query looking for a
         // state its own code makes impossible.
         if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
-            match channel_ingress::recover_orphaned_channel_events(&mut store, queue.as_ref(), now) {
+            match channel_ingress::recover_orphaned_channel_events(&mut store, queue.as_ref(), now)
+            {
                 Ok(recovery) if recovery.recovered + recovery.deferred + recovery.parked > 0 => {
                     eprintln!(
                         "monkey daemon: recovered {} inbound message(s) left unfinished by an earlier build, {} parked",
@@ -1142,6 +1143,62 @@ mod tests {
             .all(|event| event.disposition == EventDisposition::Accepted));
         assert!(events.iter().all(|event| event.job_id.is_none()));
         assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 2);
+    }
+
+    /// A message this daemon deliberately drops is finished the moment its
+    /// decision is committed: nothing runs, and the provider may be told we
+    /// have it. A challenge is the same, with its reply already queued.
+    #[test]
+    fn a_decision_never_to_run_is_still_durably_final_and_ack_safe() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.enabled = false;
+        store.upsert_channel_account(&account).unwrap();
+
+        let report = ingest_batch(&mut store, &queue, &[envelope("1")], NOW);
+
+        assert_eq!(report.ignored, 1);
+        assert_eq!(report.ack_safe, vec!["1".to_string()]);
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events[0].disposition, EventDisposition::Ignored);
+        assert!(events[0].ingress_id.is_none());
+        assert!(queue.submitted.lock().unwrap().is_empty());
+        // Nothing for a recovery pass to find: the decision is the whole story.
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+    }
+
+    /// One envelope that could not be committed holds the ordinal cursor for
+    /// the whole batch — a cursor cannot say "everything but that one" — and
+    /// still must not take its siblings' per-message acknowledgements with it.
+    #[tokio::test]
+    async fn an_uncommitted_envelope_holds_the_cursor_but_not_its_siblings_ack() {
+        let mut store = seeded_store();
+        let queue = FakeQueue::default();
+        let adapter = FakeAdapter::new();
+        adapter.batches.lock().unwrap().push(InboundBatch {
+            envelopes: vec![envelope("1"), envelope("2")],
+            cursor: Some("42".to_string()),
+        });
+
+        // Armed once, so it fires on the first envelope and the second is
+        // accepted normally.
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::AfterEventInsert);
+        let report = poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
+            .await
+            .expect("poll");
+
+        assert_eq!(report.unrecorded, 1);
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.ack_safe, vec!["2".to_string()]);
+        assert_eq!(
+            store.channel_cursor("acct-1", POLL_CURSOR_KEY).unwrap(),
+            None,
+            "the cursor must not skip the envelope that was never accepted"
+        );
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].provider_event_id, "2");
     }
 
     #[tokio::test]

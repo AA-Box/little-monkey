@@ -778,15 +778,17 @@ impl DaemonStore {
             )
             .optional()
             .map_err(|error| error.to_string())?
-            .map(|(event_id, disposition, ingress_id, job_id, envelope_json)| {
-                Ok(ExistingChannelEvent {
-                    event_id,
-                    disposition: EventDisposition::parse(&disposition)?,
-                    ingress_id,
-                    job_id,
-                    envelope_json,
-                })
-            })
+            .map(
+                |(event_id, disposition, ingress_id, job_id, envelope_json)| {
+                    Ok(ExistingChannelEvent {
+                        event_id,
+                        disposition: EventDisposition::parse(&disposition)?,
+                        ingress_id,
+                        job_id,
+                        envelope_json,
+                    })
+                },
+            )
             .transpose()
     }
 
@@ -798,7 +800,10 @@ impl DaemonStore {
     /// The daemon re-decides these from the envelope they still carry rather
     /// than letting the event log go on suppressing a provider redelivery for a
     /// message that never ran.
-    pub fn orphaned_accepted_events(&self, limit: u32) -> Result<Vec<ExistingChannelEvent>, String> {
+    pub fn orphaned_accepted_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExistingChannelEvent>, String> {
         let mut statement = self
             .connection
             .prepare(
@@ -1595,10 +1600,16 @@ fn finalize_event(
     ingress_id: Option<&str>,
     job_id: Option<&str>,
 ) -> Result<(), String> {
+    // The link and the job id are only ever added, never cleared: a decision
+    // that owns no turn must not be able to take one away from a row that has
+    // one. Two passes can only ever disagree about an event that was already
+    // accepted — a policy edit between a worker and a recovery sweep — and the
+    // turn behind it is what recovery needs to find.
     let changed = connection
         .execute(
             "UPDATE channel_events
-                SET disposition=?2, ignore_reason=?3, ingress_id=?4, job_id=COALESCE(?5, job_id)
+                SET disposition=?2, ignore_reason=?3,
+                    ingress_id=COALESCE(?4, ingress_id), job_id=COALESCE(?5, job_id)
               WHERE event_id=?1",
             params![
                 event_id,

@@ -2069,8 +2069,11 @@ fn the_run_command_takes_a_conversation_turn_only_with_a_full_identity() {
 fn the_listing_shows_every_field_an_operator_needs_and_no_message_text() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::default();
-    let (ingress, params) =
-        messaging_turn(&mut store, &queue, &telegram_dm("the launch is at noon", "1"));
+    let (ingress, params) = messaging_turn(
+        &mut store,
+        &queue,
+        &telegram_dm("the launch is at noon", "1"),
+    );
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
     let listed = &store.recent_ingress_turns(10).unwrap()[0];

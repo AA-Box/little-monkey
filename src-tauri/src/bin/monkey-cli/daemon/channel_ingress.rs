@@ -501,15 +501,8 @@ pub(crate) fn recover_orphaned_channel_events(
                 ingress_id,
                 ..
             }) => {
-                match submit_accepted_turn(
-                    store,
-                    queue,
-                    &ingress,
-                    &params,
-                    &ingress_id,
-                    0,
-                    now_ms,
-                ) {
+                match submit_accepted_turn(store, queue, &ingress, &params, &ingress_id, 0, now_ms)
+                {
                     Ok(SubmitOutcome::Queued { .. }) | Ok(SubmitOutcome::AlreadyQueued { .. }) => {
                         recovery.recovered += 1
                     }
@@ -1176,9 +1169,9 @@ fn finish_submission(
     }
     match queue.submit(ingress, params.to_vec()) {
         Ok(job_id) => {
-            if let Err(error) = super::fail_points::fire(
-                super::fail_points::FailPoint::BeforeQueuedState,
-            ) {
+            if let Err(error) =
+                super::fail_points::fire(super::fail_points::FailPoint::BeforeQueuedState)
+            {
                 // The queue has the run and the row does not know it. Nothing
                 // is written, which is the point: recovery finds the turn still
                 // accepted and re-submits under the same deterministic id, and
@@ -1437,7 +1430,10 @@ mod tests {
 
         assert!(interrupted.is_err(), "{interrupted:?}");
         assert!(super::super::fail_points::fired());
-        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store
+            .recent_channel_events("acct-1", 10)
+            .unwrap()
+            .is_empty());
         assert!(store.recent_ingress_turns(10).unwrap().is_empty());
 
         // The provider redelivers, because nothing told it not to.
@@ -1469,7 +1465,10 @@ mod tests {
             accept_channel_envelope_with(&mut store, &queue, &dm("ship it", "1"), NOW, "P".into());
 
         assert!(interrupted.is_err(), "{interrupted:?}");
-        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store
+            .recent_channel_events("acct-1", 10)
+            .unwrap()
+            .is_empty());
         assert!(store.recent_ingress_turns(10).unwrap().is_empty());
         assert!(matches!(
             plan(&mut store, &dm("ship it", "1")),
@@ -1496,7 +1495,10 @@ mod tests {
         );
 
         assert!(interrupted.is_err(), "{interrupted:?}");
-        assert!(store.recent_channel_events("acct-1", 10).unwrap().is_empty());
+        assert!(store
+            .recent_channel_events("acct-1", 10)
+            .unwrap()
+            .is_empty());
         assert!(store.channel_sender("acct-1", "user-3").unwrap().is_none());
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
 
@@ -1525,7 +1527,6 @@ mod tests {
     #[test]
     fn a_redelivery_before_the_submission_finishes_drives_the_same_turn() {
         let mut store = store_with_account(open_policy());
-        let queue = FakeQueue::default();
         let ChannelAcceptance::Run {
             ingress_id,
             ingress,

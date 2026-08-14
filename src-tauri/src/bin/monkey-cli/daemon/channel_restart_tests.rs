@@ -350,7 +350,10 @@ async fn telegram_crash_before_any_durable_write_loses_nothing() {
         .recent_channel_events("acct-tg", 10)
         .unwrap()
         .is_empty());
-    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+    assert!(store
+        .channel_cursor("acct-tg", "inbound")
+        .unwrap()
+        .is_none());
 
     let (base, _requests) = super::channel_adapter::test_http::serve(vec![
         (200, TELEGRAM_GET_ME.to_string()),
@@ -387,7 +390,10 @@ async fn telegram_crash_between_the_event_and_the_turn_keeps_the_message() {
         .await
         .expect("poll");
 
-    assert!(super::fail_points::fired(), "the boundary was never reached");
+    assert!(
+        super::fail_points::fired(),
+        "the boundary was never reached"
+    );
     assert_eq!(report.unrecorded, 1);
     assert_eq!(report.accepted, 0);
     // Nothing at all: no event to suppress the redelivery, no turn, and — the
@@ -397,7 +403,10 @@ async fn telegram_crash_between_the_event_and_the_turn_keeps_the_message() {
         .unwrap()
         .is_empty());
     assert!(store.recent_ingress_turns(10).unwrap().is_empty());
-    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+    assert!(store
+        .channel_cursor("acct-tg", "inbound")
+        .unwrap()
+        .is_none());
     drop(adapter);
 
     let (base, requests) = super::channel_adapter::test_http::serve(vec![
@@ -520,7 +529,10 @@ async fn telegram_crash_before_the_cursor_commit_dedupes_and_then_advances() {
     assert!(interrupted.is_err(), "{interrupted:?}");
     assert!(super::fail_points::fired());
     assert_one_of_everything(&store, &queue, "acct-tg");
-    assert!(store.channel_cursor("acct-tg", "inbound").unwrap().is_none());
+    assert!(store
+        .channel_cursor("acct-tg", "inbound")
+        .unwrap()
+        .is_none());
     drop(adapter);
 
     let (base, _requests) = super::channel_adapter::test_http::serve(vec![
