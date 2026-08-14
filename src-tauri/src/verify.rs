@@ -729,13 +729,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// The capture is front-truncated at the cap while the child is running.
+    ///
+    /// The workload is one program reading one file, rather than the `yes | head`
+    /// pipeline this used to run. That pipeline is three processes under `cmd`,
+    /// and it failed here about one Windows run in four with an empty capture —
+    /// on a host where nothing bounded a verify command at all until this branch,
+    /// so it had never run under the job before. A flaky test in a required gate
+    /// is worse than no test: it teaches everyone to re-run. The property being
+    /// checked is the cap, and the cap does not care how many processes produced
+    /// the bytes.
     #[tokio::test]
     async fn run_command_impl_caps_output_length() {
         let state = AppState::default();
         let cwd = temp_path("cwd_cap");
         std::fs::create_dir_all(&cwd).unwrap();
-        // Print well over VERIFY_OUTPUT_CAP characters of 'x'.
-        let cmd = command("c1", "yes x | head -c 50000");
+        // Well over VERIFY_OUTPUT_CAP bytes, written here so the command is a
+        // single read on every host.
+        std::fs::write(cwd.join("flood.txt"), "x".repeat(50_000)).unwrap();
+        #[cfg(target_os = "windows")]
+        let cmd = command("c1", "type flood.txt");
+        #[cfg(not(target_os = "windows"))]
+        let cmd = command("c1", "cat flood.txt");
 
         let result = run_command_impl(&state, &cwd, &cmd, None).await;
 
