@@ -21,8 +21,10 @@
 //! identity via `auth.test`, then owns the Socket Mode connection for the
 //! adapter's lifetime. `events_api` envelopes carrying a `message` event are
 //! normalized and pushed into a bounded channel; [`ChannelAdapter::poll`] only
-//! drains that channel. The envelope framing is [`handle_socket_frame`], a
-//! pure function so it is testable without a socket.
+//! drains that channel. The envelope framing is [`classify_socket_frame`], a
+//! pure function so it is testable without a socket; its result is the ACK
+//! decision, and a frame this adapter claims to support but cannot validate
+//! is surfaced and left unACKed rather than silently dropped.
 //!
 //! # The ACK is earned, not automatic
 //!
@@ -802,83 +804,127 @@ fn map_send_response(http_status: u16, retry_after_ms: Option<i64>, body: &Value
 // Socket Mode framing (pure)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
-enum Action {
-    /// Acknowledge now: this envelope carries nothing that must first become
-    /// durable (a warning frame, an event type we do not ingest, a message
-    /// that does not parse). Redelivery would change nothing.
-    Ack(String),
-    /// A message to ingest. When `envelope_id` is present its ACK is parked
-    /// until the worker reports durable receipt via `commit_batch`.
-    Envelope {
+/// What one Socket Mode text frame means, decided before any I/O.
+///
+/// The variants are the ACK decision. "Nothing durable came out of this
+/// frame" used to collapse two very different cases — an event we ignore on
+/// purpose and an event we claim to support but could not parse — into the
+/// same immediate ACK, and acknowledging the second silently drops a message
+/// forever. Here the two are distinct: `IgnoredAckSafe` is acknowledged
+/// because redelivery could never make it actionable, `Reject` is *not*
+/// acknowledged, so Slack redelivers and the failure stays visible instead of
+/// vanishing.
+#[derive(Debug)]
+enum SocketFrameResult {
+    /// Slack finished its Socket Mode handshake; only now is the connection
+    /// proven live end to end.
+    Hello,
+    /// A message to ingest. Its ACK is parked until the worker reports
+    /// durable receipt via `commit_batch`.
+    DurableMessage {
         envelope: Box<ChannelEnvelope>,
+        envelope_id: String,
+    },
+    /// Intentionally not ingested — a control frame, an event type outside
+    /// this adapter's support. Acknowledge now: redelivery would change
+    /// nothing.
+    IgnoredAckSafe {
+        envelope_id: Option<String>,
+        reason: &'static str,
+    },
+    /// A frame this adapter claims to support but could not validate into a
+    /// durable identity. Never acknowledged: an ACK here would tell Slack the
+    /// event was handled when it was actually lost.
+    Reject { error: String },
+    /// Slack asked for this connection to be replaced. Carries the
+    /// replacement URL when the frame names one; without one the caller mints
+    /// a fresh URL through `apps.connections.open`.
+    Reconnect {
+        replacement_url: Option<String>,
         envelope_id: Option<String>,
     },
-    Reconnect,
 }
 
-/// Handles one Socket Mode text frame.
+/// Classifies one Socket Mode text frame.
 ///
-/// An envelope carrying a message is *not* acknowledged here: its id rides
-/// the `Envelope` action so the I/O loop can park it until durable receipt —
-/// see the module doc. Every other envelope is acknowledged immediately.
-fn handle_socket_frame(
+/// A message envelope is *not* acknowledged here: its id rides the
+/// `DurableMessage` result so the I/O loop can park it until durable receipt —
+/// see the module doc.
+fn classify_socket_frame(
     account_id: &str,
     text: &str,
     our_user_id: Option<&str>,
     our_bot_id: Option<&str>,
     now_ms: i64,
-) -> Vec<Action> {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return Vec::new();
+) -> SocketFrameResult {
+    let value = match serde_json::from_str::<Value>(text) {
+        Ok(value) => value,
+        Err(error) => {
+            return SocketFrameResult::Reject {
+                error: format!("the frame is not valid JSON: {error}"),
+            }
+        }
     };
     let envelope_id = value
         .get("envelope_id")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let mut actions = Vec::new();
     match value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default()
     {
-        // Slack asks us to open a fresh connection ahead of tearing this one
-        // down. ponytail: reconnect-then-drop rather than the overlap-two-
-        // sockets dance Slack's docs describe; costs a few seconds of gap
-        // per reconnect, upgrade if that gap starts mattering.
-        "disconnect" => {
-            if let Some(envelope_id) = envelope_id {
-                actions.push(Action::Ack(envelope_id));
-            }
-            actions.push(Action::Reconnect);
-            return actions;
-        }
+        "hello" => SocketFrameResult::Hello,
+        // Slack asks us to open a replacement connection ahead of tearing
+        // this one down.
+        "disconnect" => SocketFrameResult::Reconnect {
+            replacement_url: value
+                .pointer("/payload/connection_url")
+                .or_else(|| value.get("connection_url"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            envelope_id,
+        },
         "events_api" => {
-            if let Some(event) = value
+            let Some(event) = value
                 .get("payload")
                 .and_then(|payload| payload.get("event"))
-            {
-                if event.get("type").and_then(Value::as_str) == Some("message") {
-                    if let Some(envelope) =
-                        normalize_message_event(account_id, event, our_user_id, our_bot_id, now_ms)
-                    {
-                        actions.push(Action::Envelope {
-                            envelope: Box::new(envelope),
-                            envelope_id,
-                        });
-                        return actions;
-                    }
-                }
+            else {
+                return SocketFrameResult::Reject {
+                    error: "an events_api envelope carries no event".to_string(),
+                };
+            };
+            if event.get("type").and_then(Value::as_str) != Some("message") {
+                return SocketFrameResult::IgnoredAckSafe {
+                    envelope_id,
+                    reason: "not a message event",
+                };
+            }
+            // From here on this is an event Little Monkey claims to support,
+            // so every missing piece is a failure to surface, not a shrug.
+            let Some(envelope_id) = envelope_id else {
+                return SocketFrameResult::Reject {
+                    error: "a message event arrived without an envelope_id".to_string(),
+                };
+            };
+            match normalize_message_event(account_id, event, our_user_id, our_bot_id, now_ms) {
+                Some(envelope) => SocketFrameResult::DurableMessage {
+                    envelope: Box::new(envelope),
+                    envelope_id,
+                },
+                // `channel` and `ts` are the durable identity — without them
+                // the event cannot be deduplicated, so it must not be ACKed
+                // as if it had been recorded.
+                None => SocketFrameResult::Reject {
+                    error: "a message event is missing its channel or ts".to_string(),
+                },
             }
         }
-        _ => {}
+        _ => SocketFrameResult::IgnoredAckSafe {
+            envelope_id,
+            reason: "an unsupported frame type",
+        },
     }
-    // Nothing durable came out of this frame; acknowledge so Slack stops
-    // redelivering something that will never parse differently.
-    if let Some(envelope_id) = envelope_id {
-        actions.push(Action::Ack(envelope_id));
-    }
-    actions
 }
 
 fn normalize_message_event(
@@ -1111,23 +1157,53 @@ async fn run_socket_loop(
                 continue;
             }
         };
-        // Parked ACKs and queued releases belong to the previous connection;
-        // their envelope ids mean nothing on this one. Slack redelivers the
-        // events themselves, and the event log deduplicates.
-        if let Ok(mut pending) = shared.pending_acks.lock() {
-            pending.clear();
+        let mut ws = match tokio_tungstenite::connect_async(&socket_url).await {
+            Ok((ws, _)) => ws,
+            Err(_) => {
+                shared.status.set(HealthState::Degraded);
+                tokio::time::sleep(backoff + Duration::from_millis(reconnect_jitter_ms())).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+        // One logical consumer across any number of transports: a
+        // provider-directed refresh hands the loop a replacement socket and
+        // processing continues here, so there is never a second long-lived
+        // reader of this account's events.
+        let mut established = false;
+        loop {
+            // Parked ACKs and queued releases belong to the previous
+            // transport; their envelope ids mean nothing on this one. Slack
+            // redelivers the events themselves, and the event log
+            // deduplicates.
+            if let Ok(mut pending) = shared.pending_acks.lock() {
+                pending.clear();
+            }
+            while ack_rx.try_recv().is_ok() {}
+            let (delivered, end) = run_one_connection(
+                &account_id,
+                ws,
+                our_user_id.as_deref(),
+                our_bot_id.as_deref(),
+                &tx,
+                &mut ack_rx,
+                &shared,
+                &http,
+                &api_base,
+                &secret.app_token,
+            )
+            .await;
+            established |= delivered;
+            match end {
+                // The replacement was live before the old socket was retired,
+                // so the refresh costs no receive gap and no backoff.
+                ConnectionEnd::Handoff(next) => {
+                    ws = *next;
+                }
+                ConnectionEnd::Shutdown => return,
+                ConnectionEnd::Dropped => break,
+            }
         }
-        while ack_rx.try_recv().is_ok() {}
-        let established = run_one_connection(
-            &account_id,
-            &socket_url,
-            our_user_id.as_deref(),
-            our_bot_id.as_deref(),
-            &tx,
-            &mut ack_rx,
-            &shared,
-        )
-        .await;
         // Whatever ended it, nothing arrives on this account until the next
         // connection is up.
         shared.status.set(HealthState::Degraded);
@@ -1156,27 +1232,74 @@ fn reconnect_jitter_ms() -> u64 {
         % 500
 }
 
-/// Runs one Socket Mode connection until it drops or asks us to reconnect,
-/// returning whether it ever delivered a frame. Always returns to the caller
-/// for a fresh `apps.connections.open` URL — a Socket Mode URL is single-use.
+/// The established Socket Mode transport. Plain `ws://` in tests, TLS in
+/// production; both come out of `connect_async`.
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// How one Socket Mode connection ended, as `run_socket_loop` needs to know.
+enum ConnectionEnd {
+    /// A provider-directed refresh: the replacement connection is already
+    /// live, the old socket is closed, processing continues on this one.
+    Handoff(Box<WsStream>),
+    /// The connection dropped or its replacement could not be established;
+    /// the caller mints a fresh URL with backoff.
+    Dropped,
+    /// The adapter handle is gone; the loop must exit for good.
+    Shutdown,
+}
+
+/// Connects the replacement socket for a provider-directed refresh.
+///
+/// The URL Slack named in the disconnect frame is used when present; a
+/// refresh that names none gets a freshly minted single-use URL. `None` means
+/// the caller falls back to its ordinary reconnect path — a fresh
+/// `apps.connections.open` under bounded, jittered backoff.
+async fn connect_replacement(
+    http: reqwest::Client,
+    api_base: String,
+    app_token: String,
+    replacement_url: Option<String>,
+) -> Option<WsStream> {
+    let url = match replacement_url {
+        Some(url) => url,
+        None => open_socket_url(&http, &api_base, &app_token).await.ok()?,
+    };
+    tokio_tungstenite::connect_async(&url)
+        .await
+        .ok()
+        .map(|(ws, _)| ws)
+}
+
+/// Runs one Socket Mode connection until it drops, is replaced, or the
+/// adapter is dropped; returns whether it ever delivered a frame, and how it
+/// ended.
+///
+/// `Connected` is written only on Slack's `hello` frame: a completed
+/// WebSocket handshake happens before Slack has said anything, and reporting
+/// it as connected is exactly the kind of optimism the health column exists
+/// to prevent.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_connection(
     account_id: &str,
-    socket_url: &str,
+    mut ws: WsStream,
     our_user_id: Option<&str>,
     our_bot_id: Option<&str>,
     tx: &mpsc::Sender<ChannelEnvelope>,
     ack_rx: &mut mpsc::Receiver<String>,
     shared: &Shared,
-) -> bool {
-    let (mut ws, _) = match tokio_tungstenite::connect_async(socket_url).await {
-        Ok(pair) => pair,
-        Err(_) => return false,
-    };
-    // The URL was minted seconds ago by an authenticated
-    // `apps.connections.open`, so a completed handshake on it is a live
-    // authenticated transport rather than merely an open socket.
-    shared.status.set(HealthState::Connected);
+    http: &reqwest::Client,
+    api_base: &str,
+    app_token: &str,
+) -> (bool, ConnectionEnd) {
     let mut got_frame = false;
+    // Armed by a disconnect frame. The replacement connects while this socket
+    // keeps consuming, so a routine refresh costs no receive gap; if both
+    // deliver the same event during the overlap, the durable event log
+    // deduplicates.
+    let mut replacement: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Option<WsStream>> + Send>>,
+    > = None;
     loop {
         tokio::select! {
             // The adapter handle was dropped (account disabled, credential
@@ -1184,7 +1307,20 @@ async fn run_one_connection(
             // consumer beside the replacement adapter's connection.
             _ = tx.closed() => {
                 let _ = ws.close(None).await;
-                return got_frame;
+                return (got_frame, ConnectionEnd::Shutdown);
+            }
+            next = async { replacement.as_mut().expect("guarded by is_some").as_mut().await },
+                if replacement.is_some() =>
+            {
+                match next {
+                    Some(new_ws) => {
+                        // Retire the old socket only now that its replacement
+                        // is live.
+                        let _ = ws.close(None).await;
+                        return (got_frame, ConnectionEnd::Handoff(Box::new(new_ws)));
+                    }
+                    None => return (got_frame, ConnectionEnd::Dropped),
+                }
             }
             // A durable receipt released this envelope id; the ACK finally
             // goes on the wire.
@@ -1198,38 +1334,58 @@ async fn run_one_connection(
                 match frame {
                     Some(Ok(Message::Text(text))) => {
                         got_frame = true;
-                        for action in
-                            handle_socket_frame(account_id, &text, our_user_id, our_bot_id, now_ms())
-                        {
-                            match action {
-                                Action::Ack(envelope_id) => {
+                        match classify_socket_frame(account_id, &text, our_user_id, our_bot_id, now_ms()) {
+                            SocketFrameResult::Hello => {
+                                shared.status.set(HealthState::Connected);
+                            }
+                            SocketFrameResult::DurableMessage { envelope, envelope_id } => {
+                                // Park the ACK first, then hand the message
+                                // on; the reverse order could commit the
+                                // batch before the id is parked.
+                                if let Ok(mut pending) = shared.pending_acks.lock() {
+                                    pending
+                                        .entry(envelope.provider_event_id.clone())
+                                        .or_default()
+                                        .push(envelope_id);
+                                }
+                                let _ = tx.send(*envelope).await;
+                            }
+                            SocketFrameResult::IgnoredAckSafe { envelope_id, reason: _ } => {
+                                if let Some(envelope_id) = envelope_id {
                                     let payload = serde_json::json!({ "envelope_id": envelope_id });
                                     let _ = ws.send(Message::Text(payload.to_string().into())).await;
                                 }
-                                Action::Envelope { envelope, envelope_id } => {
-                                    // Park the ACK first, then hand the message
-                                    // on; the reverse order could commit the
-                                    // batch before the id is parked.
-                                    if let Some(envelope_id) = envelope_id {
-                                        if let Ok(mut pending) = shared.pending_acks.lock() {
-                                            pending
-                                                .entry(envelope.provider_event_id.clone())
-                                                .or_default()
-                                                .push(envelope_id);
-                                        }
-                                    }
-                                    let _ = tx.send(*envelope).await;
+                            }
+                            // No ACK on purpose: Slack will redeliver, and the
+                            // failure stays in the log instead of becoming a
+                            // silently dropped message.
+                            SocketFrameResult::Reject { error } => {
+                                eprintln!(
+                                    "little monkey: slack[{account_id}] rejected a Socket Mode frame: {error}"
+                                );
+                            }
+                            SocketFrameResult::Reconnect { replacement_url, envelope_id } => {
+                                if let Some(envelope_id) = envelope_id {
+                                    let payload = serde_json::json!({ "envelope_id": envelope_id });
+                                    let _ = ws.send(Message::Text(payload.to_string().into())).await;
                                 }
-                                Action::Reconnect => return got_frame,
+                                if replacement.is_none() {
+                                    replacement = Some(Box::pin(connect_replacement(
+                                        http.clone(),
+                                        api_base.to_string(),
+                                        app_token.to_string(),
+                                        replacement_url,
+                                    )));
+                                }
                             }
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = ws.send(Message::Pong(payload)).await;
                     }
-                    Some(Ok(Message::Close(_))) => return got_frame,
+                    Some(Ok(Message::Close(_))) => return (got_frame, ConnectionEnd::Dropped),
                     Some(Ok(_)) => {}
-                    Some(Err(_)) | None => return got_frame,
+                    Some(Err(_)) | None => return (got_frame, ConnectionEnd::Dropped),
                 }
             }
         }
@@ -1393,17 +1549,15 @@ mod tests {
             "payload": { "event": message_event_fixture() },
         })
         .to_string();
-        let actions = handle_socket_frame("acct", &text, Some("BOT1"), None, 500);
-        // No immediate Ack: the id rides the envelope so the ACK can wait for
+        // No immediate Ack: the id rides the result so the ACK can wait for
         // the durable insert. Acknowledging here would trade Slack's
         // redelivery guarantee for nothing.
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            Action::Envelope {
+        match classify_socket_frame("acct", &text, Some("BOT1"), None, 500) {
+            SocketFrameResult::DurableMessage {
                 envelope,
                 envelope_id,
             } => {
-                assert_eq!(envelope_id.as_deref(), Some("env-1"));
+                assert_eq!(envelope_id, "env-1");
                 assert_eq!(envelope.provider_event_id, "cmid-1");
             }
             other => panic!("expected a deferred envelope, got {other:?}"),
@@ -1411,17 +1565,19 @@ mod tests {
     }
 
     #[test]
-    fn an_envelope_with_nothing_durable_is_acked_immediately() {
+    fn an_intentionally_ignored_event_is_acked_immediately() {
         // An events_api envelope whose payload is not a message we ingest:
-        // redelivery would never parse differently, so it is acknowledged now.
+        // redelivery would never make it actionable, so it is acknowledged now.
         let text = serde_json::json!({
             "envelope_id": "env-2",
             "type": "events_api",
             "payload": { "event": { "type": "reaction_added" } },
         })
         .to_string();
-        let actions = handle_socket_frame("acct", &text, None, None, 500);
-        assert_eq!(actions, vec![Action::Ack("env-2".to_string())]);
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::IgnoredAckSafe { envelope_id: Some(id), .. } if id == "env-2"
+        ));
 
         // A slash-command envelope this adapter does not handle at all.
         let text = serde_json::json!({
@@ -1430,15 +1586,86 @@ mod tests {
             "payload": {},
         })
         .to_string();
-        let actions = handle_socket_frame("acct", &text, None, None, 500);
-        assert_eq!(actions, vec![Action::Ack("env-3".to_string())]);
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::IgnoredAckSafe { envelope_id: Some(id), .. } if id == "env-3"
+        ));
     }
 
     #[test]
-    fn disconnect_triggers_reconnect() {
+    fn a_malformed_supported_event_is_rejected_not_acked() {
+        // Not JSON at all: without a parse there is no envelope_id, no
+        // identity, nothing to dedupe. ACK-ing is impossible and silence
+        // would hide it; the only honest answer is a surfaced rejection.
+        assert!(matches!(
+            classify_socket_frame("acct", "not json {", None, None, 500),
+            SocketFrameResult::Reject { .. }
+        ));
+
+        // A message event — a type this adapter claims to support — missing
+        // the channel/ts that form its durable identity. ACKing it would
+        // tell Slack the message was handled when it was actually lost.
+        let text = serde_json::json!({
+            "envelope_id": "env-4",
+            "type": "events_api",
+            "payload": { "event": { "type": "message", "text": "no channel, no ts" } },
+        })
+        .to_string();
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::Reject { .. }
+        ));
+
+        // A message event with no envelope_id cannot ever be acknowledged,
+        // so it cannot be treated as handled either.
+        let text = serde_json::json!({
+            "type": "events_api",
+            "payload": { "event": message_event_fixture() },
+        })
+        .to_string();
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn hello_is_the_connected_signal() {
+        let text = serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string();
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::Hello
+        ));
+    }
+
+    #[test]
+    fn disconnect_carries_the_replacement_url_when_slack_names_one() {
         let text = serde_json::json!({ "type": "disconnect", "reason": "warning" }).to_string();
-        let actions = handle_socket_frame("acct", &text, None, None, 500);
-        assert!(matches!(actions.last(), Some(Action::Reconnect)));
+        assert!(matches!(
+            classify_socket_frame("acct", &text, None, None, 500),
+            SocketFrameResult::Reconnect { replacement_url: None, .. }
+        ));
+
+        let text = serde_json::json!({
+            "type": "disconnect",
+            "reason": "refresh_requested",
+            "envelope_id": "env-5",
+            "payload": { "connection_url": "wss://replacement.example/link" },
+        })
+        .to_string();
+        match classify_socket_frame("acct", &text, None, None, 500) {
+            SocketFrameResult::Reconnect {
+                replacement_url,
+                envelope_id,
+            } => {
+                assert_eq!(
+                    replacement_url.as_deref(),
+                    Some("wss://replacement.example/link")
+                );
+                assert_eq!(envelope_id.as_deref(), Some("env-5"));
+            }
+            other => panic!("expected a reconnect, got {other:?}"),
+        }
     }
 
     fn adapter_with_base(base: &str) -> SlackAdapter {
