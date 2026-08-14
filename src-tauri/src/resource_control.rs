@@ -312,6 +312,35 @@ pub struct ResourceSample {
     pub output_bytes: Option<u64>,
 }
 
+/// Evidence, from the mechanism itself, that a configured bound fired.
+///
+/// # Why `observed > configured` cannot be the only test
+///
+/// A *supervised* bound is discovered by comparison: the workload exceeds the
+/// number, and the supervisor notices shortly afterwards. That is the right test
+/// for a supervisor, and it is the wrong test for a kernel, because a kernel
+/// bound's entire purpose is that the workload never exceeds the number.
+///
+/// A cgroup with `pids.max = 12` refuses the thirteenth `fork` and leaves
+/// `pids.current` at 12. A Windows job with an active-process limit fails the
+/// thirteenth `CreateProcess` and leaves `ActiveProcesses` at 12. In both cases
+/// `observed > configured` is false at every sample and stays false forever — so
+/// a controller that tested only the comparison would watch the limit work
+/// perfectly and then record the workload as having failed for no stated reason.
+/// "The bound held" and "the app can say which bound held" are two obligations,
+/// and this type is the second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitEvent {
+    pub limit: ProcessLimitKind,
+    /// What the mechanism was holding when it refused. Usually *equal* to the
+    /// configured value rather than above it, which is the whole point.
+    pub observed: u64,
+    /// The counter or notification that carried the evidence, named exactly —
+    /// `pids.events max`, `JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT` — so a reader can
+    /// go and look at the same thing.
+    pub evidence: String,
+}
+
 /// A limit that fired, with everything a ledger event and a UI row need.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -324,6 +353,15 @@ pub struct LimitBreach {
     pub backend: String,
     pub level: String,
     pub observed_at_ms: i64,
+    /// The kernel counter or notification that carried the evidence, when the
+    /// breach came from the mechanism's own accounting rather than from the
+    /// supervisor's comparison.
+    ///
+    /// `None` for a supervised bound, which has no accounting of its own and
+    /// whose evidence *is* the two numbers beside it. Optional rather than
+    /// mandatory precisely so the supervisor is not made to invent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 impl LimitBreach {
@@ -332,12 +370,20 @@ impl LimitBreach {
     /// Both numbers, always: "memory limit exceeded" tells a reader the budget
     /// fired, and "held 4.11 GiB against a 4.00 GiB budget" tells them whether
     /// the budget was wrong or the job was.
+    ///
+    /// Where a kernel refused rather than allowed an overshoot, the two numbers
+    /// are *equal* and would read as a limit that did not fire, so the evidence
+    /// is appended to say which counter proved it did.
     #[must_use]
     pub fn describe(&self) -> String {
-        format!(
+        let base = format!(
             "{} exceeded: observed {} against a configured {} ({} · {})",
             self.limit, self.observed, self.configured, self.backend, self.level
-        )
+        );
+        match &self.evidence {
+            Some(evidence) => format!("{base}, reported by {evidence}"),
+            None => base,
+        }
     }
 }
 
@@ -689,6 +735,48 @@ impl ResourceController {
         }))
     }
 
+    /// Ask the backend whether its own accounting says a bound fired.
+    ///
+    /// Consulted *before* [`Self::breach`] on every tick, because where a kernel
+    /// mechanism holds the bound this is the only test that can be true — see
+    /// [`LimitEvent`] for why the comparison never becomes true against a limit
+    /// that is doing its job.
+    ///
+    /// The supervisor answers `None`: it has no accounting of its own, and its
+    /// bound genuinely *is* the comparison.
+    pub fn poll_limit_events(&mut self, now_ms: i64) -> io::Result<Option<LimitBreach>> {
+        let event: Option<LimitEvent> = match &mut self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cgroup(scope) => scope.poll_limit_events()?,
+            #[cfg(windows)]
+            Backend::Job(job) => job.poll_limit_events()?,
+            Backend::Supervisor => None,
+        };
+        let Some(event) = event else {
+            return Ok(None);
+        };
+        // Only a limit this controller was actually asked to hold. A cgroup
+        // inherits nothing here, but a job object's fixed guardrail can fire
+        // without the caller having stated a bound, and attributing that to a
+        // caller's policy would name a number nobody set.
+        let Some(configured) = self.limits.value_for(event.limit) else {
+            return Ok(None);
+        };
+        let capabilities = self.capabilities();
+        let Some(level) = capabilities.for_limit(event.limit).level() else {
+            return Ok(None);
+        };
+        Ok(Some(LimitBreach {
+            limit: event.limit.as_str().to_string(),
+            configured: configured.value,
+            observed: event.observed,
+            backend: capabilities.backend,
+            level: level.as_str().to_string(),
+            observed_at_ms: now_ms,
+            evidence: Some(event.evidence),
+        }))
+    }
+
     /// The first limit this sample violates, if any.
     ///
     /// Wall is checked first because it is the one bound that is always
@@ -716,6 +804,8 @@ impl ResourceController {
                 backend: backend.clone(),
                 level: level.as_str().to_string(),
                 observed_at_ms: now_ms,
+                // The supervisor's evidence is the pair of numbers above it.
+                evidence: None,
             })
         };
 
@@ -867,8 +957,30 @@ where
             // relabelling that would make the limit look responsible for an
             // outcome it did not cause.
             biased;
-            output = &mut work => return Ok(Supervised::Completed(output, last)),
+            output = &mut work => {
+                // A kernel bound normally ends the workload rather than being
+                // observed by a sample: the cgroup OOM-kills the member that
+                // asked for too much, the job fails its allocation. The work
+                // future then resolves with an ordinary non-zero exit, and the
+                // only record of *why* is the backend's own counter. Ask before
+                // believing the exit — otherwise the strongest enforcement this
+                // app has is also the enforcement it can never name.
+                if let Some(breach) = controller.poll_limit_events(now_ms())? {
+                    controller.terminate_tree()?;
+                    return Ok(Supervised::Breached(breach, last));
+                }
+                return Ok(Supervised::Completed(output, last));
+            }
             _ = ticker.tick() => {
+                // The mechanism's own accounting first, and unconditionally —
+                // including when the workload is already gone. A cgroup that
+                // OOM-killed its member, or a job that refused the thirteenth
+                // process, has an exited workload and a limit that fired, and
+                // reading the sample first would call that an ordinary crash.
+                if let Some(breach) = controller.poll_limit_events(now_ms())? {
+                    controller.terminate_tree()?;
+                    return Ok(Supervised::Breached(breach, last));
+                }
                 let Some(sample) = controller.sample()? else {
                     // The workload is gone but `work` has not resolved yet —
                     // usually a pipe still draining. Keep waiting for it rather

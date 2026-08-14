@@ -791,6 +791,9 @@ fn parse_limit_exceeded(
                 .as_str()
                 .to_string(),
             observed_at_ms: 0,
+            // The watchdog's evidence is the two numbers above it, exactly as for
+            // the supervisor: there is no kernel counter behind this one.
+            evidence: None,
         }),
         detail,
     ))

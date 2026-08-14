@@ -20,34 +20,197 @@
 //! # What a job memory limit does, and what that means for the exit
 //!
 //! `JOB_OBJECT_LIMIT_JOB_MEMORY` makes *allocation fail* inside the job rather
-//! than terminating the process. That is a real, kernel-held bound — the tree
-//! cannot exceed it — but on its own it produces a workload that dies of a failed
-//! allocation, which reads as an ordinary crash. So the supervising loop still
-//! samples the job and, when the committed total passes the effective limit,
-//! terminates the tree and records `limit_exceeded`. The kernel holds the bound;
-//! the supervisor names it.
+//! than terminating the process, and `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` makes
+//! `CreateProcess` fail rather than killing anything. Both are real kernel-held
+//! bounds — the tree cannot exceed either — and both are invisible to a
+//! supervisor comparing a measurement against a budget, because the kernel's
+//! whole job is to stop the measurement ever passing the budget. A tree capped at
+//! twelve processes reports twelve, forever, while the thirteenth `CreateProcess`
+//! fails and the workload dies of an error it cannot explain.
+//!
+//! So the job is associated with an **I/O completion port** at creation, and the
+//! kernel posts `JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT` and
+//! `JOB_OBJECT_MSG_JOB_MEMORY_LIMIT` to it at the moment it refuses. That is the
+//! evidence [`crate::resource_control::LimitEvent`] exists to carry: the kernel
+//! holds the bound, and this is how the app can name which bound it held instead
+//! of recording an unexplained crash.
 
 #![cfg(windows)]
 
 use std::io;
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
+use windows_sys::Win32::System::JobObjects::{
+    JobObjectAssociateCompletionPortInformation, SetInformationJobObject,
+    JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
+};
+use windows_sys::Win32::System::SystemServices::{
+    JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
+    JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+};
+
+use crate::process_table::ProcessLimitKind;
 use crate::resource_control::{
-    ControllerCapabilities, EffectiveLimits, EnforcementLevel, LimitCapability,
+    ControllerCapabilities, EffectiveLimits, EnforcementLevel, LimitCapability, LimitEvent,
 };
 use crate::sandbox_windows::{JobConfinement, JobLimits};
+
+/// The port the kernel posts this job's limit notifications to.
+///
+/// Owned rather than borrowed because the notification is only useful while the
+/// workload runs, and a job may be associated with exactly one completion port
+/// for its whole lifetime — so this is created with the job and closed with it.
+struct LimitNotifications {
+    port: HANDLE,
+}
+
+// The handle is owned outright and only passed to completion-port syscalls,
+// which take it by value and are thread-safe. Needed for the same reason
+// `JobConfinement` needs it: the controller is held across awaits.
+unsafe impl Send for LimitNotifications {}
+unsafe impl Sync for LimitNotifications {}
+
+impl Drop for LimitNotifications {
+    fn drop(&mut self) {
+        // Safe: closes the handle this type owns, exactly once. Nothing useful
+        // remains to be done about a handle that will not close.
+        unsafe {
+            let _ = CloseHandle(self.port);
+        }
+    }
+}
+
+impl LimitNotifications {
+    /// Create a port and tell the job to post its limit messages to it.
+    fn associate(job: &JobConfinement) -> io::Result<Self> {
+        // A fresh, unattached port: `INVALID_HANDLE_VALUE` for the file means
+        // "create one rather than associate a handle with an existing one", and
+        // one concurrent thread is all a non-blocking drain needs.
+        // Safe: creates a kernel object and returns its handle or null.
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        if port.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let notifications = LimitNotifications { port };
+        let associate = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            // Nothing distinguishes one job from another here — this controller
+            // owns exactly one — so the key carries no meaning and is zero.
+            CompletionKey: std::ptr::null_mut(),
+            CompletionPort: port,
+        };
+        // Safe: a fully initialised struct of exactly the type this information
+        // class expects, sized from that same type.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.raw_handle(),
+                JobObjectAssociateCompletionPortInformation,
+                (&raw const associate).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>())
+                    .expect("a Win32 struct size fits in u32"),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(notifications)
+    }
+
+    /// Take every limit message the kernel has posted since the last drain.
+    ///
+    /// Non-blocking: a zero timeout returns what is queued and nothing more, so
+    /// this rides the supervisor's existing sampling tick rather than needing a
+    /// thread of its own. Messages persist in the port until drained, so a
+    /// refusal that happened between two ticks is still reported.
+    fn drain(&self) -> Option<ProcessLimitKind> {
+        let mut fired = None;
+        loop {
+            let mut message: u32 = 0;
+            let mut key: usize = 0;
+            let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
+            // Safe: writes three outputs this stack owns. A zero timeout cannot
+            // block, and a false return with an empty queue is the normal exit.
+            let ok = unsafe {
+                GetQueuedCompletionStatus(self.port, &mut message, &mut key, &mut overlapped, 0)
+            };
+            if ok == 0 {
+                return fired;
+            }
+            // For job notifications the "bytes transferred" field carries the
+            // message id and the overlapped pointer carries the process id;
+            // neither is a real transfer or a real OVERLAPPED.
+            match message {
+                JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT => {
+                    // The first refusal wins, and a process-count refusal is
+                    // reported ahead of a memory one because it is the cause a
+                    // memory message would then be a consequence of.
+                    return Some(ProcessLimitKind::ChildProcesses);
+                }
+                JOB_OBJECT_MSG_JOB_MEMORY_LIMIT | JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT => {
+                    fired = fired.or(Some(ProcessLimitKind::Memory));
+                }
+                // Process start/exit and end-of-job-time messages are not limits
+                // this controller declared; draining them is what keeps the queue
+                // from filling with them.
+                _ => {}
+            }
+        }
+    }
+}
 
 pub struct JobObject {
     job: JobConfinement,
     applied: JobLimits,
+    /// `None` when the port could not be created or associated. The kernel bound
+    /// still holds — this is the *naming* of it that is missing — so the
+    /// controller degrades to the supervisor's comparison rather than failing the
+    /// spawn over a diagnostic.
+    notifications: Option<LimitNotifications>,
 }
 
 impl JobObject {
     pub fn create(limits: &EffectiveLimits) -> io::Result<Self> {
         let applied = JobLimits::from_effective(limits);
+        let job = crate::sandbox_windows::create_job_with(applied)?;
+        let notifications = LimitNotifications::associate(&job).ok();
         Ok(JobObject {
-            job: crate::sandbox_windows::create_job_with(applied)?,
+            job,
             applied,
+            notifications,
         })
+    }
+
+    /// What the kernel says it refused, if anything.
+    ///
+    /// See this module's header for why the comparison in
+    /// [`crate::resource_control::ResourceController::breach`] cannot see either
+    /// of these.
+    pub fn poll_limit_events(&self) -> io::Result<Option<LimitEvent>> {
+        let Some(notifications) = &self.notifications else {
+            return Ok(None);
+        };
+        let Some(limit) = notifications.drain() else {
+            return Ok(None);
+        };
+        let accounting = self.job.accounting()?;
+        Ok(Some(match limit {
+            ProcessLimitKind::ChildProcesses => LimitEvent {
+                limit,
+                // The job was held *at* the ceiling, which is what refusing the
+                // next `CreateProcess` means.
+                observed: u64::from(accounting.active_processes),
+                evidence: "JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, the kernel refusing a process \
+                           creation at the job's active-process ceiling"
+                    .to_string(),
+            },
+            _ => LimitEvent {
+                limit: ProcessLimitKind::Memory,
+                observed: accounting.job_memory_bytes,
+                evidence: "JOB_OBJECT_MSG_JOB_MEMORY_LIMIT, the kernel refusing a commit at the \
+                           job's memory ceiling"
+                    .to_string(),
+            },
+        }))
     }
 
     /// Hand the job to a spawn site that will assign the suspended process to it.
@@ -72,6 +235,18 @@ impl JobObject {
         )))
     }
 
+    /// How this job reports a refusal, stated rather than assumed: a host where
+    /// the completion port could not be associated still has the kernel bound and
+    /// has lost the ability to name it, and a capability answer that did not say
+    /// so would be claiming a diagnostic it does not have.
+    fn notification_mechanism(&self) -> &'static str {
+        match self.notifications {
+            Some(_) => "the job's completion port reporting the refusal",
+            None => "no completion port available on this host, so the refusal is named only \
+                     where the supervisor's own measurement catches it",
+        }
+    }
+
     pub fn capabilities(&self) -> ControllerCapabilities {
         ControllerCapabilities {
             backend: "windows job object".to_string(),
@@ -91,16 +266,19 @@ impl JobObject {
             memory: LimitCapability::Enforced {
                 level: EnforcementLevel::Kernel,
                 mechanism: format!(
-                    "JOB_OBJECT_LIMIT_JOB_MEMORY at {} bytes, with the supervisor terminating \
-                     and naming the breach so it is not mistaken for a crash",
-                    self.applied.memory_bytes
+                    "JOB_OBJECT_LIMIT_JOB_MEMORY at {} bytes, with {} so a refused commit is \
+                     recorded as the limit it was and not as a crash",
+                    self.applied.memory_bytes,
+                    self.notification_mechanism()
                 ),
             },
             child_processes: LimitCapability::Enforced {
                 level: EnforcementLevel::Kernel,
                 mechanism: format!(
-                    "JOB_OBJECT_LIMIT_ACTIVE_PROCESS at {}, counted per job rather than per user",
-                    self.applied.active_processes
+                    "JOB_OBJECT_LIMIT_ACTIVE_PROCESS at {}, counted per job rather than per user, \
+                     with {}",
+                    self.applied.active_processes,
+                    self.notification_mechanism()
                 ),
             },
             output: LimitCapability::Enforced {

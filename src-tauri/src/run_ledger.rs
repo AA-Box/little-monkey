@@ -3880,6 +3880,12 @@ CREATE TABLE agent_processes_v21 (
         ('kernel', 'supervised', 'owner-sourced')),
     limit_observed_at_ms INTEGER
         CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
+    -- The kernel counter or notification that carried the proof, where the
+    -- breach came from a mechanism's own accounting rather than from the
+    -- supervisor's comparison. Deliberately *outside* the grouped CHECKs below:
+    -- a supervised bound has no such counter, and requiring one would force a
+    -- writer to invent it. See `resource_control::LimitEvent`.
+    limit_evidence TEXT,
     CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
     CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
     -- The breach travels as a unit. A limit named with no measurement, or a

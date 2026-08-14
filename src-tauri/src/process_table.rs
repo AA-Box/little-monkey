@@ -1740,6 +1740,18 @@ pub enum ProcessTableError {
     TerminalMismatch {
         process_id: String,
     },
+    /// A stored breach names a limit and is missing one of the values that make
+    /// it mean anything.
+    ///
+    /// The schema constrains the five columns to arrive as a group, so this can
+    /// only be reached by a row some other writer produced. It is an error rather
+    /// than a default because the alternative — reading a missing `configured` as
+    /// zero — manufactures "a budget of 0 bytes was exceeded", which is a
+    /// confident sentence about a number nobody ever set.
+    PartialBreach {
+        limit: String,
+        missing: &'static str,
+    },
     /// A parent id that names no row. Refused so the tree can never be broken.
     UnknownParent {
         parent_process_id: String,
@@ -1774,6 +1786,11 @@ impl fmt::Display for ProcessTableError {
             ProcessTableError::UnknownSignal { signal } => {
                 write!(f, "unknown process signal \"{signal}\"")
             }
+            ProcessTableError::PartialBreach { limit, missing } => write!(
+                f,
+                "the stored breach names {limit} but has no {missing}, so what it was measured \
+                 against is unknown rather than zero"
+            ),
             ProcessTableError::SignalRefused {
                 process_id,
                 kind,
@@ -2046,7 +2063,8 @@ impl<'a> ProcessTable<'a> {
                     limit_observed = ?22,
                     limit_backend = ?23,
                     limit_level = ?24,
-                    limit_observed_at_ms = ?25
+                    limit_observed_at_ms = ?25,
+                    limit_evidence = ?26
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -2081,6 +2099,7 @@ impl<'a> ProcessTable<'a> {
                 breach.as_ref().map(|breach| breach.backend.clone()),
                 breach.as_ref().map(|breach| breach.level.clone()),
                 breach.as_ref().map(|breach| breach.observed_at_ms),
+                breach.as_ref().and_then(|breach| breach.evidence.clone()),
             ],
         )?;
 
@@ -3481,7 +3500,7 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
      signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens, \
      limit_kind, limit_configured, limit_observed, limit_backend, limit_level, \
-     limit_observed_at_ms \
+     limit_observed_at_ms, limit_evidence \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -3611,17 +3630,57 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
                 signal: row.get(15)?,
                 reason: row.get(16)?,
                 // Present only for a row a resource controller closed. Read as a
-                // group: the SQL constrains the five columns to arrive together,
-                // so a partial read here would mean the schema was bypassed.
+                // group, and a group that does not arrive whole is reported as
+                // such: the SQL constrains these five columns to be all-or-none,
+                // so a partial row means some other writer bypassed the schema,
+                // and defaulting the gaps would turn that into "a budget of 0 was
+                // exceeded" — a confident sentence about a number nobody set.
                 breach: match row.get::<_, Option<String>>(27)? {
-                    Some(limit) => Some(crate::resource_control::LimitBreach {
-                        limit,
-                        configured: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u64,
-                        observed: row.get::<_, Option<i64>>(29)?.unwrap_or(0) as u64,
-                        backend: row.get::<_, Option<String>>(30)?.unwrap_or_default(),
-                        level: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
-                        observed_at_ms: row.get::<_, Option<i64>>(32)?.unwrap_or(0),
-                    }),
+                    Some(limit) => {
+                        let require_u64 = |value: Option<i64>, missing| match value {
+                            Some(value) => Ok(value as u64),
+                            None => Err(ProcessTableError::PartialBreach {
+                                limit: limit.clone(),
+                                missing,
+                            }),
+                        };
+                        let require_text = |value: Option<String>, missing| match value {
+                            Some(value) => Ok(value),
+                            None => Err(ProcessTableError::PartialBreach {
+                                limit: limit.clone(),
+                                missing,
+                            }),
+                        };
+                        let configured = require_u64(row.get(28)?, "limit_configured");
+                        let observed = require_u64(row.get(29)?, "limit_observed");
+                        let backend = require_text(row.get(30)?, "limit_backend");
+                        let level = require_text(row.get(31)?, "limit_level");
+                        match (configured, observed, backend, level) {
+                            (Ok(configured), Ok(observed), Ok(backend), Ok(level)) => {
+                                Some(crate::resource_control::LimitBreach {
+                                    limit,
+                                    configured,
+                                    observed,
+                                    backend,
+                                    level,
+                                    // A stamp is the one field a breach can
+                                    // honestly lack — see `now_ms`'s own note on
+                                    // a clock that will not read.
+                                    observed_at_ms: row
+                                        .get::<_, Option<i64>>(32)?
+                                        .unwrap_or_default(),
+                                    // Absent for every supervised bound, by
+                                    // design: the supervisor's evidence is the
+                                    // two numbers beside it.
+                                    evidence: row.get::<_, Option<String>>(33)?,
+                                })
+                            }
+                            (Err(error), ..)
+                            | (_, Err(error), ..)
+                            | (_, _, Err(error), _)
+                            | (_, _, _, Err(error)) => return Ok(Err(error)),
+                        }
+                    }
                     None => None,
                 },
             }),
@@ -4342,6 +4401,171 @@ mod tests {
         assert_eq!(
             WALL_BUDGET_REASON_PREFIX,
             "wall budget exceeded: max_wall_ms"
+        );
+    }
+
+    /// A kernel-reported breach survives the round trip whole, including the
+    /// counter that proved it.
+    ///
+    /// The evidence matters most in exactly the case the two numbers cannot
+    /// carry: a `pids.max` refusal leaves configured and observed **equal**,
+    /// which read alone says the limit did not fire.
+    #[test]
+    fn a_kernel_breach_round_trips_with_the_counter_that_proved_it() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-kernel-breach");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the shell starts");
+
+        let breach = crate::resource_control::LimitBreach {
+            limit: "max_child_processes".to_string(),
+            configured: 12,
+            observed: 12,
+            backend: "cgroup v2".to_string(),
+            level: "kernel".to_string(),
+            observed_at_ms: T0 + 2,
+            evidence: Some("cgroup v2 `pids.events` max".to_string()),
+        };
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(breach.clone())),
+                T0 + 3,
+            )
+            .expect("a limit kill is a terminal transition");
+
+        let stored = table
+            .get(&record.process_id)
+            .expect("read back")
+            .expect("the row exists")
+            .exit
+            .expect("an exited row carries its exit")
+            .breach
+            .expect("a limit kill carries its breach");
+        assert_eq!(stored, breach);
+        assert!(
+            stored.describe().contains("pids.events"),
+            "with both numbers equal, the evidence is the only thing that says the limit fired: {}",
+            stored.describe()
+        );
+    }
+
+    /// A supervised breach has no kernel counter, and is not made to invent one.
+    #[test]
+    fn a_supervised_breach_round_trips_with_no_evidence_rather_than_an_empty_one() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-supervised");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the shell starts");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(
+                    crate::resource_control::LimitBreach {
+                        limit: "max_memory_bytes".to_string(),
+                        configured: 1_024,
+                        observed: 4_096,
+                        backend: "supervisor".to_string(),
+                        level: "supervised".to_string(),
+                        observed_at_ms: T0 + 2,
+                        evidence: None,
+                    },
+                )),
+                T0 + 3,
+            )
+            .expect("terminal");
+        let stored = table
+            .get(&record.process_id)
+            .expect("read back")
+            .expect("row")
+            .exit
+            .expect("exit")
+            .breach
+            .expect("breach");
+        assert_eq!(stored.evidence, None);
+    }
+
+    /// A breach row missing one of its grouped values is reported, never
+    /// completed with zeros.
+    ///
+    /// The schema constrains the five to arrive together, so this writes past it
+    /// deliberately — which is the only way the case can exist, and exactly why
+    /// the reader must not paper over it: `configured: 0` reads as "a budget of
+    /// zero was exceeded", a confident sentence about a number nobody set.
+    #[test]
+    fn a_partial_stored_breach_is_an_error_rather_than_a_manufactured_zero() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-partial");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("running");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(
+                    crate::resource_control::LimitBreach {
+                        limit: "max_memory_bytes".to_string(),
+                        configured: 1_024,
+                        observed: 4_096,
+                        backend: "supervisor".to_string(),
+                        level: "supervised".to_string(),
+                        observed_at_ms: T0 + 2,
+                        evidence: None,
+                    },
+                )),
+                T0 + 3,
+            )
+            .expect("terminal");
+        // The schema refuses this write, which is the first line of defence and is
+        // asserted below. Suspending the check is how a row written by some other
+        // tool — an older build, a repair script, a hand-edited database — is
+        // reproduced, because that is the only way this state can arise.
+        assert!(
+            ledger
+                .connection()
+                .execute(
+                    "UPDATE agent_processes SET limit_configured = NULL WHERE process_id = ?1",
+                    rusqlite::params![record.process_id],
+                )
+                .is_err(),
+            "the schema must refuse a half-written breach in the first place"
+        );
+        ledger
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("suspend the guard for this one write");
+        ledger
+            .connection()
+            .execute(
+                "UPDATE agent_processes SET limit_configured = NULL WHERE process_id = ?1",
+                rusqlite::params![record.process_id],
+            )
+            .expect("a writer that bypassed the schema");
+        ledger
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", false)
+            .expect("restore the guard");
+
+        let error = table
+            .get(&record.process_id)
+            .expect_err("a half-written breach is a data error");
+        assert!(
+            matches!(
+                error,
+                ProcessTableError::PartialBreach {
+                    missing: "limit_configured",
+                    ..
+                }
+            ),
+            "{error}"
         );
     }
 

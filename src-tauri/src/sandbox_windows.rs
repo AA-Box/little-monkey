@@ -374,6 +374,19 @@ pub fn create_job_with(limits: JobLimits) -> io::Result<JobConfinement> {
 }
 
 impl JobConfinement {
+    /// The raw job handle, for a caller that must configure the job itself.
+    ///
+    /// Borrowed, never transferred: this type still owns the handle and its
+    /// `Drop` still closes it exactly once. The one caller is
+    /// [`crate::resource_control_job`], which associates a completion port so the
+    /// kernel can say *which* limit it refused — a job may hold exactly one such
+    /// port for its lifetime, so it has to be attached to this handle rather than
+    /// to a duplicate that will be closed.
+    #[must_use]
+    pub fn raw_handle(&self) -> HANDLE {
+        self.handle
+    }
+
     /// A second handle to the same job.
     ///
     /// A job lives while *any* handle is open and

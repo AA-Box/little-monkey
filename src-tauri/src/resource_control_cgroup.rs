@@ -291,6 +291,64 @@ impl CgroupScope {
         )))
     }
 
+    /// The kernel's own record that one of these bounds refused something.
+    ///
+    /// # Why the counters and not the comparison
+    ///
+    /// `pids.max` is the clear case. A scope capped at twelve refuses the
+    /// thirteenth `fork` with `EAGAIN` and leaves `pids.current` at twelve, so
+    /// `observed > configured` is false at the moment the limit fires and false at
+    /// every sample afterwards. The workload sees a shell reporting "cannot fork"
+    /// and dies of it, which without this reads as an ordinary command failure —
+    /// the enforcement worked and the app could not say so.
+    ///
+    /// `memory.max` behaves the same way for the same reason: the kernel reclaims
+    /// and then OOM-kills *inside the scope* rather than letting `memory.current`
+    /// pass the cap.
+    ///
+    /// So both are read from `*.events`, which are monotonic counters the kernel
+    /// increments at the refusal. A fresh scope starts at zero and no other
+    /// workload can write to it, so any non-zero value is this workload's.
+    ///
+    /// `memory.events`' `max` counter is deliberately **not** treated as a breach
+    /// on its own: it counts reclaim under pressure, which a workload right at its
+    /// ceiling can do repeatedly while making progress, and killing it for that
+    /// would turn a working budget into a flaky one. `oom_kill` is the
+    /// unambiguous one — the kernel gave up and killed a member.
+    pub fn poll_limit_events(&self) -> io::Result<Option<crate::resource_control::LimitEvent>> {
+        use crate::process_table::ProcessLimitKind;
+        use crate::resource_control::LimitEvent;
+
+        if self.pids_enforced {
+            let refused = read_event_counter(&self.path.join("pids.events"), "max");
+            if refused.is_some_and(|count| count > 0) {
+                return Ok(Some(LimitEvent {
+                    limit: ProcessLimitKind::ChildProcesses,
+                    // The kernel held the scope *at* the cap, which is what
+                    // refusing the next fork means.
+                    observed: read_number(&self.path.join("pids.current")).unwrap_or(0),
+                    evidence: "cgroup v2 `pids.events` max, the kernel refusing a fork at the cap"
+                        .to_string(),
+                }));
+            }
+        }
+        if self.memory_enforced {
+            let killed = read_event_counter(&self.path.join("memory.events"), "oom_kill");
+            if killed.is_some_and(|count| count > 0) {
+                return Ok(Some(LimitEvent {
+                    limit: ProcessLimitKind::Memory,
+                    observed: read_number(&self.path.join("memory.peak"))
+                        .or_else(|| read_number(&self.path.join("memory.current")))
+                        .unwrap_or(0),
+                    evidence: "cgroup v2 `memory.events` oom_kill, the kernel killing a member \
+                               inside the scope rather than letting it pass `memory.max`"
+                        .to_string(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// `cgroup.kill`, which SIGKILLs every member atomically — including members
     /// created while the kill is in flight, which a walk-and-signal loop cannot
     /// promise. Kernels before 5.14 have no such file, so the fallback signals
@@ -378,6 +436,23 @@ fn read_number(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// One `<key> <count>` line out of a cgroup v2 `*.events` file.
+///
+/// `None` for a missing file or a missing key rather than zero: a kernel too old
+/// to publish `pids.events` has *not* told us the limit did not fire, and reading
+/// that as "no breach" is the difference between an honest gap and a wrong
+/// answer.
+fn read_event_counter(path: &Path, key: &str) -> Option<u64> {
+    parse_event_counter(&fs::read_to_string(path).ok()?, key)
+}
+
+fn parse_event_counter(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key).then(|| fields.next()?.parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +493,27 @@ mod tests {
         fs::write(&file, "max\n").expect("write");
         assert_eq!(read_number(&file), None);
         let _ = fs::remove_file(&file);
+    }
+
+    /// The counter that proves a `pids.max` fired. `pids.current` never passes
+    /// the cap, so this file is the only thing that can say the limit worked.
+    #[test]
+    fn a_refusal_counter_is_read_by_key_rather_than_by_line_position() {
+        let pids = "max 3\n";
+        assert_eq!(parse_event_counter(pids, "max"), Some(3));
+        // `memory.events` has six keys in an order the kernel is free to change.
+        let memory = "low 0\nhigh 0\nmax 41\noom 2\noom_kill 1\noom_group_kill 0\n";
+        assert_eq!(parse_event_counter(memory, "oom_kill"), Some(1));
+        assert_eq!(parse_event_counter(memory, "max"), Some(41));
+    }
+
+    /// A kernel too old to publish the file has not said the limit did not fire.
+    /// Reading a missing key as zero would turn an unanswerable question into a
+    /// confident "no breach".
+    #[test]
+    fn a_missing_counter_is_unknown_rather_than_zero() {
+        assert_eq!(parse_event_counter("low 0\nhigh 0\n", "oom_kill"), None);
+        assert_eq!(parse_event_counter("", "max"), None);
     }
 
     /// Nothing to enforce means no scope, so an unbounded command does not pay
