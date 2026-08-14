@@ -1,0 +1,487 @@
+//! Every native process this tree can create is classified, and adding one is
+//! not silent.
+//!
+//! K4's enforcement is only as good as the set of spawn sites that go through
+//! it, and that set is not visible from any single file: `Command::new` appears
+//! in roughly fifty modules, from the agent shell to a `git` invocation to the
+//! daemon's own supervisor. Nothing stopped a new agent-controlled spawn path
+//! from being added beside them and quietly bypassing the resource controller —
+//! the code would compile, the tests would pass, and the process table would
+//! simply not know about it.
+//!
+//! So this is a **source test**, not a behaviour test. It reads the tree, finds
+//! every file that creates a native process, and requires each one to appear in
+//! the table below with a stated classification. A new spawn site in a new file
+//! fails this test until someone writes down which of the three it is.
+//!
+//! # The three classifications
+//!
+//! - [`Class::AgentShell`] — a command whose text comes from a model or from the
+//!   user's own configuration, executed on their behalf. These **must** enter the
+//!   resource infrastructure. The test asserts they do, by requiring the file to
+//!   reference the controller.
+//! - [`Class::ResourceInfrastructure`] — the machinery itself: the confinement
+//!   backends, the limit installer, the signal primitives, and the tests that
+//!   spawn a child in order to prove one of them works.
+//! - [`Class::HostUtility`] — a bounded, synchronous invocation of a known host
+//!   program with arguments this app composed: `git rev-parse`, a version probe,
+//!   a package manager the user asked to run. Each carries the reason it is not
+//!   agent-controlled, because "it is only `git`" is exactly the reasoning that
+//!   would let an agent-authored argument through one day.
+//! - [`Class::ManagedService`] — a long-lived process this app owns and
+//!   supervises with its own lifecycle: a model server, Chromium, the daemon.
+//!   These have owner-sourced bounds rather than `ProcessLimits` ones, which is
+//!   what `ProcessKind::limit_support` reports for them.
+//!
+//! # What this test does not claim
+//!
+//! It does not prove a classification is *correct* — only that one exists and
+//! that the `AgentShell` files reach the controller. A file classified
+//! `HostUtility` that starts composing model-authored arguments would still pass.
+//! That is a smaller guarantee than "no bypass is possible", and it is the one a
+//! source scan can honestly make: the alternative is a whole-program taint
+//! analysis, and a test that pretends to more than it checks is worse than one
+//! that states its limit.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    AgentShell,
+    ResourceInfrastructure,
+    HostUtility,
+    ManagedService,
+}
+
+/// Every file in `src-tauri/src` that creates a native process.
+///
+/// Ordered as the scan finds them so a diff to this list reads as a diff to the
+/// tree. The note on each is what a future reader needs: not what the file does,
+/// but why it is or is not agent-controlled.
+const CLASSIFIED: &[(&str, Class, &str)] = &[
+    // --- Agent-controlled: model- or user-authored command text --------------
+    (
+        "workspace_shell.rs",
+        Class::AgentShell,
+        "the confined shell every agent command runs through, on both clients",
+    ),
+    (
+        "tools.rs",
+        Class::AgentShell,
+        "the `run_shell` tool; its child comes from `workspace_shell::spawn_foreground`",
+    ),
+    (
+        "background_shell.rs",
+        Class::AgentShell,
+        "`run_shell` with `run_in_background`; its child comes from `spawn_background`",
+    ),
+    (
+        "verify.rs",
+        Class::AgentShell,
+        "verify commands come from the user's Settings rather than from a model, but they \
+         are executed on the agent's behalf and are unbounded except by their own timeout: \
+         this file builds its own `Command` and is NOT routed through the resource \
+         controller yet. Recorded rather than hidden — see the K4 roadmap entry",
+    ),
+    (
+        "hooks.rs",
+        Class::AgentShell,
+        "user-configured hook commands, run at agent lifecycle points. Same gap as \
+         `verify.rs`: bounded by a timeout, not by the resource controller",
+    ),
+    (
+        "sandbox.rs",
+        Class::AgentShell,
+        "the opt-in disposable-copy sandbox run; carries the same kernel confinement and \
+         `os_limits` baseline, and is not routed through the resource controller",
+    ),
+    (
+        "native_skills.rs",
+        Class::AgentShell,
+        "a skill's own executable, named by an installed skill manifest rather than by a \
+         model, and not routed through the resource controller",
+    ),
+    // --- The machinery itself ------------------------------------------------
+    (
+        "os_limits.rs",
+        Class::ResourceInfrastructure,
+        "installs `setrlimit` bounds before `exec`; spawns only in its own tests",
+    ),
+    (
+        "os_signal.rs",
+        Class::ResourceInfrastructure,
+        "process-group termination; spawns only in its own tests",
+    ),
+    (
+        "process_table.rs",
+        Class::ResourceInfrastructure,
+        "spawns only in its own tests, to prove a lifecycle against a real child",
+    ),
+    (
+        "sandbox_windows.rs",
+        Class::ResourceInfrastructure,
+        "the AppContainer + job-object launcher; creates suspended, assigns, then resumes",
+    ),
+    (
+        "sandbox_linux.rs",
+        Class::ResourceInfrastructure,
+        "Landlock and seccomp confinement; spawns only in its own tests",
+    ),
+    // --- Managed services with owner-sourced lifecycles ----------------------
+    (
+        "llama.rs",
+        Class::ManagedService,
+        "the bundled llama.cpp server, supervised by its own health and restart policy",
+    ),
+    (
+        "ollama.rs",
+        Class::ManagedService,
+        "a host-installed Ollama server this app starts and probes",
+    ),
+    (
+        "m3_production.rs",
+        Class::ManagedService,
+        "runtime process management for the production model service",
+    ),
+    (
+        "m4_runtime.rs",
+        Class::ManagedService,
+        "workflow node execution, bounded by the definition's own per-node budgets",
+    ),
+    (
+        "browser_worker.rs",
+        Class::ManagedService,
+        "the Chromium a browser session owns, bounded by that session's own quotas; the \
+         one kind that owns a process tree and is not routed through the controller",
+    ),
+    (
+        "mcp.rs",
+        Class::ManagedService,
+        "a stdio MCP server the user configured, supervised by its own transport",
+    ),
+    (
+        "terminal.rs",
+        Class::ManagedService,
+        "the user's own interactive PTY, which is the user driving their machine",
+    ),
+    (
+        "generation.rs",
+        Class::ManagedService,
+        "the bundled image/video generation server",
+    ),
+    (
+        "generation_commands.rs",
+        Class::ManagedService,
+        "lifecycle commands for that same server",
+    ),
+    (
+        "quantization.rs",
+        Class::ManagedService,
+        "a bundled quantization tool run against a model the user selected",
+    ),
+    (
+        "desktop_control.rs",
+        Class::ManagedService,
+        "platform input backends for Control Desktop, gated by its own allowlist",
+    ),
+    (
+        "m7_companion.rs",
+        Class::ManagedService,
+        "mobile companion pairing and capture helpers",
+    ),
+    (
+        "knowledge_service.rs",
+        Class::ManagedService,
+        "knowledge pipeline helpers over user-selected sources",
+    ),
+    (
+        "knowledge_adapters.rs",
+        Class::ManagedService,
+        "per-format extraction helpers for the same pipeline",
+    ),
+    (
+        "studio_tools.rs",
+        Class::ManagedService,
+        "a Studio sidecar tool binary named by an installed manifest rather than by a \
+         model; kept resident under its own LRU and residency budget, which is an \
+         owner-sourced bound rather than a `ProcessLimits` one",
+    ),
+    // --- Bounded host utilities ---------------------------------------------
+    (
+        "git.rs",
+        Class::HostUtility,
+        "`git` with arguments this app composes; paths are workspace-resolved first",
+    ),
+    (
+        "agent_worktrees.rs",
+        Class::HostUtility,
+        "`git worktree`, host-owned precisely so the model-authored shell never manages it",
+    ),
+    (
+        "system.rs",
+        Class::HostUtility,
+        "platform probes: version, hardware and capability queries with fixed arguments",
+    ),
+    (
+        "self_integrity.rs",
+        Class::HostUtility,
+        "signature and notarization checks of this app's own bundle",
+    ),
+    (
+        "update_rollback.rs",
+        Class::HostUtility,
+        "installer and rollback invocations with fixed arguments",
+    ),
+    (
+        "login_path.rs",
+        Class::HostUtility,
+        "reads the user's login shell PATH by running it once, non-interactively",
+    ),
+    (
+        "daemon_commands.rs",
+        Class::HostUtility,
+        "starts and stops the daemon service from the desktop app",
+    ),
+    (
+        "m5_delivery/git.rs",
+        Class::HostUtility,
+        "`git` for delivery: branch, commit, push, with composed arguments",
+    ),
+    (
+        "m5_delivery/github.rs",
+        Class::HostUtility,
+        "`gh` for pull-request delivery, with composed arguments",
+    ),
+    (
+        "m5_delivery/reviewer.rs",
+        Class::HostUtility,
+        "`gh` review operations against a delivery this app created",
+    ),
+];
+
+/// The `monkey-cli` binary's own spawn sites, classified on the same terms.
+///
+/// A separate list because the binary is a separate target with a separate
+/// audience: everything under `daemon/` is the resident supervisor, which owns
+/// its children's budgets through the job recipe rather than through
+/// `ProcessLimits`.
+///
+/// `tools_cli.rs` is deliberately absent, and its absence is the finding: the
+/// CLI's `run_shell` creates no process of its own, because it goes through
+/// `workspace_shell::run_to_output` — the same entry point the desktop uses. That
+/// is what "the authority boundary cannot drift by client" looks like from a
+/// source scan.
+const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
+    (
+        "acp.rs",
+        Class::ManagedService,
+        "an ACP agent process the user configured",
+    ),
+    (
+        "launcher.rs",
+        Class::HostUtility,
+        "re-execs this binary to attach a terminal session",
+    ),
+    (
+        "cmds.rs",
+        Class::HostUtility,
+        "top-level command dispatch helpers with fixed arguments",
+    ),
+    (
+        "embed_cli.rs",
+        Class::HostUtility,
+        "embedding helpers over user-selected inputs",
+    ),
+    (
+        "managed_model_cli.rs",
+        Class::HostUtility,
+        "managed-runtime install and probe operations",
+    ),
+    (
+        "daemon/mod.rs",
+        Class::ManagedService,
+        "daemon service lifecycle",
+    ),
+    (
+        "daemon/engine.rs",
+        Class::ManagedService,
+        "the job runner: each child is bounded by its recipe's own budgets, enforced by \
+         the daemon's sampling watchdog",
+    ),
+    (
+        "daemon/service.rs",
+        Class::ManagedService,
+        "OS service registration and control",
+    ),
+    (
+        "daemon/worktree.rs",
+        Class::HostUtility,
+        "`git worktree` for a job's isolated checkout",
+    ),
+    (
+        "daemon/remote/desktop.rs",
+        Class::ManagedService,
+        "remote-controlled desktop operations, gated by the pairing's granted scope",
+    ),
+    (
+        "daemon/adapters/signal.rs",
+        Class::ManagedService,
+        "the signal-cli transport the user configured",
+    ),
+    (
+        "daemon/adapters/imessage.rs",
+        Class::HostUtility,
+        "`osascript` with argv-passed values, never string interpolation",
+    ),
+    (
+        "daemon/adapters/imessage_native.rs",
+        Class::HostUtility,
+        "the same, for the native chat.db path",
+    ),
+];
+
+fn source_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every `.rs` file under `root` that mentions `Command::new`, relative to `root`.
+fn files_that_spawn(root: &Path, skip_dir: Option<&str>) -> BTreeSet<String> {
+    fn walk(dir: &Path, root: &Path, skip_dir: Option<&str>, found: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if skip_dir.is_some_and(|skip| path.file_name().is_some_and(|name| name == skip)) {
+                    continue;
+                }
+                walk(&path, root, skip_dir, found);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if text.contains("Command::new") {
+                found.insert(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+
+    let mut found = BTreeSet::new();
+    walk(root, root, skip_dir, &mut found);
+    found
+}
+
+#[test]
+fn every_file_that_creates_a_native_process_is_classified() {
+    let root = source_root();
+    // `bin/` is the CLI target, classified in its own list below.
+    let found = files_that_spawn(&root, Some("bin"));
+    let declared: BTreeSet<String> = CLASSIFIED
+        .iter()
+        .map(|(path, _, _)| (*path).to_string())
+        .collect();
+
+    let unclassified: Vec<&String> = found.difference(&declared).collect();
+    assert!(
+        unclassified.is_empty(),
+        "these files create a native process and are not classified in \
+         tests/spawn_paths_are_classified.rs: {unclassified:?}\n\n\
+         Add each one with a class and a reason. If it is agent-controlled it must enter \
+         the resource infrastructure; if it is a host utility, the reason is what stops \
+         someone extending it with model-authored arguments later."
+    );
+
+    let stale: Vec<&String> = declared.difference(&found).collect();
+    assert!(
+        stale.is_empty(),
+        "these files are classified but no longer create a native process; drop them from \
+         the list so it keeps describing the tree: {stale:?}"
+    );
+}
+
+#[test]
+fn every_cli_file_that_creates_a_native_process_is_classified() {
+    let root = source_root().join("bin/monkey-cli");
+    let found = files_that_spawn(&root, None);
+    let declared: BTreeSet<String> = CLASSIFIED_CLI
+        .iter()
+        .map(|(path, _, _)| (*path).to_string())
+        .collect();
+
+    let unclassified: Vec<&String> = found.difference(&declared).collect();
+    assert!(
+        unclassified.is_empty(),
+        "unclassified CLI spawn sites: {unclassified:?}"
+    );
+    let stale: Vec<&String> = declared.difference(&found).collect();
+    assert!(
+        stale.is_empty(),
+        "stale CLI spawn classifications: {stale:?}"
+    );
+}
+
+/// The one classification with a testable obligation attached.
+///
+/// An `AgentShell` file either reaches the resource controller itself or goes
+/// through `workspace_shell`, which does. Checked by reference rather than by
+/// behaviour, which is the honest limit of a source scan — but it is enough to
+/// fail a new agent spawn path that reaches for `Command::new` directly.
+#[test]
+fn every_agent_controlled_spawn_path_reaches_the_resource_infrastructure() {
+    let root = source_root();
+    let mut unrouted = Vec::new();
+    for (path, class, _) in CLASSIFIED.iter().chain(CLASSIFIED_CLI.iter()) {
+        if *class != Class::AgentShell {
+            continue;
+        }
+        let full = if root.join(path).exists() {
+            root.join(path)
+        } else {
+            root.join("bin/monkey-cli").join(path)
+        };
+        let text = std::fs::read_to_string(&full).unwrap_or_default();
+        let routed = text.contains("resource_control")
+            || text.contains("workspace_shell::spawn_")
+            || text.contains("workspace_shell::run_to_output");
+        if !routed {
+            unrouted.push(*path);
+        }
+    }
+
+    // `verify.rs`, `hooks.rs`, `sandbox.rs` and `native_skills.rs` are the known
+    // exceptions, and they are listed here rather than excluded from the class:
+    // calling them host utilities would make this test pass by reclassifying the
+    // problem, which is the move K4's own history warns about. When one is
+    // routed, it drops out of this list and the assertion tightens by itself.
+    const KNOWN_UNROUTED: &[&str] = &["verify.rs", "hooks.rs", "sandbox.rs", "native_skills.rs"];
+    let unexpected: Vec<&&str> = unrouted
+        .iter()
+        .filter(|path| !KNOWN_UNROUTED.contains(path))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "these agent-controlled spawn paths do not reach the resource infrastructure: \
+         {unexpected:?}"
+    );
+
+    let fixed: Vec<&&str> = KNOWN_UNROUTED
+        .iter()
+        .filter(|path| !unrouted.contains(path))
+        .collect();
+    assert!(
+        fixed.is_empty(),
+        "these are now routed through the resource controller; remove them from \
+         KNOWN_UNROUTED so the exception cannot outlive the gap: {fixed:?}"
+    );
+}
