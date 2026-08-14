@@ -123,6 +123,7 @@ pub struct TerminalPermissions {
     quiet: bool,
     allow_network: bool,
     allow_external_mutations: bool,
+    channel_send: Option<little_monkey_lib::run_protocol::ChannelSendPolicy>,
 }
 
 #[derive(Clone)]
@@ -143,6 +144,7 @@ impl TerminalPermissions {
             quiet: false,
             allow_network: true,
             allow_external_mutations: false,
+            channel_send: None,
         }
     }
 
@@ -165,6 +167,7 @@ impl TerminalPermissions {
             quiet,
             allow_network: true,
             allow_external_mutations: false,
+            channel_send: None,
         }
     }
 
@@ -186,6 +189,20 @@ impl TerminalPermissions {
 
     pub fn allow_external_mutations(&self) -> bool {
         self.allow_external_mutations
+    }
+
+    /// The run's cross-conversation/cross-account messaging grant, as its
+    /// immutable snapshot recorded. `None` — the default, and what every run
+    /// without an explicit grant carries — means reply-only.
+    pub fn set_channel_send(
+        &mut self,
+        policy: Option<little_monkey_lib::run_protocol::ChannelSendPolicy>,
+    ) {
+        self.channel_send = policy;
+    }
+
+    pub fn channel_send(&self) -> Option<&little_monkey_lib::run_protocol::ChannelSendPolicy> {
+        self.channel_send.as_ref()
     }
 
     pub fn event_sink(&self) -> Option<Arc<dyn CliRunEventSink>> {
