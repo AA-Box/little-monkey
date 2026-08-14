@@ -490,20 +490,6 @@ impl JobConfinement {
         })
     }
 
-    /// Kill every process in the job, now.
-    ///
-    /// Atomic in the way a walk-and-signal loop cannot be: a process created
-    /// while the terminate is in flight is created *into* the job and dies with
-    /// it, so there is no window for a fork to outrun the kill.
-    pub fn terminate(&self) -> io::Result<()> {
-        // Safe: terminates a job this value owns a handle to. Exit code 1 marks
-        // the members as failed rather than as clean exits.
-        if unsafe { TerminateJobObject(self.handle, 1) } == 0 {
-            return Err(os_error("TerminateJobObject"));
-        }
-        Ok(())
-    }
-
     /// Put an already-spawned child, and everything it goes on to spawn, in the
     /// job. [`spawn_confined`] uses the raw form while its child is suspended;
     /// this `tokio` form remains for callers and tests that own their spawn.
@@ -551,7 +537,14 @@ impl JobConfinement {
         let _ = self.terminate_result();
     }
 
-    fn terminate_result(&self) -> io::Result<()> {
+    /// Kill every process in the job, now, reporting whether it worked.
+    ///
+    /// Atomic in the way a walk-and-signal loop cannot be: a process created
+    /// while the terminate is in flight is created *into* the job and dies with
+    /// it, so there is no window for a fork to outrun the kill. Public because
+    /// the resource controller needs the failure — a limit kill that silently
+    /// did nothing is the worst outcome available.
+    pub fn terminate_result(&self) -> io::Result<()> {
         // 1 rather than 0: the exit code is what a killed tree reports, and a
         // zero there would read as a clean exit.
         match unsafe { TerminateJobObject(self.handle, 1) } {

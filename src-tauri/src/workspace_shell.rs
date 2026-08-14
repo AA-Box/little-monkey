@@ -1168,6 +1168,8 @@ mod tests {
             &workspace,
             "/usr/bin/python3 -c 'print(\"PY_OK\")' && (/usr/bin/python3 -c 'import socket; socket.socket(socket.AF_UNIX)' >\"$TMPDIR/socket-out\" 2>&1 && printf ESCAPE_UNIX || printf DENIED_UNIX)",
             Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
         )
         .await
         .expect("run confined socket probe");
@@ -1198,6 +1200,8 @@ mod tests {
             &workspace,
             "kill -0 $PPID 2>/dev/null && printf ESCAPE_SIGNAL || printf DENIED_SIGNAL",
             Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
         )
         .await
         .expect("run confined signal probe");

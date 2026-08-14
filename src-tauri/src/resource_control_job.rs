@@ -142,6 +142,6 @@ impl JobObject {
     }
 
     pub fn terminate_tree(&self) -> io::Result<()> {
-        self.job.terminate()
+        self.job.terminate_result()
     }
 }
