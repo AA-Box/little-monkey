@@ -234,58 +234,45 @@ fn merged_limits(
     args: &ProcessAdmitArgs,
 ) -> Result<crate::process_table::ProcessLimits, String> {
     use crate::process_table::ProcessLimitKind as L;
-    let class = kind.default_limits();
-    Ok(crate::process_table::ProcessLimits {
-        // The one field with an explicit opt-out, because it is the one with a
-        // class default a user can turn off. `unbounded_wall` beats a stated
-        // `max_wall_ms` too: a caller that says both has contradicted itself, and
-        // "no budget" is the safer of the two readings — it declares less rather
-        // than enforcing something nobody asked for.
-        // `unbounded_wall` is honoured for every kind, unlike a stated value:
-        // turning a budget *off* declares less rather than more, so it cannot
-        // manufacture a bound nobody enforces.
-        max_wall_ms: if args.unbounded_wall.unwrap_or(false) {
-            None
-        } else {
-            tightest(
-                caller_value(kind, L::Wall, args.max_wall_ms)?,
-                class.max_wall_ms,
-            )
-        },
-        max_memory_bytes: tightest(
-            caller_value(kind, L::Memory, args.max_memory_bytes)?,
-            class.max_memory_bytes,
+    // Refusals first, so what reaches the merge is a caller layer this kind's
+    // owner will actually read. The two halves are separate on purpose: deciding
+    // *whether* a caller may state a field is this path's own question — a native
+    // caller has no IPC boundary to refuse at — and deciding which number wins is
+    // not. There is one implementation of the second, and it is the one the
+    // controller installs from.
+    let caller = crate::process_table::ProcessLimits {
+        max_wall_ms: caller_value(kind, L::Wall, args.max_wall_ms)?,
+        max_memory_bytes: caller_value(kind, L::Memory, args.max_memory_bytes)?,
+        max_output_bytes: caller_value(kind, L::Output, args.max_output_bytes)?,
+        max_child_processes: caller_value(kind, L::ChildProcesses, args.max_child_processes)?,
+        max_context_tokens: caller_value(kind, L::ContextTokens, args.max_context_tokens)?,
+    };
+    let mut merged = crate::resource_control::EffectiveLimits::resolve(&[
+        crate::resource_control::LimitLayer::new(
+            crate::resource_control::LimitSource::ClassDefault,
+            kind.default_limits(),
         ),
-        max_output_bytes: tightest(
-            caller_value(kind, L::Output, args.max_output_bytes)?,
-            class.max_output_bytes,
+        crate::resource_control::LimitLayer::new(
+            crate::resource_control::LimitSource::UserOverride,
+            caller,
         ),
-        max_child_processes: tightest(
-            caller_value(kind, L::ChildProcesses, args.max_child_processes)?,
-            class.max_child_processes,
-        ),
-        max_context_tokens: tightest(
-            caller_value(kind, L::ContextTokens, args.max_context_tokens)?,
-            class.max_context_tokens,
-        ),
-    })
-}
-
-/// The stricter of a caller's value and its class default.
-///
-/// `or` was wrong in one direction that mattered: a caller stating a *larger*
-/// number than the class default replaced it, so an IPC caller could widen a
-/// class bound by asking for more. These fields are maxima, so intersecting them
-/// means taking the minimum — the same rule
-/// [`crate::resource_control::EffectiveLimits::resolve`] applies for native
-/// callers, stated here rather than shared because this path also has to answer
-/// the refusal above and threading a `Result` through that merge would obscure
-/// both.
-fn tightest<T: Ord>(caller: Option<T>, class: Option<T>) -> Option<T> {
-    match (caller, class) {
-        (Some(caller), Some(class)) => Some(caller.min(class)),
-        (caller, class) => caller.or(class),
+    ])
+    .to_process_limits();
+    // The one field with an explicit opt-out, because it is the one with a class
+    // default a user can turn off. Applied after the merge rather than inside it:
+    // `EffectiveLimits::resolve` intersects maxima and has no way to express
+    // "remove this bound", and it should not gain one — a layer that could widen
+    // by omission is the property that makes a guardrail a guardrail.
+    //
+    // `unbounded_wall` beats a stated `max_wall_ms` too: a caller that says both
+    // has contradicted itself, and "no budget" is the safer of the two readings.
+    // It is honoured for every kind, unlike a stated value, because turning a
+    // budget *off* declares less rather than more and so cannot manufacture a
+    // bound nobody enforces.
+    if args.unbounded_wall.unwrap_or(false) {
+        merged.max_wall_ms = None;
     }
+    Ok(merged)
 }
 
 /// Admit a process. Called by the frontend surfaces — a chat turn, a subagent,

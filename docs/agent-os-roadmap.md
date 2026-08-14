@@ -1704,6 +1704,19 @@ deleted, because what they say about *how the gap was found* is the useful part.
   nothing left to reclaim. Supervised is the third: the bound dies with the
   supervisor, which is the case reclaim mostly exists for.
 
+- **The precedence rule had two implementations.** `EffectiveLimits::resolve`
+  intersects the layers for every native owner, and `merged_limits` did the same
+  arithmetic field by field for the IPC admission path, on the reasoning that this
+  path also has to *refuse* a bound nobody enforces and threading a `Result`
+  through the merge would obscure both. The reasoning was right about the refusal
+  and wrong about what to do with it: two implementations of "the tightest bound
+  wins" can drift, and the one that drifts is the one a caller reaches over IPC.
+  The refusal stays here — deciding whether a caller may state a field is this
+  path's own question, and a native caller has no boundary to refuse at — and the
+  numbers now come from the one resolver. The wall opt-out is applied after the
+  merge rather than as a layer, because a layer that could widen by omission is
+  the property a guardrail cannot have.
+
 - **V21 had no upgrade probe over a database the previous release wrote.** It is
   the one process migration that rebuilds the table rather than adding to it, so
   it is the one where a shipped user's process history can be dropped silently.
