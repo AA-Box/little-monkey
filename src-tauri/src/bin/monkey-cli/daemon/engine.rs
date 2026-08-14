@@ -1071,6 +1071,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         self.store.set_meta("heartbeat_ms", &now.to_string())?;
         self.store
             .set_meta("pid", &std::process::id().to_string())?;
+        // The build the resident process is actually running — not the one
+        // installed on disk. An app update replaces the sidecar without
+        // touching the service definition, so the previous build keeps
+        // serving until something restarts it; `daemon ensure` compares this
+        // against its own version to notice exactly that.
+        self.store.set_meta("version", env!("CARGO_PKG_VERSION"))?;
         if self.store.kill_switch()? {
             self.store.request_cancel_all(now)?;
         }

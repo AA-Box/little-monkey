@@ -383,6 +383,32 @@ export async function buildDaemonDesktopRecipe(
 export type ConversationRoute = "browser" | "daemon";
 
 /**
+ * The execution service is missing or unhealthy — a repairable fault in the
+ * app's own runtime, not something the operator chose.
+ *
+ * Typed rather than a plain `Error` so a surface can offer to fix it in place.
+ * That distinction is the whole point: the service is infrastructure every chat
+ * turn runs on, installed and started by the app itself, so the answer to "it
+ * isn't there" is a Repair button — never a sentence sending someone who wanted
+ * to send a message off to install a background-agents feature.
+ *
+ * Deliberately NOT used for the kill switch or backpressure below: those are
+ * states an operator or the scheduler chose, and repairing the service would be
+ * the wrong response to both.
+ */
+export class ExecutionServiceUnavailable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecutionServiceUnavailable";
+  }
+}
+
+/** Whether a caught value is a repairable execution-service fault. */
+export function isExecutionServiceUnavailable(error: unknown): error is ExecutionServiceUnavailable {
+  return error instanceof ExecutionServiceUnavailable;
+}
+
+/**
  * The route for a machine that HAS the bridge — so, only ever `daemon`.
  *
  * Every unhealthy state throws instead of returning, and the return type says so:
@@ -392,10 +418,10 @@ export type ConversationRoute = "browser" | "daemon";
  */
 export function daemonRouteFromStatus(status: DaemonStatus): "daemon" {
   if (!status.installed) {
-    throw new Error("The M6A resident runner is required for conversations. Install it in Background Agents before sending this turn.");
+    throw new ExecutionServiceUnavailable("Little Monkey's execution service isn't installed yet, so this turn has nowhere to run.");
   }
   if (!status.serviceRunning || !status.heartbeatFresh) {
-    throw new Error("The installed M6A resident runner is not healthy. Start it in Background Agents before sending this turn.");
+    throw new ExecutionServiceUnavailable("Little Monkey's execution service is not healthy, so this turn has nowhere to run.");
   }
   if (status.killSwitch) throw new Error("The M6A global kill switch is engaged.");
   // K8 backpressure, as an INTERACTIVE producer: a user is waiting on this turn.

@@ -1255,6 +1255,23 @@ impl<R: CommandRunner> ServiceManager<R> {
         Ok(self.owned_legacy_service(paths)?.is_some())
     }
 
+    /// Whether the published service definition is byte-identical to the one
+    /// this build would write.
+    ///
+    /// It names an executable, a profile and log paths, so a definition left
+    /// by an earlier install keeps launching *that* install's binary — the app
+    /// can be replaced or moved and the service will not follow it. Anything
+    /// other than an exact match is drift to be republished, including a
+    /// missing or unreadable manifest: `install` is the repair either way, and
+    /// guessing which differences are benign is how a stale service survives
+    /// an upgrade.
+    pub fn manifest_is_current(&self, paths: &DaemonPaths) -> Result<bool, String> {
+        let Ok(published) = std::fs::read_to_string(self.manifest_path(paths)) else {
+            return Ok(false);
+        };
+        Ok(published == self.render_manifest(paths)?)
+    }
+
     pub fn status(&self, paths: &DaemonPaths) -> Result<bool, String> {
         if !self.current_service_is_owned(paths)? {
             return Ok(false);
@@ -2552,6 +2569,40 @@ mod tests {
         assert!(error.contains("Cannot prove"));
         assert!(legacy_manifest.exists());
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// The upgrade case `daemon ensure` exists for: the app is replaced, the
+    /// definition still names the previous install's binary, and nothing
+    /// notices because the service is registered and running.
+    #[test]
+    fn a_manifest_from_a_previous_install_does_not_count_as_current() {
+        let temp = TestDir::new();
+        let paths = DaemonPaths::under(&temp.0.join("state"));
+        let manager = ServiceManager::new(
+            NeverRunner,
+            ServicePlatform::Launchd,
+            temp.0.join("home"),
+            PathBuf::from("/Applications/Little Monkey.app/Contents/MacOS/monkey"),
+            test_roots("default", "default", temp.0.join("agent")),
+        )
+        .unwrap();
+        let manifest = manager.manifest_path(&paths);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+
+        // Never published at all.
+        assert!(!manager.manifest_is_current(&paths).unwrap());
+
+        // Published by an install that lived somewhere else.
+        let previous = manager.render_manifest(&paths).unwrap().replace(
+            "/Applications/Little Monkey.app",
+            "/Users/someone/Downloads",
+        );
+        std::fs::write(&manifest, &previous).unwrap();
+        assert!(!manager.manifest_is_current(&paths).unwrap());
+
+        // Published by this build.
+        std::fs::write(&manifest, manager.render_manifest(&paths).unwrap()).unwrap();
+        assert!(manager.manifest_is_current(&paths).unwrap());
     }
 
     #[test]

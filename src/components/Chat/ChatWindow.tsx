@@ -86,6 +86,8 @@ import { useCustomAgentStore } from "../../store/customAgentStore";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
 import { errorMessage } from "../../lib/errors";
+import { daemonEnsure } from "../../lib/daemonClient";
+import { isExecutionServiceUnavailable } from "../../lib/daemonDesktopTurn";
 
 const MAX_TEXTAREA_HEIGHT_PX = 160;
 
@@ -362,7 +364,11 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
   const [ultracodeMode, setUltracodeMode] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // The caught value, not its text: what the banner offers depends on what
+  // failed. A refused turn whose only fault is that the execution service is
+  // down gets a Repair action instead of a Retry that would refuse again.
+  const [error, setError] = useState<unknown>(null);
+  const [repairingService, setRepairingService] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
   const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
@@ -657,7 +663,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     setError(null);
     void runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, "voice")
       .catch((err: unknown) => {
-        setError(errorMessage(err));
+        setError(err);
       });
   }, [sessionId]);
 
@@ -797,7 +803,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         textareaRef.current?.focus();
       });
     } catch (caught) {
-      setError(errorMessage(caught));
+      setError(caught);
     }
   }, [resizeTextarea, t]);
 
@@ -822,7 +828,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     const messagesBefore = messageCount(sessionId);
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
-        setError(errorMessage(err));
+        setError(err);
         // A send refused before it was accepted — an unavailable resident
         // runner is the usual reason — leaves nothing behind: no transcript
         // entry, no durable turn, no run. The typed message is the only thing
@@ -1055,7 +1061,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(errorMessage(err));
+        setError(err);
       } finally {
         setStartingCrew(false);
         textareaRef.current?.focus();
@@ -1071,7 +1077,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(errorMessage(err));
+        setError(err);
       } finally {
         setStartingComparison(false);
         textareaRef.current?.focus();
@@ -1091,6 +1097,22 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     stopTurn(sessionId);
   }, [sessionId]);
 
+  // A turn refused for want of the execution service leaves nothing behind
+  // (see `sendTurn`): the typed message went back in the composer, so the
+  // repair only has to clear the banner — the send is the user's again, with
+  // exactly the text they wrote.
+  const serviceRepairNeeded = isExecutionServiceUnavailable(error);
+  const handleRepairService = useCallback(() => {
+    setRepairingService(true);
+    daemonEnsure()
+      .then(() => { setError(null); })
+      .catch((repairError: unknown) => { setError(repairError); })
+      .finally(() => {
+        setRepairingService(false);
+        textareaRef.current?.focus();
+      });
+  }, []);
+
   const handleEditMessage = useCallback(
     (index: number, newText: string) => {
       if (sending || preparingTurnRef.current) return;
@@ -1105,7 +1127,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           sendTurn(newText, [], skillInvocations);
         })
         .catch((turnError: unknown) => {
-          setError(errorMessage(turnError));
+          setError(turnError);
         })
         .finally(() => {
           preparingTurnRef.current = false;
@@ -1181,7 +1203,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         sendTurn(text, imageAttachments, skillInvocations, ultracodeMode);
       })
       .catch((turnError: unknown) => {
-        setError(errorMessage(turnError));
+        setError(turnError);
       })
       .finally(() => {
         preparingTurnRef.current = false;
@@ -1472,17 +1494,25 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         onOpenBackgroundTasks={onOpenBackgroundTasks}
       />
 
-      {error && (
+      {error !== null && (
         <div className="mx-4 mb-2">
           <div className="mx-auto flex max-w-3xl items-center justify-between gap-3 rounded-lg border border-danger bg-danger-soft px-3 py-2 text-sm text-danger">
-            <span className="min-w-0 break-words">{error}</span>
+            <span className="min-w-0 break-words">
+              {serviceRepairNeeded ? t("ChatWindow.executionServiceDown") : errorMessage(error)}
+            </span>
+            {/* Retrying a turn the execution service refused just refuses
+                again, so the same slot repairs the service instead. */}
             <button
               type="button"
-              onClick={compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
+              onClick={serviceRepairNeeded
+                ? handleRepairService
+                : compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
+              disabled={sending || preparingTurn || startingComparison || startingCrew || repairingService}
               className="shrink-0 cursor-pointer rounded-md border border-danger px-2 py-0.5 text-xs transition-colors hover:bg-danger hover:text-danger-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {t("ChatWindow.retryButton")}
+              {serviceRepairNeeded
+                ? repairingService ? t("ChatWindow.repairingService") : t("ChatWindow.repairServiceButton")
+                : t("ChatWindow.retryButton")}
             </button>
           </div>
         </div>
