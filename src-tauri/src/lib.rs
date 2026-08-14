@@ -334,6 +334,20 @@ pub mod process_table;
 // report. Separate from `process_table` because it is all platform syscalls and
 // no storage.
 pub mod process_usage;
+// The tree half of the same question: what does the workload rooted at this pid
+// hold, and how many processes are in it. Reads the kernel's own process table
+// rather than forking `ps`, so it can follow parent links a process group loses.
+pub mod process_tree;
+// The one contract every native child-process owner installs its limits
+// through: capability, preparation, attachment, sampling and tree termination.
+pub mod resource_control;
+// The two kernel-held backends behind that contract. Gated per OS rather than
+// stubbed: a host that cannot hold a bound must not compile a module that
+// claims to.
+#[cfg(target_os = "linux")]
+pub mod resource_control_cgroup;
+#[cfg(windows)]
+pub mod resource_control_job;
 // Policy shared by the two HTTP listeners, which default to the same port and
 // today report a bare "address already in use" naming neither the winner nor
 // the reason. Where the shared pieces accumulate as D1 collapses them into one.
