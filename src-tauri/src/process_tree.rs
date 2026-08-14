@@ -270,6 +270,53 @@ pub fn owned_identities(nodes: &[ProcessNode], root_pid: u32) -> Vec<ProcessIden
         .collect()
 }
 
+/// Whether `pid` is a child of *this* process that has exited and not yet been
+/// reaped.
+///
+/// The one question that is answerable about a corpse on every Unix host.
+/// `/proc/<pid>/stat` reports a Linux zombie's state, but macOS refuses
+/// `proc_pidinfo` for one entirely — so a zombie there has no start time, no
+/// status, and `kill(pid, 0)` still succeeds, which reads as "running" to
+/// everything else here.
+///
+/// `waitid` with `WNOWAIT` answers it without consuming the exit status, so the
+/// real owner can still `wait` for it afterwards. Only valid for our own
+/// children, which is exactly the case the containment check faces: the pid it
+/// is asked about is the one this process just spawned.
+#[cfg(unix)]
+#[must_use]
+pub fn child_exited_unreaped(pid: u32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // Safe: writes one `siginfo_t` this stack owns. `WNOHANG` cannot block and
+    // `WNOWAIT` leaves the child collectable by whoever owns it.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        // ECHILD means it is not our child, which is not the same as "running";
+        // the caller's other checks own that case.
+        return false;
+    }
+    // Safe: `waitid` initialised the struct when it returned success.
+    let info = unsafe { info.assume_init() };
+    // A zero pid means `WNOHANG` found nothing to report, i.e. the child is still
+    // running; anything else is the child whose exit it is reporting.
+    let reported = unsafe { info.si_pid() };
+    reported != 0
+}
+
+/// Windows has no zombie state and no `waitid`: a pid is released at exit.
+#[cfg(not(unix))]
+#[must_use]
+pub fn child_exited_unreaped(_pid: u32) -> bool {
+    false
+}
+
 // --- Zombie detection --------------------------------------------------------
 
 #[cfg(target_os = "linux")]

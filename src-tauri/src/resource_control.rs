@@ -590,7 +590,15 @@ impl ResourceController {
             // No identity, so either the process is gone or this host will not
             // say. Only the first is safe to carry on from, and the difference is
             // whether the pid is still there at all.
-            if crate::os_signal::process_is_alive(pid) {
+            //
+            // `kill(pid, 0)` alone answers that wrong for a corpse: macOS refuses
+            // `proc_pidinfo` for a zombie, so a child that exited a microsecond
+            // ago has no start time *and* still answers a signal probe — which
+            // read as "running and unidentifiable" and refused the spawn. Asking
+            // whether it is our own unreaped child settles it, and the pid here is
+            // always one this process just spawned.
+            if crate::os_signal::process_is_alive(pid) && !process_tree::child_exited_unreaped(pid)
+            {
                 return Err(AttachFailure::Containment(io::Error::other(format!(
                     "process {pid} is running and the host would not report its start time, so \
                      nothing can prove which process a later sample or signal would reach"
@@ -606,7 +614,20 @@ impl ResourceController {
             // A process that exited between the spawn and this check cannot be a
             // member of anything, so re-ask the question that separates the two
             // cases rather than reporting a containment failure against a corpse.
-            if !identity.is_still_alive() {
+            //
+            // `is_running`, not `is_still_alive`: a child that has exited but not
+            // yet been reaped is a zombie, and a zombie keeps its `/proc/<pid>`
+            // entry — so `is_still_alive` answers true for it and this refused a
+            // spawn that had already finished. `printf` is fast enough to hit
+            // that window essentially always, which is how the counter-test
+            // caught it: on Linux under a real cgroup, an ordinary short command
+            // failed with "started without joining its cgroup scope" while every
+            // long-running one passed.
+            //
+            // Same reasoning the survivor set already applies: an unreaped
+            // process holds nothing and cannot fork, so there is no containment
+            // question left to answer about it.
+            if !identity.is_running() {
                 return Err(AttachFailure::AlreadyExited);
             }
             return Err(AttachFailure::Containment(error));
@@ -1447,6 +1468,64 @@ mod tests {
             JobLimits::from_effective(&EffectiveLimits::default()),
             guardrail
         );
+    }
+
+    /// A child that finishes before anyone can look at it is not a containment
+    /// failure.
+    ///
+    /// The containment check reads the backend's membership back — the only way
+    /// to know a `pre_exec` migration actually took, since a failure there has no
+    /// channel home. A process that has already exited is in no cgroup and no
+    /// job, so the check has to separate "gone" from "running and uncontained".
+    ///
+    /// It separated them with `is_still_alive`, which a **zombie** satisfies: an
+    /// exited-but-unreaped child keeps its `/proc/<pid>` entry. So on Linux under
+    /// a real cgroup, every short command was refused with "started without
+    /// joining its cgroup scope" while long-running ones passed — caught by the
+    /// counter-test, on `printf`, which is fast enough to hit that window
+    /// essentially always.
+    ///
+    /// Asserted here rather than only on Linux because the distinction is the
+    /// controller's, not the backend's: the supervisor reaches the same branch,
+    /// and pinning it on every Unix host is what stops it regressing on the two
+    /// this cannot run.
+    #[cfg(unix)]
+    #[test]
+    fn attaching_to_a_child_that_already_exited_reports_it_gone_not_uncontained() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("`true` spawns");
+        let pid = child.id();
+        // Deliberately not reaped: this is the zombie window a fast command
+        // spends between exiting and its parent calling `wait`.
+        for _ in 0..200 {
+            if !ProcessIdentity::of(pid).is_some_and(|identity| identity.is_running()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(64 * 1024 * 1024),
+                max_child_processes: Some(8),
+                ..ProcessLimits::default()
+            },
+        )]));
+        match controller.attach(pid) {
+            Err(AttachFailure::AlreadyExited) => {}
+            other => panic!(
+                "a command that finished before the check must read as gone, not as a spawn \
+                 that escaped its containment: {other:?}"
+            ),
+        }
+        let _ = child.wait();
     }
 
     #[test]

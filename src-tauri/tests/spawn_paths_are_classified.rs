@@ -129,6 +129,12 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         "Landlock and seccomp confinement; spawns only in its own tests",
     ),
     (
+        "resource_control.rs",
+        Class::ResourceInfrastructure,
+        "the contract itself; spawns only in its own tests, to prove attachment and \
+         termination against a real child",
+    ),
+    (
         "process_tree.rs",
         Class::ResourceInfrastructure,
         "the tree enumeration and liveness the supervisor measures and signals through; \
