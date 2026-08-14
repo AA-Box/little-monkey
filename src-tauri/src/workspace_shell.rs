@@ -1459,15 +1459,20 @@ mod tests {
     /// Seatbelt/Landlock and then pass for the wrong reason — the workload would
     /// exit instantly, no limit would fire, and the assertion would read as "the
     /// bound did not work".
-    /// Records which mechanism actually held a limit, and refuses an answer that
-    /// is neither.
+    /// Requires that a real mechanism held this limit, and names it on failure.
     ///
-    /// Without this, "green on Linux" cannot distinguish a cgroup from the
-    /// supervised fallback, and the cross-platform requirement is precisely that
-    /// a green build means *the primary mechanism worked or the production
-    /// fallback worked* — never that a test quietly did neither. The backend is
-    /// printed so the CI log answers which one, per platform, without anyone
-    /// having to reproduce the run.
+    /// This is the half of the cross-platform requirement a test can enforce: a
+    /// green build must mean the primary mechanism worked or the production
+    /// fallback worked, never that neither did. An empty backend or an
+    /// owner-sourced level would mean the breach came from something other than
+    /// this process's own record.
+    ///
+    /// It deliberately does not pin a *specific* backend — which one is correct
+    /// depends on the host, and requiring a cgroup would fail a perfectly good
+    /// machine that has no delegated hierarchy. Answering "which one did this
+    /// runner actually use" is left to the `processes limits` step in CI, because
+    /// libtest captures a passing test's output and no print from here can reach
+    /// the log.
     #[cfg(unix)]
     fn assert_enforced_by_a_real_backend(breach: &crate::resource_control::LimitBreach) {
         assert!(
@@ -1478,13 +1483,6 @@ mod tests {
             ["kernel", "supervised"].contains(&breach.level.as_str()),
             "a limit fired on this process must be held by the kernel or by the supervisor, \
              not sourced from an owner: {breach:?}"
-        );
-        // Deliberately `println!` rather than an assertion on a specific backend:
-        // which one is correct depends on the host, and pinning it here would
-        // fail a perfectly good machine that offers a weaker mechanism.
-        println!(
-            "[k4] {} enforced by {} ({})",
-            breach.limit, breach.backend, breach.level
         );
     }
 

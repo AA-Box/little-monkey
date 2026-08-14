@@ -180,6 +180,25 @@ jobs:
           New-Item -ItemType Directory -Force $root | Out-Null
           "LITTLE_MONKEY_COW_TEST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Report this runner's resource-enforcement backend
+        # Which mechanism actually holds a limit here, per platform, in the log.
+        #
+        # The tests already refuse a limit that no backend enforced, so a green
+        # build cannot mean "skipped". What they cannot say is *which* backend
+        # did it: a Linux host with a delegated cgroup gets a kernel bound and
+        # one without falls back to the supervisor, and both pass. That
+        # distinction decides whether the cgroup path has ever executed at all,
+        # and libtest captures a passing test's output, so it can only be
+        # answered from outside the test binary.
+        #
+        # Uses the shipped `processes limits` surface rather than a bespoke
+        # probe, so what CI reports is exactly what a user reading their own
+        # machine would see. Never fails the job: an environment-dependent
+        # fallback is a legitimate outcome here, and the requirement is that it
+        # be visible rather than that it be absent.
+        continue-on-error: true
+        run: cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits
+
       - name: Rust tests
         run: pnpm test:rust
 
