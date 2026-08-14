@@ -67,6 +67,14 @@ use self::worktree::{OwnedWorktree, WorktreeRequest};
 pub enum DaemonCmd {
     /// Explicitly install and start the current-user OS service.
     Install(DaemonInstallArgs),
+    /// Bring the resident service to a usable state: install it if missing,
+    /// republish and restart it if it is stale, start it if it is stopped, and
+    /// do nothing if it is already healthy. Idempotent and safe to run at
+    /// every launch.
+    Ensure {
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the previously installed user service.
     Start,
     /// Show service, heartbeat, kill-switch, queue, backpressure, and
@@ -435,6 +443,7 @@ pub(crate) fn backpressure_for(
 pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
     match action {
         DaemonCmd::Install(args) => install(args),
+        DaemonCmd::Ensure { json } => ensure(*json),
         DaemonCmd::Start => {
             let (paths, manager) = service_context()?;
             manager.start(&paths)
@@ -494,6 +503,124 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
         format!("{:?}", manager.platform()).to_lowercase(),
         manifest.display()
     );
+    Ok(())
+}
+
+/// What [`ensure`] has to do to make the resident service usable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceAction {
+    /// Nothing: installed, current, and running.
+    Healthy,
+    Installed,
+    /// Republished and reactivated — the definition or the running build was
+    /// left behind by a previous install of the app.
+    Reinstalled,
+    Started,
+}
+
+impl ServiceAction {
+    /// The lifecycle decision, isolated from the I/O that measures its inputs.
+    ///
+    /// `version_current` is only meaningful while the service runs — a stopped
+    /// service has no build to be wrong about, and starting it necessarily
+    /// launches whatever the (already checked) definition names.
+    fn decide(
+        installed: bool,
+        manifest_current: bool,
+        running: bool,
+        version_current: bool,
+    ) -> Self {
+        if !installed {
+            return Self::Installed;
+        }
+        if !manifest_current || (running && !version_current) {
+            return Self::Reinstalled;
+        }
+        if !running {
+            return Self::Started;
+        }
+        Self::Healthy
+    }
+}
+
+/// The build the resident process last reported, or `None` when it has never
+/// run or predates the `version` heartbeat field. Absent reads as *stale*: a
+/// service that cannot say what it is running is not one to hand a turn to.
+fn running_service_version(paths: &DaemonPaths) -> Result<Option<String>, String> {
+    if !paths.state_db.is_file() {
+        return Ok(None);
+    }
+    DaemonStore::open(paths)?.get_meta("version")
+}
+
+/// The whole resident-service lifecycle, as one idempotent call.
+///
+/// This exists because the service is not an optional background-agents
+/// feature: every desktop chat turn executes on it, so the app owns installing,
+/// upgrading and starting it, and a person who only wants to send a message is
+/// never asked to go install anything. The desktop runs this at launch and
+/// behind its Repair action, and both get the same ladder.
+///
+/// It lives here rather than in the desktop bridge because everything the
+/// decision needs — the installed config, the published manifest, the running
+/// build — is already here next to [`install`]; spelling it across the IPC
+/// boundary would be a second copy that drifts.
+///
+/// A stale *running* build is repaired by reinstalling, which stops the
+/// service. That is the same interruption `install` has always been: active
+/// jobs are reconciled on the next start (`reconcile_interrupted`), and a
+/// daemon speaking the previous release's contract to this desktop is the
+/// fault being fixed.
+fn ensure(json: bool) -> Result<(), String> {
+    let (paths, manager) = service_context()?;
+    let installed = paths.config.is_file() && manager.is_installed(&paths)?;
+    let running = installed && manager.status(&paths)?;
+    let action = ServiceAction::decide(
+        installed,
+        installed && manager.manifest_is_current(&paths)?,
+        running,
+        running_service_version(&paths)?.as_deref() == Some(env!("CARGO_PKG_VERSION")),
+    );
+    if action != ServiceAction::Healthy {
+        // `daemon stop` latches intent that outlives the process, so without
+        // this the service starts and immediately stops itself again.
+        //
+        // Clearing it means a stop lasts until the app is launched again,
+        // which is the deliberate consequence of chat needing the service: a
+        // launch that left it stopped would open a chat window that cannot
+        // send. The durable "refuse to run work" lever is the kill switch,
+        // which this never touches and which every producer still honours.
+        let mut store = DaemonStore::open(&paths)?;
+        store.set_meta("stop_requested", "0")?;
+    }
+    match action {
+        ServiceAction::Healthy => {}
+        ServiceAction::Installed | ServiceAction::Reinstalled => {
+            // Defaults only for a first install; a repair keeps whatever
+            // concurrency and retention the operator configured.
+            let config = if installed {
+                DaemonConfig::load(&paths).unwrap_or_default()
+            } else {
+                DaemonConfig::default()
+            };
+            manager.install(&paths, &config)?;
+        }
+        ServiceAction::Started => manager.start(&paths)?,
+    }
+    if json {
+        let payload = serde_json::json!({
+            "action": action,
+            "installed": true,
+            "service_running": manager.status(&paths)?,
+        });
+        println!("{payload}");
+    } else {
+        println!(
+            "Execution service: {}",
+            format!("{action:?}").to_lowercase()
+        );
+    }
     Ok(())
 }
 
@@ -3060,6 +3187,33 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn ensure_repairs_a_service_left_behind_by_a_previous_app_install() {
+        use ServiceAction::*;
+
+        // Nothing there yet — the first desktop launch on a machine.
+        assert_eq!(decide_all(false, false, false, false), Installed);
+        // The app was replaced: the definition still names the old binary, or
+        // it names the right one but the old process is still resident.
+        assert_eq!(decide_all(true, false, true, true), Reinstalled);
+        assert_eq!(decide_all(true, true, true, false), Reinstalled);
+        // Installed, current, but stopped (a reboot, or an explicit stop).
+        assert_eq!(decide_all(true, true, false, false), Started);
+        // A stale version on a *stopped* service is not a reinstall: starting
+        // it launches what the current definition names.
+        assert_eq!(decide_all(true, true, false, true), Started);
+        assert_eq!(decide_all(true, true, true, true), Healthy);
+    }
+
+    fn decide_all(
+        installed: bool,
+        manifest_current: bool,
+        running: bool,
+        version_current: bool,
+    ) -> ServiceAction {
+        ServiceAction::decide(installed, manifest_current, running, version_current)
+    }
 
     #[test]
     fn daemon_and_authored_roots_must_come_from_the_same_profile_snapshot() {

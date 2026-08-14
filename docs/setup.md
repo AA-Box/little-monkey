@@ -30,6 +30,8 @@ The app creates agent-home directories with mode `0700` on Unix and rejects a re
 
 Desktop and CLI startup perform this setup automatically. Daemon installation records the resolved agent home and profile in its service configuration, so background runs use the same configuration without shell `PATH` or environment setup. Reinstalling a named-profile daemon transactionally upgrades a matching legacy fixed-ID service and restores it if the replacement cannot start.
 
+The resident execution service is runtime infrastructure, not an optional feature: every desktop chat turn executes on it. The desktop app therefore runs `monkey daemon ensure` at each launch, which installs the service if it is missing, republishes and restarts it if its definition or its running build was left behind by a previous app version, starts it if it is stopped, and does nothing if it is already healthy. Nothing has to be installed by hand; when the service cannot be brought up, chat says so and offers Repair, which runs the same command. **Settings → Background Agents** manages the service afterwards — stopping it, concurrency and queue limits, the kill switch, remote handoff.
+
 ## Development
 
 ```sh

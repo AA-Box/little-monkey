@@ -103,6 +103,7 @@ monkey security admission-trail [--limit <n>] [--json]
 monkey revisions [--change <change-id>] [--limit <n>]
 
 monkey daemon install | status [--json]
+monkey daemon ensure [--json]
 monkey daemon run <recipe> [--owned-worktree] [--json]
 monkey daemon attach <run-id> [--follow] [--json]
 monkey daemon pause|resume|cancel <run-id>
