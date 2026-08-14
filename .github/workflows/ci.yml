@@ -180,6 +180,9 @@ jobs:
           New-Item -ItemType Directory -Force $root | Out-Null
           "LITTLE_MONKEY_COW_TEST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Rust tests
+        run: pnpm test:rust
+
       - name: Report this runner's resource-enforcement backend
         # Which mechanism actually holds a limit here, per platform, in the log.
         #
@@ -193,14 +196,21 @@ jobs:
         #
         # Uses the shipped `processes limits` surface rather than a bespoke
         # probe, so what CI reports is exactly what a user reading their own
-        # machine would see. Never fails the job: an environment-dependent
-        # fallback is a legitimate outcome here, and the requirement is that it
-        # be visible rather than that it be absent.
+        # machine would see.
+        #
+        # After the tests, and through `stage:cli:placeholder`, because a bare
+        # `cargo run` here fails: `build.rs` calls `tauri-build`, which wants a
+        # sidecar binary that does not exist until that script stages a
+        # placeholder. The first version of this step ran before the tests and
+        # died on exactly that, while `continue-on-error` reported it as
+        # successful and it printed nothing — which is the failure mode this
+        # step exists to prevent one level up.
+        #
+        # Never fails the job: an environment-dependent fallback is a legitimate
+        # outcome here, and the requirement is that it be visible rather than
+        # that it be absent.
         continue-on-error: true
-        run: cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits
-
-      - name: Rust tests
-        run: pnpm test:rust
+        run: pnpm stage:cli:placeholder && cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits
 
       # The K19 gate, named as its own step so a failure reads as "the
       # published ABI changed without a version bump" rather than as one line
