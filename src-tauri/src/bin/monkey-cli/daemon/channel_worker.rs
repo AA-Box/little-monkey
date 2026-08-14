@@ -646,29 +646,71 @@ async fn run_account_inbound(
     }
 }
 
+/// What actually feeds a live adapter: the transport-relevant parts of the
+/// account row plus the resolved secret. Deliberately NOT the row's
+/// updated-at stamp — an operator renaming an account or tightening its
+/// access policy must not tear down a live gateway session, while rotating
+/// the credential or editing the provider config must.
+fn worker_fingerprint(
+    account: &super::channel_store::ChannelAccountRecord,
+    secret: &str,
+) -> String {
+    // A digest rather than the secret itself: the fingerprint is held for
+    // the daemon's lifetime and compared every reload, and there is no
+    // reason for a copy of the token to sit in it.
+    super::trigger::sha256_hex(
+        format!(
+            "{}|{:?}|{}|{}",
+            account.account_id,
+            account.kind,
+            super::trigger::sha256_hex(account.non_secret_config.to_string().as_bytes()),
+            super::trigger::sha256_hex(secret.as_bytes()),
+        )
+        .as_bytes(),
+    )
+}
+
 /// Bring the worker set in line with the enabled accounts, touching only what
 /// changed.
 ///
-/// The fingerprint covers the account row and the resolved secret, so editing
-/// a label or rotating a token rebuilds that one adapter while every other
-/// account keeps its live session. Removing (or disabling) an account aborts
-/// its task and drops its adapter, which is what tells a socket adapter's
-/// background task to hang up. An account that cannot be built — unreadable
-/// credential, config its adapter refuses — has that failure written to its
-/// stored health rather than only to the daemon's log: the operator looking
-/// at the Channels panel is the one who can fix it.
+/// The fingerprint covers what the adapter is built from — provider config
+/// and the resolved secret — so rotating a token rebuilds that one adapter
+/// while every other account keeps its live session, and editing a label
+/// rebuilds nothing. Removing (or disabling) an account aborts its task and
+/// drops its adapter, which is what tells a socket adapter's background task
+/// to hang up. An account that cannot be built — unreadable credential,
+/// config its adapter refuses — has that failure written to its stored
+/// health rather than only to the daemon's log: the operator looking at the
+/// Channels panel is the one who can fix it.
 fn reconcile_workers(
     paths: &super::store::DaemonPaths,
     store: &mut DaemonStore,
     queue: &Arc<dyn RunQueue>,
     workers: &mut BTreeMap<String, AccountWorker>,
 ) {
-    use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
+    reconcile_workers_with(
+        &super::channel_adapter::KeyringChannelSecrets,
+        paths,
+        store,
+        queue,
+        workers,
+    );
+}
+
+/// [`reconcile_workers`] with the secret store injected, so the lifecycle —
+/// spawn, keep, rebuild, stop — is provable against a store a test owns.
+fn reconcile_workers_with(
+    secrets: &dyn super::channel_adapter::ChannelSecrets,
+    paths: &super::store::DaemonPaths,
+    store: &mut DaemonStore,
+    queue: &Arc<dyn RunQueue>,
+    workers: &mut BTreeMap<String, AccountWorker>,
+) {
+    use super::channel_adapter::AdapterConfig;
 
     let Ok(now_ms) = current_ms() else {
         return;
     };
-    let secrets = KeyringChannelSecrets;
     let accounts = match store.channel_accounts() {
         Ok(accounts) => accounts,
         Err(error) => {
@@ -743,19 +785,7 @@ fn reconcile_workers(
                 None => String::new(),
             }
         };
-        // A digest rather than the secret itself: the fingerprint is held for
-        // the daemon's lifetime and compared every reload, and there is no
-        // reason for a copy of the token to sit in it.
-        let fingerprint = super::trigger::sha256_hex(
-            format!(
-                "{}|{:?}|{}|{}",
-                account.account_id,
-                account.kind,
-                account.updated_at_ms,
-                super::trigger::sha256_hex(secret.as_bytes()),
-            )
-            .as_bytes(),
-        );
+        let fingerprint = worker_fingerprint(&account, &secret);
         desired.insert(account.account_id.clone());
         if workers
             .get(&account.account_id)
@@ -765,7 +795,7 @@ fn reconcile_workers(
             continue;
         }
         let built = if is_sms {
-            build_sms_adapter(paths, store, &secrets, &account.account_id)
+            build_sms_adapter(paths, store, secrets, &account.account_id)
         } else {
             super::adapters::build_adapter(&AdapterConfig {
                 account: &account,
@@ -1250,6 +1280,143 @@ mod tests {
             .claim_outbox_batch(NOW + 120_000, 10)
             .unwrap()
             .is_empty());
+    }
+
+    // -- worker lifecycle ---------------------------------------------------
+
+    /// A LINE account: webhook-delivered, so its spawned inbound task's poll
+    /// is a local no-op — the one adapter whose worker can run in a test
+    /// without a provider fixture behind it.
+    fn line_account(updated_at_ms: i64, label: &str) -> ChannelAccountRecord {
+        ChannelAccountRecord {
+            account_id: "acct-line".into(),
+            kind: ChannelKind::Line,
+            label: label.into(),
+            enabled: true,
+            non_secret_config: serde_json::json!({}),
+            credential_ref: Some("line-cred".into()),
+            access_policy: Default::default(),
+            health: ChannelHealth::error(0, "unused"),
+            created_at_ms: NOW,
+            updated_at_ms,
+        }
+    }
+
+    fn line_secret() -> String {
+        r#"{"channel_secret":"line-secret","channel_access_token":"line-token"}"#.to_string()
+    }
+
+    fn lifecycle_world() -> (
+        DaemonStore,
+        super::super::channel_adapter::MemoryChannelSecrets,
+        super::super::store::DaemonPaths,
+        Arc<dyn RunQueue>,
+    ) {
+        use super::super::channel_adapter::ChannelSecrets;
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        store
+            .upsert_channel_account(&line_account(NOW, "Ops"))
+            .expect("account");
+        let secrets = super::super::channel_adapter::MemoryChannelSecrets::default();
+        secrets.put("line-cred", &line_secret()).expect("secret");
+        let paths = super::super::channel_restart_tests::temp_daemon_paths();
+        let queue: Arc<dyn RunQueue> = Arc::new(FakeQueue::default());
+        (store, secrets, paths, queue)
+    }
+
+    #[tokio::test]
+    async fn a_label_edit_does_not_rebuild_a_live_worker() {
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1);
+        let before = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+
+        // A rename touches the row (and its updated-at stamp) but nothing the
+        // transport is built from: the live session must survive it.
+        store
+            .upsert_channel_account(&line_account(NOW + 5_000, "Renamed"))
+            .expect("rename");
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1);
+        let after = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(
+            std::ptr::eq(before, after),
+            "a label edit must not tear down a live worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotated_credential_replaces_the_worker_exactly_once() {
+        use super::super::channel_adapter::ChannelSecrets;
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        let before = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+
+        secrets
+            .put(
+                "line-cred",
+                r#"{"channel_secret":"rotated","channel_access_token":"rotated-token"}"#,
+            )
+            .expect("rotate");
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        assert_eq!(workers.len(), 1, "one account, one worker");
+        let after = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(
+            !std::ptr::eq(before, after),
+            "a rotated credential must rebuild the worker"
+        );
+
+        // Reconciling again with nothing changed keeps the rebuilt worker.
+        reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+        let settled = Arc::as_ptr(&workers.get("acct-line").unwrap().adapter);
+        assert!(std::ptr::eq(after, settled));
+    }
+
+    #[tokio::test]
+    async fn rapid_enable_disable_cycles_leave_at_most_one_consumer() {
+        let (mut store, secrets, paths, queue) = lifecycle_world();
+        let mut workers = BTreeMap::new();
+        for round in 0..5 {
+            let mut account = line_account(NOW + round, "Ops");
+            account.enabled = round % 2 == 0;
+            store.upsert_channel_account(&account).expect("account");
+            reconcile_workers_with(&secrets, &paths, &mut store, &queue, &mut workers);
+            assert!(
+                workers.len() <= 1,
+                "round {round} left {} workers",
+                workers.len()
+            );
+            assert_eq!(
+                workers.contains_key("acct-line"),
+                account.enabled,
+                "round {round}: the worker set must mirror the enabled flag"
+            );
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_tracks_transport_inputs_and_nothing_else() {
+        let account = line_account(NOW, "Ops");
+        let base = worker_fingerprint(&account, "secret-1");
+
+        let mut renamed = line_account(NOW + 99, "Renamed");
+        renamed.access_policy = ChannelAccessPolicy {
+            direct: AccessPolicy::Open,
+            group: AccessPolicy::Open,
+            group_activation: GroupActivation::Always,
+        };
+        assert_eq!(
+            worker_fingerprint(&renamed, "secret-1"),
+            base,
+            "labels, timestamps and access policy are not transport inputs"
+        );
+
+        assert_ne!(worker_fingerprint(&account, "secret-2"), base);
+        let mut reconfigured = line_account(NOW, "Ops");
+        reconfigured.non_secret_config = serde_json::json!({"base_url": "http://other"});
+        assert_ne!(worker_fingerprint(&reconfigured, "secret-1"), base);
     }
 
     #[tokio::test]

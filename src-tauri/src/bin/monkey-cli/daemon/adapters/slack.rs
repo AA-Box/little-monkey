@@ -1643,7 +1643,10 @@ mod tests {
         let text = serde_json::json!({ "type": "disconnect", "reason": "warning" }).to_string();
         assert!(matches!(
             classify_socket_frame("acct", &text, None, None, 500),
-            SocketFrameResult::Reconnect { replacement_url: None, .. }
+            SocketFrameResult::Reconnect {
+                replacement_url: None,
+                ..
+            }
         ));
 
         let text = serde_json::json!({

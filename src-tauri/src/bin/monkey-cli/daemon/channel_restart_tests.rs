@@ -769,9 +769,7 @@ pub(crate) fn send_via_tool_seam(
     policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
 ) -> Result<serde_json::Value, String> {
     let authority = super::channel_tool::send_authority_for_job(store, job_id, false, policy);
-    let origin = store
-        .channel_origin_for_job(job_id)
-        .expect("origin lookup");
+    let origin = store.channel_origin_for_job(job_id).expect("origin lookup");
     let plan = super::channel_tool::plan_send(request, &authority, origin.as_ref())?;
     super::channel_tool::queue_send(
         store,
@@ -1456,7 +1454,10 @@ async fn a_cross_conversation_send_without_the_grant_leaves_no_outbox_row() {
     let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
     assert!(refused.is_err(), "the send must be refused: {refused:?}");
     assert!(
-        store.claim_outbox_batch(NOW + 60_000, 10).unwrap().is_empty(),
+        store
+            .claim_outbox_batch(NOW + 60_000, 10)
+            .unwrap()
+            .is_empty(),
         "a refused send must not leave an outbox row"
     );
 }
@@ -1523,7 +1524,10 @@ async fn a_cross_account_send_needs_the_account_grant() {
     let refused = send_via_tool_seam(&mut store, &paths, &job_id, &request, None);
     assert!(refused.is_err(), "the send must be refused: {refused:?}");
     assert!(
-        store.claim_outbox_batch(NOW + 60_000, 10).unwrap().is_empty(),
+        store
+            .claim_outbox_batch(NOW + 60_000, 10)
+            .unwrap()
+            .is_empty(),
         "a refused cross-account send must not leave an outbox row"
     );
 
@@ -1540,9 +1544,13 @@ async fn a_cross_account_send_needs_the_account_grant() {
             .to_string(),
     )]);
     let adapter = telegram_adapter(&base);
-    let drained = drain_outbox_once(&mut store, &adapters_map("acct-tg2", Arc::new(adapter)), NOW)
-        .await
-        .expect("drain");
+    let drained = drain_outbox_once(
+        &mut store,
+        &adapters_map("acct-tg2", Arc::new(adapter)),
+        NOW,
+    )
+    .await
+    .expect("drain");
     assert_eq!(drained.sent, 1, "the row must drain through acct-tg2");
     let wire = requests
         .recv_timeout(std::time::Duration::from_secs(5))
@@ -1794,14 +1802,20 @@ async fn slack_provider_directed_reconnect_hands_off_without_a_receive_gap() {
         (adapter, batch)
     });
     ws.wait_connections(1, "the first socket").await;
-    ws.inject(0, slack_event_envelope("env-1", "3000.001", "before the refresh"));
+    ws.inject(
+        0,
+        slack_event_envelope("env-1", "3000.001", "before the refresh"),
+    );
     let (adapter, batch) = poll.await.expect("poll task");
     let mut batch = batch.expect("poll");
     assert_eq!(batch.envelopes.len(), 1);
     for envelope in &mut batch.envelopes {
         envelope.account_id = "acct-sl".to_string();
     }
-    assert_eq!(ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted, 1);
+    assert_eq!(
+        ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted,
+        1
+    );
     adapter.commit_batch(&batch.envelopes).await;
     wait_for_frame(&ws.received, 10, "ACK for env-1", |_, frame| {
         frame.get("envelope_id").and_then(Value::as_str) == Some("env-1")
@@ -1825,7 +1839,10 @@ async fn slack_provider_directed_reconnect_hands_off_without_a_receive_gap() {
         let batch = adapter.poll(None).await;
         (adapter, batch)
     });
-    ws.inject(1, slack_event_envelope("env-1b", "3000.001", "before the refresh"));
+    ws.inject(
+        1,
+        slack_event_envelope("env-1b", "3000.001", "before the refresh"),
+    );
     let (adapter, batch) = poll.await.expect("poll task");
     let mut batch = batch.expect("poll");
     assert_eq!(batch.envelopes.len(), 1);
@@ -1836,9 +1853,14 @@ async fn slack_provider_directed_reconnect_hands_off_without_a_receive_gap() {
     assert_eq!(report.duplicates, 1);
     assert_eq!(report.accepted, 0);
     adapter.commit_batch(&batch.envelopes).await;
-    wait_for_frame(&ws.received, 10, "ACK for env-1b on the replacement", |connection, frame| {
-        connection == 1 && frame.get("envelope_id").and_then(Value::as_str) == Some("env-1b")
-    })
+    wait_for_frame(
+        &ws.received,
+        10,
+        "ACK for env-1b on the replacement",
+        |connection, frame| {
+            connection == 1 && frame.get("envelope_id").and_then(Value::as_str) == Some("env-1b")
+        },
+    )
     .await;
 
     // One run despite two sockets and two deliveries; and the fixture saw
@@ -1886,14 +1908,20 @@ async fn slack_reconnect_without_a_url_falls_back_to_a_fresh_open() {
         serde_json::json!({ "type": "disconnect", "reason": "refresh_requested" }).to_string(),
     );
     ws.wait_connections(2, "the fallback socket").await;
-    ws.inject(1, slack_event_envelope("env-7", "4000.001", "after the fallback"));
+    ws.inject(
+        1,
+        slack_event_envelope("env-7", "4000.001", "after the fallback"),
+    );
     let (adapter, batch) = poll.await.expect("poll task");
     let mut batch = batch.expect("poll");
     assert_eq!(batch.envelopes.len(), 1, "the fallback socket must deliver");
     for envelope in &mut batch.envelopes {
         envelope.account_id = "acct-sl".to_string();
     }
-    assert_eq!(ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted, 1);
+    assert_eq!(
+        ingest_batch(&mut store, &queue, &batch.envelopes, NOW).accepted,
+        1
+    );
     adapter.commit_batch(&batch.envelopes).await;
     wait_for_frame(&ws.received, 10, "ACK for env-7", |connection, frame| {
         connection == 1 && frame.get("envelope_id").and_then(Value::as_str) == Some("env-7")

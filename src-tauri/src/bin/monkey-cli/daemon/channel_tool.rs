@@ -345,8 +345,7 @@ pub(crate) fn queue_send(
     // raise — the reply-wide file cap and the artifact store's blob cap. All
     // checked before the row is written, so a request over a deterministic
     // limit never becomes durable.
-    let limits =
-        super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
+    let limits = super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
     let max_files = limits.max_listed.min(MAX_ATTACHMENTS_PER_REPLY);
     if request.artifact_ids.len() > max_files {
         return Err(format!(
@@ -889,6 +888,9 @@ mod tests {
         assert!(properties.get("artifacts").is_some());
         assert!(properties.get("attachments").is_none());
         assert!(properties.get("paths").is_none());
-        assert_eq!(schema["function"]["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            schema["function"]["parameters"]["additionalProperties"],
+            false
+        );
     }
 }
