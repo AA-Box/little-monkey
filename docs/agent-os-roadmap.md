@@ -1470,16 +1470,26 @@ has a cross-platform resource/lifetime mechanism it does not have.
 process-tree lifetime gap as an explicitly deferred platform capability; K21's
 disposable-isolation evidence prerequisite is now satisfied.
 
-## K4. Enforced per-process resource limits *(partially built)*
+## K4. Enforced per-process resource limits *(built)*
 
-**Reopened, and by evidence rather than by wording.** The slice below closed this
-item on the reading that `Unavailable(reason)` satisfies the acceptance. That
-reading is defensible for a resource nothing *can* hold; it was applied to
-memory and child-process ceilings, which a supervisor over the process tree can
-hold and now does. So the honest label is partial: the core limits are enforced
-for the kinds that own a native process tree, one platform leg is verified, two
-are written but unrun, and three named gaps remain. They are listed at the end of
-this section rather than folded back into the prose above them.
+**Reopened once, and by evidence rather than by wording.** An earlier slice
+closed this item on the reading that `Unavailable(reason)` satisfies the
+acceptance. That reading is defensible for a resource nothing *can* hold; it had
+been applied to memory and child-process ceilings, which a supervisor over the
+process tree can hold. Those are enforced now, and the five gaps the reopening
+named are closed rather than reworded: the Linux kernel path is demanded by CI
+rather than merely made possible, the Windows job object's two refusals are
+tested end to end against real child trees, a browser session is routed, the
+Processes panel shows what is bounding each process, and the scheduler audit is
+assertions in the test suite.
+
+**Two limits remain, and both are platform-fundamental rather than unfinished
+work.** macOS offers no kernel-owned process tree to an unprivileged process, so
+its bound is supervised and says so; and a browser session's Chromium is assigned
+to its Windows job immediately after creation rather than before it is resumed,
+because that spawn site has no pre-creation hook. Both are stated at the end of
+this section, reported truthfully by the capability API, and shown as such in the
+UI and the CLI. Neither is a resource left unbounded.
 
 ### Shipped — one resource-control contract, and limits that fire
 
@@ -1547,59 +1557,132 @@ claim something false.
 
 ### What remains open
 
-1. **Both platform legs compile and pass on CI. Only one of them has been shown
-   to *execute*.** Windows `rust-tests` is green, which exercises the job object
-   including its I/O completion port. Linux `rust-tests` is green too — but
-   `monkey processes limits` on that same runner reports `this host: supervisor`,
-   because a hosted runner's job is not a systemd user session and nothing has
-   been delegated to it. `CgroupScope::create` correctly declines and the
-   supervised fallback runs, which is a legitimate production outcome and also
-   means the cgroup enforcement path had never run anywhere. CI now provisions a
-   delegated `lm-ci/leaf` hierarchy and runs the Linux suite inside it, on the
-   same reasoning as the btrfs loop mount that exists so the reflink tests
-   exercise the native clone rather than its fallback.
-
-   The lesson is worth more than the fix: "the Linux job is green" was taken as
-   "the cgroup backend works", and those are different claims. The step that
-   distinguishes them prints the backend from outside the test binary, because
-   libtest captures a passing test's output and no assertion inside one can say
-   which of two acceptable answers it got.
-
-2. **`monkey-cli` could not start at all on Windows in a debug build**, and this
-   item's CI step is what finally ran one. `STATUS_STACK_OVERFLOW` (0xc00000fd)
-   before `main`'s first statement: Windows sizes the main thread's stack from a
-   PE header field whose linker default reserve is 1 MiB against Unix's 8 MiB,
-   and constructing clap's command tree unoptimized does not fit in it. Fixed by
-   reserving a Unix-sized main stack for that binary at link time.
-
-   **Recorded here because the first diagnosis in this file was wrong, and wrong
-   in the self-serving direction.** It read as "the host block this item added is
-   the new code in that path, cause unidentified" — blaming the change that
-   happened to be nearby. The crash had nothing to do with the resource
-   controller, was not specific to `processes limits`, and predated this work:
-   it looked like that subcommand only because that is the one CI ran. The
-   isolating repro is `(ulimit -s 1024; monkey-cli --version)`, which reproduces
-   on any host and shows the variable is stack size, not subcommand. A unit test
-   constructing a controller and reading its capabilities passed on Windows
-   throughout, because libtest gives each test its own spawned thread rather than
-   the 1 MiB main one — which is also why no test suite could have caught this.
-3. **A browser session owns a process tree and is not routed through the
-   controller.** Its Chromium is bounded by `browser_worker`'s own session quotas,
-   which are real; wiring it means reconciling two enforcement paths rather than
-   adding one. Both its memory and child-process cells say exactly this rather
-   than claiming a bound.
-4. **macOS has no kernel-owned process tree, and this does not invent one.** The
-   supervisor covers an ordinary descendant and a `setsid` escape. A descendant
-   that both re-parents *and* leaves the group is outside any primitive macOS
+1. **macOS has no kernel-owned process tree, and this does not invent one.** The
+   supervisor covers an ordinary descendant and a `setsid` escape, because
+   membership is the parent-link closure *unioned* with the process group and
+   each covers the other's escape. A descendant that both re-parents **and**
+   leaves the group, before ownership is captured, is outside any primitive macOS
    offers without a privileged helper. It keeps its Seatbelt filesystem and
-   network confinement; what it escapes is the lifetime bound. That specific
-   requirement stays open rather than being redefined.
-5. **The Processes UI has not been extended.** The effective limits, live usage
-   and enforcement mechanism are on the record and exposed by `monkey processes
-   show`/`limits`; no desktop surface reads them yet.
-6. **Scheduler reservations have not been re-audited against the controller.**
-   K7/K8 are built against measured reservations and are unchanged by this work,
-   which means their assumptions have not been *checked* against it.
+   network confinement; what it escapes is the lifetime bound. The capability
+   says `supervised` and the UI says `Supervised`, which is the honest report of
+   a real platform limit rather than a deferred implementation.
+
+2. **A browser session's Chromium is assigned to its Windows job after creation
+   rather than before it is resumed.** The shells get the strong ordering on
+   every platform — cgroup membership and the process group installed before
+   `exec`, a job assigned to a suspended process before it is resumed — because
+   they build their own `Command`. Chromium is launched by a long-standing spawn
+   site with its own argv, environment and stdio, and Windows offers no
+   pre-creation hook there, so the assignment happens in the microseconds after
+   `CreateProcess` returns. A descendant created inside that window would be
+   outside the job. Unix has no such window. Stated rather than glossed as
+   equivalent; `ResourceController::adopt` carries the same note at the call.
+
+### What was open, and is not
+
+Each of these was a numbered gap in the list above. They are kept, rather than
+deleted, because what they say about *how the gap was found* is the useful part.
+
+- **The Linux cgroup path had never executed anywhere.** "The Linux job is green"
+  was read as "the cgroup backend works", and those are different claims: a hosted
+  runner is not a systemd user session, so nothing is delegated, `CgroupScope::create`
+  correctly declines, and every limit test passes against the supervisor. CI now
+  provisions a delegated `lm-ci/leaf` hierarchy, runs the suite inside it, and —
+  this is the part that makes it a gate rather than an opportunity — *demands* the
+  kernel backend when both controllers were actually delegated. A runner without a
+  v2 hierarchy still skips; the leg whose purpose is the kernel path can no longer
+  pass on the fallback.
+
+  A second bug fell out of building that gate. Both reporting surfaces asked the
+  host "what would you hold a workload with" using an *empty* limit set, and a
+  backend installs only what it was asked for — so the probe declined its own
+  cgroup and `monkey processes limits` reported `supervisor` on a machine whose
+  every shell runs under `memory.max`. A capability probe has to ask a real
+  question; `resource_control::probe_limits` is that question.
+
+- **`monkey-cli` could not start at all on Windows in a debug build.**
+  `STATUS_STACK_OVERFLOW` (0xc00000fd) before `main`'s first statement: Windows
+  sizes the main thread's stack from a PE header field whose linker default
+  reserve is 1 MiB against Unix's 8 MiB, and constructing clap's command tree
+  unoptimized does not fit. Fixed by reserving a Unix-sized main stack for that
+  binary at link time, so the three platforms agree instead of one being a special
+  case.
+
+  **The first diagnosis in this file was wrong, and wrong in the self-serving
+  direction** — it blamed the change that happened to be nearby. The crash had
+  nothing to do with the resource controller and predated this work; it looked
+  specific to `processes limits` only because that is the one subcommand CI ran.
+  The isolating repro is `(ulimit -s 1024; monkey-cli --version)`, which
+  reproduces on any host. No test suite could have caught it, because libtest
+  gives each test its own spawned thread rather than the 1 MiB main one — which is
+  why the CI step now runs the shipped binary and no longer carries
+  `continue-on-error`. That flag is what let the binary sit broken and the job
+  stay green.
+
+- **A browser session owned a process tree and was not routed.** Resolved by
+  splitting *by resource* rather than by owner, which is what made the two
+  enforcement paths reconcilable: the controller holds memory and child-process
+  count over Chromium's whole tree and reclaims it, and the session keeps the
+  clock, the action budget and the disk budget, which no controller can express.
+  One resource, one owner, in both directions. Its sweep asks the mechanism before
+  it reads liveness, for the reason below.
+
+- **The Processes UI had not been extended.** Each row now expands into the
+  effective limit, who supplied it, the mechanism holding it, whether that
+  mechanism is kernel or supervised or owner-sourced, the measured cost, and the
+  breach with both numbers. The values are built in Rust by
+  `process_resource_report`, from the same controller the enforcement runs through
+  and the same matrix the CLI prints, so the two surfaces cannot drift.
+
+- **Scheduler reservations had not been re-audited.** They have been, and the
+  audit is assertions rather than a paragraph
+  (`process_commands::scheduler_assumptions`). K7's admission reserves against
+  *model footprint*, keyed by model target and summed over `daemon_jobs`; it reads
+  no `ProcessLimits` and counts no rows in this table, so foreground shells
+  gaining rows, background shells outliving their turn, browser sessions being
+  routed, and rows storing the effective limit rather than the requested one reach
+  it through no path at all. Worth pinning because the failure it rules out is
+  specific: had admission summed `max_memory_bytes` over live rows, this work
+  would have added 8 GiB of phantom reservation per agent shell and stopped the
+  queue for a reason no operator could see.
+
+### The bug this slice existed to fix
+
+**A kernel-held bound does not announce itself by making a measurement exceed a
+budget.** A cgroup with `pids.max = 12` refuses the thirteenth fork and leaves
+`pids.current` at twelve; a Windows job refuses the thirteenth `CreateProcess`
+and leaves `ActiveProcesses` where it was. `observed > configured` is false at the
+moment the limit fires and stays false forever.
+
+The foreground path knew this. The background path did not — it sampled and
+compared — so the same command, killed by the same cgroup, was recorded
+`limit_exceeded` from a turn and as an unexplained error from the background
+panel. The ordering is now decided once on the controller
+(`mechanism_breach`, `check`) and every owner goes through it: foreground
+supervision, the background watcher, the browser sweep.
+
+The background *exit* path needed the same rule for a second reason, and it is the
+subtler one. A kernel limit fires, refuses the work, and the child becomes
+terminal — often inside one poll interval, so the sampling loop never gets a tick
+while the process is still running. Reading the exit status first called that
+ordinary failure. There is a regression test for exactly that race, built on a
+kernel process ceiling of one so the shell's very first fork is refused and it
+dies in milliseconds.
+
+**The foreground shell had no row.** `ProcessKind::ForegroundShell` was declared,
+migration V21 widened the schema's vocabulary for it, and nothing ever admitted
+one — so "what is this turn running, and under what limits" had no answer while
+the command was still running, which is the only time the question is useful.
+Both clients write it now, through one builder.
+
+**A process row named a pid, not a process.** Migration V22 stores the platform's
+own start-time stamp beside `native_pid`. Startup reclaim is where that matters:
+it reads rows a crashed session left running and signals the trees behind them,
+and its only test was "is something alive at that pid" — across a restart, hours
+later, a coin flip against the pid space whose loser is whatever the user was
+running. A row that cannot prove which process it named is now skipped, including
+every pre-V22 row. Failing to reclaim one abandoned tree is recoverable; killing a
+bystander is not.
 
 **Historical record follows.** Everything below describes the state before the
 slice above and is kept because the corrections in it are the useful part.
