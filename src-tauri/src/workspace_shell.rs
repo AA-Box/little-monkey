@@ -1484,6 +1484,46 @@ mod tests {
             "a limit fired on this process must be held by the kernel or by the supervisor, \
              not sourced from an owner: {breach:?}"
         );
+
+        // The two levels report the measurement differently, and that difference
+        // is the whole distinction between them.
+        //
+        // A *supervised* bound is found by comparison: the workload passes the
+        // number and the sampler notices afterwards, so the observation that
+        // tripped it is strictly above the budget.
+        //
+        // A *kernel* bound exists so the workload never passes the number. cgroup
+        // v2 refuses the fork at `pids.max` and leaves `pids.current` at the cap;
+        // `memory.max` OOM-kills a member inside the scope rather than letting
+        // `memory.current` exceed it. `observed > configured` is false when a
+        // kernel limit fires and stays false — which is why the backends carry
+        // `evidence` from the kernel's own refusal counters, and why a kernel
+        // breach has to be judged on that rather than on an inequality it can
+        // never satisfy.
+        //
+        // These tests asserted the supervised shape on every platform and passed
+        // for as long as nobody ran the cgroup path. The first CI run inside a
+        // delegated hierarchy failed them with `configured: 12, observed: 12`,
+        // which is the correct kernel answer.
+        match breach.level.as_str() {
+            "kernel" => {
+                assert!(
+                    breach.observed <= breach.configured,
+                    "a kernel bound holds the measurement at the cap; an observation above it \
+                     would mean the kernel let the workload past: {breach:?}"
+                );
+                assert!(
+                    breach.evidence.is_some(),
+                    "a kernel breach cannot be found by comparison, so it must carry the \
+                     refusal counter that found it: {breach:?}"
+                );
+            }
+            _ => assert!(
+                breach.observed > breach.configured,
+                "a supervised bound is found by comparison, so the observation that tripped \
+                 it must be above the budget: {breach:?}"
+            ),
+        }
     }
 
     #[cfg(unix)]
@@ -1543,10 +1583,6 @@ mod tests {
         assert_eq!(breach.limit, "max_memory_bytes");
         assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 192 * 1024 * 1024);
-        assert!(
-            breach.observed > breach.configured,
-            "the recorded measurement must be the one that tripped it: {breach:?}"
-        );
         // The tree, not the shell: the hog is a grandchild, so this is the
         // assertion that would still pass against a bound measuring only the pid
         // we spawned — and would fail against one that killed only it.
