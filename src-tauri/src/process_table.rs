@@ -379,12 +379,17 @@ impl ProcessKind {
         use ProcessKind as K;
         use ProcessLimitKind as L;
 
+        // Both name what is missing *for this kind*, which changed when the
+        // resource controller landed: it is no longer that no mechanism exists —
+        // the two shell kinds are bounded by one — but that these kinds own no OS
+        // process for a controller to attach to. Leaving the old "no mechanism on
+        // any host" would read as a platform gap rather than as what it is.
         const NO_MEMORY_MECHANISM: &str =
-            "no per-class memory mechanism on any host: needs delegated cgroups v2 or a \
-             class-derived Windows job object";
+            "this kind owns no OS process tree to measure: its work runs inside the WebView, \
+             or is delegated to a child process that carries its own record";
         const NO_PIDS_MECHANISM: &str =
-            "no per-tree process-count mechanism: needs the cgroup `pids` controller or a \
-             class-derived Windows job object";
+            "this kind owns no OS process tree to count: bound the native process it spawns, \
+             which is its child in this table";
         const NO_MODEL_REQUEST: &str = "this kind issues no model request of its own";
         const NO_CAPTURED_OUTPUT: &str = "this kind captures no output stream of its own";
 
@@ -437,13 +442,21 @@ impl ProcessKind {
             // supervised sum over the owned tree everywhere else. All three
             // measure the *tree*, so a shell whose grandchild holds the memory is
             // bounded by the number on this row.
-            (K::BackgroundShell | K::ForegroundShell | K::BrowserSession, L::Memory) => {
-                E::Enforced(
-                    "the resource controller bounds the owned process tree at this row's \
+            (K::BackgroundShell | K::ForegroundShell, L::Memory) => E::Enforced(
+                "the resource controller bounds the owned process tree at this row's \
                  `max_memory_bytes`, kernel-held where the host offers a mechanism and \
                  supervised otherwise",
-                )
-            }
+            ),
+            // The one kind that owns a real process tree and is not yet routed
+            // through the controller. `browser_worker` spawns Chromium with its
+            // own watchdog and its own session quotas, so wiring it means
+            // reconciling two enforcement paths rather than adding one — stated
+            // as the remaining gap rather than claimed as done.
+            (K::BrowserSession, L::Memory) => E::Unavailable(
+                "this kind owns a process tree but is not routed through the resource \
+                 controller yet: its Chromium is bounded by `browser_worker`'s own session \
+                 quotas instead",
+            ),
             (_, L::Memory) => E::Unavailable(NO_MEMORY_MECHANISM),
 
             // --- Output ----------------------------------------------------
@@ -481,12 +494,15 @@ impl ProcessKind {
             // supervised count of the owned tree's live members. None of them is
             // `RLIMIT_NPROC`, which counts per real uid and so fires whenever the
             // logged-in user's own session is busy.
-            (K::BackgroundShell | K::ForegroundShell | K::BrowserSession, L::ChildProcesses) => {
-                E::Enforced(
-                    "the resource controller counts the owned tree's live members against this \
+            (K::BackgroundShell | K::ForegroundShell, L::ChildProcesses) => E::Enforced(
+                "the resource controller counts the owned tree's live members against this \
                  row's `max_child_processes`, per tree rather than per uid",
-                )
-            }
+            ),
+            (K::BrowserSession, L::ChildProcesses) => E::Unavailable(
+                "this kind owns a process tree but is not routed through the resource \
+                 controller yet: Chromium's renderer and GPU children are reclaimed by its \
+                 process group at teardown rather than counted against a ceiling",
+            ),
             (_, L::ChildProcesses) => E::Unavailable(NO_PIDS_MECHANISM),
 
             // --- Context tokens --------------------------------------------
@@ -6625,12 +6641,15 @@ mod tests {
         // owns a native tree, and nowhere else. Both halves are asserted: the
         // first is the capability this item added, and the second is what stops
         // it from being claimed for a kind that owns no OS process at all.
+        // The kinds routed through a resource controller — which is narrower than
+        // "owns a process tree". A browser session owns one and is deliberately
+        // not here: `browser_worker` bounds its Chromium with its own session
+        // quotas, so claiming the controller holds it would be the exact
+        // overstatement this matrix exists to prevent.
         for kind in ProcessKind::ALL {
             let owns_a_tree = matches!(
                 kind,
-                ProcessKind::BackgroundShell
-                    | ProcessKind::ForegroundShell
-                    | ProcessKind::BrowserSession
+                ProcessKind::BackgroundShell | ProcessKind::ForegroundShell
             );
             assert_eq!(
                 kind.limit_support(ProcessLimitKind::ChildProcesses)

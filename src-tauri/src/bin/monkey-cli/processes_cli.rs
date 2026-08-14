@@ -272,7 +272,40 @@ fn print_limit_matrix(json: bool) -> Result<(), String> {
          owner-sourced = a real bound, but its number comes from the owner, not from you\n\
          unavailable   = nothing enforces it for this kind; the detail names what is missing"
     );
+    println!();
+    print_host_enforcement();
     Ok(())
+}
+
+/// What this *host* would actually hold a native workload with, right now.
+///
+/// The matrix above is static — it answers on a machine where the app has never
+/// run, which is what makes it a contract. This is the other half: whether that
+/// contract is met here by the kernel or by a supervisor, which depends on the
+/// machine (a Linux box with no delegated cgroup falls back, and says so). Two
+/// questions, so two blocks, rather than one table that would be wrong about one
+/// of them.
+fn print_host_enforcement() {
+    use little_monkey_lib::resource_control::{EffectiveLimits, ResourceController};
+
+    let capabilities = ResourceController::new(EffectiveLimits::default()).capabilities();
+    println!("this host: {}", capabilities.backend);
+    println!("tree owned by: {}", capabilities.tree_primitive);
+    for limit in ProcessLimitKind::ALL {
+        let capability = capabilities.for_limit(*limit);
+        let (status, detail) = match capability {
+            little_monkey_lib::resource_control::LimitCapability::Enforced { level, mechanism } => {
+                (level.as_str().to_string(), mechanism.clone())
+            }
+            little_monkey_lib::resource_control::LimitCapability::NotApplicable { reason } => {
+                ("not-applicable".to_string(), reason.clone())
+            }
+            little_monkey_lib::resource_control::LimitCapability::Unavailable { reason } => {
+                ("unavailable".to_string(), reason.clone())
+            }
+        };
+        println!("  {:<20} {:<14} {detail}", limit.as_str(), status);
+    }
 }
 
 /// Prints which signals each kind honours, and the reason for each refusal.
@@ -402,24 +435,57 @@ fn print_detail(record: &ProcessRecord) {
     if record.limits.is_unbounded() {
         println!("limits       none declared");
     } else {
-        println!(
-            "limits       wall={} memory={} output={} children={}",
-            option_or_dash(record.limits.max_wall_ms),
-            option_or_dash(record.limits.max_memory_bytes),
-            option_or_dash(record.limits.max_output_bytes),
-            option_or_dash(record.limits.max_child_processes),
-        );
+        // Each limit with the mechanism that holds it, because the number alone
+        // does not say whether anything is holding it. A reader auditing what
+        // this app promised needs "4 GiB · enforced · Windows job object", not
+        // "4 GiB" — the second is true of a bound nobody reads too.
+        println!("limits");
+        for (limit, value) in [
+            (ProcessLimitKind::Wall, record.limits.max_wall_ms),
+            (ProcessLimitKind::Memory, record.limits.max_memory_bytes),
+            (ProcessLimitKind::Output, record.limits.max_output_bytes),
+            (
+                ProcessLimitKind::ChildProcesses,
+                record.limits.max_child_processes.map(u64::from),
+            ),
+            (
+                ProcessLimitKind::ContextTokens,
+                record.limits.max_context_tokens,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let support = record.kind.limit_support(limit);
+            println!(
+                "  {:<20} {:<16} {:<14} {}",
+                limit.as_str(),
+                value,
+                support.status(),
+                support.detail()
+            );
+        }
     }
     match &record.exit {
-        Some(exit) => println!(
-            "exit         {} code={} signal={} reason={}",
-            exit.status.as_str(),
-            exit.code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            exit.signal.as_deref().unwrap_or("-"),
-            exit.reason.as_deref().unwrap_or("-"),
-        ),
+        Some(exit) => {
+            println!(
+                "exit         {} code={} signal={} reason={}",
+                exit.status.as_str(),
+                exit.code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                exit.signal.as_deref().unwrap_or("-"),
+                exit.reason.as_deref().unwrap_or("-"),
+            );
+            // The typed breach, when a resource controller made the kill. Printed
+            // as its own block rather than folded into the reason: the two
+            // numbers beside each other are what tell a reader whether the budget
+            // was wrong or the workload was.
+            if let Some(breach) = &exit.breach {
+                println!("limit fired  {}", breach.limit);
+                println!("  configured {}", breach.configured);
+                println!("  observed   {}", breach.observed);
+                println!("  enforced by {} ({})", breach.backend, breach.level);
+            }
+        }
         None => println!("exit         -"),
     }
 }
