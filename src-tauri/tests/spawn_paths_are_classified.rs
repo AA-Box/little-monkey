@@ -351,6 +351,12 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         Class::HostUtility,
         "the same, for the native chat.db path",
     ),
+    (
+        "daemon/channel_agent_e2e.rs",
+        Class::ResourceInfrastructure,
+        "the channels end-to-end acceptance test; spawns only under `cfg(test)`, to locate \
+         the CLI binary and re-exec itself as the agent under test",
+    ),
 ];
 
 fn source_root() -> PathBuf {
