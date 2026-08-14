@@ -260,6 +260,17 @@ impl CgroupScope {
         )))
     }
 
+    /// Move an already-running process into this scope.
+    ///
+    /// The counterpart to the `pre_exec` join for a caller that could not use it.
+    /// Writing a pid into `cgroup.procs` migrates that thread group; everything it
+    /// forks afterwards is a member by kernel rule, exactly as if it had joined
+    /// before `exec`. Idempotent — a process already in the scope is written again
+    /// and stays there — which is what lets a caller do both.
+    pub fn adopt(&self, pid: u32) -> io::Result<()> {
+        fs::write(self.path.join("cgroup.procs"), pid.to_string())
+    }
+
     pub fn prepare_tokio(&self, command: &mut tokio::process::Command) -> io::Result<()> {
         let fd = self.procs_fd.as_raw_fd();
         // Safe: the closure writes two bytes to an already-open descriptor and

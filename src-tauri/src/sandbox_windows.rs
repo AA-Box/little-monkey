@@ -540,6 +540,34 @@ impl JobConfinement {
         }
     }
 
+    /// [`JobConfinement::assign`] for a process this crate did not spawn itself.
+    ///
+    /// Opens the pid with exactly the two rights the assignment needs —
+    /// `PROCESS_SET_QUOTA` to place it under the job's limits and
+    /// `PROCESS_TERMINATE` because the job's `KILL_ON_JOB_CLOSE` will eventually
+    /// use it — and nothing else. Used by an owner whose spawn site cannot be
+    /// given the job before creation; see
+    /// [`crate::resource_control::ResourceController::adopt`] for the window that
+    /// leaves and why it is stated rather than glossed.
+    pub fn assign_pid(&self, pid: u32) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // Safe: opens a handle to one pid with two rights, or null on refusal.
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Err(os_error("OpenProcess"));
+        }
+        let assigned = self.assign_raw(process);
+        // Safe: closes the handle this function opened, exactly once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        assigned
+    }
+
     /// Kill everything in the job now, without giving up the handle.
     ///
     /// The timeout path needs this rather than a `drop`: the job has to stay

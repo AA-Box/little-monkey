@@ -209,8 +209,20 @@ jobs:
           echo "+memory +pids" | sudo tee "$root/cgroup.subtree_control" >/dev/null || true
           echo "+memory +pids" | sudo tee "$root/lm-ci/cgroup.subtree_control" >/dev/null || true
           sudo chown -R "$USER" "$root/lm-ci"
-          echo "delegated controllers: $(cat "$root/lm-ci/leaf/cgroup.controllers" 2>/dev/null || echo none)"
+          delegated="$(cat "$root/lm-ci/leaf/cgroup.controllers" 2>/dev/null || echo none)"
+          echo "delegated controllers: $delegated"
           echo "LITTLE_MONKEY_CI_CGROUP=$root/lm-ci/leaf" >> "$GITHUB_ENV"
+          # Turns the leg from "the kernel path may run" into "the kernel path
+          # ran". Both controllers this backend installs have to be delegated for
+          # the demand to be honest, and when they are, `CgroupScope::create`
+          # succeeding is no longer optional: the tests below refuse a supervised
+          # fallback, so a leg whose whole purpose is to exercise cgroup v2 fails
+          # rather than passing on the same code path the other two legs cover.
+          case "$delegated" in
+            *memory*) case "$delegated" in *pids*)
+              echo "LITTLE_MONKEY_REQUIRE_CGROUP_BACKEND=1" >> "$GITHUB_ENV" ;;
+            esac ;;
+          esac
 
       - name: Rust tests (Linux, inside the delegated cgroup)
         if: startsWith(matrix.os, 'ubuntu')
@@ -239,8 +251,9 @@ jobs:
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
 
-      - name: Report this runner's resource-enforcement backend
-        # Which mechanism actually holds a limit here, per platform, in the log.
+      - name: The CLI reports this runner's resource-enforcement backend
+        # Which mechanism actually holds a limit here, per platform, in the log —
+        # and a required gate on the command itself.
         #
         # The tests already refuse a limit that no backend enforced, so a green
         # build cannot mean "skipped". What they cannot say is *which* backend
@@ -257,16 +270,39 @@ jobs:
         # After the tests, and through `stage:cli:placeholder`, because a bare
         # `cargo run` here fails: `build.rs` calls `tauri-build`, which wants a
         # sidecar binary that does not exist until that script stages a
-        # placeholder. The first version of this step ran before the tests and
-        # died on exactly that, while `continue-on-error` reported it as
-        # successful and it printed nothing — which is the failure mode this
-        # step exists to prevent one level up.
+        # placeholder.
         #
-        # Never fails the job: an environment-dependent fallback is a legitimate
-        # outcome here, and the requirement is that it be visible rather than
-        # that it be absent.
-        continue-on-error: true
+        # This step used to carry `continue-on-error: true`, and that is what
+        # let `monkey-cli` sit broken on Windows: every invocation died with
+        # STATUS_STACK_OVERFLOW before `main`, the step printed nothing, and the
+        # job stayed green. A *fallback backend* is a legitimate environment
+        # outcome and passes here; a command that will not run is not, and now
+        # fails the build. `tests/cli_processes_limits.rs` asserts the same rule
+        # from the test suite so it is not only CI that holds it.
         run: pnpm stage:cli:placeholder && cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits
+
+      - name: The delegated-cgroup leg really used cgroup v2
+        if: startsWith(matrix.os, 'ubuntu')
+        # The step above prints which backend this host offers; this one refuses
+        # the wrong answer. Same shell trick as the test step: move into the
+        # delegated leaf first, so what the CLI resolves is the hierarchy the
+        # provisioning step created rather than the root cgroup this job starts
+        # in.
+        #
+        # Skipped, not failed, when provisioning found no v2 hierarchy — that is
+        # a runner without the mechanism, and the supervised fallback it gets is
+        # a production outcome. What must never happen is this leg *silently*
+        # falling back while its whole purpose is to exercise the kernel path.
+        run: |
+          set -euo pipefail
+          if [ -z "${LITTLE_MONKEY_REQUIRE_CGROUP_BACKEND:-}" ]; then
+            echo "no delegated cgroup on this runner; the supervised fallback is the tested path"
+            exit 0
+          fi
+          echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
+          backend=$(cargo run --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits | sed -n 's/^this host: //p')
+          echo "backend: $backend"
+          test "$backend" = "cgroup v2"
 
       # The K19 gate, named as its own step so a failure reads as "the
       # published ABI changed without a version bump" rather than as one line

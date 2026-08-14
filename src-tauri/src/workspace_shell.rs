@@ -626,6 +626,26 @@ pub(crate) fn effective_shell_limits(kind: ProcessKind, caller: ProcessLimits) -
     ])
 }
 
+/// The process-table row a foreground shell should have while it runs.
+///
+/// One builder, used by both clients, for the reason [`run_to_output`] is shared:
+/// a row written differently per client is a row that can disagree with itself.
+/// It carries the *effective* limits rather than what the caller asked for, so
+/// what `monkey processes show` and the desktop panel display is the number that
+/// is actually installed on the tree.
+pub fn foreground_projection(
+    external_id: &str,
+    state: crate::process_table::ProcessState,
+    workspace: &Path,
+    native_pid: u32,
+    effective: EffectiveLimits,
+) -> crate::process_table::ProcessProjection {
+    crate::process_table::ProcessProjection::new(ProcessKind::ForegroundShell, external_id, state)
+        .with_workspace(Some(workspace.to_string_lossy().into_owned()))
+        .with_native_pid(i64::try_from(native_pid).ok())
+        .with_limits(effective.to_process_limits())
+}
+
 /// Bring a freshly spawned shell under its controller, or refuse to run it.
 ///
 /// The two failures are not degrees of the same thing and this is the one place
@@ -1479,6 +1499,16 @@ mod tests {
             !breach.backend.is_empty(),
             "a breach must name the mechanism that made it: {breach:?}"
         );
+        // …unless the host has been provisioned for a particular one, in which
+        // case "some real backend" is not the question being asked. See
+        // `resource_control::required_backend`.
+        if let Some(required) = crate::resource_control::required_backend() {
+            assert_eq!(
+                breach.backend, required,
+                "this host was provisioned to exercise {required}; a fallback here means the \
+                 kernel path was not tested: {breach:?}"
+            );
+        }
         assert!(
             ["kernel", "supervised"].contains(&breach.level.as_str()),
             "a limit fired on this process must be held by the kernel or by the supervisor, \

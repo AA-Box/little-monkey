@@ -76,6 +76,37 @@ fn default_max_disk_bytes() -> u64 {
     256 * 1024 * 1024
 }
 
+/// What the resource controller bounds for a browser session, and nothing else.
+///
+/// The split this function *is*: only the two OS-process resources appear here.
+/// Wall time is absent on purpose — the session clock is [`BrowserLimits`]'
+/// `max_session_ms`, enforced by the sweep, and adding it here would give one
+/// resource two owners with two numbers, which is the exact shape K4 forbids.
+/// Output is absent because this session captures no stream; a browser's bytes go
+/// through the artifact store's own disk quota.
+///
+/// The numbers come from [`crate::process_table::ProcessKind::BrowserSession`]'s
+/// class defaults, resolved through the one precedence implementation so a caller
+/// can tighten them and can never widen them. Chromium is genuinely memory-hungry
+/// — a real page with video is hundreds of megabytes across a dozen processes —
+/// so these are runaway ceilings, not budgets: the question they answer is "is
+/// this tab now the largest thing on the machine".
+fn browser_process_limits() -> crate::resource_control::EffectiveLimits {
+    use crate::process_table::{ProcessKind, ProcessLimits};
+    use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource};
+
+    let class = ProcessKind::BrowserSession.default_limits();
+    EffectiveLimits::resolve(&[LimitLayer::new(
+        LimitSource::ClassDefault,
+        ProcessLimits {
+            // The class default's wall bound belongs to the sweep, not here.
+            max_wall_ms: None,
+            max_output_bytes: None,
+            ..class
+        },
+    )])
+}
+
 impl Default for BrowserLimits {
     fn default() -> Self {
         Self {
@@ -157,6 +188,16 @@ pub enum BrowserCancelReason {
     /// Chromium ended on its own and nothing here asked it to. Only the sweep can
     /// ever report this — the action path never asked the question.
     ChildExited,
+    /// A *process* bound fired on the Chromium tree — memory or child-process
+    /// count — and the resource controller reclaimed it.
+    ///
+    /// Distinct from every reason above it, and the distinction is the whole
+    /// point of routing this kind through the controller: the quotas here are
+    /// browser-domain policy the session owns, while this is the OS telling us the
+    /// tree outgrew what it was allowed. Recorded with a typed
+    /// [`crate::resource_control::LimitBreach`] beside it, so the row says which
+    /// limit, what was configured and what was measured.
+    ResourceLimit,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -543,6 +584,11 @@ enum SweepVerdict {
 ///   whichever bound fired, so asking anything else about it can only overwrite a
 ///   specific cause ("action quota") with a vaguer one that merely happens to also
 ///   be true by now ("session clock").
+/// - `resource_breach` beats `child_exited`, and this is the same ordering rule
+///   the shells keep: a kernel bound ends the workload rather than being observed
+///   growing into it, so by the time anyone looks, Chromium *has* exited — and
+///   reading the exit first would record "the child exited" for a tree the kernel
+///   deliberately reclaimed. The mechanism gets the first word about why.
 /// - `child_exited` beats the clock. If Chromium is gone the session is unusable
 ///   whatever its clock says, and "the child exited" is the more specific fact.
 /// - The clock uses the same strict `>` as [`OwnedBrowser::begin_action`], so the
@@ -558,11 +604,15 @@ enum SweepVerdict {
 fn sweep_verdict(
     elapsed_ms: u64,
     limits: &BrowserLimits,
+    resource_breach: bool,
     child_exited: bool,
     cancelled: bool,
 ) -> SweepVerdict {
     if cancelled {
         return SweepVerdict::Evict;
+    }
+    if resource_breach {
+        return SweepVerdict::Reclaim(BrowserCancelReason::ResourceLimit);
     }
     if child_exited {
         return SweepVerdict::Reclaim(BrowserCancelReason::ChildExited);
@@ -801,6 +851,34 @@ struct OwnedBrowser {
     /// not need one either.
     projector: Option<Arc<crate::process_table::LedgerProcessProjector>>,
     limits: BrowserLimits,
+    /// The OS-resource authority for this session's Chromium tree.
+    ///
+    /// # Two owners, disjoint resources
+    ///
+    /// This kind owns a real process tree — Chromium forks renderer, GPU, network
+    /// and utility children — and until now nothing bounded it: the fields around
+    /// this one are *browser-domain* quotas (how many actions, how long a session,
+    /// how much profile disk), and none of them is an answer to "this page made
+    /// the renderer take 9 GiB".
+    ///
+    /// So the two authorities are split by resource, never shared over one:
+    ///
+    /// - **This controller owns** memory, child-process count, and reclaiming the
+    ///   whole tree. [`crate::resource_control::EffectiveLimits`] carries the
+    ///   numbers, and the row records them.
+    /// - **[`BrowserLimits`] owns** the session clock, the action budget and the
+    ///   disk budget. Those are not process resources and no controller can
+    ///   express them.
+    ///
+    /// In particular the controller is deliberately given **no wall bound**: the
+    /// session clock is `max_session_ms`, enforced by [`sweep_verdict`] and
+    /// [`OwnedBrowser::begin_action`], and a second wall limit here would be two
+    /// owners killing the same resource on two numbers.
+    controller: Mutex<crate::resource_control::ResourceController>,
+    /// The process bound that fired, if one did. Written once by the sweep, read
+    /// by [`Self::project`] so the row's exit is `limit_exceeded` with the
+    /// mechanism's own numbers rather than a generic cancellation.
+    resource_breach: Mutex<Option<crate::resource_control::LimitBreach>>,
     cancelled: AtomicBool,
     /// Why `cancelled` was set. Not an `AtomicU8`-flavoured enum because the
     /// first-writer-wins rule needs a compare-and-set anyway, and a `Mutex` states
@@ -881,6 +959,15 @@ impl OwnedBrowser {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        // The process-resource authority, built before the spawn so that on Linux
+        // the cgroup membership is installed between `fork` and `exec` — the same
+        // ordering rule the shells keep, for the same reason: there must be no
+        // window in which the workload runs outside its bound.
+        let mut controller =
+            crate::resource_control::ResourceController::new(browser_process_limits());
+        controller
+            .prepare_std(&mut command)
+            .map_err(|error| format!("Failed to prepare Chromium's resource bound: {error}"))?;
         let mut child = command
             .spawn()
             .map_err(|error| format!("Failed to launch owned Chromium: {error}"))?;
@@ -888,6 +975,33 @@ impl OwnedBrowser {
         // consumes it; after that there is nothing left to ask for a pid. With
         // `process_group(0)` above, this is also the group id.
         let child_pgid = child.id();
+
+        // Windows has no pre-creation hook here, so the job assignment happens
+        // now; on Unix this is the idempotent re-assertion of a membership
+        // `prepare_std` already installed. Either way `attach` below is what
+        // decides — a Chromium that is running and not inside its containment
+        // fails the launch rather than getting a row that claims a bound nothing
+        // holds.
+        let containment =
+            controller
+                .adopt(child_pgid)
+                .and_then(|()| match controller.attach(child_pgid) {
+                    Ok(()) => Ok(()),
+                    // A Chromium that died before it could be attached is a launch
+                    // failure the CDP handshake below reports far better than this
+                    // does; there is no tree left to bound.
+                    Err(crate::resource_control::AttachFailure::AlreadyExited) => Ok(()),
+                    Err(crate::resource_control::AttachFailure::Containment(error)) => Err(error),
+                });
+        if let Err(error) = containment {
+            let _ = controller.terminate_tree();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = safe_remove_profile(&profile_root, &profile, &session_id);
+            return Err(format!(
+                "Refusing to run Chromium outside its resource containment: {error}"
+            ));
+        }
 
         let launch_result = (|| {
             let port = wait_for_devtools_port(&profile, &mut child, Duration::from_secs(10))?;
@@ -931,6 +1045,10 @@ impl OwnedBrowser {
         let cdp = match launch_result {
             Ok(cdp) => cdp,
             Err(error) => {
+                // Through the controller as well as the child: the handshake may
+                // have failed after Chromium already forked, and `Child::kill`
+                // reaps exactly one pid.
+                let _ = controller.terminate_tree();
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = safe_remove_profile(&profile_root, &profile, &session_id);
@@ -952,6 +1070,8 @@ impl OwnedBrowser {
             artifacts,
             projector,
             limits: request.limits,
+            controller: Mutex::new(controller),
+            resource_breach: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_reason: Mutex::new(None),
             action_count: AtomicU64::new(0),
@@ -991,14 +1111,35 @@ impl OwnedBrowser {
                 // process group, and the only thing that lets a later app session
                 // kill a tree this one launched. It is None on Windows.
                 .with_native_pid(self.pgid.map(i64::from));
+        // Both owners, on one row: the session clock the sweep enforces, and the
+        // process bounds the controller holds. Written from the effective limits
+        // rather than from the class default, so what the row states is the number
+        // that is actually installed.
+        let effective = self
+            .controller
+            .lock()
+            .map(|controller| *controller.limits())
+            .unwrap_or_default();
+        projection.limits = effective.to_process_limits();
         projection.limits.max_wall_ms = Some(self.limits.max_session_ms);
+        let breach = self
+            .resource_breach
+            .lock()
+            .ok()
+            .and_then(|breach| breach.clone());
         projection.exit = exit.map(|exit| match exit {
-            BrowserProcessExit::Stopped => ProcessExit {
-                status: crate::process_table::ExitStatus::Cancelled,
-                code: None,
-                signal: None,
-                reason: self.cancel_reason().map(|reason| format!("{reason:?}")),
-                breach: None,
+            // A process bound that fired is not a cancellation, and the row must
+            // not say it was. Same rule the shells keep: the mechanism gets the
+            // first word about why a workload ended.
+            BrowserProcessExit::Stopped => match breach {
+                Some(breach) => ProcessExit::limit_exceeded(breach),
+                None => ProcessExit {
+                    status: crate::process_table::ExitStatus::Cancelled,
+                    code: None,
+                    signal: None,
+                    reason: self.cancel_reason().map(|reason| format!("{reason:?}")),
+                    breach: None,
+                },
             },
         });
         if let Err(error) = projector.project(&projection) {
@@ -1067,9 +1208,45 @@ impl OwnedBrowser {
         }
     }
 
-    /// The impure half of the watchdog rule: reads the clock and the cancelled
-    /// latch, and hands them plus `child_exited` to [`sweep_verdict`], which
-    /// decides. Nothing is enforced here — this only gathers.
+    /// Ask this session's controller whether a process bound has fired.
+    ///
+    /// One call, [`crate::resource_control::ResourceController::check`] — the same
+    /// one the foreground and background shells make, in the same order, so a
+    /// kernel that refused a Chromium fork is named here exactly as it is there.
+    /// A `true` means the tree is already reclaimed and the breach is recorded for
+    /// [`Self::project`].
+    fn resource_bound_fired(&self) -> bool {
+        use crate::resource_control::ResourceCheck;
+
+        let Ok(mut controller) = self.controller.lock() else {
+            return false;
+        };
+        let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        match controller.check(now) {
+            Ok(ResourceCheck::Breached { breach, .. }) => {
+                if let Ok(mut recorded) = self.resource_breach.lock() {
+                    // First writer wins, as with `cancel_reason`: the bound that
+                    // fired first is the true cause.
+                    recorded.get_or_insert(breach);
+                }
+                true
+            }
+            Ok(ResourceCheck::Running(_) | ResourceCheck::Gone) => false,
+            Err(error) => {
+                eprintln!(
+                    "browser worker: could not check session {} against its resource bounds: \
+                     {error}",
+                    self.session_id
+                );
+                false
+            }
+        }
+    }
+
+    /// The impure half of the watchdog rule: reads the clock, the cancelled
+    /// latch and the controller, and hands them plus `child_exited` to
+    /// [`sweep_verdict`], which decides. Nothing is enforced here — this only
+    /// gathers.
     fn sweep_verdict_now(&self, child_exited: bool) -> SweepVerdict {
         sweep_verdict(
             self.started
@@ -1078,6 +1255,7 @@ impl OwnedBrowser {
                 .try_into()
                 .unwrap_or(u64::MAX),
             &self.limits,
+            self.resource_bound_fired(),
             child_exited,
             self.cancelled.load(Ordering::SeqCst),
         )
@@ -1544,6 +1722,18 @@ impl OwnedBrowser {
         if reaped_child {
             if let Some(pgid) = self.pgid {
                 kill_browser_process_group(pgid);
+            }
+        }
+        // And through the controller, which is what reaches a descendant that left
+        // the group — it recorded ownership while the ancestry was still readable,
+        // and on Windows it holds the job that a process group cannot express.
+        // Idempotent, so the `Drop`-after-reclaim second pass costs a snapshot.
+        if let Ok(mut controller) = self.controller.lock() {
+            if let Err(error) = controller.terminate_tree() {
+                eprintln!(
+                    "browser worker: could not reclaim session {}'s whole tree: {error}",
+                    self.session_id
+                );
             }
         }
         let removal = safe_remove_profile(&self.profile_root, &self.profile, &self.session_id);
@@ -3242,6 +3432,16 @@ mod tests {
                 }),
                 artifacts,
                 limits,
+                // A real controller over the browser's real class bounds, with
+                // nothing attached: this stand-in child is not a Chromium tree, so
+                // the controller measures the same "no workload" it would for a
+                // session whose browser already exited. That keeps these tests
+                // about the browser-domain rule they are for, while still routing
+                // through the production `sweep_verdict_now`.
+                controller: Mutex::new(crate::resource_control::ResourceController::new(
+                    browser_process_limits(),
+                )),
+                resource_breach: Mutex::new(None),
                 cancelled: AtomicBool::new(false),
                 cancel_reason: Mutex::new(None),
                 action_count: AtomicU64::new(0),
@@ -3409,46 +3609,65 @@ mod tests {
         };
 
         // Live, inside the clock: untouched.
-        assert_eq!(sweep_verdict(0, &limits, false, false), SweepVerdict::Keep);
         assert_eq!(
-            sweep_verdict(10 * 60_000 - 1, &limits, false, false),
+            sweep_verdict(0, &limits, false, false, false),
+            SweepVerdict::Keep
+        );
+        assert_eq!(
+            sweep_verdict(10 * 60_000 - 1, &limits, false, false, false),
             SweepVerdict::Keep
         );
         // Exactly at the budget is still inside it, matching `begin_action`'s
         // strict `>`. If the two disagreed here the sweep would reclaim sessions
         // the next action would have allowed.
         assert_eq!(
-            sweep_verdict(10 * 60_000, &limits, false, false),
+            sweep_verdict(10 * 60_000, &limits, false, false, false),
             SweepVerdict::Keep
         );
 
         // One millisecond past it: reclaimed, and named after the clock.
         assert_eq!(
-            sweep_verdict(10 * 60_000 + 1, &limits, false, false),
+            sweep_verdict(10 * 60_000 + 1, &limits, false, false, false),
             SweepVerdict::Reclaim(BrowserCancelReason::SessionClock)
         );
 
         // A child that ended on its own is reclaimed even with the clock nowhere
         // near its budget — the liveness question `begin_action` never asked.
         assert_eq!(
-            sweep_verdict(0, &limits, true, false),
+            sweep_verdict(0, &limits, false, true, false),
             SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
         );
         // ...and it outranks the clock when both are true, because a gone Chromium
         // is the more specific fact about why the session is finished.
         assert_eq!(
-            sweep_verdict(10 * 60_000 + 1, &limits, true, false),
+            sweep_verdict(10 * 60_000 + 1, &limits, false, true, false),
             SweepVerdict::Reclaim(BrowserCancelReason::ChildExited)
         );
 
-        // Already cancelled: evicted, never re-attributed. Both other conditions
-        // hold here, so a rule that checked them first would overwrite the real
+        // A process bound that fired outranks both, and this is the ordering that
+        // matters most: a kernel that reclaimed the tree leaves `child_exited`
+        // true, so a rule that asked liveness first would record every resource
+        // kill as "Chromium ended on its own".
+        assert_eq!(
+            sweep_verdict(0, &limits, true, false, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ResourceLimit)
+        );
+        assert_eq!(
+            sweep_verdict(10 * 60_000 + 1, &limits, true, true, false),
+            SweepVerdict::Reclaim(BrowserCancelReason::ResourceLimit)
+        );
+
+        // Already cancelled: evicted, never re-attributed. Every other condition
+        // holds here, so a rule that checked them first would overwrite the real
         // cause (say, the action quota) with one that is merely also true by now.
         assert_eq!(
-            sweep_verdict(10 * 60_000 + 1, &limits, true, true),
+            sweep_verdict(10 * 60_000 + 1, &limits, true, true, true),
             SweepVerdict::Evict
         );
-        assert_eq!(sweep_verdict(0, &limits, false, true), SweepVerdict::Evict);
+        assert_eq!(
+            sweep_verdict(0, &limits, false, false, true),
+            SweepVerdict::Evict
+        );
 
         // The disk budget is not part of this rule and has no way to become part
         // of it: a session with a 1 MiB ceiling and a clock to spare is kept, so
@@ -3458,7 +3677,7 @@ mod tests {
             ..limits.clone()
         };
         assert_eq!(
-            sweep_verdict(0, &tiny_disk, false, false),
+            sweep_verdict(0, &tiny_disk, false, false, false),
             SweepVerdict::Keep
         );
     }

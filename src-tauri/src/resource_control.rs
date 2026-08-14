@@ -568,6 +568,42 @@ impl ResourceController {
         }
     }
 
+    /// Bring a process that is already running under this containment.
+    ///
+    /// # When this is the right call, and when it is a weakening
+    ///
+    /// [`Self::prepare_tokio`]/[`Self::prepare_std`] are the strong form: the
+    /// containment exists before the workload's first instruction, so there is no
+    /// window at all. Every shell path uses them and must keep using them.
+    ///
+    /// This is for an owner that cannot build its child's `Command` through those
+    /// entry points — today the browser session, whose Chromium is launched by a
+    /// long-standing spawn site with its own argv, environment and stdio, and
+    /// which on Windows has no pre-creation hook to hang a job assignment on.
+    /// There the assignment is made from the parent immediately after
+    /// `CreateProcess` returns, which leaves a window measured in microseconds
+    /// during which a descendant created by the new process would be outside the
+    /// job. That is a narrower guarantee than the shells get and it is stated as
+    /// such in `docs/limitations.md` rather than glossed as equivalent.
+    ///
+    /// On Unix there is no such window: the cgroup migration and the process
+    /// group are both installed by `prepare_std` before `exec`, and this call is
+    /// the idempotent re-assertion of a membership that already holds.
+    ///
+    /// Failure is not fatal by itself — [`Self::attach`] is what reads the
+    /// membership back and refuses a workload that is not inside its bound.
+    pub fn adopt(&self, #[allow(unused_variables)] pid: u32) -> io::Result<()> {
+        match &self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cgroup(scope) => scope.adopt(pid),
+            #[cfg(windows)]
+            Backend::Job(job) => job.adopt(pid),
+            // The supervisor's containment is the process group, which only the
+            // child can install for itself before `exec`; `prepare_std` did it.
+            Backend::Supervisor => Ok(()),
+        }
+    }
+
     /// Record the workload's root once it exists, and verify it is contained.
     ///
     /// Stores an identity rather than a pid: everything after this — sampling,
@@ -798,6 +834,58 @@ impl ResourceController {
         }))
     }
 
+    /// Ask the mechanism whether it refused, and reclaim the tree if it did.
+    ///
+    /// **This is the call every owner must make before deciding why a workload
+    /// ended.** A kernel-held bound does not announce itself by making a
+    /// measurement exceed a budget — it announces itself by refusing work, after
+    /// which the workload usually dies of an error it cannot explain. An owner
+    /// that reads the exit status without asking here records the strongest
+    /// enforcement this app has as an anonymous failure.
+    ///
+    /// Returning `Some` means the tree has already been terminated: a breach that
+    /// is reported without reclaiming the workload has reclaimed nothing, and
+    /// leaving that to each caller is how one of them forgets.
+    pub fn mechanism_breach(&mut self, now_ms: i64) -> io::Result<Option<LimitBreach>> {
+        let Some(breach) = self.poll_limit_events(now_ms)? else {
+            return Ok(None);
+        };
+        self.terminate_tree()?;
+        Ok(Some(breach))
+    }
+
+    /// The whole "is this workload still allowed to run" question, in one call.
+    ///
+    /// Every owner of a long-running controlled workload asks this on its own
+    /// tick — [`run_under`] for a foreground shell, the background shell's exit
+    /// watcher, the browser session's watchdog — so the order of the two tests
+    /// is decided once here rather than three times at three call sites. The
+    /// order is the load-bearing part: the mechanism's own accounting is
+    /// consulted *first* and unconditionally, because where a kernel holds the
+    /// bound that is the only test that can ever be true (see [`LimitEvent`]).
+    ///
+    /// A [`ResourceCheck::Breached`] has already torn the owned tree down.
+    pub fn check(&mut self, now_ms: i64) -> io::Result<ResourceCheck> {
+        if let Some(breach) = self.mechanism_breach(now_ms)? {
+            // Taken after the termination rather than before it: what the caller
+            // wants recorded is the last measurement that exists, and on a host
+            // where the workload is already gone there is honestly none.
+            let sample = self.sample().ok().flatten();
+            return Ok(ResourceCheck::Breached { breach, sample });
+        }
+        let Some(sample) = self.sample()? else {
+            return Ok(ResourceCheck::Gone);
+        };
+        if let Some(breach) = self.breach(&sample, now_ms) {
+            self.terminate_tree()?;
+            return Ok(ResourceCheck::Breached {
+                breach,
+                sample: Some(sample),
+            });
+        }
+        Ok(ResourceCheck::Running(sample))
+    }
+
     /// The first limit this sample violates, if any.
     ///
     /// Wall is checked first because it is the one bound that is always
@@ -933,6 +1021,32 @@ fn now_ms() -> i64 {
 /// interval per supervised workload, which is a few milliseconds.
 pub const SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// What one tick of supervision found.
+///
+/// The three answers a controller can give about a live workload, as a value, so
+/// that every owner acts on the same three and cannot invent a fourth by
+/// combining the primitives in its own order. Before this existed the foreground
+/// path polled the mechanism and then sampled, and the background path only
+/// sampled — which meant a kernel that refused the thirteenth `fork` ended a
+/// background command with an unexplained error while the identical foreground
+/// command was correctly recorded as `limit_exceeded`.
+#[derive(Debug)]
+pub enum ResourceCheck {
+    /// Inside every bound. Carries the measurement, for the ledger.
+    Running(ResourceSample),
+    /// A bound fired and the owned tree has already been terminated.
+    Breached {
+        breach: LimitBreach,
+        /// The last measurement, or `None` when the workload was already gone by
+        /// the time the mechanism's evidence was read — which is the ordinary
+        /// case for a kernel that OOM-killed its member. A sample of zeros would
+        /// be a measurement nobody took.
+        sample: Option<ResourceSample>,
+    },
+    /// The workload is gone and nothing fired.
+    Gone,
+}
+
 /// The outcome of running work under a controller.
 #[derive(Debug)]
 pub enum Supervised<T> {
@@ -986,36 +1100,46 @@ where
                 // only record of *why* is the backend's own counter. Ask before
                 // believing the exit — otherwise the strongest enforcement this
                 // app has is also the enforcement it can never name.
-                if let Some(breach) = controller.poll_limit_events(now_ms())? {
-                    controller.terminate_tree()?;
+                if let Some(breach) = controller.mechanism_breach(now_ms())? {
                     return Ok(Supervised::Breached(breach, last));
                 }
                 return Ok(Supervised::Completed(output, last));
             }
             _ = ticker.tick() => {
-                // The mechanism's own accounting first, and unconditionally —
-                // including when the workload is already gone. A cgroup that
-                // OOM-killed its member, or a job that refused the thirteenth
-                // process, has an exited workload and a limit that fired, and
-                // reading the sample first would call that an ordinary crash.
-                if let Some(breach) = controller.poll_limit_events(now_ms())? {
-                    controller.terminate_tree()?;
-                    return Ok(Supervised::Breached(breach, last));
-                }
-                let Some(sample) = controller.sample()? else {
+                match controller.check(now_ms())? {
+                    ResourceCheck::Breached { breach, sample } => {
+                        return Ok(Supervised::Breached(breach, sample.unwrap_or(last)));
+                    }
+                    ResourceCheck::Running(sample) => last = sample,
                     // The workload is gone but `work` has not resolved yet —
                     // usually a pipe still draining. Keep waiting for it rather
                     // than reporting a breach against a corpse.
-                    continue;
-                };
-                last = sample;
-                if let Some(breach) = controller.breach(&sample, now_ms()) {
-                    controller.terminate_tree()?;
-                    return Ok(Supervised::Breached(breach, sample));
+                    ResourceCheck::Gone => continue,
                 }
             }
         }
     }
+}
+
+/// The backend this host has been *provisioned* to use, when something says so.
+///
+/// A hosted CI runner is not a systemd user session, so nothing is delegated to
+/// it, `CgroupScope::create` correctly declines, and every limit test passes
+/// against the supervisor — on the leg whose entire purpose is to prove the
+/// kernel path works. That is a green build meaning "the kernel path is still
+/// never executed anywhere", which is the failure mode a fallback quietly
+/// produces.
+///
+/// So the CI step that delegates a cgroup also states that it did, and the tests
+/// read that statement here and refuse the fallback. A developer machine sets
+/// nothing and keeps whichever backend it really has.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn required_backend() -> Option<&'static str> {
+    if std::env::var_os("LITTLE_MONKEY_REQUIRE_CGROUP_BACKEND").is_some() {
+        return Some("cgroup v2");
+    }
+    None
 }
 
 /// What a supervisor can and cannot promise.
@@ -1424,6 +1548,41 @@ mod tests {
         );
     }
 
+    /// A host provisioned for one backend must actually select it.
+    ///
+    /// The gate behind the Linux CI leg that exists to run the kernel path: with
+    /// a delegated hierarchy in place, `ResourceController::new` falling back to
+    /// the supervisor is the difference between "cgroup v2 compiles" and "cgroup
+    /// v2 works", and every other assertion in this suite passes either way.
+    #[test]
+    fn a_host_provisioned_for_a_backend_selects_that_backend() {
+        let Some(required) = required_backend() else {
+            return;
+        };
+        let capabilities = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::ClassDefault,
+            limits(None, Some(512 * 1024 * 1024)),
+        )]))
+        .capabilities();
+        assert_eq!(
+            capabilities.backend, required,
+            "this host was provisioned to exercise {required}, so falling back leaves the \
+             kernel path unexecuted"
+        );
+        // The two resources this backend is provisioned for, held by the kernel
+        // rather than by the sampling loop — which is the property the whole leg
+        // is for.
+        for limit in [ProcessLimitKind::Memory, ProcessLimitKind::ChildProcesses] {
+            assert_eq!(
+                capabilities.for_limit(limit).level(),
+                Some(EnforcementLevel::Kernel),
+                "{} must be kernel-held under {required}: {:?}",
+                limit.as_str(),
+                capabilities.for_limit(limit)
+            );
+        }
+    }
+
     /// The Windows job's numbers must come from the effective limits, and the
     /// fixed guardrail must survive as a ceiling rather than as the policy.
     ///
@@ -1468,6 +1627,299 @@ mod tests {
             JobLimits::from_effective(&EffectiveLimits::default()),
             guardrail
         );
+    }
+
+    // --- K4 on Windows: the job object actually refuses, and says so ---------
+    //
+    // The Unix suite proves the shells' bounds against real trees through
+    // `run_to_output`. Windows could not reuse it: the confined spawn there goes
+    // through an AppContainer and a `cmd`-flavoured command line, so a test
+    // written in shell would be testing the command language as much as the
+    // bound. These drive the controller's own contract instead — prepare, adopt,
+    // attach, check — against real child processes, which is the same sequence
+    // `spawn_windows` performs and the only part that is platform-specific.
+    //
+    // Both bounds here are the *invisible* kind: a job refuses rather than
+    // letting a measurement pass the cap, so `observed > configured` is false
+    // forever and the only evidence is the completion port's message. That is
+    // exactly what these assert.
+
+    /// Holds `LITTLE_MONKEY_WINDOWS_IDLE_MS` milliseconds, so a parent can count
+    /// it.
+    #[cfg(windows)]
+    #[test]
+    fn windows_idle_child() {
+        let Some(ms) = std::env::var("LITTLE_MONKEY_WINDOWS_IDLE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+
+    /// Waits, then spawns `LITTLE_MONKEY_WINDOWS_FORK_CHILDREN` idle children.
+    ///
+    /// The wait is what makes the test deterministic rather than a race: the
+    /// parent adopts this process into the job immediately after
+    /// `CreateProcess` returns, and nothing may be created here before that has
+    /// happened, or the descendants would be outside the bound for a reason the
+    /// bound is not responsible for.
+    #[cfg(windows)]
+    #[test]
+    fn windows_fork_child() {
+        let Some(count) = std::env::var("LITTLE_MONKEY_WINDOWS_FORK_CHILDREN")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let executable = std::env::current_exe().expect("the test binary knows its own path");
+        let mut children = Vec::new();
+        for _ in 0..count {
+            let spawned = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "resource_control::tests::windows_idle_child",
+                    "--test-threads=1",
+                ])
+                .env("LITTLE_MONKEY_WINDOWS_IDLE_MS", "20000")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            match spawned {
+                Ok(child) => children.push(child),
+                // The refusal this whole test is about. Stop asking; the parent
+                // reads it from the kernel's own notification.
+                Err(_) => break,
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        for mut child in children {
+            let _ = child.kill();
+        }
+    }
+
+    /// Allocates and *touches* `LITTLE_MONKEY_WINDOWS_MEMORY_MIB` mebibytes.
+    ///
+    /// Touched, not merely reserved: a job's memory limit counts committed
+    /// memory, and an untouched `Vec::with_capacity` is not committed on every
+    /// allocator path — a hog that only reserved would leave the bound looking
+    /// broken.
+    #[cfg(windows)]
+    #[test]
+    fn windows_memory_hog_child() {
+        let Some(mib) = std::env::var("LITTLE_MONKEY_WINDOWS_MEMORY_MIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..mib {
+            let mut block = vec![0_u8; 1024 * 1024];
+            for page in block.chunks_mut(4096) {
+                page[0] = 1;
+            }
+            held.push(block);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        assert_eq!(held.len(), mib);
+    }
+
+    /// Spawn `workload` under `controller`, in the ordering `spawn_windows` uses.
+    #[cfg(windows)]
+    fn windows_child_under(
+        controller: &mut ResourceController,
+        workload: &str,
+        variable: &str,
+        value: &str,
+    ) -> std::process::Child {
+        let executable = std::env::current_exe().expect("the test binary knows its own path");
+        let mut command = std::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                &format!("resource_control::tests::{workload}"),
+                "--test-threads=1",
+            ])
+            .env(variable, value)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        controller
+            .prepare_std(&mut command)
+            .expect("a Windows job needs nothing before the spawn");
+        let child = command.spawn().expect("the workload spawns");
+        controller
+            .adopt(child.id())
+            .expect("the job takes the process it is about to bound");
+        controller.attach(child.id()).expect("the job contains it");
+        child
+    }
+
+    /// Poll the controller until it reports a breach, or give up.
+    #[cfg(windows)]
+    fn windows_wait_for_breach(controller: &mut ResourceController) -> LimitBreach {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match controller.check(now_ms()).expect("the controller checks") {
+                ResourceCheck::Breached { breach, .. } => return breach,
+                ResourceCheck::Running(_) | ResourceCheck::Gone => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job never reported the limit it was configured with"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// `ActiveProcessLimit`, end to end: the effective number is what is
+    /// installed, the kernel refuses the process that would exceed it, and the
+    /// refusal arrives as a typed breach rather than as an unexplained failure.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_refuses_the_process_past_its_ceiling_and_names_the_refusal() {
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_child_processes: Some(3),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        let capabilities = controller.capabilities();
+        assert_eq!(
+            capabilities.backend, "windows job object",
+            "every Windows host can create a job; a fallback here is a real failure"
+        );
+        assert!(
+            capabilities
+                .child_processes
+                .mechanism()
+                .is_some_and(|mechanism| mechanism.contains(" at 3,")),
+            "the job must be built from the effective limit, not from the fixed guardrail: {:?}",
+            capabilities.child_processes
+        );
+
+        // Ten wanted against a ceiling of three: the fourth `CreateProcess` is
+        // refused and `ActiveProcesses` stays at three.
+        let mut child = windows_child_under(
+            &mut controller,
+            "windows_fork_child",
+            "LITTLE_MONKEY_WINDOWS_FORK_CHILDREN",
+            "10",
+        );
+        let breach = windows_wait_for_breach(&mut controller);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(breach.limit, "max_child_processes");
+        assert_eq!(breach.configured, 3);
+        assert_eq!(breach.backend, "windows job object");
+        assert_eq!(breach.level, "kernel");
+        assert!(
+            breach.observed <= breach.configured,
+            "a refusing kernel holds the count at the cap: {breach:?}"
+        );
+        let evidence = breach
+            .evidence
+            .expect("a kernel breach carries its counter");
+        assert!(
+            evidence.contains("JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT"),
+            "{evidence}"
+        );
+    }
+
+    /// `JobMemoryLimit`, end to end, on the same terms.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_refuses_the_commit_past_its_memory_ceiling_and_names_the_refusal() {
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(192 * 1024 * 1024),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        let capabilities = controller.capabilities();
+        assert_eq!(capabilities.backend, "windows job object");
+        assert!(
+            capabilities
+                .memory
+                .mechanism()
+                .is_some_and(|mechanism| mechanism.contains(&(192 * 1024 * 1024).to_string())),
+            "the job's memory ceiling must be the effective limit: {:?}",
+            capabilities.memory
+        );
+
+        let mut child = windows_child_under(
+            &mut controller,
+            "windows_memory_hog_child",
+            "LITTLE_MONKEY_WINDOWS_MEMORY_MIB",
+            "512",
+        );
+        let breach = windows_wait_for_breach(&mut controller);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(breach.limit, "max_memory_bytes");
+        assert_eq!(breach.configured, 192 * 1024 * 1024);
+        assert_eq!(breach.backend, "windows job object");
+        assert_eq!(breach.level, "kernel");
+        let evidence = breach
+            .evidence
+            .expect("a kernel breach carries its counter");
+        assert!(
+            evidence.contains("JOB_OBJECT_MSG_JOB_MEMORY_LIMIT"),
+            "{evidence}"
+        );
+    }
+
+    /// A Windows workload inside every bound must finish, with nothing reported.
+    ///
+    /// The counter-test for the two above: a job that fired on everything would
+    /// satisfy both of them and break every command the app runs.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_inside_its_bounds_reports_no_breach() {
+        let effective = EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_child_processes: Some(16),
+                max_memory_bytes: Some(512 * 1024 * 1024),
+                ..ProcessLimits::default()
+            },
+        )]);
+        let mut controller = ResourceController::new(effective);
+        let mut child = windows_child_under(
+            &mut controller,
+            "windows_idle_child",
+            "LITTLE_MONKEY_WINDOWS_IDLE_MS",
+            "1500",
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match controller.check(now_ms()).expect("the controller checks") {
+                ResourceCheck::Breached { breach, .. } => {
+                    let _ = child.kill();
+                    panic!("a workload inside every bound must not be a breach: {breach:?}")
+                }
+                ResourceCheck::Gone => break,
+                ResourceCheck::Running(_) => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the idle child never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.wait();
     }
 
     /// A child that finishes before anyone can look at it is not a containment

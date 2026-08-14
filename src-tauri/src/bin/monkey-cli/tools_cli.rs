@@ -354,11 +354,70 @@ pub async fn run_shell(
         }
     })?;
 
+    record_foreground_shell(&cwd_path, &output);
+
     Ok(serde_json::json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
         "code": output.exit_code,
     }))
+}
+
+/// Records this CLI shell on the same process table the desktop writes to.
+///
+/// Both clients already share the enforcement — `run_to_output` is one entry
+/// point — and this is the other half of "the authority boundary cannot drift by
+/// client": a `monkey processes list` on a machine where the agent ran from the
+/// terminal shows the same rows, with the same effective limits and the same
+/// typed breach, as one where it ran from the window.
+///
+/// One write rather than the desktop's two, because this client has no separate
+/// spawn and wait to sit between: `run_to_output` returns when the command is
+/// already terminal, so `reconcile` admits and closes the row in a single call.
+///
+/// Fail-soft throughout, and deliberately without creating a ledger that does not
+/// exist: a shell must not fail because bookkeeping could not be written, and a
+/// read-only tool invocation must not leave a database behind as a side effect.
+fn record_foreground_shell(
+    cwd: &std::path::Path,
+    output: &little_monkey_lib::workspace_shell::ShellOutput,
+) {
+    use little_monkey_lib::process_table::{ExitStatus, ProcessExit, ProcessState};
+
+    let Some(data_dir) = crate::app_data_dir() else {
+        return;
+    };
+    let path = data_dir.join("profile-v1.sqlite3");
+    if !path.exists() {
+        return;
+    }
+    let Ok(ledger) = little_monkey_lib::run_ledger::RunLedger::open(&path) else {
+        return;
+    };
+    let mut projection = little_monkey_lib::workspace_shell::foreground_projection(
+        &format!("fgsh-{}", uuid::Uuid::new_v4()),
+        ProcessState::Exited,
+        cwd,
+        output.native_pid,
+        output.limits,
+    );
+    projection.exit = Some(match &output.breach {
+        Some(breach) => ProcessExit::limit_exceeded(breach.clone()),
+        None => ProcessExit {
+            status: match output.exit_code {
+                Some(0) => ExitStatus::Succeeded,
+                _ => ExitStatus::Failed,
+            },
+            code: output.exit_code,
+            signal: None,
+            reason: None,
+            breach: None,
+        },
+    });
+    let now = crate::durable_run::unix_time_ms().unwrap_or(0);
+    let _ = ledger
+        .process_table()
+        .reconcile(&projection, i64::try_from(now).unwrap_or(i64::MAX));
 }
 
 /// Saves a durable fact to `<app-data>/memories.json` for the current

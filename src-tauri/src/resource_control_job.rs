@@ -40,7 +40,6 @@
 use std::io;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED};
 use windows_sys::Win32::System::JobObjects::{
     JobObjectAssociateCompletionPortInformation, SetInformationJobObject,
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT,
@@ -48,6 +47,9 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::SystemServices::{
     JOB_OBJECT_MSG_ACTIVE_PROCESS_LIMIT, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
     JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
+};
+use windows_sys::Win32::System::IO::{
+    CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
 };
 
 use crate::process_table::ProcessLimitKind;
@@ -88,7 +90,8 @@ impl LimitNotifications {
         // "create one rather than associate a handle with an existing one", and
         // one concurrent thread is all a non-blocking drain needs.
         // Safe: creates a kernel object and returns its handle or null.
-        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+        let port =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
         if port.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -223,6 +226,16 @@ impl JobObject {
         self.job.duplicate()
     }
 
+    /// Assign a process this controller did not create into the job.
+    ///
+    /// See [`crate::resource_control::ResourceController::adopt`]: this is the
+    /// weaker ordering, for an owner with no pre-creation hook, and
+    /// [`Self::confirm_assignment`] is still what decides whether the workload
+    /// runs.
+    pub fn adopt(&self, pid: u32) -> io::Result<()> {
+        self.job.assign_pid(pid)
+    }
+
     /// A process that reached the spawn site but never got assigned would run
     /// outside the bound while the record claimed it was inside one.
     pub fn confirm_assignment(&self, pid: u32) -> io::Result<()> {
@@ -242,8 +255,10 @@ impl JobObject {
     fn notification_mechanism(&self) -> &'static str {
         match self.notifications {
             Some(_) => "the job's completion port reporting the refusal",
-            None => "no completion port available on this host, so the refusal is named only \
-                     where the supervisor's own measurement catches it",
+            None => {
+                "no completion port available on this host, so the refusal is named only \
+                     where the supervisor's own measurement catches it"
+            }
         }
     }
 

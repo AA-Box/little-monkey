@@ -170,6 +170,29 @@ pub const SHELL_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// defence in depth that a caller cannot widen.
 pub const SHELL_PROCESS_BUDGET: u32 = 512;
 
+/// The resident-memory ceiling one browser session's Chromium tree carries.
+///
+/// Lower than a shell's, and for a different reason rather than a stricter mood:
+/// a shell legitimately hosts a compiler and a model server, while a browser
+/// session hosts one page. 4 GiB is several times what a heavy real page costs
+/// across its dozen renderer, GPU and utility processes, and well under what a
+/// runaway page — a leaking script, an infinite canvas — reaches within seconds.
+///
+/// Held by [`crate::resource_control::ResourceController`], not by
+/// `browser_worker`: the session's own quotas bound *browser* things (actions,
+/// session clock, profile disk) and none of them is an answer to a renderer
+/// taking the machine's memory.
+pub const BROWSER_MEMORY_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Live processes one browser session's tree may hold at once.
+///
+/// Chromium's own process model is the sizing input: one browser process, one
+/// GPU, one network service, one storage service, a utility or two, and a
+/// renderer per site instance. A page with many cross-origin frames is the widest
+/// legitimate case and stays well inside this; a tab spawning without bound is
+/// nowhere near it.
+pub const BROWSER_PROCESS_BUDGET: u32 = 128;
+
 impl ProcessKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -447,15 +470,16 @@ impl ProcessKind {
                  `max_memory_bytes`, kernel-held where the host offers a mechanism and \
                  supervised otherwise",
             ),
-            // The one kind that owns a real process tree and is not yet routed
-            // through the controller. `browser_worker` spawns Chromium with its
-            // own watchdog and its own session quotas, so wiring it means
-            // reconciling two enforcement paths rather than adding one — stated
-            // as the remaining gap rather than claimed as done.
-            (K::BrowserSession, L::Memory) => E::Unavailable(
-                "this kind owns a process tree but is not routed through the resource \
-                 controller yet: its Chromium is bounded by `browser_worker`'s own session \
-                 quotas instead",
+            // The third kind that owns a real process tree, and now routed through
+            // the same controller. The reconciliation the old note said was
+            // needed is done by *splitting by resource*: the controller holds
+            // memory and child-process count over Chromium's whole tree, while
+            // `browser_worker` keeps the browser-domain quotas — session clock,
+            // action budget, profile disk — which no controller can express.
+            (K::BrowserSession, L::Memory) => E::Enforced(
+                "the resource controller bounds the whole Chromium tree at this row's \
+                 `max_memory_bytes`, kernel-held where the host offers a mechanism and \
+                 supervised otherwise",
             ),
             (_, L::Memory) => E::Unavailable(NO_MEMORY_MECHANISM),
 
@@ -498,10 +522,9 @@ impl ProcessKind {
                 "the resource controller counts the owned tree's live members against this \
                  row's `max_child_processes`, per tree rather than per uid",
             ),
-            (K::BrowserSession, L::ChildProcesses) => E::Unavailable(
-                "this kind owns a process tree but is not routed through the resource \
-                 controller yet: Chromium's renderer and GPU children are reclaimed by its \
-                 process group at teardown rather than counted against a ceiling",
+            (K::BrowserSession, L::ChildProcesses) => E::Enforced(
+                "the resource controller counts Chromium's renderer, GPU and utility children \
+                 against this row's `max_child_processes`, per tree rather than per uid",
             ),
             (_, L::ChildProcesses) => E::Unavailable(NO_PIDS_MECHANISM),
 
@@ -728,8 +751,23 @@ impl ProcessKind {
             // default, and a caller that starts a session with a tighter budget
             // writes its own `max_wall_ms` onto the row through the projection,
             // exactly as the daemon does with its per-job recipe.
+            //
+            // The two process bounds beneath it belong to the *other* owner. A
+            // browser session owns a real process tree — Chromium's renderer, GPU
+            // and utility children — and it is now routed through the same
+            // `ResourceController` the shells use, which holds memory and
+            // child-process count while the sweep keeps the session clock. One
+            // resource, one owner, both stated on this row.
+            //
+            // Generous rather than tuned, for the shell's reason and more so: a
+            // page with video across a dozen renderers is legitimately hundreds of
+            // megabytes, and a number tight enough to argue about would break real
+            // browsing. These answer "is this tab now the largest thing on the
+            // machine".
             ProcessKind::BrowserSession => ProcessLimits {
                 max_wall_ms: Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS),
+                max_memory_bytes: Some(BROWSER_MEMORY_BUDGET_BYTES),
+                max_child_processes: Some(BROWSER_PROCESS_BUDGET),
                 ..ProcessLimits::default()
             },
         }
