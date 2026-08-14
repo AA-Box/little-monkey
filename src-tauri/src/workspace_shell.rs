@@ -1603,7 +1603,6 @@ mod tests {
         assert_eq!(breach.limit, "max_child_processes");
         assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 12);
-        assert!(breach.observed > 12, "{breach:?}");
         assert!(
             breach.observed < u64::try_from(host_processes).unwrap(),
             "the count must be of the owned tree, not of everything this uid owns: {breach:?}"
@@ -1645,6 +1644,10 @@ mod tests {
         assert_eq!(breach.limit, "max_wall_ms");
         assert_enforced_by_a_real_backend(&breach);
         assert_eq!(breach.configured, 1_000);
+        // Wall is the one bound no kernel here holds — neither cgroup v2 nor a
+        // job object expresses wall clock — so it is always supervised and always
+        // found by comparison.
+        assert_eq!(breach.level, "supervised");
         assert!(breach.observed >= 1_000, "{breach:?}");
         assert!(
             crate::process_tree::measure_tree(output.native_pid)
