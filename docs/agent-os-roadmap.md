@@ -1547,27 +1547,44 @@ claim something false.
 
 ### What remains open
 
-1. **Two platform legs are unrun.** The cgroup v2 and Windows job-object backends
-   are written and `rustfmt`-parsed, and neither has been compiled: this machine
-   has Homebrew Rust rather than rustup, so no other target can be added and
-   `cfg(windows)` cannot be typechecked locally at all. CI is their first real
-   build and their first real execution. Until that is green, "kernel-held on
-   Linux and Windows" is an intention.
-2. **A browser session owns a process tree and is not routed through the
+1. **Both platform legs compile and pass on CI. Only one of them has been shown
+   to *execute*.** Windows `rust-tests` is green, which exercises the job object
+   including its I/O completion port. Linux `rust-tests` is green too — but
+   `monkey processes limits` on that same runner reports `this host: supervisor`,
+   because a hosted runner's job is not a systemd user session and nothing has
+   been delegated to it. `CgroupScope::create` correctly declines and the
+   supervised fallback runs, which is a legitimate production outcome and also
+   means the cgroup enforcement path had never run anywhere. CI now provisions a
+   delegated `lm-ci/leaf` hierarchy and runs the Linux suite inside it, on the
+   same reasoning as the btrfs loop mount that exists so the reflink tests
+   exercise the native clone rather than its fallback.
+
+   The lesson is worth more than the fix: "the Linux job is green" was taken as
+   "the cgroup backend works", and those are different claims. The step that
+   distinguishes them prints the backend from outside the test binary, because
+   libtest captures a passing test's output and no assertion inside one can say
+   which of two acceptable answers it got.
+
+2. **`monkey processes limits` crashes on Windows** with `STATUS_STACK_OVERFLOW`
+   (0xc00000fd), found by that same step. Not the controller: a unit test
+   constructs one and reads its capabilities on Windows and passes. The host
+   block this item added to that command is the new code in the path, and the
+   cause is not yet identified. The command is Unix-verified only.
+3. **A browser session owns a process tree and is not routed through the
    controller.** Its Chromium is bounded by `browser_worker`'s own session quotas,
    which are real; wiring it means reconciling two enforcement paths rather than
    adding one. Both its memory and child-process cells say exactly this rather
    than claiming a bound.
-3. **macOS has no kernel-owned process tree, and this does not invent one.** The
+4. **macOS has no kernel-owned process tree, and this does not invent one.** The
    supervisor covers an ordinary descendant and a `setsid` escape. A descendant
    that both re-parents *and* leaves the group is outside any primitive macOS
    offers without a privileged helper. It keeps its Seatbelt filesystem and
    network confinement; what it escapes is the lifetime bound. That specific
    requirement stays open rather than being redefined.
-4. **The Processes UI has not been extended.** The effective limits, live usage
+5. **The Processes UI has not been extended.** The effective limits, live usage
    and enforcement mechanism are on the record and exposed by `monkey processes
    show`/`limits`; no desktop surface reads them yet.
-5. **Scheduler reservations have not been re-audited against the controller.**
+6. **Scheduler reservations have not been re-audited against the controller.**
    K7/K8 are built against measured reservations and are unchanged by this work,
    which means their assumptions have not been *checked* against it.
 

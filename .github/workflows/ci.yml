@@ -180,7 +180,54 @@ jobs:
           New-Item -ItemType Directory -Force $root | Out-Null
           "LITTLE_MONKEY_COW_TEST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Provision a delegated cgroup so the kernel path runs
+        if: startsWith(matrix.os, 'ubuntu')
+        # Without this the Linux leg proves only that the cgroup code compiles.
+        # A hosted runner's job is not a systemd user session, so nothing has
+        # been delegated to it and `CgroupScope::create` correctly declines and
+        # falls back to the supervisor — which is a legitimate production
+        # outcome, and also means the kernel path never executes anywhere.
+        #
+        # Same move as the btrfs loop mount two steps up, which exists so the
+        # reflink tests exercise the native clone rather than its copy fallback:
+        # provision the environment the production path needs, then let the
+        # production path run unmodified.
+        #
+        # The two-level layout is required by cgroup v2's "no internal
+        # processes" rule: `lm-ci` may enable controllers for its children only
+        # because it holds no processes itself, and this shell moves into
+        # `lm-ci/leaf`. `CgroupScope` then walks up from its own cgroup, finds
+        # `lm-ci`, and creates its scope there.
+        run: |
+          set -euo pipefail
+          root=/sys/fs/cgroup
+          test -f "$root/cgroup.controllers" || { echo "not cgroup v2; leaving the fallback in place"; exit 0; }
+          echo "root controllers: $(cat "$root/cgroup.controllers")"
+          sudo mkdir -p "$root/lm-ci/leaf"
+          # Delegate downward one level at a time; a controller the root does not
+          # have cannot be enabled and is not worth failing the job over.
+          echo "+memory +pids" | sudo tee "$root/cgroup.subtree_control" >/dev/null || true
+          echo "+memory +pids" | sudo tee "$root/lm-ci/cgroup.subtree_control" >/dev/null || true
+          sudo chown -R "$USER" "$root/lm-ci"
+          echo "delegated controllers: $(cat "$root/lm-ci/leaf/cgroup.controllers" 2>/dev/null || echo none)"
+          echo "LITTLE_MONKEY_CI_CGROUP=$root/lm-ci/leaf" >> "$GITHUB_ENV"
+
+      - name: Rust tests (Linux, inside the delegated cgroup)
+        if: startsWith(matrix.os, 'ubuntu')
+        # Moves this shell into the delegated leaf before the test binary is
+        # built, so every process it spawns inherits the membership and
+        # `/proc/self/cgroup` points somewhere `CgroupScope` can create under.
+        # Falls through unchanged when the provisioning step found no v2
+        # hierarchy, which keeps the supervised fallback the tested path there.
+        run: |
+          if [ -n "${LITTLE_MONKEY_CI_CGROUP:-}" ] && [ -w "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" ]; then
+            echo $$ > "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs"
+            echo "running under $(cat /proc/self/cgroup)"
+          fi
+          pnpm test:rust
+
       - name: Rust tests
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
 
       - name: Report this runner's resource-enforcement backend
