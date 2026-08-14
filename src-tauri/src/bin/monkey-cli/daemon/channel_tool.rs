@@ -14,8 +14,12 @@
 //!   tool returns as soon as the row is durable, so a crash between "the model
 //!   said it" and "the provider has it" resolves the same way every other
 //!   outbound message does. This file never calls a provider adapter.
-//! - The idempotency key is derived from the job and the number of messages it
-//!   has already queued, so a retried run cannot duplicate a send.
+//! - The send is identified by the job and the runtime-assigned tool-call id —
+//!   the durable identity of one tool invocation, and nothing about where the
+//!   message is going — so a run that re-executes a tool call recomputes the
+//!   same identity and the outbox recognizes the row even if the destination
+//!   was recomputed with it, while two distinct calls asking for the same
+//!   words remain two messages. One invocation is at most one outbound intent.
 //! - Reply depth is carried forward, which is what lets the inbound gate stop
 //!   two agents from talking to each other forever.
 
@@ -197,8 +201,15 @@ const MAX_DESTINATION_CHARS: usize = 512;
 pub(crate) fn send_message(
     request: &ChannelSendRequest,
     authority: &SendAuthority,
+    tool_call_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let job_id = std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty());
+    let invocation = SendInvocation {
+        job_id: std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty()),
+        tool_call_id: tool_call_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+    };
     let origin = current_channel_origin().map(|(_, origin)| origin);
     let plan = plan_send(request, authority, origin.as_ref())?;
 
@@ -210,9 +221,21 @@ pub(crate) fn send_message(
         request,
         &plan,
         origin.as_ref(),
-        job_id.as_deref(),
+        &invocation,
         now_ms()?,
     )
+}
+
+/// The trusted identity of one durable tool invocation.
+///
+/// Both fields come from the runtime — the daemon's job id from the
+/// environment it set on its own child, and the agent loop's tool-call id —
+/// never from a tool argument. The model cannot supply, repeat, or omit
+/// either, which is what makes the pair safe to key deliveries on.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SendInvocation {
+    pub job_id: Option<String>,
+    pub tool_call_id: Option<String>,
 }
 
 /// A send that has passed every check that does not need the store: what it
@@ -233,7 +256,7 @@ pub(crate) fn plan_send(
 ) -> Result<SendPlan, String> {
     let text = request.text.trim();
     if text.is_empty() && request.artifact_ids.is_empty() {
-        return Err("A message must contain some text.".to_string());
+        return Err("A message must carry some text or at least one artifact.".to_string());
     }
     if text.chars().count() > MAX_REPLY_CHARS {
         return Err(format!(
@@ -278,8 +301,8 @@ pub(crate) fn plan_send(
 /// Write the planned send into the durable outbox.
 ///
 /// Everything a provider will need is decided here and nowhere later: the
-/// files are copied, the idempotency key is derived from the job, and the row
-/// is the only record of the send. This function never calls an adapter —
+/// files are copied, the idempotency key is derived from the invocation, and
+/// the row is the only record of the send. This function never calls an adapter —
 /// delivery is the outbox worker's job, so a crash between "the model said it"
 /// and "the provider has it" resolves the same way every other outbound
 /// message does.
@@ -289,9 +312,10 @@ pub(crate) fn queue_send(
     request: &ChannelSendRequest,
     plan: &SendPlan,
     origin: Option<&ChannelOrigin>,
-    job_id: Option<&str>,
+    invocation: &SendInvocation,
     now_ms: i64,
 ) -> Result<serde_json::Value, String> {
+    let job_id = invocation.job_id.as_deref();
     let text = request.text.trim();
     let has_files = !request.artifact_ids.is_empty();
     let Destination {
@@ -355,16 +379,35 @@ pub(crate) fn queue_send(
         Some(job_id) if origin.is_some() => inbound_reply_depth(store, job_id).saturating_add(1),
         _ => 0,
     };
-    let idempotency_key = match job_id {
-        Some(job_id) => {
-            let sequence = store.outbox_count_for_job(job_id)?;
-            let prefix = if is_origin_reply { "reply" } else { "send" };
-            format!("{prefix}-{job_id}-{sequence}")
-        }
-        // No durable job to be retried under: a fresh key per call is the
-        // honest statement that nothing will ever legitimately resubmit it.
-        None => format!("send-adhoc-{}", uuid::Uuid::new_v4().simple()),
+    // The durable invocation — the job and the runtime's own tool-call id, and
+    // nothing else. Not the content: a content key would collapse two
+    // intentional identical sends from one run into one delivery. Not a
+    // counter: it shifts under a replayed run and lets the first message go
+    // out twice. And nothing about *where* the message is going, which is the
+    // whole point — an invocation replayed against a recomputed destination,
+    // another account, or as an explicit send where it was first an origin
+    // reply is the same invocation, and one invocation may become at most one
+    // outbound intent. A `reply-`/`send-` prefix here made that replay a
+    // second identity and a second message.
+    //
+    // What the invocation *asked to send* is pinned separately — the row's
+    // payload digest, which covers the account and destination — so a replay
+    // carrying different bytes under the same identity fails closed in the
+    // store instead of silently sending either version. See
+    // `enqueue_channel_message`.
+    let invocation_id = match (job_id, invocation.tool_call_id.as_deref()) {
+        (Some(job_id), Some(tool_call_id)) => Some(format!("channel-send:{job_id}:{tool_call_id}")),
+        // No durable invocation to be retried under, so there is no identity
+        // to enforce: a job with no tool-call id lands here too, and guessing
+        // one from content would recreate the collapsed-duplicates bug.
+        _ => None,
     };
+    // What a provider is told to deduplicate on. The same string as the
+    // invocation when there is one; otherwise a fresh value per call, the
+    // honest statement that nothing will ever legitimately resubmit it.
+    let idempotency_key = invocation_id
+        .clone()
+        .unwrap_or_else(|| format!("channel-send:adhoc:{}", uuid::Uuid::new_v4().simple()));
 
     let payload = OutboxPayload {
         message: OutboundMessage {
@@ -389,6 +432,7 @@ pub(crate) fn queue_send(
         payload_digest: sha256_hex(payload_json.as_bytes()),
         payload_json,
         idempotency_key,
+        invocation_id,
         max_attempts: REPLY_MAX_ATTEMPTS,
         job_id: job_id.map(str::to_string),
         created_at_ms: now_ms,
@@ -474,23 +518,36 @@ fn resolve_destination(
 /// The authorization ladder. Each refusal names the missing grant rather than
 /// a generic "denied", because the operator reading it in the transcript is
 /// the one who could add the grant.
+///
+/// The three rules do not overlap: exactly one applies to any destination.
+/// Answering the origin conversation needs `reply`; another conversation on
+/// the origin account needs `cross_conversation`; another account needs that
+/// account named in `accounts`. In particular, naming the *origin* account in
+/// `accounts` grants nothing extra — it is already the account this run
+/// arrived on, and letting it stand in for `cross_conversation` would widen a
+/// run's reach inside its own account by a grant that says nothing about
+/// conversations.
 fn authorize(
     account_id: &str,
     is_origin_reply: bool,
     origin_on_this_account: bool,
     authority: &SendAuthority,
 ) -> Result<SendRule, &'static str> {
-    let account_granted = authority.accounts.iter().any(|id| id == account_id);
     if is_origin_reply {
         if authority.reply {
             return Ok(SendRule::OriginReply);
         }
         return Err("This run was not granted the authority to answer its conversation.");
     }
-    if origin_on_this_account && (authority.cross_conversation || account_granted) {
-        return Ok(SendRule::CrossConversation);
+    if origin_on_this_account {
+        if authority.cross_conversation {
+            return Ok(SendRule::CrossConversation);
+        }
+        return Err(
+            "This run's permission snapshot does not grant other conversations on this account.",
+        );
     }
-    if !origin_on_this_account && account_granted {
+    if authority.accounts.iter().any(|id| id == account_id) {
         return Ok(SendRule::CrossAccount);
     }
     Err("This run's permission snapshot does not grant that destination.")
@@ -637,13 +694,13 @@ mod tests {
 
     #[test]
     fn an_empty_reply_is_refused_before_anything_is_opened() {
-        assert!(send_message(&request("   "), &reply_authority()).is_err());
+        assert!(send_message(&request("   "), &reply_authority(), None).is_err());
     }
 
     #[test]
     fn an_oversized_reply_is_refused() {
         let huge = "x".repeat(MAX_REPLY_CHARS + 1);
-        let error = send_message(&request(&huge), &reply_authority()).expect_err("too long");
+        let error = send_message(&request(&huge), &reply_authority(), None).expect_err("too long");
         assert!(error.contains("at most"));
     }
 
@@ -651,7 +708,7 @@ mod tests {
     fn a_blank_destination_id_is_refused() {
         let mut asked = request("hello");
         asked.conversation_id = Some("   ".to_string());
-        let error = send_message(&asked, &reply_authority()).expect_err("blank id");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("blank id");
         assert!(error.contains("'to'"), "{error}");
     }
 
@@ -659,7 +716,7 @@ mod tests {
     fn an_oversized_destination_id_is_refused() {
         let mut asked = request("hello");
         asked.account_id = Some("x".repeat(MAX_DESTINATION_CHARS + 1));
-        let error = send_message(&asked, &reply_authority()).expect_err("oversized id");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("oversized id");
         assert!(error.contains("'account'"), "{error}");
     }
 
@@ -699,7 +756,7 @@ mod tests {
     fn a_run_with_no_channel_origin_has_nowhere_to_send() {
         // No job id in the environment: every non-channel run looks like this.
         std::env::remove_var(JOB_ID_ENV);
-        let error = send_message(&request("hello"), &reply_authority()).expect_err("no origin");
+        let error = send_message(&request("hello"), &reply_authority(), None).expect_err("no origin");
         assert!(error.contains("did not arrive from a messaging conversation"));
     }
 
@@ -709,7 +766,7 @@ mod tests {
         let mut asked = request("hello");
         asked.account_id = Some("chan-someone-elses".to_string());
         asked.conversation_id = Some("conv-1".to_string());
-        let error = send_message(&asked, &reply_authority()).expect_err("no grant");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("no grant");
         assert!(error.contains("does not grant"), "{error}");
     }
 
@@ -790,6 +847,69 @@ mod tests {
         assert!(authorize("chan-origin", true, true, &authority).is_err());
     }
 
+    /// Naming the run's *own* account in the account grant must not stand in
+    /// for the conversation grant. The two answer different questions — "which
+    /// accounts may this run use" and "may it leave its own conversation" —
+    /// and folding one into the other let a run reach every conversation on
+    /// the account it arrived on without anyone granting that.
+    #[test]
+    fn granting_the_origin_account_does_not_open_its_other_conversations() {
+        let authority = SendAuthority {
+            reply: true,
+            cross_conversation: false,
+            accounts: vec!["chan-origin".to_string()],
+        };
+        assert_eq!(
+            authorize("chan-origin", true, true, &authority),
+            Ok(SendRule::OriginReply)
+        );
+        let refused =
+            authorize("chan-origin", false, true, &authority).expect_err("no conversation grant");
+        assert!(refused.contains("other conversations"), "{refused}");
+    }
+
+    /// The three grants, each on its own, against every destination shape.
+    /// One table, because what matters is as much what each grant does *not*
+    /// reach as what it does.
+    #[test]
+    fn each_grant_reaches_exactly_what_it_names() {
+        // reply only: the origin conversation, nothing else.
+        let reply = reply_authority();
+        assert_eq!(
+            authorize("chan-origin", true, true, &reply),
+            Ok(SendRule::OriginReply)
+        );
+        assert!(authorize("chan-origin", false, true, &reply).is_err());
+        assert!(authorize("chan-second", false, false, &reply).is_err());
+
+        // cross_conversation only: other conversations on the origin account,
+        // and still no other account.
+        let cross = SendAuthority {
+            reply: false,
+            cross_conversation: true,
+            accounts: Vec::new(),
+        };
+        assert_eq!(
+            authorize("chan-origin", false, true, &cross),
+            Ok(SendRule::CrossConversation)
+        );
+        assert!(authorize("chan-second", false, false, &cross).is_err());
+        // Without `reply` it cannot even answer its own conversation.
+        assert!(authorize("chan-origin", true, true, &cross).is_err());
+
+        // A named account: that account, and no neighbouring one.
+        let named = SendAuthority {
+            reply: false,
+            cross_conversation: false,
+            accounts: vec!["chan-second".to_string()],
+        };
+        assert_eq!(
+            authorize("chan-second", false, false, &named),
+            Ok(SendRule::CrossAccount)
+        );
+        assert!(authorize("chan-third", false, false, &named).is_err());
+    }
+
     #[test]
     fn a_malformed_artifact_id_is_refused() {
         let base =
@@ -861,5 +981,29 @@ mod tests {
         assert!(properties.get("attachments").is_none());
         assert!(properties.get("paths").is_none());
         assert_eq!(schema["function"]["parameters"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn the_schema_offers_every_destination_field_and_demands_none_of_them() {
+        // The model-visible contract, field by field: account, destination,
+        // thread, reply target and artifacts are all expressible, and `text`
+        // is not required — an artifact-only message is a legal send, and a
+        // schema demanding text would make it unsayable.
+        let schema = little_monkey_lib::agent_tools::send_message_tool_def();
+        let properties = &schema["function"]["parameters"]["properties"];
+        for field in ["text", "account", "to", "thread", "reply_to", "artifacts"] {
+            assert!(properties.get(field).is_some(), "missing '{field}'");
+        }
+        assert_eq!(
+            schema["function"]["parameters"]["required"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        // And the daemon, not the schema, is what refuses a message carrying
+        // neither.
+        let error = plan_send(&request("  "), &reply_authority(), Some(&origin()))
+            .expect_err("nothing to send");
+        assert!(error.contains("text or at least one artifact"), "{error}");
     }
 }
