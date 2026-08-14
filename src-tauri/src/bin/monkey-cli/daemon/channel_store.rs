@@ -1386,6 +1386,87 @@ impl DaemonStore {
             .map_err(|error| error.to_string())?;
         Ok(())
     }
+
+    // -- Conversation references ---------------------------------------------
+
+    /// Where this provider wants a reply to one conversation sent.
+    ///
+    /// `None` means nothing authenticated has ever named an address for it, and
+    /// an adapter that needs one says so rather than guessing: a reply endpoint
+    /// invented from a conversation id is how a message goes to the wrong
+    /// tenant.
+    pub fn channel_conversation_ref(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT reference_json FROM channel_conversation_refs
+                 WHERE account_id=?1 AND conversation_id=?2",
+                params![account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        stored
+            .map(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// Record where a reply to one conversation goes, replacing whatever was
+    /// there.
+    ///
+    /// The newest authenticated address wins: providers move conversations
+    /// between regional endpoints, and the stale one answers 404 rather than
+    /// delivering. Callers must have authenticated and validated the value
+    /// first — see this table's own doc for what may and may not live here.
+    pub fn set_channel_conversation_ref(
+        &mut self,
+        account_id: &str,
+        conversation_id: &str,
+        reference: &serde_json::Value,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let json = serde_json::to_string(reference).map_err(|error| error.to_string())?;
+        if json.len() > 8192 {
+            return Err("That conversation reference is too large to store".to_string());
+        }
+        self.connection
+            .execute(
+                "INSERT INTO channel_conversation_refs (
+                    account_id, conversation_id, reference_json, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(account_id, conversation_id) DO UPDATE SET
+                    reference_json = excluded.reference_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![account_id, conversation_id, json, now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Drop one conversation's reference.
+    ///
+    /// Used for the parts of a reference that are single-use — a LINE reply
+    /// token is spent by the reply that uses it — so a second send falls back
+    /// to the durable path instead of replaying a token the provider has
+    /// already retired.
+    pub fn clear_channel_conversation_ref(
+        &mut self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "DELETE FROM channel_conversation_refs
+                 WHERE account_id=?1 AND conversation_id=?2",
+                params![account_id, conversation_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 // Re-export so callers of `complete_outbox_send` do not need a separate

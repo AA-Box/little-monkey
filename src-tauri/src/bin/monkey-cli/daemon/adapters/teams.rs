@@ -26,6 +26,22 @@
 //!
 //! Outbound uses the client-credentials flow against the configured tenant,
 //! with the resulting token cached and refreshed on expiry.
+//!
+//! # Where a reply is addressed — read this before touching `send`
+//!
+//! The Bot Framework does not accept a conversation id alone. A reply is POSTed
+//! to the `serviceUrl` the inbound activity carried, which is per conversation
+//! and per region, so without it there is no endpoint at all. That value is
+//! therefore *durable state*, not a cache: a turn accepted before a restart
+//! still owes an answer afterwards, and a process-local map cannot give it one.
+//! [`TeamsAdapter::record_conversation_reference`] writes it — only from an
+//! activity whose JWT has already verified, and only after
+//! [`validate_service_url`] — and `send` loads it back through
+//! [`ConversationReferences`]. Nothing derives, reconstructs or defaults it.
+//!
+//! The bearer token is the opposite and stays that way: acquired from the
+//! operator's own app credentials, cached in memory with its expiry, never
+//! written anywhere.
 
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
@@ -35,7 +51,6 @@ use little_monkey_lib::channels::types::{
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::jwt::{
@@ -43,7 +58,8 @@ use super::jwt::{
     try_refresh_blocking, validate_alg_is_rs256, verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    fetch_url, AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    fetch_url, AdapterConfig, ChannelAdapter, ConversationReferences, DaemonConversationReferences,
+    InboundBatch, WebhookChannelAdapter,
 };
 
 const LOGIN_BASE: &str = "https://login.microsoftonline.com";
@@ -83,17 +99,26 @@ struct CachedToken {
     expires_at_ms: i64,
 }
 
+/// The addressing a reply needs, read back out of the durable reference.
+struct TeamsConversation {
+    /// Already trailing-slash trimmed and re-validated.
+    service_url: String,
+    bot_id: Option<String>,
+    bot_name: Option<String>,
+}
+
 pub struct TeamsAdapter {
     account_id: String,
     app_id: String,
     tenant_id: String,
     app_password: String,
     token_cache: Mutex<Option<CachedToken>>,
-    /// Validated `serviceUrl` per conversation. Only ever written by
-    /// [`TeamsAdapter::record_conversation_service_url`], which validates
-    /// before inserting — `send` refuses to guess or derive one. Populated
-    /// from every activity `verify_and_normalize` accepts (see that method).
-    service_urls: Mutex<BTreeMap<String, String>>,
+    /// Where a reply to each conversation is addressed. Durable, because a
+    /// turn accepted before a restart still owes an answer after one — see the
+    /// module doc. Only ever written by
+    /// [`TeamsAdapter::record_conversation_reference`], which validates before
+    /// storing; `send` refuses to guess or derive an endpoint.
+    references: std::sync::Arc<dyn ConversationReferences>,
     /// Identity provider origin. Always [`LOGIN_BASE`] in production;
     /// swappable in tests.
     login_base: String,
@@ -129,7 +154,7 @@ impl TeamsAdapter {
             tenant_id: non_secret.tenant_id,
             app_password: secrets.app_password,
             token_cache: Mutex::new(None),
-            service_urls: Mutex::new(BTreeMap::new()),
+            references: std::sync::Arc::new(DaemonConversationReferences),
             login_base: LOGIN_BASE.to_string(),
             jwks_cache: JwksCache::new(),
             metadata_url,
@@ -137,14 +162,34 @@ impl TeamsAdapter {
     }
 
     #[cfg(test)]
-    fn with_login_base(mut self, base: &str) -> Self {
+    pub(crate) fn with_login_base(mut self, base: &str) -> Self {
         self.login_base = base.to_string();
         self
     }
 
     #[cfg(test)]
-    fn with_metadata_url(mut self, url: &str) -> Self {
+    pub(crate) fn with_metadata_url(mut self, url: &str) -> Self {
         self.metadata_url = url.to_string();
+        self
+    }
+
+    /// Stand in for the JWKS fetch with this file's own test key, so a test
+    /// can verify a genuinely signed token without reaching Microsoft.
+    #[cfg(test)]
+    pub(crate) fn seed_jwks_for_test(&self) {
+        self.jwks_cache
+            .seed_for_test("test-key-1", tests::test_jwk());
+    }
+
+    /// Swap the durable reference store. Used by the restart tests, which build
+    /// two adapters over one store to prove the second can address a
+    /// conversation the first was told about.
+    #[cfg(test)]
+    pub(crate) fn with_references(
+        mut self,
+        references: std::sync::Arc<dyn ConversationReferences>,
+    ) -> Self {
+        self.references = references;
         self
     }
 
@@ -181,27 +226,122 @@ impl TeamsAdapter {
         None
     }
 
-    /// Records a `serviceUrl` for a conversation, refusing anything that is
-    /// not `https` on a Microsoft-owned Bot Framework host. This is the only
-    /// way `send` learns where to POST — it never reconstructs or trusts a
-    /// value handed to it any other way.
-    fn record_conversation_service_url(
+    /// Durably record where replies to one conversation go, refusing any
+    /// `serviceUrl` that is not `https` on a Microsoft-owned Bot Framework
+    /// host.
+    ///
+    /// This is the only way `send` learns where to POST — it never
+    /// reconstructs a URL or trusts one handed to it another way — and it is
+    /// only ever called from [`WebhookChannelAdapter::verify_and_normalize`]
+    /// *after* the activity's JWT has verified. That ordering is the security
+    /// property: an unauthenticated request cannot make this process POST an
+    /// operator's bot token to a host of its choosing.
+    ///
+    /// No token is stored. What is stored is addressing: the endpoint, the
+    /// tenant and conversation shape the Bot Framework needs to route a reply,
+    /// and when it was last confirmed.
+    fn record_conversation_reference(
         &self,
         conversation_id: &str,
-        service_url: &str,
+        activity: &JsonValue,
+        now_ms: i64,
     ) -> Result<(), String> {
+        let service_url = activity
+            .get("serviceUrl")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "Activity carries no serviceUrl".to_string())?;
         validate_service_url(service_url)?;
-        if let Ok(mut cache) = self.service_urls.lock() {
-            cache.insert(conversation_id.to_string(), service_url.to_string());
-        }
-        Ok(())
+
+        let conversation = activity.get("conversation");
+        let mut reference = serde_json::json!({
+            "service_url": service_url,
+            "last_updated_at_ms": now_ms,
+        });
+        // Everything below is optional because Teams omits each of them in
+        // some shapes: a personal chat has no tenant on the conversation, and
+        // `conversationType` is absent outside channels. What is present is
+        // kept, because a proactive reply is addressed with it.
+        let mut put = |key: &str, value: Option<&str>| {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                reference[key] = JsonValue::from(value);
+            }
+        };
+        put(
+            "tenant_id",
+            activity
+                .get("channelData")
+                .and_then(|data| data.get("tenant"))
+                .and_then(|tenant| tenant.get("id"))
+                .and_then(JsonValue::as_str)
+                .or_else(|| {
+                    conversation
+                        .and_then(|conversation| conversation.get("tenantId"))
+                        .and_then(JsonValue::as_str)
+                }),
+        );
+        put(
+            "conversation_type",
+            conversation
+                .and_then(|conversation| conversation.get("conversationType"))
+                .and_then(JsonValue::as_str),
+        );
+        put(
+            "channel_id",
+            activity.get("channelId").and_then(JsonValue::as_str),
+        );
+        // The bot's own identity on this conversation, which a proactive
+        // activity has to name as its `from`.
+        put(
+            "bot_id",
+            activity
+                .get("recipient")
+                .and_then(|recipient| recipient.get("id"))
+                .and_then(JsonValue::as_str),
+        );
+        put(
+            "bot_name",
+            activity
+                .get("recipient")
+                .and_then(|recipient| recipient.get("name"))
+                .and_then(JsonValue::as_str),
+        );
+        self.references
+            .put(&self.account_id, conversation_id, &reference)
     }
 
-    #[cfg(test)]
-    fn seed_service_url_for_test(&self, conversation_id: &str, service_url: &str) {
-        if let Ok(mut cache) = self.service_urls.lock() {
-            cache.insert(conversation_id.to_string(), service_url.to_string());
-        }
+    /// The stored reference for a conversation, or the reason there is none.
+    fn conversation_reference(&self, conversation_id: &str) -> Result<TeamsConversation, String> {
+        let stored = self
+            .references
+            .get(&self.account_id, conversation_id)
+            .ok_or_else(|| {
+                format!(
+                    "No verified serviceUrl on file for conversation '{conversation_id}'; Teams \
+                     requires an inbound activity to establish where to send before it can be \
+                     messaged"
+                )
+            })?;
+        let service_url = stored
+            .get("service_url")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!("The stored Teams reference for '{conversation_id}' names no serviceUrl")
+            })?;
+        // Re-validated on the way out as well as in. The row is only ever
+        // written by the path above, but a database is a file on disk and this
+        // is the moment a bot token would be sent somewhere.
+        validate_service_url(service_url)?;
+        Ok(TeamsConversation {
+            service_url: service_url.trim_end_matches('/').to_string(),
+            bot_id: stored
+                .get("bot_id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            bot_name: stored
+                .get("bot_name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// A cached client-credentials token, fetching and caching a new one when
@@ -306,17 +446,21 @@ impl WebhookChannelAdapter for TeamsAdapter {
 
         // The `serviceUrl` this specific activity carries is the only way
         // `send` learns where to POST for this conversation — record it now
-        // that the activity is verified, per `record_conversation_service_url`'s
-        // own doc. Best-effort: an invalid or absent `serviceUrl` still lets a
-        // valid activity normalize, it just cannot be replied to yet.
-        if let (Some(conversation_id), Some(service_url)) = (
-            activity
-                .get("conversation")
-                .and_then(|conversation| conversation.get("id"))
-                .and_then(JsonValue::as_str),
-            activity.get("serviceUrl").and_then(JsonValue::as_str),
-        ) {
-            let _ = self.record_conversation_service_url(conversation_id, service_url);
+        // that the activity is verified, per `record_conversation_reference`'s
+        // own doc. Written durably rather than cached: the turn this delivery
+        // becomes may well outlive the process that received it.
+        //
+        // Best-effort on failure: an invalid or absent `serviceUrl` still lets
+        // a valid activity normalize and run, it just cannot be replied to
+        // until an activity that carries a usable one arrives. Refusing the
+        // whole delivery instead would throw away a real message over a reply
+        // address, and the send says plainly what is missing.
+        if let Some(conversation_id) = activity
+            .get("conversation")
+            .and_then(|conversation| conversation.get("id"))
+            .and_then(JsonValue::as_str)
+        {
+            let _ = self.record_conversation_reference(conversation_id, &activity, now_ms);
         }
 
         let bot_id = activity
@@ -369,25 +513,11 @@ impl ChannelAdapter for TeamsAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
-        let service_url = {
-            let cache = match self.service_urls.lock() {
-                Ok(cache) => cache,
-                Err(_) => {
-                    return SendOutcome::PermanentFailure {
-                        error: "Teams service URL cache is poisoned".to_string(),
-                    }
-                }
-            };
-            cache.get(&message.conversation_id).cloned()
-        };
-        let Some(service_url) = service_url else {
-            return SendOutcome::PermanentFailure {
-                error: format!(
-                    "No verified serviceUrl on file for conversation '{}'; Teams requires an \
-                     inbound activity to establish where to send before it can be messaged",
-                    message.conversation_id
-                ),
-            };
+        // Loaded, never remembered: this is the same lookup whether the
+        // activity arrived a second ago or before the last restart.
+        let conversation = match self.conversation_reference(&message.conversation_id) {
+            Ok(conversation) => conversation,
+            Err(error) => return SendOutcome::PermanentFailure { error },
         };
         let token = match self.access_token().await {
             Ok(token) => token,
@@ -406,15 +536,37 @@ impl ChannelAdapter for TeamsAdapter {
                 }
             }
         };
-        let url = format!(
-            "{}/v3/conversations/{}/activities",
-            service_url.trim_end_matches('/'),
-            message.conversation_id
-        );
-        let body = serde_json::json!({
+        // Replying to a specific activity keeps the answer under the message
+        // that prompted it, which in a Teams channel is the difference between
+        // a threaded reply and a new post nobody connects to the question.
+        // Falling back to the conversation endpoint is what a proactive
+        // message — one with no activity to hang from — needs.
+        let reply_to = message
+            .reply_to_provider_id
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let url = match activity_url(
+            &conversation.service_url,
+            &message.conversation_id,
+            reply_to,
+        ) {
+            Ok(url) => url,
+            Err(error) => return SendOutcome::PermanentFailure { error },
+        };
+        let mut body = serde_json::json!({
             "type": "message",
             "text": message.text,
         });
+        if let Some(activity_id) = reply_to {
+            body["replyToId"] = JsonValue::from(activity_id);
+        }
+        if let Some(bot_id) = conversation.bot_id.as_deref() {
+            let mut from = serde_json::json!({ "id": bot_id });
+            if let Some(name) = conversation.bot_name.as_deref() {
+                from["name"] = JsonValue::from(name);
+            }
+            body["from"] = from;
+        }
         let request = client.post(url).bearer_auth(&token).json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
             Ok(response) => response,
@@ -502,6 +654,37 @@ fn is_bot_framework_host(url: &str) -> bool {
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
+/// The Bot Framework endpoint one reply is POSTed to.
+///
+/// Built with the URL parser rather than by formatting, so a conversation or
+/// activity id is percent-encoded into exactly one path segment. Those ids come
+/// from a provider payload: a `/` inside one, formatted straight into a path,
+/// would move the request to an endpoint of the sender's choosing — with the
+/// bot's own bearer token attached.
+fn activity_url(
+    service_url: &str,
+    conversation_id: &str,
+    reply_to_activity_id: Option<&str>,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(service_url)
+        .map_err(|_| "The stored Teams serviceUrl is not a valid URL".to_string())?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "The stored Teams serviceUrl cannot carry a path".to_string())?;
+        // The stored value is a base like `https://smba.trafficmanager.net/amer/`,
+        // whose trailing slash would otherwise leave an empty segment.
+        segments.pop_if_empty();
+        segments.extend(["v3", "conversations"]);
+        segments.push(conversation_id);
+        segments.push("activities");
+        if let Some(activity_id) = reply_to_activity_id {
+            segments.push(activity_id);
+        }
+    }
+    Ok(url.to_string())
+}
+
 /// `https` on a Microsoft-owned Bot Framework host. Bot Framework
 /// `serviceUrl`s are `api.botframework.com` or a regional
 /// `*.botframework.com` / `*.trafficmanager.net` name (e.g.
@@ -510,6 +693,17 @@ fn is_bot_framework_host(url: &str) -> bool {
 fn validate_service_url(candidate: &str) -> Result<(), String> {
     let url =
         reqwest::Url::parse(candidate).map_err(|_| "serviceUrl is not a valid URL".to_string())?;
+    // A loopback fixture stands in for the Bot Framework in this file's own
+    // tests, which is the only way to drive the real send path without the
+    // network. Compiled out of every shipped build, so the rule below is the
+    // only one production has.
+    #[cfg(test)]
+    if url
+        .host_str()
+        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        return Ok(());
+    }
     if url.scheme() != "https" {
         return Err("serviceUrl must be https".to_string());
     }
@@ -719,8 +913,9 @@ fn normalize_activity(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::daemon::channel_adapter::MemoryConversationReferences;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
@@ -728,7 +923,7 @@ mod tests {
     use little_monkey_lib::channels::types::{ConversationKind, HealthState};
     use std::io::{Read, Write};
 
-    fn test_account() -> ChannelAccountRecord {
+    pub(crate) fn test_account() -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-teams".to_string(),
             kind: ChannelKind::Teams,
@@ -758,7 +953,11 @@ mod tests {
             account: &account,
             secret,
         };
-        TeamsAdapter::new(&config).expect("adapter builds")
+        // Never the daemon-backed reference store: a unit test must not reach
+        // for the operator's real state database to find a reply address.
+        TeamsAdapter::new(&config)
+            .expect("adapter builds")
+            .with_references(std::sync::Arc::new(MemoryConversationReferences::default()))
     }
 
     /// A structurally-shaped but unsigned JWT: real base64url in all three
@@ -775,7 +974,7 @@ mod tests {
         format!("{header}.{payload}.{signature}")
     }
 
-    fn valid_claims(now_secs: i64) -> JsonValue {
+    pub(crate) fn valid_claims(now_secs: i64) -> JsonValue {
         serde_json::json!({
             "iss": EXPECTED_ISSUER,
             "aud": "app-id-1",
@@ -789,7 +988,7 @@ mod tests {
     /// A 2048-bit RSA test key generated locally for these tests only, whose
     /// public half is seeded into the JWKS cache as the "genuine" signer.
     /// Not used anywhere else and grants access to nothing.
-    const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDSxaufYG907lGy
 3EZKuTZSppsN3d4R8whFTFsFgo+11Zp5plEImzXl469p+Nc4/afv56nsig4MegEe
 0A7jiBHSnLBSBnsvuCCEoXY+T1QXyDOmZ3ycr9uSkRmSXon/wglUIbs4VaYCg2SS
@@ -856,7 +1055,7 @@ Z4Cr3JR0FbjywTd4IHU6
     const TEST_JWK_N: &str = "0sWrn2BvdO5RstxGSrk2UqabDd3eEfMIRUxbBYKPtdWaeaZRCJs15eOvafjXOP2n7-ep7IoODHoBHtAO44gR0pywUgZ7L7gghKF2Pk9UF8gzpmd8nK_bkpEZkl6J_8IJVCG7OFWmAoNkkrRT8jlfheHmwjReWmNUaHGYXurXEsllBwcVeVjClzjQifOKrzjdH_Nevx1GIDp5DftkAosKLvtdg6jwvMzpTLVwSVZ_xiY2UMCDjmnPC7RUnopE1wz9UGoj9Gb1QgV6APHEfZ1kym4Fqsdsi1bDiUdq2buWQgrZVKCGXXXo9KG-dtIYQw12YJJv23wFxKWxlzW2dGUR4w";
     const TEST_JWK_E: &str = "AQAB";
 
-    fn test_jwk() -> JwkRsaKey {
+    pub(crate) fn test_jwk() -> JwkRsaKey {
         JwkRsaKey {
             n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
             e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
@@ -878,7 +1077,7 @@ Z4Cr3JR0FbjywTd4IHU6
     }
 
     /// Signs `claims` with `kid` in the header, using `private_key_pem`.
-    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+    pub(crate) fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
         use ring::rand::SystemRandom;
         use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
@@ -928,7 +1127,8 @@ Z4Cr3JR0FbjywTd4IHU6
 
     #[test]
     fn a_verified_activity_records_its_service_url_for_send() {
-        let adapter = adapter();
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        let adapter = adapter().with_references(references.clone());
         adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
         let now_ms = 1_700_000_000_000i64;
         let jwt = sign_test_jwt(
@@ -945,15 +1145,74 @@ Z4Cr3JR0FbjywTd4IHU6
                 now_ms,
             )
             .expect("verification should succeed");
-        let cached = adapter
-            .service_urls
-            .lock()
-            .unwrap()
-            .get("19:conv1")
-            .cloned();
+        let stored = references
+            .get("acct-teams", "19:conv1")
+            .expect("the verified activity's address is durable");
         assert_eq!(
-            cached.as_deref(),
+            stored.get("service_url").and_then(JsonValue::as_str),
             Some("https://smba.trafficmanager.net/amer/")
+        );
+        // Addressing, and nothing that authorizes anything.
+        assert_eq!(
+            stored.get("bot_id").and_then(JsonValue::as_str),
+            Some("28:bot-id")
+        );
+        assert_eq!(
+            stored.get("conversation_type").and_then(JsonValue::as_str),
+            Some("personal")
+        );
+        assert!(
+            stored.get("last_updated_at_ms").is_some(),
+            "the operator can see how fresh an address is"
+        );
+        let serialized = stored.to_string();
+        assert!(
+            !serialized.contains("Bearer") && !serialized.contains("access_token"),
+            "no token may be written to the reference table: {serialized}"
+        );
+    }
+
+    /// A second adapter over the same store, as a restart produces: the
+    /// process that received the activity is gone and this one has to answer.
+    #[tokio::test]
+    async fn a_reply_is_addressed_from_the_store_after_the_receiving_adapter_is_gone() {
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        let now_ms = 1_700_000_000_000i64;
+        {
+            let receiver = adapter().with_references(references.clone());
+            receiver.jwks_cache.seed_for_test("test-key-1", test_jwk());
+            let jwt = sign_test_jwt(
+                &valid_claims(now_ms / 1000),
+                "test-key-1",
+                TEST_PRIVATE_KEY_PEM,
+            );
+            receiver
+                .verify_and_normalize(
+                    &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                    &serde_json::to_vec(&personal_activity()).unwrap(),
+                    None,
+                    now_ms,
+                )
+                .expect("verification should succeed");
+        }
+
+        let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
+        let send_base = serve_once("200 OK", r#"{"id":"activity-out-1"}"#);
+        // The sender is told nothing about the conversation beyond its id, and
+        // its own reference store starts empty of anything it learned itself.
+        let sender = adapter()
+            .with_login_base(&token_base)
+            .with_references(references.clone());
+        // Rewrite only the endpoint the fixture listens on, keeping every
+        // other field the verified activity produced.
+        let mut stored = references.get("acct-teams", "19:conv1").expect("stored");
+        stored["service_url"] = JsonValue::from(send_base);
+        references.put("acct-teams", "19:conv1", &stored).unwrap();
+
+        let outcome = sender.send(&outbound_message()).await;
+        assert!(
+            matches!(outcome, SendOutcome::Sent { .. }),
+            "a restart must not strand a durable reply: {outcome:?}"
         );
     }
 
@@ -1274,6 +1533,33 @@ Z4Cr3JR0FbjywTd4IHU6
     }
 
     #[test]
+    fn a_conversation_id_cannot_walk_the_reply_out_of_its_own_endpoint() {
+        // Ids arrive in a provider payload. One containing a path separator,
+        // formatted straight into a URL, would move the POST — and the bot's
+        // bearer token with it — somewhere the sender chose.
+        let url = activity_url(
+            "https://smba.trafficmanager.net/amer",
+            "19:conv1/../../../v3/conversations/19:victim",
+            None,
+        )
+        .expect("a hostile id still produces a URL, just not that one");
+        assert!(
+            url.starts_with("https://smba.trafficmanager.net/amer/v3/conversations/"),
+            "{url}"
+        );
+        assert!(
+            !url.contains("/../"),
+            "the id escaped its own path segment: {url}"
+        );
+        // The ordinary shape, with the base's trailing slash: no empty segment.
+        let url = activity_url("https://smba.trafficmanager.net/amer/", "19:conv1", None).unwrap();
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/amer/v3/conversations/19:conv1/activities"
+        );
+    }
+
+    #[test]
     fn a_non_https_service_url_is_refused() {
         assert!(validate_service_url("http://smba.trafficmanager.net/amer/").is_err());
     }
@@ -1327,6 +1613,24 @@ Z4Cr3JR0FbjywTd4IHU6
         format!("http://127.0.0.1:{port}")
     }
 
+    /// A reference store already holding one conversation addressed at a
+    /// loopback fixture, which is what an inbound activity would have written.
+    fn references_at(service_url: &str) -> std::sync::Arc<MemoryConversationReferences> {
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        references
+            .put(
+                "acct-teams",
+                "19:conv1",
+                &serde_json::json!({
+                    "service_url": service_url,
+                    "bot_id": "28:bot",
+                    "last_updated_at_ms": 1_700_000_000_000i64,
+                }),
+            )
+            .expect("seed reference");
+        references
+    }
+
     fn outbound_message() -> OutboundMessage {
         OutboundMessage {
             account_id: "acct-teams".to_string(),
@@ -1353,8 +1657,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_429_activity_response_maps_to_retryable_failure() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("429 Too Many Requests", "{}");
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         assert!(
             matches!(outcome, SendOutcome::RetryableFailure { .. }),
@@ -1366,8 +1671,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_401_activity_response_maps_to_permanent_failure() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("401 Unauthorized", "{}");
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         assert!(
             matches!(outcome, SendOutcome::PermanentFailure { .. }),
@@ -1379,8 +1685,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_successful_send_extracts_the_provider_message_id() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("200 OK", r#"{"id":"activity-out-1"}"#);
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         match outcome {
             SendOutcome::Sent {

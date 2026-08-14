@@ -436,6 +436,124 @@ pub trait BlobSource: Send + Sync {
     }
 }
 
+/// Where an adapter keeps the address a provider wants replies sent to.
+///
+/// A trait for the same reasons [`BlobSource`] is one: the real implementation
+/// resolves the daemon's own paths, and a test has no business creating those.
+/// Only the providers whose reply address is not derivable from a conversation
+/// id use it — Teams cannot address an activity without the `serviceUrl` its
+/// inbound delivery carried, and LINE's reply token is valid only briefly.
+///
+/// Reads and writes are best-effort by signature: an adapter that cannot reach
+/// the store must fail its send with a real message rather than panicking
+/// inside the outbox drain. What must never be relaxed is the rule about what
+/// goes in — see `channel_conversation_refs`' own doc — because this is
+/// addressing, not authorization.
+pub trait ConversationReferences: Send + Sync {
+    fn get(&self, account_id: &str, conversation_id: &str) -> Option<serde_json::Value>;
+
+    fn put(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        reference: &serde_json::Value,
+    ) -> Result<(), String>;
+
+    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String>;
+}
+
+/// The production source: the daemon's own state database.
+///
+/// Opened per call rather than held, which is what lets one adapter be shared
+/// by the webhook route and the outbox drain without either holding a
+/// connection open across an await.
+pub struct DaemonConversationReferences;
+
+impl DaemonConversationReferences {
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
+impl ConversationReferences for DaemonConversationReferences {
+    fn get(&self, account_id: &str, conversation_id: &str) -> Option<serde_json::Value> {
+        let paths = super::store::DaemonPaths::resolve().ok()?;
+        let store = super::store::DaemonStore::open(&paths).ok()?;
+        store
+            .channel_conversation_ref(account_id, conversation_id)
+            .ok()
+            .flatten()
+    }
+
+    fn put(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        reference: &serde_json::Value,
+    ) -> Result<(), String> {
+        let paths = super::store::DaemonPaths::resolve()?;
+        let mut store = super::store::DaemonStore::open(&paths)?;
+        store.set_channel_conversation_ref(account_id, conversation_id, reference, Self::now_ms())
+    }
+
+    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
+        let paths = super::store::DaemonPaths::resolve()?;
+        let mut store = super::store::DaemonStore::open(&paths)?;
+        store.clear_channel_conversation_ref(account_id, conversation_id)
+    }
+}
+
+/// An in-memory reference store for tests.
+///
+/// Kept beside the production one rather than inside one file's test module
+/// because the restart tests need to prove the *store* is what a reply is
+/// loaded from: they build one adapter, drop it, build a second, and assert the
+/// second can still address the conversation.
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemoryConversationReferences {
+    entries: std::sync::Mutex<std::collections::BTreeMap<(String, String), serde_json::Value>>,
+}
+
+#[cfg(test)]
+impl ConversationReferences for MemoryConversationReferences {
+    fn get(&self, account_id: &str, conversation_id: &str) -> Option<serde_json::Value> {
+        self.entries
+            .lock()
+            .ok()?
+            .get(&(account_id.to_string(), conversation_id.to_string()))
+            .cloned()
+    }
+
+    fn put(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        reference: &serde_json::Value,
+    ) -> Result<(), String> {
+        self.entries
+            .lock()
+            .map_err(|_| "conversation reference store poisoned".to_string())?
+            .insert(
+                (account_id.to_string(), conversation_id.to_string()),
+                reference.clone(),
+            );
+        Ok(())
+    }
+
+    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.entries
+            .lock()
+            .map_err(|_| "conversation reference store poisoned".to_string())?
+            .remove(&(account_id.to_string(), conversation_id.to_string()));
+        Ok(())
+    }
+}
+
 /// The production source: the daemon's own content store.
 pub struct DaemonBlobs;
 
@@ -1067,6 +1185,26 @@ pub(crate) mod test_http {
             }
         });
         (format!("http://127.0.0.1:{port}"), receiver)
+    }
+
+    /// A host that accepts the connection and then says nothing.
+    ///
+    /// The failure mode a read timeout exists for, and the one a test cannot
+    /// produce with [`serve`]: a refused connection fails immediately, while a
+    /// media host that has gone quiet holds the socket. Held for a minute and
+    /// then dropped, which is long enough for any budget under test and short
+    /// enough that the thread cannot outlive the run.
+    pub(crate) fn stall() -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            drop(stream);
+        });
+        format!("http://127.0.0.1:{port}")
     }
 
     fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {

@@ -222,54 +222,221 @@ async fn handle_channel_delivery(
     // the full callback URL. Absent is fine: adapters that need nothing
     // ignore it, and one that requires it refuses its delivery itself.
     let public_base_url = store.channel_public_base_url().ok().flatten();
-    let mut envelopes =
-        match adapter.verify_and_normalize(&headers, &body, public_base_url.as_deref(), now_ms) {
-            Ok(envelopes) => envelopes,
-            // Deliberately opaque, and deliberately not recorded: an unverified
-            // body has not earned a row in the durable event log.
-            Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
-        };
+    let queue = super::DaemonChannelQueue::new(paths.clone());
+    let outcome = accept_webhook_delivery(
+        &mut store,
+        &queue,
+        adapter.as_ref(),
+        fetcher.as_deref(),
+        &super::channel_adapter::DaemonBlobs,
+        &WebhookDelivery {
+            headers: &headers,
+            body: &body,
+            public_base_url: public_base_url.as_deref(),
+            limits,
+            attachment_budget: ATTACHMENT_BUDGET,
+            now_ms,
+        },
+    )
+    .await;
+    outcome.into_response()
+}
+
+/// One delivery as it reached the listener, before any of it is trusted.
+pub(crate) struct WebhookDelivery<'a> {
+    /// Lowercase-keyed, as [`WebhookChannelAdapter::verify_and_normalize`]
+    /// requires.
+    pub headers: &'a [(String, String)],
+    /// The exact bytes received. Never re-serialized: every one of these
+    /// providers signs the body it sent, not a normalization of it.
+    pub body: &'a [u8],
+    pub public_base_url: Option<&'a str>,
+    pub limits: super::channel_adapter::AttachmentLimits,
+    /// How long the provider's socket may be held downloading what it
+    /// referenced. Always [`ATTACHMENT_BUDGET`] in production; a test sets its
+    /// own so proving the budget exists does not cost ten seconds.
+    pub attachment_budget: std::time::Duration,
+    pub now_ms: i64,
+}
+
+/// What one delivery did, before it becomes a status code.
+///
+/// Separate from the HTTP shell because this — not the header parsing around
+/// it — is the contract with the provider: what may be acknowledged, and what
+/// must be left for redelivery. Tests drive it with the production adapters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Nothing proved the request came from the provider. No durable trace is
+    /// left, deliberately: an unverified body has not earned a row.
+    Rejected,
+    /// Authenticated, and carrying no turn — a status-only body, or an event
+    /// type this provider maps to nothing.
+    Nothing { receipts: usize },
+    /// Every message in it crossed the durable acceptance boundary. Safe to
+    /// acknowledge: a redelivery from here collapses onto the rows already
+    /// committed.
+    Accepted { accepted: u32, duplicates: u32 },
+    /// At least one message left no durable trace. Must NOT be acknowledged —
+    /// only the provider's redelivery can bring it back.
+    NotAccepted,
+    /// Durable, but nothing in the delivery could be planned into a turn (no
+    /// route, or a store that refused). The operator can see the failed rows;
+    /// a redelivery would only repeat them, so this is not a plain success
+    /// either.
+    NotQueued,
+}
+
+impl DeliveryOutcome {
+    fn into_response(self) -> Response<Full<Bytes>> {
+        match self {
+            DeliveryOutcome::Rejected => response(StatusCode::UNAUTHORIZED, "rejected"),
+            DeliveryOutcome::Nothing { receipts } => response(
+                StatusCode::OK,
+                if receipts > 0 { "recorded" } else { "ignored" },
+            ),
+            DeliveryOutcome::Accepted { .. } => response(StatusCode::ACCEPTED, "accepted"),
+            DeliveryOutcome::NotAccepted => {
+                response(StatusCode::INTERNAL_SERVER_ERROR, "not_accepted")
+            }
+            DeliveryOutcome::NotQueued => response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued"),
+        }
+    }
+
+    /// Whether the provider may be told this delivery is done with.
+    ///
+    /// The shipped path answers with [`Self::into_response`] instead; this is
+    /// how the acknowledgement tests ask the same question without asserting on
+    /// a status code, which is a detail of the HTTP shell rather than of what
+    /// was durably accepted.
+    #[cfg(test)]
+    pub(crate) fn is_success(&self) -> bool {
+        matches!(
+            self,
+            DeliveryOutcome::Nothing { .. } | DeliveryOutcome::Accepted { .. }
+        )
+    }
+}
+
+/// How long a provider's own delivery may be held open fetching the files it
+/// referenced.
+///
+/// The download client's read budget is ten minutes, which is right for the
+/// polling worker it was written for and wrong on this path: here the socket
+/// being held is the provider's, and all four of these give up and redeliver in
+/// far less than that. A media host that stalls would otherwise turn one
+/// message into a redelivery loop, and Meta disables a callback URL that keeps
+/// timing out.
+///
+/// Blowing the budget costs the attachment, never the message: the turn still
+/// commits, and [`note_unfetched_attachments`] leaves the agent a real reason
+/// instead of a file that silently is not there.
+const ATTACHMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Say so on every attachment the budget ran out on.
+///
+/// An attachment with neither stored bytes nor an error reads as "nothing to
+/// fetch", which is exactly the wrong thing for the agent to conclude about a
+/// photo somebody sent.
+fn note_unfetched_attachments(
+    envelopes: &mut [little_monkey_lib::channels::types::ChannelEnvelope],
+) {
+    for attachment in envelopes
+        .iter_mut()
+        .flat_map(|envelope| envelope.attachments.iter_mut())
+        .filter(|attachment| {
+            attachment.stored_artifact_id.is_none() && attachment.fetch_error.is_none()
+        })
+    {
+        attachment.fetch_error = Some(
+            "The provider's own delivery had to be acknowledged before this file finished \
+             downloading"
+                .to_string(),
+        );
+    }
+}
+
+/// Authenticate one delivery, then durably accept whatever it carries.
+///
+/// The order is the whole point, and it is the same for all four providers:
+///
+/// 1. the provider's own adapter verifies the signature over the exact bytes
+///    received — nothing is parsed before that, and a failure returns
+///    [`DeliveryOutcome::Rejected`] having written nothing;
+/// 2. the verified body is normalized into envelopes;
+/// 3. every envelope crosses `accept_channel_envelope`'s single-transaction
+///    acceptance boundary, which is what makes the provider's `provider_event_id`
+///    the durable dedupe identity;
+/// 4. only then may the caller answer with a success.
+///
+/// No agent runs on this path. What acceptance commits is the turn; running it
+/// is the queue's job, asynchronously, and a turn that was committed but not
+/// yet queued is picked up by the daemon's recovery pass rather than being
+/// waited for here.
+pub(crate) async fn accept_webhook_delivery(
+    store: &mut DaemonStore,
+    queue: &dyn super::channel_worker::RunQueue,
+    adapter: &dyn super::channel_adapter::WebhookChannelAdapter,
+    fetcher: Option<&dyn super::channel_adapter::ChannelAdapter>,
+    blobs: &dyn super::channel_adapter::BlobSource,
+    delivery: &WebhookDelivery<'_>,
+) -> DeliveryOutcome {
+    let mut envelopes = match adapter.verify_and_normalize(
+        delivery.headers,
+        delivery.body,
+        delivery.public_base_url,
+        delivery.now_ms,
+    ) {
+        Ok(envelopes) => envelopes,
+        // Deliberately opaque, and deliberately not recorded.
+        Err(_) => return DeliveryOutcome::Rejected,
+    };
     // What the provider says happened to messages we already sent. Recorded
     // before the inbound work because it is cheap and must survive even a
     // delivery that carries nothing else — a status-only body is the normal
     // shape of a failure report.
-    let receipts = record_delivery_receipts(&mut store, adapter.delivery_receipts(&body, now_ms));
+    let receipts = record_delivery_receipts(
+        store,
+        adapter.delivery_receipts(delivery.body, delivery.now_ms),
+    );
 
-    if !envelopes.is_empty() {
-        // Same as the polled path: the bytes are fetched before the turn is
-        // durable, so what is stored is what the agent will be shown.
-        if let Some(fetcher) = fetcher.as_deref() {
-            super::channel_adapter::hydrate_attachments(
-                fetcher,
-                &super::channel_adapter::DaemonBlobs,
-                limits,
-                &mut envelopes,
-            )
-            .await;
+    if envelopes.is_empty() {
+        return DeliveryOutcome::Nothing { receipts };
+    }
+
+    // Same as the polled path: the bytes are fetched before the turn is
+    // durable, so what is stored is what the agent will be shown. Unlike the
+    // polled path it is on a clock — see [`ATTACHMENT_BUDGET`].
+    if let Some(fetcher) = fetcher {
+        let hydration = super::channel_adapter::hydrate_attachments(
+            fetcher,
+            blobs,
+            delivery.limits,
+            &mut envelopes,
+        );
+        if tokio::time::timeout(delivery.attachment_budget, hydration)
+            .await
+            .is_err()
+        {
+            note_unfetched_attachments(&mut envelopes);
         }
     }
 
-    if envelopes.is_empty() {
-        return response(
-            StatusCode::OK,
-            if receipts > 0 { "recorded" } else { "ignored" },
-        );
-    }
-
-    let queue = super::DaemonChannelQueue::new(paths.clone());
-    let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
+    let report = super::channel_worker::ingest_batch(store, queue, &envelopes, delivery.now_ms);
     // The HTTP response *is* this transport's acknowledgement, so it may only
     // be a success when every message in the delivery crossed the durable
     // acceptance boundary. One that did not has no durable trace at all, and
     // only the provider's redelivery can bring it back; the ones that did
     // commit are deduplicated when it arrives.
     if report.unrecorded > 0 {
-        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_accepted");
+        return DeliveryOutcome::NotAccepted;
     }
     if report.failed > 0 && report.accepted == 0 {
-        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
+        return DeliveryOutcome::NotQueued;
     }
-    response(StatusCode::ACCEPTED, "accepted")
+    DeliveryOutcome::Accepted {
+        accepted: report.accepted,
+        duplicates: report.duplicates,
+    }
 }
 
 /// An open store plus the adapter for the account the request named.

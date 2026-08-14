@@ -2132,6 +2132,51 @@ CREATE INDEX IF NOT EXISTS channel_events_orphan_idx
     ON channel_events(direction, disposition, ingress_id, received_at_ms);
 "#;
 
+const DAEMON_V15: i64 = 15;
+const DAEMON_V15_CHECKSUM: &str = "daemon-jobs-v15-channel-conversation-refs";
+
+/// Where a provider wants a reply sent, kept durably per conversation.
+///
+/// Some providers do not accept a conversation id alone. The Bot Framework
+/// addresses a Teams reply by the `serviceUrl` its inbound activity carried,
+/// and that value is per conversation and per region — without it there is no
+/// endpoint to POST to at all. Holding it in memory made a reply survive only
+/// as long as the process that received the activity, so a durable turn that
+/// outlived a restart had a queued answer and nowhere to send it.
+///
+/// # What may live here
+///
+/// Addressing, never authorization. `reference_json` is written only from an
+/// input the provider's own adapter has already authenticated and validated —
+/// for Teams that means an activity whose Bot Framework JWT verified and a
+/// `serviceUrl` on a Microsoft-owned host — so an unauthenticated request can
+/// never plant an outbound destination.
+///
+/// A **credential** may never live here: the bot access tokens both Teams and
+/// Google Chat acquire stay in memory with their expiry, and the operator's own
+/// long-lived tokens stay in the keychain, exactly as they do today. LINE's
+/// `replyToken` is the one thing stored here that reads like a secret and is
+/// not one — it authorizes nothing, names one inbound event, is spent by a
+/// single use and is abandoned once stale — so it is stored with the moment it
+/// arrived and the adapter refuses it past its window rather than trusting the
+/// row. Nothing reads this table but the adapters; no status API projects it.
+///
+/// The size check keeps a provider from turning a reply address into unbounded
+/// storage.
+///
+/// A row is per `(account_id, conversation_id)` and is overwritten as newer
+/// activities arrive, because the newest authenticated address is the one a
+/// provider wants used.
+const DAEMON_V15_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_conversation_refs (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL CHECK (length(conversation_id) > 0),
+    reference_json TEXT NOT NULL CHECK (length(reference_json) <= 8192),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    PRIMARY KEY(account_id, conversation_id)
+) STRICT;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2157,12 +2202,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
     (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
     (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
+    (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V14;
+const DAEMON_LATEST: i64 = DAEMON_V15;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,

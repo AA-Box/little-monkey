@@ -151,14 +151,22 @@ impl GoogleChatAdapter {
     }
 
     #[cfg(test)]
-    fn with_bases(mut self, chat_api_base: &str, oauth_token_base: &str) -> Self {
+    pub(crate) fn with_bases(mut self, chat_api_base: &str, oauth_token_base: &str) -> Self {
         self.chat_api_base = chat_api_base.to_string();
         self.oauth_token_base = oauth_token_base.to_string();
         self
     }
 
+    /// Stand in for the JWKS fetch with this file's own test key, so a test can
+    /// verify a genuinely signed token without reaching Google.
     #[cfg(test)]
-    fn with_jwks_url(mut self, jwks_url: &str) -> Self {
+    pub(crate) fn seed_jwks_for_test(&self) {
+        self.jwks_cache
+            .seed_for_test("test-key-1", tests::test_jwk());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_jwks_url(mut self, jwks_url: &str) -> Self {
         self.jwks_url = jwks_url.to_string();
         self
     }
@@ -312,7 +320,8 @@ impl ChannelAdapter for GoogleChatAdapter {
             supports_threads: true,
             supports_attachments: false,
             supports_mention_metadata: true,
-            supports_idempotency_key: false,
+            // `requestId` on messages.create, which the send always carries.
+            supports_idempotency_key: true,
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::GoogleChat, InboundTransport::Webhook)
         }
@@ -356,13 +365,25 @@ impl ChannelAdapter for GoogleChatAdapter {
                 }
             }
         };
-        let url = format!(
-            "{}/v1/{}/messages",
-            self.chat_api_base, message.conversation_id
+        // `requestId` is Chat's own idempotency: creating a message with a
+        // request id it has already seen returns that message rather than
+        // posting a second one. The outbox's key is stable across retries of
+        // the same row, which is the only thing that makes it useful.
+        let mut url = format!(
+            "{}/v1/{}/messages?requestId={}",
+            self.chat_api_base,
+            message.conversation_id,
+            request_id(&message.idempotency_key)
         );
         let mut body = serde_json::json!({ "text": message.text });
         if let Some(thread_id) = &message.thread_id {
             body["thread"] = serde_json::json!({ "name": thread_id });
+            // Naming a thread is not by itself a reply: without this the API
+            // starts a new thread and the answer is posted away from the
+            // question. The fallback is deliberate — a thread that has since
+            // been deleted should still get the answer somewhere visible
+            // rather than nowhere.
+            url.push_str("&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
         }
         let request = client.post(url).bearer_auth(&token).json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
@@ -431,6 +452,19 @@ impl ChannelAdapter for GoogleChatAdapter {
         )
         .await
     }
+}
+
+/// The outbox's idempotency key as a Chat `requestId`.
+///
+/// Hex of a digest rather than the key itself: the key is an internal id of no
+/// fixed alphabet, and this ends up in a query string. Deterministic, because a
+/// request id that changed per attempt would collapse nothing.
+fn request_id(idempotency_key: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, idempotency_key.as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Strips PEM armor and base64-decodes to PKCS8 DER.
@@ -683,7 +717,7 @@ fn normalize_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #[test]
     fn an_uploaded_file_becomes_an_attachment_the_adapter_can_fetch() {
@@ -722,7 +756,7 @@ mod tests {
 
     /// A 2048-bit RSA test key generated locally for these tests only. Not
     /// used anywhere else and grants access to nothing.
-    const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDazRpB7LGR9vNE
 et1N+4LHeMOtHD6zHXy7bx4t/YlI0EVVPbekoxkqG5TXLIzrOoKcDoEgOvs5ZpZV
 zdaFW55J1YnUdS84Wiu3rfcBNCNOZXC/ovOpLvTOIU/gqjFM05QqsrXQVK6/iRHO
@@ -751,7 +785,7 @@ sYUI1xZFJBXRBoaBu6eF94YD5JKHxsm80gSsAHACPui5VVoMSoHPA8YXxlHh5nFC
 rBTxwRqn0v9lv8H7GtnYwaw=
 -----END PRIVATE KEY-----";
 
-    fn test_account() -> ChannelAccountRecord {
+    pub(crate) fn test_account() -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-gchat".to_string(),
             kind: ChannelKind::GoogleChat,
@@ -799,7 +833,7 @@ rBTxwRqn0v9lv8H7GtnYwaw=
         format!("{header}.{payload}.{signature}")
     }
 
-    fn valid_claims(now_secs: i64) -> JsonValue {
+    pub(crate) fn valid_claims(now_secs: i64) -> JsonValue {
         serde_json::json!({
             "iss": EXPECTED_ISSUER,
             "aud": "123456789",
@@ -871,7 +905,7 @@ Z4Cr3JR0FbjywTd4IHU6
     const TEST_JWK_N: &str = "2s0aQeyxkfbzRHrdTfuCx3jDrRw-sx18u28eLf2JSNBFVT23pKMZKhuU1yyM6zqCnA6BIDr7OWaWVc3WhVueSdWJ1HUvOFort633ATQjTmVwv6LzqS70ziFP4KoxTNOUKrK10FSuv4kRznKDli7vOrOxq8JIyd0NK5GoyyjZV42eM2ZPHMqNxcEwKJtCc_GdZPwB7wp7k1u6JnFUTZyp-LzSs3W50lu8Bo1zbrr3CHvhHhCHwqXXfrtvjY-ILesDcRtDeMpZ8HfYn6mWl1-gnRfVqMopI1eWhQeSr58NgKlfJgKkAsJrFx5igpgJwkQK9M_Y3aeslGVumlsZybwJBw";
     const TEST_JWK_E: &str = "AQAB";
 
-    fn test_jwk() -> JwkRsaKey {
+    pub(crate) fn test_jwk() -> JwkRsaKey {
         JwkRsaKey {
             n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
             e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
@@ -883,7 +917,7 @@ Z4Cr3JR0FbjywTd4IHU6
     /// verifier the same way [`the_service_account_jwt_signs_and_verifies_with_its_own_public_key`]
     /// already does for the outbound assertion — this is the same technique
     /// aimed at an inbound delivery instead.
-    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+    pub(crate) fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
         let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
         let signing_input = format!(
             "{}.{}",
