@@ -366,6 +366,7 @@ impl CgroupScope {
     /// the membership list until it stops changing.
     pub fn terminate_tree(&self) -> io::Result<()> {
         if fs::write(self.path.join("cgroup.kill"), "1").is_ok() {
+            self.wait_for_the_scope_to_empty();
             return Ok(());
         }
         for _ in 0..8 {
@@ -385,6 +386,48 @@ impl CgroupScope {
             }
         }
         Ok(())
+    }
+
+    /// Wait until nothing in the scope is still executing.
+    ///
+    /// # Why a kill is not finished when the write returns
+    ///
+    /// `cgroup.kill` queues SIGKILL for every member; the kernel decides when
+    /// each one actually dies, and the write returns long before that. Every
+    /// caller of `terminate_tree` reads it as "the workload is reclaimed" — the
+    /// breach path records the row immediately afterwards, and the tests assert
+    /// the tree is gone — so a backend that returns early makes the strongest
+    /// enforcement this app has *look* like the flakiest. The supervisor has
+    /// always verified across bounded passes with a settle between them; this is
+    /// the same promise from the kernel backend, and the reason it is the same
+    /// function's job rather than each caller's.
+    ///
+    /// A **zombie counts as gone**, which is the distinction the rest of this
+    /// module already draws: an exited-but-unreaped member holds no memory, runs
+    /// no code and cannot fork, and it stays listed in `cgroup.procs` until its
+    /// parent reaps it — which for the shell leader is the caller, after this
+    /// returns. Waiting for it would be waiting for ourselves.
+    ///
+    /// Bounded, because "wait until it is empty" against a member the kernel will
+    /// not kill is an unbounded loop, and a supervisor that will not return is
+    /// worse than one that reports a survivor.
+    fn wait_for_the_scope_to_empty(&self) {
+        const PASSES: usize = 10;
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
+        for _ in 0..PASSES {
+            let members = fs::read_to_string(self.path.join("cgroup.procs")).unwrap_or_default();
+            let still_running = members
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .any(|pid| {
+                    crate::process_tree::ProcessIdentity::of(pid)
+                        .is_some_and(|identity| identity.is_running())
+                });
+            if !still_running {
+                return;
+            }
+            std::thread::sleep(SETTLE);
+        }
     }
 }
 
