@@ -515,9 +515,14 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                 disposition: super::channel_store::EventDisposition::Accepted,
                 received_at_ms: now_ms,
             })?;
-            if let super::channel_store::EventRecording::Duplicate { .. } = recording {
-                return Err("This turn was already recorded".to_string());
-            }
+            // A duplicate is not a reason to stop. The event and the accepted
+            // turn are two writes here — a call turn has no provider to
+            // redeliver it — so an event already present may be one whose turn
+            // was never created, and refusing would strand the caller's
+            // sentence for good. `submit_conversation_turn` is keyed on the
+            // same deterministic identity, so replaying it costs nothing and
+            // finishes whatever the first attempt did not.
+            let _ = recording;
         }
         let mut ingress = ConversationIngress::direct(
             ConversationSource::Telephone,

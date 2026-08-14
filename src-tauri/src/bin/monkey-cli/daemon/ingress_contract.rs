@@ -30,7 +30,7 @@ use little_monkey_lib::channels::types::{
 };
 
 use super::channel_ingress::{
-    self, recover_pending_ingress, submit_conversation_turn, PlannedDecision,
+    self, recover_pending_ingress, submit_conversation_turn, ChannelAcceptance,
     ReportedMutationOutcome, RunOutcomeSource, SubmitOutcome,
 };
 use super::channel_store::ChannelAccountRecord;
@@ -159,16 +159,25 @@ fn telegram_dm(text: &str, event_id: &str) -> ChannelEnvelope {
     }
 }
 
-/// A messaging turn, planned by the real planner: recorded, gated, routed.
+/// A messaging turn, accepted by the real acceptance boundary: recorded, gated,
+/// routed and durable, all in one transaction.
 fn messaging_turn(
     store: &mut DaemonStore,
+    queue: &dyn RunQueue,
     envelope: &ChannelEnvelope,
 ) -> (ConversationIngress, Vec<String>) {
-    let planned =
-        channel_ingress::plan_channel_ingress_with(store, envelope, NOW, "PAIR1234".into())
-            .expect("plan");
-    match planned.decision {
-        PlannedDecision::Run { ingress, params } => (*ingress, params),
+    match channel_ingress::accept_channel_envelope_with(
+        store,
+        queue,
+        envelope,
+        NOW,
+        "PAIR1234".into(),
+    )
+    .expect("accept")
+    {
+        ChannelAcceptance::Run {
+            ingress, params, ..
+        } => (*ingress, params),
         other => panic!("expected the message to run, got {other:?}"),
     }
 }
@@ -292,11 +301,14 @@ fn telephone_turn(index: u32) -> (ConversationIngress, Vec<String>) {
 }
 
 /// Every origin, in the order the durable contract lists them.
-fn every_origin(store: &mut DaemonStore) -> Vec<(ConversationIngress, Vec<String>)> {
+fn every_origin(
+    store: &mut DaemonStore,
+    queue: &dyn RunQueue,
+) -> Vec<(ConversationIngress, Vec<String>)> {
     vec![
         bridge_turn(ConversationSource::Desktop, "turn-1"),
         mobile_turn("mm-1"),
-        messaging_turn(store, &telegram_dm("ship it", "1")),
+        messaging_turn(store, queue, &telegram_dm("ship it", "1")),
         peer_turn("msg-1"),
         bridge_turn(ConversationSource::Voice, "utterance-1"),
         telephone_turn(0),
@@ -308,7 +320,7 @@ fn all_six_origins_reach_the_queue_through_the_one_durable_service() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::default();
 
-    for (ingress, params) in every_origin(&mut store) {
+    for (ingress, params) in every_origin(&mut store, &queue) {
         let outcome = submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW)
             .unwrap_or_else(|error| panic!("{} failed: {error}", ingress.source.as_str()));
         let SubmitOutcome::Queued { ingress_id, job_id } = outcome else {
@@ -379,7 +391,7 @@ fn crash_between_accepting_and_submitting_recovers_to_exactly_one_run() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::failing();
 
-    for (ingress, params) in every_origin(&mut store) {
+    for (ingress, params) in every_origin(&mut store, &queue) {
         assert!(matches!(
             submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit"),
             SubmitOutcome::Deferred { .. }
@@ -453,18 +465,22 @@ fn a_redelivered_event_produces_one_ingress_and_one_run() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::default();
 
-    // The provider's own redelivery: the planner refuses it as a duplicate
-    // event before it can even become a second turn.
-    let (ingress, params) = messaging_turn(&mut store, &telegram_dm("ship it", "1"));
+    // The provider's own redelivery: the acceptance boundary answers with the
+    // event it already committed, and nothing becomes a second turn.
+    let (ingress, params) = messaging_turn(&mut store, &queue, &telegram_dm("ship it", "1"));
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
-    let replanned = channel_ingress::plan_channel_ingress_with(
+    let redelivered = channel_ingress::accept_channel_envelope_with(
         &mut store,
+        &queue,
         &telegram_dm("ship it", "1"),
         NOW + 5_000,
         "PAIR1234".into(),
     )
-    .expect("replan");
-    assert_eq!(replanned.decision, PlannedDecision::Duplicate);
+    .expect("redelivery");
+    assert!(
+        matches!(redelivered, ChannelAcceptance::Duplicate { .. }),
+        "{redelivered:?}"
+    );
 
     // And the durable half, for an origin that has no event log in front of it:
     // resubmitting the identical turn finds the row that already exists.
@@ -484,7 +500,7 @@ fn a_redelivered_event_produces_one_ingress_and_one_run() {
 fn a_recovered_turn_runs_the_configuration_it_was_accepted_under() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::failing();
-    let (ingress, params) = messaging_turn(&mut store, &telegram_dm("ship it", "1"));
+    let (ingress, params) = messaging_turn(&mut store, &queue, &telegram_dm("ship it", "1"));
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
     let accepted = store.pending_ingress_turns(10).unwrap()[0].clone();
@@ -1552,8 +1568,25 @@ fn a_correction_can_still_reach_the_attachments_of_the_turn_it_corrects() {
             handle: "file-1".into(),
         },
     });
-    let (planned, params) = messaging_turn(&mut store, &envelope);
-    let ingress = planned.with_mutation_contract(true);
+    // Built from the envelope by the production builder rather than through the
+    // channel acceptance boundary: a messaging turn never carries a mutation
+    // contract of its own, and what this test is about is the attachments an
+    // accepted turn hands to the correction it produces.
+    let (_, params) = messaging_turn(&mut store, &queue, &envelope);
+    let mut contracted = envelope.clone();
+    contracted.provider_event_id = "2".into();
+    let ingress = ConversationIngress::from_channel(
+        &contracted,
+        &ChannelRoute {
+            route_id: "route-1".into(),
+            scope: RouteScope::account("acct-1"),
+            target: RouteTarget::new("chat"),
+            enabled: true,
+            created_at_ms: NOW,
+            updated_at_ms: NOW,
+        },
+    )
+    .with_mutation_contract(true);
     let outcome =
         submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
     let SubmitOutcome::Queued { ingress_id, job_id } = outcome else {
@@ -1642,8 +1675,9 @@ fn the_listing_shows_the_contract_and_the_lineage_without_showing_the_message() 
 #[test]
 fn the_operators_own_turns_are_not_wrapped_and_everyone_elses_are() {
     let mut store = store_with_channel_account();
+    let queue = ContractQueue::default();
 
-    for (ingress, params) in every_origin(&mut store) {
+    for (ingress, params) in every_origin(&mut store, &queue) {
         let message = params
             .iter()
             .find(|param| param.starts_with("message=") || param.starts_with("prompt="))
@@ -1687,7 +1721,7 @@ fn an_accepted_attachment_survives_the_crash_and_the_recovery() {
         fetch_error: None,
         text_excerpt: None,
     });
-    let (ingress, params) = messaging_turn(&mut store, &with_photo);
+    let (ingress, params) = messaging_turn(&mut store, &queue, &with_photo);
     assert_eq!(ingress.attachments.len(), 1);
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
@@ -1715,7 +1749,8 @@ fn an_accepted_attachment_survives_the_crash_and_the_recovery() {
 #[test]
 fn each_origin_deduplicates_on_its_own_identity() {
     let mut store = store_with_channel_account();
-    let turns = every_origin(&mut store);
+    let queue = ContractQueue::default();
+    let turns = every_origin(&mut store, &queue);
 
     let mut keys: Vec<String> = turns
         .iter()
@@ -1935,9 +1970,15 @@ fn a_spoken_call_turn_becomes_a_durable_row_before_it_becomes_a_run() {
     };
 
     let job_id = sink.submit_turn(turn(0)).expect("first turn");
-    // The carrier redelivering the same turn must not produce a second run; the
-    // call's own event log refuses it before ingress even sees it.
-    assert!(sink.submit_turn(turn(0)).is_err());
+    // Replaying the same turn must not produce a second run. It is answered
+    // with the run that already exists rather than refused: the event row alone
+    // is not proof the turn was ever created, and a call has no carrier to
+    // redeliver what a refusal would drop.
+    assert_eq!(
+        sink.submit_turn(turn(0)).expect("replayed turn"),
+        job_id,
+        "a replayed call turn must collapse onto the run it already has"
+    );
     let second = sink.submit_turn(turn(1)).expect("second turn");
     assert_ne!(job_id, second);
 
@@ -2028,7 +2069,11 @@ fn the_run_command_takes_a_conversation_turn_only_with_a_full_identity() {
 fn the_listing_shows_every_field_an_operator_needs_and_no_message_text() {
     let mut store = store_with_channel_account();
     let queue = ContractQueue::default();
-    let (ingress, params) = messaging_turn(&mut store, &telegram_dm("the launch is at noon", "1"));
+    let (ingress, params) = messaging_turn(
+        &mut store,
+        &queue,
+        &telegram_dm("the launch is at noon", "1"),
+    );
     submit_conversation_turn(&mut store, &queue, &ingress, &params, NOW).expect("submit");
 
     let listed = &store.recent_ingress_turns(10).unwrap()[0];

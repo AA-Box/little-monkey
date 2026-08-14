@@ -264,8 +264,7 @@ pub struct RealProcessAdapter {
 impl RealProcessAdapter {
     pub fn current() -> Result<Self, String> {
         Ok(Self {
-            executable: std::env::current_exe()
-                .map_err(|error| format!("Could not resolve monkey executable: {error}"))?,
+            executable: super::monkey_executable()?,
         })
     }
 }
