@@ -1570,16 +1570,19 @@ claim something false.
    says `supervised` and the UI says `Supervised`, which is the honest report of
    a real platform limit rather than a deferred implementation.
 
-2. **A browser session's Chromium is assigned to its Windows job after creation
-   rather than before it is resumed.** The shells get the strong ordering on
-   every platform — cgroup membership and the process group installed before
-   `exec`, a job assigned to a suspended process before it is resumed — because
-   they build their own `Command`. Chromium is launched by a long-standing spawn
-   site with its own argv, environment and stdio, and Windows offers no
-   pre-creation hook there, so the assignment happens in the microseconds after
-   `CreateProcess` returns. A descendant created inside that window would be
-   outside the job. Unix has no such window. Stated rather than glossed as
-   equivalent; `ResourceController::adopt` carries the same note at the call.
+2. **On Windows, an owner that does not call `CreateProcessW` itself is assigned
+   to its job after creation rather than before it is resumed.** Three do:
+   Chromium, launched by a long-standing spawn site with its own argv,
+   environment and stdio; the verify runner; and the hook runner. A job object is
+   applied *to* a process and cannot be carried into one by a `Command`, so for
+   those the assignment happens in the microseconds after `CreateProcess`
+   returns, and a descendant created inside that window would be outside it. The
+   agent shells and the sandbox run build the process themselves — created
+   suspended, assigned, then resumed — and get the strong ordering, which is the
+   same ordering every owner gets on Unix, where the cgroup membership and the
+   process group are installed before `exec`. Stated rather than glossed as
+   equivalent; `ResourceController::adopt` carries the same note at the call, and
+   `attach` still refuses to run a workload whose membership does not read back.
 
 ### What was open, and is not
 
