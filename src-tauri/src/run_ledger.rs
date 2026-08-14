@@ -210,9 +210,11 @@ const MIGRATION_V20: i64 = 20;
 const MIGRATION_V20_CHECKSUM: &str = "subsystem-worktree-v20-2026-08-10";
 const MIGRATION_V21: i64 = 21;
 const MIGRATION_V21_CHECKSUM: &str = "foreground-shell-and-limit-breach-v21-2026-08-14";
+const MIGRATION_V22: i64 = 22;
+const MIGRATION_V22_CHECKSUM: &str = "native-process-identity-v22-2026-08-14";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V21;
+const SCHEMA_VERSION: i64 = MIGRATION_V22;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -2253,6 +2255,15 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V21_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // One nullable column beside `native_pid`, so a row names a *process* rather
+    // than a slot in the pid space. Additive in the strict sense an older binary
+    // cares about: it adds no vocabulary and widens no `CHECK`, so a V21 reader
+    // opens the database and simply never selects the column.
+    (
+        MIGRATION_V22,
+        MIGRATION_V22_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2907,6 +2918,44 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V21_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V21)
+            ],
+        )?;
+    }
+
+    let has_v22 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V22],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v22 {
+        // A plain `ADD COLUMN`, so no rebuild and no probe of the table's DDL:
+        // this changes no `CHECK` and no vocabulary, unlike V18, V20 and V21.
+        // Guarded anyway, because a database that already carries the column
+        // from a half-applied run would otherwise fail the whole ladder.
+        let already_present = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%native_start_time%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_present {
+            transaction.execute_batch(MIGRATION_V22_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V22,
+                MIGRATION_V22_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V22)
             ],
         )?;
     }
@@ -3811,6 +3860,32 @@ ALTER TABLE agent_processes ADD COLUMN max_context_tokens INTEGER
 /// They are constrained as a group rather than individually: a partial write —
 /// a limit named with no measurement, a measurement with no limit — is the one
 /// shape that would let a UI print a confident half-truth.
+/// A process row names a process, not a pid.
+///
+/// # Why a pid alone was not enough, and where it bit
+///
+/// Everything the resource controller does in memory is keyed on
+/// `(pid, start_time)` — `ProcessIdentity` — precisely so a pid the kernel has
+/// since handed to somebody else is never sampled as ours and, far worse, never
+/// signalled as ours. That identity died with the process holding it.
+///
+/// Startup reconciliation is exactly where that matters. After a crash the app
+/// reads rows a previous session left `running` and reclaims the trees behind
+/// them, and the only handle it had was `native_pid` plus "is something alive at
+/// that pid". On a machine that has been up for a while, and across a restart
+/// that may be hours later, that is a coin flip against the pid space: the
+/// answer is yes for the user's editor as readily as for the shell this app
+/// abandoned.
+///
+/// So the identity is durable now. The value is the platform's own opaque
+/// start-time stamp — `/proc` jiffies, a BSD start timeval, a Windows creation
+/// FILETIME — never compared across hosts, only ever against
+/// `ProcessIdentity::of(pid)` on the machine that wrote it.
+const MIGRATION_V22_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN native_start_time INTEGER
+    CHECK (native_start_time IS NULL OR native_start_time >= 0);
+"#;
+
 const MIGRATION_V21_SQL: &str = r#"
 CREATE TABLE agent_processes_v21 (
     process_id TEXT PRIMARY KEY,

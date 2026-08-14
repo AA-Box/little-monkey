@@ -4,7 +4,9 @@ import { Loader2, Pause, Play, RefreshCw, Square, X } from "lucide-react";
 
 import { IconButton, StatusPill } from "../ui";
 import { statusTone } from "../../lib/statusTone";
-import type { ProcessKind, ProcessRecord } from "../../lib/processTable";
+import type { ProcessKind, ProcessRecord, ProcessResourceReport } from "../../lib/processTable";
+import { fetchProcessResourceReport } from "../../lib/processTable";
+import { ProcessResources } from "./ProcessResources";
 import { canResume, canSuspend, processDisplayState } from "../../lib/processSignals";
 import {
   selectStateCounts,
@@ -79,6 +81,10 @@ function kindLabel(t: Translate, kind: ProcessKind): string {
       return t("ProcessesPanel.kindRemoteRun");
     case "background_shell":
       return t("ProcessesPanel.kindBackgroundShell");
+    case "foreground_shell":
+      return t("ProcessesPanel.kindForegroundShell");
+    case "browser_session":
+      return t("ProcessesPanel.kindBrowserSession");
     case "side_task":
       return t("ProcessesPanel.kindSideTask");
     default:
@@ -111,6 +117,25 @@ function ProcessRow({ record, now }: { record: ProcessRecord; now: number }) {
   const busy = useProcessStore((state) => state.pending[record.processId] === true);
   const signal = useProcessStore((state) => state.signal);
   const display = processDisplayState(record);
+  // Fetched on demand rather than with the listing. The report builds a real
+  // controller to ask this host what it would hold a tree with — which on Linux
+  // creates a cgroup scope — and doing that for every row on every poll would be
+  // a containment primitive per process per second, to answer a question nobody
+  // asked yet.
+  const [resources, setResources] = useState<ProcessResourceReport | null>(null);
+  const [showResources, setShowResources] = useState(false);
+  useEffect(() => {
+    if (!showResources) return;
+    let cancelled = false;
+    void fetchProcessResourceReport(record.processId).then((report) => {
+      if (!cancelled) setResources(report);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // `updatedAtMs` rather than the record: a row that has not changed needs no
+    // second read, and a row that just exited needs its final numbers.
+  }, [showResources, record.processId, record.updatedAtMs]);
   // `now` is passed in rather than read here so every row ages off the same
   // instant, and so the age advances on the panel's tick instead of freezing
   // until some unrelated store write happens to re-render this row.
@@ -172,7 +197,17 @@ function ProcessRow({ record, now }: { record: ProcessRecord; now: number }) {
         >
           <Square size={12} />
         </IconButton>
+        <button
+          type="button"
+          className="cursor-pointer text-[11px] text-faint underline"
+          aria-expanded={showResources}
+          onClick={() => setShowResources((open) => !open)}
+        >
+          {t("ProcessesPanel.resourcesToggle")}
+        </button>
       </div>
+
+      {showResources && resources && <ProcessResources report={resources} />}
     </div>
   );
 }

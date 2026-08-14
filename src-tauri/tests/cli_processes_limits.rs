@@ -105,7 +105,7 @@ fn the_limits_command_prints_the_static_matrix_and_this_host_s_real_backend() {
         "the command printed no tree primitive:\n{stdout}"
     );
     let backend = little_monkey_lib::resource_control::ResourceController::new(
-        little_monkey_lib::resource_control::EffectiveLimits::default(),
+        little_monkey_lib::resource_control::probe_limits(),
     )
     .capabilities()
     .backend;

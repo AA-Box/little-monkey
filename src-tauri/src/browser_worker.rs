@@ -1110,7 +1110,16 @@ impl OwnedBrowser {
                 // On Unix the pid is the only durable handle on this Chromium's
                 // process group, and the only thing that lets a later app session
                 // kill a tree this one launched. It is None on Windows.
-                .with_native_pid(self.pgid.map(i64::from));
+                //
+                // With its start time beside it: a later session reclaiming this
+                // group has to prove the pid is still this Chromium and not
+                // whatever the kernel handed the number to in the meantime.
+                .with_native_identity(
+                    self.controller
+                        .lock()
+                        .ok()
+                        .and_then(|controller| controller.root()),
+                );
         // Both owners, on one row: the session clock the sweep enforces, and the
         // process bounds the controller holds. Written from the effective limits
         // rather than from the class default, so what the row states is the number
@@ -2776,18 +2785,19 @@ pub fn reclaim_orphaned_browser_sessions(
 
     let mut killed = 0;
     for record in live {
-        // A row with no pid says nothing about what is running, so there is
-        // nothing to signal — the same rule `reap_dead_hosts` applies to its own
-        // liveness question, and for the same reason.
-        let Some(pid) = record.native_pid else {
-            continue;
-        };
-        let Ok(pid) = u32::try_from(pid) else {
-            continue;
-        };
-        if !crate::os_signal::process_is_alive(pid) {
+        // Identity, not liveness. "Something is alive at this pid" was the whole
+        // test here, and across a restart that is a coin flip against the pid
+        // space: the pid a previous session recorded may since have been handed
+        // to the user's editor, and this would have signalled its process group.
+        // Failing to reclaim one abandoned Chromium is a far better outcome than
+        // killing an unrelated process, so a row that cannot prove which process
+        // it named is left alone.
+        if !crate::process_table::still_the_recorded_process(&record) {
             continue;
         }
+        let Some(pid) = record.native_pid.and_then(|pid| u32::try_from(pid).ok()) else {
+            continue;
+        };
         kill_browser_process_group(pid);
         killed += 1;
     }
@@ -3305,7 +3315,10 @@ mod tests {
                     "orphan-session".to_string(),
                     ProcessState::Running,
                 )
-                .with_native_pid(Some(i64::from(pgid))),
+                // The identity, which is what a reclaim is now allowed to act on:
+                // a row carrying only a pid says nothing about *which* process
+                // holds it, and across a restart that pid may be anybody's.
+                .with_native_identity(crate::process_tree::ProcessIdentity::of(pgid)),
                 now,
             )
             .expect("the orphan row is recorded");

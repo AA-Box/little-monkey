@@ -398,7 +398,7 @@ fn record_foreground_shell(
         &format!("fgsh-{}", uuid::Uuid::new_v4()),
         ProcessState::Exited,
         cwd,
-        output.native_pid,
+        output.identity,
         output.limits,
     );
     projection.exit = Some(match &output.breach {

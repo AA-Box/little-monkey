@@ -164,8 +164,10 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
     (
         "browser_worker.rs",
         Class::ManagedService,
-        "the Chromium a browser session owns, bounded by that session's own quotas; the \
-         one kind that owns a process tree and is not routed through the controller",
+        "the Chromium a browser session owns. Split by resource rather than by owner: the \
+         resource controller holds the tree's memory and process count and reclaims it, and \
+         the session keeps the clock, the action budget and the disk budget, which no \
+         controller can express. One resource, one owner",
     ),
     (
         "mcp.rs",
@@ -502,4 +504,174 @@ fn every_agent_controlled_spawn_path_reaches_the_resource_infrastructure() {
         "these are now routed through the resource controller; remove them from \
          KNOWN_UNROUTED so the exception cannot outlive the gap: {fixed:?}"
     );
+}
+
+/// Every file that owns an agent-controlled native process **tree**.
+///
+/// A separate list from the classes above, because the obligation is separate:
+/// `Class` says what kind of thing a spawn site is, and this says which sites own
+/// a fan-out that a single pid does not describe. Those are the sites where "kill
+/// the child" is not "reclaim the workload", and each of them must have a
+/// declared resource owner.
+///
+/// `browser_worker.rs` is why the two lists cannot be one. It is a
+/// `ManagedService` — Chromium's lifecycle is its own, and its action and disk
+/// budgets are browser-domain policy no `ProcessLimits` field expresses — and it
+/// is simultaneously a process-tree owner whose memory and process count belong
+/// to the controller. Classifying it as infrastructure to satisfy one rule would
+/// have made the other rule wrong.
+const TREE_OWNERS: &[(&str, &str)] = &[
+    (
+        "workspace_shell.rs",
+        "the confined shell's process group / cgroup / job, foreground and background",
+    ),
+    (
+        "background_shell.rs",
+        "the watcher that owns a background command's controller after its turn ends",
+    ),
+    (
+        "browser_worker.rs",
+        "Chromium's renderer, GPU, network and utility children",
+    ),
+];
+
+/// Each process-tree owner names a resource owner, and it is this one.
+///
+/// The invariant K4 turns on, as a source contract: **no agent-controlled native
+/// process tree may run without a declared resource owner.** A new fan-out spawn
+/// site added without one fails here, rather than shipping as a tree nothing
+/// bounds and nothing can report on.
+#[test]
+fn every_owner_of_a_native_process_tree_declares_its_resource_owner() {
+    let root = source_root();
+    for (path, what) in TREE_OWNERS {
+        let text = std::fs::read_to_string(root.join(path)).unwrap_or_default();
+        assert!(
+            text.contains("resource_control"),
+            "{path} owns a native process tree ({what}) and does not reach the resource \
+             controller; a tree with no declared resource owner is the gap K4 exists to close"
+        );
+        assert!(
+            text.contains("terminate_tree"),
+            "{path} owns a native process tree ({what}) and never reclaims it as a tree; \
+             killing the direct child leaves the fan-out running"
+        );
+    }
+}
+
+/// A limit kill reaches the ledger as typed fields, never only as prose.
+///
+/// `ExitStatus::LimitExceeded` may be *constructed* in exactly one place —
+/// [`ProcessExit::limit_exceeded`], which derives the human sentence from the
+/// breach so the two can never disagree. Every other site has to go through it,
+/// which is what makes "a resource kill always carries which limit, what was
+/// configured and what was observed" a property of the code rather than of each
+/// author's care.
+///
+/// The daemon genuinely used to parse that sentence back out with a marker
+/// string, which is what a prose-only record forces a reader into.
+#[test]
+fn a_limit_exceeded_exit_is_only_ever_built_from_a_typed_breach() {
+    let root = source_root();
+    let mut offenders = Vec::new();
+    walk_rust_files(&root, &mut |path, text| {
+        // The definition itself, and the parser that turns a stored string back
+        // into the enum, are the two legitimate mentions.
+        let is_definition = path.ends_with("process_table.rs");
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with("//") || line.starts_with("///") {
+                continue;
+            }
+            // A struct-literal field, which is the only way to build the exit
+            // without going through the constructor.
+            if line.contains("status: ExitStatus::LimitExceeded")
+                || line.contains("status: crate::process_table::ExitStatus::LimitExceeded")
+            {
+                if is_definition {
+                    continue;
+                }
+                offenders.push(format!("{path}:{}", number + 1));
+            }
+        }
+    });
+    assert!(
+        offenders.is_empty(),
+        "these build a limit-exceeded exit by hand instead of through \
+         `ProcessExit::limit_exceeded`, so nothing guarantees the typed breach is beside the \
+         prose: {offenders:?}"
+    );
+}
+
+/// Bounded capture stays bounded *while the child runs*.
+///
+/// `wait_with_output` and `read_to_end` both retain everything before returning
+/// anything, so a command printing a gigabyte takes a gigabyte of this process's
+/// heap with it — which is what the shell paths used to do. The bound has to be
+/// applied as bytes arrive, and the pipes have to keep draining, or a child that
+/// fills a 64 KiB pipe deadlocks against a reader that is not reading.
+///
+/// A source contract because the failure is invisible in a test: a bounded
+/// implementation and an unbounded one produce the same output for every input
+/// small enough to assert on.
+#[test]
+fn the_bounded_capture_paths_never_collect_a_whole_stream() {
+    const BOUNDED: &[&str] = &[
+        "workspace_shell.rs",
+        "background_shell.rs",
+        "output_cap.rs",
+        "tools.rs",
+    ];
+    let root = source_root();
+    let mut offenders = Vec::new();
+    for path in BOUNDED {
+        let full = root.join(path);
+        let Ok(text) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            // Prose about the rule is how the rule stays explained.
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            if trimmed.contains("wait_with_output(") || trimmed.contains(".read_to_end(") {
+                offenders.push(format!("{path}:{}", number + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these bounded-capture paths collect a whole stream before returning, so the app's \
+         retained memory is whatever the child chose to print: {offenders:?}"
+    );
+}
+
+/// Visit every `.rs` file under `root` with its path (relative) and contents.
+fn walk_rust_files(root: &Path, visit: &mut dyn FnMut(&str, &str)) {
+    fn walk(dir: &Path, root: &Path, visit: &mut dyn FnMut(&str, &str)) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, visit);
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            visit(&relative, &text);
+        }
+    }
+    walk(root, root, visit);
 }

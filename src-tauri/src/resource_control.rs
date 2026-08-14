@@ -1121,6 +1121,27 @@ where
     }
 }
 
+/// The limit set to ask a host "what would you hold a workload with".
+///
+/// **Not `EffectiveLimits::default()`, and that distinction is a real bug this
+/// exists to prevent.** A backend installs only the bounds it was asked for: a
+/// cgroup scope with nothing to enforce is pure cost, so `CgroupScope::create`
+/// correctly declines an empty limit set and the controller falls back to the
+/// supervisor. A capability probe built from an empty set therefore reports
+/// "supervisor" on a machine whose every real workload runs under a kernel
+/// bound — which is the reporting surface saying the opposite of the truth.
+///
+/// So a probe asks with the bounds a real workload carries. The foreground
+/// shell's class defaults are that shape: a memory ceiling and a process ceiling,
+/// the two resources every backend here has an answer for.
+#[must_use]
+pub fn probe_limits() -> EffectiveLimits {
+    EffectiveLimits::resolve(&[LimitLayer::new(
+        LimitSource::ClassDefault,
+        crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+    )])
+}
+
 /// The backend this host has been *provisioned* to use, when something says so.
 ///
 /// A hosted CI runner is not a systemd user session, so nothing is delegated to
@@ -1559,11 +1580,10 @@ mod tests {
         let Some(required) = required_backend() else {
             return;
         };
-        let capabilities = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
-            LimitSource::ClassDefault,
-            limits(None, Some(512 * 1024 * 1024)),
-        )]))
-        .capabilities();
+        // Both bounds, because a scope installs only what it was asked for: a
+        // memory-only request leaves `pids.max` unwritten and the capability
+        // answer correctly says nothing is holding a process ceiling.
+        let capabilities = ResourceController::new(probe_limits()).capabilities();
         assert_eq!(
             capabilities.backend, required,
             "this host was provisioned to exercise {required}, so falling back leaves the \

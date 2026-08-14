@@ -1217,6 +1217,7 @@ pub fn run() {
             process_commands::process_link_run,
             process_commands::process_reap_missing,
             process_commands::process_usage_ledger,
+            process_commands::process_resource_report,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,

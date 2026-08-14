@@ -290,6 +290,11 @@ impl ForegroundShell {
         self.native_pid
     }
 
+    /// The `(pid, start_time)` the controller attached to, for the row.
+    pub(crate) fn identity(&self) -> Option<crate::process_tree::ProcessIdentity> {
+        self.controller.root()
+    }
+
     pub(crate) fn id(&self) -> Option<u32> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -637,12 +642,14 @@ pub fn foreground_projection(
     external_id: &str,
     state: crate::process_table::ProcessState,
     workspace: &Path,
-    native_pid: u32,
+    identity: Option<crate::process_tree::ProcessIdentity>,
     effective: EffectiveLimits,
 ) -> crate::process_table::ProcessProjection {
     crate::process_table::ProcessProjection::new(ProcessKind::ForegroundShell, external_id, state)
         .with_workspace(Some(workspace.to_string_lossy().into_owned()))
-        .with_native_pid(i64::try_from(native_pid).ok())
+        // The identity, not the bare pid: a row that names only a pid cannot be
+        // reconciled after a restart without risking an unrelated process.
+        .with_native_identity(identity)
         .with_limits(effective.to_process_limits())
 }
 
@@ -929,6 +936,9 @@ pub struct ShellOutput {
     pub enforcement: crate::resource_control::ControllerCapabilities,
     pub limits: EffectiveLimits,
     pub native_pid: u32,
+    /// The identity the controller attached to, so a record of this shell names
+    /// a process rather than a pid.
+    pub identity: Option<crate::process_tree::ProcessIdentity>,
 }
 
 /// AppHandle-free entry point used by `monkey-cli`; desktop foreground and
@@ -954,6 +964,7 @@ pub async fn run_to_output(
     let enforcement = shell.capabilities();
     let effective = shell.effective_limits();
     let native_pid = shell.native_pid();
+    let identity = shell.identity();
     let stdout = shell
         .take_stdout()
         .ok_or_else(|| io::Error::other("confined shell had no stdout pipe"))?;
@@ -986,6 +997,7 @@ pub async fn run_to_output(
             enforcement,
             limits: effective,
             native_pid,
+            identity,
         })
     };
 

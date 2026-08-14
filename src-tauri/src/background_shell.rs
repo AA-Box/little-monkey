@@ -191,7 +191,31 @@ impl BackgroundShellManager {
             if let Ok(mut child) = process.child.lock() {
                 let _ = child.kill();
             }
+            // The whole owned tree, not the leader. On shutdown this is the last
+            // chance: anything left after the app exits is an orphan no UI can
+            // ever reach again.
+            reclaim_owned_tree(&process);
         }
+    }
+}
+
+/// Reclaim everything one background command owns, through its controller.
+///
+/// Every deliberate teardown goes through here rather than through the child
+/// handle alone: `BackgroundShellChild::kill` signals the process group, which
+/// covers the ordinary case and misses the one this exists for — a descendant
+/// that left the group, or a Windows tree whose containment is the job rather
+/// than any group at all. The controller recorded that membership while the
+/// ancestry was still readable, which is the only moment it could be recorded.
+///
+/// Idempotent and fail-soft: a tree already gone costs one process-table read,
+/// and a teardown must not fail because one member could not be signalled.
+fn reclaim_owned_tree(process: &Arc<BackgroundProcess>) {
+    let Ok(mut controller) = process.controller.lock() else {
+        return;
+    };
+    if let Err(error) = controller.terminate_tree() {
+        eprintln!("background shell: could not reclaim the whole owned tree: {error}");
     }
 }
 
@@ -236,9 +260,9 @@ fn append_bounded(buffer: &mut String, chunk: &str, truncated: &mut bool) -> usi
 fn emit_status<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     view: BackgroundShellView,
-    native_pid: Option<i64>,
+    identity: Option<crate::process_tree::ProcessIdentity>,
 ) {
-    project_process(app, &view, native_pid, None);
+    project_process(app, &view, identity, None);
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
 }
 
@@ -267,7 +291,7 @@ fn emit_status_with_breach<R: tauri::Runtime>(
 fn project_process<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     view: &BackgroundShellView,
-    native_pid: Option<i64>,
+    identity: Option<crate::process_tree::ProcessIdentity>,
     breach: Option<crate::resource_control::LimitBreach>,
 ) {
     use crate::process_table::{
@@ -319,7 +343,9 @@ fn project_process<R: tauri::Runtime>(
     let mut projection =
         ProcessProjection::new(ProcessKind::BackgroundShell, view.id.clone(), state)
             .with_workspace(Some(view.cwd.clone()))
-            .with_native_pid(native_pid);
+            // The identity rather than the pid, so a restart can tell this
+            // process from whatever the kernel later gave its pid to.
+            .with_native_identity(identity);
     projection.exit = exit;
 
     let state_handle = app.state::<crate::AppState>();
@@ -793,7 +819,7 @@ pub(crate) fn start_background_command<R: tauri::Runtime>(
     let spawned =
         crate::workspace_shell::spawn_background(workspace_root, cwd_path, &command, limits)
             .map_err(|error| format!("Failed to spawn shell: {error}"))?;
-    let native_pid = i64::try_from(spawned.child.id()).ok();
+    let identity = spawned.controller.root();
     let crate::workspace_shell::BackgroundSpawn {
         child,
         controller,
@@ -835,7 +861,7 @@ pub(crate) fn start_background_command<R: tauri::Runtime>(
         spawn_reader(app.clone(), process.clone(), stderr);
     }
     spawn_exit_watcher(app.clone(), process);
-    emit_status(app, view.clone(), native_pid);
+    emit_status(app, view.clone(), identity);
     Ok(view)
 }
 
@@ -906,6 +932,12 @@ pub fn background_shell_kill(
             .kill()
             .map_err(|error| format!("Failed to kill background command: {error}"))?;
     }
+    // And the tree, through the controller. `kill` above signals the process
+    // group, which is the ordinary case and misses the one that matters: a
+    // descendant that left the group is reachable only through the membership the
+    // controller recorded while the ancestry was still readable. The user asked
+    // for this command to stop, not for its leader to stop.
+    reclaim_owned_tree(&process);
     let view = {
         let mut view = lock(&process.view)?;
         view.status = BackgroundShellStatus::Killed;

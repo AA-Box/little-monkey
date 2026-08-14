@@ -912,12 +912,12 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
     let shell_process_id = format!("fgsh-{}", uuid::Uuid::new_v4());
     let shell_workspace = cwd_path.to_path_buf();
     let shell_limits = child.effective_limits();
-    let shell_native_pid = child.native_pid();
+    let shell_identity = child.identity();
     let running = crate::workspace_shell::foreground_projection(
         &shell_process_id,
         crate::process_table::ProcessState::Running,
         &shell_workspace,
-        shell_native_pid,
+        shell_identity,
         shell_limits,
     );
     // The turn is the parent when there is one, which is what makes
@@ -1039,7 +1039,7 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
         &shell_process_id,
         crate::process_table::ProcessState::Exited,
         &shell_workspace,
-        shell_native_pid,
+        shell_identity,
         shell_limits,
     );
     exited.exit = Some(exit);

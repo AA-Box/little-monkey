@@ -927,6 +927,46 @@ fn upgrade_a_budget_kill(
     })
 }
 
+/// Whether the pid on this row still belongs to the process the row is about.
+///
+/// # The rule every reconciler has to obey
+///
+/// A row outlives the app session that wrote it, which is the entire point of a
+/// durable process table — and it is why "is something alive at that pid" is not
+/// a safe question to act on. Pids are reused; across a restart, hours later, on
+/// a busy machine, the number a previous session recorded is as likely to name
+/// the user's editor as the shell this app abandoned.
+///
+/// So a startup reclaim signals only what it can *prove*: the pid is still the
+/// process whose start time this row recorded. Three things answer `false`,
+/// deliberately:
+///
+/// - no pid — the row says nothing about anything running;
+/// - no start time — a pre-V22 row, or a host that would not report one, so the
+///   pid cannot be tied to a process;
+/// - a start time that does not match — the pid was reused, and the process
+///   behind it is somebody else's.
+///
+/// The asymmetry is the safety property: failing to reclaim one stale process is
+/// recoverable, and killing an unrelated one is not.
+#[must_use]
+pub fn still_the_recorded_process(record: &ProcessRecord) -> bool {
+    let Some(pid) = record.native_pid.and_then(|pid| u32::try_from(pid).ok()) else {
+        return false;
+    };
+    let Some(recorded) = record
+        .native_start_time
+        .and_then(|start| u64::try_from(start).ok())
+    else {
+        return false;
+    };
+    crate::process_tree::ProcessIdentity {
+        pid,
+        start_time: recorded,
+    }
+    .is_still_alive()
+}
+
 /// The limit set attached to a process.
 ///
 /// `None` means "not bounded by this process record" — honest, and different
@@ -1231,6 +1271,17 @@ pub struct ProcessRecord {
     pub profile: Option<String>,
     /// OS process id, where the process owns one.
     pub native_pid: Option<i64>,
+    /// The platform's own start-time stamp for that pid, which together with it
+    /// names a *process* rather than a slot in the pid space.
+    ///
+    /// Opaque and host-local by design — `/proc` jiffies, a BSD start timeval, a
+    /// Windows creation FILETIME — and only ever compared against
+    /// [`crate::process_tree::ProcessIdentity::of`] on the machine that wrote it.
+    /// `None` on a row written before V22, and on a host that will not report
+    /// one; a reconciler that finds `None` must not signal, because it cannot
+    /// prove the pid is still the process this row is about.
+    #[serde(default)]
+    pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
     /// Durable signal intent. Survives a restart, unlike the in-memory
     /// `AbortController`/`CancellationToken` each kind used before, and is
@@ -1574,6 +1625,7 @@ pub struct ProcessProjection {
     pub workspace: Option<String>,
     pub profile: Option<String>,
     pub native_pid: Option<i64>,
+    pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
 }
 
@@ -1589,6 +1641,7 @@ impl ProcessProjection {
             workspace: None,
             profile: None,
             native_pid: None,
+            native_start_time: None,
             // Same seeding as `AdmitProcess::new`, and it has to be here too:
             // `reconcile` admits through a projection, so a kind whose only
             // adopter projects (every desktop kind) would otherwise never pick up
@@ -1625,6 +1678,22 @@ impl ProcessProjection {
 
     pub fn with_native_pid(mut self, native_pid: Option<i64>) -> Self {
         self.native_pid = native_pid;
+        self
+    }
+
+    /// The pid *and* the start time that says which process it is.
+    ///
+    /// Preferred over [`Self::with_native_pid`] wherever the caller holds a
+    /// [`crate::process_tree::ProcessIdentity`], which every resource-controlled
+    /// spawn does: a row with a bare pid cannot be safely reconciled after a
+    /// restart, because nothing can prove the pid was not reused.
+    pub fn with_native_identity(
+        mut self,
+        identity: Option<crate::process_tree::ProcessIdentity>,
+    ) -> Self {
+        self.native_pid = identity.and_then(|identity| i64::try_from(identity.pid).ok());
+        self.native_start_time =
+            identity.and_then(|identity| i64::try_from(identity.start_time).ok());
         self
     }
 
@@ -2723,9 +2792,29 @@ impl<'a> ProcessTable<'a> {
         native_pid: Option<i64>,
         now_ms: i64,
     ) -> ProcessTableResult<()> {
+        self.set_native_identity(process_id, native_pid, None, now_ms)
+    }
+
+    /// [`Self::set_native_pid`] with the start time that makes the pid an
+    /// identity.
+    ///
+    /// The start time is written only when supplied, so a caller that has a pid
+    /// and nothing else does not erase one a better-informed caller recorded —
+    /// the same rule `reconcile` already applies to the pid itself.
+    pub fn set_native_identity(
+        &self,
+        process_id: &str,
+        native_pid: Option<i64>,
+        native_start_time: Option<i64>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
         let updated = self.connection.execute(
-            "UPDATE agent_processes SET native_pid = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
-            params![process_id, native_pid, now_ms],
+            "UPDATE agent_processes
+                SET native_pid = ?2,
+                    native_start_time = COALESCE(?3, native_start_time),
+                    updated_at_ms = ?4
+              WHERE process_id = ?1",
+            params![process_id, native_pid, native_start_time, now_ms],
         )?;
         if updated == 0 {
             return Err(ProcessTableError::NotFound {
@@ -2815,8 +2904,17 @@ impl<'a> ProcessTable<'a> {
                 self.link_run(&record.process_id, run_id, now_ms)?;
             }
         }
-        if projection.native_pid.is_some() && record.native_pid != projection.native_pid {
-            self.set_native_pid(&record.process_id, projection.native_pid, now_ms)?;
+        if projection.native_pid.is_some()
+            && (record.native_pid != projection.native_pid
+                || (projection.native_start_time.is_some()
+                    && record.native_start_time != projection.native_start_time))
+        {
+            self.set_native_identity(
+                &record.process_id,
+                projection.native_pid,
+                projection.native_start_time,
+                now_ms,
+            )?;
         }
 
         if record.state == projection.state {
@@ -3538,7 +3636,7 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
      signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens, \
      limit_kind, limit_configured, limit_observed, limit_backend, limit_level, \
-     limit_observed_at_ms, limit_evidence \
+     limit_observed_at_ms, limit_evidence, native_start_time \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -3737,6 +3835,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
         workspace: row.get(6)?,
         profile: row.get(7)?,
         native_pid: row.get(8)?,
+        native_start_time: row.get(34)?,
         limits: ProcessLimits {
             max_wall_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
             max_memory_bytes: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
@@ -4771,16 +4870,20 @@ mod tests {
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
         );
 
-        // The only desktop kind with an *enforced* wall bound, and the number is
-        // the one `browser_worker`'s watchdog actually sweeps on — not a second
-        // ceiling declared beside it.
+        // Two owners on one row, and the assertions are per field because that is
+        // exactly the split. The wall number is the one `browser_worker`'s
+        // watchdog actually sweeps on — not a second ceiling declared beside it —
+        // while the two process bounds belong to the resource controller, which
+        // now holds Chromium's whole tree. Output stays absent: this kind
+        // captures no stream of its own.
         let browser = ProcessKind::BrowserSession.default_limits();
         assert_eq!(
             browser.max_wall_ms,
             Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS)
         );
         assert_eq!(browser.max_output_bytes, None);
-        assert_eq!(browser.max_memory_bytes, None);
+        assert_eq!(browser.max_memory_bytes, Some(BROWSER_MEMORY_BUDGET_BYTES));
+        assert_eq!(browser.max_child_processes, Some(BROWSER_PROCESS_BUDGET));
 
         let shell = ProcessKind::BackgroundShell.default_limits();
         assert_eq!(
@@ -6903,15 +7006,18 @@ mod tests {
         // owns a native tree, and nowhere else. Both halves are asserted: the
         // first is the capability this item added, and the second is what stops
         // it from being claimed for a kind that owns no OS process at all.
-        // The kinds routed through a resource controller — which is narrower than
-        // "owns a process tree". A browser session owns one and is deliberately
-        // not here: `browser_worker` bounds its Chromium with its own session
-        // quotas, so claiming the controller holds it would be the exact
-        // overstatement this matrix exists to prevent.
+        // The kinds routed through a resource controller. That set is now exactly
+        // "owns a native process tree": the browser session was the one member of
+        // the second group and not the first, bounded by `browser_worker`'s own
+        // session quotas, and it is routed. What the quotas kept is what no
+        // controller can express — the session clock, the action budget, the disk
+        // budget — so the two authorities still hold disjoint resources.
         for kind in ProcessKind::ALL {
             let owns_a_tree = matches!(
                 kind,
-                ProcessKind::BackgroundShell | ProcessKind::ForegroundShell
+                ProcessKind::BackgroundShell
+                    | ProcessKind::ForegroundShell
+                    | ProcessKind::BrowserSession
             );
             assert_eq!(
                 kind.limit_support(ProcessLimitKind::ChildProcesses)

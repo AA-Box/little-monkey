@@ -286,9 +286,13 @@ fn print_limit_matrix(json: bool) -> Result<(), String> {
 /// questions, so two blocks, rather than one table that would be wrong about one
 /// of them.
 fn print_host_enforcement() {
-    use little_monkey_lib::resource_control::{EffectiveLimits, ResourceController};
+    use little_monkey_lib::resource_control::{probe_limits, ResourceController};
 
-    let capabilities = ResourceController::new(EffectiveLimits::default()).capabilities();
+    // Asked with the bounds a real workload carries, never with an empty set: a
+    // backend installs only what it was asked for, so a cgroup scope with nothing
+    // to enforce declines and this would report the supervisor on a machine whose
+    // every shell runs under `memory.max`. See `resource_control::probe_limits`.
+    let capabilities = ResourceController::new(probe_limits()).capabilities();
     println!("this host: {}", capabilities.backend);
     println!("tree owned by: {}", capabilities.tree_primitive);
     for limit in ProcessLimitKind::ALL {

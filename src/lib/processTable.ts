@@ -51,11 +51,105 @@ export interface ProcessLimits {
   maxChildProcesses?: number | null;
 }
 
+/**
+ * A limit that fired, as the mechanism itself reported it.
+ *
+ * Beside `ProcessExit.reason` rather than instead of it: the prose is what a
+ * person reads, and this is what a UI formats and a query filters on. Before
+ * migration V21 only the prose existed, so "how much memory did it actually
+ * hold" could be answered only by parsing a sentence — which the daemon
+ * genuinely did, with a marker string.
+ *
+ * `observed` is frequently *equal* to `configured` rather than above it, and that
+ * is not a bug to paper over in the display: a kernel-held bound exists so the
+ * workload never passes the number, so it refuses the thirteenth fork and leaves
+ * the count at twelve. Where that is what happened, `evidence` names the kernel
+ * counter that proved it, and a supervised bound — found by comparison — carries
+ * no evidence rather than an invented one.
+ */
+export interface LimitBreach {
+  /** The `ProcessLimits` field name, e.g. `max_memory_bytes`. */
+  limit: string;
+  configured: number;
+  observed: number;
+  /** `"cgroup v2"`, `"windows job object"`, `"supervisor"`. */
+  backend: string;
+  /** `"kernel"`, `"supervised"`, or `"owner-sourced"`. */
+  level: string;
+  observedAtMs: number;
+  evidence?: string | null;
+}
+
 export interface ProcessExit {
   status: ProcessExitStatus;
   code?: number | null;
   signal?: string | null;
   reason?: string | null;
+  /** Present exactly when a resource controller made the kill. */
+  breach?: LimitBreach | null;
+}
+
+/** Which layer supplied the number on a row, as `process_commands.rs` derives it. */
+export type LimitOrigin =
+  | "class_default"
+  | "caller_override"
+  | "caller_supplied"
+  | "unrecorded"
+  | "unbounded";
+
+/**
+ * What this host can do about one resource — the backend's own answer, not a
+ * table maintained here.
+ *
+ * The tag names match `resource_control.rs`'s `LimitCapability`, which is the
+ * point: a mechanism string invented in TypeScript is a second source of truth
+ * that drifts from the one doing the enforcing.
+ */
+export type LimitCapability =
+  | { status: "enforced"; level: "kernel" | "supervised" | "owner-sourced"; mechanism: string }
+  | { status: "not_applicable"; reason: string }
+  | { status: "unavailable"; reason: string };
+
+export interface ProcessLimitReport {
+  /** `max_wall_ms`, `max_memory_bytes`, … — the same name the breach uses. */
+  limit: string;
+  classDefault: number | null;
+  effective: number | null;
+  origin: LimitOrigin;
+  /** `"enforced"`, `"owner-sourced"`, `"unavailable"` — the static per-kind matrix. */
+  supportStatus: string;
+  supportDetail: string;
+  /** Only for the kinds a resource controller owns. */
+  host?: LimitCapability;
+  observed?: number;
+  observedUnavailable?: string;
+}
+
+export interface ProcessResourceReport {
+  processId: string;
+  kind: ProcessKind;
+  backend?: string;
+  treePrimitive?: string;
+  limits: ProcessLimitReport[];
+  breach?: LimitBreach;
+}
+
+/**
+ * What is bounding one process, and who says so.
+ *
+ * Fail-soft like everything else here: a panel that cannot read the report shows
+ * the row without it rather than showing an error where a process should be.
+ */
+export async function fetchProcessResourceReport(
+  processId: string,
+): Promise<ProcessResourceReport | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<ProcessResourceReport>("process_resource_report", { processId });
+  } catch (error) {
+    warn(`resource report for ${processId}`, error);
+    return null;
+  }
 }
 
 /**
@@ -87,6 +181,15 @@ export interface ProcessRecord {
   workspace: string | null;
   profile: string | null;
   nativePid: number | null;
+  /**
+   * The platform's own start-time stamp for that pid.
+   *
+   * Opaque and host-local: it exists so a reconciler can prove a pid still names
+   * the process this row is about rather than one the kernel handed the number
+   * to later. Nothing in the UI should render it. `null` on a row written before
+   * migration V22, and on a host that will not report one.
+   */
+  nativeStartTime?: number | null;
   limits: ProcessLimits;
   /** What has been asked of this process. Delivery is `processSignalDelivery.ts`. */
   signalIntent: SignalIntent;
