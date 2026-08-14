@@ -1470,9 +1470,113 @@ has a cross-platform resource/lifetime mechanism it does not have.
 process-tree lifetime gap as an explicitly deferred platform capability; K21's
 disposable-isolation evidence prerequisite is now satisfied.
 
-## K4. Enforced per-process resource limits *(built)*
+## K4. Enforced per-process resource limits *(partially built)*
 
-**Where this stands.** The original acceptance was a portable quota checklist
+**Reopened, and by evidence rather than by wording.** The slice below closed this
+item on the reading that `Unavailable(reason)` satisfies the acceptance. That
+reading is defensible for a resource nothing *can* hold; it was applied to
+memory and child-process ceilings, which a supervisor over the process tree can
+hold and now does. So the honest label is partial: the core limits are enforced
+for the kinds that own a native process tree, one platform leg is verified, two
+are written but unrun, and three named gaps remain. They are listed at the end of
+this section rather than folded back into the prose above them.
+
+### Shipped — one resource-control contract, and limits that fire
+
+`resource_control::ResourceController` is the single path every native
+child-process owner takes: capabilities, prepare, attach, sample, terminate_tree,
+over three `cfg`-selected backends. It answers from code what the roadmap used to
+answer in prose — the requested limit, the effective one, the mechanism, whether
+that mechanism is kernel-held or supervised, the measured usage, the exact reason
+a limit cannot be enforced, and the tree primitive that owns the workload.
+
+- **The measurement had to come first.** The daemon's watchdog forked
+  `ps -eo pgid=,rss=` per sample, which cannot report a *parent* link — so it
+  could only ever measure a process **group**, which one `setsid` leaves.
+  `process_tree` reads the kernel's own table (procfs, `proc_listallpids`,
+  ToolHelp) and takes membership as the parent-link closure **unioned** with the
+  group, because each covers the other's escape: re-parenting breaks the chain and
+  keeps the group, `setsid` breaks the group and keeps the chain. It also carries a
+  `(pid, start-time)` identity, so a reused pid is never sampled as ours and — far
+  worse — never killed as ours.
+- **The strongest bound wins, whoever stated it.** `EffectiveLimits::resolve`
+  intersects the layers rather than substituting them. `process_admit` used to
+  `or` a caller's value over the class default, so a caller stating a *larger*
+  number replaced the class bound — a class default that a caller can widen is a
+  suggestion. Each resolved value records which layer supplied it.
+- **A requested bound nobody holds is now refused.** The previous slice fixed the
+  first half of this by dropping such a value, which left the second half: the
+  admission still succeeded, so a caller that asked for a memory ceiling on a chat
+  turn got a running process and no reason to doubt the ceiling was active.
+  Admission fails with a message naming the field, the kind, and the missing
+  mechanism.
+- **The foreground shell became a process.** The most common native process this
+  app creates had no `ProcessKind` and therefore no row — so the limit could be
+  declared on the turn while the compiler consuming the machine was invisible.
+  Migration V21 admits `foreground_shell` and adds the typed breach columns the
+  earlier slice deferred: limit, configured, observed, backend, level. The
+  daemon's marker encoding carried its two numbers only inside an English
+  sentence, so those columns would have been filled by parsing prose; it now
+  encodes them structurally and tolerates the old form as an honest gap rather
+  than a guessed number.
+- **Output is bounded while it is produced.** `verify.rs` used
+  `wait_with_output` and `workspace_shell::run_to_output` used `read_to_end`:
+  both collect an unbounded `Vec<u8>` per stream, so the cap held the model's
+  context window and never the app's heap. All three runners now share
+  `output_cap`'s streaming capture, drained concurrently with the wait.
+
+**Six integration tests against real child processes**, each running its workload
+as a *grandchild* of the shell, because the direct child is always a shell holding
+a few hundred kilobytes and forking nothing — a bound that measures only the pid
+we spawned is evaded by the normal case rather than by a trick. A 512 MiB
+grandchild against a 192 MiB budget; forty concurrent children against a
+twelve-process budget, asserting the count is of the owned tree and not of
+everything this uid owns; a wall limit that ends the grandchild; a descendant that
+leaves the process group and is terminated anyway; both pipes flooded past the cap
+with no deadlock and a normal exit; and the counter-test, a command inside every
+bound completing with its output — without which "everything is a limit kill"
+passes the other five.
+
+**Two findings worth keeping.** The memory test first passed for the wrong reason:
+the workload binary lived outside the workspace, so the confinement denied the
+exec, the grandchild exited instantly, and no limit fired — which reads
+identically to a broken bound. And the environment is scrubbed at spawn, so the
+variable configuring the hog had to be set inside the command line rather than
+exported. Both are the confinement working; both would have made this section
+claim something false.
+
+### What remains open
+
+1. **Two platform legs are unrun.** The cgroup v2 and Windows job-object backends
+   are written and `rustfmt`-parsed, and neither has been compiled: this machine
+   has Homebrew Rust rather than rustup, so no other target can be added and
+   `cfg(windows)` cannot be typechecked locally at all. CI is their first real
+   build and their first real execution. Until that is green, "kernel-held on
+   Linux and Windows" is an intention.
+2. **A browser session owns a process tree and is not routed through the
+   controller.** Its Chromium is bounded by `browser_worker`'s own session quotas,
+   which are real; wiring it means reconciling two enforcement paths rather than
+   adding one. Both its memory and child-process cells say exactly this rather
+   than claiming a bound.
+3. **macOS has no kernel-owned process tree, and this does not invent one.** The
+   supervisor covers an ordinary descendant and a `setsid` escape. A descendant
+   that both re-parents *and* leaves the group is outside any primitive macOS
+   offers without a privileged helper. It keeps its Seatbelt filesystem and
+   network confinement; what it escapes is the lifetime bound. That specific
+   requirement stays open rather than being redefined.
+4. **The Processes UI has not been extended.** The effective limits, live usage
+   and enforcement mechanism are on the record and exposed by `monkey processes
+   show`/`limits`; no desktop surface reads them yet.
+5. **Scheduler reservations have not been re-audited against the controller.**
+   K7/K8 are built against measured reservations and are unchanged by this work,
+   which means their assumptions have not been *checked* against it.
+
+**Historical record follows.** Everything below describes the state before the
+slice above and is kept because the corrections in it are the useful part.
+
+### Historical: where this stood when the item was first closed
+
+**Where this stood.** The original acceptance was a portable quota checklist
 whose named mechanisms cannot provide three of its six resources and whose
 failure semantics do not match those mechanisms. The historical wording and the
 corrections it forced remain below. Every userspace mechanism named in the shipped
@@ -1480,9 +1584,13 @@ slices is built, but that does not make the platform legs portable or turn
 `ProcessLimits` into proof of enforcement: explicit admission overrides can still
 record fields an owner does not enforce. Stronger mechanisms remain documented
 under *Deferred, with reasons*. ~~K4 stays open rather than moving those gaps
-outside the cut line by wording alone.~~ **Closed by the final slice below — not
+outside the cut line by wording alone.~~ ~~**Closed by the final slice below — not
 by wording: the declaration contract is enforced at admission, and each deferred
-leg answers `Unavailable(reason)` as a value a caller receives.**
+leg answers `Unavailable(reason)` as a value a caller receives.**~~ **That closure
+was wrong, and the correction is at the top of this section: answering
+`Unavailable(reason)` is the right outcome for a resource nothing can hold, and it
+was applied to two that a supervisor over the process tree can. Those are now
+enforced; the item is partial rather than closed.**
 
 What is enforced today: kernel-held `setrlimit` bounds on Unix app-side spawn
 sites, process-group termination on Unix timeouts, Windows job ownership for
@@ -2100,6 +2208,14 @@ declarations and platform capabilities are either enforced or surfaced as
 `Unavailable(reason)`; fixed Unix rlimits and Windows shell-job guardrails do not
 stand in for that contract.
 
+**Superseded.** The "or surfaced as `Unavailable(reason)`" half of this is what
+let the item close with memory and process-count ceilings unenforced, and it is
+too weak: `Unavailable` is honest only where no viable mechanism exists. The
+current acceptance is at the top of this section — enforcement for the kinds that
+own a native process tree, with the enforcement *level* reported rather than
+assumed, and `Unavailable` reserved for a resource that genuinely does not apply
+or a platform that genuinely cannot hold it.
+
 **Shipped — the declaration contract is enforced at the boundary that leaked it,
 and every platform gap now answers for itself.**
 
@@ -2154,7 +2270,10 @@ a caller receives rather than a paragraph a reader has to find.
 and K8 on the theory that admission without a universal quota was a guess. Both are
 now built against measured reservations, so K4 no longer blocks their mechanics;
 ~~their existence does not close K4's declaration and platform-enforcement gaps.~~
-**Those gaps are closed by the slice above.**
+~~**Those gaps are closed by the slice above.**~~ **The declaration gap is closed;
+the platform gaps are not — see the open list at the top of this section. K7/K8
+still do not block on it, but their reservations have not been re-audited against
+the resource controller either.**
 
 ## K5. Per-run egress policy *(renamed from per-process — see the acceptance correction)*
 
