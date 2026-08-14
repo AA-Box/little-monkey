@@ -104,6 +104,7 @@ pub(crate) fn test_frozen_execution(ingress: &ConversationIngress) -> FrozenExec
         max_iterations: None,
         timeout_seconds: None,
         output: Default::default(),
+        channel_send: None,
         desktop_turn: None,
         placed_run: None,
     };
@@ -461,7 +462,7 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(store) => reconcile_workers(&paths, &store, &queue, &mut workers),
+                    Ok(mut store) => reconcile_workers(&paths, &mut store, &queue, &mut workers),
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -492,30 +493,68 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
     });
 }
 
-/// How often a running account's health is re-derived from its transport.
-const HEALTH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often an unchanged health state is re-asserted anyway, so a row some
+/// other writer (a manual `channels probe`, an operator edit) overwrote does
+/// not stay stale behind the debounce forever.
+const HEALTH_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Ask the provider what is actually true and record it on the account.
+/// What a successful poll says about an account's health, if anything.
 ///
-/// The health an operator reads has to come from the transport, not from the
-/// fact that a credential was saved: only [`ChannelAdapter::probe`] talks to
-/// the provider, and each adapter's own probe folds in whatever its transport
-/// knows — Telegram's `getMe`, Discord's REST identity plus gateway session
-/// state, Slack's `auth.test` plus its Socket Mode connection. Nothing else in
-/// the daemon calls it, so without this the panel would show whatever was
-/// written the last time somebody ran `channels probe` by hand.
-///
-/// Best effort: a health row that cannot be written must not disturb polling.
-pub(crate) async fn record_account_health(
-    store: &mut DaemonStore,
-    account_id: &str,
+/// For a long-polling or helper adapter the poll is the whole story: it spoke
+/// to the provider with this account's real credential and came back. An
+/// adapter holding a socket open answers for itself, because its poll returns
+/// an empty batch whether the connection is live or dropped. And a webhook
+/// adapter's poll is a local no-op that spoke to nobody — its success proves
+/// nothing, so it moves health nowhere: for those accounts Connected can only
+/// come from a real probe.
+fn health_after_poll(
     adapter: &dyn ChannelAdapter,
+) -> Option<little_monkey_lib::channels::types::HealthState> {
+    if let Some(live) = adapter.live_transport() {
+        return Some(live);
+    }
+    match adapter.capabilities().inbound_transport {
+        little_monkey_lib::channels::types::InboundTransport::Webhook => None,
+        _ => Some(little_monkey_lib::channels::types::HealthState::Connected),
+    }
+}
+
+/// Persist one account's health when it differs from what was last written.
+///
+/// The map is the debounce: state transitions are recorded the moment they
+/// happen, an unchanged state costs nothing per tick. `last_error` rides
+/// along only on the transition, so a failure's first message is kept rather
+/// than churned.
+fn record_health_transition(
+    store: &mut DaemonStore,
+    posted: &mut BTreeMap<String, little_monkey_lib::channels::types::HealthState>,
+    account_id: &str,
+    state: little_monkey_lib::channels::types::HealthState,
+    error: Option<&str>,
+    now_ms: i64,
 ) {
-    let health = adapter.probe().await;
-    if let Ok(now) = current_ms() {
-        if let Err(error) = store.set_channel_account_health(account_id, &health, now) {
-            eprintln!("monkey daemon: channel {account_id} health: {error}");
+    use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+    if posted.get(account_id) == Some(&state) {
+        return;
+    }
+    let health = ChannelHealth {
+        state,
+        detail: match state {
+            HealthState::Connected => Some("Live transport active.".to_string()),
+            HealthState::Degraded => {
+                Some("The provider is unreachable; the daemon keeps retrying.".to_string())
+            }
+            HealthState::Error => Some("The account could not be started.".to_string()),
+            _ => None,
+        },
+        last_error: error.map(str::to_string),
+        probed_at_ms: now_ms,
+    };
+    match store.set_channel_account_health(account_id, &health, now_ms) {
+        Ok(()) => {
+            posted.insert(account_id.to_string(), state);
         }
+        Err(error) => eprintln!("monkey daemon: channel {account_id} health: {error}"),
     }
 }
 
@@ -523,7 +562,10 @@ pub(crate) async fn record_account_health(
 ///
 /// Poll failures back off exponentially per account — a provider outage or a
 /// rate-limited `getUpdates` must not turn into a hammer — and recover to full
-/// speed on the first success.
+/// speed on the first success. Health is derived from the transport after
+/// every poll: a socket adapter answers for its own connection via
+/// `live_transport`, a long-polling adapter's returned poll IS the proof, and
+/// a failing poll is recorded as degraded with its reason.
 async fn run_account_inbound(
     paths: super::store::DaemonPaths,
     queue: Arc<dyn RunQueue>,
@@ -533,7 +575,10 @@ async fn run_account_inbound(
     const MIN_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
     const MAX_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
     let mut error_backoff = MIN_ERROR_BACKOFF;
-    let mut last_health: Option<std::time::Instant> = None;
+    // This task's one account, but the shared debounce helper wants a map.
+    let mut posted_health: BTreeMap<String, little_monkey_lib::channels::types::HealthState> =
+        BTreeMap::new();
+    let mut last_asserted = std::time::Instant::now();
     loop {
         let Ok(now) = current_ms() else {
             tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
@@ -547,6 +592,12 @@ async fn run_account_inbound(
                 continue;
             }
         };
+        // Periodically forget what was posted so the true state is re-asserted
+        // even if something else rewrote the row in between.
+        if last_asserted.elapsed() >= HEALTH_REASSERT_INTERVAL {
+            last_asserted = std::time::Instant::now();
+            posted_health.clear();
+        }
         let started = std::time::Instant::now();
         match poll_account_once(
             &mut store,
@@ -559,6 +610,16 @@ async fn run_account_inbound(
         {
             Ok(_) => {
                 error_backoff = MIN_ERROR_BACKOFF;
+                if let Some(state) = health_after_poll(adapter.as_ref()) {
+                    record_health_transition(
+                        &mut store,
+                        &mut posted_health,
+                        &account_id,
+                        state,
+                        None,
+                        now,
+                    );
+                }
                 // A long-polling adapter paces this loop itself by blocking
                 // inside `poll`. One that returns immediately forever — a
                 // webhook adapter, or a broken one — must not busy-spin.
@@ -567,18 +628,20 @@ async fn run_account_inbound(
                 }
             }
             Err(error) => {
+                // Stored health saying Connected while every poll fails is
+                // the lie the health column exists to prevent.
+                record_health_transition(
+                    &mut store,
+                    &mut posted_health,
+                    &account_id,
+                    little_monkey_lib::channels::types::HealthState::Degraded,
+                    Some(&error),
+                    now,
+                );
                 eprintln!("monkey daemon: channel {account_id} poll: {error}");
                 tokio::time::sleep(error_backoff).await;
                 error_backoff = (error_backoff * 2).min(MAX_ERROR_BACKOFF);
             }
-        }
-        // After the poll rather than before it: a socket transport reports its
-        // connection honestly only once something has asked it to connect, and
-        // `poll` is what does that. A failed poll still gets a probe — that is
-        // exactly when an operator most wants to know why.
-        if last_health.map_or(true, |at| at.elapsed() >= HEALTH_INTERVAL) {
-            last_health = Some(std::time::Instant::now());
-            record_account_health(&mut store, &account_id, adapter.as_ref()).await;
         }
     }
 }
@@ -590,21 +653,53 @@ async fn run_account_inbound(
 /// a label or rotating a token rebuilds that one adapter while every other
 /// account keeps its live session. Removing (or disabling) an account aborts
 /// its task and drops its adapter, which is what tells a socket adapter's
-/// background task to hang up.
+/// background task to hang up. An account that cannot be built — unreadable
+/// credential, config its adapter refuses — has that failure written to its
+/// stored health rather than only to the daemon's log: the operator looking
+/// at the Channels panel is the one who can fix it.
 fn reconcile_workers(
     paths: &super::store::DaemonPaths,
-    store: &DaemonStore,
+    store: &mut DaemonStore,
     queue: &Arc<dyn RunQueue>,
     workers: &mut BTreeMap<String, AccountWorker>,
 ) {
     use super::channel_adapter::{AdapterConfig, ChannelSecrets, KeyringChannelSecrets};
 
+    let Ok(now_ms) = current_ms() else {
+        return;
+    };
     let secrets = KeyringChannelSecrets;
     let accounts = match store.channel_accounts() {
         Ok(accounts) => accounts,
         Err(error) => {
             eprintln!("monkey daemon: could not read channel accounts: {error}");
             return;
+        }
+    };
+    // Written only on a state change, like the poll loop's transitions: a
+    // permanently broken account is one row update, not one per reload.
+    let mut mark_failed = |store: &mut DaemonStore,
+                           account: &super::channel_store::ChannelAccountRecord,
+                           error: &str| {
+        use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+        if account.health.state == HealthState::Error
+            && account.health.last_error.as_deref() == Some(error)
+        {
+            return;
+        }
+        let health = ChannelHealth {
+            state: HealthState::Error,
+            detail: Some("The account could not be started.".to_string()),
+            last_error: Some(error.to_string()),
+            probed_at_ms: now_ms,
+        };
+        if let Err(write_error) =
+            store.set_channel_account_health(&account.account_id, &health, now_ms)
+        {
+            eprintln!(
+                "monkey daemon: channel {} health: {write_error}",
+                account.account_id
+            );
         }
     };
     let mut desired = std::collections::BTreeSet::new();
@@ -626,6 +721,7 @@ fn reconcile_workers(
                             "monkey daemon: SMS account {} cannot send: {error}",
                             account.account_id
                         );
+                        mark_failed(store, &account, &error);
                         continue;
                     }
                 },
@@ -640,6 +736,7 @@ fn reconcile_workers(
                             "monkey daemon: channel account {} has no usable credential: {error}",
                             account.account_id
                         );
+                        mark_failed(store, &account, &error);
                         continue;
                     }
                 },
@@ -682,6 +779,7 @@ fn reconcile_workers(
                     "monkey daemon: channel account {} is not runnable: {error}",
                     account.account_id
                 );
+                mark_failed(store, &account, &error);
                 // A broken replacement must not keep the stale adapter running
                 // on the old credential.
                 workers.remove(&account.account_id);
@@ -797,6 +895,10 @@ mod tests {
         batches: Mutex<Vec<InboundBatch>>,
         outcomes: Mutex<Vec<SendOutcome>>,
         sent: Mutex<Vec<OutboundMessage>>,
+        /// What a socket-holding adapter would report. `None` is every
+        /// long-polling and webhook provider.
+        live: Option<little_monkey_lib::channels::types::HealthState>,
+        transport: InboundTransport,
     }
 
     impl FakeAdapter {
@@ -805,6 +907,24 @@ mod tests {
                 batches: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(Vec::new()),
                 sent: Mutex::new(Vec::new()),
+                live: None,
+                transport: InboundTransport::LongPoll,
+            }
+        }
+
+        fn with_live(state: little_monkey_lib::channels::types::HealthState) -> Self {
+            Self {
+                live: Some(state),
+                ..Self::new()
+            }
+        }
+
+        /// A delivered-to provider: `poll` is a local no-op that returns an
+        /// empty batch without speaking to anyone.
+        fn webhook() -> Self {
+            Self {
+                transport: InboundTransport::Webhook,
+                ..Self::new()
             }
         }
     }
@@ -816,7 +936,11 @@ mod tests {
         }
 
         fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities::minimal(ChannelKind::Telegram, InboundTransport::LongPoll)
+            ProviderCapabilities::minimal(ChannelKind::Telegram, self.transport)
+        }
+
+        fn live_transport(&self) -> Option<little_monkey_lib::channels::types::HealthState> {
+            self.live
         }
 
         async fn probe(&self) -> ChannelHealth {
@@ -1098,7 +1222,12 @@ mod tests {
             .set_channel_account_health("acct-1", &ChannelHealth::error(NOW, "never probed"), NOW)
             .expect("seed health");
 
-        record_account_health(&mut store, "acct-1", &FakeAdapter::new()).await;
+        // The same sequence the per-account loop performs after a poll.
+        let adapter = FakeAdapter::new();
+        let mut posted = BTreeMap::new();
+        if let Some(state) = health_after_poll(&adapter) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
 
         let account = store
             .channel_account("acct-1")
@@ -1147,5 +1276,400 @@ mod tests {
             .expect("drain");
         assert_eq!(report.sent, 1);
         assert_eq!(adapter.sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_socket_adapter_answers_for_its_own_connection() {
+        use little_monkey_lib::channels::types::HealthState;
+        // A long-polling provider: the poll came back, so it is connected.
+        assert_eq!(
+            health_after_poll(&FakeAdapter::new()),
+            Some(HealthState::Connected)
+        );
+        // A socket provider whose connection has dropped polls exactly the
+        // same way — empty batch, no error — so recording Connected off the
+        // back of that would be the lie the health column exists to prevent.
+        for state in [
+            HealthState::Connecting,
+            HealthState::Degraded,
+            HealthState::Error,
+        ] {
+            assert_eq!(
+                health_after_poll(&FakeAdapter::with_live(state)),
+                Some(state)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_webhook_adapters_no_op_poll_never_claims_connected() {
+        use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+        // A webhook adapter's poll succeeds without speaking to anyone, so a
+        // successful tick must leave health exactly where it was.
+        let adapter = FakeAdapter::webhook();
+        assert_eq!(health_after_poll(&adapter), None);
+
+        // End to end through the same sequence the runtime loop performs: the
+        // poll succeeds, and a Disconnected account stays Disconnected.
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.health = ChannelHealth {
+            state: HealthState::Disconnected,
+            detail: None,
+            last_error: None,
+            probed_at_ms: NOW,
+        };
+        store.upsert_channel_account(&account).unwrap();
+
+        let queue = FakeQueue::default();
+        let mut posted = BTreeMap::new();
+        poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
+            .await
+            .expect("the no-op poll succeeds");
+        if let Some(state) = health_after_poll(&adapter) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Disconnected);
+
+        // The same sequence with a long-polling adapter does move it: the
+        // difference is the transport, not the emptiness of the batch.
+        if let Some(state) = health_after_poll(&FakeAdapter::new()) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Connected);
+    }
+
+    #[test]
+    fn health_is_written_on_a_change_and_not_on_every_tick() {
+        use little_monkey_lib::channels::types::HealthState;
+        let mut store = seeded_store();
+        let mut posted = BTreeMap::new();
+
+        record_health_transition(
+            &mut store,
+            &mut posted,
+            "acct-1",
+            HealthState::Degraded,
+            Some("connection dropped"),
+            NOW,
+        );
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Degraded);
+        assert_eq!(
+            account.health.last_error.as_deref(),
+            Some("connection dropped")
+        );
+
+        // The same state again writes nothing new — the error message from the
+        // first transition is kept rather than churned.
+        record_health_transition(
+            &mut store,
+            &mut posted,
+            "acct-1",
+            HealthState::Degraded,
+            Some("a later, less useful message"),
+            NOW + 1_000,
+        );
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.probed_at_ms, NOW);
+
+        record_health_transition(
+            &mut store,
+            &mut posted,
+            "acct-1",
+            HealthState::Connected,
+            None,
+            NOW + 2_000,
+        );
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, HealthState::Connected);
+        assert_eq!(account.health.last_error, None);
+    }
+
+    // -- The agent tool, end to end -----------------------------------------
+
+    use super::super::channel_tool::{plan_send, queue_send, ChannelSendRequest, SendAuthority};
+    use super::super::store::DaemonPaths;
+
+    /// A throwaway app-data root, per test, so nothing here can reach the
+    /// daemon state or the shared ledger of the machine running the suite.
+    fn scratch_root() -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("lm-channel-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    /// Paths whose artifact store is only ever touched by a send carrying
+    /// files; a text-only send never opens anything under here.
+    fn scratch_paths() -> DaemonPaths {
+        DaemonPaths::under(&scratch_root())
+    }
+
+    fn send_to(conversation_id: &str, text: &str) -> ChannelSendRequest {
+        ChannelSendRequest {
+            account_id: Some("acct-1".to_string()),
+            conversation_id: Some(conversation_id.to_string()),
+            text: text.to_string(),
+            ..ChannelSendRequest::default()
+        }
+    }
+
+    /// The grant an operator gives a run that may reach one named account.
+    fn account_authority() -> SendAuthority {
+        SendAuthority {
+            accounts: vec!["acct-1".to_string()],
+            ..SendAuthority::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_tool_queues_a_message_the_worker_then_delivers() {
+        // The whole path in one test: authority, a normalized outbound
+        // message, a durable outbox row, and the provider adapter receiving
+        // exactly what was queued. The tool itself never touches an adapter.
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let request = send_to("chat-9", "the build passed");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+
+        let queued = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect("queued");
+        assert_eq!(queued["status"], "queued");
+        assert!(queued["outbox_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        // Durable before anything is delivered: the row exists against the
+        // job, which is also what the next call's idempotency key counts.
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].account_id, "acct-1");
+        assert_eq!(sent[0].conversation_id, "chat-9");
+        assert_eq!(sent[0].text, "the build passed");
+        // Keyed on the job, so a retried run cannot duplicate the send.
+        assert_eq!(sent[0].idempotency_key, "send-job-1-0");
+
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events[0].direction, EventDirection::Outbound);
+    }
+
+    #[tokio::test]
+    async fn a_send_the_run_was_not_granted_never_reaches_the_outbox() {
+        // The refusal is the point, but so is what did not happen: no row, so
+        // nothing for the worker to find and nothing for an adapter to send.
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let request = send_to("chat-9", "exfiltrate this");
+
+        let refused = plan_send(&request, &SendAuthority::default(), None)
+            .expect_err("no grant for that account");
+        assert!(refused.contains("does not grant"), "{refused}");
+
+        // And the reply grant alone does not reach another account either.
+        let reply_only = SendAuthority {
+            reply: true,
+            ..SendAuthority::default()
+        };
+        assert!(plan_send(&request, &reply_only, None).is_err());
+
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW)
+            .await
+            .expect("drain");
+        assert!(adapter.sent.lock().unwrap().is_empty());
+        let _ = paths;
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_cannot_be_sent_through() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.enabled = false;
+        store.upsert_channel_account(&account).unwrap();
+
+        let request = send_to("chat-9", "still there?");
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("disabled");
+        assert!(error.contains("disabled"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_artifact_over_the_account_configured_limit_never_reaches_the_outbox() {
+        // The account, not a constant, is what bounds an outbound file: an
+        // operator who set max_attachment_bytes low gets exactly that limit,
+        // checked from durable metadata before any row is written.
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.non_secret_config = serde_json::json!({ "max_attachment_bytes": 4 });
+        store.upsert_channel_account(&account).unwrap();
+
+        let root = scratch_root();
+        let paths = DaemonPaths::under(&root);
+        let blobs = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            root.join("content-v1"),
+            16 * 1024 * 1024,
+        )
+        .expect("store");
+        let blob = blobs.put(b"more than four bytes").expect("blob");
+
+        let mut request = send_to("chat-9", "here is the file");
+        request.artifact_ids = vec![blob.id.clone()];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("over the account limit");
+        assert!(error.contains("on this account"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+
+        // Raising the account's limit is all it takes for the same artifact.
+        account.non_secret_config = serde_json::json!({ "max_attachment_bytes": 1024 });
+        store.upsert_channel_account(&account).unwrap();
+        queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect("within the raised limit");
+    }
+
+    #[tokio::test]
+    async fn more_artifacts_than_the_account_allows_are_refused_before_anything_is_resolved() {
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.non_secret_config = serde_json::json!({ "max_listed_attachments": 1 });
+        store.upsert_channel_account(&account).unwrap();
+
+        let paths = scratch_paths();
+        let mut request = send_to("chat-9", "two files");
+        request.artifact_ids = vec!["a".repeat(64), "b".repeat(64)];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("over the account's count limit");
+        assert!(error.contains("at most 1"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_artifact_id_queues_nothing() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let mut request = send_to("chat-9", "the chart");
+        request.artifact_ids = vec!["c".repeat(64)];
+        let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            Some("job-1"),
+            NOW,
+        )
+        .expect_err("no such artifact");
+        assert!(error.contains("no stored artifact"), "{error}");
+        assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_survives_a_restart_and_is_still_delivered() {
+        // The daemon stopping between "queued" and "sent" is the ordinary
+        // case, not the exotic one: the row is the only thing that carries
+        // the send, so it has to outlive the process that wrote it.
+        let paths = DaemonPaths::under(&scratch_root());
+
+        let outbox_id = {
+            let mut store = DaemonStore::open(&paths).expect("open");
+            store
+                .upsert_channel_account(&ChannelAccountRecord {
+                    account_id: "acct-1".into(),
+                    kind: ChannelKind::Telegram,
+                    label: "Ops".into(),
+                    enabled: true,
+                    non_secret_config: serde_json::json!({}),
+                    credential_ref: Some("channel:acct-1".into()),
+                    access_policy: ChannelAccessPolicy::default(),
+                    health: ChannelHealth::connected(NOW, None),
+                    created_at_ms: NOW,
+                    updated_at_ms: NOW,
+                })
+                .expect("account");
+            let request = send_to("chat-9", "queued before the crash");
+            let plan = plan_send(&request, &account_authority(), None).expect("authorized");
+            let queued = queue_send(
+                &mut store,
+                &paths,
+                &request,
+                &plan,
+                None,
+                Some("job-restart"),
+                NOW,
+            )
+            .expect("queued");
+            queued["outbox_id"].as_str().expect("id").to_string()
+        }; // the daemon stops here
+
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        let adapter = Arc::new(FakeAdapter::new());
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent[0].text, "queued before the crash");
+        // The same durable identity throughout — not a second message.
+        assert!(!outbox_id.is_empty());
+        assert!(store
+            .claim_outbox_batch(NOW + 120_000, 10)
+            .unwrap()
+            .is_empty());
     }
 }

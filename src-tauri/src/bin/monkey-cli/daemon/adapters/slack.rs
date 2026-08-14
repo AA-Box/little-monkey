@@ -48,8 +48,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope, ChannelHealth,
-    ChannelKind, ChannelSender, InboundTransport, OutboundMessage, ProviderCapabilities,
-    SendOutcome,
+    ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -57,7 +57,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
     fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
-    InboundBatch, LoadedAttachment,
+    InboundBatch, LoadedAttachment, TransportStatus,
 };
 
 const API_BASE: &str = "https://slack.com/api";
@@ -107,9 +107,10 @@ struct Shared {
     /// Hands released envelope ids back to whichever socket connection is
     /// current, which is the only place an ACK frame can be written.
     ack_tx: mpsc::Sender<String>,
-    /// True between a successful WebSocket connect and its loss, for a probe
-    /// that reports the transport rather than the credential.
-    socket_connected: std::sync::atomic::AtomicBool,
+    /// What the Socket Mode connection is actually doing — see
+    /// [`TransportStatus`]; `poll` cannot answer this, and the probe reports
+    /// the transport rather than the credential.
+    status: TransportStatus,
 }
 
 pub struct SlackAdapter {
@@ -150,7 +151,7 @@ impl SlackAdapter {
                 permanent_error: Mutex::new(None),
                 pending_acks: std::sync::Mutex::new(std::collections::HashMap::new()),
                 ack_tx,
-                socket_connected: std::sync::atomic::AtomicBool::new(false),
+                status: TransportStatus::default(),
             }),
             ack_rx: std::sync::Mutex::new(Some(ack_rx)),
             started: tokio::sync::OnceCell::new(),
@@ -214,6 +215,12 @@ impl ChannelAdapter for SlackAdapter {
         }
     }
 
+    /// The Socket Mode connection's own state. A poll coming back empty is
+    /// the normal quiet case and says nothing about whether it is live.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(self.shared.status.get())
+    }
+
     async fn probe(&self) -> ChannelHealth {
         let now = now_ms();
         if let Some(error) = self.shared.permanent_error.lock().await.clone() {
@@ -227,10 +234,7 @@ impl ChannelAdapter for SlackAdapter {
                 // Mode connection. A token whose socket has never started is
                 // not connected, and one whose socket dropped is degraded.
                 let started = self.started.get().is_some();
-                let socket_up = self
-                    .shared
-                    .socket_connected
-                    .load(std::sync::atomic::Ordering::SeqCst);
+                let socket_up = self.shared.status.get() == HealthState::Connected;
                 if started && socket_up {
                     ChannelHealth::connected(
                         now,
@@ -1078,11 +1082,13 @@ async fn run_socket_loop(
         match auth_test(&http, &api_base, &secret.bot_token).await {
             Ok(identity) if identity.ok => break identity,
             Ok(identity) => {
+                shared.status.set(HealthState::Error);
                 *shared.permanent_error.lock().await =
                     Some(format!("Slack rejected the bot token: {}", identity.error));
                 return;
             }
             Err(_) => {
+                shared.status.set(HealthState::Degraded);
                 tokio::time::sleep(identity_backoff).await;
                 identity_backoff = (identity_backoff * 2).min(MAX_BACKOFF);
             }
@@ -1099,6 +1105,7 @@ async fn run_socket_loop(
         let socket_url = match open_socket_url(&http, &api_base, &secret.app_token).await {
             Ok(url) => url,
             Err(_) => {
+                shared.status.set(HealthState::Degraded);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
@@ -1121,9 +1128,9 @@ async fn run_socket_loop(
             &shared,
         )
         .await;
-        shared
-            .socket_connected
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Whatever ended it, nothing arrives on this account until the next
+        // connection is up.
+        shared.status.set(HealthState::Degraded);
         if tx.is_closed() {
             return;
         }
@@ -1165,9 +1172,10 @@ async fn run_one_connection(
         Ok(pair) => pair,
         Err(_) => return false,
     };
-    shared
-        .socket_connected
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // The URL was minted seconds ago by an authenticated
+    // `apps.connections.open`, so a completed handshake on it is a live
+    // authenticated transport rather than merely an open socket.
+    shared.status.set(HealthState::Connected);
     let mut got_frame = false;
     loop {
         tokio::select! {
@@ -1485,8 +1493,8 @@ mod tests {
         let _ = adapter.started.set(());
         adapter
             .shared
-            .socket_connected
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .status
+            .set(little_monkey_lib::channels::types::HealthState::Connected);
         let health = adapter.probe().await;
         assert_eq!(
             health.state,

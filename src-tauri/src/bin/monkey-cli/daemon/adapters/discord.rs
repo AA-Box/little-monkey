@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
+    ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
     ProviderCapabilities, SendOutcome,
 };
 use serde_json::Value;
@@ -130,6 +130,9 @@ impl ResumeState {
 const GATEWAY_NOT_STARTED: u8 = 0;
 const GATEWAY_RECONNECTING: u8 = 1;
 const GATEWAY_CONNECTED: u8 = 2;
+/// The gateway task exited for good — bad token or disallowed intent.
+/// Backoff does not fix it, and health must say so rather than "reconnecting".
+const GATEWAY_FAILED: u8 = 3;
 
 /// State shared between the gateway task and the adapter handle. Everything
 /// here is either non-secret or already redacted before it lands — the token
@@ -144,7 +147,9 @@ struct Shared {
     /// The current resume state, mirrored out of the gateway task after every
     /// frame so `poll` can snapshot it into the durable cursor.
     resume: std::sync::Mutex<ResumeState>,
-    /// One of the `GATEWAY_*` constants above.
+    /// One of the `GATEWAY_*` constants above. This is what the daemon's
+    /// health loop reads through `live_transport`: `poll` returns an empty
+    /// batch whether the socket is live or dropped, so it cannot answer this.
     gateway_status: std::sync::atomic::AtomicU8,
 }
 
@@ -283,6 +288,26 @@ impl ChannelAdapter for DiscordAdapter {
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::Discord, InboundTransport::Socket)
         }
+    }
+
+    /// The gateway's own state. Discord is a socket transport, so a poll
+    /// coming back empty says nothing about whether the connection is live.
+    /// `Connected` is reported for exactly one state: a live READY/RESUMED
+    /// session. A never-started gateway is `Disconnected`, a dead one is
+    /// `Error`, and anything in between is `Degraded`.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(
+            match self
+                .shared
+                .gateway_status
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                GATEWAY_CONNECTED => HealthState::Connected,
+                GATEWAY_NOT_STARTED => HealthState::Disconnected,
+                GATEWAY_FAILED => HealthState::Error,
+                _ => HealthState::Degraded,
+            },
+        )
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -1385,6 +1410,8 @@ async fn run_one_connection(
                                 std::sync::atomic::Ordering::SeqCst,
                             );
                         }
+                        // The id itself is captured into GatewayState by
+                        // handle_frame; liveness is Action::Established's job.
                         Action::SetBotUserId(_id) => {}
                         Action::Envelope(envelope) => {
                             // The state rides along, frozen at this dispatch.
@@ -1532,7 +1559,7 @@ async fn run_gateway_loop(
                         *shared.permanent_error.lock().await = Some(error);
                         shared
                             .gateway_status
-                            .store(GATEWAY_RECONNECTING, std::sync::atomic::Ordering::SeqCst);
+                            .store(GATEWAY_FAILED, std::sync::atomic::Ordering::SeqCst);
                         return;
                     }
                     ConnectionOutcome::Shutdown => return,
@@ -1550,6 +1577,9 @@ async fn run_gateway_loop(
                 }
             }
             Err(FetchError::Permanent(error)) => {
+                shared
+                    .gateway_status
+                    .store(GATEWAY_FAILED, std::sync::atomic::Ordering::SeqCst);
                 *shared.permanent_error.lock().await = Some(error);
                 return;
             }

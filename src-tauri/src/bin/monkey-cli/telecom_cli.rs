@@ -346,9 +346,8 @@ fn set_token(account_id: &str) -> Result<(), String> {
     let reference = little_monkey_lib::channels::telecom_credential_ref(account_id);
     KeyringChannelSecrets.put(&reference, secret)?;
     account.credential_ref = Some(reference);
-    account.updated_at_ms = now_ms();
-    store.upsert_telecom_account(&account)?;
-    println!("Credential stored for {account_id}.");
+    record_credential_change(&mut store, account)?;
+    println!("Credential stored for {account_id}. Run `monkey telecom probe {account_id}` to verify it.");
     Ok(())
 }
 
@@ -360,9 +359,33 @@ fn mark_credential(account_id: &str) -> Result<(), String> {
     account.credential_ref = Some(little_monkey_lib::channels::telecom_credential_ref(
         account_id,
     ));
+    record_credential_change(&mut store, account)?;
+    println!("Credential recorded for {account_id}.");
+    Ok(())
+}
+
+/// A carrier credential was just written: whatever the old one had proven
+/// about connectivity is unverified now, on this row and on the SMS channel
+/// account that shadows it — texts go out through this same credential.
+fn record_credential_change(
+    store: &mut DaemonStore,
+    mut account: TelecomAccountRecord,
+) -> Result<(), String> {
+    let unverified = ChannelHealth {
+        state: HealthState::Disconnected,
+        detail: Some("Credential changed; run a probe to verify the connection.".to_string()),
+        last_error: None,
+        probed_at_ms: now_ms(),
+    };
+    let account_id = account.account_id.clone();
+    account.health = unverified.clone();
     account.updated_at_ms = now_ms();
     store.upsert_telecom_account(&account)?;
-    println!("Credential recorded for {account_id}.");
+    if let Some(mut channel) = store.channel_account(&account_id)? {
+        channel.health = unverified;
+        channel.updated_at_ms = now_ms();
+        store.upsert_channel_account(&channel)?;
+    }
     Ok(())
 }
 

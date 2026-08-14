@@ -394,6 +394,33 @@ impl DaemonStore {
             .collect()
     }
 
+    /// Whether the frozen route that produced a job said its run may answer
+    /// the conversation it came from.
+    ///
+    /// Read back from the durable turn rather than carried in the child's
+    /// environment for the same reason `send_message` reads its destination
+    /// from the event log: the grant was decided when the route was frozen,
+    /// and the run must not be able to influence it. `None` when the job did
+    /// not come through ingress at all.
+    pub fn ingress_reply_grant_for_job(&self, job_id: &str) -> Result<Option<bool>, String> {
+        let ingress_json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT ingress_json FROM ingress_turns WHERE job_id=?1
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(ingress_json) = ingress_json else {
+            return Ok(None);
+        };
+        let ingress: ConversationIngress =
+            serde_json::from_str(&ingress_json).map_err(|error| error.to_string())?;
+        Ok(Some(ingress.target.reply_to_conversation))
+    }
+
     /// One turn by the durable submission id handed back to its origin.
     pub fn ingress_turn(&self, ingress_id: &str) -> Result<Option<StoredIngressTurn>, String> {
         self.connection

@@ -1970,30 +1970,110 @@ pub async fn channels_routes() -> Result<Value, String> {
     parse_json(&command(vec!["channels".into(), "routes".into(), "--json".into()]).await?)
 }
 
-#[tauri::command]
-pub async fn channels_add_route(
-    recipe: String,
-    account_id: Option<String>,
-    conversation_id: Option<String>,
-    kind: Option<String>,
-    repository: Option<String>,
-) -> Result<(), String> {
-    validate_token("recipe", &recipe, 200)?;
-    let mut args = vec!["channels".into(), "add-route".into(), recipe];
+/// The scope and target fields `channels_add_route`/`channels_update_route`
+/// share, exactly the CLI's `RouteOptions`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RouteOptionArgs {
+    pub account_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub sender_id: Option<String>,
+    pub kind: Option<String>,
+    pub repository: Option<String>,
+    /// Recipe parameters as `name=value` strings.
+    #[serde(default)]
+    pub params: Vec<String>,
+    pub session_scope: Option<String>,
+    pub priority: Option<i32>,
+    /// Whether runs of this route may answer their conversation. Defaults on.
+    pub reply: Option<bool>,
+    /// Whether the route is active. Defaults on.
+    pub enabled: Option<bool>,
+}
+
+/// Turn the shared route fields into CLI arguments.
+///
+/// Every valued flag is passed as one `--flag=value` token: a provider
+/// conversation id may legitimately begin with a dash (a Telegram group id
+/// does), and as a separate token the CLI's parser would read it as a flag.
+fn route_option_args(options: RouteOptionArgs, args: &mut Vec<String>) -> Result<(), String> {
     for (flag, value) in [
-        ("--account", account_id),
-        ("--conversation", conversation_id),
-        ("--kind", kind),
+        ("--account", options.account_id),
+        ("--conversation", options.conversation_id),
+        ("--thread", options.thread_id),
+        ("--sender", options.sender_id),
+        ("--kind", options.kind),
     ] {
         if let Some(value) = value {
             validate_token("route scope", &value, MAX_CHANNEL_ID)?;
-            args.push(flag.into());
-            args.push(value);
+            args.push(format!("{flag}={value}"));
         }
     }
-    if let Some(repository) = repository {
-        args.push("--repository".into());
-        args.push(repository);
+    if let Some(repository) = options.repository {
+        validate_token("repository", &repository, 512)?;
+        args.push(format!("--repository={repository}"));
+    }
+    for param in options.params {
+        validate_token("route param", &param, 512)?;
+        if !param.contains('=') {
+            return Err("Route parameters must be name=value".to_string());
+        }
+        args.push(format!("--param={param}"));
+    }
+    if let Some(session_scope) = options.session_scope {
+        validate_token("session scope", &session_scope, 32)?;
+        args.push(format!("--session-scope={session_scope}"));
+    }
+    if let Some(priority) = options.priority {
+        args.push(format!("--priority={priority}"));
+    }
+    if options.reply == Some(false) {
+        args.push("--no-reply".into());
+    }
+    if options.enabled == Some(false) {
+        args.push("--disabled".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn channels_add_route(
+    recipe: String,
+    options: Option<RouteOptionArgs>,
+) -> Result<Value, String> {
+    validate_token("recipe", &recipe, 200)?;
+    if recipe.starts_with('-') {
+        return Err("Invalid recipe".to_string());
+    }
+    let mut args = vec!["channels".into(), "add-route".into(), recipe];
+    route_option_args(options.unwrap_or_default(), &mut args)?;
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+#[tauri::command]
+pub async fn channels_update_route(
+    route_id: String,
+    recipe: String,
+    options: Option<RouteOptionArgs>,
+) -> Result<Value, String> {
+    let route_id = channel_id("route id", &route_id)?;
+    validate_token("recipe", &recipe, 200)?;
+    if recipe.starts_with('-') {
+        return Err("Invalid recipe".to_string());
+    }
+    let mut args = vec!["channels".into(), "update-route".into(), route_id, recipe];
+    route_option_args(options.unwrap_or_default(), &mut args)?;
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+#[tauri::command]
+pub async fn channels_enable_route(route_id: String, enabled: bool) -> Result<(), String> {
+    let route_id = channel_id("route id", &route_id)?;
+    let mut args = vec!["channels".into(), "enable-route".into(), route_id];
+    if !enabled {
+        args.push("--off".into());
     }
     command(args).await.map(|_| ())
 }
@@ -2028,6 +2108,71 @@ pub async fn channels_remove(account_id: String) -> Result<(), String> {
     command(vec!["channels".into(), "remove".into(), account_id])
         .await
         .map(|_| ())
+}
+
+/// Edit an existing account's non-secret settings and label. Secrets cannot
+/// travel through here: the CLI subcommand this wraps writes
+/// `non_secret_config` and `label` and nothing else.
+#[tauri::command]
+pub async fn channels_set_config(
+    account_id: String,
+    config: Option<String>,
+    label: Option<String>,
+) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "set-config".into(), account_id];
+    if let Some(config) = config {
+        // Parsed here as well as in the CLI so a malformed object is refused
+        // before it becomes a process argument.
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Provider settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    if let Some(label) = label {
+        validate_token("label", &label, 120)?;
+        args.push(format!("--label={label}"));
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// The complete callback URL for a webhook account, or `configured: false`
+/// with the listener path when no public base URL is set. Composed by the
+/// daemon — the one authority on what it is reachable as — never glued
+/// together in the frontend.
+#[tauri::command]
+pub async fn channels_callback_url(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "callback-url".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Set or clear the public base URL webhook callbacks are advertised under.
+#[tauri::command]
+pub async fn channels_set_public_url(url: Option<String>) -> Result<(), String> {
+    let mut args = vec!["channels".into(), "set-public-url".into()];
+    match url {
+        Some(url) => {
+            validate_token("public base URL", &url, 512)?;
+            // A positional argument, so a value starting with a dash would be
+            // read as a flag by the CLI's own parser — `--clear` typed into
+            // the URL box must not clear the setting instead of failing.
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err("The public base URL must start with http:// or https://".to_string());
+            }
+            args.push(url);
+        }
+        None => args.push("--clear".into()),
+    }
+    command(args).await.map(|_| ())
 }
 
 /// Store an account's credential.
