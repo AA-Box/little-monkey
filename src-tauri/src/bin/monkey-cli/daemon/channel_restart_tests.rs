@@ -212,6 +212,30 @@ fn distinct_runs(queue: &FakeQueue) -> usize {
 
 /// The invariant every crash test ends on: one provider event, one durable
 /// turn that the event points at, and one run.
+/// The durable row a crash *before* the queue took the turn leaves behind.
+///
+/// Asserted column by column rather than trusted, because the injected failure
+/// reaches its caller as an `Err` and a caller's error handling writes — the
+/// event's `ignore_reason`, the account's health. None of that is state a real
+/// crash produces. What makes the recovery claim hold anyway is that recovery
+/// reads only `ingress_turns`, so this pins the row to exactly what a bare
+/// commit leaves: never submitted, never charged an attempt, no error recorded.
+fn assert_turn_awaits_its_first_submission(store: &DaemonStore) {
+    let pending = store.pending_ingress_turns(10).unwrap();
+    assert_eq!(pending.len(), 1, "expected one turn awaiting submission");
+    assert_eq!(
+        pending[0].attempts, 0,
+        "a crash spent a submission attempt the process never made"
+    );
+    let turns = store.recent_ingress_turns(10).unwrap();
+    assert_eq!(turns[0].state, super::ingress_store::IngressState::Accepted);
+    assert_eq!(turns[0].job_id, None, "no run was submitted");
+    assert_eq!(
+        turns[0].last_error, None,
+        "the injected failure must not be recorded as the turn's own"
+    );
+}
+
 fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, account_id: &str) {
     let events = store.recent_channel_events(account_id, 10).unwrap();
     assert_eq!(events.len(), 1, "expected one durable event: {events:?}");
@@ -457,7 +481,7 @@ async fn telegram_crash_before_the_queue_submit_recovers_exactly_one_run() {
     let events = store.recent_channel_events("acct-tg", 10).unwrap();
     assert_eq!(events.len(), 1);
     assert!(events[0].ingress_id.is_some());
-    assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 1);
+    assert_turn_awaits_its_first_submission(&store);
     assert_eq!(
         store.channel_cursor("acct-tg", "inbound").unwrap(),
         Some("500".to_string())
@@ -496,8 +520,9 @@ async fn telegram_crash_before_the_queued_state_does_not_duplicate_the_run() {
     assert_eq!(report.deferred, 1);
     assert_eq!(queue.submitted.lock().unwrap().len(), 1);
     // The run exists and the row does not know it, which is the only state
-    // recovery may not be able to tell from "never submitted".
-    assert_eq!(store.pending_ingress_turns(10).unwrap().len(), 1);
+    // recovery may not be able to tell from "never submitted" — and it must
+    // not be able to tell, because the two have to be finished the same way.
+    assert_turn_awaits_its_first_submission(&store);
 
     let recovery = super::channel_ingress::recover_pending_ingress(&mut store, &queue, NOW + 1)
         .expect("recover");
@@ -529,6 +554,20 @@ async fn telegram_crash_before_the_cursor_commit_dedupes_and_then_advances() {
     assert!(interrupted.is_err(), "{interrupted:?}");
     assert!(super::fail_points::fired());
     assert_one_of_everything(&store, &queue, "acct-tg");
+    // The mirror of crash C and D, and the reason this boundary is last: the
+    // turn is *completely* durable — queued, with the run it owns named on the
+    // row — and the only thing the crash cost is Telegram's offset. That is the
+    // cursor invariant from the durable side: an offset may only ever advance
+    // over messages already in this state, so losing it costs a redelivery and
+    // nothing else.
+    let turns = store.recent_ingress_turns(10).unwrap();
+    assert_eq!(turns[0].state, super::ingress_store::IngressState::Queued);
+    assert_eq!(
+        turns[0].job_id.as_deref(),
+        Some(queue.submitted.lock().unwrap()[0].as_str()),
+        "the queued row must name the run the queue took"
+    );
+    assert_eq!(turns[0].attempts, 1, "exactly one submission was made");
     assert!(store
         .channel_cursor("acct-tg", "inbound")
         .unwrap()
