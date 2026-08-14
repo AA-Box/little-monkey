@@ -400,12 +400,16 @@ impl ForegroundShell {
     }
 
     pub(crate) fn terminate_tree(&mut self) {
+        // Through the controller, not the pgid: the controller knows the members
+        // that left the process group, because it recorded them while their
+        // ancestry was still readable. A bare `terminate_process_group` here is
+        // the escape this branch exists to close.
+        if let Err(error) = self.controller.terminate_tree() {
+            eprintln!("agent shell: could not reclaim the whole owned tree: {error}");
+        }
         #[cfg(not(target_os = "windows"))]
-        {
-            if !self.reaped {
-                let _ = crate::os_signal::terminate_process_group(self.pgid);
-                let _ = self.child.start_kill();
-            }
+        if !self.reaped {
+            let _ = self.child.start_kill();
         }
         #[cfg(target_os = "windows")]
         {
@@ -622,6 +626,35 @@ pub(crate) fn effective_shell_limits(kind: ProcessKind, caller: ProcessLimits) -
     ])
 }
 
+/// Bring a freshly spawned shell under its controller, or refuse to run it.
+///
+/// The two failures are not degrees of the same thing and this is the one place
+/// that says so. A command that exits before anyone can look at it — an `exec`
+/// the confinement denied, a one-line `echo` — leaves no tree to bound and its
+/// exit status is the answer the caller asked for. A command that is *running*
+/// outside its containment is the case a discarded `Result` used to wave
+/// through, and there is no version of continuing from it that is not a process
+/// record claiming a bound nothing holds.
+fn attach_or_refuse(controller: &mut ResourceController, native_pid: u32) -> io::Result<()> {
+    use crate::resource_control::AttachFailure;
+
+    match controller.attach(native_pid) {
+        Ok(()) => Ok(()),
+        Err(AttachFailure::AlreadyExited) => Ok(()),
+        Err(AttachFailure::Containment(error)) => {
+            // Whatever is running is reclaimed before the error propagates: an
+            // unbounded agent-controlled tree must not outlive the refusal to
+            // supervise it.
+            if let Err(cleanup) = controller.terminate_tree() {
+                return Err(io::Error::other(format!(
+                    "{error}; and the tree could not be reclaimed either: {cleanup}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn spawn_foreground(
     workspace_root: &Path,
     cwd: &Path,
@@ -667,10 +700,9 @@ pub(crate) fn spawn_foreground(
     let native_pid = child.id();
     #[cfg(not(target_os = "windows"))]
     let native_pid = pgid;
-    // Attaching can fail only if the child is already gone, which for a command
-    // that exits instantly is normal rather than an error: there is then nothing
-    // left to bound, and the exit is the answer.
-    let _ = controller.attach(native_pid);
+    // The tokio child carries `kill_on_drop`, so returning an error here reaps the
+    // leader; `attach_or_refuse` has already reclaimed the rest of the tree.
+    attach_or_refuse(&mut controller, native_pid)?;
     Ok(ForegroundShell {
         child,
         #[cfg(not(target_os = "windows"))]
@@ -825,7 +857,19 @@ pub(crate) fn spawn_background(
         (child, stdout, stderr)
     };
     let native_pid = child.id();
-    let _ = controller.attach(native_pid);
+    if let Err(error) = attach_or_refuse(&mut controller, native_pid) {
+        // A background shell is deliberately not built with `kill_on_drop`, so the
+        // leader is reaped by wrapping it in the type whose `Drop` already knows
+        // how to end one on either platform. The rest of the tree is gone by now.
+        drop(BackgroundShellChild {
+            #[cfg(not(target_os = "windows"))]
+            pgid: native_pid,
+            child,
+            reaped: false,
+            _runtime: Some(runtime),
+        });
+        return Err(error);
+    }
     Ok(BackgroundSpawn {
         child: BackgroundShellChild {
             #[cfg(not(target_os = "windows"))]

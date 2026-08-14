@@ -85,12 +85,19 @@ pub fn snapshot() -> io::Result<Vec<ProcessNode>> {
 /// tested against hand-written tables on every platform.
 #[must_use]
 pub fn tree_members(nodes: &[ProcessNode], root_pid: u32) -> BTreeSet<u32> {
+    tree_members_of_any(nodes, &[root_pid])
+}
+
+/// [`tree_members`] over several roots at once, in one pass.
+///
+/// A supervisor that has recorded members the closure can no longer reach — a
+/// descendant whose ancestors have exited — has to expand from each of them as
+/// well as from the original root. Doing that by calling [`tree_members`] per
+/// root rebuilds the parent index once per member, which for a forty-process
+/// tree on a busy host is forty walks of the whole table every sampling tick.
+#[must_use]
+pub fn tree_members_of_any(nodes: &[ProcessNode], roots: &[u32]) -> BTreeSet<u32> {
     let mut members = BTreeSet::new();
-    if root_pid == 0 {
-        // Nothing owns pid 0, and treating it as a root would select the whole
-        // machine on a platform that reports 0 as an ancestor.
-        return members;
-    }
 
     let by_parent: BTreeMap<u32, Vec<u32>> = nodes.iter().fold(BTreeMap::new(), |mut map, node| {
         // A process that reports itself as its own parent would otherwise
@@ -102,16 +109,19 @@ pub fn tree_members(nodes: &[ProcessNode], root_pid: u32) -> BTreeSet<u32> {
         map
     });
 
-    let root_group = nodes
-        .iter()
-        .find(|node| node.pid == root_pid)
-        .map(|node| node.process_group_id)
-        .unwrap_or(0);
-
     // Parent closure, iterated rather than recursed: a reported parent cycle must
     // terminate the walk, not the watchdog.
-    let mut frontier = vec![root_pid];
-    members.insert(root_pid);
+    let mut frontier = Vec::new();
+    for root_pid in roots {
+        // Nothing owns pid 0, and treating it as a root would select the whole
+        // machine on a platform that reports 0 as an ancestor.
+        if *root_pid == 0 {
+            continue;
+        }
+        if members.insert(*root_pid) {
+            frontier.push(*root_pid);
+        }
+    }
     while let Some(pid) = frontier.pop() {
         for child in by_parent.get(&pid).into_iter().flatten() {
             if members.insert(*child) {
@@ -122,9 +132,19 @@ pub fn tree_members(nodes: &[ProcessNode], root_pid: u32) -> BTreeSet<u32> {
 
     // Group union. A group id of zero is "no group", never "every ungrouped
     // process on the host".
-    if root_group != 0 {
+    let groups: BTreeSet<u32> = roots
+        .iter()
+        .filter_map(|root_pid| {
+            nodes
+                .iter()
+                .find(|node| node.pid == *root_pid)
+                .map(|node| node.process_group_id)
+        })
+        .filter(|group| *group != 0)
+        .collect();
+    if !groups.is_empty() {
         for node in nodes {
-            if node.process_group_id == root_group {
+            if groups.contains(&node.process_group_id) {
                 members.insert(node.pid);
             }
         }
@@ -149,10 +169,25 @@ pub fn measure_tree_in(nodes: &[ProcessNode], root_pid: u32) -> Option<TreeUsage
     if !nodes.iter().any(|node| node.pid == root_pid) {
         return None;
     }
-    let members = tree_members(nodes, root_pid);
+    measure_members(&tree_members(nodes, root_pid))
+}
+
+/// Measure an already-derived membership set.
+///
+/// Split out because a supervisor's membership is not always a single closure:
+/// it is the closure unioned with descendants it recorded before their ancestry
+/// was destroyed, and those have to be measured on the same terms.
+///
+/// `None` for an empty set, on the same reasoning as [`measure_tree_in`]: zero
+/// processes holding zero bytes is a budget satisfied forever.
+#[must_use]
+pub fn measure_members(members: &BTreeSet<u32>) -> Option<TreeUsage> {
+    if members.is_empty() {
+        return None;
+    }
     let mut rss_bytes: Option<u64> = None;
     let mut unmeasured_members = 0u32;
-    for pid in &members {
+    for pid in members {
         match resident_bytes(*pid) {
             Some(bytes) => rss_bytes = Some(rss_bytes.unwrap_or(0).saturating_add(bytes)),
             // A member that exited between the snapshot and this read is not an
@@ -207,6 +242,67 @@ impl ProcessIdentity {
             None => false,
         }
     }
+
+    /// Whether this identity is still *executing*, as opposed to merely existing.
+    ///
+    /// A killed process that its parent has not reaped is a zombie: it holds no
+    /// memory, runs no code and cannot fork, but it still has a `/proc` entry and
+    /// a start time, so [`Self::is_still_alive`] answers `true` for it. A
+    /// termination pass that used that answer to decide whether anything survived
+    /// would loop until its budget ran out and then report a failure to reclaim a
+    /// tree it had in fact reclaimed.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.is_still_alive() && !is_zombie(self.pid)
+    }
+}
+
+/// Every owned member of the tree rooted at `root_pid`, as identities.
+///
+/// Identities rather than bare pids because capture and signal are separated in
+/// time — a pid captured before a group is torn down and signalled after it may
+/// by then name a process the kernel handed to somebody else.
+#[must_use]
+pub fn owned_identities(nodes: &[ProcessNode], root_pid: u32) -> Vec<ProcessIdentity> {
+    tree_members(nodes, root_pid)
+        .into_iter()
+        .filter_map(ProcessIdentity::of)
+        .collect()
+}
+
+// --- Zombie detection --------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    parse_proc_stat_is_zombie(&stat)
+}
+
+/// The state field, which is the first token after the parenthesised comm — so
+/// the same last-`)` rule the link and start-time parsers use applies here.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_is_zombie(stat: &str) -> bool {
+    let Some(index) = stat.rfind(')') else {
+        return false;
+    };
+    stat[index + 1..].split_whitespace().next() == Some("Z")
+}
+
+#[cfg(target_os = "macos")]
+fn is_zombie(pid: u32) -> bool {
+    /// `SZOMB` from `sys/proc.h`: awaiting collection by its parent.
+    const SZOMB: u32 = 5;
+    proc_bsd_info(pid).is_some_and(|info| info.pbi_status == SZOMB)
+}
+
+/// Windows has no zombie state: a process object outlives its exit only as a
+/// handle, and the pid is released at exit, so nothing can be both gone and
+/// reported alive.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
 }
 
 // --- Linux ------------------------------------------------------------------
@@ -646,6 +742,65 @@ mod tests {
         // Twenty fields after the comm; the twentieth is starttime.
         let stat = format!("42 (sh (echo)) S 7 9 9 {} 4242", "0 ".repeat(15));
         assert_eq!(parse_proc_stat_start_time(&stat), Some(4242));
+    }
+
+    #[test]
+    fn this_process_reads_as_running_rather_than_merely_existing() {
+        let me = ProcessIdentity::of(std::process::id()).expect("identity");
+        assert!(me.is_running());
+    }
+
+    /// A killed-but-unreaped child still has an entry and a start time, so a
+    /// termination pass that counted it as a survivor would never conclude.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_but_unreaped_child_is_alive_and_not_running() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("sleep spawns");
+        let identity = ProcessIdentity::of(child.id()).expect("the child has an identity");
+        child.kill().expect("kill");
+        // Deliberately not reaped yet: this is the zombie window.
+        for _ in 0..200 {
+            if !identity.is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !identity.is_running(),
+            "a zombie holds nothing and cannot fork; counting it as a survivor makes every \
+             termination burn its whole pass budget and then report a failure to reclaim a tree \
+             it did reclaim"
+        );
+        // Linux keeps the `/proc` entry and its start time for an unreaped
+        // process, which is exactly what makes this case a trap there. Darwin
+        // stops answering `PROC_PIDTBSDINFO` for a zombie, so liveness already
+        // reads as gone and only the assertion above is meaningful — asserting
+        // the same thing on both would be asserting the platform, not the rule.
+        #[cfg(target_os = "linux")]
+        assert!(
+            identity.is_still_alive(),
+            "an unreaped process still exists on Linux"
+        );
+        child.wait().expect("reaped");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_state_column_is_read_past_a_parenthesised_comm() {
+        assert!(parse_proc_stat_is_zombie(
+            "42 (sh (echo)) Z 7 9 9 0 -1 4194304"
+        ));
+        assert!(!parse_proc_stat_is_zombie(
+            "42 (sh (echo)) S 7 9 9 0 -1 4194304"
+        ));
     }
 
     #[cfg(target_os = "linux")]

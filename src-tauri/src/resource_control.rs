@@ -37,6 +37,7 @@
 //! distinction is load-bearing: a kernel-held bound survives this app dying, and
 //! a supervised one does not.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::time::Instant;
 
@@ -340,6 +341,41 @@ impl LimitBreach {
     }
 }
 
+/// Why a workload could not be brought under containment.
+///
+/// The two cases are not degrees of the same failure and must not share a
+/// branch: one is a workload that finished, and the other is a workload running
+/// outside the bound its record would otherwise claim.
+#[derive(Debug)]
+pub enum AttachFailure {
+    /// The process finished before it could be attached.
+    ///
+    /// Nothing escaped: there is no tree left to bound, and the exit status is
+    /// the answer the caller wanted. Normal for a command that fails to `exec`
+    /// or prints one line.
+    AlreadyExited,
+    /// The process exists and containment could not be established or verified —
+    /// job membership refused, the cgroup did not take it, or the host would not
+    /// report an identity that a later sample or signal could be checked against.
+    ///
+    /// Fatal by construction: continuing would run agent-controlled code with a
+    /// process record asserting a bound nothing holds.
+    Containment(io::Error),
+}
+
+impl std::fmt::Display for AttachFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachFailure::AlreadyExited => {
+                write!(formatter, "the process exited before it could be attached")
+            }
+            AttachFailure::Containment(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for AttachFailure {}
+
 /// The controller: one workload's whole resource story.
 pub struct ResourceController {
     limits: EffectiveLimits,
@@ -351,6 +387,14 @@ pub struct ResourceController {
     /// Bytes the owner has captured. Fed by whoever drains the pipes, because
     /// no backend can see a pipe.
     output_bytes: Option<u64>,
+    /// Every process this workload has ever been observed to own, by identity.
+    ///
+    /// Accumulated rather than re-derived, because ancestry is only readable
+    /// while the ancestors are alive: a descendant that re-parents after its
+    /// parent is killed cannot be attributed to this workload by any later
+    /// snapshot. What can be attributed is what was recorded *before* the link
+    /// was destroyed, which is what this is.
+    owned: BTreeMap<u32, u64>,
 }
 
 enum Backend {
@@ -397,6 +441,7 @@ impl ResourceController {
             peak_rss_bytes: None,
             peak_process_count: None,
             output_bytes: None,
+            owned: BTreeMap::new(),
         }
     }
 
@@ -477,29 +522,120 @@ impl ResourceController {
         }
     }
 
-    /// Record the workload's root once it exists.
+    /// Record the workload's root once it exists, and verify it is contained.
     ///
     /// Stores an identity rather than a pid: everything after this — sampling,
     /// termination — re-checks that the pid is still the process we attached to,
     /// so a reused pid cannot be sampled as ours or, far worse, killed as ours.
-    pub fn attach(&mut self, pid: u32) -> io::Result<()> {
-        let identity = ProcessIdentity::of(pid).ok_or_else(|| {
-            io::Error::other(format!(
-                "process {pid} was gone before it could be attached"
-            ))
-        })?;
+    ///
+    /// # This is containment verification, not bookkeeping
+    ///
+    /// The `Err` half used to be discarded at both call sites on the reading that
+    /// a process which exits instantly is normal — which is true, and is only one
+    /// of the two things that reach here. The other is a process that is
+    /// **running** and is not inside the containment the record is about to claim
+    /// for it: a Windows process that reached `CreateProcess` without being
+    /// assigned to its job, a cgroup that did not take the migration write, a host
+    /// that will not report an identity later checks depend on. Continuing from
+    /// those is the exact failure K4 exists to prevent, so they are
+    /// [`AttachFailure::Containment`] and the caller must fail the spawn.
+    pub fn attach(&mut self, pid: u32) -> Result<(), AttachFailure> {
+        let Some(identity) = ProcessIdentity::of(pid) else {
+            // No identity, so either the process is gone or this host will not
+            // say. Only the first is safe to carry on from, and the difference is
+            // whether the pid is still there at all.
+            if crate::os_signal::process_is_alive(pid) {
+                return Err(AttachFailure::Containment(io::Error::other(format!(
+                    "process {pid} is running and the host would not report its start time, so \
+                     nothing can prove which process a later sample or signal would reach"
+                ))));
+            }
+            return Err(AttachFailure::AlreadyExited);
+        };
         self.root = Some(identity);
         self.started_at = Instant::now();
-        #[cfg(windows)]
-        if let Backend::Job(job) = &self.backend {
-            job.confirm_assignment(pid)?;
+        self.owned.insert(pid, identity.start_time);
+
+        if let Err(error) = self.confirm_containment(pid) {
+            // A process that exited between the spawn and this check cannot be a
+            // member of anything, so re-ask the question that separates the two
+            // cases rather than reporting a containment failure against a corpse.
+            if !identity.is_still_alive() {
+                return Err(AttachFailure::AlreadyExited);
+            }
+            return Err(AttachFailure::Containment(error));
         }
         Ok(())
+    }
+
+    /// Ask the backend whether this process is inside the containment it created.
+    fn confirm_containment(&self, #[allow(unused_variables)] pid: u32) -> io::Result<()> {
+        match &self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cgroup(scope) => scope.confirm_membership(pid),
+            #[cfg(windows)]
+            Backend::Job(job) => job.confirm_assignment(pid),
+            // The supervisor's containment *is* the identity recorded above and
+            // the process group installed before the fork; there is no separate
+            // membership to read back.
+            Backend::Supervisor => Ok(()),
+        }
     }
 
     /// Feed the controller the byte count only the pipe reader can know.
     pub fn record_output_bytes(&mut self, bytes: u64) {
         self.output_bytes = Some(bytes);
+    }
+
+    /// Fold everything currently attributable to this workload into the owned set.
+    ///
+    /// Called on every sample, and once more immediately before a termination,
+    /// because **ancestry is only readable while the ancestors are alive**. Kill
+    /// the group first and a descendant that had left it is re-parented to init;
+    /// no later snapshot can then prove it was ever ours, and it survives. The
+    /// order this function's callers keep — record, then terminate — is the fix
+    /// for that race.
+    fn record_ownership(&mut self) {
+        let Some(root) = self.root else {
+            return;
+        };
+        let Ok(nodes) = process_tree::snapshot() else {
+            return;
+        };
+        // Expand from the root *and* from every member already recorded as ours:
+        // once the root is gone the closure from it is empty, while a member
+        // captured earlier may still have live children of its own.
+        let mut roots: Vec<u32> = vec![root.pid];
+        roots.extend(
+            self.owned
+                .iter()
+                .filter(|(pid, start_time)| {
+                    ProcessIdentity {
+                        pid: **pid,
+                        start_time: **start_time,
+                    }
+                    .is_running()
+                })
+                .map(|(pid, _)| *pid),
+        );
+        for pid in process_tree::tree_members_of_any(&nodes, &roots) {
+            if let Some(identity) = ProcessIdentity::of(pid) {
+                self.owned.entry(pid).or_insert(identity.start_time);
+            }
+        }
+    }
+
+    /// Every process still running that this workload owns.
+    #[must_use]
+    pub fn live_owned(&self) -> Vec<ProcessIdentity> {
+        self.owned
+            .iter()
+            .map(|(pid, start_time)| ProcessIdentity {
+                pid: *pid,
+                start_time: *start_time,
+            })
+            .filter(ProcessIdentity::is_running)
+            .collect()
     }
 
     /// Measure now, folding peaks into the controller.
@@ -518,18 +654,19 @@ impl ResourceController {
             }));
         };
 
+        // Whatever the backend measures, ownership is recorded on every tick:
+        // the set has to be complete *before* a termination destroys the links
+        // that prove membership.
+        self.record_ownership();
+
         let measured = match &self.backend {
             #[cfg(target_os = "linux")]
             Backend::Cgroup(scope) => scope.sample()?,
             #[cfg(windows)]
             Backend::Job(job) => job.sample()?,
             Backend::Supervisor => {
-                if !root.is_still_alive() {
-                    None
-                } else {
-                    process_tree::measure_tree(root.pid)?
-                        .map(|usage| (usage.rss_bytes, Some(usage.process_count)))
-                }
+                let usage = supervised_tree_usage(root, &self.owned)?;
+                usage.map(|usage| (usage.rss_bytes, Some(usage.process_count)))
             }
         };
         let Some((rss_bytes, process_count)) = measured else {
@@ -595,25 +732,61 @@ impl ResourceController {
 
     /// Stop the entire owned workload.
     ///
-    /// Idempotent, and safe against a root that has already exited: the identity
-    /// check happens first, so a pid that has been reused is never signalled.
-    pub fn terminate_tree(&self) -> io::Result<()> {
+    /// Idempotent, and safe against a root that has already exited: every signal
+    /// is preceded by an identity check, so a pid that has been reused is never
+    /// signalled.
+    ///
+    /// `&mut` rather than `&self` because reclaiming a tree is not a read: the
+    /// membership recorded before the first signal is what the later passes
+    /// verify against, and deriving it after the fact is the race this exists to
+    /// close.
+    pub fn terminate_tree(&mut self) -> io::Result<()> {
+        // Before anything is signalled, and unconditionally — including when the
+        // root is already gone, which is precisely the case where an escaped
+        // descendant is all that is left.
+        self.record_ownership();
         match &self.backend {
             #[cfg(target_os = "linux")]
             Backend::Cgroup(scope) => scope.terminate_tree(),
             #[cfg(windows)]
             Backend::Job(job) => job.terminate_tree(),
-            Backend::Supervisor => {
-                let Some(root) = self.root else {
-                    return Ok(());
-                };
-                if !root.is_still_alive() {
-                    return Ok(());
-                }
-                terminate_supervised_tree(root)
-            }
+            Backend::Supervisor => terminate_supervised_tree(self.root, &mut self.owned),
         }
     }
+}
+
+/// What the supervisor measures: the closure from the root, unioned with every
+/// member recorded as ours that is still running.
+///
+/// The second half is what makes an escaped descendant count against the budget
+/// it escaped. Without it a workload could put its allocation behind a `setsid`
+/// and a re-parent and read as a tree holding nothing.
+fn supervised_tree_usage(
+    root: ProcessIdentity,
+    owned: &BTreeMap<u32, u64>,
+) -> io::Result<Option<process_tree::TreeUsage>> {
+    let mut roots: Vec<u32> = vec![root.pid];
+    roots.extend(
+        owned
+            .iter()
+            .filter(|(pid, start_time)| {
+                ProcessIdentity {
+                    pid: **pid,
+                    start_time: **start_time,
+                }
+                .is_running()
+            })
+            .map(|(pid, _)| *pid),
+    );
+    if !root.is_running() && roots.len() == 1 {
+        // Nothing owned is executing: the workload is gone, which is not the same
+        // as a tree of zero processes holding zero bytes.
+        return Ok(None);
+    }
+    let nodes = process_tree::snapshot()?;
+    Ok(process_tree::measure_members(
+        &process_tree::tree_members_of_any(&nodes, &roots),
+    ))
 }
 
 /// Wall-clock milliseconds, for stamping a breach.
@@ -766,32 +939,200 @@ fn prepare_supervised(_command: &mut tokio::process::Command) {}
 #[cfg(not(unix))]
 fn prepare_supervised_std(_command: &mut std::process::Command) {}
 
+/// How many terminate-and-verify passes before the supervisor reports that it
+/// could not reclaim the workload.
+///
+/// A pass is needed at all because a member may `fork` between the snapshot and
+/// the signal, and the child is owned too. Bounded because "kill until nothing is
+/// left" against a process actively forking is an unbounded loop, and a
+/// supervisor that will not return is worse than one that reports a survivor.
+const MAX_TERMINATION_PASSES: usize = 6;
+
+/// How long a pass waits before deciding whether a signal took effect.
+///
+/// SIGKILL is not synchronous with its delivery: the target is dead when the
+/// kernel says so, not when `kill` returns, and a re-check with no pause reads
+/// the process as still running and burns a pass.
 #[cfg(unix)]
-fn terminate_supervised_tree(root: ProcessIdentity) -> io::Result<()> {
-    // The group first: one signal reaches every member that stayed in it, which
-    // is the ordinary case and the cheap one.
-    let group_result =
-        crate::os_signal::terminate_process_group(root.pid).map_err(io::Error::other);
-    // Then anything that left the group but is still a descendant. This is the
-    // half a process group cannot do, and the reason the supervisor measures by
-    // parent link as well: a child that called `setsid` is outside the group and
-    // still inside the workload.
-    if let Ok(nodes) = process_tree::snapshot() {
-        for pid in process_tree::tree_members(&nodes, root.pid) {
-            if pid == root.pid {
+const TERMINATION_SETTLE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Reclaim every process this workload owns, and prove it.
+///
+/// # The ordering, and why it is the whole algorithm
+///
+/// The previous version killed the process group and *then* looked for
+/// descendants outside it. That is a race with a guaranteed loser: the group kill
+/// re-parents every out-of-group descendant to init, so by the time the snapshot
+/// is taken the escaped process has neither the group nor a parent link, and
+/// nothing can attribute it to the workload. It survives, and the supervisor
+/// reports success.
+///
+/// So membership is captured **before** anything is signalled — that is what
+/// [`ResourceController::record_ownership`] does on every sample and once more
+/// immediately above this call — and the captured identities are what the later
+/// passes signal and verify against.
+///
+/// # Identity, at every signal
+///
+/// Each captured member is re-checked against its recorded start time
+/// immediately before it is signalled. A pid the kernel has since handed to an
+/// unrelated process fails that check and is skipped: killing the user's editor
+/// because a compiler exited and its pid was reused is a far worse outcome than
+/// leaving one process alive.
+#[cfg(unix)]
+fn terminate_supervised_tree(
+    root: Option<ProcessIdentity>,
+    owned: &mut BTreeMap<u32, u64>,
+) -> io::Result<()> {
+    if owned.is_empty() {
+        return Ok(());
+    }
+    let mut group_error = None;
+    for pass in 0..MAX_TERMINATION_PASSES {
+        if pass > 0 {
+            // Re-derive from what is still running: a member that forked after
+            // the previous pass is owned as well, and its ancestry is readable
+            // right now because its parent is one of ours.
+            expand_owned(owned);
+        }
+
+        // The group: one signal for every member that stayed in it, which is the
+        // ordinary case and the cheap one. Only while the leader is still there —
+        // a process-group id *is* the leader's pid, so signalling it after the
+        // leader has been reaped can reach a group the kernel has since given to
+        // somebody else.
+        if let Some(root) = root {
+            if root.is_still_alive() {
+                if let Err(error) = crate::os_signal::terminate_process_group(root.pid) {
+                    group_error = Some(error);
+                }
+            }
+        }
+
+        // Then every captured member, identity-validated. The root goes last so
+        // that while the rest are being signalled its zombie still reserves the
+        // process-group id above.
+        let root_pid = root.map(|root| root.pid);
+        for (pid, start_time) in owned.iter() {
+            if Some(*pid) == root_pid {
                 continue;
             }
-            // Safe: sends a signal to one pid. A pid that has already exited
-            // answers ESRCH, which is the success case here.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            kill_if_identity_matches(*pid, *start_time);
+        }
+        if let Some(root) = root {
+            kill_if_identity_matches(root.pid, root.start_time);
+        }
+
+        if survivors(owned).is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(TERMINATION_SETTLE);
+        if survivors(owned).is_empty() {
+            return Ok(());
         }
     }
-    group_result
+
+    let remaining = survivors(owned);
+    if !remaining.is_empty() {
+        // Reported, never swallowed: a caller that believes a tree was reclaimed
+        // will release its reservation and record a clean exit for a workload
+        // still consuming the machine.
+        return Err(io::Error::other(format!(
+            "{} process(es) owned by this workload survived {MAX_TERMINATION_PASSES} termination \
+             passes: {remaining:?}",
+            remaining.len()
+        )));
+    }
+    match group_error {
+        Some(error) => Err(io::Error::other(error)),
+        None => Ok(()),
+    }
 }
 
+/// Add anything reachable from a still-running owned member.
+#[cfg(unix)]
+fn expand_owned(owned: &mut BTreeMap<u32, u64>) {
+    let roots = survivors(owned);
+    if roots.is_empty() {
+        return;
+    }
+    let Ok(nodes) = process_tree::snapshot() else {
+        return;
+    };
+    for pid in process_tree::tree_members_of_any(&nodes, &roots) {
+        if let Some(identity) = ProcessIdentity::of(pid) {
+            owned.entry(pid).or_insert(identity.start_time);
+        }
+    }
+}
+
+/// Owned members that are still executing — zombies excluded, because a process
+/// awaiting reaping holds nothing and cannot fork, and counting it would make
+/// every termination burn its whole pass budget and then report a failure.
+#[cfg(unix)]
+fn survivors(owned: &BTreeMap<u32, u64>) -> Vec<u32> {
+    owned
+        .iter()
+        .filter(|(pid, start_time)| {
+            ProcessIdentity {
+                pid: **pid,
+                start_time: **start_time,
+            }
+            .is_running()
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// SIGKILL one pid, and only if it is still the process that was recorded.
+#[cfg(unix)]
+fn kill_if_identity_matches(pid: u32, start_time: u64) {
+    let identity = ProcessIdentity { pid, start_time };
+    if !identity.is_still_alive() {
+        return;
+    }
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // 0 is "every process in our own group" and negatives name a group, so
+    // neither is a question about one process — and one of them would signal this
+    // app. 1 is init.
+    if target <= 1 {
+        return;
+    }
+    // Safe: sends a signal to one pid whose identity was checked on the line
+    // above. A process that exited in between answers ESRCH, which is the
+    // outcome this wanted.
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+/// Windows reaches here only when the job object could not be created, so the
+/// tree primitive is the parent-link closure and `taskkill /T` walks it.
 #[cfg(not(unix))]
-fn terminate_supervised_tree(root: ProcessIdentity) -> io::Result<()> {
-    crate::os_signal::terminate_process_group(root.pid).map_err(io::Error::other)
+fn terminate_supervised_tree(
+    root: Option<ProcessIdentity>,
+    owned: &mut BTreeMap<u32, u64>,
+) -> io::Result<()> {
+    let mut last_error = None;
+    for (pid, start_time) in owned.iter() {
+        let identity = ProcessIdentity {
+            pid: *pid,
+            start_time: *start_time,
+        };
+        // Same rule as the unix path: never signal a pid the kernel may have
+        // handed to somebody else since it was recorded.
+        if !identity.is_running() {
+            continue;
+        }
+        if let Err(error) = crate::os_signal::terminate_process_group(*pid) {
+            last_error = Some(error);
+        }
+    }
+    let _ = root;
+    match last_error {
+        Some(error) => Err(io::Error::other(error)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -998,7 +1339,39 @@ mod tests {
 
     #[test]
     fn terminating_before_anything_is_attached_is_not_an_error() {
-        let controller = ResourceController::new(EffectiveLimits::default());
+        let mut controller = ResourceController::new(EffectiveLimits::default());
         controller.terminate_tree().expect("nothing to terminate");
+    }
+
+    /// A pid that has been reused is the one thing a supervisor must never
+    /// signal. Deterministic because it never involves a second process: an
+    /// identity whose start time does not match what the pid reports now is by
+    /// definition not the process that was recorded, and this asserts the
+    /// supervisor treats that as "not ours" rather than as "still running".
+    #[cfg(unix)]
+    #[test]
+    fn a_recorded_member_whose_identity_no_longer_matches_is_not_signalled() {
+        let mut owned = BTreeMap::new();
+        // This test process, under a start time it does not have.
+        let me = std::process::id();
+        owned.insert(me, u64::MAX);
+        assert!(
+            survivors(&owned).is_empty(),
+            "a stale identity must not read as a live owned member"
+        );
+        // And the signal path agrees: were it not identity-checked, this would
+        // SIGKILL the test binary and the run would simply disappear.
+        kill_if_identity_matches(me, u64::MAX);
+        terminate_supervised_tree(None, &mut owned).expect("nothing of ours is running");
+    }
+
+    /// Init is not a member of anything, and 0 means "our own process group".
+    #[cfg(unix)]
+    #[test]
+    fn the_supervisor_refuses_to_signal_init_or_its_own_group() {
+        // Neither call may deliver a signal. Reaching the `libc::kill` below
+        // either guard would terminate this test binary or the whole session.
+        kill_if_identity_matches(0, 0);
+        kill_if_identity_matches(1, 0);
     }
 }

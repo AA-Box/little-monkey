@@ -236,6 +236,30 @@ impl CgroupScope {
         }
     }
 
+    /// Read the scope's membership back and require the workload to be in it.
+    ///
+    /// The migration write happens between `fork` and `exec`, where a failure has
+    /// no channel back to this process: `pre_exec` returning an error aborts the
+    /// spawn on some paths and is simply lost on others, and a partially applied
+    /// delegation can leave the write refused with `EPERM`. Reading `cgroup.procs`
+    /// afterwards is the only way to know the kernel bound is actually holding the
+    /// process the record says it is holding.
+    pub fn confirm_membership(&self, pid: u32) -> io::Result<()> {
+        let members = fs::read_to_string(self.path.join("cgroup.procs"))?;
+        if members
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .any(|member| member == pid)
+        {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "process {pid} started without joining its cgroup scope at {}, so `memory.max` and \
+             `pids.max` are not holding it",
+            self.path.display()
+        )))
+    }
+
     pub fn prepare_tokio(&self, command: &mut tokio::process::Command) -> io::Result<()> {
         let fd = self.procs_fd.as_raw_fd();
         // Safe: the closure writes two bytes to an already-open descriptor and
