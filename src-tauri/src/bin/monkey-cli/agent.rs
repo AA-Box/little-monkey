@@ -830,6 +830,10 @@ async fn execute_tool_call(
     options: &chat::ChatOptions,
     state: &AppState,
     perms: &mut TerminalPermissions,
+    // The loop's own id for this invocation — the same one the run events
+    // carry. Trusted because the runtime assigns it; the model never sees or
+    // supplies it. `send_message` keys durable deliveries on it.
+    tool_call_id: &str,
     name: &str,
     raw_arguments: &str,
     checkpoint_id: Option<&str>,
@@ -931,7 +935,11 @@ async fn execute_tool_call(
             ));
         }
         return match perms.request("send_message", &preview).await {
-            Ok(()) => match crate::daemon::channel_tool::send_message(&request, &authority) {
+            Ok(()) => match crate::daemon::channel_tool::send_message(
+                &request,
+                &authority,
+                Some(tool_call_id),
+            ) {
                 Ok(value) => value.to_string(),
                 Err(error) => serde_json::json!({ "error": error }).to_string(),
             },
@@ -1939,6 +1947,7 @@ async fn run_tool_loop(
                 options,
                 state,
                 perms,
+                &observed_tool_call_id,
                 &call.name,
                 &call.arguments,
                 checkpoint_id,
@@ -2097,6 +2106,7 @@ mod tests {
                 &options,
                 &state,
                 &mut perms,
+                "tool-1-1",
                 "present_plan",
                 args,
                 None,
@@ -2146,6 +2156,7 @@ mod tests {
                 &options,
                 &state,
                 &mut perms,
+                "tool-1-1",
                 "task",
                 args,
                 None,
@@ -2197,6 +2208,7 @@ mod tests {
             &options,
             &state,
             &mut perms,
+            "tool-1-1",
             "task",
             args,
             None,
@@ -2230,6 +2242,7 @@ mod tests {
             &options,
             &state,
             &mut perms,
+            "tool-1-1",
             "remember",
             r#"{"text":"must not persist"}"#,
             None,

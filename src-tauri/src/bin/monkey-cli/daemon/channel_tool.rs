@@ -14,9 +14,11 @@
 //!   tool returns as soon as the row is durable, so a crash between "the model
 //!   said it" and "the provider has it" resolves the same way every other
 //!   outbound message does. This file never calls a provider adapter.
-//! - The idempotency key is derived from the job and from what is being sent,
-//!   so a run that re-executes its tool calls recomputes the same key and the
-//!   outbox recognizes the row instead of queueing a second message.
+//! - The idempotency key is derived from the job and the runtime-assigned
+//!   tool-call id — the durable identity of one tool invocation — so a run
+//!   that re-executes a tool call recomputes the same key and the outbox
+//!   recognizes the row, while two distinct calls asking for the same words
+//!   remain two messages.
 //! - Reply depth is carried forward, which is what lets the inbound gate stop
 //!   two agents from talking to each other forever.
 
@@ -198,8 +200,15 @@ const MAX_DESTINATION_CHARS: usize = 512;
 pub(crate) fn send_message(
     request: &ChannelSendRequest,
     authority: &SendAuthority,
+    tool_call_id: Option<&str>,
 ) -> Result<serde_json::Value, String> {
-    let job_id = std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty());
+    let invocation = SendInvocation {
+        job_id: std::env::var(JOB_ID_ENV).ok().filter(|id| !id.is_empty()),
+        tool_call_id: tool_call_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+    };
     let origin = current_channel_origin().map(|(_, origin)| origin);
     let plan = plan_send(request, authority, origin.as_ref())?;
 
@@ -211,9 +220,21 @@ pub(crate) fn send_message(
         request,
         &plan,
         origin.as_ref(),
-        job_id.as_deref(),
+        &invocation,
         now_ms()?,
     )
+}
+
+/// The trusted identity of one durable tool invocation.
+///
+/// Both fields come from the runtime — the daemon's job id from the
+/// environment it set on its own child, and the agent loop's tool-call id —
+/// never from a tool argument. The model cannot supply, repeat, or omit
+/// either, which is what makes the pair safe to key deliveries on.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SendInvocation {
+    pub job_id: Option<String>,
+    pub tool_call_id: Option<String>,
 }
 
 /// A send that has passed every check that does not need the store: what it
@@ -279,8 +300,8 @@ pub(crate) fn plan_send(
 /// Write the planned send into the durable outbox.
 ///
 /// Everything a provider will need is decided here and nowhere later: the
-/// files are copied, the idempotency key is derived from the job, and the row
-/// is the only record of the send. This function never calls an adapter —
+/// files are copied, the idempotency key is derived from the invocation, and
+/// the row is the only record of the send. This function never calls an adapter —
 /// delivery is the outbox worker's job, so a crash between "the model said it"
 /// and "the provider has it" resolves the same way every other outbound
 /// message does.
@@ -290,9 +311,10 @@ pub(crate) fn queue_send(
     request: &ChannelSendRequest,
     plan: &SendPlan,
     origin: Option<&ChannelOrigin>,
-    job_id: Option<&str>,
+    invocation: &SendInvocation,
     now_ms: i64,
 ) -> Result<serde_json::Value, String> {
+    let job_id = invocation.job_id.as_deref();
     let text = request.text.trim();
     let has_files = !request.artifact_ids.is_empty();
     let Destination {
@@ -356,37 +378,30 @@ pub(crate) fn queue_send(
         Some(job_id) if origin.is_some() => inbound_reply_depth(store, job_id).saturating_add(1),
         _ => 0,
     };
-    let idempotency_key = match job_id {
-        // Derived from the job and from *what is being sent*, never from how
-        // many sends came before it. A counter would shift under a run that
-        // re-executes its tool calls — the earlier rows are still there, so
-        // the replayed first message would take the second slot and go out
-        // twice. Keyed by content, the replay recomputes the key the outbox
-        // already holds and the row is recognized rather than duplicated.
+    let idempotency_key = match (job_id, invocation.tool_call_id.as_deref()) {
+        // Derived from the durable invocation — the job and the runtime's own
+        // tool-call id — never from the content. A content key would collapse
+        // two intentional identical sends from one run into one delivery; a
+        // counter would shift under a replayed run and let the first message
+        // go out twice. The invocation is exactly what a replay repeats and
+        // exactly what two distinct tool calls never share: the replay
+        // recomputes the key the outbox already holds and is recognized,
+        // while "Reminder!" sent twice on purpose is two keys and two rows.
         //
-        // The cost is deliberate: one run that sends byte-identical messages
-        // to the same destination twice gets one message and an
-        // `already_queued` answer telling it so. An accidental double-send
-        // reaches a person and cannot be taken back; a suppressed identical
-        // repeat is visible in the tool's own result.
-        Some(job_id) => {
+        // What the invocation *asked to send* is still pinned — the row's
+        // payload digest — so a replay that somehow carries different bytes
+        // under the same identity fails closed in the store instead of
+        // silently sending either version. See `enqueue_channel_message`.
+        (Some(job_id), Some(tool_call_id)) => {
             let prefix = if is_origin_reply { "reply" } else { "send" };
-            let digest = sha256_hex(
-                send_fingerprint(
-                    &account_id,
-                    &conversation_id,
-                    thread_id.as_deref(),
-                    reply_to_provider_id.as_deref(),
-                    text,
-                    &attachments,
-                )
-                .as_bytes(),
-            );
-            format!("{prefix}-{job_id}-{}", &digest[..32])
+            format!("{prefix}-{job_id}-{tool_call_id}")
         }
-        // No durable job to be retried under: a fresh key per call is the
-        // honest statement that nothing will ever legitimately resubmit it.
-        None => format!("send-adhoc-{}", uuid::Uuid::new_v4().simple()),
+        // No durable invocation to be retried under: a fresh key per call is
+        // the honest statement that nothing will ever legitimately resubmit
+        // it. A job with no tool-call id lands here too — without the id
+        // there is no invocation identity, and guessing one from content
+        // would recreate the collapsed-duplicates bug.
+        _ => format!("send-adhoc-{}", uuid::Uuid::new_v4().simple()),
     };
 
     let payload = OutboxPayload {
@@ -442,36 +457,6 @@ pub(crate) fn queue_send(
             "note": "An identical message was already queued for this run; nothing was duplicated."
         }),
     })
-}
-
-/// Everything that makes one send different from another, in one string.
-///
-/// Length-prefixed rather than delimited, so no id containing the separator
-/// can be arranged to collide with a different set of fields.
-fn send_fingerprint(
-    account_id: &str,
-    conversation_id: &str,
-    thread_id: Option<&str>,
-    reply_to_provider_id: Option<&str>,
-    text: &str,
-    attachments: &[OutboundAttachment],
-) -> String {
-    let mut fingerprint = String::new();
-    let mut field = |value: &str| {
-        fingerprint.push_str(&value.len().to_string());
-        fingerprint.push(':');
-        fingerprint.push_str(value);
-        fingerprint.push('|');
-    };
-    field(account_id);
-    field(conversation_id);
-    field(thread_id.unwrap_or_default());
-    field(reply_to_provider_id.unwrap_or_default());
-    field(text);
-    for attachment in attachments {
-        field(&attachment.artifact_id);
-    }
-    fingerprint
 }
 
 /// A resolved destination: concrete account and conversation, and whether the
@@ -703,13 +688,13 @@ mod tests {
 
     #[test]
     fn an_empty_reply_is_refused_before_anything_is_opened() {
-        assert!(send_message(&request("   "), &reply_authority()).is_err());
+        assert!(send_message(&request("   "), &reply_authority(), None).is_err());
     }
 
     #[test]
     fn an_oversized_reply_is_refused() {
         let huge = "x".repeat(MAX_REPLY_CHARS + 1);
-        let error = send_message(&request(&huge), &reply_authority()).expect_err("too long");
+        let error = send_message(&request(&huge), &reply_authority(), None).expect_err("too long");
         assert!(error.contains("at most"));
     }
 
@@ -717,7 +702,7 @@ mod tests {
     fn a_blank_destination_id_is_refused() {
         let mut asked = request("hello");
         asked.conversation_id = Some("   ".to_string());
-        let error = send_message(&asked, &reply_authority()).expect_err("blank id");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("blank id");
         assert!(error.contains("'to'"), "{error}");
     }
 
@@ -725,7 +710,7 @@ mod tests {
     fn an_oversized_destination_id_is_refused() {
         let mut asked = request("hello");
         asked.account_id = Some("x".repeat(MAX_DESTINATION_CHARS + 1));
-        let error = send_message(&asked, &reply_authority()).expect_err("oversized id");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("oversized id");
         assert!(error.contains("'account'"), "{error}");
     }
 
@@ -765,7 +750,7 @@ mod tests {
     fn a_run_with_no_channel_origin_has_nowhere_to_send() {
         // No job id in the environment: every non-channel run looks like this.
         std::env::remove_var(JOB_ID_ENV);
-        let error = send_message(&request("hello"), &reply_authority()).expect_err("no origin");
+        let error = send_message(&request("hello"), &reply_authority(), None).expect_err("no origin");
         assert!(error.contains("did not arrive from a messaging conversation"));
     }
 
@@ -775,7 +760,7 @@ mod tests {
         let mut asked = request("hello");
         asked.account_id = Some("chan-someone-elses".to_string());
         asked.conversation_id = Some("conv-1".to_string());
-        let error = send_message(&asked, &reply_authority()).expect_err("no grant");
+        let error = send_message(&asked, &reply_authority(), None).expect_err("no grant");
         assert!(error.contains("does not grant"), "{error}");
     }
 

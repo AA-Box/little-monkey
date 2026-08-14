@@ -844,13 +844,27 @@ impl DaemonStore {
         let result = if changed == 1 {
             OutboxEnqueue::Queued { outbox_id }
         } else {
-            let existing_id: String = transaction
+            let (existing_id, existing_digest): (String, String) = transaction
                 .query_row(
-                    "SELECT outbox_id FROM channel_outbox WHERE account_id=?1 AND idempotency_key=?2",
+                    "SELECT outbox_id, payload_digest FROM channel_outbox
+                     WHERE account_id=?1 AND idempotency_key=?2",
                     params![row.account_id, row.idempotency_key],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(|error| error.to_string())?;
+            // The key names one durable invocation; the digest pins what that
+            // invocation asked to send. The same identity carrying different
+            // bytes is a consistency fault, not a retry — fail closed rather
+            // than overwrite the original or queue a second row, because
+            // there is no way to know which version should reach a person.
+            if existing_digest != row.payload_digest {
+                return Err(format!(
+                    "Internal consistency error: outbox row {existing_id} already holds \
+                     idempotency key '{}' with a different payload digest; refusing to \
+                     overwrite or duplicate it.",
+                    row.idempotency_key
+                ));
+            }
             OutboxEnqueue::AlreadyQueued {
                 outbox_id: existing_id,
             }
@@ -1096,8 +1110,9 @@ impl DaemonStore {
     ///
     /// Test-only: the send path used to derive its idempotency key from this
     /// count, which shifted under a replayed run and let the first message go
-    /// out twice. The key is content-derived now, and this remains only as
-    /// the assertion tests make about how many rows a run produced.
+    /// out twice. The key is derived from the invocation identity now, and
+    /// this remains only as the assertion tests make about how many rows a
+    /// run produced.
     #[cfg(test)]
     pub fn outbox_count_for_job(&self, job_id: &str) -> Result<u32, String> {
         self.connection
@@ -1969,6 +1984,29 @@ mod tests {
         };
         let second = store.enqueue_channel_message(&row).expect("second");
         assert_eq!(second, OutboxEnqueue::AlreadyQueued { outbox_id });
+    }
+
+    /// The unique constraint names one durable invocation; the digest pins
+    /// what it asked to send. The same key with different bytes must neither
+    /// overwrite the original nor queue a second row.
+    #[test]
+    fn enqueue_fails_closed_when_the_same_key_carries_a_different_payload() {
+        let mut store = seeded();
+        let row = new_outbox("acct-1", "idem-1");
+        store.enqueue_channel_message(&row).expect("first");
+
+        let mut changed = new_outbox("acct-1", "idem-1");
+        changed.payload_json = r#"{"text":"different"}"#.into();
+        changed.payload_digest = "another-digest".into();
+        let error = store
+            .enqueue_channel_message(&changed)
+            .expect_err("a changed payload under the same key");
+        assert!(error.contains("consistency"), "{error}");
+
+        // The original row is untouched and still the only one.
+        let claimed = store.claim_outbox_batch(1_000, 10).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].payload_json, "{}");
     }
 
     #[test]
