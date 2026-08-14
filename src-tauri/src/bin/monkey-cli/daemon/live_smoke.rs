@@ -197,10 +197,19 @@ async fn interactive_roundtrip(kind: ChannelKind, adapter: Arc<dyn ChannelAdapte
                     && event.job_id.is_some()
             });
         if let Some(event) = matched {
+            // The invariant the whole inbound path exists to keep, checked
+            // here against a real provider: an accepted event owns the turn it
+            // became, so a crash anywhere after this leaves work to recover
+            // rather than a message the provider believes it delivered.
+            assert!(
+                event.ingress_id.is_some(),
+                "an accepted event with no durable turn behind it"
+            );
             eprintln!(
-                "{}: durable inbound event {} accepted, run {} submitted",
+                "{}: durable inbound event {} accepted as turn {}, run {} submitted",
                 kind.as_str(),
                 event.provider_event_id,
+                event.ingress_id.as_deref().unwrap_or("?"),
                 event.job_id.as_deref().unwrap_or("?")
             );
             break event.job_id.expect("job id");
