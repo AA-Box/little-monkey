@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
+    ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
     ProviderCapabilities, SendOutcome,
 };
 use serde_json::Value;
@@ -28,7 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
     load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
-    LoadedAttachment,
+    LoadedAttachment, TransportStatus,
 };
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -54,6 +54,10 @@ struct Shared {
     /// gateway task has exited and will not reconnect — a bad token or a
     /// disallowed intent is not something backoff fixes.
     permanent_error: Mutex<Option<String>>,
+    /// What the gateway connection is actually doing, published for the
+    /// daemon's health loop: `poll` returns an empty batch whether the socket
+    /// is live or dropped, so it cannot answer this.
+    status: TransportStatus,
 }
 
 pub struct DiscordAdapter {
@@ -121,6 +125,12 @@ impl ChannelAdapter for DiscordAdapter {
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::Discord, InboundTransport::Socket)
         }
+    }
+
+    /// The gateway's own state. Discord is a socket transport, so a poll
+    /// coming back empty says nothing about whether the connection is live.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(self.shared.status.get())
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -761,6 +771,7 @@ async fn run_one_connection(
     gateway_url: &str,
     tx: &mpsc::Sender<ChannelEnvelope>,
     state: &mut GatewayState,
+    status: &TransportStatus,
 ) -> ConnectionOutcome {
     let full_url = format!(
         "{}/?v={GATEWAY_VERSION}&encoding=json",
@@ -806,7 +817,11 @@ async fn run_one_connection(
                             ticker.tick().await;
                             heartbeat_armed = true;
                         }
-                        Action::SetBotUserId(_id) => {}
+                        // READY: the identify was accepted and this
+                        // session is live. Nothing earlier proves that — a
+                        // websocket handshake happens before the token is
+                        // checked.
+                        Action::SetBotUserId(_id) => status.set(HealthState::Connected),
                         Action::Envelope(envelope) => {
                             let _ = tx.send(*envelope).await;
                         }
@@ -834,20 +849,30 @@ async fn run_gateway_loop(
     let mut state = GatewayState::default();
     loop {
         match fetch_gateway_url(&http, &token).await {
-            Ok(url) => match run_one_connection(&account_id, &token, &url, &tx, &mut state).await {
-                ConnectionOutcome::Permanent(error) => {
-                    *shared.permanent_error.lock().await = Some(error);
-                    return;
+            Ok(url) => {
+                match run_one_connection(&account_id, &token, &url, &tx, &mut state, &shared.status)
+                    .await
+                {
+                    ConnectionOutcome::Permanent(error) => {
+                        shared.status.set(HealthState::Error);
+                        *shared.permanent_error.lock().await = Some(error);
+                        return;
+                    }
+                    ConnectionOutcome::Reconnect => {
+                        // The session ended; whatever it was, this account is
+                        // not receiving anything until the next one is up.
+                        shared.status.set(HealthState::Degraded);
+                        backoff = MIN_BACKOFF;
+                    }
                 }
-                ConnectionOutcome::Reconnect => {
-                    backoff = MIN_BACKOFF;
-                }
-            },
+            }
             Err(FetchError::Permanent(error)) => {
+                shared.status.set(HealthState::Error);
                 *shared.permanent_error.lock().await = Some(error);
                 return;
             }
             Err(FetchError::Retryable(error)) => {
+                shared.status.set(HealthState::Degraded);
                 eprintln!("little monkey: discord[{account_id}] gateway lookup: {error}");
             }
         }

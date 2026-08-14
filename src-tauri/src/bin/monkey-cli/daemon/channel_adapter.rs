@@ -28,7 +28,7 @@ use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelEnvelope, ChannelHealth, ChannelKind,
-    DeliveryReceipt, OutboundMessage, ProviderCapabilities, SendOutcome,
+    DeliveryReceipt, HealthState, OutboundMessage, ProviderCapabilities, SendOutcome,
 };
 
 /// One batch of inbound events plus the cursor to resume from.
@@ -49,6 +49,48 @@ pub struct AdapterConfig<'a> {
     pub secret: String,
 }
 
+/// The live state of a socket adapter's own connection.
+///
+/// One atomic rather than a field behind the adapter's async locks: the health
+/// loop reads it on every tick and must never wait on a task that is itself
+/// mid-reconnect. A new one starts at `Connecting`, which is what an adapter
+/// whose task has been spawned but has not reached the provider yet honestly
+/// is.
+#[derive(Debug)]
+pub struct TransportStatus(std::sync::atomic::AtomicU8);
+
+impl Default for TransportStatus {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(CONNECTING))
+    }
+}
+
+const CONNECTING: u8 = 0;
+const CONNECTED: u8 = 1;
+const DEGRADED: u8 = 2;
+const ERRORED: u8 = 3;
+
+impl TransportStatus {
+    pub fn set(&self, state: HealthState) {
+        let code = match state {
+            HealthState::Connected => CONNECTED,
+            HealthState::Degraded => DEGRADED,
+            HealthState::Error => ERRORED,
+            _ => CONNECTING,
+        };
+        self.0.store(code, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> HealthState {
+        match self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            CONNECTED => HealthState::Connected,
+            DEGRADED => HealthState::Degraded,
+            ERRORED => HealthState::Error,
+            _ => HealthState::Connecting,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {
     fn kind(&self) -> ChannelKind;
@@ -58,6 +100,18 @@ pub trait ChannelAdapter: Send + Sync {
     /// Ask the provider who we are. This — and only this — is what may write
     /// `HealthState::Connected`: saved configuration is not a connection.
     async fn probe(&self) -> ChannelHealth;
+
+    /// The state of a persistent connection this adapter holds open.
+    ///
+    /// `None` — the default — means the provider has no socket to report:
+    /// for a long-polling or webhook adapter, a poll that came back is the
+    /// whole story. A socket adapter must answer, because its poll returns
+    /// an empty batch whether the gateway is live or dropped, and recording
+    /// "connected" off the back of that is exactly the lie the health column
+    /// exists to prevent.
+    fn live_transport(&self) -> Option<HealthState> {
+        None
+    }
 
     /// Fetch the next batch of inbound events, resuming from `cursor`.
     ///

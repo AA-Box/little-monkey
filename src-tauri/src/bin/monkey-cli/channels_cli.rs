@@ -45,6 +45,20 @@ pub enum ChannelsCmd {
     /// Store the account's credential, read from stdin so it never lands in a
     /// shell history or a process listing.
     SetToken { account_id: String },
+    /// Edit an existing account's non-secret settings and label. Validated
+    /// against what the provider's adapter actually reads; changing settings
+    /// marks the connection unverified until the next probe.
+    SetConfig {
+        account_id: String,
+        /// Replacement non-secret settings as a JSON object.
+        #[arg(long)]
+        config: Option<String>,
+        /// New display label.
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Enable or disable an account.
     Enable {
         account_id: String,
@@ -97,16 +111,26 @@ pub enum ChannelsCmd {
     AddRoute {
         /// Recipe an inbound message runs as.
         recipe: String,
+        #[command(flatten)]
+        options: RouteOptions,
         #[arg(long)]
-        account: Option<String>,
+        json: bool,
+    },
+    /// Replace a route's scope and target, keeping its id.
+    UpdateRoute {
+        route_id: String,
+        /// Recipe an inbound message runs as.
+        recipe: String,
+        #[command(flatten)]
+        options: RouteOptions,
         #[arg(long)]
-        conversation: Option<String>,
-        /// Provider-wide default, e.g. `--kind telegram`.
+        json: bool,
+    },
+    /// Enable or disable a route without editing it.
+    EnableRoute {
+        route_id: String,
         #[arg(long)]
-        kind: Option<String>,
-        /// Workspace the run gets.
-        #[arg(long)]
-        repository: Option<String>,
+        off: bool,
     },
     /// Remove a route.
     RemoveRoute { route_id: String },
@@ -118,11 +142,69 @@ pub enum ChannelsCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Set or clear the public base URL webhook callbacks are advertised
+    /// under, e.g. `https://hooks.example.com`. The daemon still listens on
+    /// loopback only; reaching it from that URL is the operator's tunnel or
+    /// reverse proxy.
+    SetPublicUrl {
+        /// The base URL. Omit with `--clear` to remove it.
+        url: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
+    /// The complete callback URL to paste into a webhook provider's console,
+    /// or a clear statement that no public base URL is configured.
+    CallbackUrl {
+        account_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Record that a credential was stored for this account by the app. The
     /// secret itself never travels through an argument.
     MarkCredential { account_id: String },
     /// Remove an account and its stored credential.
     Remove { account_id: String },
+}
+
+/// The scope and target of one route, shared by `add-route` and
+/// `update-route` so the two can never drift apart.
+#[derive(clap::Args, Debug)]
+pub struct RouteOptions {
+    /// Scope: account the route is pinned to.
+    #[arg(long)]
+    pub account: Option<String>,
+    /// Scope: conversation inside `--account`.
+    #[arg(long)]
+    pub conversation: Option<String>,
+    /// Scope: thread inside `--conversation`.
+    #[arg(long)]
+    pub thread: Option<String>,
+    /// Scope: sender inside `--conversation`.
+    #[arg(long)]
+    pub sender: Option<String>,
+    /// Scope: provider-wide default, e.g. `--kind telegram`.
+    #[arg(long)]
+    pub kind: Option<String>,
+    /// Workspace the run gets.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Recipe parameter as `name=value`. Repeatable.
+    #[arg(long = "param")]
+    pub params: Vec<String>,
+    /// Which durable session the conversation maps onto:
+    /// thread | conversation | sender | account.
+    #[arg(long)]
+    pub session_scope: Option<String>,
+    /// Queue priority for runs this route produces.
+    #[arg(long)]
+    pub priority: Option<i32>,
+    /// Do not grant runs of this route the authority to answer the
+    /// conversation they came from.
+    #[arg(long)]
+    pub no_reply: bool,
+    /// Create or leave the route disabled.
+    #[arg(long)]
+    pub disabled: bool,
 }
 
 pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
@@ -135,6 +217,12 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
             json,
         } => add(kind, label, config.as_deref(), *json),
         ChannelsCmd::SetToken { account_id } => set_token(account_id),
+        ChannelsCmd::SetConfig {
+            account_id,
+            config,
+            label,
+            json,
+        } => set_config(account_id, config.as_deref(), label.as_deref(), *json),
         ChannelsCmd::Enable { account_id, off } => enable(account_id, !*off),
         ChannelsCmd::Probe { account_id, json } => probe(account_id, *json).await,
         ChannelsCmd::Policy {
@@ -160,23 +248,24 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
         ChannelsCmd::Routes { json } => routes(*json),
         ChannelsCmd::AddRoute {
             recipe,
-            account,
-            conversation,
-            kind,
-            repository,
-        } => add_route(
+            options,
+            json,
+        } => add_route(recipe, options, *json),
+        ChannelsCmd::UpdateRoute {
+            route_id,
             recipe,
-            account.as_deref(),
-            conversation.as_deref(),
-            kind.as_deref(),
-            repository.as_deref(),
-        ),
+            options,
+            json,
+        } => update_route(route_id, recipe, options, *json),
+        ChannelsCmd::EnableRoute { route_id, off } => enable_route(route_id, !*off),
         ChannelsCmd::RemoveRoute { route_id } => remove_route(route_id),
         ChannelsCmd::Events {
             account_id,
             limit,
             json,
         } => events(account_id, *limit, *json),
+        ChannelsCmd::SetPublicUrl { url, clear } => set_public_url(url.as_deref(), *clear),
+        ChannelsCmd::CallbackUrl { account_id, json } => callback_url(account_id, *json),
         ChannelsCmd::MarkCredential { account_id } => mark_credential(account_id),
         ChannelsCmd::Remove { account_id } => remove(account_id),
     }
@@ -261,9 +350,7 @@ pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Re
             .map_err(|error| format!("--config must be a JSON object: {error}"))?,
         None => serde_json::json!({}),
     };
-    if !non_secret_config.is_object() {
-        return Err("--config must be a JSON object".to_string());
-    }
+    crate::daemon::adapters::validate_non_secret_config(kind, &non_secret_config)?;
     let account_id = format!("chan-{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
     let record = ChannelAccountRecord {
@@ -296,14 +383,124 @@ pub fn add(kind: &str, label: &str, config_json: Option<&str>, json: bool) -> Re
     Ok(())
 }
 
+/// Edit an existing account's non-secret settings.
+///
+/// The settings replace the stored object wholesale — the caller shows the
+/// current values and sends back the edited whole, so there is no merge
+/// semantics to misremember. Secrets are not touched here and never could be:
+/// this writes `non_secret_config` and `label`, nothing else.
+///
+/// A config change moves health to `Disconnected`: the old probe result
+/// described a configuration that no longer exists, and claiming its
+/// connectivity would be the lie the health field exists to prevent. The
+/// running adapter is rebuilt from the new row within the worker's normal
+/// reload interval.
+pub fn set_config(
+    account_id: &str,
+    config_json: Option<&str>,
+    label: Option<&str>,
+    json: bool,
+) -> Result<(), String> {
+    let mut store = store()?;
+    let (account, config_changed) = apply_account_edit(&mut store, account_id, config_json, label)?;
+    if json {
+        println!("{}", account_json(&account));
+    } else {
+        println!(
+            "Updated {account_id}.{}",
+            if config_changed {
+                " The change takes effect within about 30 seconds; run `monkey channels probe` to verify the connection."
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The edit itself, against whichever store the caller owns: label and
+/// settings applied, and — only when the settings actually changed — the old
+/// connectivity claim dropped. A label rename proves nothing about the
+/// connection either way, so it leaves health alone.
+pub(crate) fn apply_account_edit(
+    store: &mut DaemonStore,
+    account_id: &str,
+    config_json: Option<&str>,
+    label: Option<&str>,
+) -> Result<(ChannelAccountRecord, bool), String> {
+    if config_json.is_none() && label.is_none() {
+        return Err("Pass --config, --label, or both.".to_string());
+    }
+    let mut account = store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    if let Some(label) = label {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err("--label must not be empty.".to_string());
+        }
+        account.label = label.to_string();
+    }
+    let mut config_changed = false;
+    if let Some(raw) = config_json {
+        let config: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("--config must be a JSON object: {error}"))?;
+        crate::daemon::adapters::validate_non_secret_config(account.kind, &config)?;
+        config_changed = config != account.non_secret_config;
+        account.non_secret_config = config;
+    }
+    if config_changed {
+        account.health = unverified_health(
+            "Settings changed; run a probe to verify the connection.",
+            now_ms(),
+        );
+    }
+    account.updated_at_ms = now_ms();
+    store.upsert_channel_account(&account)?;
+    Ok((account, config_changed))
+}
+
+/// The state a configuration or credential write leaves behind: whatever the
+/// old value had proven, the new one has proven nothing yet. Only a real
+/// probe, or a real authenticated transport, may claim Connected again.
+fn unverified_health(detail: &str, now_ms: i64) -> ChannelHealth {
+    ChannelHealth {
+        state: HealthState::Disconnected,
+        detail: Some(detail.to_string()),
+        last_error: None,
+        probed_at_ms: now_ms,
+    }
+}
+
+/// Record that `account_id`'s credential was just written: point the row at
+/// its keychain entry and drop the connectivity claim the old credential had
+/// earned. Every credential write path — the CLI's `set-token`, the desktop's
+/// save (which arrives here as `mark-credential`) — funnels through this.
+pub(crate) fn record_credential_change(
+    store: &mut DaemonStore,
+    account_id: &str,
+) -> Result<ChannelAccountRecord, String> {
+    let mut account = store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    account.credential_ref = Some(little_monkey_lib::channels::credential_ref(account_id));
+    account.health = unverified_health(
+        "Credential changed; run a probe to verify the connection.",
+        now_ms(),
+    );
+    account.updated_at_ms = now_ms();
+    store.upsert_channel_account(&account)?;
+    Ok(account)
+}
+
 /// Store the account's credential in the keychain. The value is read from
 /// stdin, never from an argument, so it cannot end up in a process listing or a
 /// shell history file.
 pub fn set_token(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
-    let mut account = store
-        .channel_account(account_id)?
-        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    if store.channel_account(account_id)?.is_none() {
+        return Err(format!("No such account '{account_id}'"));
+    }
 
     let mut secret = String::new();
     std::io::stdin()
@@ -314,24 +511,16 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
         return Err("No credential was supplied on stdin".to_string());
     }
 
-    let credential_ref = little_monkey_lib::channels::credential_ref(account_id);
-    KeyringChannelSecrets.put(&credential_ref, secret)?;
-    account.credential_ref = Some(credential_ref);
-    account.updated_at_ms = now_ms();
-    store.upsert_channel_account(&account)?;
-    println!("Credential stored for {account_id}.");
+    KeyringChannelSecrets.put(&little_monkey_lib::channels::credential_ref(account_id), secret)?;
+    record_credential_change(&mut store, account_id)?;
+    println!("Credential stored for {account_id}. Run `monkey channels probe {account_id}` to verify it.");
     Ok(())
 }
 
 /// Point the account at its keychain entry after the app stored one there.
 pub fn mark_credential(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
-    let mut account = store
-        .channel_account(account_id)?
-        .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    account.credential_ref = Some(little_monkey_lib::channels::credential_ref(account_id));
-    account.updated_at_ms = now_ms();
-    store.upsert_channel_account(&account)?;
+    record_credential_change(&mut store, account_id)?;
     println!("Credential recorded for {account_id}.");
     Ok(())
 }
@@ -526,34 +715,168 @@ pub fn routes(json: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn add_route(
-    recipe: &str,
-    account_id: Option<&str>,
-    conversation_id: Option<&str>,
-    kind: Option<&str>,
-    repository: Option<&str>,
-) -> Result<(), String> {
-    let scope = match (account_id, conversation_id, kind) {
-        (Some(account), Some(conversation), _) => RouteScope::conversation(account, conversation),
-        (Some(account), None, _) => RouteScope::account(account),
-        (None, _, Some(kind)) => RouteScope::channel_default(
-            ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
-        ),
-        (None, _, None) => RouteScope::global_default(),
+/// The route scope the flags describe. `RouteScope::validate` (run by the
+/// store) is what rejects off-ladder combinations; this only assembles.
+fn route_scope(options: &RouteOptions) -> Result<RouteScope, String> {
+    let mut scope = match (options.account.as_deref(), options.conversation.as_deref()) {
+        (Some(account), Some(conversation)) => RouteScope::conversation(account, conversation),
+        (Some(account), None) => RouteScope::account(account),
+        (None, _) => match options.kind.as_deref() {
+            Some(kind) => RouteScope::channel_default(
+                ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
+            ),
+            None => RouteScope::global_default(),
+        },
     };
+    if let Some(thread) = &options.thread {
+        scope = scope.with_thread(thread);
+    }
+    if let Some(sender) = &options.sender {
+        scope = scope.with_sender(sender);
+    }
+    Ok(scope)
+}
+
+/// The route target the flags describe.
+fn route_target(recipe: &str, options: &RouteOptions) -> Result<RouteTarget, String> {
+    if recipe.trim().is_empty() {
+        return Err("A route must name the task an incoming message runs as.".to_string());
+    }
     let mut target = RouteTarget::new(recipe);
-    target.repository = repository.map(str::to_string);
+    target.repository = options.repository.clone();
+    for param in &options.params {
+        let (name, value) = param
+            .split_once('=')
+            .ok_or_else(|| format!("--param '{param}' must be name=value"))?;
+        if name.is_empty() {
+            return Err(format!("--param '{param}' has an empty name"));
+        }
+        target.params.insert(name.to_string(), value.to_string());
+    }
+    if let Some(session_scope) = &options.session_scope {
+        target.session_scope = match session_scope.as_str() {
+            "thread" => little_monkey_lib::channels::routing::SessionScope::Thread,
+            "conversation" => little_monkey_lib::channels::routing::SessionScope::Conversation,
+            "sender" => little_monkey_lib::channels::routing::SessionScope::Sender,
+            "account" => little_monkey_lib::channels::routing::SessionScope::Account,
+            other => {
+                return Err(format!(
+                    "Unknown session scope '{other}' (expected thread, conversation, sender or account)"
+                ))
+            }
+        };
+    }
+    if let Some(priority) = options.priority {
+        target.priority = priority;
+    }
+    target.reply_to_conversation = !options.no_reply;
+    Ok(target)
+}
+
+pub fn add_route(recipe: &str, options: &RouteOptions, json: bool) -> Result<(), String> {
     let now = now_ms();
     let route = ChannelRoute {
         route_id: format!("route-{}", uuid::Uuid::new_v4().simple()),
-        scope,
-        target,
-        enabled: true,
+        scope: route_scope(options)?,
+        target: route_target(recipe, options)?,
+        enabled: !options.disabled,
         created_at_ms: now,
         updated_at_ms: now,
     };
     store()?.insert_channel_route(&route)?;
-    println!("Added route {} -> {recipe}.", route.route_id);
+    if json {
+        println!("{}", serde_json::json!({ "route": route }));
+    } else {
+        println!("Added route {} -> {recipe}.", route.route_id);
+    }
+    Ok(())
+}
+
+pub fn update_route(
+    route_id: &str,
+    recipe: &str,
+    options: &RouteOptions,
+    json: bool,
+) -> Result<(), String> {
+    let mut store = store()?;
+    let existing = store
+        .channel_routes()?
+        .into_iter()
+        .find(|route| route.route_id == route_id)
+        .ok_or_else(|| format!("No such route '{route_id}'"))?;
+    let route = ChannelRoute {
+        route_id: route_id.to_string(),
+        scope: route_scope(options)?,
+        target: route_target(recipe, options)?,
+        enabled: !options.disabled,
+        created_at_ms: existing.created_at_ms,
+        updated_at_ms: now_ms(),
+    };
+    store.update_channel_route(&route)?;
+    if json {
+        println!("{}", serde_json::json!({ "route": route }));
+    } else {
+        println!("Updated route {route_id} -> {recipe}.");
+    }
+    Ok(())
+}
+
+pub fn enable_route(route_id: &str, enabled: bool) -> Result<(), String> {
+    if store()?.set_channel_route_enabled(route_id, enabled, now_ms())? {
+        println!(
+            "Route {route_id} is now {}.",
+            if enabled { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    } else {
+        Err(format!("No such route '{route_id}'"))
+    }
+}
+
+pub fn set_public_url(url: Option<&str>, clear: bool) -> Result<(), String> {
+    match (url, clear) {
+        (Some(url), false) => {
+            store()?.set_channel_public_base_url(Some(url))?;
+            println!("Webhook callbacks are now advertised under {url}.");
+            Ok(())
+        }
+        (None, true) => {
+            store()?.set_channel_public_base_url(None)?;
+            println!("Public base URL cleared; webhook providers cannot reach this daemon until one is configured.");
+            Ok(())
+        }
+        (Some(_), true) => Err("Pass a URL or --clear, not both.".to_string()),
+        (None, false) => Err("Pass the base URL, or --clear to remove it.".to_string()),
+    }
+}
+
+pub fn callback_url(account_id: &str, json: bool) -> Result<(), String> {
+    let store = store()?;
+    store
+        .channel_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    let path = crate::daemon::channel_store::channel_callback_path(account_id);
+    let url = store.channel_callback_url(account_id)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "account_id": account_id,
+                "configured": url.is_some(),
+                "url": url,
+                "path": path,
+            })
+        );
+        return Ok(());
+    }
+    match url {
+        Some(url) => println!("{url}"),
+        None => println!(
+            "No public base URL is configured. The listener path is {path}; run \
+             `monkey channels set-public-url <https://your-public-host>` once a tunnel or \
+             reverse proxy exposes the daemon."
+        ),
+    }
     Ok(())
 }
 
@@ -658,6 +981,187 @@ mod tests {
         assert!(rendered.contains("\"has_credential\":true"));
         assert!(!rendered.contains("credential_ref"));
         assert!(!rendered.contains("channel:chan-1"));
+    }
+
+    /// One connected account in a store this test owns.
+    fn connected_store() -> DaemonStore {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "chan-1".into(),
+                kind: ChannelKind::Telegram,
+                label: "Ops".into(),
+                enabled: true,
+                non_secret_config: serde_json::json!({}),
+                credential_ref: Some("channel:chan-1".into()),
+                access_policy: ChannelAccessPolicy::default(),
+                health: ChannelHealth::connected(1, None),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .expect("account");
+        store
+    }
+
+    #[test]
+    fn a_replaced_credential_invalidates_the_old_connectivity_claim() {
+        // Connected → replace credential → Disconnected. The new credential
+        // has never spoken to the provider, so the old claim must not
+        // survive the write.
+        let mut store = connected_store();
+        let account = record_credential_change(&mut store, "chan-1").expect("recorded");
+        assert_eq!(account.health.state, HealthState::Disconnected);
+        assert!(
+            account.health.detail.as_deref().unwrap_or("").contains("probe"),
+            "{:?}",
+            account.health.detail
+        );
+
+        // And writing a credential over a Disconnected account never makes it
+        // Connected: saving is not connecting.
+        let again = record_credential_change(&mut store, "chan-1").expect("recorded");
+        assert_ne!(again.health.state, HealthState::Connected);
+    }
+
+    #[test]
+    fn a_label_only_edit_keeps_the_health_a_probe_earned() {
+        let mut store = connected_store();
+        let (account, config_changed) =
+            apply_account_edit(&mut store, "chan-1", None, Some("Renamed")).expect("edited");
+        assert!(!config_changed);
+        assert_eq!(account.label, "Renamed");
+        assert_eq!(account.health.state, HealthState::Connected);
+    }
+
+    #[test]
+    fn a_settings_change_drops_the_old_connectivity_claim() {
+        let mut store = connected_store();
+        let (account, config_changed) = apply_account_edit(
+            &mut store,
+            "chan-1",
+            Some(r#"{"max_attachment_bytes": 1024}"#),
+            None,
+        )
+        .expect("edited");
+        assert!(config_changed);
+        assert_eq!(account.health.state, HealthState::Disconnected);
+
+        // Saving the identical settings again is not a change, so the (now
+        // Disconnected) state and its detail are left alone.
+        let (_, changed_again) = apply_account_edit(
+            &mut store,
+            "chan-1",
+            Some(r#"{"max_attachment_bytes": 1024}"#),
+            None,
+        )
+        .expect("edited");
+        assert!(!changed_again);
+    }
+
+    /// Every option the CLI, the bridge and the UI can set, all at once.
+    fn fully_populated_options() -> RouteOptions {
+        RouteOptions {
+            account: Some("chan-1".to_string()),
+            conversation: Some("conv-7".to_string()),
+            thread: Some("thread-2".to_string()),
+            sender: Some("user-9".to_string()),
+            kind: None,
+            repository: Some("/work/repo".to_string()),
+            params: vec!["focus=deps".to_string(), "depth=3".to_string()],
+            session_scope: Some("sender".to_string()),
+            priority: Some(7),
+            no_reply: true,
+            disabled: true,
+        }
+    }
+
+    #[test]
+    fn a_fully_populated_route_round_trips_through_create_read_edit_and_reenable() {
+        // The daemon replaces a route's target wholesale on update, so the
+        // one way an editor can be honest is to send everything back. This
+        // holds the other half of that bargain: everything sent is stored,
+        // read back, and survives an edit that touches one field.
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let options = fully_populated_options();
+        let route = ChannelRoute {
+            route_id: "route-full".to_string(),
+            scope: route_scope(&options).expect("scope"),
+            target: route_target("triage", &options).expect("target"),
+            enabled: !options.disabled,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.insert_channel_route(&route).expect("insert");
+
+        let read = |store: &DaemonStore| {
+            store
+                .channel_routes()
+                .expect("routes")
+                .into_iter()
+                .find(|entry| entry.route_id == "route-full")
+                .expect("the route exists")
+        };
+        let stored = read(&store);
+        assert_eq!(stored.scope.account_id.as_deref(), Some("chan-1"));
+        assert_eq!(stored.scope.conversation_id.as_deref(), Some("conv-7"));
+        assert_eq!(stored.scope.thread_id.as_deref(), Some("thread-2"));
+        assert_eq!(stored.scope.sender_id.as_deref(), Some("user-9"));
+        assert_eq!(stored.target.recipe, "triage");
+        assert_eq!(stored.target.repository.as_deref(), Some("/work/repo"));
+        assert_eq!(stored.target.params.get("focus").map(String::as_str), Some("deps"));
+        assert_eq!(stored.target.params.get("depth").map(String::as_str), Some("3"));
+        assert_eq!(
+            stored.target.session_scope,
+            little_monkey_lib::channels::routing::SessionScope::Sender
+        );
+        assert_eq!(stored.target.priority, 7);
+        assert!(!stored.target.reply_to_conversation);
+        assert!(!stored.enabled);
+
+        // Edit one field — the recipe — with everything else resent, exactly
+        // as the UI does. Nothing else may move.
+        let updated = ChannelRoute {
+            route_id: "route-full".to_string(),
+            scope: route_scope(&options).expect("scope"),
+            target: route_target("chat-2", &options).expect("target"),
+            enabled: !options.disabled,
+            created_at_ms: stored.created_at_ms,
+            updated_at_ms: 2,
+        };
+        store.update_channel_route(&updated).expect("update");
+        let after_edit = read(&store);
+        assert_eq!(after_edit.target.recipe, "chat-2");
+        assert_eq!(after_edit.target.params.len(), 2);
+        assert_eq!(after_edit.target.repository.as_deref(), Some("/work/repo"));
+        assert_eq!(after_edit.target.priority, 7);
+        assert!(!after_edit.target.reply_to_conversation);
+        assert_eq!(after_edit.scope, stored.scope);
+
+        // Disable and re-enable through the dedicated switch: the target is
+        // not part of that operation and must not be touched by it.
+        store
+            .set_channel_route_enabled("route-full", true, 3)
+            .expect("enable");
+        let enabled = read(&store);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.target, after_edit.target);
+        store
+            .set_channel_route_enabled("route-full", false, 4)
+            .expect("disable");
+        let disabled = read(&store);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.target, after_edit.target);
+    }
+
+    #[test]
+    fn a_parameter_with_no_name_is_refused_with_the_daemons_own_words() {
+        let mut options = fully_populated_options();
+        options.params = vec!["=value".to_string()];
+        let error = route_target("triage", &options).expect_err("empty name");
+        assert!(error.contains("empty name"), "{error}");
+        options.params = vec!["notapair".to_string()];
+        let error = route_target("triage", &options).expect_err("no separator");
+        assert!(error.contains("name=value"), "{error}");
     }
 
     #[test]

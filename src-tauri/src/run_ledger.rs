@@ -5254,6 +5254,7 @@ mod tests {
                 allow_network: false,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

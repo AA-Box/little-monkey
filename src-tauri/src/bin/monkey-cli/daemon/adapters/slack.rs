@@ -33,8 +33,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope, ChannelHealth,
-    ChannelKind, ChannelSender, InboundTransport, OutboundMessage, ProviderCapabilities,
-    SendOutcome,
+    ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
+    ProviderCapabilities, SendOutcome,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
@@ -42,7 +42,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
     fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
-    InboundBatch, LoadedAttachment,
+    InboundBatch, LoadedAttachment, TransportStatus,
 };
 
 const API_BASE: &str = "https://slack.com/api";
@@ -86,6 +86,9 @@ fn parse_secret(secret: &str) -> Result<SlackSecret, String> {
 #[derive(Default)]
 struct Shared {
     permanent_error: Mutex<Option<String>>,
+    /// What the Socket Mode connection is actually doing — see
+    /// [`TransportStatus`]; `poll` cannot answer this.
+    status: TransportStatus,
 }
 
 pub struct SlackAdapter {
@@ -154,6 +157,12 @@ impl ChannelAdapter for SlackAdapter {
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::Slack, InboundTransport::Socket)
         }
+    }
+
+    /// The Socket Mode connection's own state. A poll coming back empty is
+    /// the normal quiet case and says nothing about whether it is live.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(self.shared.status.get())
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -779,6 +788,7 @@ async fn run_socket_loop(
     let identity = match auth_test(&http, &secret.bot_token).await {
         Ok(identity) if identity.ok => identity,
         Ok(identity) => {
+            shared.status.set(HealthState::Error);
             *shared.permanent_error.lock().await =
                 Some(format!("Slack rejected the bot token: {}", identity.error));
             return;
@@ -802,6 +812,7 @@ async fn run_socket_loop(
         let socket_url = match open_socket_url(&http, &secret.app_token).await {
             Ok(url) => url,
             Err(_) => {
+                shared.status.set(HealthState::Degraded);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 continue;
@@ -813,8 +824,12 @@ async fn run_socket_loop(
             our_user_id.as_deref(),
             our_bot_id.as_deref(),
             &tx,
+            &shared.status,
         )
         .await;
+        // Whatever ended it, nothing arrives on this account until the next
+        // connection is up.
+        shared.status.set(HealthState::Degraded);
         if tx.is_closed() {
             return;
         }
@@ -835,11 +850,16 @@ async fn run_one_connection(
     our_user_id: Option<&str>,
     our_bot_id: Option<&str>,
     tx: &mpsc::Sender<ChannelEnvelope>,
+    status: &TransportStatus,
 ) -> bool {
     let (mut ws, _) = match tokio_tungstenite::connect_async(socket_url).await {
         Ok(pair) => pair,
         Err(_) => return false,
     };
+    // The URL was minted seconds ago by an authenticated
+    // `apps.connections.open`, so a completed handshake on it is a live
+    // authenticated transport rather than merely an open socket.
+    status.set(HealthState::Connected);
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => {
