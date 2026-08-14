@@ -14,11 +14,12 @@
 //!   tool returns as soon as the row is durable, so a crash between "the model
 //!   said it" and "the provider has it" resolves the same way every other
 //!   outbound message does. This file never calls a provider adapter.
-//! - The idempotency key is derived from the job and the runtime-assigned
-//!   tool-call id — the durable identity of one tool invocation — so a run
-//!   that re-executes a tool call recomputes the same key and the outbox
-//!   recognizes the row, while two distinct calls asking for the same words
-//!   remain two messages.
+//! - The send is identified by the job and the runtime-assigned tool-call id —
+//!   the durable identity of one tool invocation, and nothing about where the
+//!   message is going — so a run that re-executes a tool call recomputes the
+//!   same identity and the outbox recognizes the row even if the destination
+//!   was recomputed with it, while two distinct calls asking for the same
+//!   words remain two messages. One invocation is at most one outbound intent.
 //! - Reply depth is carried forward, which is what lets the inbound gate stop
 //!   two agents from talking to each other forever.
 
@@ -378,31 +379,35 @@ pub(crate) fn queue_send(
         Some(job_id) if origin.is_some() => inbound_reply_depth(store, job_id).saturating_add(1),
         _ => 0,
     };
-    let idempotency_key = match (job_id, invocation.tool_call_id.as_deref()) {
-        // Derived from the durable invocation — the job and the runtime's own
-        // tool-call id — never from the content. A content key would collapse
-        // two intentional identical sends from one run into one delivery; a
-        // counter would shift under a replayed run and let the first message
-        // go out twice. The invocation is exactly what a replay repeats and
-        // exactly what two distinct tool calls never share: the replay
-        // recomputes the key the outbox already holds and is recognized,
-        // while "Reminder!" sent twice on purpose is two keys and two rows.
-        //
-        // What the invocation *asked to send* is still pinned — the row's
-        // payload digest — so a replay that somehow carries different bytes
-        // under the same identity fails closed in the store instead of
-        // silently sending either version. See `enqueue_channel_message`.
-        (Some(job_id), Some(tool_call_id)) => {
-            let prefix = if is_origin_reply { "reply" } else { "send" };
-            format!("{prefix}-{job_id}-{tool_call_id}")
-        }
-        // No durable invocation to be retried under: a fresh key per call is
-        // the honest statement that nothing will ever legitimately resubmit
-        // it. A job with no tool-call id lands here too — without the id
-        // there is no invocation identity, and guessing one from content
-        // would recreate the collapsed-duplicates bug.
-        _ => format!("send-adhoc-{}", uuid::Uuid::new_v4().simple()),
+    // The durable invocation — the job and the runtime's own tool-call id, and
+    // nothing else. Not the content: a content key would collapse two
+    // intentional identical sends from one run into one delivery. Not a
+    // counter: it shifts under a replayed run and lets the first message go
+    // out twice. And nothing about *where* the message is going, which is the
+    // whole point — an invocation replayed against a recomputed destination,
+    // another account, or as an explicit send where it was first an origin
+    // reply is the same invocation, and one invocation may become at most one
+    // outbound intent. A `reply-`/`send-` prefix here made that replay a
+    // second identity and a second message.
+    //
+    // What the invocation *asked to send* is pinned separately — the row's
+    // payload digest, which covers the account and destination — so a replay
+    // carrying different bytes under the same identity fails closed in the
+    // store instead of silently sending either version. See
+    // `enqueue_channel_message`.
+    let invocation_id = match (job_id, invocation.tool_call_id.as_deref()) {
+        (Some(job_id), Some(tool_call_id)) => Some(format!("channel-send:{job_id}:{tool_call_id}")),
+        // No durable invocation to be retried under, so there is no identity
+        // to enforce: a job with no tool-call id lands here too, and guessing
+        // one from content would recreate the collapsed-duplicates bug.
+        _ => None,
     };
+    // What a provider is told to deduplicate on. The same string as the
+    // invocation when there is one; otherwise a fresh value per call, the
+    // honest statement that nothing will ever legitimately resubmit it.
+    let idempotency_key = invocation_id
+        .clone()
+        .unwrap_or_else(|| format!("channel-send:adhoc:{}", uuid::Uuid::new_v4().simple()));
 
     let payload = OutboxPayload {
         message: OutboundMessage {
@@ -427,6 +432,7 @@ pub(crate) fn queue_send(
         payload_digest: sha256_hex(payload_json.as_bytes()),
         payload_json,
         idempotency_key,
+        invocation_id,
         max_attempts: REPLY_MAX_ATTEMPTS,
         job_id: job_id.map(str::to_string),
         created_at_ms: now_ms,

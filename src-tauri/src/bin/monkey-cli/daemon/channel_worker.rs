@@ -981,6 +981,7 @@ mod tests {
                 payload_digest: "digest".into(),
                 payload_json,
                 idempotency_key: idempotency_key.to_string(),
+                invocation_id: None,
                 max_attempts: 3,
                 job_id: None,
                 created_at_ms: NOW,
@@ -1289,13 +1290,10 @@ mod tests {
         assert_eq!(sent[0].account_id, "acct-1");
         assert_eq!(sent[0].conversation_id, "chat-9");
         assert_eq!(sent[0].text, "the build passed");
-        // Keyed on the job and the tool-call id, so a run replaying this
-        // exact call recomputes the same key rather than a second message.
-        assert!(
-            sent[0].idempotency_key.starts_with("send-job-1-"),
-            "{}",
-            sent[0].idempotency_key
-        );
+        // Keyed on the job and the tool-call id and nothing else, so a run
+        // replaying this exact call recomputes the same key rather than a
+        // second message.
+        assert_eq!(sent[0].idempotency_key, "channel-send:job-1:call-1");
 
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events[0].direction, EventDirection::Outbound);
@@ -1567,13 +1565,10 @@ mod tests {
             .expect("the reply");
         assert_eq!(reply.thread_id.as_deref(), Some("thread-3"));
         assert_eq!(reply.reply_to_provider_id.as_deref(), Some("msg-42"));
-        // Keyed as a reply to this job; the redirect is a different send and
-        // gets its own key.
-        assert!(
-            reply.idempotency_key.starts_with("reply-job-reply-"),
-            "{}",
-            reply.idempotency_key
-        );
+        // Keyed on the invocation alone. Being an origin reply is what this
+        // send *is*, not which invocation asked for it, so it leaves no mark
+        // on the key; the redirect is a different tool call and gets its own.
+        assert_eq!(reply.idempotency_key, "channel-send:job-reply:call-1");
 
         let redirected = sent
             .iter()
@@ -1707,6 +1702,197 @@ mod tests {
         let sent = adapter.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].text, "the build passed");
+    }
+
+    /// The invocation is the identity, so the account cannot be part of it.
+    ///
+    /// A replay that recomputes its destination onto another account is the
+    /// same tool call asking for the same thing, and one tool call may become
+    /// at most one outbound intent. Account-scoped uniqueness answered "has
+    /// this account been told this?" and cheerfully queued a second message
+    /// to a second person; the invocation index answers the question that
+    /// matters, across every account.
+    #[tokio::test]
+    async fn the_same_invocation_replayed_onto_another_account_queues_nothing_new() {
+        let mut store = seeded_store();
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "acct-2".into(),
+                kind: ChannelKind::Telegram,
+                label: "Second".into(),
+                enabled: true,
+                non_secret_config: serde_json::json!({}),
+                credential_ref: Some("channel:acct-2".into()),
+                access_policy: ChannelAccessPolicy::default(),
+                health: ChannelHealth::connected(NOW, None),
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("second account");
+        let paths = scratch_paths();
+        let both = SendAuthority {
+            accounts: vec!["acct-1".to_string(), "acct-2".to_string()],
+            ..SendAuthority::default()
+        };
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = send_to("C1", "hello");
+        let plan = plan_send(&first, &both, None).expect("authorized");
+        let queued = queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW)
+            .expect("queued");
+        assert_eq!(queued["status"], "queued");
+
+        let elsewhere = ChannelSendRequest {
+            account_id: Some("acct-2".to_string()),
+            conversation_id: Some("C1".to_string()),
+            text: "hello".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&elsewhere, &both, None).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &elsewhere,
+            &plan,
+            None,
+            &same_call,
+            NOW + 5,
+        )
+        .expect_err("the same invocation on another account");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        // And no second person hears from it.
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].account_id, "acct-1");
+    }
+
+    /// Answering the origin and addressing a conversation explicitly are two
+    /// things one invocation may be, not two invocations. The key carried a
+    /// `reply-`/`send-` prefix, so a replay that reclassified itself became a
+    /// second identity and a second message; the classification lives in the
+    /// payload now, where a changed one is caught as changed intent.
+    #[tokio::test]
+    async fn the_same_invocation_replayed_as_an_explicit_send_queues_nothing_new() {
+        use super::super::channel_store::ChannelOrigin;
+
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let origin = ChannelOrigin {
+            account_id: "acct-1".to_string(),
+            conversation_id: "chat-7".to_string(),
+            thread_id: Some("thread-3".to_string()),
+            provider_event_id: "msg-42".to_string(),
+        };
+        let authority = SendAuthority {
+            reply: true,
+            cross_conversation: true,
+            ..SendAuthority::default()
+        };
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let bare = ChannelSendRequest {
+            text: "on it".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&bare, &authority, Some(&origin)).expect("authorized");
+        let queued = queue_send(
+            &mut store,
+            &paths,
+            &bare,
+            &plan,
+            Some(&origin),
+            &same_call,
+            NOW,
+        )
+        .expect("queued");
+        assert_eq!(queued["status"], "queued");
+
+        let explicit = send_to("chat-other", "on it");
+        let plan = plan_send(&explicit, &authority, Some(&origin)).expect("authorized");
+        let error = queue_send(
+            &mut store,
+            &paths,
+            &explicit,
+            &plan,
+            Some(&origin),
+            &same_call,
+            NOW + 5,
+        )
+        .expect_err("the same invocation reclassified as an explicit send");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+
+        let adapter = Arc::new(FakeAdapter::new());
+        drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
+            .await
+            .expect("drain");
+        let sent = adapter.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].conversation_id, "chat-7");
+    }
+
+    /// The destination is what the invocation asked to send, so changing it
+    /// under the same identity is changed intent — caught by the digest, on
+    /// the same account as anywhere else.
+    #[test]
+    fn the_same_invocation_replayed_to_another_conversation_queues_nothing_new() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = send_to("C1", "hello");
+        let plan = plan_send(&first, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW).expect("queued");
+
+        let moved = send_to("C2", "hello");
+        let plan = plan_send(&moved, &account_authority(), None).expect("authorized");
+        let error = queue_send(&mut store, &paths, &moved, &plan, None, &same_call, NOW + 5)
+            .expect_err("the same invocation to another conversation");
+        assert!(error.contains("consistency"), "{error}");
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
+    }
+
+    /// The thread and the message being answered are part of the intent too:
+    /// the same words in a different thread reach different people.
+    #[test]
+    fn the_same_invocation_replayed_into_another_thread_queues_nothing_new() {
+        let mut store = seeded_store();
+        let paths = scratch_paths();
+        let same_call = invocation("job-1", "tool-1-2");
+
+        let first = ChannelSendRequest {
+            account_id: Some("acct-1".to_string()),
+            conversation_id: Some("C1".to_string()),
+            thread_id: Some("T1".to_string()),
+            reply_to_provider_id: Some("msg-1".to_string()),
+            text: "hello".to_string(),
+            ..ChannelSendRequest::default()
+        };
+        let plan = plan_send(&first, &account_authority(), None).expect("authorized");
+        queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW).expect("queued");
+
+        for changed in [
+            ChannelSendRequest {
+                thread_id: Some("T2".to_string()),
+                ..first.clone()
+            },
+            ChannelSendRequest {
+                reply_to_provider_id: Some("msg-2".to_string()),
+                ..first.clone()
+            },
+        ] {
+            let plan = plan_send(&changed, &account_authority(), None).expect("authorized");
+            let error = queue_send(&mut store, &paths, &changed, &plan, None, &same_call, NOW + 5)
+                .expect_err("the same invocation with a changed target");
+            assert!(error.contains("consistency"), "{error}");
+        }
+        assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
     }
 
     /// A replay does not need the process that wrote the row: the invocation
