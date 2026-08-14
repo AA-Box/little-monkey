@@ -252,9 +252,10 @@ describe("every desktop send is a durable ingress turn", () => {
 
   /** Every way the resident runner can be unusable. None of them is permission
    * to execute the turn here instead: the app refuses, and says which state the
-   * runner is in so the person can go fix it in Background Agents. */
+   * runner is in — repairable in place for the first three, deliberate for the
+   * kill switch. */
   const unusable = [
-    ["is not installed", { installed: false }, /required for conversations/i],
+    ["is not installed", { installed: false }, /isn't installed/i],
     ["is installed but stopped", { serviceRunning: false }, /not healthy/i],
     ["has a stale heartbeat", { heartbeatFresh: false }, /not healthy/i],
     ["is kill-switched", { killSwitch: true }, /kill switch/i],

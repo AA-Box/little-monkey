@@ -73,6 +73,14 @@ export interface RawBackpressure {
   held: number;
 }
 
+/** What one `daemonEnsure` call did. `healthy` means the service was already
+ * installed, current and running, so nothing was touched. */
+export interface DaemonEnsureResult {
+  action: "healthy" | "installed" | "reinstalled" | "started";
+  installed: boolean;
+  service_running: boolean;
+}
+
 export interface DaemonInstallRequest {
   concurrency: number;
   maxQueue: number;
@@ -160,6 +168,15 @@ const MOBILE_CAPABILITIES = new Set([
 
 export const daemonStatus = () => invoke<DaemonStatus>("daemon_desktop_status");
 export const daemonInstall = (request: DaemonInstallRequest) => invoke<string>("daemon_desktop_install", { request });
+/**
+ * Brings the resident execution service to a usable state and reports what
+ * that took.
+ *
+ * Idempotent: `healthy` means it did nothing. The app already runs this at
+ * launch, so a caller here is a repair — chat's Repair action, or the manual
+ * one in Background Agents — not the normal way the service comes up.
+ */
+export const daemonEnsure = () => invoke<DaemonEnsureResult>("daemon_desktop_ensure");
 export const daemonStart = () => invoke<string>("daemon_desktop_start");
 export const daemonStop = () => invoke<string>("daemon_desktop_stop");
 export const daemonUninstall = (purgeState = false) => invoke<string>("daemon_desktop_uninstall", { purgeState });
