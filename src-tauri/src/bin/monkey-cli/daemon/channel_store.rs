@@ -462,30 +462,55 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    // -- Public callback base ------------------------------------------------
+
+    /// Set or clear the one externally advertised base URL webhook providers
+    /// deliver to. Stored daemon-wide: the operator runs one tunnel or reverse
+    /// proxy in front of one webhook listener, not one per account.
+    pub fn set_channel_public_base_url(&mut self, base: Option<&str>) -> Result<(), String> {
+        match base {
+            Some(base) => {
+                let normalized = validate_public_base_url(base)?;
+                self.set_meta(CHANNEL_PUBLIC_BASE_URL_KEY, &normalized)
+            }
+            None => {
+                self.connection
+                    .execute(
+                        "DELETE FROM daemon_meta WHERE key=?1",
+                        [CHANNEL_PUBLIC_BASE_URL_KEY],
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn channel_public_base_url(&self) -> Result<Option<String>, String> {
+        self.get_meta(CHANNEL_PUBLIC_BASE_URL_KEY)
+    }
+
+    /// The complete callback URL an operator pastes into a provider's console
+    /// for one account, or `None` while no public base URL is configured.
+    ///
+    /// This is the one place the full URL is composed; every front end shows
+    /// what this returns rather than gluing a host onto the path itself.
+    pub fn channel_callback_url(&self, account_id: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .channel_public_base_url()?
+            .map(|base| format!("{base}{}", channel_callback_path(account_id))))
+    }
+
     // -- Routes --------------------------------------------------------------
 
     pub fn insert_channel_route(&mut self, route: &ChannelRoute) -> Result<(), String> {
         route
             .scope
             .validate()
-            .map_err(|error| format!("Invalid route scope: {error:?}"))?;
+            .map_err(|error| error.message().to_string())?;
+        self.reject_route_conflict(&route.scope, None)?;
         let scope_json = serde_json::to_string(&route.scope).map_err(|error| error.to_string())?;
         let target_json =
             serde_json::to_string(&route.target).map_err(|error| error.to_string())?;
-        let existing: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT route_id FROM channel_routes WHERE scope_json=?1",
-                [&scope_json],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        if let Some(existing_route_id) = existing {
-            return Err(format!(
-                "Route '{existing_route_id}' already owns this scope"
-            ));
-        }
         self.connection
             .execute(
                 "INSERT INTO channel_routes (
@@ -501,6 +526,85 @@ impl DaemonStore {
                 ],
             )
             .map_err(|error| format!("Failed to insert channel route: {error}"))?;
+        Ok(())
+    }
+
+    /// Replace a route's scope and target in place, keeping its identity.
+    ///
+    /// The same rules as insertion: the scope must be on the ladder and must
+    /// not tie with another route, because an edit that would make two routes
+    /// ambiguous should fail while the operator is looking at it, not when a
+    /// message arrives.
+    pub fn update_channel_route(&mut self, route: &ChannelRoute) -> Result<(), String> {
+        route
+            .scope
+            .validate()
+            .map_err(|error| error.message().to_string())?;
+        self.reject_route_conflict(&route.scope, Some(&route.route_id))?;
+        let scope_json = serde_json::to_string(&route.scope).map_err(|error| error.to_string())?;
+        let target_json =
+            serde_json::to_string(&route.target).map_err(|error| error.to_string())?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE channel_routes
+                 SET scope_json=?2, target_json=?3, enabled=?4, updated_at_ms=?5
+                 WHERE route_id=?1",
+                params![
+                    route.route_id,
+                    scope_json,
+                    target_json,
+                    route.enabled,
+                    route.updated_at_ms,
+                ],
+            )
+            .map_err(|error| format!("Failed to update channel route: {error}"))?;
+        if changed == 0 {
+            return Err(format!("No such route '{}'", route.route_id));
+        }
+        Ok(())
+    }
+
+    /// Flip a route on or off without touching what it routes to.
+    pub fn set_channel_route_enabled(
+        &mut self,
+        route_id: &str,
+        enabled: bool,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        self.connection
+            .execute(
+                "UPDATE channel_routes SET enabled=?2, updated_at_ms=?3 WHERE route_id=?1",
+                params![route_id, enabled, now_ms],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Refuse a scope that would tie with an existing route.
+    ///
+    /// Compared semantically — parsed scopes, not stored JSON bytes — and at
+    /// the same specificity only: a message matching two routes on different
+    /// rungs resolves by rung, but two overlapping scopes on one rung can
+    /// only ever be reported as ambiguous.
+    fn reject_route_conflict(
+        &self,
+        scope: &little_monkey_lib::channels::routing::RouteScope,
+        exclude_route_id: Option<&str>,
+    ) -> Result<(), String> {
+        for existing in self.channel_routes()? {
+            if Some(existing.route_id.as_str()) == exclude_route_id {
+                continue;
+            }
+            if existing.scope.specificity() == scope.specificity() && existing.scope.overlaps(scope)
+            {
+                return Err(format!(
+                    "Route '{}' already owns this scope: two routes at the same specificity \
+                     would be ambiguous for any message matching both",
+                    existing.route_id
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1222,6 +1326,36 @@ fn read_channel_event(
     }))
 }
 
+/// `daemon_meta` key holding the operator's public base URL for webhook
+/// callbacks. A KV row rather than a schema column: one value, daemon-wide.
+const CHANNEL_PUBLIC_BASE_URL_KEY: &str = "channels.public_base_url";
+
+/// The listener-relative path one account's webhook deliveries arrive on.
+pub fn channel_callback_path(account_id: &str) -> String {
+    format!("/v1/channels/{account_id}")
+}
+
+/// One acceptable public base: an absolute http(s) URL with a host, no query,
+/// no fragment, and no trailing slash so composing with a path never doubles
+/// one. A path prefix is allowed — reverse proxies mount things under paths.
+fn validate_public_base_url(base: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(base.trim())
+        .map_err(|error| format!("'{base}' is not a valid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "The public base URL must use http or https, not '{}'.",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("The public base URL must include a host.".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("The public base URL must not carry a query or fragment.".to_string());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
 fn read_outbox_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredOutboxMessage> {
     Ok(StoredOutboxMessage {
         outbox_id: row.get(0)?,
@@ -1493,6 +1627,138 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("r1"), "error should name the owner: {error}");
         assert_eq!(store.channel_routes().expect("routes").len(), 1);
+    }
+
+    /// Two routes that would tie are refused even when their stored JSON
+    /// differs — the comparison is what a message would match, not what the
+    /// bytes look like. A scope on a *different* rung is fine: resolution
+    /// picks the more specific one.
+    #[test]
+    fn same_rung_overlap_is_rejected_and_a_different_rung_is_not() {
+        let mut store = seeded();
+        store
+            .insert_channel_route(&route(
+                "r1",
+                RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            ))
+            .expect("thread route");
+        // Same rung, same message: ambiguous.
+        let error = store
+            .insert_channel_route(&route(
+                "r2",
+                RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+            ))
+            .unwrap_err();
+        assert!(error.contains("r1"), "{error}");
+        // Same conversation, a different thread: no message matches both.
+        store
+            .insert_channel_route(&route(
+                "r3",
+                RouteScope::conversation("acct-1", "C1").with_thread("T2"),
+            ))
+            .expect("other thread");
+        // A less specific rung under it: resolution decides, not insertion.
+        store
+            .insert_channel_route(&route("r4", RouteScope::conversation("acct-1", "C1")))
+            .expect("conversation route");
+        assert_eq!(store.channel_routes().expect("routes").len(), 3);
+    }
+
+    #[test]
+    fn a_route_is_edited_in_place_and_can_be_turned_off() {
+        let mut store = seeded();
+        store
+            .insert_channel_route(&route("r1", RouteScope::account("acct-1")))
+            .expect("route");
+
+        let mut edited = route("r1", RouteScope::conversation("acct-1", "C1"));
+        edited.target = RouteTarget::new("triage");
+        edited.updated_at_ms = 2_000;
+        store.update_channel_route(&edited).expect("update");
+
+        let stored = &store.channel_routes().expect("routes")[0];
+        assert_eq!(stored.route_id, "r1");
+        assert_eq!(stored.target.recipe, "triage");
+        assert_eq!(stored.scope.conversation_id.as_deref(), Some("C1"));
+        // Identity survives the edit; only what it routes changed.
+        assert_eq!(stored.created_at_ms, 1_000);
+
+        assert!(store
+            .set_channel_route_enabled("r1", false, 3_000)
+            .expect("disable"));
+        assert!(!store.channel_routes().expect("routes")[0].enabled);
+        // A route that does not exist is reported rather than silently ignored.
+        assert!(!store
+            .set_channel_route_enabled("nope", false, 3_000)
+            .expect("missing route"));
+    }
+
+    #[test]
+    fn an_edit_that_would_tie_with_another_route_is_refused() {
+        let mut store = seeded();
+        store
+            .insert_channel_route(&route("r1", RouteScope::account("acct-1")))
+            .expect("route");
+        store
+            .insert_channel_route(&route("r2", RouteScope::conversation("acct-1", "C1")))
+            .expect("route");
+
+        // Moving r2 onto r1's rung would make both match the same message.
+        let error = store
+            .update_channel_route(&route("r2", RouteScope::account("acct-1")))
+            .unwrap_err();
+        assert!(error.contains("r1"), "{error}");
+        // Editing a route without moving it is not a conflict with itself.
+        let mut same_scope = route("r2", RouteScope::conversation("acct-1", "C1"));
+        same_scope.target = RouteTarget::new("triage");
+        store.update_channel_route(&same_scope).expect("self-edit");
+    }
+
+    #[test]
+    fn a_callback_url_is_composed_only_from_the_configured_public_base() {
+        let mut store = seeded();
+        // Nothing configured: the path is known, the URL is not, and the store
+        // says so rather than guessing a host.
+        assert_eq!(store.channel_public_base_url().expect("base"), None);
+        assert_eq!(store.channel_callback_url("acct-1").expect("url"), None);
+        assert_eq!(channel_callback_path("acct-1"), "/v1/channels/acct-1");
+
+        store
+            .set_channel_public_base_url(Some("https://hooks.example.com/"))
+            .expect("set base");
+        assert_eq!(
+            store.channel_callback_url("acct-1").expect("url"),
+            Some("https://hooks.example.com/v1/channels/acct-1".to_string())
+        );
+
+        // A proxy mounting the daemon under a path prefix is normal.
+        store
+            .set_channel_public_base_url(Some("https://example.com/monkey"))
+            .expect("set base");
+        assert_eq!(
+            store.channel_callback_url("acct-1").expect("url"),
+            Some("https://example.com/monkey/v1/channels/acct-1".to_string())
+        );
+
+        store.set_channel_public_base_url(None).expect("clear");
+        assert_eq!(store.channel_callback_url("acct-1").expect("url"), None);
+    }
+
+    #[test]
+    fn a_public_base_that_could_not_receive_a_callback_is_refused() {
+        let mut store = seeded();
+        for bad in [
+            "not a url",
+            "ftp://example.com",
+            "https://",
+            "https://example.com?token=abc",
+            "https://example.com#fragment",
+        ] {
+            assert!(
+                store.set_channel_public_base_url(Some(bad)).is_err(),
+                "accepted {bad}"
+            );
+        }
     }
 
     #[test]

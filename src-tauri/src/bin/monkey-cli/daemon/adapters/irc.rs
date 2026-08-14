@@ -31,10 +31,13 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
-use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use crate::daemon::channel_adapter::{
+    AdapterConfig, ChannelAdapter, InboundBatch, TransportStatus,
+};
 use little_monkey_lib::channels::types::{
     BoundedMetadata, ChannelConversation, ChannelEnvelope, ChannelHealth, ChannelKind,
-    ChannelSender, InboundTransport, OutboundMessage, ProviderCapabilities, SendOutcome,
+    ChannelSender, HealthState, InboundTransport, OutboundMessage, ProviderCapabilities,
+    SendOutcome,
 };
 
 /// IRC's own per-line limit (RFC 1459 section 2.3 / RFC 2812 section 2.3):
@@ -79,6 +82,10 @@ struct Shared {
     /// Set only when `001 RPL_WELCOME` is seen — see [`IrcAdapter::probe`]'s
     /// doc for why configuration or a live socket must not be enough.
     registered: AtomicBool,
+    /// The same fact as `registered`, in the shape the daemon's health loop
+    /// reads: connecting before the first registration, degraded once a
+    /// connection has dropped.
+    status: TransportStatus,
     last_error: AsyncMutex<Option<String>>,
     write_half: AsyncMutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
@@ -138,6 +145,7 @@ impl IrcAdapter {
             password: config.secret.clone(),
             shared: Arc::new(Shared {
                 registered: AtomicBool::new(false),
+                status: TransportStatus::default(),
                 last_error: AsyncMutex::new(None),
                 write_half: AsyncMutex::new(None),
                 inbound_tx,
@@ -196,6 +204,12 @@ impl ChannelAdapter for IrcAdapter {
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
         }
+    }
+
+    /// Registration state, which is the only thing that means "connected"
+    /// on IRC — an open TCP socket is not one.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(self.shared.status.get())
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -339,6 +353,7 @@ async fn connection_loop(
         )
         .await;
         shared.registered.store(false, Ordering::SeqCst);
+        shared.status.set(HealthState::Degraded);
         *shared.write_half.lock().await = None;
         if let Err(error) = result {
             *shared.last_error.lock().await = Some(error);
@@ -434,6 +449,7 @@ async fn connect_and_register(
                 // only place `registered` becomes true — see `probe`'s doc
                 // for why nothing earlier may set it.
                 shared.registered.store(true, Ordering::SeqCst);
+                shared.status.set(HealthState::Connected);
                 for channel in channels {
                     write_line(shared, &format!("JOIN {channel}")).await?;
                 }

@@ -70,6 +70,94 @@ export interface ChannelEvent {
   received_at_ms: number;
 }
 
+/** Which durable session a conversation maps onto. Matches the daemon's
+ * `SessionScope`. */
+export type SessionScope = "thread" | "conversation" | "sender" | "account";
+
+/** How much of a message's identity a route pins down. Every field is
+ * optional; which ones are set decides the rung the route sits on, and the
+ * daemon rejects the combinations that are not on the ladder. */
+export interface ChannelRouteScope {
+  account_id?: string;
+  kind?: string;
+  conversation_id?: string;
+  thread_id?: string;
+  sender_id?: string;
+}
+
+/** What a matching message runs as. Mirrors the daemon's `RouteTarget`. */
+export interface ChannelRouteTarget {
+  recipe: string;
+  params?: Record<string, string>;
+  repository?: string;
+  session_scope: SessionScope;
+  priority: number;
+  reply_to_conversation: boolean;
+}
+
+export interface ChannelRoute {
+  route_id: string;
+  scope: ChannelRouteScope;
+  target: ChannelRouteTarget;
+  enabled: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** The rungs of the routing ladder, most specific first — the same order
+ * `resolve_route` walks. */
+export const ROUTE_SPECIFICITY = [
+  "sender",
+  "thread",
+  "conversation",
+  "account",
+  "channel_default",
+  "global_default",
+] as const;
+
+export type RouteSpecificity = (typeof ROUTE_SPECIFICITY)[number];
+
+/** Which rung a scope sits on, computed the same way the daemon computes it.
+ * Display only — the daemon remains the authority on what a scope means. */
+export function routeSpecificity(scope: ChannelRouteScope): RouteSpecificity {
+  if (scope.sender_id) return "sender";
+  if (scope.thread_id) return "thread";
+  if (scope.conversation_id) return "conversation";
+  if (scope.account_id) return "account";
+  if (scope.kind) return "channel_default";
+  return "global_default";
+}
+
+/** The scope and target fields `channels_add_route`/`channels_update_route`
+ * accept, exactly the daemon's `RouteOptionArgs`. Sent as one object, so the
+ * keys stay the daemon's snake_case rather than being renamed in flight. */
+export interface RouteOptions {
+  account_id?: string | null;
+  conversation_id?: string | null;
+  thread_id?: string | null;
+  sender_id?: string | null;
+  kind?: string | null;
+  repository?: string | null;
+  /** Recipe parameters as `name=value` strings. */
+  params?: string[];
+  session_scope?: SessionScope | null;
+  priority?: number | null;
+  /** Whether runs of this route may answer their conversation. Defaults on. */
+  reply?: boolean | null;
+  /** Whether the route is active. Defaults on. */
+  enabled?: boolean | null;
+}
+
+/** The complete callback URL for one webhook account, as the daemon composes
+ * it. `configured: false` means no public base URL is set — the frontend shows
+ * `path` and says so, and never glues a host on itself. */
+export interface ChannelCallback {
+  account_id: string;
+  configured: boolean;
+  url: string | null;
+  path: string;
+}
+
 /** One non-secret setting an account needs, collected as its own input.
  *
  * `type` is what the value becomes in the account row, not how it is typed:
@@ -108,6 +196,10 @@ export interface ProviderGuide {
   credentialOptional?: boolean;
   /** Platforms this provider can run on at all. Absent means anywhere. */
   requiresPlatform?: "macos";
+  /** True for accounts another subsystem creates (SMS shadows a telephony
+   * account). Their settings are editable here, but the add flow must not
+   * offer to create one directly. */
+  editOnly?: boolean;
   /** The parts the credential is made of, when it is more than one value.
    * Setup collects each one and saves them as the single JSON bundle the
    * adapter parses, so nobody has to know the wire shape. Omitted means the
@@ -164,13 +256,44 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     configFields: [
       { key: "handle", label: "Your iMessage handle", type: "text", required: true, placeholder: "you@example.com" },
       { key: "helper_path", label: "Helper path (optional)", type: "text", placeholder: "/usr/local/bin/imessage-helper", hint: "Leave empty to use Messages on this Mac directly. Set it only if you run your own helper process." },
+      { key: "db_path", label: "Messages database path (optional)", type: "text", placeholder: "~/Library/Messages/chat.db", hint: "Leave empty to read the signed-in user's own Messages database." },
+      { key: "osascript_path", label: "osascript path (optional)", type: "text", placeholder: "/usr/bin/osascript", hint: "Leave empty to use the system osascript." },
     ],
   },
   { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "WhatsApp credentials", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup for the access token and phone number ID; App settings → Basic for the app secret. The verify token is yours to invent — type the same value here and into Meta's webhook form.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configFields: [{ key: "phone_number_id", label: "Phone number ID", type: "text", required: true }], secretFields: [{ key: "access_token", label: "Access token" }, { key: "app_secret", label: "App secret" }, { key: "verify_token", label: "Verify token (you choose it)" }] },
   { kind: "line", label: "LINE", transport: "webhook", credentialLabel: "LINE credentials", whereToGetIt: "LINE Developers Console → your channel → Messaging API for the access token, and Basic settings for the channel secret that verifies signatures.", docsUrl: "https://developers.line.biz/en/docs/messaging-api/", configFields: [], secretFields: [{ key: "channel_access_token", label: "Channel access token" }, { key: "channel_secret", label: "Channel secret" }] },
-  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "Client secret", whereToGetIt: "Azure Bot resource → Configuration for the Microsoft App ID and tenant ID; Certificates & secrets for a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configFields: [{ key: "app_id", label: "Microsoft App ID", type: "text", required: true }, { key: "tenant_id", label: "Tenant ID", type: "text", required: true }], secretFields: [{ key: "app_password", label: "Client secret" }] },
-  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (paste the whole JSON file)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key. Paste the file's contents unchanged.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configFields: [{ key: "project_number", label: "Project number", type: "text", required: true }] },
+  { kind: "teams", label: "Microsoft Teams", transport: "webhook", credentialLabel: "Client secret", whereToGetIt: "Azure Bot resource → Configuration for the Microsoft App ID and tenant ID; Certificates & secrets for a client secret.", docsUrl: "https://learn.microsoft.com/azure/bot-service/", configFields: [{ key: "app_id", label: "Microsoft App ID", type: "text", required: true }, { key: "tenant_id", label: "Tenant ID", type: "text", required: true }, { key: "open_id_metadata_url", label: "OpenID metadata URL (optional)", type: "text", placeholder: "https://login.botframework.com/v1/.well-known/openidconfiguration", hint: "Leave empty for the public Bot Framework endpoint. Set it only for a sovereign cloud." }], secretFields: [{ key: "app_password", label: "Client secret" }] },
+  { kind: "google_chat", label: "Google Chat", transport: "webhook", credentialLabel: "Service account key (paste the whole JSON file)", whereToGetIt: "Google Cloud Console → Chat API → create a service account and download its key. Paste the file's contents unchanged.", docsUrl: "https://developers.google.com/chat/api/guides/auth", configFields: [{ key: "project_number", label: "Project number", type: "text", required: true }, { key: "bot_user_name", label: "Bot user name (optional)", type: "text", placeholder: "users/1234567890", hint: "The app's own Chat user resource name, used to recognize mentions of itself." }] },
+  {
+    kind: "sms", label: "SMS", transport: "webhook", credentialLabel: "None here — the carrier credential lives on the telephony account", credentialOptional: true, editOnly: true,
+    whereToGetIt: "An SMS account is created automatically for a telephony account of the same id; configure the carrier and its credential under Telephony.",
+    docsUrl: "https://www.twilio.com/docs/usage/webhooks/sms-webhooks",
+    configFields: [
+      { key: "webhook_public_key", label: "Webhook public key (optional)", type: "text", hint: "The carrier's signing key for inbound webhook verification, when the carrier publishes one." },
+      { key: "session_scope", label: "Session scope (optional)", type: "text", placeholder: "conversation", hint: "Which durable session a text thread maps onto." },
+    ],
+  },
 ];
+
+/** Keys every account accepts regardless of provider: the per-account
+ * attachment knobs the daemon's `AttachmentLimits::for_account` reads. They
+ * bound what one inbound message may cost and what one outbound reply may
+ * carry, so they are edited in the account's advanced section rather than
+ * hidden behind the terminal. */
+export const UNIVERSAL_CONFIG_FIELDS: ProviderConfigField[] = [
+  { key: "max_attachment_bytes", label: "Max attachment size (bytes)", type: "number", placeholder: "16777216", hint: "Per file, inbound and outbound. The application ceiling still applies." },
+  { key: "max_attachment_excerpt_chars", label: "Max text excerpt (characters)", type: "number", placeholder: "4000", hint: "How much of an inbound text file is quoted into the conversation." },
+  { key: "max_listed_attachments", label: "Max attachments per message", type: "number", placeholder: "8", hint: "How many files one message may list or carry." },
+];
+
+/** Every non-secret setting an account of this kind can hold: the provider's
+ * own schema plus the universal attachment knobs. Exactly what the daemon's
+ * `validate_non_secret_config` accepts — the contract test holds the two
+ * sides together. */
+export function editableConfigFields(kind: string): ProviderConfigField[] {
+  const guide = PROVIDER_GUIDES.find((entry) => entry.kind === kind);
+  return [...(guide?.configFields ?? []), ...UNIVERSAL_CONFIG_FIELDS];
+}
 
 /** Turn what the operator typed into the account row's settings object.
  *
@@ -239,27 +362,76 @@ export const channelsSenders = (accountId: string) =>
   invoke<{ pending: PendingSender[] }>("channels_senders", { accountId });
 export const channelsDecideSender = (accountId: string, senderId: string, approve: boolean) =>
   invoke<void>("channels_decide_sender", { accountId, senderId, approve });
-export const channelsRoutes = () => invoke<{ routes: unknown[] }>("channels_routes");
-export const channelsAddRoute = (
-  recipe: string,
-  accountId: string | null,
-  conversationId: string | null,
-  kind: string | null,
-  repository: string | null,
-) => invoke<void>("channels_add_route", { recipe, accountId, conversationId, kind, repository });
+export const channelsRoutes = () => invoke<{ routes: ChannelRoute[] }>("channels_routes");
+export const channelsAddRoute = (recipe: string, options: RouteOptions) =>
+  invoke<{ route: ChannelRoute }>("channels_add_route", { recipe, options });
+export const channelsUpdateRoute = (routeId: string, recipe: string, options: RouteOptions) =>
+  invoke<{ route: ChannelRoute }>("channels_update_route", { routeId, recipe, options });
+export const channelsEnableRoute = (routeId: string, enabled: boolean) =>
+  invoke<void>("channels_enable_route", { routeId, enabled });
 export const channelsRemoveRoute = (routeId: string) => invoke<void>("channels_remove_route", { routeId });
 export const channelsEvents = (accountId: string, limit = 20) =>
   invoke<{ events: ChannelEvent[] }>("channels_events", { accountId, limit });
 export const channelsRemove = (accountId: string) => invoke<void>("channels_remove", { accountId });
+/** Replace an existing account's non-secret settings and/or label. The
+ * credential is untouched: it does not travel through this command in either
+ * direction. */
+export const channelsSetConfig = (
+  accountId: string,
+  config: string | null,
+  label: string | null,
+) => invoke<ChannelAccount>("channels_set_config", { accountId, config, label });
+export const channelsCallbackUrl = (accountId: string) =>
+  invoke<ChannelCallback>("channels_callback_url", { accountId });
+export const channelsSetPublicUrl = (url: string | null) =>
+  invoke<void>("channels_set_public_url", { url });
 
-/** Whether this provider needs the operator to expose a public callback URL.
- * Setup asks for one only when it is genuinely required. */
+/** Whether this provider needs the operator to expose a public callback URL
+ * on the channels listener. Setup asks for one only when it is genuinely
+ * required. SMS is webhook-delivered too, but to the telephony listener —
+ * its callback belongs to the telephony account, and showing the channels
+ * path for it would hand the operator a URL nothing answers. */
 export function needsPublicCallback(kind: string): boolean {
-  return PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport === "webhook";
+  return (
+    kind !== "sms" && PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport === "webhook"
+  );
 }
 
-/** The callback path a webhook provider must be pointed at, under whatever
- * public base URL the operator configured. */
-export function callbackPath(accountId: string): string {
-  return `/v1/channels/${accountId}`;
+/** Merge edited guide fields back over an account's stored settings.
+ *
+ * `channels set-config` replaces the settings object wholesale, so anything
+ * the panel does not render has to be carried across explicitly — an account
+ * configured from the terminal can hold keys no provider guide describes
+ * (per-account attachment limits, say), and silently dropping them on an
+ * unrelated edit would be a data loss the operator never asked for. */
+export function mergeProviderConfig(
+  existing: Record<string, unknown>,
+  fields: ProviderConfigField[],
+  values: Record<string, string>,
+): Record<string, unknown> {
+  const edited = buildProviderConfig(fields, values);
+  const untouched = Object.fromEntries(
+    Object.entries(existing).filter(([key]) => !fields.some((field) => field.key === key)),
+  );
+  return { ...untouched, ...edited };
+}
+
+/** An account's stored settings as the edit form's string values, so the form
+ * starts from what is actually configured rather than blank. */
+export function configFormValues(
+  fields: ProviderConfigField[],
+  config: Record<string, unknown>,
+): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const field of fields) {
+    const value = config[field.key];
+    if (value === undefined || value === null) {
+      values[field.key] = field.type === "boolean" ? "false" : "";
+    } else if (Array.isArray(value)) {
+      values[field.key] = value.join(", ");
+    } else {
+      values[field.key] = String(value);
+    }
+  }
+  return values;
 }

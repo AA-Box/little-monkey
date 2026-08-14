@@ -990,6 +990,47 @@ fn validate_egress_host(value: &str) -> ProtocolValidationResult {
     Ok(())
 }
 
+/// The messaging destinations a run may reach beyond answering its own
+/// conversation.
+///
+/// Absent (the snapshot's `channel_send: None`) means "reply only": a run may
+/// answer the conversation that produced it when its route granted that, and
+/// nothing else. Cross-conversation and cross-account delivery each require
+/// the operator to have said so here — a run cannot widen its own reach by
+/// knowing an account id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelSendPolicy {
+    /// May target conversations other than the run's own origin, on the
+    /// account the run arrived through.
+    #[serde(default)]
+    pub cross_conversation: bool,
+    /// Channel account ids this run may send through in addition to the one
+    /// it arrived through. Each entry names one configured account; there is
+    /// deliberately no wildcard.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<String>,
+}
+
+/// Accounts one grant may name. High enough for any real installation, low
+/// enough that a snapshot cannot be inflated without bound.
+const MAX_CHANNEL_SEND_ACCOUNTS: usize = 32;
+
+impl ChannelSendPolicy {
+    pub fn validate(&self) -> ProtocolValidationResult {
+        if self.accounts.len() > MAX_CHANNEL_SEND_ACCOUNTS {
+            return Err(ProtocolValidationError::new(
+                "permission_policy.channel_send.accounts",
+                format!("contains more than {MAX_CHANNEL_SEND_ACCOUNTS} entries"),
+            ));
+        }
+        for account in &self.accounts {
+            validate_protocol_id("permission_policy.channel_send.accounts", account)?;
+        }
+        Ok(())
+    }
+}
+
 /// One protocol entry: an RFC 3986 scheme, lowercase, no `://`.
 fn validate_egress_protocol(value: &str) -> ProtocolValidationResult {
     const FIELD: &str = "permission_policy.egress_allowlist.protocols";
@@ -1031,6 +1072,11 @@ pub struct PermissionPolicySnapshot {
     /// would turn every idempotent resubmit of an existing run into a conflict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_allowlist: Option<EgressAllowlist>,
+    /// Messaging destinations beyond the run's own conversation — see
+    /// [`ChannelSendPolicy`]. Same serde shape as `egress_allowlist`, for the
+    /// same byte-stability reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_send: Option<ChannelSendPolicy>,
 }
 
 impl PermissionPolicySnapshot {
@@ -1067,6 +1113,9 @@ impl PermissionPolicySnapshot {
 
         if let Some(allowlist) = &self.egress_allowlist {
             allowlist.validate()?;
+        }
+        if let Some(channel_send) = &self.channel_send {
+            channel_send.validate()?;
         }
         Ok(())
     }
@@ -2113,6 +2162,7 @@ mod tests {
                 allow_network: false,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

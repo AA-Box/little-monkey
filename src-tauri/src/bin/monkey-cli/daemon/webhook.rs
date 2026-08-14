@@ -218,12 +218,17 @@ async fn handle_channel_delivery(
         })
         .unwrap_or_default();
 
-    let mut envelopes = match adapter.verify_and_normalize(&headers, &body, None, now_ms) {
-        Ok(envelopes) => envelopes,
-        // Deliberately opaque, and deliberately not recorded: an unverified
-        // body has not earned a row in the durable event log.
-        Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
-    };
+    // The operator's advertised base, for providers whose signatures cover
+    // the full callback URL. Absent is fine: adapters that need nothing
+    // ignore it, and one that requires it refuses its delivery itself.
+    let public_base_url = store.channel_public_base_url().ok().flatten();
+    let mut envelopes =
+        match adapter.verify_and_normalize(&headers, &body, public_base_url.as_deref(), now_ms) {
+            Ok(envelopes) => envelopes,
+            // Deliberately opaque, and deliberately not recorded: an unverified
+            // body has not earned a row in the durable event log.
+            Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
+        };
     // What the provider says happened to messages we already sent. Recorded
     // before the inbound work because it is cheap and must survive even a
     // delivery that carries nothing else — a status-only body is the normal

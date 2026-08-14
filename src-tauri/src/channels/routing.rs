@@ -89,15 +89,40 @@ pub enum RouteScopeError {
     /// A channel-default route names a provider and nothing else; anything more
     /// specific must name the account instead.
     ChannelDefaultWithDetail,
+    /// An id was present but blank. A scope pinned to `""` reads as more
+    /// specific than it is and matches nothing, which is indistinguishable
+    /// from a route that simply never fires.
+    BlankId,
 }
 
 impl RouteScopeError {
+    /// What to tell the operator who typed the scope. `as_str` is the stable
+    /// machine name; this is the sentence the CLI and the panel show.
+    pub fn message(self) -> &'static str {
+        match self {
+            RouteScopeError::MissingAccount => {
+                "A conversation, thread or sender route must also name the account it lives in."
+            }
+            RouteScopeError::MissingConversation => {
+                "A thread or sender route must also name the conversation it lives in."
+            }
+            RouteScopeError::MissingThreadForSender => {
+                "A sender route needs the thread it lives in."
+            }
+            RouteScopeError::ChannelDefaultWithDetail => {
+                "A provider-wide route names the provider and nothing else; name the account instead."
+            }
+            RouteScopeError::BlankId => "A route's account, conversation, thread and sender ids must not be blank.",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             RouteScopeError::MissingAccount => "missing_account",
             RouteScopeError::MissingConversation => "missing_conversation",
             RouteScopeError::MissingThreadForSender => "missing_thread_for_sender",
             RouteScopeError::ChannelDefaultWithDetail => "channel_default_with_detail",
+            RouteScopeError::BlankId => "blank_id",
         }
     }
 }
@@ -165,6 +190,19 @@ impl RouteScope {
     /// only thread-less messages. What is never accepted is a sender or thread
     /// floating free of its conversation.
     pub fn validate(&self) -> Result<(), RouteScopeError> {
+        // A present-but-blank id first: every rule below asks whether a field
+        // is set, and `Some("")` answers yes to all of them while naming
+        // nothing.
+        for id in [
+            &self.account_id,
+            &self.conversation_id,
+            &self.thread_id,
+            &self.sender_id,
+        ] {
+            if id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+                return Err(RouteScopeError::BlankId);
+            }
+        }
         let needs_account =
             self.conversation_id.is_some() || self.thread_id.is_some() || self.sender_id.is_some();
         if needs_account && self.account_id.is_none() {
@@ -181,6 +219,28 @@ impl RouteScope {
             return Err(RouteScopeError::ChannelDefaultWithDetail);
         }
         Ok(())
+    }
+
+    /// Could one message match both scopes?
+    ///
+    /// Two scopes overlap unless some field pins them to different values —
+    /// a field one side leaves unset constrains nothing, exactly as in
+    /// [`Self::matches`]. Two overlapping scopes on the same rung would tie
+    /// for every message they share, which [`resolve_route`] can only report
+    /// as ambiguous; checking here lets configuration reject the pair while
+    /// the operator is still looking at it.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        fn compatible<T: PartialEq>(left: &Option<T>, right: &Option<T>) -> bool {
+            match (left, right) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            }
+        }
+        compatible(&self.kind, &other.kind)
+            && compatible(&self.account_id, &other.account_id)
+            && compatible(&self.conversation_id, &other.conversation_id)
+            && compatible(&self.thread_id, &other.thread_id)
+            && compatible(&self.sender_id, &other.sender_id)
     }
 
     /// Does this scope match the message?
@@ -503,6 +563,80 @@ mod tests {
         assert_eq!(resolved.route_id, "sender");
     }
 
+    /// Every rung, on its own, against the same message. The stacked test
+    /// above proves the order; this proves each level is reachable at all —
+    /// a rung nothing can resolve to is one an operator can configure and
+    /// then watch do nothing.
+    #[test]
+    fn every_rung_resolves_on_its_own() {
+        let rungs = [
+            (
+                "global",
+                RouteScope::global_default(),
+                RouteSpecificity::GlobalDefault,
+            ),
+            (
+                "kind",
+                RouteScope::channel_default(ChannelKind::Slack),
+                RouteSpecificity::ChannelDefault,
+            ),
+            (
+                "account",
+                RouteScope::account("acct-1"),
+                RouteSpecificity::Account,
+            ),
+            (
+                "conv",
+                RouteScope::conversation("acct-1", "C1"),
+                RouteSpecificity::Conversation,
+            ),
+            (
+                "thread",
+                RouteScope::conversation("acct-1", "C1").with_thread("T1"),
+                RouteSpecificity::Thread,
+            ),
+            (
+                "sender",
+                RouteScope::conversation("acct-1", "C1")
+                    .with_thread("T1")
+                    .with_sender("U1"),
+                RouteSpecificity::Sender,
+            ),
+        ];
+        for (id, scope, specificity) in rungs {
+            assert_eq!(scope.specificity(), specificity, "{id}");
+            scope
+                .validate()
+                .unwrap_or_else(|error| panic!("{id}: {error:?}"));
+            let routes = vec![route(id, scope)];
+            assert_eq!(
+                resolve_route(&routes, &envelope())
+                    .unwrap_or_else(|error| panic!("{id}: {error:?}"))
+                    .route_id,
+                id
+            );
+        }
+    }
+
+    /// What configuration checks before storing a route, so an ambiguity is
+    /// reported while the operator is looking at it rather than when a
+    /// message arrives.
+    #[test]
+    fn two_scopes_overlap_only_when_no_field_separates_them() {
+        let account = RouteScope::account("acct-1");
+        assert!(account.overlaps(&RouteScope::account("acct-1")));
+        assert!(!account.overlaps(&RouteScope::account("acct-2")));
+        // An unset field constrains nothing, exactly as in `matches`.
+        assert!(RouteScope::global_default().overlaps(&account));
+        // Different conversations in one account never tie.
+        assert!(!RouteScope::conversation("acct-1", "C1")
+            .overlaps(&RouteScope::conversation("acct-1", "C2")));
+        // Same conversation, different sender: also distinct.
+        assert!(!RouteScope::conversation("acct-1", "C1")
+            .with_sender("U1")
+            .overlaps(&RouteScope::conversation("acct-1", "C1").with_sender("U2")));
+    }
+
     #[test]
     fn resolution_falls_back_down_the_ladder() {
         let routes = vec![
@@ -591,6 +725,26 @@ mod tests {
         assert_eq!(
             resolve_route(&routes, &message).unwrap_err(),
             RouteError::NoRoute
+        );
+    }
+
+    #[test]
+    fn a_blank_id_is_not_a_scope() {
+        // `--account ""` used to store a route pinned to the empty string: on
+        // the account rung by shape, matching nothing in practice.
+        assert_eq!(
+            RouteScope::account("").validate(),
+            Err(RouteScopeError::BlankId)
+        );
+        assert_eq!(
+            RouteScope::conversation("acct-1", "   ").validate(),
+            Err(RouteScopeError::BlankId)
+        );
+        assert_eq!(
+            RouteScope::conversation("acct-1", "C1")
+                .with_sender("")
+                .validate(),
+            Err(RouteScopeError::BlankId)
         );
     }
 

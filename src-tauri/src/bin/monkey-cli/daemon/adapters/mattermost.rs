@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
+    ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
     ProviderCapabilities, SendOutcome,
 };
 use serde_json::Value;
@@ -30,7 +30,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::daemon::channel_adapter::{
     fetch_url, load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs,
-    InboundBatch, LoadedAttachment,
+    InboundBatch, LoadedAttachment, TransportStatus,
 };
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
@@ -90,6 +90,10 @@ fn websocket_url(base_url: &str) -> String {
 #[derive(Default)]
 struct Shared {
     permanent_error: Mutex<Option<String>>,
+    /// What the websocket is actually doing — see [`TransportStatus`]. `poll`
+    /// returns an empty batch whether the socket is live or dropped, so it
+    /// cannot answer this.
+    status: TransportStatus,
 }
 
 pub struct MattermostAdapter {
@@ -169,6 +173,11 @@ impl ChannelAdapter for MattermostAdapter {
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::Mattermost, InboundTransport::Socket)
         }
+    }
+
+    /// The websocket's own state, which a quiet poll cannot report.
+    fn live_transport(&self) -> Option<HealthState> {
+        Some(self.shared.status.get())
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -674,13 +683,22 @@ async fn run_socket_loop(
         let me = match fetch_me(&http, &base_url, &token).await {
             Ok(me) => Some(me),
             Err(FetchMeError::Permanent(error)) => {
+                shared.status.set(HealthState::Error);
                 *shared.permanent_error.lock().await = Some(error);
                 return;
             }
             Err(FetchMeError::Retryable(_)) => None,
         };
-        let reconnected =
-            run_one_connection(&account_id, &base_url, &token, me.as_ref(), &tx).await;
+        let reconnected = run_one_connection(
+            &account_id,
+            &base_url,
+            &token,
+            me.as_ref(),
+            &tx,
+            &shared.status,
+        )
+        .await;
+        shared.status.set(HealthState::Degraded);
         if tx.is_closed() {
             return;
         }
@@ -698,6 +716,7 @@ async fn run_one_connection(
     token: &str,
     me: Option<&Me>,
     tx: &mpsc::Sender<ChannelEnvelope>,
+    status: &TransportStatus,
 ) -> bool {
     let (mut ws, _) = match tokio_tungstenite::connect_async(websocket_url(base_url)).await {
         Ok(pair) => pair,
@@ -711,6 +730,7 @@ async fn run_one_connection(
     {
         return false;
     }
+    status.set(HealthState::Connected);
 
     let our_user_id = me.map(|me| me.user_id.as_str());
     let our_username = me.map(|me| me.username.as_str());

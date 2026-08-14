@@ -1361,6 +1361,7 @@ fn placed_recipe(
         max_iterations: usize::try_from(spec.budgets.max_iterations).ok(),
         timeout_seconds: Some(spec.budgets.wall_time_ms.div_ceil(1_000).max(1)),
         output: little_monkey_lib::recipes::RecipeOutput { json: true },
+        channel_send: None,
         desktop_turn: None,
         placed_run: Some(snapshot),
     };

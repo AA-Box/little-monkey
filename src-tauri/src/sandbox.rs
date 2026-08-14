@@ -1733,6 +1733,7 @@ fn build_sandbox_run_spec(
             allow_network: request.allow_network,
             allow_external_mutations: false,
             egress_allowlist: None,
+            channel_send: None,
         },
         budgets: RunBudgets {
             wall_time_ms: request.timeout().as_millis() as u64,
