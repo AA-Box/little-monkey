@@ -258,6 +258,14 @@ async fn handle_channel_delivery(
 
     let queue = super::DaemonChannelQueue::new(paths.clone());
     let report = super::channel_worker::ingest_batch(&mut store, &queue, &envelopes, now_ms);
+    // The HTTP response *is* this transport's acknowledgement, so it may only
+    // be a success when every message in the delivery crossed the durable
+    // acceptance boundary. One that did not has no durable trace at all, and
+    // only the provider's redelivery can bring it back; the ones that did
+    // commit are deduplicated when it arrives.
+    if report.unrecorded > 0 {
+        return response(StatusCode::INTERNAL_SERVER_ERROR, "not_accepted");
+    }
     if report.failed > 0 && report.accepted == 0 {
         return response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued");
     }
@@ -475,9 +483,19 @@ async fn handle_carrier_callback(
         &digest,
         now_ms,
     ) {
-        Ok(super::telecom_store::TelecomEventRecording::Duplicate { .. }) => {
+        // A redelivered event this daemon has already recorded is finished —
+        // except for an inbound message, where this row is not proof that the
+        // conversation turn behind it exists. A crash between this commit and
+        // the acceptance would otherwise have the carrier answered "duplicate"
+        // for a message nothing ever ran. Handling it again is safe: the
+        // channel event and the turn each deduplicate on their own identity,
+        // so a genuine duplicate collapses and an unfinished one is repaired.
+        Ok(super::telecom_store::TelecomEventRecording::Duplicate { .. })
+            if !matches!(event, super::telephony::TelecomEvent::InboundSms(_)) =>
+        {
             return response(StatusCode::OK, "duplicate")
         }
+        Ok(super::telecom_store::TelecomEventRecording::Duplicate { .. }) => {}
         Ok(super::telecom_store::TelecomEventRecording::Recorded { .. }) => {}
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
     }

@@ -255,7 +255,7 @@ pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn Channe
         ChannelKind::IMessage => Arc::new(imessage::ImessageAdapter::new(config)?),
         // SMS is the one provider whose credential lives on a telephony account
         // rather than a channel account, so it is built from that row instead —
-        // see `channel_worker::load_adapters`.
+        // see `channel_worker::reconcile_workers`.
         ChannelKind::Sms => {
             return Err("An SMS account is built from its telephony account".to_string())
         }
@@ -345,9 +345,10 @@ mod tests {
 
     #[test]
     fn an_edited_setting_is_what_the_next_adapter_is_built_from() {
-        // What "reconfiguration" means in practice: `load_adapters` builds
-        // from the stored row every reload, so an account whose settings were
-        // fixed becomes runnable without anything else being touched.
+        // What "reconfiguration" means in practice: `reconcile_workers`
+        // rebuilds from the stored row when its fingerprint changes, so an
+        // account whose settings were fixed becomes runnable without anything
+        // else being touched.
         let broken = config(
             ChannelKind::Mattermost,
             serde_json::json!({"base_url": "http://chat.example.com"}),

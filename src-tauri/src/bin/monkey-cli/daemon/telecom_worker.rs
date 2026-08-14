@@ -48,6 +48,12 @@ pub(crate) fn handle_carrier_event(
         TelecomEvent::InboundSms(envelope) => {
             ensure_sms_channel_account(store, account, now_ms)?;
             let report = ingest_batch(store, queue, std::slice::from_ref(&*envelope), now_ms);
+            // Nothing crossed the acceptance boundary, so nothing exists to
+            // recover from. The carrier must not be told we have it: an error
+            // here is what buys the redelivery that brings the message back.
+            if report.unrecorded > 0 {
+                return Err("The message could not be durably accepted".to_string());
+            }
             Ok(CarrierOutcome::Message {
                 accepted: report.accepted,
                 ignored: report.ignored + report.challenged + report.duplicates,
@@ -531,6 +537,81 @@ mod tests {
             &account,
             TelecomEvent::InboundSms(Box::new(text("status?", "sms-2"))),
             NOW,
+        )
+        .expect("handled");
+        assert_eq!(
+            outcome,
+            CarrierOutcome::Message {
+                accepted: 1,
+                ignored: 0
+            }
+        );
+        assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+    }
+
+    /// A text whose acceptance rolled back is not something the carrier may be
+    /// told we have: the webhook answers an error, which is what buys the
+    /// redelivery, and that redelivery runs it exactly once.
+    #[test]
+    fn a_text_that_was_never_accepted_is_not_acknowledged_to_the_carrier() {
+        let (mut store, account) = seeded(InboundCallPolicy::Answer);
+        store
+            .insert_channel_route(&ChannelRoute {
+                route_id: "route-1".into(),
+                scope: RouteScope::global_default(),
+                target: RouteTarget::new("chat"),
+                enabled: true,
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("route");
+        let queue = FakeQueue::default();
+        // The account's first text is what creates the paired channel account,
+        // so approve the sender through one before the interesting delivery.
+        let _ = handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::InboundSms(Box::new(text("hello", "sms-1"))),
+            NOW,
+        );
+        store
+            .upsert_channel_sender(
+                "tel-1",
+                "+15551234567",
+                &super::super::channel_store::StoredSenderAuthorization {
+                    sender_id: "+15551234567".into(),
+                    state: little_monkey_lib::channels::policy::SenderState::Approved,
+                    pairing_code_digest: None,
+                    requested_at_ms: NOW,
+                    expires_at_ms: None,
+                    approved_at_ms: Some(NOW),
+                    blocked_at_ms: None,
+                    display_label: None,
+                    metadata: Default::default(),
+                },
+            )
+            .expect("approve");
+
+        super::super::fail_points::arm(super::super::fail_points::FailPoint::AfterEventInsert);
+        let refused = handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::InboundSms(Box::new(text("status?", "sms-2"))),
+            NOW,
+        );
+
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(queue.submitted.lock().unwrap().is_empty());
+
+        // The carrier retries, and the message runs.
+        let outcome = handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::InboundSms(Box::new(text("status?", "sms-2"))),
+            NOW + 1,
         )
         .expect("handled");
         assert_eq!(

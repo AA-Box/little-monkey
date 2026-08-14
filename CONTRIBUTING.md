@@ -159,6 +159,23 @@ cd extensions/little-monkey-vscode
 LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completions
 ```
 
+The messaging adapters have a third opt-in suite that talks to real provider
+accounts. Nothing is bundled and nothing is defaulted: you supply your own test
+bot and your own destination, and every test passes silently when its variables
+are absent, so CI never needs them. Without a destination variable a test
+probes and sends nothing.
+
+```sh
+cd src-tauri
+LM_TEST_TELEGRAM_BOT_TOKEN=… LM_TEST_TELEGRAM_CHAT_ID=… \
+LM_TEST_DISCORD_BOT_TOKEN=…  LM_TEST_DISCORD_CHANNEL_ID=… \
+LM_TEST_SLACK_BOT_TOKEN=xoxb-… LM_TEST_SLACK_APP_TOKEN=xapp-… LM_TEST_SLACK_CHANNEL_ID=… \
+cargo test --bin monkey-cli -- daemon::live_smoke --nocapture
+```
+
+The message it posts is visible in whatever chat you name, so point it at a
+channel of your own rather than one other people read.
+
 ### What CI runs
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull

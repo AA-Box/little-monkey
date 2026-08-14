@@ -43,7 +43,7 @@ const MAX_REPLY_CHARS: usize = 16_000;
 /// Environment variable the daemon sets on a task child so it knows which job
 /// it is. Absent for every other kind of run, which is exactly how this tool
 /// knows it has nothing to reply to.
-const JOB_ID_ENV: &str = "LITTLE_MONKEY_DAEMON_JOB_ID";
+pub(crate) const JOB_ID_ENV: &str = "LITTLE_MONKEY_DAEMON_JOB_ID";
 
 /// The origin of the current process's run, if it has one.
 pub(crate) fn current_channel_origin() -> Option<(String, ChannelOrigin)> {
@@ -143,6 +143,10 @@ impl SendAuthority {
 /// The run's send authority: the legacy external-mutations grant or the
 /// frozen route's reply flag covers answering the origin conversation, and
 /// the snapshot's explicit [`ChannelSendPolicy`] covers everything wider.
+///
+/// Thin wrapper: it only resolves the current process's job and store, then
+/// derives through [`send_authority_for_job`], so a test exercising the
+/// derivation against its own store crosses the same logic.
 pub(crate) fn send_authority(
     allow_external_mutations: bool,
     policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
@@ -156,6 +160,31 @@ pub(crate) fn send_authority(
             store.ingress_reply_grant_for_job(&job_id).ok().flatten()
         })
         .unwrap_or(false);
+    authority_from_grants(route_reply, allow_external_mutations, policy)
+}
+
+/// [`send_authority`] with the store and job injected: the reply grant comes
+/// from the frozen route recorded on the durable turn, never from anything
+/// the run says about itself.
+pub(crate) fn send_authority_for_job(
+    store: &DaemonStore,
+    job_id: &str,
+    allow_external_mutations: bool,
+    policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
+) -> SendAuthority {
+    let route_reply = store
+        .ingress_reply_grant_for_job(job_id)
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    authority_from_grants(route_reply, allow_external_mutations, policy)
+}
+
+fn authority_from_grants(
+    route_reply: bool,
+    allow_external_mutations: bool,
+    policy: Option<&little_monkey_lib::run_protocol::ChannelSendPolicy>,
+) -> SendAuthority {
     SendAuthority {
         reply: allow_external_mutations || route_reply,
         cross_conversation: policy.map(|p| p.cross_conversation).unwrap_or(false),
@@ -340,8 +369,7 @@ pub(crate) fn queue_send(
     // raise — the reply-wide file cap and the artifact store's blob cap. All
     // checked before the row is written, so a request over a deterministic
     // limit never becomes durable.
-    let limits =
-        super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
+    let limits = super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config);
     let max_files = limits.max_listed.min(MAX_ATTACHMENTS_PER_REPLY);
     if request.artifact_ids.len() > max_files {
         return Err(format!(
@@ -980,7 +1008,10 @@ mod tests {
         assert!(properties.get("artifacts").is_some());
         assert!(properties.get("attachments").is_none());
         assert!(properties.get("paths").is_none());
-        assert_eq!(schema["function"]["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            schema["function"]["parameters"]["additionalProperties"],
+            false
+        );
     }
 
     #[test]

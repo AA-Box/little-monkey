@@ -347,7 +347,9 @@ fn set_token(account_id: &str) -> Result<(), String> {
     KeyringChannelSecrets.put(&reference, secret)?;
     account.credential_ref = Some(reference);
     record_credential_change(&mut store, account)?;
-    println!("Credential stored for {account_id}. Run `monkey telecom probe {account_id}` to verify it.");
+    println!(
+        "Credential stored for {account_id}. Run `monkey telecom probe {account_id}` to verify it."
+    );
     Ok(())
 }
 
