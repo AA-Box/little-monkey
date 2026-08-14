@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Smartphone, Square, Trash2 } from "lucide-react";
+import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Smartphone, Square, Trash2, Wrench } from "lucide-react";
 import {
   backpressureGate,
   backpressureMessage,
   backpressureOf,
   type BackpressureState,
+  daemonEnsure,
   daemonInstall,
   daemonKillSwitch,
   daemonQueue,
@@ -147,19 +148,31 @@ export function BackgroundAgentsPanel() {
 
   return (
     <section className="flex flex-col gap-4">
-      <div><h3 className="text-sm font-semibold text-foreground">Background agents and user-owned handoff</h3><p className="mt-1 text-xs leading-5 text-muted">The installed daemon is the authoritative engine for background, CLI, ACP, scheduler, and workflow runs. Remote control is opt-in and keeps inference, provider keys, tools, and repository access on your runner.</p></div>
+      <div><h3 className="text-sm font-semibold text-foreground">Background agents and user-owned handoff</h3><p className="mt-1 text-xs leading-5 text-muted">The resident execution service is part of Little Monkey&apos;s runtime, not an add-on: desktop chat runs on it, as do background, CLI, ACP, scheduler, and workflow runs. The app installs it, keeps it on the shipped build, and starts it at launch — this panel is for managing it afterwards. Remote control is opt-in and keeps inference, provider keys, tools, and repository access on your runner.</p></div>
       <Tabs tabs={[{ id: "daemon", label: "Service" }, { id: "queue", label: "Queue a run" }, { id: "remote", label: "Remote handoff" }]} active={tab} onChange={(id) => setTab(id as typeof tab)} />
 
       {tab === "daemon" && <>
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
           {[["Service", status?.serviceRunning ? "Running" : status?.installed ? "Stopped" : "Not installed"], ["Heartbeat", status?.heartbeatFresh ? "Healthy" : "Offline"], ["Active", status?.active ?? 0], ["Waiting approval", status?.waitingApproval ?? 0], ["Queued", status?.queued ?? 0], ["Paused", status?.paused ?? 0], ["PID", status?.pid ?? "—"], ["Kill switch", status?.killSwitch ? "Engaged" : "Released"], [t("BackgroundAgentsPanel.backpressureLabel"), backpressureStateLabel(t, backpressure.state)], [t("BackgroundAgentsPanel.backpressureQueueLabel"), `${backpressure.queueDepth}/${backpressure.queueCapacity || "—"}`]].map(([label, value]) => <div key={String(label)} className="rounded-lg border border-border bg-surface p-3"><p className="text-[11px] text-faint">{label}</p><p className="mt-1 text-sm font-medium text-foreground">{value}</p></div>)}
         </div>
+        {/* The same repair the app runs at launch and chat offers when a turn
+            cannot be routed: install if missing, republish and restart if the
+            service was left behind by a previous app version, start if
+            stopped, nothing if healthy. Always available, because "it is
+            installed and running" is exactly what an operator comes here to
+            re-establish. */}
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface p-3">
+          <Button variant="primary" disabled={busy !== null} onClick={() => void act("repair", daemonEnsure)}><Wrench size={14} /> Repair service</Button>
+          <p className="text-[11px] leading-4 text-muted">Restores the service to the version this app ships and starts it. Safe to run at any time — a healthy service is left untouched.</p>
+        </div>
         {!status?.installed ? <div className="rounded-lg border border-border bg-surface p-3">
-          <h4 className="text-xs font-semibold text-foreground">Install current-user service</h4>
+          <h4 className="text-xs font-semibold text-foreground">Install with custom limits</h4>
+          <p className="mt-1 text-[11px] leading-4 text-muted">Repair above installs with defaults. Use this only to choose concurrency, queue and retention up front.</p>
           <div className="mt-3 grid gap-2 sm:grid-cols-2"><label className="text-xs text-muted">Concurrency<input type="number" min={1} max={32} value={install.concurrency} onChange={(event) => setInstall({ ...install, concurrency: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Max queue<input type="number" min={1} value={install.maxQueue} onChange={(event) => setInstall({ ...install, maxQueue: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Retention days<input type="number" min={1} value={install.retentionDays} onChange={(event) => setInstall({ ...install, retentionDays: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Loopback webhook port (optional)<input value={install.webhookPort} onChange={(event) => setInstall({ ...install, webhookPort: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label></div>
           <label className="mt-3 flex gap-2 text-xs text-muted"><input type="checkbox" checked={install.notifications} onChange={(event) => setInstall({ ...install, notifications: event.target.checked })} /> Notifications</label>
           <Button className="mt-3" variant="primary" disabled={busy !== null} onClick={() => void act("install", () => daemonInstall({ concurrency: install.concurrency, maxQueue: install.maxQueue, retentionDays: install.retentionDays, webhookPort: install.webhookPort ? Number(install.webhookPort) : null, notifications: install.notifications }))}><Power size={14} /> Install service</Button>
         </div> : <div className="flex flex-wrap gap-2"><Button disabled={busy !== null || Boolean(status.serviceRunning)} onClick={() => void act("start", daemonStart)}><Play size={14} /> Start</Button><Button disabled={busy !== null || !status.serviceRunning} onClick={() => void act("stop", daemonStop)}><Square size={14} /> Stop safely</Button><Button variant={status.killSwitch ? "secondary" : "danger"} disabled={busy !== null} onClick={() => void act("kill switch", () => daemonKillSwitch(!status.killSwitch))}><ShieldAlert size={14} /> {status.killSwitch ? "Release kill switch" : "Engage kill switch"}</Button><Button variant="danger" disabled={busy !== null || status.serviceRunning} onClick={() => { if (window.confirm("Uninstall the current-user daemon service? Durable run history will be retained.")) void act("uninstall", () => daemonUninstall(false)); }}><Trash2 size={14} /> Uninstall service</Button><Button disabled={busy !== null} onClick={() => void act("triggers", daemonTriggers, setTriggers)}><RefreshCw size={14} /> Inspect triggers</Button></div>}
+        {status?.installed && <p className="text-[11px] leading-4 text-muted">Stopping the service also stops desktop chat, and the next app launch starts it again — the durable way to hold all work is the kill switch, which survives restarts and is honoured by every producer.</p>}
         {triggers !== null && <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-surface p-3 text-[10px] text-muted">{JSON.stringify(triggers, null, 2)}</pre>}
       </>}
 
