@@ -744,7 +744,19 @@ mod tests {
             "stdout not capped: {} chars",
             result.stdout.len()
         );
-        assert!(result.stdout.starts_with("… (truncated)"));
+        // The whole result on failure, not just the predicate. A short stdout has
+        // several causes that look identical from a bare `starts_with` — the
+        // command never ran, it was reclaimed for a limit, the shell could not
+        // find the program — and the first Windows failure of this assertion cost
+        // a CI round to tell them apart.
+        assert!(
+            result.stdout.starts_with("… (truncated)"),
+            "expected a front-truncated capture, got {} bytes; code={:?} timed_out={} stderr={:?}",
+            result.stdout.len(),
+            result.code,
+            result.timed_out,
+            result.stderr
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
