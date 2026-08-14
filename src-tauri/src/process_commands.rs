@@ -212,20 +212,30 @@ fn caller_value<T>(
     kind: ProcessKind,
     limit: crate::process_table::ProcessLimitKind,
     stated: Option<T>,
-) -> Option<T> {
-    match kind.limit_support(limit).honours_caller_value() {
-        true => stated,
-        false => None,
+) -> Result<Option<T>, String> {
+    if stated.is_none() || kind.limit_support(limit).honours_caller_value() {
+        return Ok(stated);
     }
+    // Refused, not dropped. Silently discarding it is the failure K4 names
+    // outright: the caller asked for a safety bound, got an admitted process,
+    // and has every reason to believe the bound is active. A typed refusal is
+    // the only answer that leaves the caller's next decision correct — retry
+    // without the limit, pick a kind that can hold it, or stop.
+    Err(format!(
+        "{} cannot be enforced for a {} process: {}",
+        limit.as_str(),
+        kind.as_str(),
+        kind.limit_support(limit).detail()
+    ))
 }
 
 fn merged_limits(
     kind: ProcessKind,
     args: &ProcessAdmitArgs,
-) -> crate::process_table::ProcessLimits {
+) -> Result<crate::process_table::ProcessLimits, String> {
     use crate::process_table::ProcessLimitKind as L;
     let class = kind.default_limits();
-    crate::process_table::ProcessLimits {
+    Ok(crate::process_table::ProcessLimits {
         // The one field with an explicit opt-out, because it is the one with a
         // class default a user can turn off. `unbounded_wall` beats a stated
         // `max_wall_ms` too: a caller that says both has contradicted itself, and
@@ -237,16 +247,44 @@ fn merged_limits(
         max_wall_ms: if args.unbounded_wall.unwrap_or(false) {
             None
         } else {
-            caller_value(kind, L::Wall, args.max_wall_ms).or(class.max_wall_ms)
+            tightest(
+                caller_value(kind, L::Wall, args.max_wall_ms)?,
+                class.max_wall_ms,
+            )
         },
-        max_memory_bytes: caller_value(kind, L::Memory, args.max_memory_bytes)
-            .or(class.max_memory_bytes),
-        max_output_bytes: caller_value(kind, L::Output, args.max_output_bytes)
-            .or(class.max_output_bytes),
-        max_child_processes: caller_value(kind, L::ChildProcesses, args.max_child_processes)
-            .or(class.max_child_processes),
-        max_context_tokens: caller_value(kind, L::ContextTokens, args.max_context_tokens)
-            .or(class.max_context_tokens),
+        max_memory_bytes: tightest(
+            caller_value(kind, L::Memory, args.max_memory_bytes)?,
+            class.max_memory_bytes,
+        ),
+        max_output_bytes: tightest(
+            caller_value(kind, L::Output, args.max_output_bytes)?,
+            class.max_output_bytes,
+        ),
+        max_child_processes: tightest(
+            caller_value(kind, L::ChildProcesses, args.max_child_processes)?,
+            class.max_child_processes,
+        ),
+        max_context_tokens: tightest(
+            caller_value(kind, L::ContextTokens, args.max_context_tokens)?,
+            class.max_context_tokens,
+        ),
+    })
+}
+
+/// The stricter of a caller's value and its class default.
+///
+/// `or` was wrong in one direction that mattered: a caller stating a *larger*
+/// number than the class default replaced it, so an IPC caller could widen a
+/// class bound by asking for more. These fields are maxima, so intersecting them
+/// means taking the minimum — the same rule
+/// [`crate::resource_control::EffectiveLimits::resolve`] applies for native
+/// callers, stated here rather than shared because this path also has to answer
+/// the refusal above and threading a `Result` through that merge would obscure
+/// both.
+fn tightest<T: Ord>(caller: Option<T>, class: Option<T>) -> Option<T> {
+    match (caller, class) {
+        (Some(caller), Some(class)) => Some(caller.min(class)),
+        (caller, class) => caller.or(class),
     }
 }
 
@@ -267,7 +305,7 @@ pub fn process_admit(
     // make a subagent's admission depend on its parent's record having landed
     // first.
     // Computed before `args` starts being moved from, one line below.
-    let limits = merged_limits(kind, &args);
+    let limits = merged_limits(kind, &args)?;
 
     let parent_process_id = match (args.parent_process_id, args.parent_external_id) {
         (Some(explicit), _) => Some(explicit),
@@ -906,7 +944,7 @@ mod tests {
             ProcessKind::CrewMember,
             ProcessKind::SideTask,
         ] {
-            let merged = merged_limits(kind, &args(kind.as_str()));
+            let merged = merged_limits(kind, &args(kind.as_str())).expect("states nothing");
             assert_eq!(
                 merged,
                 kind.default_limits(),
@@ -922,53 +960,101 @@ mod tests {
             merged_limits(
                 ProcessKind::BackgroundShell,
                 &args(ProcessKind::BackgroundShell.as_str())
-            ),
+            )
+            .expect("states nothing"),
             ProcessKind::BackgroundShell.default_limits()
         );
     }
 
     /// K4's contract at the boundary that used to leak it: a caller may not
-    /// record a bound this kind's owner will not read.
+    /// record a bound this kind's owner will not read — and must be *told*, not
+    /// quietly given a process without it.
     ///
-    /// Before this, `process_admit` `or`-ed every stated field over the class
-    /// default, so an IPC caller could put a 512 MiB ceiling and a 4-process
-    /// ceiling on a chat turn. Nothing on any platform consults either, so the
-    /// row advertised containment that did not exist — to the run dashboard, to
-    /// `monkey processes show`, and to anyone auditing what this app promised.
+    /// Two defects, one after the other. `process_admit` first `or`-ed every
+    /// stated field over the class default, so an IPC caller could put a 512 MiB
+    /// ceiling and a 4-process ceiling on a chat turn and the row would advertise
+    /// containment that did not exist. That was fixed by dropping the value —
+    /// which left the second defect: the admission still succeeded, so a caller
+    /// that asked for a safety bound got a running process and no reason to doubt
+    /// the bound was active. Refusing is the only answer that leaves the caller's
+    /// next decision correct.
     #[test]
-    fn a_caller_cannot_record_a_bound_whose_owner_will_not_read_it() {
-        let mut overreaching = args("chat_turn");
-        overreaching.max_memory_bytes = Some(512 * 1024 * 1024);
-        overreaching.max_child_processes = Some(4);
-        overreaching.max_output_bytes = Some(1_024);
+    fn a_caller_asking_for_a_bound_nobody_enforces_is_refused_rather_than_ignored() {
+        for (field, mutate) in [
+            (
+                "max_memory_bytes",
+                Box::new(|args: &mut ProcessAdmitArgs| {
+                    args.max_memory_bytes = Some(512 * 1024 * 1024)
+                }) as Box<dyn Fn(&mut ProcessAdmitArgs)>,
+            ),
+            (
+                "max_child_processes",
+                Box::new(|args: &mut ProcessAdmitArgs| args.max_child_processes = Some(4)),
+            ),
+            (
+                "max_output_bytes",
+                Box::new(|args: &mut ProcessAdmitArgs| args.max_output_bytes = Some(1_024)),
+            ),
+        ] {
+            let mut overreaching = args("chat_turn");
+            mutate(&mut overreaching);
+            let refusal = merged_limits(ProcessKind::ChatTurn, &overreaching)
+                .expect_err("a chat turn holds none of these");
+            assert!(
+                refusal.contains(field) && refusal.contains("chat_turn"),
+                "the refusal must name the field and the kind, got {refusal:?}"
+            );
+            assert!(
+                refusal.len() > 40,
+                "the refusal must say why, not merely that: {refusal:?}"
+            );
+        }
 
-        let merged = merged_limits(ProcessKind::ChatTurn, &overreaching);
-        assert_eq!(merged.max_memory_bytes, None, "no memory mechanism exists");
-        assert_eq!(merged.max_child_processes, None, "no pids mechanism exists");
+        // The field its owner *does* read is admitted by the same path, which is
+        // what stops "refuse everything" from passing the assertions above.
+        let mut bounded = args("chat_turn");
+        bounded.max_wall_ms = Some(1_000);
         assert_eq!(
-            merged.max_output_bytes, None,
-            "a chat turn captures no output stream of its own"
+            merged_limits(ProcessKind::ChatTurn, &bounded)
+                .expect("a wall budget is read off this row")
+                .max_wall_ms,
+            Some(1_000)
         );
-        // The field its owner *does* read is untouched by the same call.
-        assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
 
         // A real bound whose number belongs to the owner is refused too: the
         // daemon enforces memory from the job's own recipe, and a caller value
         // would be replaced on the next projection rather than honoured.
         let mut daemon = args("daemon_job");
         daemon.max_memory_bytes = Some(1_024);
-        assert_eq!(
-            merged_limits(ProcessKind::DaemonJob, &daemon).max_memory_bytes,
-            None
-        );
+        assert!(merged_limits(ProcessKind::DaemonJob, &daemon).is_err());
 
         // And the one desktop kind that reads a caller value for output keeps
         // it, so this is a contract rather than a blanket refusal.
         let mut shell = args("background_shell");
         shell.max_output_bytes = Some(4_096);
         assert_eq!(
-            merged_limits(ProcessKind::BackgroundShell, &shell).max_output_bytes,
+            merged_limits(ProcessKind::BackgroundShell, &shell)
+                .expect("a background shell reads its own output ceiling")
+                .max_output_bytes,
             Some(4_096)
+        );
+    }
+
+    /// A caller may tighten a class default and may not widen it.
+    ///
+    /// `or` used to mean substitution, so a caller stating a *larger* number
+    /// replaced the class bound with its own — which turns a class default into a
+    /// suggestion. These fields are maxima, so the merge takes the minimum.
+    #[test]
+    fn a_caller_may_tighten_a_class_default_but_never_widen_it() {
+        let mut wider = args("chat_turn");
+        wider.max_wall_ms = Some(WEBVIEW_WALL_BUDGET_MS * 10);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &wider)
+                .expect("a wall budget is read off this row")
+                .max_wall_ms,
+            Some(WEBVIEW_WALL_BUDGET_MS),
+            "a caller asking for more must not get more"
         );
     }
 
@@ -976,14 +1062,14 @@ mod tests {
     fn a_stated_value_wins_over_the_class_default_field_by_field() {
         let mut stated = args("chat_turn");
         stated.max_wall_ms = Some(30_000);
-        let merged = merged_limits(ProcessKind::ChatTurn, &stated);
+        let merged = merged_limits(ProcessKind::ChatTurn, &stated).expect("a wall budget");
         assert_eq!(merged.max_wall_ms, Some(30_000));
 
         // …and only that field. A stated context budget must not wipe the class
         // wall budget beside it, which is exactly what substitution used to do.
         let mut tokens_only = args("chat_turn");
         tokens_only.max_context_tokens = Some(8_192);
-        let merged = merged_limits(ProcessKind::ChatTurn, &tokens_only);
+        let merged = merged_limits(ProcessKind::ChatTurn, &tokens_only).expect("a context budget");
         assert_eq!(merged.max_context_tokens, Some(8_192));
         assert_eq!(merged.max_wall_ms, Some(WEBVIEW_WALL_BUDGET_MS));
     }
@@ -995,7 +1081,12 @@ mod tests {
     fn the_opt_out_drops_the_budget_rather_than_zeroing_it() {
         let mut off = args("chat_turn");
         off.unbounded_wall = Some(true);
-        assert_eq!(merged_limits(ProcessKind::ChatTurn, &off).max_wall_ms, None);
+        assert_eq!(
+            merged_limits(ProcessKind::ChatTurn, &off)
+                .expect("turning a budget off declares less")
+                .max_wall_ms,
+            None
+        );
 
         // A caller that says both has contradicted itself; "no budget" is the
         // reading that declares less.
@@ -1003,7 +1094,9 @@ mod tests {
         both.unbounded_wall = Some(true);
         both.max_wall_ms = Some(30_000);
         assert_eq!(
-            merged_limits(ProcessKind::ChatTurn, &both).max_wall_ms,
+            merged_limits(ProcessKind::ChatTurn, &both)
+                .expect("the opt-out wins")
+                .max_wall_ms,
             None
         );
 
@@ -1011,7 +1104,9 @@ mod tests {
         let mut on = args("chat_turn");
         on.unbounded_wall = Some(false);
         assert_eq!(
-            merged_limits(ProcessKind::ChatTurn, &on).max_wall_ms,
+            merged_limits(ProcessKind::ChatTurn, &on)
+                .expect("false is not an opt-out")
+                .max_wall_ms,
             Some(WEBVIEW_WALL_BUDGET_MS)
         );
     }

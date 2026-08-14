@@ -457,6 +457,26 @@ impl ResourceController {
         }
     }
 
+    /// Hand the spawn site the job this workload must be created into.
+    ///
+    /// Windows containment is the job, and the job has to exist before
+    /// `CreateProcessW` so the process can be created suspended, assigned, and
+    /// only then resumed. That ordering is why this is a separate step rather
+    /// than part of `prepare_*`: on Unix the containment is installed by the
+    /// child between `fork` and `exec`, and on Windows it is installed by the
+    /// parent around the creation.
+    #[cfg(windows)]
+    pub fn windows_job_for_spawn(&self) -> io::Result<crate::sandbox_windows::JobConfinement> {
+        match &self.backend {
+            Backend::Job(job) => job.duplicate_for_spawn(),
+            // The job could not be created, so this workload gets the fixed
+            // containment ceiling and the supervisor's own bounds on top. It is
+            // weaker than the caller asked for, which is exactly what
+            // `capabilities()` will report.
+            Backend::Supervisor => crate::sandbox_windows::create_job(),
+        }
+    }
+
     /// Record the workload's root once it exists.
     ///
     /// Stores an identity rather than a pid: everything after this — sampling,
@@ -927,6 +947,52 @@ mod tests {
         assert!(
             controller.breach(&sample, 1).is_none(),
             "a limit is a maximum, so equalling it is inside it"
+        );
+    }
+
+    /// The Windows job's numbers must come from the effective limits, and the
+    /// fixed guardrail must survive as a ceiling rather than as the policy.
+    ///
+    /// Compiled and run only on Windows, because the type it asserts on is the
+    /// job's own. The *rule* it encodes — intersect, never replace — is the same
+    /// one `a_caller_cannot_widen_a_platform_guardrail` holds for every host.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_job_takes_the_tighter_of_the_guardrail_and_the_effective_limit() {
+        use crate::sandbox_windows::JobLimits;
+
+        let guardrail = JobLimits::guardrail();
+
+        // Tighter than the guardrail: the caller's number is installed.
+        let tightened = JobLimits::from_effective(&EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(512 * 1024 * 1024),
+                max_child_processes: Some(8),
+                ..ProcessLimits::default()
+            },
+        )]));
+        assert_eq!(tightened.memory_bytes, 512 * 1024 * 1024);
+        assert_eq!(tightened.active_processes, 8);
+
+        // Looser than the guardrail: the guardrail holds. This is the assertion
+        // that stops a job object from advertising a bound larger than the fixed
+        // containment ceiling it is also meant to provide.
+        let widened = JobLimits::from_effective(&EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_memory_bytes: Some(u64::MAX),
+                max_child_processes: Some(u32::MAX),
+                ..ProcessLimits::default()
+            },
+        )]));
+        assert_eq!(widened, guardrail);
+
+        // Nothing stated: the guardrail, unchanged, which is what every spawn got
+        // before effective limits existed.
+        assert_eq!(
+            JobLimits::from_effective(&EffectiveLimits::default()),
+            guardrail
         );
     }
 

@@ -3880,11 +3880,6 @@ CREATE TABLE agent_processes_v21 (
         ('kernel', 'supervised', 'owner-sourced')),
     limit_observed_at_ms INTEGER
         CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
-    -- Which layer supplied each effective limit, as a compact JSON object. One
-    -- column rather than five, because nothing queries by source; it exists so
-    -- the UI can answer "where did this number come from" without the reader
-    -- knowing the resolution order.
-    limit_sources_json TEXT,
     CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
     CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
     -- The breach travels as a unit. A limit named with no measurement, or a
