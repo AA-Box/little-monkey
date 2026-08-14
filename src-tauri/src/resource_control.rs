@@ -1942,13 +1942,27 @@ mod tests {
     /// leaves no unmanaged descendants behind at all. There is nothing for a later
     /// session to reclaim, which is a stronger property than "the bound is gone"
     /// and is why it is asserted rather than assumed.
+    /// The precondition is read from the job's own accounting rather than from a
+    /// liveness probe on the pid. Both answer "is it running", and only one of
+    /// them answers the question this test needs — whether the *job* holds a live
+    /// member — which is also the reading that survives a runner slow enough for a
+    /// freshly spawned test binary not to be schedulable yet. The first version
+    /// asserted `process_is_alive` once, immediately after the spawn, and failed
+    /// on CI for that reason while every assertion it existed to make went untested.
     #[cfg(windows)]
-    #[test]
-    fn a_windows_job_takes_its_tree_with_it_when_the_supervisor_goes() {
+    #[tokio::test]
+    async fn a_windows_job_takes_its_tree_with_it_when_the_supervisor_goes() {
+        // A process ceiling and no memory ceiling, deliberately. A job's memory
+        // limit is a *commit* charge over the whole job, and the workload here is
+        // a second copy of this debug test binary — which is not a workload whose
+        // commit anyone chose. The first version of this test set 512 MiB and the
+        // child died between the attach and the next statement, which read as the
+        // precondition being wrong rather than as the bound doing exactly what it
+        // was told. The two tests that keep an idle child alive for twenty seconds
+        // on CI state a process ceiling only; these state the same.
         let effective = EffectiveLimits::resolve(&[LimitLayer::new(
             LimitSource::UserOverride,
             ProcessLimits {
-                max_memory_bytes: Some(512 * 1024 * 1024),
                 max_child_processes: Some(8),
                 ..ProcessLimits::default()
             },
@@ -1961,37 +1975,71 @@ mod tests {
         );
         // Twenty seconds of doing nothing, so anything that ends it inside the
         // wait below is the job closing rather than the workload finishing.
-        let mut child = windows_child_under(
-            &mut controller,
-            "windows_idle_child",
-            "LITTLE_MONKEY_WINDOWS_IDLE_MS",
-            "20000",
-        );
-        let pid = child.id();
+        let mut child = windows_idle_child_under(&mut controller, "20000");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut held = false;
+        while std::time::Instant::now() < deadline {
+            let sample = controller.sample().expect("the job reports its accounting");
+            if sample.is_some_and(|sample| sample.process_count.is_some_and(|count| count >= 1)) {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
-            crate::os_signal::process_is_alive(pid),
-            "the workload has to be running before the handle closes, or this proves nothing"
+            held,
+            "the job has to hold a live member before the handle closes, or this proves nothing"
         );
 
         drop(controller);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let ended = loop {
+        let mut ended = false;
+        while std::time::Instant::now() < deadline {
             if child.try_wait().is_ok_and(|status| status.is_some()) {
-                break true;
+                ended = true;
+                break;
             }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        };
-        let _ = child.kill();
-        let _ = child.wait();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = child.kill().await;
         assert!(
             ended,
             "closing the last job handle must end the tree; a survivor here is a descendant no \
              later session could find"
         );
+    }
+
+    /// A contained idle child, spawned the way an owner with its own `Command`
+    /// spawns one: prepare, spawn, attach, and no explicit `adopt`.
+    #[cfg(windows)]
+    fn windows_idle_child_under(
+        controller: &mut ResourceController,
+        idle_ms: &str,
+    ) -> tokio::process::Child {
+        let executable = std::env::current_exe().expect("the test binary knows its own path");
+        let mut command = tokio::process::Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "resource_control::tests::windows_idle_child",
+                "--test-threads=1",
+            ])
+            .env("LITTLE_MONKEY_WINDOWS_IDLE_MS", idle_ms)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        controller
+            .prepare_tokio(&mut command)
+            .expect("a Windows job needs nothing before the spawn");
+        let child = command.spawn().expect("the workload spawns");
+        let pid = child.id().expect("a freshly spawned child has a pid");
+        controller
+            .attach(pid)
+            .expect("attaching a running child must contain it, not refuse it");
+        child
     }
 
     /// An owner that only prepares, spawns and attaches gets a contained child.
@@ -2013,10 +2061,17 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn an_owner_that_only_prepares_and_attaches_gets_a_contained_child() {
+        // A process ceiling and no memory ceiling, deliberately. A job's memory
+        // limit is a *commit* charge over the whole job, and the workload here is
+        // a second copy of this debug test binary — which is not a workload whose
+        // commit anyone chose. The first version of this test set 512 MiB and the
+        // child died between the attach and the next statement, which read as the
+        // precondition being wrong rather than as the bound doing exactly what it
+        // was told. The two tests that keep an idle child alive for twenty seconds
+        // on CI state a process ceiling only; these state the same.
         let effective = EffectiveLimits::resolve(&[LimitLayer::new(
             LimitSource::UserOverride,
             ProcessLimits {
-                max_memory_bytes: Some(512 * 1024 * 1024),
                 max_child_processes: Some(8),
                 ..ProcessLimits::default()
             },
@@ -2028,28 +2083,8 @@ mod tests {
             "every Windows host can create a job; a fallback here is a real failure"
         );
 
-        let executable = std::env::current_exe().expect("the test binary knows its own path");
-        let mut command = tokio::process::Command::new(executable);
-        command
-            .args([
-                "--exact",
-                "resource_control::tests::windows_idle_child",
-                "--test-threads=1",
-            ])
-            .env("LITTLE_MONKEY_WINDOWS_IDLE_MS", "4000")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        controller
-            .prepare_tokio(&mut command)
-            .expect("a Windows job needs nothing before the spawn");
-        let mut child = command.spawn().expect("the workload spawns");
-        let pid = child.id().expect("a freshly spawned child has a pid");
-
-        controller
-            .attach(pid)
-            .expect("attaching a running child must contain it, not refuse it");
+        // No explicit `adopt`, which is the whole point: prepare, spawn, attach.
+        let mut child = windows_idle_child_under(&mut controller, "4000");
         // Not merely "attach returned Ok": the sample comes from the job's own
         // accounting, so a non-empty one is the kernel agreeing that the process
         // is inside the bound.
