@@ -1608,6 +1608,64 @@ mod tests {
         assert_eq!(queue.submissions().len(), 1);
     }
 
+    /// The other shape an older build left: both rows were written, but no link
+    /// between them, because the column did not exist. The migration backfills
+    /// what it can pair by dedupe key; this covers the row it reaches at run
+    /// time instead — the pairing is a repair rather than a guess, since the
+    /// key is built from the same three fields the event already carries.
+    #[test]
+    fn an_event_whose_turn_predates_the_link_is_paired_not_re_run() {
+        let mut store = store_with_account(open_policy());
+        let queue = FakeQueue::default();
+        let envelope = dm("ship it", "1");
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "1".into(),
+                conversation_id: "chat-7".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: serde_json::to_string(&envelope).unwrap(),
+                disposition: EventDisposition::Accepted,
+                received_at_ms: NOW,
+            })
+            .expect("legacy event");
+        // The turn the old build did create, queued as it would have been.
+        let route = store.channel_routes().unwrap()[0].clone();
+        let ingress = ConversationIngress::from_channel(&envelope, &route).with_execution(
+            super::super::channel_worker::test_frozen_execution(
+                &ConversationIngress::from_channel(&envelope, &route),
+            ),
+        );
+        let IngressAcceptance::Accepted { ingress_id } = store
+            .accept_ingress_turn(&ingress, &["message=ship it".into()], NOW)
+            .expect("legacy turn")
+        else {
+            panic!("expected a fresh row");
+        };
+        store
+            .mark_ingress_queued(&ingress_id, &ingress.deterministic_job_id(), NOW)
+            .expect("legacy queued");
+
+        // The provider redelivers. The turn already ran, so this must collapse
+        // — and must not be mistaken for the orphan case, which would decide
+        // the message again and queue a second run for a message already run.
+        assert!(matches!(
+            plan(&mut store, &envelope),
+            ChannelAcceptance::Duplicate { .. }
+        ));
+        assert!(queue.submissions().is_empty());
+        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
+
+        // And the link is repaired in passing, so the next reader does not have
+        // to derive it again.
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        assert_eq!(events[0].ingress_id.as_deref(), Some(ingress_id.as_str()));
+        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+    }
+
     /// The same repair, for a row whose envelope cannot be read back: parked as
     /// failed, where an operator sees it. Never silently counted as handled.
     #[test]
