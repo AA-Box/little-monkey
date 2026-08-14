@@ -511,6 +511,45 @@ pub async fn daemon_desktop_install(
     Ok(output)
 }
 
+/// Bring the resident execution service to a usable state.
+///
+/// Every desktop chat turn executes on that service (see
+/// [`crate::m6a_desktop_bridge`]), which makes it runtime infrastructure rather
+/// than a feature: the app installs it, keeps it on the shipped build and
+/// starts it, and the user is never asked to go and do that themselves. This is
+/// called once at launch by [`ensure_resident_service_at_startup`] and again
+/// behind the Repair action chat offers when a turn cannot be routed.
+///
+/// The whole decision — install, republish, start, or nothing — belongs to
+/// `monkey daemon ensure`, which already owns the installed config, the
+/// published manifest and the running build. This is the fixed-argument bridge
+/// to it and nothing more.
+#[tauri::command]
+pub async fn daemon_desktop_ensure(app: tauri::AppHandle) -> Result<Value, String> {
+    let output = command(vec!["daemon".into(), "ensure".into(), "--json".into()]).await?;
+    let value: Value = serde_json::from_str(output.trim()).map_err(|error| error.to_string())?;
+    let _ = app.emit(DAEMON_CHANGED_EVENT, "ensured");
+    Ok(value)
+}
+
+/// Fire-and-forget [`daemon_desktop_ensure`] for the setup hook.
+///
+/// Failure is not fatal to launching and is not reported here: the person is
+/// told where it matters, by the chat surface that could not send, with a
+/// Repair action next to the sentence. This print is for a terminal-attached
+/// launch, matching every other best-effort startup step.
+///
+/// Release-only, with its one caller — see the comment there for why a dev
+/// build must not claim the machine's service definition.
+#[cfg(not(debug_assertions))]
+pub fn ensure_resident_service_at_startup(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = daemon_desktop_ensure(app).await {
+            eprintln!("Resident execution service could not be started: {error}");
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn daemon_desktop_start(app: tauri::AppHandle) -> Result<String, String> {
     let output = command(vec!["daemon".into(), "start".into()]).await?;
