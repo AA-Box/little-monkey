@@ -899,7 +899,7 @@ impl ProcessKind {
 /// its reservations, and is not making progress; that distinction belongs to
 /// the kind's own record, not to the arbitration layer. `Suspended` means the
 /// process has been deliberately stopped and can be resumed, which today only
-/// the daemon can actually do (see K2 in `docs/agent-os-roadmap.md`).
+/// the daemon can actually do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessState {
@@ -6892,8 +6892,8 @@ mod tests {
     /// compile until its adopter is named here. That is the closest this can get
     /// to the acceptance criterion "a run that exists without a process record
     /// is a bug" — it cannot catch a *new execution path* that reuses an
-    /// existing kind and forgets to project, which is stated as a remaining gap
-    /// in `docs/agent-os-roadmap.md` rather than pretended away.
+    /// existing kind and forgets to project, which is a stated remaining gap
+    /// rather than something pretended away.
     fn adopter_for(kind: ProcessKind) -> &'static str {
         match kind {
             ProcessKind::ChatTurn => "src/lib/agentLoop.ts — runAgentTurn",
