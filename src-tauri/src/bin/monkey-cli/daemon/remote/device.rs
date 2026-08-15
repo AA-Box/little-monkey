@@ -12,8 +12,8 @@
 use std::collections::BTreeSet;
 
 use super::protocol::{
-    effective_capabilities, validate_id, DeviceCapability, DeviceCommandState,
-    MAX_DEVICE_COMMAND_ARG_BYTES,
+    capability_block, effective_capabilities, legacy_capabilities, validate_id, DeviceCapability,
+    DeviceCommandState, MAX_DEVICE_COMMAND_ARG_BYTES,
 };
 use super::store::{DeviceCommandRecord, DeviceCommandRequest, RemoteStore};
 use crate::daemon::store::DaemonPaths;
@@ -37,6 +37,26 @@ pub struct DeviceActionRequest {
     pub source_run_id: Option<String>,
     pub source_session_id: Option<String>,
     pub source_tool_call_id: Option<String>,
+    /// The durable identity of the invocation asking, when there is one.
+    /// See [`invocation_identity`].
+    pub invocation_id: Option<String>,
+}
+
+/// The identity of one durable tool invocation, in the same shape the channel
+/// send path already uses: the daemon's job id from the environment it set on
+/// its own child, plus the agent loop's tool-call id.
+///
+/// Both halves come from the runtime — a model cannot supply, repeat or omit
+/// either — which is what makes the pair safe to key a physical action on. A
+/// turn that is replayed reaches the same pair and therefore the same command;
+/// an operator running the CLI twice has no pair at all and gets two commands,
+/// which is what they asked for.
+pub fn invocation_identity(tool_call_id: Option<&str>) -> Option<String> {
+    let job_id = std::env::var("LITTLE_MONKEY_DAEMON_JOB_ID")
+        .ok()
+        .filter(|id| !id.is_empty())?;
+    let tool_call_id = tool_call_id.map(str::trim).filter(|id| !id.is_empty())?;
+    Some(format!("{job_id}:{tool_call_id}"))
 }
 
 /// Maps the tool's `action` string onto a capability.
@@ -176,41 +196,70 @@ pub fn resolve_target(
     capability: DeviceCapability,
     requested: Option<&str>,
 ) -> Result<String, String> {
-    let candidates = store
+    // Every active device, with the one thing standing between it and this
+    // capability. Kept rather than discarded, because "which of the four axes
+    // said no" is the entire content of a useful failure here.
+    let considered = store
         .devices()?
         .into_iter()
         .filter(|device| device.active())
-        .filter(|device| {
+        .map(|device| {
             let surface = store.device_surface(&device.device_id).ok().flatten();
-            effective_capabilities(&device.capabilities, surface.as_ref()).contains(&capability)
+            let granted = if device.capabilities.is_empty() {
+                legacy_capabilities(&device.scopes)
+            } else {
+                device.capabilities.clone()
+            };
+            let block = capability_block(&granted, surface.as_ref(), capability);
+            (device.device_id, device.device_name, block)
         })
-        .map(|device| (device.device_id, device.device_name))
         .collect::<Vec<_>>();
     if let Some(requested) = requested {
-        return candidates
+        let Some((device_id, _, block)) = considered
             .into_iter()
-            .find(|(device_id, _)| device_id == requested)
-            .map(|(device_id, _)| device_id)
-            .ok_or_else(|| {
-                format!(
-                    "Device '{requested}' cannot do this: the capability is not granted, not \
-                     advertised by that device, or not permitted by its operating system."
-                )
-            });
+            .find(|(device_id, _, _)| device_id == requested)
+        else {
+            return Err(format!("There is no active paired device '{requested}'."));
+        };
+        return match block {
+            None => Ok(device_id),
+            Some(block) => Err(block.explain(capability)),
+        };
     }
-    match candidates.len() {
-        0 => Err(format!(
-            "No paired device can do this. Grant '{}' to a device and make sure the device has \
-             advertised it and been given the matching operating-system permission.",
-            capability_token(capability)
-        )),
-        1 => Ok(candidates.into_iter().next().expect("length checked").0),
+    let eligible = considered
+        .iter()
+        .filter(|(_, _, block)| block.is_none())
+        .collect::<Vec<_>>();
+    match eligible.len() {
+        0 => Err(match considered.len() {
+            0 => format!(
+                "No device is paired with this runner, so '{}' cannot be performed. Pair a device \
+                 first.",
+                capability_token(capability)
+            ),
+            // One device: say exactly what that device is missing rather than a
+            // generic sentence that fits every case and helps in none.
+            1 => considered[0]
+                .2
+                .expect("no eligible device means this one is blocked")
+                .explain(capability),
+            _ => format!(
+                "No paired device can do this right now: {}",
+                considered
+                    .iter()
+                    .filter_map(|(device_id, name, block)| block
+                        .map(|block| format!("{name} ({device_id}) — {}", block.as_str())))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }),
+        1 => Ok(eligible[0].0.clone()),
         _ => Err(format!(
             "{} paired devices can do this — name one with 'device_id': {}",
-            candidates.len(),
-            candidates
+            eligible.len(),
+            eligible
                 .iter()
-                .map(|(device_id, name)| format!("{device_id} ({name})"))
+                .map(|(device_id, name, _)| format!("{device_id} ({name})"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
@@ -294,6 +343,15 @@ pub async fn dispatch(
             source_run_id: request.source_run_id.clone(),
             source_session_id: request.source_session_id.clone(),
             source_tool_call_id: request.source_tool_call_id.clone(),
+            // A durable tool call names itself; a manual invocation does not,
+            // and must not be deduplicated against an earlier one that happened
+            // to look the same.
+            invocation_id: request.invocation_id.clone().or_else(|| {
+                DeviceCommandRequest::invocation_id_for(
+                    request.source_run_id.as_deref(),
+                    request.source_tool_call_id.as_deref(),
+                )
+            }),
             expires_at_ms: now_ms.saturating_add(DEFAULT_COMMAND_TTL_MS),
         },
         now_ms,

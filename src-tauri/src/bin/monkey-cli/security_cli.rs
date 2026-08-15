@@ -233,6 +233,19 @@ fn collect_device_state(runtime: &mut SecurityRuntimeSnapshot) {
             state: command.state.as_str().to_string(),
         });
     }
+    // Read from the same configuration the listener itself uses, so the audit
+    // describes the transport devices actually reach rather than a second copy
+    // of what it should be.
+    runtime.transport = crate::daemon::remote::host_config(&paths)
+        .ok()
+        .flatten()
+        .map(
+            |config| little_monkey_lib::security_doctor::TransportSnapshot {
+                enabled: config.enabled,
+                pinned: !config.certificate_sha256.is_empty(),
+                advertise_url: config.advertise_url,
+            },
+        );
     let push = crate::daemon::remote::push::load_config(&paths)
         .ok()
         .flatten();

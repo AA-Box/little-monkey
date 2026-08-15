@@ -284,6 +284,20 @@ fn header<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Result<&'a str, Stri
 }
 
 fn to_http(value: ApiResponse) -> Response<Full<Bytes>> {
+    // The controller document gets a policy that permits what it implements;
+    // everything else keeps the deny-everything one. A single header for both
+    // was the bug: it denied this page the camera, microphone, location and
+    // screen capture it exists to reach, so the preparation controls could not
+    // work however the browser's own permission prompt was answered.
+    let document = super::web::is_controller_document(value.content_type);
+    let (permissions, csp) = if document {
+        (
+            super::web::CONTROLLER_PERMISSIONS_POLICY,
+            super::web::CONTROLLER_CSP,
+        )
+    } else {
+        (super::web::API_PERMISSIONS_POLICY, super::web::API_CSP)
+    };
     Response::builder()
         .status(StatusCode::from_u16(value.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header(CONTENT_TYPE, value.content_type)
@@ -292,16 +306,10 @@ fn to_http(value: ApiResponse) -> Response<Full<Bytes>> {
         .header("x-content-type-options", "nosniff")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
-        .header(
-            "permissions-policy",
-            "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=()",
-        )
+        .header("permissions-policy", permissions)
         .header("cross-origin-opener-policy", "same-origin")
         .header("cross-origin-resource-policy", "same-origin")
-        .header(
-            "content-security-policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-        )
+        .header("content-security-policy", csp)
         .body(Full::new(Bytes::from(value.body)))
         .expect("static remote response is valid")
 }
@@ -500,5 +508,91 @@ mod tests {
         assert!(policy.contains("default-src 'none'"));
         assert!(policy.contains("connect-src 'self'"));
         assert!(policy.contains("frame-ancestors 'none'"));
+    }
+
+    /// The controller must be permitted to use the hardware it implements.
+    ///
+    /// This is the assertion whose absence let every device test pass while the
+    /// real browser path was dead: an empty allowlist — `camera=()` — disables
+    /// the feature for the document, so `getUserMedia`, `getDisplayMedia` and
+    /// `getCurrentPosition` were refused before any permission prompt could
+    /// appear, and no amount of correct client logic could reach hardware.
+    #[test]
+    fn the_controller_document_is_permitted_to_use_what_it_implements() {
+        let response = to_http(super::super::web::asset("GET", "/remote").unwrap());
+        let policy = response.headers()["permissions-policy"].to_str().unwrap();
+        for feature in ["camera", "microphone", "geolocation", "display-capture"] {
+            assert!(
+                policy.contains(&format!("{feature}=(self)")),
+                "the controller implements {feature} and this policy forbids it: {policy}"
+            );
+            assert!(
+                !policy.contains(&format!("{feature}=()")),
+                "an empty allowlist disables {feature} outright: {policy}"
+            );
+        }
+        // Narrow, not open: this origin only, and nothing it does not use.
+        assert!(
+            !policy.contains('*'),
+            "the allowlist must name self, not all"
+        );
+        for denied in ["payment=()", "usb=()"] {
+            assert!(
+                policy.contains(denied),
+                "{denied} must stay denied: {policy}"
+            );
+        }
+    }
+
+    /// …and nothing else is. A signed API response has no reason to reach a
+    /// camera, so it keeps the deny-everything policy.
+    #[test]
+    fn an_api_response_still_denies_every_hardware_feature() {
+        let response = to_http(ApiResponse::error(401, "nope"));
+        let policy = response.headers()["permissions-policy"].to_str().unwrap();
+        for feature in ["camera", "microphone", "geolocation", "display-capture"] {
+            assert!(
+                policy.contains(&format!("{feature}=()")),
+                "{feature} must stay denied outside the controller document: {policy}"
+            );
+        }
+    }
+
+    /// The audio the controller plays has to be allowed to load.
+    ///
+    /// `media-src` has no fallback but `default-src`, which is `'none'` here, so
+    /// without it the two real audio sources — a `blob:` URL for an artifact and
+    /// a `data:` URL for the silence that unlocks autoplay — were both refused.
+    /// The header and the document's own `<meta>` copy are both enforced and the
+    /// browser intersects them, so they are checked together: a directive
+    /// present in one and missing from the other still blocks.
+    #[test]
+    fn the_controller_may_load_the_audio_it_plays_under_both_policy_copies() {
+        let response = to_http(super::super::web::asset("GET", "/remote").unwrap());
+        let header = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let html = String::from_utf8(super::super::web::asset("GET", "/remote").unwrap().body)
+            .expect("the controller document is text");
+        let meta = html
+            .split_once("http-equiv=\"Content-Security-Policy\" content=\"")
+            .and_then(|(_, tail)| tail.split_once('"'))
+            .map(|(value, _)| value.to_string())
+            .expect("the controller document still declares its own policy");
+        assert_eq!(
+            header, meta,
+            "both copies are enforced and the browser intersects them; they must not drift"
+        );
+        for policy in [&header, &meta] {
+            assert!(policy.contains("media-src 'self' blob: data:"), "{policy}");
+            // The strictness the relaxation must not have cost.
+            assert!(policy.contains("default-src 'none'"), "{policy}");
+            assert!(policy.contains("object-src 'none'"), "{policy}");
+            assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+            assert!(policy.contains("base-uri 'none'"), "{policy}");
+            assert!(!policy.contains("unsafe-inline"), "{policy}");
+            assert!(!policy.contains("unsafe-eval"), "{policy}");
+        }
     }
 }

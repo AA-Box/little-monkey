@@ -111,7 +111,7 @@ monkey daemon retry <run-id> [--acknowledge-side-effects]
 monkey daemon kill-switch engage|release|status
 monkey daemon trigger --help
 monkey daemon remote --help
-monkey daemon remote pair-create --output <file> --run <run-id> --device <capability> [--qr]
+monkey daemon remote pair-create --output <file> --run <run-id> --device <capability> [--qr] [--json]
 monkey daemon remote device-list [--json]
 monkey daemon remote device-grant <device-id> [--capability <capability>]...
 monkey daemon remote device-action <action> [--device-id <id>] [--wait-ms <n>] [--json]

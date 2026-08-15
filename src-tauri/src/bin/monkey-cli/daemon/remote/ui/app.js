@@ -1,7 +1,37 @@
+import {
+  JOURNAL_LIMITS,
+  PERMISSION,
+  PERMISSION_NAMES,
+  PHASE,
+  READINESS,
+  aborted,
+  acquireExecutor,
+  artifactOutcome,
+  createJournal,
+  deliverStaged as deliverStagedResult,
+  describeCapability,
+  isEffective,
+  isUnacknowledged,
+  journalUpgrade,
+  plainOutcome,
+  recordAudio,
+  recoveryAction,
+  runLeasedCommand,
+  speakText,
+  unknownOutcomeReport,
+  waitOrAbort,
+} from "./device-core.js";
+
 const PROTOCOL_VERSION = 1;
 const DB_NAME = "little-monkey-remote-v1";
-const DB_VERSION = 1;
+// v2 adds the durable command journal. Additive: the controller store keeps its
+// name, its key path and every record in it, so an upgrade never re-pairs.
+const DB_VERSION = 2;
 const STORE_NAME = "controllers";
+// Artifact bytes live here, not in the controller record. A profile row that
+// carried multi-megabyte stills would be rewritten in full on every sequence
+// allocation, which is the hottest write this client makes.
+const JOURNAL_STORE = "device_command_journal";
 const ACTIVE_RECORD = "active";
 const MAX_INVITATION_BYTES = 256 * 1024;
 // Every `RemoteAction` the runner can grant. `pause` and `control_desktop`
@@ -19,29 +49,41 @@ const ALLOWED_ACTIONS = new Set([
   "control_desktop",
 ]);
 
-// Physical capabilities this build can actually perform, mapped to the
-// browser feature that performs them. Advertised to the runner as "supported";
-// the runner intersects that with the operator's grant and the OS permission.
-const DEVICE_CAPABILITIES = {
-  device_info: () => true,
-  camera_capture: () => Boolean(navigator.mediaDevices?.getUserMedia),
-  microphone_capture: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
-  location_read: () => Boolean(navigator.geolocation),
-  notification_post: () => "Notification" in window,
-  screen_capture: () => Boolean(navigator.mediaDevices?.getDisplayMedia),
-  // Either half is enough to be useful: an artifact is played back through the
-  // audio element, and `text` is spoken by the synthesizer.
-  audio_playback: () => Boolean(window.speechSynthesis) || typeof Audio === "function",
-  voice_stream: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
-};
-
-// Which Permissions API name answers for each capability, where one does.
-const PERMISSION_NAMES = {
-  camera_capture: "camera",
-  microphone_capture: "microphone",
-  // A stream is the microphone, so it is the microphone's permission.
-  voice_stream: "microphone",
-  location_read: "geolocation",
+// Every non-physical `DeviceCapability` the runner can grant a controller,
+// mapped to the surface in this client that spends it.
+//
+// The physical capabilities below answer "what may the runner ask of this
+// device"; these answer the other direction, and each one is a route the runner
+// already serves. A grant with no surface here is a grant an operator can make
+// and this client silently ignores — which is how `pause` and `control_desktop`
+// were once accepted at pairing and then unreachable. `web.rs` asserts this
+// object against the Rust enum, so a capability added there fails the build
+// here rather than becoming another dead letter.
+const CONTROLLER_CAPABILITIES = {
+  view_runs: "the run list and every run's durable detail",
+  view_events: "the replayed event timeline",
+  read_artifacts: "fetching a run's artifact by id",
+  approve: "deciding a digest-bound approval",
+  cancel: "requesting cancellation of a run",
+  pause: "pausing and resuming a run",
+  kill: "the emergency stop",
+  view_sessions: "reading paired conversations and their messages",
+  chat: "sending a message that becomes a durable run",
+  view_tasks: "listing the workflows declared on the runner",
+  run_workflows: "launching one of those workflows",
+  capture: "filing a note or file from this device",
+  // Driven from the runner's own desktop, with local visible consent there.
+  // This client is the *subject* of that session, never its operator, so it
+  // has no surface of its own — and saying so here is what keeps the parity
+  // check honest rather than silent.
+  control_desktop: null,
+  describe_node: null,
+  place_runs: null,
+  migrate: null,
+  peer_message: null,
+  peer_task_request: null,
+  peer_artifact: null,
+  admin: null,
 };
 
 const PAIRING_URI_SCHEME = "littlemonkey://pair/";
@@ -69,9 +111,23 @@ const state = {
   // Last surface reported to the runner, and what it answered with — the
   // grant/advertised/OS/effective breakdown the device screen shows.
   deviceState: null,
-  // The command currently being performed, so a cancel can reach it.
-  activeCommand: null,
+  // The last surface this device posted — what it supports, what its OS
+  // permits, and whether each capability is ready right now.
+  surface: null,
   commandLoopRunning: false,
+  // True while this tab holds the executor lock. Exactly one tab of a paired
+  // profile performs physical commands; the others say so and do nothing.
+  executor: false,
+  // Autoplay policy cleared by an explicit gesture. Never assumed: a browser
+  // that refuses to play a sound would otherwise be advertised as ready.
+  audioEnabled: false,
+  // Permission names this session has obtained itself, by running the real
+  // browser permission operation from a real user gesture and having it
+  // succeed. Only consulted for a permission this browser cannot query at all
+  // (Safari answers for neither camera nor microphone), and deliberately in
+  // memory only: a reload starts fail-closed again rather than remembering
+  // consent nothing can re-verify.
+  sessionVerified: {},
   pushSubscribed: false,
   // The armed display stream. Held so a screen capture needs no second consent
   // prompt; while it is null, screen capture is reported as not permitted and
@@ -87,8 +143,27 @@ const state = {
   events: new Map(),
   eventStartCursors: new Map(),
   approvals: [],
+  // The paired conversation surface: what the runner last said, plus the
+  // unsent draft, which is the one thing here that survives being offline.
+  sessions: [],
+  selectedSessionId: null,
+  messages: new Map(),
+  drafts: {},
+  workflows: [],
   toastTimer: null,
   activeRequests: 0,
+};
+
+// Bounds on what this browser keeps for the train. Every one of them is a
+// count rather than a byte budget because IndexedDB has no quota this page can
+// read: a bound nobody can measure is not a bound.
+const CACHE_LIMITS = {
+  runs: 50,
+  eventsPerRun: 200,
+  approvalsPerRun: 20,
+  sessions: 50,
+  messagesPerSession: 200,
+  artifactsPerRun: 50,
 };
 
 const ui = Object.fromEntries(
@@ -136,11 +211,34 @@ const ui = Object.fromEntries(
     "deviceSupported",
     "deviceEffective",
     "devicePermissions",
+    "deviceReadiness",
+    "journalStatus",
     "staleBanner",
     "pushButton",
     "pushStatus",
     "screenShareButton",
     "screenShareStatus",
+    "revokeSelfButton",
+    "pauseButton",
+    "resumeButton",
+    "chatPanel",
+    "chatRefreshButton",
+    "sessionSelect",
+    "chatEmpty",
+    "messageList",
+    "chatForm",
+    "chatInput",
+    "chatSendButton",
+    "workflowPanel",
+    "workflowRefreshButton",
+    "workflowList",
+    "workflowEmpty",
+    "capturePanel",
+    "captureForm",
+    "captureTitleInput",
+    "captureText",
+    "captureFile",
+    "captureButton",
     "connectionDot",
     "connectionText",
     "toast",
@@ -152,10 +250,14 @@ const ui = Object.fromEntries(
 );
 
 class RemoteError extends Error {
-  constructor(message, status = 0) {
+  constructor(message, status = 0, { cancelled = false } = {}) {
     super(message);
     this.name = "RemoteError";
     this.status = status;
+    // True only for a request this device itself cancelled — a long poll giving
+    // the lock up, or a watcher whose command finished. Never a runner failure,
+    // so a caller must not back off over one.
+    this.cancelled = cancelled;
   }
 }
 
@@ -171,12 +273,10 @@ function requiredFeaturesAvailable() {
 function openDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(STORE_NAME)) {
-        database.createObjectStore(STORE_NAME, { keyPath: "id" });
-      }
-    };
+    // The upgrade lives in `device-core.js` so it can be exercised without a
+    // browser: it adds the journal store and leaves an existing pairing's key,
+    // sequence and cache exactly where they were.
+    request.onupgradeneeded = () => journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Browser storage could not be opened"));
     request.onblocked = () => reject(new Error("Browser storage upgrade is blocked by another tab"));
@@ -330,6 +430,24 @@ function validateStoredRecord(record) {
       throw new Error("A stored event cursor is invalid");
     }
   }
+  // Absent on a record written before capabilities were stored, which is not an
+  // error: `hasCapability` falls back to the legacy action mapping for exactly
+  // that pairing.
+  if (profile.capabilities !== undefined) {
+    if (!Array.isArray(profile.capabilities) || profile.capabilities.some((value) => typeof value !== "string")) {
+      throw new Error("The stored pairing capabilities are invalid");
+    }
+  }
+  if (record.drafts !== undefined) {
+    if (!record.drafts || typeof record.drafts !== "object" || Array.isArray(record.drafts)) {
+      throw new Error("The stored drafts are invalid");
+    }
+    for (const [sessionId, text] of Object.entries(record.drafts)) {
+      if (!validId(sessionId) || typeof text !== "string" || text.length > 4_000) {
+        throw new Error("A stored draft is invalid");
+      }
+    }
+  }
 }
 
 function validId(value) {
@@ -390,6 +508,25 @@ function hasScope(action) {
   return Boolean(state.profile?.scopes.actions.includes(action));
 }
 
+// Whether this pairing holds a capability, by the runner's own answer where one
+// is available.
+//
+// Three sources, deliberately in this order: the device-state route is
+// authoritative and is what an operator's later grant edit shows up in; the
+// accept response is what the runner said at pairing and is all a device has
+// while offline; and a pairing made before capabilities existed has neither, so
+// its legacy actions are mapped the same way `legacy_capabilities` maps them on
+// the runner. Nothing here can widen anything — a route the runner does not
+// grant answers 403 whatever this returns — it only decides whether a surface
+// is offered at all, and offering one that always fails is worse than hiding it.
+function hasCapability(capability) {
+  const granted = state.deviceState?.granted;
+  if (Array.isArray(granted)) return granted.includes(capability);
+  const paired = state.profile?.capabilities;
+  if (Array.isArray(paired) && paired.length > 0) return paired.includes(capability);
+  return hasScope(capability);
+}
+
 function randomToken(byteCount) {
   const bytes = crypto.getRandomValues(new Uint8Array(byteCount));
   let binary = "";
@@ -415,15 +552,54 @@ function endRequest(success) {
   if (state.activeRequests === 0 && success) setConnection("online", "Paired and reachable");
 }
 
-async function signedRequest(method, pathAndQuery, bodyValue) {
-  return navigator.locks.request(
-    "little-monkey-remote-command-v1",
-    { mode: "exclusive" },
-    () => signedRequestExclusive(method, pathAndQuery, bodyValue),
-  );
+// The long-poll currently holding the request lock, if any.
+//
+// Every signed request is serialized, because the runner refuses a sequence it
+// has already passed and two requests in flight can arrive in either order. A
+// long poll therefore holds the lock while it waits — up to 25 seconds — and
+// anything else the device wants to say waits behind it. That is fine while
+// nothing else is happening and wrong the moment something is: a voice stream's
+// chunks, an artifact fetch, a result to deliver.
+//
+// So a long poll registers itself here and any ordinary request cancels it
+// first. Nothing is lost: the poll is a question about state, the watcher asks
+// it again straight afterwards, and cancelling a request that has already been
+// counted by the runner costs one sequence number.
+//
+// Registered *before* the lock is asked for, and the same signal cancels the
+// lock request itself: a long poll that is still queued for the lock is exactly
+// as much in the way as one that holds it, and registering only once it was
+// granted left a window where an ordinary request found nothing to cancel and
+// then waited out the poll it had just missed.
+let pendingLongPoll = null;
+
+async function signedRequest(method, pathAndQuery, bodyValue, options = {}) {
+  if (!options.longPoll) pendingLongPoll?.abort();
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  if (options.signal?.aborted) cancel();
+  options.signal?.addEventListener?.("abort", cancel, { once: true });
+  if (options.longPoll) pendingLongPoll = controller;
+  try {
+    return await navigator.locks.request(
+      "little-monkey-remote-command-v1",
+      { mode: "exclusive", signal: controller.signal },
+      () => signedRequestExclusive(method, pathAndQuery, bodyValue, controller),
+    );
+  } catch (error) {
+    // The lock request itself was cancelled while queued. Same answer as a
+    // cancelled fetch: nothing was sent, nothing is inferred.
+    if (controller.signal.aborted && !(error instanceof RemoteError)) {
+      throw new RemoteError("This request was cancelled on the device", 0, { cancelled: true });
+    }
+    throw error;
+  } finally {
+    options.signal?.removeEventListener?.("abort", cancel);
+    if (pendingLongPoll === controller) pendingLongPoll = null;
+  }
 }
 
-async function signedRequestExclusive(method, pathAndQuery, bodyValue) {
+async function signedRequestExclusive(method, pathAndQuery, bodyValue, controller) {
   if (!/^\/v1\/remote\//u.test(pathAndQuery) || /[\r\n]/u.test(pathAndQuery)) {
     throw new Error("Controller request path is outside the remote API");
   }
@@ -464,6 +640,9 @@ async function signedRequestExclusive(method, pathAndQuery, bodyValue) {
   try {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
+        if (controller.signal.aborted) {
+          throw new RemoteError("This request was cancelled on the device", 0, { cancelled: true });
+        }
         const response = await fetch(pathAndQuery, {
           method,
           headers,
@@ -472,6 +651,7 @@ async function signedRequestExclusive(method, pathAndQuery, bodyValue) {
           credentials: "omit",
           redirect: "error",
           referrerPolicy: "no-referrer",
+          signal: controller.signal,
         });
         const text = await response.text();
         let value;
@@ -492,6 +672,11 @@ async function signedRequestExclusive(method, pathAndQuery, bodyValue) {
         return value;
       } catch (error) {
         if (error instanceof RemoteError) throw error;
+        // A cancelled request is not an unreachable runner, and retrying it
+        // would defeat the cancellation it was asked for.
+        if (controller.signal.aborted) {
+          throw new RemoteError("This request was cancelled on the device", 0, { cancelled: true });
+        }
         lastNetworkError = error;
         if (attempt < 2) await delay(125 * 2 ** attempt);
       }
@@ -655,10 +840,18 @@ async function acceptInvitation(invitation, deviceName) {
       deviceId: accepted.device_id,
       secretGeneration: accepted.secret_generation,
       scopes: accepted.scopes,
+      // What the runner says this pairing may reach beyond the legacy run
+      // actions. Kept so the chat, workflow and capture surfaces are decided
+      // correctly on the first frame and while offline, rather than only after
+      // the device-state route answers.
+      capabilities: Array.isArray(accepted.capabilities)
+        ? accepted.capabilities.filter((value) => typeof value === "string")
+        : [],
     },
     key,
     nextSequence: 1,
     eventCursors: {},
+    drafts: {},
   };
   validateStoredRecord(record);
   await saveActiveRecord(record);
@@ -673,6 +866,11 @@ function showPairing() {
   state.events.clear();
   state.eventStartCursors.clear();
   state.approvals = [];
+  state.sessions = [];
+  state.selectedSessionId = null;
+  state.messages.clear();
+  state.workflows = [];
+  state.drafts = {};
   ui.dashboardView.hidden = true;
   ui.pairingView.hidden = false;
   setConnection("idle", "Not paired");
@@ -686,8 +884,34 @@ function showDashboard(profile) {
   ui.killButton.hidden = !hasScope("kill");
   ui.artifactPanel.hidden = !hasScope("read_artifacts");
   ui.eventsPanel.hidden = !hasScope("view_events");
+  ui.capturePanel.hidden = !hasCapability("capture");
   renderDeviceState();
+  renderSessions();
+  renderWorkflows();
   setConnection("online", "Paired; checking runner…");
+}
+
+// Loads every capability surface this pairing actually holds.
+//
+// Failures are reported and swallowed one at a time rather than aborting the
+// batch: a runner build without the workflow service answers 501 for
+// workflows, and that is not a reason for the chat panel to stay empty.
+async function refreshCapabilitySurfaces() {
+  if (hasCapability("view_sessions")) {
+    try {
+      await loadSessions();
+    } catch (error) {
+      handleError(error, "Sessions could not be read");
+    }
+  }
+  if (hasCapability("view_tasks")) {
+    try {
+      await loadWorkflows();
+    } catch (error) {
+      handleError(error, "Workflows could not be read");
+    }
+  }
+  ui.capturePanel.hidden = !hasCapability("capture");
 }
 
 function setConnection(kind, message) {
@@ -823,13 +1047,30 @@ async function loadRunDetail(runId) {
   if (!isRunSummary(value.run) || !value.spec || typeof value.spec !== "object") {
     throw new RemoteError("Runner returned invalid run details");
   }
-  state.selectedRun = value.run;
-  ui.detailRunId.textContent = value.run.run_id;
-  ui.detailStatus.textContent = humanize(value.run.status);
-  ui.detailStatus.dataset.status = value.run.status;
-  ui.specJson.textContent = JSON.stringify(value.spec, null, 2);
-  renderFacts(value.run);
-  ui.cancelButton.hidden = !hasScope("cancel") || TERMINAL_STATUSES.has(value.run.status);
+  // `paused` is a sibling of `run`, not a field on it: the daemon's job holds
+  // the flag and the run summary is the ledger's, so folding it in would mean
+  // one of the two shapes lying about where the state lives.
+  const paused = value.paused === true;
+  await cacheRunDetail(runId, value.run, value.spec, paused);
+  renderRunDetail(value.run, value.spec, paused);
+}
+
+function renderRunDetail(run, spec, paused) {
+  state.selectedRun = run;
+  ui.detailRunId.textContent = run.run_id;
+  ui.detailStatus.textContent = humanize(run.status);
+  ui.detailStatus.dataset.status = run.status;
+  ui.specJson.textContent = JSON.stringify(spec ?? {}, null, 2);
+  renderFacts(run);
+  const terminal = TERMINAL_STATUSES.has(run.status);
+  ui.cancelButton.hidden = !hasScope("cancel") || terminal;
+  // Pause and resume are one grant and two buttons, because "paused" is a
+  // state a controller has to be able to leave. Which of the two is offered
+  // follows the run's own answer rather than a local memory of what was
+  // clicked: a run resumed from the desktop must not still read as paused here.
+  ui.pauseButton.hidden = !hasCapability("pause") || terminal || paused;
+  ui.resumeButton.hidden = !hasCapability("pause") || terminal || !paused;
+  applyStaleState();
 }
 
 function renderFacts(run) {
@@ -863,7 +1104,40 @@ async function loadApprovals(runId) {
   if (state.selectedRunId !== runId) return;
   if (!Array.isArray(value.approvals)) throw new RemoteError("Runner returned invalid approvals");
   state.approvals = value.approvals.filter(isApproval);
+  await cacheApprovals(runId, state.approvals);
   renderApprovals();
+}
+
+// Pause and resume, which are the same grant and two different requests.
+//
+// The runner answers 202 with a *request* recorded, not a state reached: a run
+// between tool calls does not stop the instant somebody taps pause. Saying
+// "requested" rather than "paused" is the difference between reporting what
+// happened and reporting what was asked for.
+async function setRunPaused(paused) {
+  const runId = state.selectedRunId;
+  if (!runId) return;
+  const button = paused ? ui.pauseButton : ui.resumeButton;
+  setButtonBusy(button, true, paused ? "Pausing…" : "Resuming…");
+  try {
+    const value = await signedRequest(
+      "POST",
+      `/v1/remote/runs/${encodeURIComponent(runId)}/${paused ? "pause" : "resume"}`,
+      {},
+    );
+    showToast(
+      value.status === "already_terminal"
+        ? "The run had already finished."
+        : paused
+          ? "Pause requested. The run stops at its next safe point."
+          : "Resume requested.",
+    );
+    await Promise.all([loadRunDetail(runId), loadEventsIfPermitted(runId)]);
+  } catch (error) {
+    handleError(error, paused ? "Pause failed" : "Resume failed");
+  } finally {
+    setButtonBusy(button, false);
+  }
 }
 
 function isApproval(approval) {
@@ -978,6 +1252,7 @@ async function loadEvents(runId) {
   const merged = [...bySequence.values()].sort((left, right) => left.sequence - right.sequence).slice(-1000);
   state.events.set(runId, merged);
   await saveEventCursor(runId, value.next_cursor);
+  await cacheEvents(runId, merged);
   if (state.selectedRunId === runId) renderEvents();
 }
 
@@ -1036,6 +1311,257 @@ function summarizeEvent(event) {
   }
   const keys = Object.keys(payload).slice(0, 3).map(humanize);
   return keys.length > 0 ? keys.join(" · ") : "Durable event recorded.";
+}
+
+// --- Paired conversations --------------------------------------------------
+//
+// The runner has served these routes since the mobile companion existed; this
+// client simply never used them, so an operator could grant `chat` and watch
+// nothing appear. Everything below spends a capability the runner already
+// gates, and every one of these requests is refused with a 403 if the grant is
+// absent — the visibility rules here decide what to *offer*, never what is
+// allowed.
+
+function isSessionSummary(session) {
+  return Boolean(
+    session &&
+      validId(session.id) &&
+      typeof session.title === "string" &&
+      Number.isSafeInteger(session.updated_at_ms),
+  );
+}
+
+function isChatMessage(message) {
+  return Boolean(
+    message &&
+      validId(message.id) &&
+      typeof message.role === "string" &&
+      typeof message.text === "string" &&
+      Number.isSafeInteger(message.created_at_ms),
+  );
+}
+
+async function loadSessions() {
+  const value = await signedRequest("GET", "/v1/remote/mobile/sessions");
+  if (!Array.isArray(value.sessions)) throw new RemoteError("Runner returned an invalid session list");
+  state.sessions = value.sessions.filter(isSessionSummary);
+  await cacheSessions(state.sessions);
+  if (!state.sessions.some((session) => session.id === state.selectedSessionId)) {
+    state.selectedSessionId = state.sessions[0]?.id || null;
+  }
+  renderSessions();
+  if (state.selectedSessionId) await loadMessages(state.selectedSessionId);
+}
+
+async function loadMessages(sessionId) {
+  const value = await signedRequest(
+    "GET",
+    `/v1/remote/mobile/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
+  if (!Array.isArray(value.messages)) throw new RemoteError("Runner returned invalid messages");
+  const messages = value.messages.filter(isChatMessage);
+  state.messages.set(sessionId, messages);
+  await cacheMessages(sessionId, messages);
+  if (state.selectedSessionId === sessionId) renderMessages();
+}
+
+function renderSessions() {
+  if (!ui.chatPanel) return;
+  const visible = hasCapability("view_sessions");
+  ui.chatPanel.hidden = !visible;
+  if (!visible) return;
+  ui.sessionSelect.replaceChildren(
+    ...state.sessions.map((session) => {
+      const option = document.createElement("option");
+      option.value = session.id;
+      option.textContent = `${session.title || session.id} · ${relativeTime(session.updated_at_ms)}`;
+      option.selected = session.id === state.selectedSessionId;
+      return option;
+    }),
+  );
+  ui.sessionSelect.hidden = state.sessions.length === 0;
+  ui.chatEmpty.hidden = state.sessions.length !== 0;
+  ui.chatForm.hidden = !hasCapability("chat") || !state.selectedSessionId;
+  if (state.selectedSessionId) {
+    ui.chatInput.value = state.drafts[state.selectedSessionId] || "";
+  }
+  renderMessages();
+}
+
+function renderMessages() {
+  const messages = state.messages.get(state.selectedSessionId) || [];
+  ui.messageList.replaceChildren(...messages.map(messageRow));
+}
+
+function messageRow(message) {
+  const row = element("li", "message-row");
+  row.dataset.role = message.role;
+  const header = element("span", "message-head", `${humanize(message.role)} · ${formatDate(message.created_at_ms)}`);
+  const body = element("span", "message-body", message.text);
+  row.append(header, body);
+  // The runner's three states are `queued`, `accepted` and `failed`. Only the
+  // first and last are worth a badge: `queued` says the durable run has not
+  // finished, which is what keeps a slow answer from reading as a lost one, and
+  // `failed` says it never will. `accepted` is the answer sitting right above.
+  if (message.task_state === "queued" || message.task_state === "failed") {
+    row.append(element("span", "message-state", humanize(message.task_state)));
+  }
+  return row;
+}
+
+async function sendMessage() {
+  const sessionId = state.selectedSessionId;
+  const text = ui.chatInput.value.trim();
+  if (!sessionId || !text) return;
+  setButtonBusy(ui.chatSendButton, true, "Sending…");
+  try {
+    await signedRequest(
+      "POST",
+      `/v1/remote/mobile/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { text },
+    );
+    // Cleared only after the runner accepted it. A draft dropped on a failed
+    // send is a message somebody has to retype, and this is the one screen
+    // where that is most likely to happen on a bad connection.
+    ui.chatInput.value = "";
+    await saveDraft(sessionId, "");
+    await loadMessages(sessionId);
+    showToast("Sent. The runner answers as a durable run under its own recipe.");
+  } catch (error) {
+    handleError(error, "The message was not sent");
+  } finally {
+    setButtonBusy(ui.chatSendButton, false);
+  }
+}
+
+// --- Workflows -------------------------------------------------------------
+
+async function loadWorkflows() {
+  const value = await signedRequest("GET", "/v1/remote/mobile/workflows");
+  if (!Array.isArray(value.workflows)) throw new RemoteError("Runner returned an invalid workflow list");
+  state.workflows = value.workflows.filter(
+    (workflow) => workflow && validId(workflow.id) && typeof workflow.name === "string",
+  );
+  renderWorkflows();
+}
+
+function renderWorkflows() {
+  if (!ui.workflowPanel) return;
+  const visible = hasCapability("view_tasks");
+  ui.workflowPanel.hidden = !visible;
+  if (!visible) return;
+  ui.workflowEmpty.hidden = state.workflows.length !== 0;
+  ui.workflowList.replaceChildren(
+    ...state.workflows.map((workflow) => {
+      const row = element("li", "workflow-row");
+      const label = document.createElement("span");
+      label.append(
+        element("span", "workflow-name", workflow.name),
+        element(
+          "span",
+          "workflow-meta",
+          `${workflow.summary || ""}${workflow.last_run_at_ms ? ` · last run ${relativeTime(workflow.last_run_at_ms)}` : ""}`,
+        ),
+      );
+      row.append(label);
+      if (hasCapability("run_workflows")) {
+        row.append(
+          actionButton("Launch", "secondary", (button) => launchWorkflow(workflow, button)),
+        );
+      }
+      return row;
+    }),
+  );
+  applyStaleState();
+}
+
+async function launchWorkflow(workflow, button) {
+  if (!confirm(`Launch '${workflow.name}' on the runner? It runs under the runner's own policy.`)) return;
+  setButtonBusy(button, true, "Launching…");
+  try {
+    const value = await signedRequest(
+      "POST",
+      `/v1/remote/mobile/workflows/${encodeURIComponent(workflow.id)}/runs`,
+      {},
+    );
+    showToast(`Launched as run ${value.run_id || "(pending)"}.`);
+    await refreshRuns();
+  } catch (error) {
+    handleError(error, "The workflow was not launched");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+// --- Captures --------------------------------------------------------------
+//
+// The one direction in which this device hands the runner content on its own
+// initiative, rather than because a command asked for it. The runner re-derives
+// the digest and refuses anything whose bytes do not match what was declared,
+// so the check below is a courtesy that fails fast, never the authority.
+
+async function fileCapture(event) {
+  event.preventDefault();
+  const title = ui.captureTitleInput.value.trim();
+  const text = ui.captureText.value.trim();
+  const file = ui.captureFile.files?.[0] || null;
+  if (!title) {
+    showToast("A capture needs a title.", "error");
+    return;
+  }
+  const budget = Number(state.deviceState?.max_artifact_bytes || MAX_ARTIFACT_BYTES);
+  if (file && file.size > budget) {
+    showToast(`That file is ${formatBytes(file.size)}; this pairing allows ${formatBytes(budget)}.`, "error");
+    return;
+  }
+  setButtonBusy(ui.captureButton, true, "Filing…");
+  try {
+    const body = {
+      capture_id: `cap-${randomToken(18)}`,
+      kind: file ? (file.type.startsWith("image/") ? "image" : "file") : "text",
+      title,
+    };
+    if (text) body.text = text;
+    if (file) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      // Through the same FileReader the camera path uses, not
+      // `btoa(String.fromCharCode(...bytes))`: spreading a multi-megabyte array
+      // into arguments overflows the call stack, and the artifact budget here
+      // is eight megabytes.
+      body.content_base64 = await blobToBase64(file);
+      body.content_sha256 = await sha256Hex(bytes);
+      body.size_bytes = bytes.length;
+      body.mime_type = file.type || "application/octet-stream";
+    }
+    await signedRequest("POST", "/v1/remote/mobile/captures", body);
+    ui.captureForm.reset();
+    showToast("Filed on the runner.");
+  } catch (error) {
+    handleError(error, "The capture was not filed");
+  } finally {
+    setButtonBusy(ui.captureButton, false);
+  }
+}
+
+async function revokeSelf() {
+  if (
+    !confirm(
+      "Revoke this device on the runner? Its key stops working immediately, any live session it owns is force-stopped, and re-pairing needs a new invitation.",
+    )
+  ) {
+    return;
+  }
+  setButtonBusy(ui.revokeSelfButton, true, "Revoking…");
+  try {
+    await signedRequest("DELETE", "/v1/remote/mobile/devices/self", undefined);
+    await deleteActiveRecord();
+    showPairing();
+    showToast("This device is revoked on the runner and forgotten here.");
+  } catch (error) {
+    handleError(error, "The device could not revoke itself");
+  } finally {
+    setButtonBusy(ui.revokeSelfButton, false);
+  }
 }
 
 async function cancelSelectedRun(reason) {
@@ -1230,6 +1756,7 @@ function bindEvents() {
       showToast("Browser paired. The device key is non-exportable and scoped by the invitation.");
       await refreshRuns({ preserveSelection: false });
       await advertiseDevice();
+      await refreshCapabilitySurfaces();
       void runCommandLoop();
     } catch (error) {
       handleError(error, "Pairing failed");
@@ -1243,6 +1770,7 @@ function bindEvents() {
     setButtonBusy(ui.refreshButton, true, "Refreshing…");
     try {
       await refreshRuns();
+      await refreshCapabilitySurfaces();
       showToast("Runner state refreshed.");
     } catch (error) {
       handleError(error, "Refresh failed");
@@ -1327,6 +1855,54 @@ function bindEvents() {
     }
   });
 
+  ui.pauseButton?.addEventListener("click", () => void setRunPaused(true));
+  ui.resumeButton?.addEventListener("click", () => void setRunPaused(false));
+  ui.revokeSelfButton?.addEventListener("click", () => void revokeSelf());
+
+  ui.sessionSelect?.addEventListener("change", async () => {
+    state.selectedSessionId = ui.sessionSelect.value || null;
+    ui.chatInput.value = state.drafts[state.selectedSessionId] || "";
+    renderMessages();
+    if (state.selectedSessionId && !state.stale) {
+      try {
+        await loadMessages(state.selectedSessionId);
+      } catch (error) {
+        handleError(error, "Messages could not be read");
+      }
+    }
+  });
+  // Debounced by nothing on purpose: an IndexedDB put per keystroke is cheap,
+  // and a debounce is exactly what loses the last few characters when a phone
+  // is locked mid-sentence.
+  ui.chatInput?.addEventListener("input", () => {
+    if (state.selectedSessionId) void saveDraft(state.selectedSessionId, ui.chatInput.value);
+  });
+  ui.chatForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendMessage();
+  });
+  ui.chatRefreshButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.chatRefreshButton, true, "Checking…");
+    try {
+      await loadSessions();
+    } catch (error) {
+      handleError(error, "Sessions could not be read");
+    } finally {
+      setButtonBusy(ui.chatRefreshButton, false);
+    }
+  });
+  ui.workflowRefreshButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.workflowRefreshButton, true, "Checking…");
+    try {
+      await loadWorkflows();
+    } catch (error) {
+      handleError(error, "Workflows could not be read");
+    } finally {
+      setButtonBusy(ui.workflowRefreshButton, false);
+    }
+  });
+  ui.captureForm?.addEventListener("submit", (event) => void fileCapture(event));
+
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -1391,50 +1967,89 @@ function parsePairingCode(value) {
 }
 
 // --- What this device is --------------------------------------------------
+//
+// Four separate questions, kept separate: what this build supports, what the OS
+// permits, whether it could act right now, and — the runner's answer, never
+// this client's — whether all of that adds up to something effective.
 
-async function readOsPermission(capability) {
-  // Screen capture has no Permissions API name: a browser asks at the moment of
-  // capture and forgets afterwards, which would mean a prompt on every single
-  // command. Holding one armed display stream is what replaces that — while it
-  // is live the permission genuinely is granted, and the moment the user stops
-  // sharing (from this page or from the browser's own bar) it genuinely is not.
-  // Reporting it this way is what makes "effective" tell the truth: an unarmed
-  // device is not asked to capture a screen it would have to interrupt someone
-  // for.
-  if (capability === "screen_capture") {
-    return screenShareIsLive() ? "granted" : "undetermined";
+// Physical capabilities this build can actually perform, mapped to the browser
+// feature that performs them. Advertised to the runner as "supported"; the
+// runner intersects that with the operator's grant, the OS permission and the
+// readiness reported beside it.
+const DEVICE_CAPABILITIES = {
+  device_info: () => true,
+  camera_capture: () => Boolean(navigator.mediaDevices?.getUserMedia),
+  microphone_capture: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
+  location_read: () => Boolean(navigator.geolocation),
+  notification_post: () => "Notification" in window,
+  screen_capture: () => Boolean(navigator.mediaDevices?.getDisplayMedia),
+  // Either half is enough to be useful: an artifact is played back through the
+  // audio element, and `text` is spoken by the synthesizer.
+  audio_playback: () => Boolean(window.speechSynthesis) || typeof Audio === "function",
+  voice_stream: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
+};
+
+// What each capability's preparation control says and does. Only a direct user
+// gesture ever reaches these — an agent asking for a camera must never cause a
+// permission prompt to appear in somebody's face.
+const PREPARATION = {
+  camera_capture: { label: "Allow camera", prepare: () => promptForMedia({ video: true }) },
+  microphone_capture: { label: "Allow microphone", prepare: () => promptForMedia({ audio: true }) },
+  voice_stream: { label: "Allow microphone", prepare: () => promptForMedia({ audio: true }) },
+  location_read: { label: "Allow location", prepare: promptForLocation },
+  notification_post: { label: "Allow notifications", prepare: promptForNotifications },
+  screen_capture: { label: "Allow screen capture", prepare: armScreenShare },
+  audio_playback: { label: "Enable audio playback", prepare: enableAudioPlayback },
+};
+
+function capabilitySupported(capability) {
+  try {
+    return Boolean(DEVICE_CAPABILITIES[capability]?.());
+  } catch {
+    return false;
   }
-  const name = PERMISSION_NAMES[capability];
-  if (!name) return "undetermined";
-  if (!navigator.permissions?.query) return "undetermined";
+}
+
+// Everything the browser will tell us right now, collected in one place so the
+// decision itself stays a pure function of it.
+async function collectProbe() {
+  const permissions = {};
+  for (const [capability, name] of Object.entries(PERMISSION_NAMES)) {
+    permissions[capability] = await queryPermission(name);
+  }
+  return {
+    permissions,
+    sessionVerified: state.sessionVerified,
+    notificationPermission: "Notification" in window ? Notification.permission : null,
+    screenShareLive: screenShareIsLive(),
+    audioEnabled: state.audioEnabled === true,
+    foreground: document.visibilityState === "visible",
+  };
+}
+
+async function queryPermission(name) {
+  if (!navigator.permissions?.query) return null;
   try {
     const status = await navigator.permissions.query({ name });
-    if (status.state === "granted") return "granted";
-    if (status.state === "denied") return "denied";
-    return "undetermined";
+    return status.state;
   } catch {
-    // A browser that does not know this permission name cannot answer for it.
-    return "undetermined";
+    // A browser that does not know this permission name cannot answer for it,
+    // and "cannot answer" is not "granted".
+    return null;
   }
 }
 
 async function describeDevice() {
-  const capabilities = Object.entries(DEVICE_CAPABILITIES)
-    .filter(([, supported]) => {
-      try {
-        return supported();
-      } catch {
-        return false;
-      }
-    })
-    .map(([capability]) => capability);
+  const probe = await collectProbe();
+  const capabilities = [];
   const permissions = {};
-  for (const capability of capabilities) {
-    const permission = await readOsPermission(capability);
-    // A capability the OS cannot be asked about is reported honestly as
-    // undetermined rather than optimistically as granted; the runner then
-    // treats it as not effective until the device proves otherwise.
-    permissions[capability] = DEVICE_CAPABILITIES[capability]() ? permission : "unsupported";
+  const readiness = {};
+  for (const capability of Object.keys(DEVICE_CAPABILITIES)) {
+    const supported = capabilitySupported(capability);
+    const answer = describeCapability(capability, { ...probe, supported });
+    if (supported) capabilities.push(capability);
+    permissions[capability] = answer.permission;
+    readiness[capability] = answer.readiness;
   }
   return {
     protocol_version: PROTOCOL_VERSION,
@@ -1444,35 +2059,93 @@ async function describeDevice() {
     device_model: navigator.userAgentData?.mobile ? "mobile browser" : "browser",
     capabilities,
     permissions,
+    readiness,
     constraints: {
       max_artifact_bytes: MAX_ARTIFACT_BYTES,
       max_recording_ms: MAX_RECORDING_MS,
       max_notification_chars: 512,
-      camera_positions: DEVICE_CAPABILITIES.camera_capture() ? ["front", "back"] : [],
+      camera_positions: capabilitySupported("camera_capture") ? ["front", "back"] : [],
     },
     reported_at_ms: Date.now(),
   };
 }
 
 // Reports the surface and renders what the runner says is effective.
+//
+// Called after every event that can change any of the four axes — a permission
+// prompt answered, the page coming back to the front, a screen share ending —
+// because a runner acting on a stale surface either refuses something possible
+// or queues something that will fail in the user's face.
 async function advertiseDevice() {
   const surface = await describeDevice();
+  state.surface = surface;
   state.deviceState = await signedRequest("POST", "/v1/remote/device/surface", surface);
   renderDeviceState();
   return state.deviceState;
+}
+
+let advertisePending = null;
+// Coalesced: focus, visibility and permission-change events arrive together and
+// three surfaces posted in a row would differ only in their timestamps.
+function scheduleAdvertise() {
+  if (!state.profile || state.stale) return;
+  if (advertisePending) return;
+  advertisePending = setTimeout(() => {
+    advertisePending = null;
+    advertiseDevice().catch(() => {});
+  }, 250);
+}
+
+// Every input to the four axes that can change without this client acting.
+function watchDeviceReadiness() {
+  document.addEventListener("visibilitychange", scheduleAdvertise);
+  window.addEventListener("focus", scheduleAdvertise);
+  window.addEventListener("online", () => {
+    scheduleAdvertise();
+    // A result staged before the network went is delivered now. This is not a
+    // queued user action — the effect already happened and the runner is
+    // waiting for it.
+    runCommandLoop();
+  });
+  if (!navigator.permissions?.query) return;
+  for (const name of new Set(Object.values(PERMISSION_NAMES))) {
+    navigator.permissions
+      .query({ name })
+      .then((status) => {
+        status.addEventListener?.("change", scheduleAdvertise);
+      })
+      .catch(() => {});
+  }
 }
 
 function capabilityList(values) {
   return Array.isArray(values) && values.length > 0 ? values.map(humanize).join(", ") : "none";
 }
 
+const READINESS_WORDS = {
+  [READINESS.ready]: "Ready",
+  [READINESS.foregroundRequired]: "Needs this page in front",
+  [READINESS.interactionRequired]: "Needs user interaction",
+  [READINESS.armedRequired]: "Needs screen sharing armed",
+  [READINESS.unavailable]: "Unavailable",
+};
+
+const PERMISSION_WORDS = {
+  [PERMISSION.granted]: "Granted",
+  [PERMISSION.denied]: "Denied",
+  [PERMISSION.promptable]: "Needs permission",
+  [PERMISSION.notRequired]: "Not required",
+  [PERMISSION.unsupported]: "Unsupported",
+  undetermined: "Needs permission",
+};
+
 function renderDeviceState() {
   if (!ui.devicePanel) return;
   const value = state.deviceState;
   ui.devicePanel.hidden = !value;
   if (!value) return;
-  // Four separate lines, never one merged list: "why can it not take a photo"
-  // has four different answers and the operator has to be able to see which.
+  // Never one merged list: "why can it not take a photo" has four different
+  // answers and the operator has to be able to see which.
   ui.deviceGranted.textContent = capabilityList(value.granted);
   ui.deviceSupported.textContent = capabilityList(value.advertised);
   ui.deviceEffective.textContent = capabilityList(value.effective);
@@ -1481,6 +2154,170 @@ function renderDeviceState() {
   ui.devicePermissions.textContent = entries.length
     ? entries.map(([capability, permission]) => `${humanize(capability)}: ${permission}`).join(" · ")
     : "not reported";
+  renderReadiness();
+  // The runner has just restated what this pairing holds, which is where an
+  // operator's grant edit becomes visible: a withdrawn `chat` has to take the
+  // composer with it rather than leaving a control that answers 403.
+  renderSessions();
+  renderWorkflows();
+  if (ui.capturePanel) ui.capturePanel.hidden = !hasCapability("capture");
+}
+
+// One row per granted physical capability: the four axes, and the control that
+// fixes whichever one is in the way.
+function renderReadiness() {
+  const host = ui.deviceReadiness;
+  if (!host) return;
+  const granted = new Set(state.deviceState?.granted || []);
+  const surface = state.surface;
+  host.replaceChildren();
+  const rows = Object.keys(DEVICE_CAPABILITIES).filter((capability) => granted.has(capability));
+  if (rows.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "field-help";
+    empty.textContent = "No hardware capability is granted to this device.";
+    host.append(empty);
+    return;
+  }
+  for (const capability of rows) {
+    const supported = capabilitySupported(capability);
+    const permission = surface?.permissions?.[capability] || PERMISSION.unsupported;
+    const readiness = surface?.readiness?.[capability] || READINESS.unavailable;
+    const effective = isEffective({ granted: true, supported, permission, readiness });
+
+    const row = document.createElement("div");
+    row.className = "readiness-row";
+    const title = document.createElement("p");
+    title.className = "readiness-name";
+    title.textContent = humanize(capability);
+    const facts = document.createElement("p");
+    facts.className = "field-help";
+    facts.textContent = [
+      "Granted: yes",
+      `Supported: ${supported ? "yes" : "no"}`,
+      `Permission: ${PERMISSION_WORDS[permission] || permission}`,
+      `Readiness: ${READINESS_WORDS[readiness] || readiness}`,
+      `Effective: ${effective ? "yes" : "no"}`,
+    ].join(" · ");
+    row.append(title, facts);
+
+    const preparation = PREPARATION[capability];
+    // A control only where one would actually help. A denied OS permission is
+    // fixed in the system's own settings, not here, and offering a button that
+    // silently does nothing is worse than offering none.
+    if (!effective && supported && preparation && permission !== PERMISSION.denied) {
+      const button = document.createElement("button");
+      button.className = "button secondary";
+      button.type = "button";
+      button.textContent = preparation.label;
+      button.disabled = state.stale;
+      button.addEventListener("click", async () => {
+        setButtonBusy(button, true, "Asking…");
+        try {
+          await preparation.prepare();
+          recordSessionPermission(capability, true);
+        } catch (error) {
+          recordSessionPermission(capability, false);
+          handleError(error, `${preparation.label} was refused`);
+        } finally {
+          setButtonBusy(button, false);
+          // Whatever the answer was, the surface is re-read and re-posted: the
+          // runner's view of this device must never be older than the device's.
+          await advertiseDevice().catch(() => {});
+        }
+      });
+      row.append(button);
+    }
+    host.append(row);
+  }
+}
+
+// What this device is still holding that the runner has not acknowledged.
+// Visible locally on purpose: an operator looking at a phone that is holding an
+// undelivered photograph should be able to see that, not wonder.
+function renderJournalState() {
+  const host = ui.journalStatus;
+  if (!host) return;
+  journalEntries()
+    .then((entries) => {
+      const pending = entries.filter((entry) => isUnacknowledged(entry));
+      const bytes = pending.reduce((total, entry) => total + (Number(entry.artifactBytes) || 0), 0);
+      if (pending.length === 0) {
+        host.textContent = state.executor
+          ? "This tab performs the runner's device commands."
+          : "Another tab of this profile is performing device commands.";
+        return;
+      }
+      host.textContent =
+        `${pending.length} result${pending.length === 1 ? "" : "s"} not yet acknowledged by the runner` +
+        (bytes > 0 ? ` (${Math.round(bytes / 1024)} KiB held here).` : ".");
+    })
+    .catch(() => {});
+}
+
+// --- Preparing a capability, always from a user gesture --------------------
+
+/**
+ * Records what this session's own preparation gesture proved.
+ *
+ * The only thing that may set it: the real browser permission operation,
+ * invoked from a real user gesture, returning successfully. Never a guess,
+ * never a timer, never anything a remote agent asked for. It is consulted only
+ * where the Permissions API cannot answer at all — see `queriedPermission` in
+ * `device-core.js` — and a refusal clears it rather than leaving yesterday's
+ * answer standing.
+ *
+ * Keyed by permission *name*, not capability: one microphone consent covers
+ * both `microphone_capture` and `voice_stream`, which is what the browser
+ * itself thinks too.
+ */
+function recordSessionPermission(capability, verified) {
+  const name = PERMISSION_NAMES[capability];
+  if (!name) return;
+  if (verified) state.sessionVerified[name] = true;
+  else delete state.sessionVerified[name];
+}
+
+// Opens the stream only to make the browser ask, then closes it immediately.
+// The permission is what is wanted here, not the media.
+async function promptForMedia(constraints) {
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  stopTracks(stream);
+  return true;
+}
+
+function promptForLocation() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      () => resolve(true),
+      (error) => reject(new Error(error.message || "Location permission was refused")),
+      { timeout: 20_000, maximumAge: 0 },
+    );
+  });
+}
+
+async function promptForNotifications() {
+  const decision = await Notification.requestPermission();
+  if (decision !== "granted") throw new Error("Notification permission was refused");
+  return true;
+}
+
+// Autoplay policy, cleared the only way it can be: by playing something
+// silently inside the gesture that asked for it.
+async function enableAudioPlayback() {
+  if (window.speechSynthesis) {
+    // A zero-length utterance counts as the page having spoken.
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(" "));
+  }
+  if (typeof Audio === "function") {
+    const silence = new Audio(
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=",
+    );
+    silence.volume = 0;
+    await silence.play().catch(() => {});
+  }
+  state.audioEnabled = true;
+  return true;
 }
 
 // --- Performing one command ------------------------------------------------
@@ -1503,12 +2340,18 @@ function stopTracks(stream) {
   for (const track of stream?.getTracks?.() || []) track.stop();
 }
 
-async function captureStill(position) {
+const delayUntilAborted = waitOrAbort;
+
+async function captureStill(position, signal) {
+  // Cancellation observed before the camera opens prevents the effect outright;
+  // that is the only point at which it can.
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: position === "front" ? "user" : "environment" },
     audio: false,
   });
   try {
+    if (aborted(signal)) return { cancelledBeforeEffect: true };
     return await frameFromStream(stream, "image/jpeg", 0.85);
   } finally {
     // Always, on every path: a camera left running after a refused or failed
@@ -1527,8 +2370,7 @@ async function captureStill(position) {
 // It is not a way around consent: the browser still asks once, the page still
 // shows what is shared, and the browser's own "stop sharing" control ends it
 // from outside this page. That is why the `ended` listener below re-advertises
-// rather than trying to reacquire — the honest report is that the permission is
-// gone.
+// rather than trying to reacquire — the honest report is that readiness is gone.
 
 function screenShareIsLive() {
   return Boolean(state.screenStream?.getVideoTracks?.().some((track) => track.readyState === "live"));
@@ -1541,11 +2383,11 @@ async function armScreenShare() {
   for (const track of stream.getVideoTracks()) {
     track.addEventListener("ended", () => {
       // Stopped from the browser's own sharing bar. Drop it and tell the runner
-      // immediately, so a queued capture fails with "not permitted" instead of
+      // immediately, so a queued capture fails with "not armed" instead of
       // interrupting someone with a fresh prompt.
       if (state.screenStream === stream) state.screenStream = null;
       renderScreenShare();
-      advertiseDevice().catch(() => {});
+      scheduleAdvertise();
     });
   }
   renderScreenShare();
@@ -1556,12 +2398,13 @@ function disarmScreenShare() {
   stopTracks(state.screenStream);
   state.screenStream = null;
   renderScreenShare();
+  scheduleAdvertise();
 }
 
 function renderScreenShare() {
   if (!ui.screenShareButton) return;
   const live = screenShareIsLive();
-  const supported = DEVICE_CAPABILITIES.screen_capture();
+  const supported = capabilitySupported("screen_capture");
   ui.screenShareButton.hidden = !supported;
   ui.screenShareButton.textContent = live ? "Stop screen capture" : "Allow screen capture";
   if (ui.screenShareStatus) {
@@ -1573,12 +2416,13 @@ function renderScreenShare() {
   }
 }
 
-async function captureScreen() {
+async function captureScreen(signal) {
   if (!screenShareIsLive()) {
-    // Never a silent prompt: the runner was told this was not permitted, and
-    // this path exists only if that report raced with the user stopping.
+    // Never a silent prompt: the runner was told this was not armed, and this
+    // path exists only if that report raced with the user stopping.
     throw new Error("Screen sharing is not armed on this device");
   }
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   // The armed stream is deliberately NOT stopped afterwards — it is the whole
   // reason a second capture needs no second prompt.
   return await frameFromStream(state.screenStream, "image/png", undefined);
@@ -1608,42 +2452,31 @@ async function frameFromStream(stream, mediaType, quality) {
   return { blob, mediaType, result: { width: canvas.width, height: canvas.height } };
 }
 
-async function recordMicrophone(durationMs) {
-  const bounded = Math.min(Math.max(Number(durationMs) || 10_000, 1), MAX_RECORDING_MS);
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-  try {
-    const recorder = new MediaRecorder(stream);
-    const chunks = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data?.size) chunks.push(event.data);
-    };
-    const finished = new Promise((resolve) => {
-      recorder.onstop = resolve;
-    });
-    recorder.start();
-    const started = Date.now();
-    // Polled rather than a single timer so an operator's cancel reaches a
-    // recording already in progress instead of waiting out its full duration.
-    while (Date.now() - started < bounded && !state.activeCommand?.cancelled) {
-      await delay(200);
-    }
-    recorder.stop();
-    await finished;
-    const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-    return {
-      blob,
-      mediaType: blob.type || "audio/webm",
-      result: { duration_ms: Date.now() - started, cancelled: Boolean(state.activeCommand?.cancelled) },
-    };
-  } finally {
-    stopTracks(stream);
-  }
+// The browser half of `recordAudio`: open the microphone, hand over a recorder,
+// close it afterwards. Every decision the recording makes — how long, when a
+// cancellation cuts it short, what a cut-short recording reports — lives in
+// `device-core.js` and is exercised there without a microphone.
+function recordMicrophone(durationMs, signal) {
+  return recordAudio(durationMs, signal, {
+    openStream: () => navigator.mediaDevices.getUserMedia({ audio: true, video: false }),
+    createRecorder: (stream) => new MediaRecorder(stream),
+    stopStream: stopTracks,
+    createBlob: (chunks, mediaType) => new Blob(chunks, { type: mediaType }),
+    maxMs: MAX_RECORDING_MS,
+  });
 }
 
-function readLocation(accuracy) {
+function readLocation(accuracy, signal) {
   return new Promise((resolve, reject) => {
-    navigator.geolocation.getCurrentPosition(
-      (position) =>
+    if (aborted(signal)) {
+      resolve({ cancelledBeforeEffect: true });
+      return;
+    }
+    let settled = false;
+    const watch = navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (settled) return;
+        settled = true;
         resolve({
           result: {
             latitude: position.coords.latitude,
@@ -1653,36 +2486,54 @@ function readLocation(accuracy) {
             // no continuous background tracking to turn on.
             taken_at_ms: position.timestamp,
           },
-        }),
-      (error) => reject(new Error(error.message || "Location is unavailable")),
+        });
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(error.message || "Location is unavailable"));
+      },
       { enableHighAccuracy: accuracy === "precise", timeout: 20_000, maximumAge: 0 },
+    );
+    // A fix in flight cannot be recalled, but it can be abandoned: nothing
+    // observable happened, so this is honestly a cancellation before effect.
+    signal?.addEventListener?.(
+      "abort",
+      () => {
+        if (settled) return;
+        settled = true;
+        navigator.geolocation.clearWatch?.(watch);
+        resolve({ cancelledBeforeEffect: true });
+      },
+      { once: true },
     );
   });
 }
 
-async function postNotification(argumentsValue) {
+async function postNotification(argumentsValue, signal) {
   if (Notification.permission !== "granted") {
-    const decision = await Notification.requestPermission();
-    if (decision !== "granted") {
-      throw new Error("The device's notification permission is denied");
-    }
+    // Never prompts here. A prompt raised by a remote command would appear
+    // without anyone having touched this device — permission is asked for from
+    // the readiness control instead, which is a gesture the user made.
+    throw new Error(
+      "This device has not granted notification permission. Open the paired-device controller and " +
+        "allow notifications under Device readiness, then retry.",
+    );
   }
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   const notification = new Notification(String(argumentsValue.title || ""), {
     body: String(argumentsValue.body || ""),
     silent: false,
   });
+  // Shown. A cancellation arriving now cannot unshow it, and saying otherwise
+  // would be a lie the operator acts on.
   return { result: { shown: true, at_ms: Date.now() }, notification };
 }
 
-function speak(text) {
-  return new Promise((resolve, reject) => {
-    const utterance = new SpeechSynthesisUtterance(String(text || ""));
-    utterance.onend = () => resolve({ result: { spoken: true } });
-    utterance.onerror = (event) =>
-      // A cancelled utterance ends with an error event; the caller decides
-      // whether that was a cancellation or a failure.
-      reject(new Error(event.error === "canceled" ? "Playback was cancelled" : "Playback failed"));
-    window.speechSynthesis.speak(utterance);
+function speak(text, signal) {
+  return speakText(text, signal, {
+    synthesis: window.speechSynthesis,
+    createUtterance: (value) => new SpeechSynthesisUtterance(value),
   });
 }
 
@@ -1698,7 +2549,7 @@ function base64ToBytes(encoded) {
 // The bytes are fetched over the ordinary signed artifact route, under the run
 // scope this device was already paired with — there is no second way in, and a
 // device without `read_artifacts` cannot reach one at all.
-async function playArtifact(runId, artifactId) {
+async function playArtifact(runId, artifactId, signal) {
   const artifact = await signedRequest(
     "GET",
     `/v1/remote/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
@@ -1711,20 +2562,22 @@ async function playArtifact(runId, artifactId) {
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   try {
+    if (aborted(signal)) return { cancelledBeforeEffect: true };
     await audio.play();
-    // Polled rather than awaiting `ended` alone, so a cancellation reaches a
-    // long recording instead of waiting it out.
-    while (!audio.ended && !state.activeCommand?.cancelled) {
-      await delay(200);
+    while (!audio.ended && !aborted(signal)) {
+      await delayUntilAborted(200, signal);
     }
+    // Stopping playback is one of the few cancellations that genuinely works:
+    // the sound stops when asked.
     if (!audio.ended) audio.pause();
     return {
+      cancelledDuringEffect: !audio.ended,
       result: {
         played: audio.ended,
         artifact_id: artifactId,
         media_type: mediaType,
         bytes: artifact.size_bytes ?? null,
-        cancelled: Boolean(state.activeCommand?.cancelled),
+        cancelled: !audio.ended,
       },
     };
   } finally {
@@ -1732,23 +2585,23 @@ async function playArtifact(runId, artifactId) {
   }
 }
 
-async function playAudio(argumentsValue) {
+async function playAudio(argumentsValue, signal) {
   if (argumentsValue.artifact_id && argumentsValue.run_id) {
-    return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id);
+    return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id, signal);
   }
   if (!window.speechSynthesis) {
     throw new Error("This device cannot speak text");
   }
-  return await speak(argumentsValue.text);
+  return await speak(argumentsValue.text, signal);
 }
 
 // --- A live microphone stream ----------------------------------------------
 //
 // The control command stays `running` for as long as the microphone is open;
 // the audio does not travel in its result but in chunks, to the session the
-// command named. Two things end it: the duration it was given, and the runner
+// command named. Three things end it: the duration it was given, the runner
 // answering `stop: true` — which arrives on the reply to a chunk this device is
-// posting anyway, so a cancellation needs no second poll to be noticed.
+// posting anyway — and the cancellation watcher aborting.
 
 // Containers the runner accepts. A recorder that reports anything else has its
 // type normalized to the family it belongs to rather than being refused, since
@@ -1771,7 +2624,7 @@ function voiceMediaType(recorded) {
   return "audio/webm";
 }
 
-async function streamVoice(argumentsValue) {
+async function streamVoice(argumentsValue, signal) {
   const sessionId = String(argumentsValue.session_id || "");
   if (!validId(sessionId)) throw new Error("The runner did not name a voice session");
   const durationMs = Math.min(Math.max(Number(argumentsValue.duration_ms) || 60_000, 1_000), MAX_STREAM_MS);
@@ -1814,11 +2667,11 @@ async function streamVoice(argumentsValue) {
   const started = Date.now();
   try {
     recorder.start(chunkMs);
-    while (Date.now() - started < durationMs && !stopped && !state.activeCommand?.cancelled) {
-      await delay(Math.min(chunkMs, 500));
+    while (Date.now() - started < durationMs && !stopped && !aborted(signal)) {
+      await delayUntilAborted(Math.min(chunkMs, 500), signal);
       await drain();
     }
-    if (state.activeCommand?.cancelled) stopped = "Cancelled on the device";
+    if (aborted(signal)) stopped = "Cancelled on the device";
     recorder.stop();
     // One last slice is emitted by `stop()`; give it a moment to arrive.
     await delay(250);
@@ -1842,6 +2695,7 @@ async function streamVoice(argumentsValue) {
     }
   }
   return {
+    cancelledDuringEffect: aborted(signal),
     result: {
       session_id: sessionId,
       chunks: sequence,
@@ -1854,31 +2708,29 @@ async function streamVoice(argumentsValue) {
 }
 
 // Runs one leased command and returns the terminal report to send back.
-async function performCommand(command) {
+//
+// The three cancellation outcomes are kept apart rather than collapsed into
+// "cancelled": an operator reading a result has to be able to tell a photograph
+// that never happened from one that did.
+async function performCommand(command, signal) {
   const argumentsValue = command.arguments || {};
   switch (command.capability) {
     case "device_info":
       return { outcome: "succeeded", result: await describeDevice() };
-    case "camera_capture": {
-      const { blob, mediaType, result } = await captureStill(argumentsValue.position);
-      return await withArtifact(blob, mediaType, result);
-    }
-    case "screen_capture": {
-      const { blob, mediaType, result } = await captureScreen();
-      return await withArtifact(blob, mediaType, result);
-    }
-    case "microphone_capture": {
-      const { blob, mediaType, result } = await recordMicrophone(argumentsValue.duration_ms);
-      return await withArtifact(blob, mediaType, result);
-    }
+    case "camera_capture":
+      return await stagedArtifactOutcome(await captureStill(argumentsValue.position, signal));
+    case "screen_capture":
+      return await stagedArtifactOutcome(await captureScreen(signal));
+    case "microphone_capture":
+      return await stagedArtifactOutcome(await recordMicrophone(argumentsValue.duration_ms, signal));
     case "location_read":
-      return { outcome: "succeeded", result: (await readLocation(argumentsValue.accuracy)).result };
+      return plainOutcome(await readLocation(argumentsValue.accuracy, signal));
     case "notification_post":
-      return { outcome: "succeeded", result: (await postNotification(argumentsValue)).result };
+      return plainOutcome(await postNotification(argumentsValue, signal));
     case "audio_playback":
-      return { outcome: "succeeded", result: (await playAudio(argumentsValue)).result };
+      return plainOutcome(await playAudio(argumentsValue, signal));
     case "voice_stream":
-      return { outcome: "succeeded", result: (await streamVoice(argumentsValue)).result };
+      return plainOutcome(await streamVoice(argumentsValue, signal));
     default:
       // Honest refusal rather than a silent success: the runner records the
       // reason and the waiting run reads it.
@@ -1889,162 +2741,469 @@ async function performCommand(command) {
   }
 }
 
-async function withArtifact(blob, mediaType, result) {
-  if (blob.size > MAX_ARTIFACT_BYTES) {
-    return { outcome: "failed", error: "The captured artifact is larger than this device allows" };
-  }
-  return {
-    outcome: "succeeded",
-    result,
-    artifact_base64: await blobToBase64(blob),
-    artifact_media_type: mediaType,
-  };
+// Digested once, here, and carried through staging: the same digest is declared
+// to the runner after a reload, so a truncated redelivery is caught rather than
+// accepted as authoritative bytes.
+function stagedArtifactOutcome(outcome) {
+  return artifactOutcome(outcome, {
+    digest: async (blob) => sha256Hex(await blob.arrayBuffer()),
+    maxBytes: MAX_ARTIFACT_BYTES,
+  });
 }
 
-// --- The command loop ------------------------------------------------------
-
-// Long-polls for work, performs it, and reports back.
+// --- The durable command journal -------------------------------------------
 //
-// The order is the exactly-once contract: `start` is posted BEFORE anything
-// physical happens, and a `started: false` reply means another connection
-// already began this command — so this one performs nothing and stops. A
-// command is never retried by this client; the runner decides whether a lapsed
-// lease may be requeued, and it only does so before `start`.
-async function runCommandLoop() {
-  if (state.commandLoopRunning) return;
-  state.commandLoopRunning = true;
-  try {
-    while (state.profile && !state.stale) {
-      let command;
-      try {
-        command = await signedRequest("GET", `/v1/remote/device/commands/next?wait_ms=${LEASE_WAIT_MS}`);
-      } catch (error) {
-        if (error instanceof RemoteError && error.status === 401) throw error;
-        // Any other failure is a network hiccup: wait and poll again rather
-        // than tearing the session down.
-        await delay(5_000);
-        continue;
-      }
-      if (!command || !validId(command.command_id)) continue;
-      await executeLeasedCommand(command);
-    }
-  } catch (error) {
-    handleError(error, "Device command loop stopped");
-  } finally {
-    state.commandLoopRunning = false;
-  }
-}
+// One record per command this device has been handed, holding the phase it
+// reached and — once it has one — the staged result including its bytes. It is
+// the reason a reload cannot cause a second photograph and cannot lose the
+// first one: the phase is written *before* the runner is asked to authorize a
+// start, and the bytes are dropped only after the runner acknowledges them.
 
-async function executeLeasedCommand(command) {
-  const recent = await rememberCommand(command.command_id);
-  if (recent) {
-    // This device already performed this command in an earlier session. Report
-    // the remembered outcome instead of doing it again.
-    await reportCommand(command.command_id, recent);
-    return;
-  }
-  if (command.cancel_requested) {
-    await reportCommand(command.command_id, { outcome: "cancelled", error: "Cancelled before it started" });
-    return;
-  }
-  let started;
-  try {
-    started = await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(command.command_id)}/start`, {});
-  } catch (error) {
-    handleError(error, "The device command could not be started");
-    return;
-  }
-  if (started.started !== true) {
-    // Already running elsewhere (or on this device before a reconnect). Doing
-    // it again would take a second photograph.
-    return;
-  }
-  state.activeCommand = { commandId: command.command_id, capability: command.capability, cancelled: false };
-  showToast(`Running ${humanize(command.capability)} for the runner…`);
-  let report;
-  try {
-    report = await performCommand(command);
-  } catch (error) {
-    report = { outcome: "failed", error: String(error?.message || error) };
-  } finally {
-    state.activeCommand = null;
-  }
-  await rememberCommand(command.command_id, report);
-  await reportCommand(command.command_id, report);
-}
-
-async function reportCommand(commandId, report) {
-  try {
-    await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(commandId)}/result`, {
-      protocol_version: PROTOCOL_VERSION,
-      outcome: report.outcome,
-      result: report.result ?? null,
-      artifact_base64: report.artifact_base64 ?? null,
-      artifact_media_type: report.artifact_media_type ?? null,
-      error: report.error ?? null,
-    });
-  } catch (error) {
-    handleError(error, "The device result could not be delivered");
-  }
-}
-
-// --- Bounded local caches --------------------------------------------------
-
-// Remembers what this device already did, so a command that survives a browser
-// restart is reported rather than performed twice. Bounded to the most recent
-// 50 commands; older ones cannot recur, because the runner expires them long
-// before that.
-async function rememberCommand(commandId, report) {
+async function withJournal(mode, operation) {
   const database = await openDatabase();
   try {
     return await new Promise((resolve, reject) => {
-      const transaction = database.transaction(STORE_NAME, report ? "readwrite" : "readonly");
-      const store = transaction.objectStore(STORE_NAME);
-      const request = store.get(ACTIVE_RECORD);
-      let found = null;
-      request.onsuccess = () => {
-        const record = request.result;
-        if (!record) return;
-        record.commandResults ||= {};
-        if (report) {
-          // The artifact bytes are deliberately not remembered — only the
-          // outcome. Re-reporting a cached success without its artifact is
-          // honest and bounded; caching megabytes of stills is not.
-          record.commandResults[commandId] = {
-            outcome: report.outcome,
-            result: report.result ?? null,
-            error: report.error ?? null,
-            atMs: Date.now(),
-          };
-          const entries = Object.entries(record.commandResults).sort((a, b) => b[1].atMs - a[1].atMs);
-          record.commandResults = Object.fromEntries(entries.slice(0, 50));
-          store.put(record);
-        } else {
-          found = record.commandResults[commandId] || null;
-        }
-      };
-      request.onerror = () => reject(request.error || new Error("The command cache could not be read"));
-      transaction.oncomplete = () => resolve(found);
-      transaction.onerror = () => reject(transaction.error || new Error("The command cache failed"));
-      transaction.onabort = () => reject(transaction.error || new Error("The command cache was aborted"));
+      const transaction = database.transaction(JOURNAL_STORE, mode);
+      const store = transaction.objectStore(JOURNAL_STORE);
+      let result;
+      let failure;
+      try {
+        result = operation(store);
+      } catch (error) {
+        failure = error;
+        transaction.abort();
+      }
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(failure || transaction.error || new Error("The command journal failed"));
+      transaction.onabort = () => reject(failure || transaction.error || new Error("The command journal was aborted"));
     });
   } finally {
     database.close();
   }
 }
 
+function requestValue(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("The command journal could not be read"));
+  });
+}
+
+// The IndexedDB adapter the journal runs on. Mechanical: open, one request,
+// close. Every decision it serves — what may be dropped, what may be forgotten,
+// what must be retried — lives in `device-core.js` and is tested there.
+const journalAdapter = {
+  async get(commandId) {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(JOURNAL_STORE, "readonly");
+      return (await requestValue(transaction.objectStore(JOURNAL_STORE).get(commandId))) || null;
+    } finally {
+      database.close();
+    }
+  },
+  async all() {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(JOURNAL_STORE, "readonly");
+      return (await requestValue(transaction.objectStore(JOURNAL_STORE).getAll())) || [];
+    } finally {
+      database.close();
+    }
+  },
+  put(record) {
+    return withJournal("readwrite", (store) => store.put(record));
+  },
+  remove(commandIds) {
+    return withJournal("readwrite", (store) => {
+      for (const commandId of commandIds) store.delete(commandId);
+    });
+  },
+};
+
+const journal = createJournal(journalAdapter, { limits: JOURNAL_LIMITS });
+
+const journalEntry = (commandId) => journal.get(commandId);
+const journalEntries = () => journal.all();
+
+async function journalWrite(entry) {
+  const record = await journal.write(entry);
+  renderJournalState();
+  return record;
+}
+
+// Drops what the bounds allow, and never an unacknowledged result: a cache
+// limit must not become data loss about an effect that really happened.
+const pruneJournal = () => journal.prune();
+
+function stagedReport(entry) {
+  return {
+    outcome: entry.outcome,
+    result: entry.result ?? null,
+    error: entry.error ?? null,
+    artifactBlob: entry.artifactBlob ?? null,
+    artifactMediaType: entry.artifactMediaType ?? null,
+    artifactSha256: entry.artifactSha256 ?? null,
+  };
+}
+
+// --- The command loop ------------------------------------------------------
+
+// One executor per paired profile, whatever a browser does with tabs.
+//
+// The lock is held for the whole loop rather than around each signed request:
+// two loops that merely serialized their HTTP calls would still lease, start
+// and execute the same command in two tabs. Everything physical happens inside
+// this lock.
+const EXECUTOR_LOCK = "little-monkey-device-executor-v1";
+
+async function runCommandLoop() {
+  if (state.commandLoopRunning) return;
+  state.commandLoopRunning = true;
+  try {
+    const held = await acquireExecutor(navigator.locks, EXECUTOR_LOCK, async () => {
+      state.executor = true;
+      renderJournalState();
+      await commandLoopBody();
+    });
+    if (!held.executor) {
+      state.executor = false;
+      renderJournalState();
+    }
+  } catch (error) {
+    handleError(error, "Device command loop stopped");
+  } finally {
+    state.executor = false;
+    state.commandLoopRunning = false;
+  }
+}
+
+// The order is the whole recovery contract, and it is not negotiable:
+//
+//   1. deliver everything already staged — those effects have happened, and the
+//      runner is waiting for results it may re-hand out otherwise;
+//   2. reconcile what the runner still calls running — deliver or report
+//      unknown, never re-execute;
+//   3. only then take new work.
+//
+// Leasing first would let a fresh command race ahead of a result the runner is
+// still waiting for, and a command whose result never arrives is one the runner
+// eventually fails as unproven.
+async function commandLoopBody() {
+  while (state.profile && !state.stale) {
+    try {
+      await flushOutbox();
+      await reconcileRunningCommands();
+    } catch (error) {
+      if (error instanceof RemoteError && error.status === 401) throw error;
+      await delay(5_000);
+      continue;
+    }
+    let command;
+    try {
+      // A long poll, so anything the user does meanwhile cancels it and takes
+      // the request lock rather than waiting out the runner's deadline.
+      command = await signedRequest(
+        "GET",
+        `/v1/remote/device/commands/next?wait_ms=${LEASE_WAIT_MS}`,
+        undefined,
+        { longPoll: true },
+      );
+    } catch (error) {
+      if (error instanceof RemoteError && error.status === 401) throw error;
+      // A poll this device gave up so something else could speak: ask again at
+      // once. Backing off would make every tap cost five idle seconds of work
+      // this device could have been taking.
+      if (error instanceof RemoteError && error.cancelled) continue;
+      // Any other failure is a network hiccup: wait and poll again rather
+      // than tearing the session down.
+      await delay(5_000);
+      continue;
+    }
+    if (!command || !validId(command.command_id)) continue;
+    await executeLeasedCommand(command);
+    await pruneJournal();
+  }
+}
+
+/**
+ * Everything this device performed and the runner has not acknowledged.
+ *
+ * This is not an action queue. Nothing here is a request somebody made offline
+ * and this client decided to replay — every entry is the *result of an effect
+ * that already happened*, which the runner is waiting for and will otherwise
+ * record as unproven. That is why it retries while approvals, cancellations and
+ * chat sends never do.
+ */
+async function flushOutbox() {
+  const staged = (await journalEntries()).filter((entry) => entry.phase === PHASE.resultStaged);
+  for (const entry of staged) {
+    await deliverStaged(entry);
+  }
+}
+
+async function deliverStaged(entry) {
+  const answer = await deliverStagedResult(entry, {
+    journal,
+    send: (staged) => reportCommand(staged.commandId, stagedReport(staged), staged.executionId),
+  });
+  renderJournalState();
+  if (answer.outcome === "conflict") {
+    showToast("The runner already holds a different result for one command; ours was dropped.");
+    return false;
+  }
+  if (answer.outcome === "retry") {
+    // Bounded backoff, then out — the loop's next pass, a reconnect or the
+    // online handler wakes it again. Never a tight retry.
+    await delay(answer.backoffMs);
+    throw new RemoteError("The device result has not been acknowledged yet");
+  }
+  return true;
+}
+
+/**
+ * The commands the runner still believes are running on this device.
+ *
+ * Deliberately a separate route from the lease: a `running` command handed back
+ * as work would be a second execution. Each one is answered from the journal,
+ * and the answer is never "do it again".
+ */
+async function reconcileRunningCommands() {
+  const answer = await signedRequest("GET", "/v1/remote/device/commands/recover");
+  const commands = Array.isArray(answer?.commands) ? answer.commands : [];
+  for (const command of commands) {
+    if (!validId(command.command_id)) continue;
+    const entry = await journalEntry(command.command_id);
+    const decision = recoveryAction(entry);
+    if (decision.action === "none") continue;
+    if (decision.action === "deliver_staged") {
+      await deliverStaged(entry);
+      continue;
+    }
+    // The uncertainty window. The runner authorized a start, so the effect may
+    // have happened; nothing survives to prove it either way. Reported as
+    // exactly that, and never performed again.
+    const report = unknownOutcomeReport(decision.reason);
+    await journalWrite({
+      commandId: command.command_id,
+      capability: command.capability,
+      executionId: entry?.executionId ?? command.execution_id ?? null,
+      phase: PHASE.uncertain,
+      outcome: report.outcome,
+      result: null,
+      error: report.error,
+      artifactBlob: null,
+      artifactBytes: 0,
+    });
+    try {
+      // The runner's own execution id when this device has lost its journal:
+      // a terminal report has to name the execution that holds the command, and
+      // `/recover` is where the holder is stated.
+      await reportCommand(
+        command.command_id,
+        report,
+        entry?.executionId ?? command.execution_id ?? null,
+      );
+      await journalWrite({
+        commandId: command.command_id,
+        capability: command.capability,
+        executionId: entry?.executionId ?? null,
+        phase: PHASE.resultAcked,
+        outcome: report.outcome,
+        error: report.error,
+        artifactBlob: null,
+        artifactBytes: 0,
+      });
+      showToast("A command interrupted mid-action was reported as unknown, not repeated.");
+    } catch (error) {
+      if (!(error instanceof RemoteError && error.status === 409)) throw error;
+    }
+  }
+}
+
+// One leased command, performed by `runLeasedCommand` over this browser.
+//
+// Everything ordered lives in `device-core.js` — journal before start, start
+// before hardware, the result durable before any network wait, the watcher
+// stopped only after that, delivery last. This half is the browser: signed
+// requests, the physical effect, and what the screen says about it.
+async function executeLeasedCommand(command) {
+  await runLeasedCommand(command, {
+    journal,
+    request: signedRequest,
+    perform: performCommand,
+    // Delivery failure is never fatal to the loop: the entry stays staged and
+    // the next pass, a reconnect or the online handler tries again.
+    deliver: (entry) => deliverStaged(entry).catch(() => false),
+    report: reportCommand,
+    newExecutionId: () => `exec-${randomToken(18)}`,
+    // Room for the result, bounded by whichever of the two ceilings is lower.
+    artifactCeiling: Math.min(
+      MAX_ARTIFACT_BYTES,
+      Number(state.deviceState?.max_artifact_bytes) || MAX_ARTIFACT_BYTES,
+    ),
+    controlWaitMs: LEASE_WAIT_MS,
+    notify: (capability) => showToast(`Running ${humanize(capability)} for the runner…`),
+    onStartFailed: (error) => handleError(error, "The device command could not be started"),
+  });
+  renderJournalState();
+}
+
+async function reportCommand(commandId, report, executionId) {
+  const encoded = report.artifactBlob ? await blobToBase64(report.artifactBlob) : null;
+  await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(commandId)}/result`, {
+    protocol_version: PROTOCOL_VERSION,
+    outcome: report.outcome,
+    result: report.result ?? null,
+    artifact_base64: encoded,
+    artifact_media_type: report.artifactMediaType ?? null,
+    // Declared so a truncated upload is refused rather than stored as
+    // authoritative bytes that do not match what this device holds.
+    artifact_sha256: encoded ? report.artifactSha256 ?? null : null,
+    error: report.error ?? null,
+    execution_id: executionId ?? null,
+  });
+}
+
 // Keeps the last view of the runner so the app opens to something on a train.
-// Bounded to 50 runs, and never anything that could be replayed as an action.
-async function cacheRuns(runs) {
+//
+// Everything the controller *reads* is cached — runs, their details, events,
+// approval metadata, artifact metadata, sessions and messages — and nothing it
+// *does* is. That asymmetry is the whole design: a queued approval replayed on
+// reconnect would act on a run whose state this device could not see, so no
+// action is ever buffered. A draft is the one exception, and it is not an
+// action: nothing has happened until it is sent.
+function emptyCache() {
+  return {
+    savedAtMs: 0,
+    runs: [],
+    details: {},
+    approvals: {},
+    events: {},
+    artifacts: {},
+    sessions: [],
+    messages: {},
+  };
+}
+
+async function updateRecord(mutate) {
   await withStore("readwrite", (store, transaction) => {
     const request = store.get(ACTIVE_RECORD);
     request.onsuccess = () => {
       const record = request.result;
       if (!record) return;
-      record.cache = { runs: runs.slice(0, 50), savedAtMs: Date.now() };
-      store.put(record);
+      try {
+        mutate(record);
+        store.put(record);
+      } catch {
+        transaction.abort();
+      }
     };
     request.onerror = () => transaction.abort();
+  });
+}
+
+async function cacheWrite(mutate) {
+  await updateRecord((record) => {
+    record.cache = { ...emptyCache(), ...(record.cache || {}) };
+    mutate(record.cache);
+    // Pruned on every write rather than on read: a bound enforced only when
+    // something reads it is a bound that grows without limit on a device that
+    // is never opened offline.
+    record.cache.runs = record.cache.runs.slice(0, CACHE_LIMITS.runs);
+    const visible = new Set(record.cache.runs.map((run) => run.run_id));
+    for (const key of ["details", "approvals", "events", "artifacts"]) {
+      for (const runId of Object.keys(record.cache[key])) {
+        if (!visible.has(runId)) delete record.cache[key][runId];
+      }
+    }
+    record.cache.sessions = record.cache.sessions.slice(0, CACHE_LIMITS.sessions);
+    const sessions = new Set(record.cache.sessions.map((session) => session.id));
+    for (const sessionId of Object.keys(record.cache.messages)) {
+      if (!sessions.has(sessionId)) delete record.cache.messages[sessionId];
+    }
+    record.cache.savedAtMs = Date.now();
+  });
+}
+
+async function cacheRuns(runs) {
+  await cacheWrite((cache) => {
+    cache.runs = runs.slice(0, CACHE_LIMITS.runs);
+  });
+}
+
+async function cacheRunDetail(runId, run, spec, paused) {
+  await cacheWrite((cache) => {
+    cache.details[runId] = { run, spec, paused };
+  });
+}
+
+async function cacheApprovals(runId, approvals) {
+  await cacheWrite((cache) => {
+    // Metadata only, which is all the route returns: an approval carries a
+    // digest and an expiry, never the operation's arguments.
+    cache.approvals[runId] = approvals.slice(0, CACHE_LIMITS.approvalsPerRun);
+  });
+}
+
+// Events, and the artifact metadata they announce.
+//
+// The bytes are never cached — an artifact is fetched over the signed route and
+// verified against its digest, and a copy sitting in this browser would be an
+// unverified second source. What is kept is that the artifact exists, so an
+// offline device can tell someone which id to ask for.
+async function cacheEvents(runId, events) {
+  await cacheWrite((cache) => {
+    cache.events[runId] = events.slice(-CACHE_LIMITS.eventsPerRun);
+    const artifacts = new Map(
+      (cache.artifacts[runId] || []).map((artifact) => [artifact.artifact_id, artifact]),
+    );
+    for (const envelope of events) {
+      if (envelope.event?.type !== "artifact_added") continue;
+      const payload = envelope.event.payload || {};
+      const artifactId = payload.artifact_id;
+      if (typeof artifactId !== "string" || !validId(artifactId)) continue;
+      artifacts.set(artifactId, {
+        artifact_id: artifactId,
+        media_type: typeof payload.media_type === "string" ? payload.media_type : null,
+        bytes: Number.isSafeInteger(payload.bytes) ? payload.bytes : null,
+        sequence: envelope.sequence,
+      });
+    }
+    cache.artifacts[runId] = [...artifacts.values()].slice(-CACHE_LIMITS.artifactsPerRun);
+  });
+}
+
+async function cacheSessions(sessions) {
+  await cacheWrite((cache) => {
+    cache.sessions = sessions.slice(0, CACHE_LIMITS.sessions);
+  });
+}
+
+async function cacheMessages(sessionId, messages) {
+  await cacheWrite((cache) => {
+    cache.messages[sessionId] = messages.slice(-CACHE_LIMITS.messagesPerSession);
+  });
+}
+
+// A draft is not an action, so unlike everything else on this screen it is kept
+// while offline and restored on the next load. It is stored beside the cache
+// rather than inside it, so pruning a run or a session never deletes something
+// a person typed.
+async function saveDraft(sessionId, text) {
+  // A draft keyed by something `validateStoredRecord` would later reject would
+  // invalidate the whole profile on the next load — which is to say, lose the
+  // device key over a piece of text. The session list only ever offers ids that
+  // already passed this check; the guard is what keeps that true.
+  if (!validId(sessionId)) return;
+  state.drafts[sessionId] = text;
+  await updateRecord((record) => {
+    record.drafts ||= {};
+    if (text.trim()) {
+      record.drafts[sessionId] = text.slice(0, 4_000);
+    } else {
+      delete record.drafts[sessionId];
+    }
   });
 }
 
@@ -2058,8 +3217,40 @@ function showStale(record, reason) {
   const cached = record?.cache;
   state.stale = true;
   state.lastSyncAtMs = cached?.savedAtMs || null;
+  state.drafts = record?.drafts || {};
   state.runs = Array.isArray(cached?.runs) ? cached.runs.filter(isRunSummary) : [];
+  state.sessions = Array.isArray(cached?.sessions) ? cached.sessions.filter(isSessionSummary) : [];
+  state.messages = new Map(
+    Object.entries(cached?.messages || {}).map(([sessionId, messages]) => [
+      sessionId,
+      (Array.isArray(messages) ? messages : []).filter(isChatMessage),
+    ]),
+  );
+  for (const [runId, events] of Object.entries(cached?.events || {})) {
+    state.events.set(runId, (Array.isArray(events) ? events : []).filter(isEventEnvelope));
+  }
   renderRuns();
+  if (!state.sessions.some((session) => session.id === state.selectedSessionId)) {
+    state.selectedSessionId = state.sessions[0]?.id || null;
+  }
+  renderSessions();
+  renderWorkflows();
+  // A cached run detail, so the offline view is a run rather than an empty
+  // panel. Chosen the same way the online path chooses: the previous selection
+  // if it is still visible, otherwise the first run.
+  const selected = state.runs.some((run) => run.run_id === state.selectedRunId)
+    ? state.selectedRunId
+    : state.runs[0]?.run_id || null;
+  state.selectedRunId = selected;
+  const detail = selected ? cached?.details?.[selected] : null;
+  ui.runPlaceholder.hidden = Boolean(detail);
+  ui.runDetail.hidden = !detail;
+  if (detail && isRunSummary(detail.run)) {
+    renderRunDetail(detail.run, detail.spec, detail.paused === true);
+    state.approvals = (cached?.approvals?.[selected] || []).filter(isApproval);
+    renderApprovals();
+    renderEvents();
+  }
   applyStaleState();
   setConnection("error", cached ? `Offline — showing ${relativeTime(cached.savedAtMs)}` : reason);
 }
@@ -2069,15 +3260,32 @@ function applyStaleState() {
     ui.staleBanner.hidden = !state.stale;
     if (state.stale) {
       ui.staleBanner.textContent = state.lastSyncAtMs
-        ? `Offline. Showing what the runner said ${relativeTime(state.lastSyncAtMs)}. Actions are disabled until it is reachable again.`
+        ? `Offline. Showing what the runner said ${relativeTime(state.lastSyncAtMs)}. Actions are disabled until it is reachable again; anything you type is kept as a draft.`
         : "Offline. No cached runner state is available.";
     }
   }
-  // Every control whose effect leaves this device.
-  for (const button of [ui.cancelButton, ui.killButton, ui.eventsButton, ui.artifactForm?.querySelector("button")]) {
+  // Every control whose effect leaves this device. A draft is not one of them —
+  // the composer stays usable, because typing changes nothing on the runner and
+  // the text is what a person would otherwise lose.
+  for (const button of [
+    ui.cancelButton,
+    ui.killButton,
+    ui.eventsButton,
+    ui.pauseButton,
+    ui.resumeButton,
+    ui.chatSendButton,
+    ui.chatRefreshButton,
+    ui.workflowRefreshButton,
+    ui.captureButton,
+    ui.revokeSelfButton,
+    ui.artifactForm?.querySelector("button"),
+  ]) {
     if (button) button.disabled = state.stale;
   }
   for (const button of ui.approvalsList?.querySelectorAll("button") || []) {
+    button.disabled = state.stale;
+  }
+  for (const button of ui.workflowList?.querySelectorAll("button") || []) {
     button.disabled = state.stale;
   }
 }
@@ -2189,6 +3397,9 @@ async function initialize() {
     showPairing();
     return;
   }
+  // Drafts before anything on the network: the text somebody typed is the one
+  // thing on this screen that does not depend on the runner being reachable.
+  state.drafts = record.drafts || {};
   showDashboard(record.profile);
   try {
     await refreshRuns({ preserveSelection: false });
@@ -2204,8 +3415,14 @@ async function initialize() {
   } catch (error) {
     handleError(error, "This device could not report what it can do");
   }
+  await refreshCapabilitySurfaces();
   void refreshPushState();
   renderScreenShare();
+  // Focus, visibility, a permission changed in the browser's own settings, a
+  // screen share ended from its bar: every one of those changes an axis, and a
+  // runner acting on a stale surface refuses what is possible or queues what
+  // will fail.
+  watchDeviceReadiness();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }

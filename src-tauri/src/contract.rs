@@ -270,6 +270,24 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         path: "/v1/remote/device/commands/next",
         gate: RemoteGate::SelfService,
     },
+    // Reconciliation after a reconnect or a restart. Self-service like the
+    // lease, and deliberately not a lease: it returns only what this device
+    // already started and never finished, so the device can deliver a staged
+    // result or say the outcome is unknown — never perform the action again.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/recover",
+        gate: RemoteGate::SelfService,
+    },
+    // A running command's control signals, held open by the long poll. This is
+    // how a cancellation reaches a recording already in progress.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/{command_id}/control",
+        gate: RemoteGate::SelfService,
+    },
     RemoteRouteSpec {
         plane: RemotePlane::Device,
         method: "POST",
