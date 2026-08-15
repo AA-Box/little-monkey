@@ -21,7 +21,8 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookAck, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookAck,
+    WebhookChannelAdapter,
 };
 
 const GRAPH_API_BASE: &str = "https://graph.facebook.com/v21.0";
@@ -160,7 +161,7 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // WhatsApp's signature covers only the body, so `public_base_url` is
         // unused here — it exists for providers whose signature *does* cover
         // the delivery URL, and reconstructing one from request headers would
@@ -176,7 +177,13 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
 
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("WhatsApp webhook body is not valid JSON: {error}"))?;
-        Ok(normalize_payload(&payload, &self.account_id, now_ms))
+        // A Graph reply is addressed by the recipient's own phone number, which
+        // the envelope carries, so there is no addressing to make durable here.
+        Ok(VerifiedWebhookDelivery::messages_only(normalize_payload(
+            &payload,
+            &self.account_id,
+            now_ms,
+        )))
     }
 
     /// Meta reports what happened to a message we sent — `sent`, `delivered`,
@@ -877,7 +884,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].provider_event_id, "wamid.ABC123");
         assert_eq!(envelopes[0].sender.sender_id, "15550001111");
@@ -1249,7 +1257,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert!(envelopes.is_empty());
     }
 
@@ -1283,7 +1292,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].attachments.len(), 1);
         match &envelopes[0].attachments[0].source {
@@ -1304,7 +1314,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .unwrap();
+            .unwrap()
+            .envelopes;
         let second = adapter
             .verify_and_normalize(
                 &[("x-hub-signature-256".to_string(), signature)],
@@ -1312,7 +1323,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .unwrap();
+            .unwrap()
+            .envelopes;
         assert_eq!(first[0].provider_event_id, second[0].provider_event_id);
     }
 

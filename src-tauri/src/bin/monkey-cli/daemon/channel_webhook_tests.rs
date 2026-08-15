@@ -1253,6 +1253,11 @@ async fn a_teams_activity_whose_reply_address_is_lost_is_never_acknowledged() {
         .channel_conversation_ref("acct-teams", "19:conv1")
         .expect("read")
         .is_some());
+    // And it becomes exactly one run: the delivery that was refused left
+    // nothing for this one to collapse onto or duplicate.
+    let queue = FakeQueue::default();
+    process(&mut store, &queue).await;
+    assert_one_of_everything(&store, &queue, "acct-teams");
 }
 
 /// Every way a Teams delivery can fail authentication, and the same answer to
@@ -1358,6 +1363,75 @@ async fn no_refused_teams_activity_records_an_event_or_a_reply_address() {
             "{label}: an unauthenticated request planted a reply address"
         );
     }
+}
+
+/// The other half of the same invariant: an activity that authenticated
+/// perfectly and still has no address to answer to.
+///
+/// Everything the Bot Framework signs is correct here — the signature, the
+/// audience, the issuer, the lifetime, the channel, the endorsement, and the
+/// `serviceurl` claim really does match the activity's own `serviceUrl`. What
+/// fails is producing an address from it: the endpoint names a host that is on
+/// no Bot Framework cloud this build knows, so `send` would have nowhere to
+/// POST. There is no later moment that repairs that — the connector will not
+/// redeliver something it saw succeed — so the delivery is refused, and the
+/// message stays the provider's to send again.
+///
+/// Driven through the production HTTP route, because "the provider was told
+/// yes" is a status line rather than an internal enum.
+#[tokio::test]
+async fn a_teams_activity_whose_reply_address_cannot_be_produced_is_never_acknowledged() {
+    /// A real endpoint shape on a host no Bot Framework cloud owns.
+    const OFF_CLOUD: &str = "https://smba.example.com/amer/";
+
+    let (paths, store) = route_world(
+        "acct-teams",
+        ChannelKind::Teams,
+        teams_config(),
+        teams_secret(),
+    );
+    drop(store);
+    // The token vouches for exactly the endpoint the activity carries, so the
+    // binding check passes and the refusal can only come from the address.
+    let headers = teams_authorization_for(OFF_CLOUD);
+    let body = teams_body_at("activity-unaddressable", OFF_CLOUD);
+
+    let response = test_route::post(&paths, "/v1/channels/acct-teams", &headers, &body).await;
+
+    assert!(
+        !(200..300).contains(&response.status),
+        "an activity that cannot be answered must not read as accepted: {response:?}"
+    );
+
+    let mut store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(
+        inbound_events(&store, "acct-teams"),
+        0,
+        "an accepted event with no reply address is the state this prevents"
+    );
+    assert_eq!(awaiting(&store), 0);
+    assert!(
+        store
+            .channel_conversation_ref("acct-teams", "19:conv1")
+            .expect("read")
+            .is_none(),
+        "nothing landed"
+    );
+    let queue = FakeQueue::default();
+    process(&mut store, &queue).await;
+    assert_eq!(distinct_runs(&queue), 0, "no turn, so no run");
+
+    // And the same delivery over an endpoint this cloud does own is accepted,
+    // which is what pins the refusal above to the address rather than to some
+    // unrelated thing about the fixture.
+    let good = test_route::post(
+        &paths,
+        "/v1/channels/acct-teams",
+        &teams_authorization(),
+        &teams_body("activity-addressable"),
+    )
+    .await;
+    assert_eq!(good.status, 200, "{good:?}");
 }
 
 /// A key the Bot Framework has not endorsed for Teams cannot sign a Teams

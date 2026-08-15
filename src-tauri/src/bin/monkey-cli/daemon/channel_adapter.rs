@@ -433,6 +433,39 @@ pub struct DurableAddressing {
     pub reference: serde_json::Value,
 }
 
+/// Everything one verified delivery established, as a single value.
+///
+/// The two halves travel together because they are accepted together: an
+/// envelope whose reply address did not survive is a message nobody can ever
+/// answer, and the acknowledgement rests on both. Returning them as one result
+/// is what makes that a property of the type rather than of a convention — a
+/// verifier that cannot produce mandatory addressing returns `Err` and the
+/// delivery is not accepted at all, which is not the same answer as a verifier
+/// that had none to produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedWebhookDelivery {
+    pub envelopes: Vec<ChannelEnvelope>,
+    /// Addressing this delivery established that MUST be durable before the
+    /// provider is told "yes", committed by the acceptance path *with* the
+    /// event rather than beside it.
+    ///
+    /// Only trustworthy once the delivery has authenticated, and for Teams only
+    /// once the token's own `serviceurl` claim has been bound to the
+    /// activity's. Empty for every provider whose replies are addressable from
+    /// a conversation id alone, which is all of them but Teams.
+    pub durable_addressing: Vec<DurableAddressing>,
+}
+
+impl VerifiedWebhookDelivery {
+    /// A delivery that carries messages and no addressing of its own.
+    pub fn messages_only(envelopes: Vec<ChannelEnvelope>) -> Self {
+        Self {
+            envelopes,
+            durable_addressing: Vec::new(),
+        }
+    }
+}
+
 /// Providers that are delivered to rather than polled.
 ///
 /// Signature verification happens here, over the exact bytes received, because
@@ -455,30 +488,17 @@ pub trait WebhookChannelAdapter: Send + Sync {
     ///
     /// Returning `Err` rejects the delivery without recording anything, which
     /// is the correct answer for a bad signature: an unverified body has not
-    /// earned a row in the durable event log.
+    /// earned a row in the durable event log. It is equally the correct answer
+    /// when the delivery authenticated but its mandatory
+    /// [`VerifiedWebhookDelivery::durable_addressing`] could not be produced —
+    /// a message that cannot be answered must be redelivered, not accepted.
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String>;
-
-    /// Addressing this delivery established that MUST be durable before the
-    /// provider is told "yes", drained by the acceptance path so it is
-    /// committed *with* the event rather than beside it.
-    ///
-    /// Filled by [`Self::verify_and_normalize`], which is the only thing that
-    /// can produce it: the values are only trustworthy once the delivery has
-    /// authenticated, and for Teams only once the token's own `serviceurl`
-    /// claim has been bound to the activity's. Draining is what keeps one
-    /// delivery's addressing from leaking into the next.
-    ///
-    /// An adapter whose replies are addressable from a conversation id alone
-    /// returns nothing, which is every provider but Teams.
-    fn take_durable_addressing(&self) -> Vec<DurableAddressing> {
-        Vec::new()
-    }
+    ) -> Result<VerifiedWebhookDelivery, String>;
 
     /// Delivery progress this same body reports for messages already sent.
     ///

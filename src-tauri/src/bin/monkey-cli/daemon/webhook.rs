@@ -306,7 +306,11 @@ fn ack_response(ack: super::channel_adapter::WebhookAck) -> Response<Full<Bytes>
 /// 1. the provider's own adapter verifies the signature over the exact bytes
 ///    received — nothing is parsed before that, and a failure returns
 ///    [`DeliveryOutcome::Rejected`] having written nothing;
-/// 2. the verified body is normalized into envelopes;
+/// 2. the verified body is normalized into envelopes *and* whatever reply
+///    addressing this provider requires, as one result: an adapter that
+///    authenticated a message it could not produce an address for returns
+///    `Err` here, which is refused exactly like a bad signature, because a
+///    message nobody can answer must be redelivered rather than accepted;
 /// 3. any reply address the delivery established is committed, because a
 ///    message that is acknowledged and then cannot be answered is worse than
 ///    one that is redelivered — see [`record_durable_addressing`];
@@ -331,20 +335,26 @@ pub(crate) fn accept_webhook_delivery(
     adapter: &dyn super::channel_adapter::WebhookChannelAdapter,
     delivery: &WebhookDelivery<'_>,
 ) -> DeliveryOutcome {
-    let envelopes = match adapter.verify_and_normalize(
+    let verified = match adapter.verify_and_normalize(
         delivery.headers,
         delivery.body,
         delivery.public_base_url,
         delivery.now_ms,
     ) {
-        Ok(envelopes) => envelopes,
-        // Deliberately opaque, and deliberately not recorded.
+        Ok(verified) => verified,
+        // Deliberately opaque, and deliberately not recorded. Covers both a
+        // delivery that did not authenticate and one that did but could not
+        // produce the addressing its own message requires.
         Err(_) => return DeliveryOutcome::Rejected,
     };
+    let super::channel_adapter::VerifiedWebhookDelivery {
+        envelopes,
+        durable_addressing,
+    } = verified;
     // Where this conversation's answer goes, before anything says it arrived.
     // A provider that saw success for a message whose only reply address was
     // lost is owed an answer nothing can ever send, and it will not redeliver.
-    if !record_durable_addressing(store, adapter.take_durable_addressing(), delivery.now_ms) {
+    if !record_durable_addressing(store, durable_addressing, delivery.now_ms) {
         return DeliveryOutcome::NotAccepted;
     }
     // What the provider says happened to messages we already sent. Recorded

@@ -42,7 +42,8 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookAck, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookAck,
+    WebhookChannelAdapter,
 };
 
 const LINE_API_BASE: &str = "https://api.line.me";
@@ -119,7 +120,7 @@ impl WebhookChannelAdapter for LineAdapter {
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // LINE's signature covers only the body, same as WhatsApp's — see the
         // module doc for why there is no timestamp skew check here, and why
         // `public_base_url` is unused (it is only for providers whose
@@ -137,8 +138,13 @@ impl WebhookChannelAdapter for LineAdapter {
         // Nothing is written here. A LINE delivery carries one reply token per
         // event and this adapter answers with push, so there is no per-event
         // state to keep and nothing a second event in the same delivery could
-        // overwrite — see the module doc.
-        Ok(normalize_payload(&payload, &self.account_id, now_ms))
+        // overwrite — see the module doc, and nothing durable to address a
+        // push with beyond the destination the envelope already carries.
+        Ok(VerifiedWebhookDelivery::messages_only(normalize_payload(
+            &payload,
+            &self.account_id,
+            now_ms,
+        )))
     }
 }
 
@@ -724,7 +730,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].provider_event_id, "evt-1");
         assert_eq!(envelopes[0].text, "hello");
@@ -851,7 +858,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Group);
         assert_eq!(envelopes[0].conversation.conversation_id, "G1");
         assert_eq!(envelopes[0].sender.sender_id, "U9");
@@ -869,7 +877,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert!(envelopes.is_empty());
     }
 
@@ -893,7 +902,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes[0].provider_event_id, "msg-only-3");
     }
 
@@ -909,7 +919,8 @@ pub(crate) mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         // Not the text, not the metadata, not the durable envelope: the
         // token is dropped at normalization and nothing downstream can find
         // one to use, refresh or leak.
@@ -1198,7 +1209,8 @@ pub(crate) mod tests {
                 None,
                 now_ms(),
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
 
         assert_eq!(envelopes.len(), 2);
         assert_eq!(envelopes[0].provider_event_id, "01FIRST");

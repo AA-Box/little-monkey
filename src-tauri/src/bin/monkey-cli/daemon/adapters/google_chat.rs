@@ -64,7 +64,7 @@ use super::jwt::{
     verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookChannelAdapter,
 };
 
 const CHAT_API_BASE: &str = "https://chat.googleapis.com";
@@ -297,7 +297,7 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // `public_base_url` is unused: the only supported Authentication
         // Audience is the project number, so nothing here is ever compared
         // against a URL — least of all one a request could choose.
@@ -327,11 +327,13 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         // Google's own JWKS — the body is never parsed before that.
         let event: JsonValue = serde_json::from_slice(body)
             .map_err(|_| "Google Chat event body is not valid JSON".to_string())?;
-        Ok(
+        // A Chat reply is addressed by space name alone, so this delivery
+        // establishes no addressing that has to outlive it.
+        Ok(VerifiedWebhookDelivery::messages_only(
             normalize_event(&event, &self.account_id, &self.bot_user_name, now_ms)
                 .into_iter()
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -1103,7 +1105,8 @@ Z4Cr3JR0FbjywTd4IHU6
                 None,
                 now_ms,
             )
-            .expect("a genuinely signed, structurally valid token must verify");
+            .expect("a genuinely signed, structurally valid token must verify")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].text, "hello there");
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);

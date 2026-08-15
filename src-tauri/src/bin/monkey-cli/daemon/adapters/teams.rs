@@ -52,9 +52,10 @@
 //! still owes an answer afterwards, and a process-local map cannot give it one.
 //! [`TeamsAdapter::conversation_reference_for`] produces it — only from an
 //! activity whose JWT has already verified, and only after
-//! [`validate_service_url`] — and it leaves this adapter as
-//! [`DurableAddressing`], which the webhook acceptance path commits *before*
-//! the provider is answered. `send` loads it back through
+//! [`validate_service_url`] — and it leaves this adapter as the
+//! [`DurableAddressing`] half of the [`VerifiedWebhookDelivery`] that
+//! `verify_and_normalize` returns, which the webhook acceptance path commits
+//! *before* the provider is answered. `send` loads it back through
 //! [`ConversationReferences`]. Nothing derives, reconstructs or defaults it.
 //!
 //! That the address is committed by the acceptance path rather than written
@@ -63,6 +64,14 @@
 //! to, and no amount of retrying fixes it because the provider considers it
 //! delivered. So the two are one acceptance — event and address together, or
 //! neither and a redelivery.
+//!
+//! Which is why an activity that normalizes into an inbound envelope and whose
+//! address cannot be produced — no conversation id, no `serviceUrl`, or a
+//! `serviceUrl` on a host this cloud does not own — fails
+//! `verify_and_normalize` outright. It is returned as one result rather than
+//! staged on the adapter precisely so that failure cannot quietly read as
+//! "there was no addressing to commit": the two are not the same answer, and
+//! only the second may be acknowledged.
 //!
 //! The bearer token is the opposite and stays that way: acquired from the
 //! operator's own app credentials, cached in memory with its expiry, never
@@ -84,7 +93,7 @@ use super::jwt::{
 };
 use crate::daemon::channel_adapter::{
     fetch_url, AdapterConfig, ChannelAdapter, ConversationReferences, DaemonConversationReferences,
-    DurableAddressing, InboundBatch, WebhookChannelAdapter,
+    DurableAddressing, InboundBatch, VerifiedWebhookDelivery, WebhookChannelAdapter,
 };
 
 /// Applies to `exp`/`nbf` alike, per the shared skew rule this file follows.
@@ -174,10 +183,6 @@ pub struct TeamsAdapter {
     /// module doc. Read here and written by the acceptance path; `send`
     /// refuses to guess or derive an endpoint.
     references: std::sync::Arc<dyn ConversationReferences>,
-    /// What the last verified delivery established about where to answer,
-    /// waiting for the acceptance path to drain and commit it. Empty at every
-    /// other moment — see [`WebhookChannelAdapter::take_durable_addressing`].
-    pending_addressing: Mutex<Vec<DurableAddressing>>,
     /// Which Bot Framework cloud this account belongs to. Decides the issuer
     /// that is accepted, where signing keys come from, where the bot's own
     /// token is bought and what a reply may be addressed to — all five
@@ -215,7 +220,6 @@ impl TeamsAdapter {
             app_password: secrets.app_password,
             token_cache: Mutex::new(None),
             references: std::sync::Arc::new(DaemonConversationReferences::new()),
-            pending_addressing: Mutex::new(Vec::new()),
             environment,
             login_base: environment.oauth_authority.to_string(),
             jwks_cache: JwksCache::new(),
@@ -498,20 +502,13 @@ impl WebhookChannelAdapter for TeamsAdapter {
         crate::daemon::channel_adapter::WebhookAck::json_ok()
     }
 
-    fn take_durable_addressing(&self) -> Vec<DurableAddressing> {
-        self.pending_addressing
-            .lock()
-            .map(|mut pending| std::mem::take(&mut *pending))
-            .unwrap_or_default()
-    }
-
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // `public_base_url` is unused: the Bot Framework's JWT signs the
         // token's own claims, never the delivery URL, so there is nothing
         // here that would ever need it.
@@ -556,41 +553,12 @@ impl WebhookChannelAdapter for TeamsAdapter {
         validate_channel_is_endorsed(&activity, &key)?;
         validate_service_url_claim(&decoded.claims, &activity)?;
 
-        // The `serviceUrl` this specific activity carries is the only way
-        // `send` learns where to POST for this conversation — produce it now
-        // that the activity is verified *and* bound to the token, per
-        // `conversation_reference_for`'s own doc, and hand it to the acceptance
-        // path, which commits it before this provider is told anything. It has
-        // to be durable rather than cached: the turn this delivery becomes may
-        // well outlive the process that received it.
-        //
-        // An activity whose `serviceUrl` is on a host this cloud does not own
-        // yields no address, and still normalizes and runs — it just cannot be
-        // replied to until one that carries a usable address arrives. Throwing
-        // away a real message over that would be worse, and the send says
-        // plainly what is missing. What must *not* happen is the other order:
-        // an address that exists and is lost. That case is the acceptance
-        // path's, and it withholds the acknowledgement.
-        if let Some(conversation_id) = activity
-            .get("conversation")
-            .and_then(|conversation| conversation.get("id"))
-            .and_then(JsonValue::as_str)
-        {
-            if let Ok(addressing) =
-                self.conversation_reference_for(conversation_id, &activity, now_ms)
-            {
-                if let Ok(mut pending) = self.pending_addressing.lock() {
-                    pending.push(addressing);
-                }
-            }
-        }
-
         let bot_id = activity
             .get("recipient")
             .and_then(|recipient| recipient.get("id"))
             .and_then(JsonValue::as_str)
             .unwrap_or_default();
-        Ok(normalize_activity(
+        let envelopes: Vec<ChannelEnvelope> = normalize_activity(
             &activity,
             &self.account_id,
             bot_id,
@@ -598,7 +566,43 @@ impl WebhookChannelAdapter for TeamsAdapter {
             now_ms,
         )
         .into_iter()
-        .collect())
+        .collect();
+
+        // The `serviceUrl` this specific activity carries is the only way
+        // `send` learns where to POST for this conversation — produce it now
+        // that the activity is verified *and* bound to the token, per
+        // `conversation_reference_for`'s own doc, and return it alongside the
+        // envelopes so the acceptance path commits it before this provider is
+        // told anything. It has to be durable rather than cached: the turn
+        // this delivery becomes may well outlive the process that received it.
+        let addressing = activity
+            .get("conversation")
+            .and_then(|conversation| conversation.get("id"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "Teams activity has no conversation id".to_string())
+            .and_then(|conversation_id| {
+                self.conversation_reference_for(conversation_id, &activity, now_ms)
+            });
+        let durable_addressing = match addressing {
+            Ok(addressing) => vec![addressing],
+            // An activity that becomes an inbound turn owes an answer, and the
+            // Bot Framework does not accept a conversation id alone: without a
+            // usable address there is no endpoint at all, and no later moment
+            // can invent one. So the whole delivery is refused rather than
+            // acknowledged — the provider redelivers, and the alternative is a
+            // message that is durably accepted and permanently unanswerable.
+            Err(error) if !envelopes.is_empty() => return Err(error),
+            // An authenticated activity this adapter maps to no message —
+            // `conversationUpdate`, a reaction, a typing indicator. Nothing
+            // owes it a reply, so an address that could not be produced costs
+            // nothing and the delivery is still finished with.
+            Err(_) => Vec::new(),
+        };
+
+        Ok(VerifiedWebhookDelivery {
+            envelopes,
+            durable_addressing,
+        })
     }
 }
 
@@ -1370,21 +1374,23 @@ Z4Cr3JR0FbjywTd4IHU6
                 None,
                 now_ms,
             )
-            .expect("a genuinely signed, structurally valid token must verify");
+            .expect("a genuinely signed, structurally valid token must verify")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].text, "hello bot");
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
     }
 
     /// What the webhook acceptance path does with the addressing a verified
-    /// delivery established: drain it and commit it. Here the store is the
-    /// in-memory one, because what these tests are about is the *value* the
-    /// verifier produced — `channel_webhook_tests` proves the real path
-    /// commits it to the real database before the provider is answered.
-    fn commit_addressing(adapter: &TeamsAdapter, references: &dyn ConversationReferences) {
-        for entry in
-            crate::daemon::channel_adapter::WebhookChannelAdapter::take_durable_addressing(adapter)
-        {
+    /// delivery returned: commit it. Here the store is the in-memory one,
+    /// because what these tests are about is the *value* the verifier produced
+    /// — `channel_webhook_tests` proves the real path commits it to the real
+    /// database before the provider is answered.
+    fn commit_addressing(
+        verified: &VerifiedWebhookDelivery,
+        references: &dyn ConversationReferences,
+    ) {
+        for entry in &verified.durable_addressing {
             references
                 .put(&entry.account_id, &entry.conversation_id, &entry.reference)
                 .expect("store the address");
@@ -1403,7 +1409,7 @@ Z4Cr3JR0FbjywTd4IHU6
             TEST_PRIVATE_KEY_PEM,
         );
         let body = serde_json::to_vec(&personal_activity()).unwrap();
-        adapter
+        let verified = adapter
             .verify_and_normalize(
                 &[("authorization".to_string(), format!("Bearer {jwt}"))],
                 &body,
@@ -1411,7 +1417,7 @@ Z4Cr3JR0FbjywTd4IHU6
                 now_ms,
             )
             .expect("verification should succeed");
-        commit_addressing(&adapter, references.as_ref());
+        commit_addressing(&verified, references.as_ref());
         let stored = references
             .get("acct-teams", "19:conv1")
             .expect("the verified activity's address is durable");
@@ -1439,6 +1445,75 @@ Z4Cr3JR0FbjywTd4IHU6
         );
     }
 
+    /// A message this adapter cannot address is not a message it may hand on.
+    ///
+    /// The token is genuine and vouches for exactly the `serviceUrl` the
+    /// activity carries, so every binding check passes; the endpoint is simply
+    /// on a host no Bot Framework cloud this build knows owns. Since the reply
+    /// address is the only endpoint `send` will ever have, that failure is the
+    /// whole delivery's — returned as `Err`, which the acceptance path refuses,
+    /// rather than as a verified delivery carrying no addressing.
+    #[test]
+    fn a_message_whose_address_cannot_be_produced_fails_verification() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let off_cloud = "https://smba.example.com/amer/";
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, off_cloud),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity["serviceUrl"] = JsonValue::from(off_cloud);
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&activity).unwrap(),
+            None,
+            now_ms,
+        );
+
+        assert!(
+            result.is_err(),
+            "a message with no usable reply address must not verify: {result:?}"
+        );
+    }
+
+    /// The same unusable endpoint on an activity that is not a message at all.
+    ///
+    /// Nothing here owes anyone an answer — no envelope is produced, so no
+    /// reply address is required — and refusing it would only make the Bot
+    /// Framework redeliver a `conversationUpdate` forever. It verifies, carries
+    /// no message and carries no addressing.
+    #[test]
+    fn a_non_message_activity_needs_no_reply_address() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let off_cloud = "https://smba.example.com/amer/";
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, off_cloud),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity["type"] = JsonValue::from("conversationUpdate");
+        activity["serviceUrl"] = JsonValue::from(off_cloud);
+
+        let verified = adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &serde_json::to_vec(&activity).unwrap(),
+                None,
+                now_ms,
+            )
+            .expect("an activity that becomes no turn needs no reply address");
+
+        assert!(verified.envelopes.is_empty());
+        assert!(verified.durable_addressing.is_empty());
+    }
+
     /// A second adapter over the same store, as a restart produces: the
     /// process that received the activity is gone and this one has to answer.
     #[tokio::test]
@@ -1453,7 +1528,7 @@ Z4Cr3JR0FbjywTd4IHU6
                 "test-key-1",
                 TEST_PRIVATE_KEY_PEM,
             );
-            receiver
+            let verified = receiver
                 .verify_and_normalize(
                     &[("authorization".to_string(), format!("Bearer {jwt}"))],
                     &serde_json::to_vec(&personal_activity()).unwrap(),
@@ -1461,7 +1536,7 @@ Z4Cr3JR0FbjywTd4IHU6
                     now_ms,
                 )
                 .expect("verification should succeed");
-            commit_addressing(&receiver, references.as_ref());
+            commit_addressing(&verified, references.as_ref());
         }
 
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
@@ -1511,7 +1586,9 @@ Z4Cr3JR0FbjywTd4IHU6
             result.unwrap_err().contains("serviceUrl"),
             "a token for one endpoint must not vouch for another"
         );
-        commit_addressing(&adapter, references.as_ref());
+        // A refusal returns no delivery at all, so there is nothing for the
+        // acceptance path to commit — the reference store stays empty because
+        // no addressing was ever produced, not because a commit was skipped.
         assert!(
             references.get("acct-teams", "19:conv1").is_none(),
             "a mismatched token planted a reply address"
