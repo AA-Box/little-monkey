@@ -18,8 +18,14 @@
 //!   made (`send`, a probe's `listAccounts` call) — routed to the matching
 //!   entry in `pending` and never seen by `poll`.
 //! - A line with `"method": "receive"` and no `id` is an inbound
-//!   *notification* — parsed by [`parse_event`] and pushed onto `poll`'s
-//!   channel.
+//!   *notification* — parsed by [`parse_event`] and offered to `poll`'s
+//!   bounded channel without ever waiting on it. One stdout reader serves
+//!   both directions, so blocking it on a downstream consumer would stop
+//!   *RPC responses* from being read at all: a burst of inbound traffic
+//!   would time out every `send` and probe behind it, and a helper that was
+//!   answering perfectly would look dead. An overflow is therefore dropped,
+//!   counted in [`Shared::dropped_inbound`], and surfaced as degraded
+//!   health.
 //! - EOF (the helper exited) resolves every still-pending request with a
 //!   "helper exited" error, which is what turns an in-flight `send` into
 //!   [`SendOutcome::NeedsReconciliation`] rather than leaving it hanging
@@ -81,6 +87,7 @@ const MAX_TEXT_CHARS: usize = 2000;
 
 /// Outcome of one JSON-RPC round trip, distinguished by whether a request
 /// provably reached the helper's stdin.
+#[derive(Debug)]
 enum CallError {
     /// Never written — the helper is not running or failed to start. Nothing
     /// happened, so this is the one arm a send may safely be retried from.
@@ -113,6 +120,17 @@ struct Shared {
     /// for [`HEALTHY_RUN`] — so a broken install is retried at a decreasing
     /// rate while a one-off crash is recovered from immediately.
     restart_cooldown: Mutex<Duration>,
+    /// Notifications normalized but never handed on, because `poll` fell far
+    /// enough behind to fill the inbound queue.
+    ///
+    /// Counted rather than waited on: [`run_rpc_loop`] is the only reader of
+    /// the helper's stdout, and stdout carries JSON-RPC *responses* down the
+    /// same pipe. A reader parked on a full inbound queue stops resolving
+    /// pending requests, which turns a working helper into timed-out sends
+    /// and probes. Bounded and lossy beats unbounded and wedged — but a
+    /// message that never arrived must still be something an operator can
+    /// see, which is what [`SignalAdapter::probe`] reads this for.
+    dropped_inbound: AtomicU64,
 }
 
 pub struct SignalAdapter {
@@ -160,6 +178,7 @@ impl SignalAdapter {
                 stdin: Mutex::new(None),
                 alive: AtomicBool::new(false),
                 restart_cooldown: Mutex::new(INITIAL_RESTART_COOLDOWN),
+                dropped_inbound: AtomicU64::new(0),
             }),
             last_start: Mutex::new(None),
             blobs: Arc::new(DaemonBlobs),
@@ -308,7 +327,26 @@ async fn run_rpc_loop(
                     continue;
                 }
                 if let Some(envelope) = parse_event(&line) {
-                    let _ = inbound_tx.send(envelope).await;
+                    // `try_send`, never `send().await`: the next line down
+                    // this pipe may be the JSON-RPC response an in-flight
+                    // `send` is waiting on, and a reader parked on a full
+                    // inbound queue would never reach it. Backpressure is
+                    // kept — the queue stays bounded and the overflow is
+                    // counted — it just stops being applied to the one task
+                    // that must not absorb it.
+                    match inbound_tx.try_send(envelope) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            shared.dropped_inbound.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // The receiver lives in the adapter and is dropped
+                        // only when the adapter itself is, so a closed
+                        // channel means this helper has no owner left to
+                        // deliver to. Stop reading and run the same shutdown
+                        // the EOF arm does — the helper sees its stdin close
+                        // and exits.
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
                 }
             }
             Ok(None) | Err(_) => break,
@@ -510,8 +548,25 @@ impl ChannelAdapter for SignalAdapter {
         // is unfinished, never Connected.
         match self.call("listAccounts", json!({})).await {
             Ok(result) => match registered_accounts(&result) {
+                // Registration is established first and overflow is read only
+                // inside this arm: an account that is not registered, or a
+                // helper that cannot say, is a more fundamental failure than a
+                // queue that overran, and must never be softened into
+                // "connected but busy".
                 Some(accounts) if accounts.iter().any(|number| number == &self.account) => {
-                    ChannelHealth::connected(now, Some(self.account.clone()))
+                    match self.shared.dropped_inbound.load(Ordering::Relaxed) {
+                        0 => ChannelHealth::connected(now, Some(self.account.clone())),
+                        // No number, no message text, no helper path: an
+                        // operator needs the count and the cause, and the
+                        // count is not private.
+                        dropped => ChannelHealth::degraded(
+                            now,
+                            format!(
+                                "Signal is connected, but {dropped} inbound message(s) were \
+                                 dropped because Little Monkey fell behind reading them.",
+                            ),
+                        ),
+                    }
                 }
                 Some(_) => ChannelHealth::error(
                     now,
@@ -1009,23 +1064,80 @@ mod tests {
         /// tests share one process, and a process-wide variable would make the
         /// answer depend on which test ran last.
         fn write_fake_helper_registering(name: &str, registered: &str) -> std::path::PathBuf {
-            write_fake_helper_answering(
+            write_fake_helper_registering_bursting(name, registered, 0)
+        }
+
+        /// The same, ahead of a burst of inbound notifications.
+        fn write_fake_helper_registering_bursting(
+            name: &str,
+            registered: &str,
+            burst: usize,
+        ) -> std::path::PathBuf {
+            write_fake_helper_bursting(
                 name,
                 &format!(r#"\"result\":[{{\"number\":\"{registered}\"}}]"#),
+                burst,
             )
+        }
+
+        /// One valid `receive` notification per iteration, each from its own
+        /// number so nothing downstream can collapse them into one event.
+        const BURST_COMMAND: &str = r#"awk 'BEGIN{for(i=0;i<__COUNT__;i++)printf "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+1555000%04d\",\"timestamp\":1700000000000,\"dataMessage\":{\"message\":\"burst\"}}}}\n", i}'"#;
+
+        /// More notifications than the inbound queue holds, so the tail of the
+        /// burst has nowhere to go while nothing is draining `poll`.
+        const OVERFLOW_BURST: usize = INBOUND_CHANNEL_CAPACITY + 32;
+
+        /// An adapter whose helper floods stdout before it will read a single
+        /// request, and whose `poll` is never called.
+        ///
+        /// Every RPC response therefore arrives behind a full inbound queue,
+        /// which is exactly the production shape: a Signal account under a
+        /// burst while the consumer is busy.
+        fn saturated_adapter(name: &str) -> (SignalAdapter, std::path::PathBuf) {
+            let path = write_fake_helper_registering_bursting(name, "+15550000000", OVERFLOW_BURST);
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+            (adapter, path)
         }
 
         /// The same fixture again, answering `listAccounts` with an arbitrary
         /// JSON-RPC tail — a result in a shape this adapter cannot read, or an
         /// outright error from a helper too old to have the method at all.
         fn write_fake_helper_answering(name: &str, list_accounts_tail: &str) -> std::path::PathBuf {
+            write_fake_helper_bursting(name, list_accounts_tail, 0)
+        }
+
+        /// The same fixture once more, preceded by `burst` inbound
+        /// notifications written before it reads a single request.
+        ///
+        /// One `awk` rather than `burst` separate `/bin/echo`s: the point is a
+        /// crowd of lines arriving ahead of the RPC response, and spawning
+        /// three hundred processes to produce them makes the test slow without
+        /// making it stricter. It still exits before the read loop starts, so
+        /// nothing is left sitting in a buffer.
+        fn write_fake_helper_bursting(
+            name: &str,
+            list_accounts_tail: &str,
+            burst: usize,
+        ) -> std::path::PathBuf {
             let path = std::env::temp_dir().join(format!(
                 "monkey-fake-signal-{name}-{}",
                 uuid::Uuid::new_v4().simple()
             ));
+            let burst_line = if burst == 0 {
+                String::new()
+            } else {
+                BURST_COMMAND.replace("__COUNT__", &burst.to_string())
+            };
             let script = r#"#!/bin/sh
 /bin/echo '{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"source":"+15551230001","sourceName":"Ada","timestamp":1700000000000,"dataMessage":{"message":"hello there"}}}}'
 /bin/echo 'this line is not JSON'
+__BURST__
 while IFS= read -r line; do
   case "$line" in
     *crash*) exit 7 ;;
@@ -1041,7 +1153,9 @@ done
 "#;
             std::fs::write(
                 &path,
-                script.replace("__LIST_ACCOUNTS__", list_accounts_tail),
+                script
+                    .replace("__LIST_ACCOUNTS__", list_accounts_tail)
+                    .replace("__BURST__", &burst_line),
             )
             .expect("write fake helper");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
@@ -1226,6 +1340,105 @@ done
             let health = adapter.probe().await;
             assert_eq!(health.state, HealthState::Connected);
             assert_eq!(health.detail.as_deref(), Some("+15550000000"));
+            // The overflow counter must stay a report of something that
+            // happened, not a state a healthy account drifts into: an account
+            // nothing was dropped on is Connected, permanently.
+            assert_eq!(adapter.shared.dropped_inbound.load(Ordering::Relaxed), 0);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The one this whole mechanism exists for.
+        ///
+        /// One reader serves both directions of the helper's stdout, so a
+        /// reader that waits for inbound-queue capacity stops reading JSON-RPC
+        /// responses — and a helper answering perfectly starts timing out
+        /// every send and probe behind the burst. Fails against a reader that
+        /// awaits `inbound_tx.send`.
+        #[tokio::test]
+        async fn a_full_inbound_queue_never_blocks_an_rpc_response() {
+            let (adapter, path) = saturated_adapter("saturated-rpc");
+            // The burst is written before the fixture reads anything, so this
+            // response sits behind all of it in the same pipe.
+            let answered = tokio::time::timeout(
+                Duration::from_secs(15),
+                adapter.call("listAccounts", json!({})),
+            )
+            .await;
+            assert!(
+                matches!(answered, Ok(Ok(_))),
+                "a full inbound queue starved the RPC reader: {answered:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The same starvation seen from the send path, where it costs more:
+        /// an RPC that times out is not a failed send, it is a send nobody can
+        /// classify, and it lands in reconciliation instead of being delivered.
+        #[tokio::test]
+        async fn a_full_inbound_queue_never_makes_a_send_ambiguous() {
+            let (adapter, path) = saturated_adapter("saturated-send");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(15),
+                adapter.send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "under load".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-saturated".to_string(),
+                }),
+            )
+            .await
+            .expect("the helper answered, so the send must not have hung");
+            match outcome {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => assert_eq!(provider_message_id.as_deref(), Some("1700000000001")),
+                other => panic!("inbound load must not make a send ambiguous: {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Dropping under load is the deliberate trade; dropping *silently* is
+        /// not.
+        #[tokio::test]
+        async fn inbound_the_queue_could_not_take_is_counted() {
+            let (adapter, path) = saturated_adapter("saturated-count");
+            // The response arrives behind the whole burst, so by the time this
+            // returns every line the queue refused has already been counted.
+            adapter.probe().await;
+            assert!(
+                adapter.shared.dropped_inbound.load(Ordering::Relaxed) > 0,
+                "the queue overran and nothing recorded it"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// And the count has to reach the operator, because the messages did
+        /// not reach the agent.
+        #[tokio::test]
+        async fn a_queue_that_overran_reports_degraded_with_the_count() {
+            let (adapter, path) = saturated_adapter("saturated-health");
+            let health = adapter.probe().await;
+            assert_eq!(
+                health.state,
+                HealthState::Degraded,
+                "messages were lost; this is not a clean connection"
+            );
+            let dropped = adapter.shared.dropped_inbound.load(Ordering::Relaxed);
+            let detail = health.detail.expect("detail");
+            assert!(detail.contains("dropped"), "{detail}");
+            assert!(detail.contains(&dropped.to_string()), "{detail}");
+            // A health string is read by whoever can see the account. Not the
+            // number, not a word anybody sent, not where the helper lives.
+            assert!(!detail.contains("+1555"), "{detail}");
+            assert!(!detail.contains("burst"), "{detail}");
+            assert!(
+                !detail.contains(&path.to_string_lossy().to_string()),
+                "{detail}"
+            );
             let _ = std::fs::remove_file(&path);
         }
 
