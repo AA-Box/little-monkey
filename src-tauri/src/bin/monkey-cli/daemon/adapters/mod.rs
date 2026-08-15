@@ -10,8 +10,6 @@
 pub(crate) mod discord;
 pub(crate) mod google_chat;
 pub(crate) mod imessage;
-#[cfg(target_os = "macos")]
-pub(crate) mod imessage_native;
 pub(crate) mod irc;
 pub(crate) mod jwt;
 pub(crate) mod line;
@@ -127,6 +125,11 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("nick", ConfigFieldKind::Text),
         optional("channels", ConfigFieldKind::TextList),
         optional("use_sasl", ConfigFieldKind::Boolean),
+        // The SASL *account*, which is not always the nick — a collision
+        // changes the nick and must not change who we authenticate as.
+        // Defaults to `nick`, so an account configured before this key existed
+        // behaves exactly as it did.
+        optional("sasl_username", ConfigFieldKind::Text),
     ];
     const MATRIX: &[ConfigField] = &[
         required("homeserver_url", ConfigFieldKind::Text),
@@ -136,11 +139,13 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("helper_path", ConfigFieldKind::Text),
         required("account", ConfigFieldKind::Text),
     ];
+    // The helper path is required now: the daemon holds no Full Disk Access
+    // and sends no Apple events, so an account with no helper has nothing to
+    // talk to. `db_path`/`osascript_path` moved with that code — they are the
+    // helper's own command-line overrides, not account configuration.
     const IMESSAGE: &[ConfigField] = &[
         required("handle", ConfigFieldKind::Text),
-        optional("helper_path", ConfigFieldKind::Text),
-        optional("db_path", ConfigFieldKind::Text),
-        optional("osascript_path", ConfigFieldKind::Text),
+        required("helper_path", ConfigFieldKind::Text),
     ];
     const WHATSAPP: &[ConfigField] = &[required("phone_number_id", ConfigFieldKind::Text)];
     const TEAMS: &[ConfigField] = &[

@@ -16,6 +16,19 @@ default-run = "little-monkey"
 name = "little_monkey_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The macOS iMessage helper. A separate process on purpose: Full Disk Access
+# and Automation for Messages.app are permissions the *daemon* must never hold,
+# so the code that needs them lives here and talks JSON-RPC over its own stdio.
+# The operator installs and points an account at it; nothing downloads or
+# launches it behind their back.
+#
+# Declared explicitly rather than discovered under `src/bin/` so the name the
+# operator types matches the product. It compiles on every platform and refuses
+# to run anywhere but macOS — see its `main`.
+[[bin]]
+name = "little-monkey-imessage-helper"
+path = "src/imessage_helper/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 sha2 = "0.10.9"

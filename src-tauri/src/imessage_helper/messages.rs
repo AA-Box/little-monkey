@@ -1,9 +1,11 @@
-//! The real macOS iMessage backend: read the Messages database, send
-//! through Messages.app.
+//! The helper's macOS integration: read the Messages database, send through
+//! Messages.app, hand back attachment bytes.
 //!
-//! `imessage.rs` can drive either a user-installed helper process or this
-//! module. This one is what runs when no helper is configured, and it is the
-//! only path that needs nothing installed beyond macOS itself.
+//! This is the *only* code in the tree that touches Messages, and it runs in
+//! the helper process the operator installs and grants permissions to — never
+//! in the daemon. The daemon speaks JSON-RPC to `main.rs` and receives plain
+//! records; it holds no Full Disk Access, opens no `chat.db`, and sends no
+//! Apple events.
 //!
 //! # Inbound: `~/Library/Messages/chat.db`
 //!
@@ -41,11 +43,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use little_monkey_lib::channels::types::{
-    AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
-    ChannelKind, ChannelSender,
-};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 
 /// Seconds between the Unix epoch and Apple's (2001-01-01T00:00:00Z).
 const APPLE_EPOCH_OFFSET_SECONDS: i64 = 978_307_200;
@@ -85,28 +84,39 @@ end run
 /// still this module's own constant, and the runner is still invoked as an
 /// argument vector.
 #[derive(Debug, Clone)]
-pub(crate) struct NativeConfig {
+pub struct MessagesConfig {
     pub db_path: PathBuf,
     pub osascript_path: PathBuf,
 }
 
-impl NativeConfig {
-    /// The stock locations, plus whatever the account overrode.
-    pub fn resolve(non_secret_config: &serde_json::Value) -> Self {
-        let db_path = non_secret_config
-            .get("db_path")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(default_db_path);
-        let osascript_path = non_secret_config
-            .get("osascript_path")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/usr/bin/osascript"));
+impl Default for MessagesConfig {
+    fn default() -> Self {
         Self {
-            db_path,
-            osascript_path,
+            db_path: default_db_path(),
+            osascript_path: PathBuf::from("/usr/bin/osascript"),
         }
+    }
+}
+
+impl MessagesConfig {
+    /// The stock locations, plus whatever the command line overrode.
+    ///
+    /// Both overrides exist so this helper can be exercised against a database
+    /// a test built and a script runner that records its argv. Neither is a way
+    /// to run an arbitrary command with arbitrary text: the AppleScript is
+    /// still this module's own constant and is still invoked as an argument
+    /// vector.
+    pub fn from_args(args: &[String]) -> Self {
+        let mut config = Self::default();
+        let mut pairs = args.windows(2);
+        while let Some([flag, value]) = pairs.next() {
+            match flag.as_str() {
+                "--db-path" => config.db_path = PathBuf::from(value),
+                "--osascript-path" => config.osascript_path = PathBuf::from(value),
+                _ => {}
+            }
+        }
+        config
     }
 }
 
@@ -116,9 +126,52 @@ fn default_db_path() -> PathBuf {
 }
 
 /// One inbound batch plus the ROWID to resume from.
-pub(crate) struct NativeBatch {
-    pub envelopes: Vec<ChannelEnvelope>,
+///
+/// The records are deliberately plain data, not `ChannelEnvelope`s: normalizing
+/// into the common envelope is the daemon's job, and the helper's contract is a
+/// stable JSON shape rather than an internal Rust type.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Batch {
+    pub messages: Vec<MessageRecord>,
     pub cursor: i64,
+}
+
+/// One message as the helper reports it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRecord {
+    /// Messages' own stable identifier, and the daemon's dedupe key.
+    pub guid: String,
+    /// The row this came from, which is what the cursor advances over.
+    pub rowid: i64,
+    pub sender: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    pub is_group: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub text: String,
+    /// Unix milliseconds.
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_guid: Option<String>,
+    pub attachments: Vec<AttachmentRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRecord {
+    /// The path Messages stored it at, which is also the handle the daemon
+    /// passes back to `fetchAttachment`. The bytes never leave this process
+    /// except through that call.
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// Open the database read-only.
@@ -161,7 +214,7 @@ fn describe_open_failure(db_path: &Path, error: &rusqlite::Error) -> String {
 /// The largest `message.ROWID` that exists right now.
 ///
 /// This is what the first poll records instead of returning history.
-pub(crate) fn latest_rowid(config: &NativeConfig) -> Result<i64, String> {
+pub fn latest_rowid(config: &MessagesConfig) -> Result<i64, String> {
     let connection = open_read_only(&config.db_path)?;
     connection
         .query_row("SELECT IFNULL(MAX(ROWID), 0) FROM message", [], |row| {
@@ -175,7 +228,7 @@ pub(crate) fn latest_rowid(config: &NativeConfig) -> Result<i64, String> {
 /// Returns the number of known handles, which is a cheap, non-sensitive way
 /// of saying "this is a real, populated Messages database" without reading a
 /// single message.
-pub(crate) fn probe(config: &NativeConfig) -> Result<u64, String> {
+pub fn probe(config: &MessagesConfig) -> Result<u64, String> {
     let connection = open_read_only(&config.db_path)?;
     connection
         .query_row("SELECT COUNT(*) FROM handle", [], |row| {
@@ -190,7 +243,7 @@ pub(crate) fn probe(config: &NativeConfig) -> Result<u64, String> {
 /// Messages this account sent (`is_from_me = 1`) are skipped: an agent
 /// answering its own outbound message is a loop, and the gate downstream
 /// should never have to be the thing that catches it.
-pub(crate) fn poll_since(config: &NativeConfig, cursor: i64) -> Result<NativeBatch, String> {
+pub fn poll_since(config: &MessagesConfig, cursor: i64) -> Result<Batch, String> {
     let connection = open_read_only(&config.db_path)?;
     let mut statement = connection
         .prepare(
@@ -206,7 +259,7 @@ pub(crate) fn poll_since(config: &NativeConfig, cursor: i64) -> Result<NativeBat
         .map_err(|error| format!("Cannot read the Messages database: {error}"))?;
 
     let mut highest = cursor;
-    let mut envelopes = Vec::new();
+    let mut messages = Vec::new();
     let rows = statement
         .query_map(rusqlite::params![cursor, MAX_ROWS_PER_POLL as i64], |row| {
             Ok(MessageRow {
@@ -228,13 +281,13 @@ pub(crate) fn poll_since(config: &NativeConfig, cursor: i64) -> Result<NativeBat
         let row = row.map_err(|error| format!("Cannot read a Messages row: {error}"))?;
         highest = highest.max(row.rowid);
         let attachments = read_attachments(&connection, row.rowid)?;
-        if let Some(envelope) = normalize(row, attachments) {
-            envelopes.push(envelope);
+        if let Some(record) = to_record(row, attachments) {
+            messages.push(record);
         }
     }
 
-    Ok(NativeBatch {
-        envelopes,
+    Ok(Batch {
+        messages,
         cursor: highest,
     })
 }
@@ -260,7 +313,7 @@ struct MessageRow {
 fn read_attachments(
     connection: &Connection,
     message_rowid: i64,
-) -> Result<Vec<ChannelAttachment>, String> {
+) -> Result<Vec<AttachmentRecord>, String> {
     let mut statement = connection
         .prepare(
             "SELECT a.filename, a.mime_type, a.transfer_name, a.total_bytes \
@@ -285,31 +338,20 @@ fn read_attachments(
         let (filename, mime_type, transfer_name, total_bytes) =
             row.map_err(|error| format!("Cannot read a Messages attachment: {error}"))?;
         let Some(path) = filename else { continue };
-        let kind = mime_type
-            .as_deref()
-            .map(AttachmentKind::from_mime)
-            .unwrap_or(AttachmentKind::Other);
-        attachments.push(ChannelAttachment {
-            provider_id: None,
-            kind,
-            filename: transfer_name,
+        attachments.push(AttachmentRecord {
+            path,
             mime_type,
-            declared_size_bytes: total_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
-            source: AttachmentSource::ProviderHandle { handle: path },
-            // Filled by ingest once the bytes are actually fetched; nothing has
-            // been read yet at the point this row is turned into an envelope.
-            stored_artifact_id: None,
-            fetch_error: None,
-            text_excerpt: None,
+            filename: transfer_name,
+            size: total_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
         });
     }
     Ok(attachments)
 }
 
-/// One database row as a normalized envelope, or `None` when there is
-/// nothing to deliver (no text, no attachments, or no sender to attribute it
-/// to — a row with a NULL handle is Messages' own bookkeeping, not a turn).
-fn normalize(row: MessageRow, attachments: Vec<ChannelAttachment>) -> Option<ChannelEnvelope> {
+/// One database row as a reportable record, or `None` when there is nothing to
+/// deliver (no text, no attachments, or no sender to attribute it to — a row
+/// with a NULL handle is Messages' own bookkeeping, not a turn).
+fn to_record(row: MessageRow, attachments: Vec<AttachmentRecord>) -> Option<MessageRecord> {
     let sender_id = row.handle?;
     let text = row
         .text
@@ -320,43 +362,57 @@ fn normalize(row: MessageRow, attachments: Vec<ChannelAttachment>) -> Option<Cha
         return None;
     }
 
-    let is_group = row.chat_style == Some(CHAT_STYLE_GROUP);
-    let conversation = match (&row.chat_identifier, is_group) {
-        (Some(chat_id), true) => ChannelConversation::group(chat_id.clone()),
-        _ => ChannelConversation::direct(sender_id.clone()),
-    };
-
-    // `guid` is Messages' own stable identifier and is what dedupe wants.
-    // The ROWID fallback is deterministic too — a row keeps its ROWID — and
-    // is never random.
-    let provider_event_id = row
+    // `guid` is Messages' own stable identifier and is what dedupe wants. The
+    // ROWID fallback is deterministic too — a row keeps its ROWID — and is
+    // never random.
+    let guid = row
         .guid
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("rowid:{}", row.rowid));
 
-    Some(ChannelEnvelope {
-        account_id: String::new(),
-        kind: ChannelKind::IMessage,
-        provider_event_id,
-        conversation,
-        sender: ChannelSender {
-            sender_id,
-            display_label: row.display_name.filter(|value| !value.is_empty()),
-            is_self: false,
-            is_bot: false,
-        },
+    Some(MessageRecord {
+        guid,
+        rowid: row.rowid,
+        sender: sender_id,
+        chat_id: row.chat_identifier,
+        is_group: row.chat_style == Some(CHAT_STYLE_GROUP),
+        display_name: row.display_name.filter(|value| !value.is_empty()),
         text,
-        attachments,
+        timestamp: apple_date_to_unix_ms(row.date),
         // Messages records a real reply as the originating message's GUID,
-        // which is the same identifier space `provider_event_id` uses.
-        reply_to_provider_id: row.thread_originator_guid.filter(|value| !value.is_empty()),
-        // Messages has no mention metadata of its own. Group activation
-        // falls back to the gate's own text matching rather than claiming a
-        // signal that does not exist.
-        mentions_self: false,
-        received_at_ms: apple_date_to_unix_ms(row.date),
-        metadata: little_monkey_lib::channels::types::BoundedMetadata::new(),
+        // which is the same identifier space `guid` uses.
+        reply_to_guid: row.thread_originator_guid.filter(|value| !value.is_empty()),
+        attachments,
     })
+}
+
+/// Read one attachment's bytes off this machine.
+///
+/// The path comes back from `poll` and is therefore one Messages itself
+/// recorded; `~` is expanded because that is how the database stores it. The
+/// cap is applied to the directory entry first, so an oversized file costs a
+/// `stat` rather than its own size.
+pub fn read_attachment(path: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let expanded = expand_tilde(path);
+    let metadata = std::fs::metadata(&expanded)
+        .map_err(|error| format!("That attachment is no longer readable: {error}"))?;
+    if !metadata.is_file() {
+        return Err("That iMessage attachment is not a file".to_string());
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "The attachment is larger than the {max_bytes}-byte limit"
+        ));
+    }
+    std::fs::read(&expanded).map_err(|error| format!("That attachment could not be read: {error}"))
+}
+
+/// `~/Library/...` as Messages writes it, resolved against this user's home.
+fn expand_tilde(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(path),
+    }
 }
 
 /// Apple's `message.date` as Unix milliseconds.
@@ -435,7 +491,7 @@ fn typedstream_text(blob: &[u8]) -> Option<String> {
 }
 
 /// What happened to one send attempt.
-pub(crate) enum NativeSend {
+pub enum SendResult {
     Sent,
     /// Messages refused it outright — a handle it cannot reach, no signed-in
     /// account, Automation permission not granted.
@@ -450,14 +506,9 @@ pub(crate) enum NativeSend {
 /// `target` is a handle (phone number or Apple ID) for a direct message, or
 /// a chat GUID for a group. The text is passed as an argument and is never
 /// part of the script.
-pub(crate) async fn send(
-    config: &NativeConfig,
-    target: &str,
-    text: &str,
-    is_group: bool,
-) -> NativeSend {
+pub async fn send(config: &MessagesConfig, target: &str, text: &str, is_group: bool) -> SendResult {
     if !config.osascript_path.exists() {
-        return NativeSend::Refused(format!(
+        return SendResult::Refused(format!(
             "{} does not exist; iMessage sending needs macOS's own osascript",
             config.osascript_path.display()
         ));
@@ -474,12 +525,12 @@ pub(crate) async fn send(
 
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => return NativeSend::Refused(format!("Could not run osascript: {error}")),
+        Err(error) => return SendResult::Refused(format!("Could not run osascript: {error}")),
     };
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
         if let Err(error) = stdin.write_all(SEND_SCRIPT.as_bytes()).await {
-            return NativeSend::Ambiguous(format!(
+            return SendResult::Ambiguous(format!(
                 "Could not hand the script to osascript: {error}"
             ));
         }
@@ -487,18 +538,18 @@ pub(crate) async fn send(
     }
 
     match tokio::time::timeout(SEND_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) if output.status.success() => NativeSend::Sent,
+        Ok(Ok(output)) if output.status.success() => SendResult::Sent,
         Ok(Ok(output)) => {
             let detail = String::from_utf8_lossy(&output.stderr);
-            NativeSend::Refused(format!(
+            SendResult::Refused(format!(
                 "Messages refused the send: {}",
                 first_line(detail.trim())
             ))
         }
         Ok(Err(error)) => {
-            NativeSend::Ambiguous(format!("osascript could not be waited on: {error}"))
+            SendResult::Ambiguous(format!("osascript could not be waited on: {error}"))
         }
-        Err(_) => NativeSend::Ambiguous(
+        Err(_) => SendResult::Ambiguous(
             "Messages did not answer in time; the message may or may not have been sent"
                 .to_string(),
         ),
@@ -558,8 +609,8 @@ mod tests {
         (path, connection)
     }
 
-    fn config_for(path: &Path) -> NativeConfig {
-        NativeConfig {
+    fn config_for(path: &Path) -> MessagesConfig {
+        MessagesConfig {
             db_path: path.to_path_buf(),
             osascript_path: PathBuf::from("/usr/bin/osascript"),
         }
@@ -586,18 +637,18 @@ mod tests {
             .unwrap();
 
         let batch = poll_since(&config_for(&path), 0).expect("poll");
-        assert_eq!(batch.envelopes.len(), 1);
-        let envelope = &batch.envelopes[0];
-        assert_eq!(envelope.provider_event_id, "GUID-1");
-        assert_eq!(envelope.text, "hello there");
-        assert_eq!(envelope.sender.sender_id, "+15551230001");
-        assert_eq!(envelope.conversation.conversation_id, "+15551230001");
+        assert_eq!(batch.messages.len(), 1);
+        let record = &batch.messages[0];
+        assert_eq!(record.guid, "GUID-1");
+        assert_eq!(record.text, "hello there");
+        assert_eq!(record.sender, "+15551230001");
         assert_eq!(
-            envelope.conversation.kind,
-            little_monkey_lib::channels::types::ConversationKind::Direct
+            record.chat_id.as_deref().unwrap_or_default(),
+            "+15551230001"
         );
+        assert!(!record.is_group);
         // 2024-01-01T00:00:00Z
-        assert_eq!(envelope.received_at_ms, 1_704_067_200_000);
+        assert_eq!(record.timestamp, 1_704_067_200_000);
         assert_eq!(batch.cursor, 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -620,13 +671,10 @@ mod tests {
             .unwrap();
 
         let batch = poll_since(&config_for(&path), 0).expect("poll");
-        let envelope = &batch.envelopes[0];
-        assert_eq!(envelope.conversation.conversation_id, "chat9001");
-        assert_eq!(
-            envelope.conversation.kind,
-            little_monkey_lib::channels::types::ConversationKind::Group
-        );
-        assert_eq!(envelope.sender.sender_id, "ada@example.com");
+        let record = &batch.messages[0];
+        assert_eq!(record.chat_id.as_deref().unwrap_or_default(), "chat9001");
+        assert!(record.is_group);
+        assert_eq!(record.sender, "ada@example.com");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -643,7 +691,7 @@ mod tests {
 
         let batch = poll_since(&config_for(&path), 0).expect("poll");
         assert!(
-            batch.envelopes.is_empty(),
+            batch.messages.is_empty(),
             "an echo of our own send is a loop"
         );
         let _ = std::fs::remove_file(&path);
@@ -664,10 +712,10 @@ mod tests {
 
         let config = config_for(&path);
         let first = poll_since(&config, 0).expect("poll");
-        assert_eq!(first.envelopes.len(), 3);
+        assert_eq!(first.messages.len(), 3);
         assert_eq!(first.cursor, 3);
         let second = poll_since(&config, first.cursor).expect("poll");
-        assert!(second.envelopes.is_empty());
+        assert!(second.messages.is_empty());
         assert_eq!(second.cursor, 3);
         let _ = std::fs::remove_file(&path);
     }
@@ -698,19 +746,14 @@ mod tests {
 
         let batch = poll_since(&config_for(&path), 0).expect("poll");
         assert_eq!(
-            batch.envelopes.len(),
+            batch.messages.len(),
             1,
             "an attachment alone is still a turn"
         );
-        let attachment = &batch.envelopes[0].attachments[0];
-        assert_eq!(attachment.kind, AttachmentKind::Image);
-        assert_eq!(attachment.declared_size_bytes, Some(4096));
-        match &attachment.source {
-            AttachmentSource::ProviderHandle { handle } => {
-                assert!(handle.ends_with("photo.png"));
-            }
-            other => panic!("expected a provider handle, got {other:?}"),
-        }
+        let attachment = &batch.messages[0].attachments[0];
+        assert_eq!(attachment.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(attachment.size, Some(4096));
+        assert!(attachment.path.ends_with("photo.png"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -733,7 +776,7 @@ mod tests {
             .unwrap();
 
         let batch = poll_since(&config_for(&path), 0).expect("poll");
-        assert_eq!(batch.envelopes[0].text, body);
+        assert_eq!(batch.messages[0].text, body);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -788,14 +831,14 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let config = NativeConfig {
+        let config = MessagesConfig {
             db_path: std::env::temp_dir().join("unused.db"),
             osascript_path: fake.clone(),
         };
         let hostile = "\"; tell application \\\"Finder\\\" to empty trash --";
         assert!(matches!(
             send(&config, "+15551230001", hostile, false).await,
-            NativeSend::Sent
+            SendResult::Sent
         ));
 
         let argv = std::fs::read_to_string(&recorded).unwrap();
@@ -820,12 +863,12 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let config = NativeConfig {
+        let config = MessagesConfig {
             db_path: std::env::temp_dir().join("unused.db"),
             osascript_path: fake.clone(),
         };
         match send(&config, "+15551230001", "hi", false).await {
-            NativeSend::Refused(detail) => assert!(detail.contains("-1743"), "{detail}"),
+            SendResult::Refused(detail) => assert!(detail.contains("-1743"), "{detail}"),
             _ => panic!("a refusal must not read as sent or ambiguous"),
         }
         let _ = std::fs::remove_file(&fake);
@@ -833,12 +876,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_osascript_refuses_without_spawning_anything() {
-        let config = NativeConfig {
+        let config = MessagesConfig {
             db_path: std::env::temp_dir().join("unused.db"),
             osascript_path: std::env::temp_dir().join("definitely-not-osascript"),
         };
         match send(&config, "+1555", "hi", false).await {
-            NativeSend::Refused(detail) => assert!(detail.contains("osascript"), "{detail}"),
+            SendResult::Refused(detail) => assert!(detail.contains("osascript"), "{detail}"),
             _ => panic!("expected a refusal"),
         }
     }
