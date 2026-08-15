@@ -2111,9 +2111,10 @@ const DAEMON_V14_CHECKSUM: &str = "daemon-jobs-v14-channel-event-ingress-link";
 /// The backfill links every inbound accepted event that already has a turn, by
 /// the dedupe key that turn was stored under — `source:account:event_id`, the
 /// same three columns the event carries. What it deliberately cannot do is
-/// invent a turn for an event that never got one: those rows stay NULL and are
-/// picked up by the orphan sweep at daemon start, which re-decides them from
-/// the envelope they still carry rather than pretending they completed.
+/// invent a turn for an event that never got one: those rows stay NULL, which
+/// is the same shape a message a webhook provider has been acknowledged for
+/// rests in, and the channel worker decides them again from the envelope they
+/// still carry rather than pretending they completed.
 const DAEMON_V14_SQL: &str = r#"
 ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
 
