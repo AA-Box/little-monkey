@@ -51,7 +51,14 @@ use little_monkey_lib::channels::types::{
 };
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
+#[cfg(not(test))]
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+/// The same budget, widened for tests. The fake helper is a `/bin/sh` script
+/// competing with the rest of the suite for the machine, and no test asserts
+/// that this deadline *fires* — a shorter one here only ever produces a
+/// timeout that means "the box was busy".
+#[cfg(test)]
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait before spawning the helper again after the first failure.
 ///
 /// A helper that dies on startup (unregistered account, broken install) would
@@ -1150,8 +1157,12 @@ done
             .expect("adapter");
             // Kill the helper, then send inside the restart cooldown: the
             // request is never written, so nothing can have happened and the
-            // message must stay queued rather than be dropped.
+            // message must stay queued rather than be dropped. The attempt
+            // stamp is reset so the window starts now — otherwise a slow run
+            // spends the whole cooldown before the send and gets a fresh
+            // helper instead of the refusal being tested.
             let _ = adapter.call("crash", json!({})).await;
+            *adapter.last_start.lock().await = Some(Instant::now());
             let outcome = adapter
                 .send(&OutboundMessage {
                     account_id: "acct-1".to_string(),

@@ -52,7 +52,14 @@ mod macos {
         ProviderCapabilities, SendOutcome,
     };
 
+    #[cfg(not(test))]
     const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+    /// The same budget, widened for tests. The fake helper is a `/bin/sh`
+    /// script competing with the rest of the suite for the machine, and no test
+    /// asserts that this deadline *fires* — a shorter one here only ever
+    /// produces a timeout that means "the box was busy".
+    #[cfg(test)]
+    const RPC_TIMEOUT: Duration = Duration::from_secs(60);
     /// How long to wait before the first restart after the helper exits.
     const INITIAL_RESTART_COOLDOWN: Duration = Duration::from_secs(5);
     /// The ceiling that cooldown backs off to. A helper that has been failing
@@ -1164,8 +1171,12 @@ done
                 let path = write_fake_helper("not-sent");
                 let adapter = adapter(&path);
                 // Kill the helper, then send inside the restart cooldown. The
-                // request is never written, so the reply must stay queued.
+                // request is never written, so the reply must stay queued. The
+                // attempt stamp is reset so the window starts now — otherwise a
+                // slow run spends the whole cooldown before the send and gets a
+                // fresh helper instead of the refusal being tested.
                 let _ = adapter.call("crash", json!({})).await;
+                *adapter.last_start.lock().await = Some(Instant::now());
                 let outcome = adapter
                     .send(&OutboundMessage {
                         account_id: "acct-1".to_string(),
