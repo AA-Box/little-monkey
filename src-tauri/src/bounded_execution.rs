@@ -426,4 +426,92 @@ mod tests {
 
         execution.exited(ProcessExit::succeeded(), None);
     }
+
+    /// A backend that measures nothing must leave a gap, not record a zero.
+    ///
+    /// The peak fold is where this is easy to get wrong: `MAX(peak, 0)` against
+    /// an unmeasured reading writes `0`, which reads as "this tree held nothing"
+    /// rather than "nobody looked" — and a reader cannot tell those apart after
+    /// the fact.
+    #[test]
+    fn an_unmeasured_sample_leaves_a_gap_rather_than_recording_a_zero() {
+        let projector = fake();
+        let mut execution = BoundedExecution::admit(
+            projector.clone(),
+            ProcessKind::VerifyCommand,
+            None,
+            ProcessKind::VerifyCommand.default_limits(),
+        );
+        let external_id = execution.external_id().to_string();
+        execution.identity = crate::process_tree::ProcessIdentity::of(std::process::id());
+        let projection = execution.projection(ProcessState::Running, None, None);
+        execution.project(projection);
+
+        // Wall time only, which is what a host that can measure nothing else
+        // honestly reports.
+        execution.sampled(&ResourceSample {
+            wall_ms: 10,
+            rss_bytes: None,
+            peak_rss_bytes: None,
+            process_count: None,
+            peak_process_count: None,
+            output_bytes: None,
+        });
+
+        let live = row(&projector, &external_id);
+        let usage = live
+            .usage
+            .expect("the row was sampled, so it has a reading");
+        assert_eq!(usage.rss_bytes, None);
+        assert_eq!(
+            usage.peak_rss_bytes, None,
+            "an unmeasured peak became a zero"
+        );
+        assert_eq!(usage.process_count, None);
+        assert_eq!(usage.peak_process_count, None);
+        assert_eq!(usage.output_bytes, None);
+        // The stamp is still there: "measured, and there was nothing to report"
+        // is what separates this from "never measured at all".
+        assert!(live.usage_sampled_at_ms.is_some());
+
+        execution.exited(ProcessExit::succeeded(), None);
+    }
+
+    /// A peak already on the row survives a later sample that cannot measure.
+    #[test]
+    fn an_unmeasured_sample_never_lowers_a_peak_the_row_already_holds() {
+        let projector = fake();
+        let mut execution = BoundedExecution::admit(
+            projector.clone(),
+            ProcessKind::VerifyCommand,
+            None,
+            ProcessKind::VerifyCommand.default_limits(),
+        );
+        let external_id = execution.external_id().to_string();
+        execution.identity = crate::process_tree::ProcessIdentity::of(std::process::id());
+        let projection = execution.projection(ProcessState::Running, None, None);
+        execution.project(projection);
+
+        execution.sampled(&ResourceSample {
+            wall_ms: 10,
+            rss_bytes: Some(9_000),
+            peak_rss_bytes: Some(9_000),
+            process_count: Some(7),
+            peak_process_count: Some(7),
+            output_bytes: Some(5),
+        });
+        execution.sampled(&ResourceSample {
+            wall_ms: 20,
+            ..ResourceSample::default()
+        });
+
+        let live = row(&projector, &external_id);
+        let usage = live.usage.expect("the row was sampled");
+        assert_eq!(usage.peak_rss_bytes, Some(9_000));
+        assert_eq!(usage.peak_process_count, Some(7));
+        // And the retained-output count, which is cumulative rather than a peak.
+        assert_eq!(usage.output_bytes, Some(5));
+
+        execution.exited(ProcessExit::succeeded(), None);
+    }
 }

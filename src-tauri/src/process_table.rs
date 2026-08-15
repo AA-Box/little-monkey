@@ -3087,12 +3087,23 @@ impl<'a> ProcessTable<'a> {
         now_ms: i64,
     ) -> ProcessTableResult<()> {
         let updated = self.connection.execute(
+            // Each peak is folded only when the new sample *has* one. A bare
+            // `MAX(COALESCE(peak, 0), COALESCE(?, 0))` turns an unmeasured
+            // reading into a recorded zero — a backend that measures nothing
+            // would write `peak = 0`, which reads as "this tree held nothing"
+            // rather than "nobody looked", and those are the two things this
+            // whole surface exists to keep apart.
             "UPDATE agent_processes
                 SET tree_rss_bytes = ?2,
-                    tree_peak_rss_bytes = MAX(COALESCE(tree_peak_rss_bytes, 0), COALESCE(?3, 0)),
+                    tree_peak_rss_bytes = CASE
+                        WHEN ?3 IS NULL THEN tree_peak_rss_bytes
+                        ELSE MAX(COALESCE(tree_peak_rss_bytes, 0), ?3)
+                    END,
                     tree_process_count = ?4,
-                    tree_peak_process_count =
-                        MAX(COALESCE(tree_peak_process_count, 0), COALESCE(?5, 0)),
+                    tree_peak_process_count = CASE
+                        WHEN ?5 IS NULL THEN tree_peak_process_count
+                        ELSE MAX(COALESCE(tree_peak_process_count, 0), ?5)
+                    END,
                     tree_output_bytes = COALESCE(?6, tree_output_bytes),
                     tree_sampled_at_ms = ?7,
                     updated_at_ms = ?7
