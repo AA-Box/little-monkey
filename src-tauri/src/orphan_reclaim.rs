@@ -375,6 +375,10 @@ mod tests {
     #[test]
     fn a_scope_this_app_could_not_have_written_never_parses() {
         for hostile in [
+            // The mount point itself, and a sibling directory whose name merely
+            // starts the same way — the reason the prefix carries its separator.
+            "cgroup2:/sys/fs/cgroup",
+            "cgroup2:/sys/fs/cgrouped/little-monkey-x",
             "cgroup2:/sys/fs/cgroup/system.slice",
             "cgroup2:/sys/fs/cgroup/../../etc/little-monkey-x",
             "cgroup2:/etc/little-monkey-x",

@@ -436,22 +436,36 @@ fn elapsed_ms(record: &ProcessRecord) -> Option<i64> {
     }
 }
 
-fn print_detail(record: &ProcessRecord) {
-    println!("process      {}", record.process_id);
-    println!("kind         {}", record.kind.as_str());
-    println!("state        {}", record.state.as_str());
-    println!("external id  {}", record.external_id);
-    println!(
+/// The detail block, as text.
+///
+/// Built into a `String` rather than printed as it goes, so a test can assert
+/// what a reader is told. The part worth asserting is new: which mechanism
+/// actually held this process, and what it was measured holding — both read off
+/// the row rather than recomputed on the machine running the command.
+fn detail_text(record: &ProcessRecord) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, $($arg)*);
+        }};
+    }
+
+    line!("process      {}", record.process_id);
+    line!("kind         {}", record.kind.as_str());
+    line!("state        {}", record.state.as_str());
+    line!("external id  {}", record.external_id);
+    line!(
         "parent       {}",
         record.parent_process_id.as_deref().unwrap_or("-")
     );
-    println!("run          {}", record.run_id.as_deref().unwrap_or("-"));
-    println!(
+    line!("run          {}", record.run_id.as_deref().unwrap_or("-"));
+    line!(
         "workspace    {}",
         record.workspace.as_deref().unwrap_or("-")
     );
-    println!("profile      {}", record.profile.as_deref().unwrap_or("-"));
-    println!(
+    line!("profile      {}", record.profile.as_deref().unwrap_or("-"));
+    line!(
         "native pid   {}",
         record
             .native_pid
@@ -459,13 +473,13 @@ fn print_detail(record: &ProcessRecord) {
             .unwrap_or_else(|| "-".to_string())
     );
     if record.limits.is_unbounded() {
-        println!("limits       none declared");
+        line!("limits       none declared");
     } else {
         // Each limit with the mechanism that holds it, because the number alone
         // does not say whether anything is holding it. A reader auditing what
         // this app promised needs "4 GiB · enforced · Windows job object", not
         // "4 GiB" — the second is true of a bound nobody reads too.
-        println!("limits");
+        line!("limits");
         for (limit, value) in [
             (ProcessLimitKind::Wall, record.limits.max_wall_ms),
             (ProcessLimitKind::Memory, record.limits.max_memory_bytes),
@@ -481,7 +495,7 @@ fn print_detail(record: &ProcessRecord) {
         ] {
             let Some(value) = value else { continue };
             let support = record.kind.limit_support(limit);
-            println!(
+            line!(
                 "  {:<20} {:<16} {:<14} {}",
                 limit.as_str(),
                 value,
@@ -509,7 +523,7 @@ fn print_detail(record: &ProcessRecord) {
                         reason,
                     } => ("unavailable", reason.as_str()),
                 };
-                println!("  {:<20} {:<16} {:<14} {}", "", "held by", level, detail);
+                line!("  {:<20} {:<16} {:<14} {}", "", "held by", level, detail);
             }
         }
     }
@@ -518,42 +532,53 @@ fn print_detail(record: &ProcessRecord) {
     // recorded, which is reported as the gap it is rather than filled in.
     match &record.containment {
         Some(containment) => {
-            println!("backend      {}", containment.backend);
-            println!("tree         {}", containment.tree_primitive);
-            println!(
+            line!("backend      {}", containment.backend);
+            line!("tree         {}", containment.tree_primitive);
+            line!(
                 "scope        {}",
                 containment.scope.as_deref().unwrap_or("-")
             );
         }
-        None => println!("backend      not recorded for this process"),
+        None => line!("backend      not recorded for this process"),
     }
     // What it was last measured holding. Current and peak both, because a process
     // now sitting idle is exactly the case where only the peak says whether a
     // limit was nearly hit.
     match &record.usage {
         Some(usage) => {
-            let show = |name: &str, current: Option<u64>, peak: Option<u64>| {
-                let render = |value: Option<u64>| {
-                    value
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "not measured".to_string())
-                };
-                println!(
+            let render = |value: Option<u64>| {
+                value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
+            };
+            line!("usage");
+            for (name, current, peak) in [
+                ("rss_bytes", usage.rss_bytes, usage.peak_rss_bytes),
+                (
+                    "process_count",
+                    usage.process_count.map(u64::from),
+                    usage.peak_process_count.map(u64::from),
+                ),
+            ] {
+                line!(
                     "  {:<20} current={:<16} peak={}",
                     name,
                     render(current),
                     render(peak)
                 );
-            };
-            println!("usage");
-            show("rss_bytes", usage.rss_bytes, usage.peak_rss_bytes);
-            show(
-                "process_count",
-                usage.process_count.map(u64::from),
-                usage.peak_process_count.map(u64::from),
+            }
+            // One number: retained output has no separate high-water mark, and
+            // printing the same figure twice invites a reader to look for a
+            // difference that cannot exist.
+            line!(
+                "  {:<20} {}",
+                "output_bytes",
+                usage
+                    .output_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
             );
-            show("output_bytes", usage.output_bytes, usage.output_bytes);
-            println!(
+            line!(
                 "  {:<20} {}",
                 "wall_ms",
                 elapsed_ms(record)
@@ -561,11 +586,11 @@ fn print_detail(record: &ProcessRecord) {
                     .unwrap_or_else(|| "not measured".to_string())
             );
         }
-        None => println!("usage        nothing sampled this process"),
+        None => line!("usage        nothing sampled this process"),
     }
     match &record.exit {
         Some(exit) => {
-            println!(
+            line!(
                 "exit         {} code={} signal={} reason={}",
                 exit.status.as_str(),
                 exit.code
@@ -579,14 +604,19 @@ fn print_detail(record: &ProcessRecord) {
             // numbers beside each other are what tell a reader whether the budget
             // was wrong or the workload was.
             if let Some(breach) = &exit.breach {
-                println!("limit fired  {}", breach.limit);
-                println!("  configured {}", breach.configured);
-                println!("  observed   {}", breach.observed);
-                println!("  enforced by {} ({})", breach.backend, breach.level);
+                line!("limit fired  {}", breach.limit);
+                line!("  configured {}", breach.configured);
+                line!("  observed   {}", breach.observed);
+                line!("  enforced by {} ({})", breach.backend, breach.level);
             }
         }
-        None => println!("exit         -"),
+        None => line!("exit         -"),
     }
+    out
+}
+
+fn print_detail(record: &ProcessRecord) {
+    print!("{}", detail_text(record));
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -622,6 +652,127 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `monkey processes show` must tell a reader what actually held this
+    /// process, and what it was measured holding.
+    ///
+    /// Both come off the row. The mechanism used to be recomputed on whichever
+    /// machine ran the command, so a workload the Linux kernel had held printed
+    /// `supervisor` on a Mac — this test runs on all three platform legs and
+    /// asserts the row's own answer survives every one of them.
+    #[test]
+    fn processes_show_names_the_mechanism_that_held_this_process_and_what_it_held() {
+        use little_monkey_lib::process_table::{ProcessState, SignalIntent};
+        use little_monkey_lib::resource_control::{
+            Containment, EnforcementLevel, LimitCapability, RecordedUsage,
+        };
+
+        let record = ProcessRecord {
+            process_id: "fgsh-show".to_string(),
+            parent_process_id: None,
+            kind: ProcessKind::ForegroundShell,
+            external_id: "ext".to_string(),
+            state: ProcessState::Running,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: Some(4242),
+            native_start_time: Some(99),
+            limits: ProcessKind::ForegroundShell.default_limits(),
+            containment: Some(Containment {
+                backend: "cgroup v2".to_string(),
+                tree_primitive: "cgroup v2 scope at /sys/fs/cgroup/little-monkey-abc".to_string(),
+                scope: Some("cgroup2:/sys/fs/cgroup/little-monkey-abc".to_string()),
+                enforcement: [(
+                    ProcessLimitKind::Memory.as_str().to_string(),
+                    LimitCapability::Enforced {
+                        level: EnforcementLevel::Kernel,
+                        mechanism: "cgroup v2 `memory.max`".to_string(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            usage: Some(RecordedUsage {
+                rss_bytes: Some(2_000),
+                peak_rss_bytes: Some(6_000),
+                process_count: Some(3),
+                peak_process_count: Some(41),
+                output_bytes: Some(1_700),
+            }),
+            usage_sampled_at_ms: Some(1_800_000_000_000),
+            signal_intent: SignalIntent::default(),
+            signal_reason: None,
+            signal_requested_at_ms: None,
+            exit: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            exited_at_ms: None,
+        };
+
+        let text = detail_text(&record);
+        assert!(text.contains("backend      cgroup v2"), "{text}");
+        assert!(
+            text.contains("scope        cgroup2:/sys/fs/cgroup/little-monkey-abc"),
+            "{text}"
+        );
+        // The named mechanism, beside the limit it holds — a level alone would
+        // not tell a reader what to go and look at.
+        assert!(text.contains("cgroup v2 `memory.max`"), "{text}");
+        assert!(text.contains("held by"), "{text}");
+        // Current and peak, separately: a process now idle at 2 KB that peaked
+        // at 6 KB is the case where only the second number says anything.
+        assert!(text.contains("current=2000"), "{text}");
+        assert!(text.contains("peak=6000"), "{text}");
+        assert!(text.contains("current=3"), "{text}");
+        assert!(text.contains("peak=41"), "{text}");
+        // And a live process's wall time is answerable, which is the measurement
+        // that used to be reported as unavailable for not being final.
+        assert!(text.contains("wall_ms"), "{text}");
+    }
+
+    /// A row that recorded no mechanism says so, rather than being handed a
+    /// plausible one by whichever machine is reading it.
+    #[test]
+    fn processes_show_refuses_to_invent_a_mechanism_it_was_never_told() {
+        use little_monkey_lib::process_table::{ProcessState, SignalIntent};
+
+        let record = ProcessRecord {
+            process_id: "turn-show".to_string(),
+            parent_process_id: None,
+            kind: ProcessKind::ChatTurn,
+            external_id: "ext".to_string(),
+            state: ProcessState::Running,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: None,
+            native_start_time: None,
+            limits: ProcessKind::ChatTurn.default_limits(),
+            containment: None,
+            usage: None,
+            usage_sampled_at_ms: None,
+            signal_intent: SignalIntent::default(),
+            signal_reason: None,
+            signal_requested_at_ms: None,
+            exit: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            exited_at_ms: None,
+        };
+
+        let text = detail_text(&record);
+        assert!(
+            text.contains("backend      not recorded for this process"),
+            "{text}"
+        );
+        assert!(
+            text.contains("usage        nothing sampled this process"),
+            "{text}"
+        );
     }
 
     #[test]

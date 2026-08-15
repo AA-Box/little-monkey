@@ -151,6 +151,20 @@ function UsageLine({ report }: { report: ProcessLimitReport }) {
   }
   const value = (raw: number | undefined) =>
     raw === undefined ? t("ProcessesPanel.usageNotMeasured") : formatLimitValue(report.limit, raw);
+  // One number where the two are the same fact. Wall time and retained output
+  // have no separate high-water mark — a peak identical to the current reading
+  // is noise, and printing it twice invites a reader to look for a difference
+  // that cannot exist.
+  const separate = report.observedPeak !== undefined && report.observedPeak !== report.observed;
+  if (!separate) {
+    return (
+      <p className="mt-0.5 font-mono text-[11px] text-faint">
+        {t("ProcessesPanel.usageObserved", {
+          observed: value(report.observed ?? report.observedPeak),
+        })}
+      </p>
+    );
+  }
   return (
     <p className="mt-0.5 font-mono text-[11px] text-faint">
       {t("ProcessesPanel.usageCurrentAndPeak", {

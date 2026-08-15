@@ -450,7 +450,10 @@ pub enum ContainmentScope {
 const CGROUP_SCOPE_PREFIX: &str = "little-monkey-";
 
 /// Where cgroup2 is mounted. A stored path outside this is not ours.
-const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+///
+/// With its trailing separator, because the mount point itself is not a scope
+/// and `starts_with` on a bare prefix would also accept `/sys/fs/cgrouped`.
+const CGROUP_MOUNT_PREFIX: &str = "/sys/fs/cgroup/";
 
 impl ContainmentScope {
     /// The stored form. Schemed, so a reader can tell a cgroup path from a pid
@@ -486,21 +489,24 @@ impl ContainmentScope {
                 .filter(|pgid| *pgid > 1)
                 .map(ContainmentScope::ProcessGroup);
         }
-        let path = std::path::PathBuf::from(stored.strip_prefix("cgroup2:")?);
-        if !path.is_absolute() || !path.starts_with(CGROUP_MOUNT) {
+        let raw = stored.strip_prefix("cgroup2:")?;
+        // Parsed as the POSIX path it is, by string, rather than through
+        // `Path`. A stored cgroup path is a *Linux* path whatever host is
+        // reading the row, and `Path::is_absolute` answers `false` for
+        // `/sys/fs/cgroup/...` on Windows — which would have made every such row
+        // unparseable there instead of unreachable, and those are different
+        // findings.
+        if !raw.starts_with(CGROUP_MOUNT_PREFIX) {
             return None;
         }
-        if path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
+        if raw.split('/').any(|segment| segment == "..") {
             return None;
         }
-        let named_by_us = path
-            .file_name()
-            .and_then(|name| name.to_str())
+        let named_by_us = raw
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
             .is_some_and(|name| name.starts_with(CGROUP_SCOPE_PREFIX));
-        named_by_us.then_some(ContainmentScope::CgroupV2(path))
+        named_by_us.then(|| ContainmentScope::CgroupV2(std::path::PathBuf::from(raw)))
     }
 }
 
@@ -3001,10 +3007,18 @@ mod tests {
             }
             let pid_file = scratch("combined.pid");
             let flag = scratch("combined.go");
+            // The subshell waits for the same flag before exiting, so the
+            // grandchild is captured while its ancestry is still readable and
+            // only then loses the parent link *and* the session. Without the
+            // wait, the subshell is gone before the first sample and the test
+            // would fail for the opposite reason to the one it is about.
             let (mut controller, mut root) = supervised(&format!(
-                "( perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$;                  close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }}                  setsid(); sleep 60' {} {} & ) ; sleep 60",
-                pid_file.display(),
-                flag.display()
+                "( perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$; \
+                 close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }} \
+                 setsid(); sleep 60' {pid_file} {flag} & \
+                 while [ ! -e {flag} ]; do sleep 0.05; done ) ; sleep 60",
+                pid_file = pid_file.display(),
+                flag = flag.display()
             ));
 
             let escapee = wait_for_pid(&pid_file);

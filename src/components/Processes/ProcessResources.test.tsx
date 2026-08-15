@@ -233,12 +233,15 @@ describe("the resource view", () => {
     expect(screen.getByText("Now 3 MiB · peak 7 GiB")).toBeTruthy();
   });
 
-  it("marks a half-measured resource rather than printing a zero for the other half", () => {
+  it("prints one number where the current reading and the peak are the same fact", () => {
+    // Wall time and retained output have no separate high-water mark. Printing
+    // the same figure twice invites a reader to look for a difference that
+    // cannot exist.
     render(
       <ProcessResources report={report({ limits: [limit({ observed: 3 * 1024 * 1024 })] })} />,
     );
 
-    expect(screen.getByText("Now 3 MiB · peak not measured")).toBeTruthy();
+    expect(screen.getByText("Used: 3 MiB")).toBeTruthy();
   });
 
   it("says so when a process recorded no enforcement mechanism at all", () => {
