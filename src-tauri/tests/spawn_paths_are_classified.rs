@@ -295,6 +295,13 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
         Class::HostUtility,
         "`gh` review operations against a delivery this app created",
     ),
+    (
+        "imessage_helper/messages.rs",
+        Class::HostUtility,
+        "`osascript` with argv-passed values, never string interpolation — the recipient \
+         and the message text are arguments the script reads, so no text anyone sends can \
+         become AppleScript. Runs in the operator-installed helper, never in the daemon",
+    ),
 ];
 
 /// The `monkey-cli` binary's own spawn sites, classified on the same terms.
@@ -370,11 +377,6 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "daemon/adapters/imessage.rs",
         Class::HostUtility,
         "`osascript` with argv-passed values, never string interpolation",
-    ),
-    (
-        "daemon/adapters/imessage_native.rs",
-        Class::HostUtility,
-        "the same, for the native chat.db path",
     ),
     (
         "daemon/channel_agent_e2e.rs",

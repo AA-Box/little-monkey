@@ -92,25 +92,69 @@ describe("channels setup guidance", () => {
     expect(PROVIDER_GUIDES.find((entry) => entry.kind === "imessage")?.requiresPlatform).toBe("macos");
   });
 
-  it("does not make an iMessage helper mandatory", () => {
-    // iMessage talks to Messages on this Mac by default. Requiring a helper
-    // path would block setup on installing something that most people have
-    // no reason to run.
+  it("makes both helper paths mandatory, because both are the only way in", () => {
+    // Full Disk Access and Automation for Messages belong to the iMessage
+    // helper, and the daemon holds neither — so an account with no helper path
+    // has nothing to talk to and setup should say so up front.
     const fields = PROVIDER_GUIDES.find((guide) => guide.kind === "imessage")!.configFields;
-    expect(fields.find((field) => field.key === "helper_path")?.required).toBeFalsy();
+    expect(fields.find((field) => field.key === "helper_path")?.required).toBe(true);
     expect(fields.find((field) => field.key === "handle")?.required).toBe(true);
-    // Signal is the opposite: signal-cli is the only way in, so its path is
-    // required.
+    // Neither helper provider asks for a credential of ours: the helper holds
+    // the account.
     const signal = PROVIDER_GUIDES.find((guide) => guide.kind === "signal")!.configFields;
     expect(signal.find((field) => field.key === "helper_path")?.required).toBe(true);
+  });
+
+  it("keeps the IRC SASL account separate from the nickname", () => {
+    // A taken nickname changes the nickname, and must not change who the
+    // connection authenticates as.
+    const fields = PROVIDER_GUIDES.find((guide) => guide.kind === "irc")!.configFields;
+    const sasl = fields.find((field) => field.key === "sasl_username");
+    expect(sasl).toBeDefined();
+    expect(sasl?.required).toBeFalsy();
+  });
+
+  it("describes each provider's transport the way the daemon implements it", () => {
+    // One truthful answer, not two. The daemon's `ProviderCapabilities`
+    // decides this — Matrix holds `/sync` open in a background task, which is
+    // `InboundTransport::Socket` there, so it is "socket" here. A guide that
+    // said "long_poll" would describe a client this app does not have.
+    const transport = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport;
+    expect(transport("matrix")).toBe("socket");
+    expect(transport("mattermost")).toBe("socket");
+    expect(transport("irc")).toBe("socket");
+    expect(transport("discord")).toBe("socket");
+    expect(transport("slack")).toBe("socket");
+    expect(transport("telegram")).toBe("long_poll");
+    expect(transport("signal")).toBe("helper");
+    expect(transport("imessage")).toBe("helper");
+  });
+
+  it("says what health actually checks, for the providers where a process is not an account", () => {
+    // Each of these had a false-positive Connected: a running helper, an
+    // installed binary, a saved token. The guide is where an operator reads
+    // what the health badge now means.
+    const text = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)!.whereToGetIt;
+    expect(text("signal")).toMatch(/actually registered/i);
+    expect(text("imessage")).toMatch(/checked for real/i);
+    expect(text("mattermost")).toMatch(/websocket/i);
+    expect(text("irc")).toMatch(/never completed as an anonymous one/i);
+    expect(text("matrix")).toMatch(/refuses to send/i);
   });
 
   it("collects each server's own address rather than a hosted provider's", () => {
     const keys = (kind: string) =>
       (PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields ?? []).map((field) => field.key);
-    expect(keys("matrix")).toEqual(["homeserver_url", "user_id"]);
+    expect(keys("matrix")).toEqual(["homeserver_url", "user_id", "device_id"]);
     expect(keys("mattermost")).toEqual(["base_url"]);
-    expect(keys("irc")).toEqual(["server", "port", "nick", "channels", "use_sasl"]);
+    expect(keys("irc")).toEqual([
+      "server",
+      "port",
+      "nick",
+      "channels",
+      "use_sasl",
+      "sasl_username",
+    ]);
   });
 });
 
@@ -213,6 +257,7 @@ describe("editing an existing account's settings", () => {
       nick: "",
       channels: "#one, #two",
       use_sasl: "true",
+      sasl_username: "",
     });
   });
 
