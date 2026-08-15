@@ -786,6 +786,37 @@ mod tests {
 
     // --- Durable supervised ownership -----------------------------------------
 
+    /// A child that stays alive long enough to be a signal target.
+    ///
+    /// The boot-marker tests assert that *nothing was signalled*, and a real
+    /// child is the honest subject for that: the test process is not a legitimate
+    /// target on any platform, and asking the host whether it is looking at
+    /// itself turned out to be unreliable on Windows CI — which made the
+    /// assertion about the probe rather than about the reclaim.
+    ///
+    /// `cmd` has no `sleep`, so Windows gets the same ping stand-in the verify
+    /// tests use.
+    fn sleeping_child() -> std::process::Child {
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "ping -n 31 127.0.0.1"]);
+            command
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30");
+            command
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the child starts")
+    }
+
     /// One recorded member, as a previous session's journal would hold it.
     ///
     /// Not `cfg(unix)`, unlike the process-spawning helper below: the boot-marker
@@ -1085,8 +1116,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn identities_recorded_against_another_boot_are_absent_and_never_signalled() {
-        let pid = std::process::id();
-        let live = crate::process_tree::ProcessIdentity::of(pid).expect("this process exists");
+        let mut child = sleeping_child();
+        let pid = child.id();
+        let live = crate::process_tree::ProcessIdentity::of(pid).expect("the child exists");
         let mut record = row(Some(i64::from(pid)), Some(1));
         record.native_boot_marker = Some("linux-btime:1".to_string());
 
@@ -1098,17 +1130,20 @@ mod tests {
             "identities from a previous boot cannot still exist"
         );
         assert!(
-            crate::os_signal::process_is_alive(pid),
+            live.is_running(),
             "a member from another boot was signalled on its pid alone"
         );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A row whose boot cannot be identified at all is the uncertain case.
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn identities_recorded_against_an_unidentifiable_boot_are_uncertain() {
-        let pid = std::process::id();
-        let live = crate::process_tree::ProcessIdentity::of(pid).expect("this process exists");
+        let mut child = sleeping_child();
+        let pid = child.id();
+        let live = crate::process_tree::ProcessIdentity::of(pid).expect("the child exists");
         let mut record = row(Some(i64::from(pid)), Some(1));
         record.native_boot_marker = Some("linux-btime:1".to_string());
 
@@ -1119,6 +1154,11 @@ mod tests {
             "a host that cannot identify the recorded boot cannot match its identities: \
              {verdict:?}"
         );
-        assert!(crate::os_signal::process_is_alive(pid));
+        assert!(
+            live.is_running(),
+            "a member whose boot could not be identified was signalled anyway"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
