@@ -787,7 +787,11 @@ mod tests {
     // --- Durable supervised ownership -----------------------------------------
 
     /// One recorded member, as a previous session's journal would hold it.
-    #[cfg(unix)]
+    ///
+    /// Not `cfg(unix)`, unlike the process-spawning helper below: the boot-marker
+    /// tests are decided by `target_os` rather than by family, so this is reached
+    /// on Windows too — and gating it there is how it first failed to compile on
+    /// the one platform that cannot be built for locally.
     fn owned(identity: crate::process_tree::ProcessIdentity) -> OwnedMember {
         OwnedMember {
             identity,

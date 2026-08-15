@@ -2898,12 +2898,18 @@ mod tests {
     // --- Durable ownership ----------------------------------------------------
 
     /// A journal that records what it was handed, or refuses to.
+    ///
+    /// `cfg(unix)` because every test that drives one is: the ownership tests
+    /// need a real supervised tree, and the escapes module that uses it is itself
+    /// Unix-only. Leaving it ungated would make it dead code on Windows.
+    #[cfg(unix)]
     struct TestJournal {
         recorded: std::sync::Mutex<Vec<ProcessIdentity>>,
         sessions: std::sync::Mutex<Vec<Option<u32>>>,
         fails: std::sync::atomic::AtomicBool,
     }
 
+    #[cfg(unix)]
     impl TestJournal {
         fn new() -> Arc<Self> {
             Arc::new(TestJournal {
@@ -2922,6 +2928,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl OwnershipJournal for TestJournal {
         fn record_owned(
             &self,

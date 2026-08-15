@@ -856,7 +856,7 @@ pub(crate) mod tests {
         let state = AppState::default();
         let cwd = temp_path("cwd_ownership");
         std::fs::create_dir_all(&cwd).unwrap();
-        let cmd = command("c1", "sleep 30");
+        let cmd = command("c1", &long_running_command());
 
         let result = run_command_impl(
             &state,
@@ -878,6 +878,22 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A command that stays alive long enough to be attached and then reclaimed.
+    ///
+    /// `cmd` has no `sleep`, so Windows gets the usual stand-in: a ping with a
+    /// one-second interval, which is what makes this test's assertion about a
+    /// *running* workload rather than about one that had already exited.
+    pub(crate) fn long_running_command() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            "ping -n 31 127.0.0.1 > nul".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sleep 30".to_string()
+        }
     }
 
     /// A shell command whose only effect is to create `marker`.
