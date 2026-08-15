@@ -790,7 +790,46 @@ fn health_after_poll(
     }
     match adapter.capabilities().inbound_transport {
         little_monkey_lib::channels::types::InboundTransport::Webhook => None,
+        // A helper's poll proves the helper answered, and nothing more. For
+        // Signal that is a running process, not a registered number; for
+        // iMessage it is a readable database, not permission to reply. Both
+        // are capabilities only a real probe measures, so the poll moves
+        // health nowhere and [`probe_health`] is what writes it.
+        little_monkey_lib::channels::types::InboundTransport::Helper => None,
         _ => Some(little_monkey_lib::channels::types::HealthState::Connected),
+    }
+}
+
+/// Whether this account's health can only come from asking the adapter.
+///
+/// True exactly for the helper providers: their poll succeeding is compatible
+/// with an account that cannot send or receive a single message.
+fn needs_probe_for_health(adapter: &dyn ChannelAdapter) -> bool {
+    adapter.live_transport().is_none()
+        && adapter.capabilities().inbound_transport
+            == little_monkey_lib::channels::types::InboundTransport::Helper
+}
+
+/// Persist one probe's own answer, debounced on the state the way a
+/// transition is.
+///
+/// Unlike [`record_health_transition`] this keeps the probe's *detail* — which
+/// permission is missing, which number is not registered — because for these
+/// providers that sentence is the only actionable part.
+fn record_probe_health(
+    store: &mut DaemonStore,
+    posted: &mut BTreeMap<String, little_monkey_lib::channels::types::HealthState>,
+    account_id: &str,
+    health: &little_monkey_lib::channels::types::ChannelHealth,
+) {
+    if posted.get(account_id) == Some(&health.state) {
+        return;
+    }
+    match store.set_channel_account_health(account_id, health, health.probed_at_ms) {
+        Ok(()) => {
+            posted.insert(account_id.to_string(), health.state);
+        }
+        Err(error) => eprintln!("monkey daemon: channel {account_id} health: {error}"),
     }
 }
 
@@ -854,6 +893,10 @@ async fn run_account_inbound(
     let mut posted_health: BTreeMap<String, little_monkey_lib::channels::types::HealthState> =
         BTreeMap::new();
     let mut last_asserted = std::time::Instant::now();
+    // When this account was last asked what it can actually do — only used by
+    // the providers whose poll cannot answer that. `None` means never, so the
+    // first successful poll is followed by a real probe.
+    let mut last_probed: Option<std::time::Instant> = None;
     loop {
         let Ok(now) = current_ms() else {
             tokio::time::sleep(std::time::Duration::from_millis(IDLE_TICK_MS)).await;
@@ -894,6 +937,17 @@ async fn run_account_inbound(
                         None,
                         now,
                     );
+                } else if needs_probe_for_health(adapter.as_ref())
+                    && last_probed.is_none_or(|at: std::time::Instant| {
+                        at.elapsed() >= HEALTH_REASSERT_INTERVAL
+                    })
+                {
+                    // Paced rather than run every poll: for iMessage this
+                    // sends Messages an Apple event, and a health check is not
+                    // a reason to drive somebody's Messages.app in a loop.
+                    last_probed = Some(std::time::Instant::now());
+                    let health = adapter.probe().await;
+                    record_probe_health(&mut store, &mut posted_health, &account_id, &health);
                 }
                 // A long-polling adapter paces this loop itself by blocking
                 // inside `poll`. One that returns immediately forever — a
@@ -1232,6 +1286,16 @@ mod tests {
         fn webhook() -> Self {
             Self {
                 transport: InboundTransport::Webhook,
+                ..Self::new()
+            }
+        }
+
+        /// Signal and iMessage: `poll` reaches a helper process, which proves
+        /// the process answered and nothing about whether the account behind
+        /// it can send or receive.
+        fn helper() -> Self {
+            Self {
+                transport: InboundTransport::Helper,
                 ..Self::new()
             }
         }
@@ -1844,6 +1908,60 @@ mod tests {
         }
         let account = store.channel_account("acct-1").unwrap().unwrap();
         assert_eq!(account.health.state, HealthState::Connected);
+    }
+
+    #[tokio::test]
+    async fn a_helper_adapters_poll_never_claims_connected_on_its_own() {
+        use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
+        // The false positive this exists to stop: signal-cli starts, its poll
+        // comes back, and the account is reported Connected — while the number
+        // it is configured for was never registered. The same shape for
+        // iMessage, where a poll needs Full Disk Access and a *reply* needs a
+        // permission a poll never touches.
+        let adapter = FakeAdapter::helper();
+        assert_eq!(health_after_poll(&adapter), None);
+        assert!(needs_probe_for_health(&adapter));
+        // A socket adapter answers for itself, so it is never probed for this.
+        assert!(!needs_probe_for_health(&FakeAdapter::with_live(
+            HealthState::Connected
+        )));
+        assert!(!needs_probe_for_health(&FakeAdapter::new()));
+
+        let mut store = seeded_store();
+        let mut account = store.channel_account("acct-1").unwrap().unwrap();
+        account.health = ChannelHealth {
+            state: HealthState::Disconnected,
+            detail: None,
+            last_error: None,
+            probed_at_ms: NOW,
+        };
+        store.upsert_channel_account(&account).unwrap();
+
+        let queue = FakeQueue::default();
+        let mut posted = BTreeMap::new();
+        poll_account_once(&mut store, &queue, "acct-1", &adapter, NOW)
+            .await
+            .expect("the helper poll succeeds");
+        if let Some(state) = health_after_poll(&adapter) {
+            record_health_transition(&mut store, &mut posted, "acct-1", state, None, NOW);
+        }
+        assert_eq!(
+            store
+                .channel_account("acct-1")
+                .unwrap()
+                .unwrap()
+                .health
+                .state,
+            HealthState::Disconnected,
+            "a helper that answered is not an account that works"
+        );
+
+        // What the loop does instead: ask, and keep the answer's own reason.
+        let probed = adapter.probe().await;
+        record_probe_health(&mut store, &mut posted, "acct-1", &probed);
+        let account = store.channel_account("acct-1").unwrap().unwrap();
+        assert_eq!(account.health.state, probed.state);
+        assert_eq!(account.health.detail, probed.detail);
     }
 
     #[test]

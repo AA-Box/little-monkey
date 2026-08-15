@@ -7,6 +7,12 @@
 //! Ollama-compatible management commands retain their daemon behavior. A bare
 //! `monkey` prints the subcommand overview (see [`is_bare_invocation`]).
 
+// `matrix-sdk`'s sync path is a deep chain of nested `async fn`s, and proving
+// the spawned future is `Send` walks all of it. The default limit of 128 runs
+// out partway down `matrix-sdk-crypto`'s Olm session handling and reports an
+// overflow rather than a real error — this is the increase rustc itself names.
+#![recursion_limit = "256"]
+
 mod acp;
 mod agent;
 mod channels_cli;

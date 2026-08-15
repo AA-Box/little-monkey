@@ -15,11 +15,17 @@
 //! its stdin/stdout to a background task ([`run_rpc_loop`]) that is the only
 //! code in this module allowed to touch the child process directly:
 //! - A line with an `id` is a JSON-RPC *response* to a request this adapter
-//!   made (`send`, a probe's `version` call) — routed to the matching entry
-//!   in `pending` and never seen by `poll`.
+//!   made (`send`, a probe's `listAccounts` call) — routed to the matching
+//!   entry in `pending` and never seen by `poll`.
 //! - A line with `"method": "receive"` and no `id` is an inbound
-//!   *notification* — parsed by [`parse_event`] and pushed onto `poll`'s
-//!   channel.
+//!   *notification* — parsed by [`parse_event`] and offered to `poll`'s
+//!   bounded channel without ever waiting on it. One stdout reader serves
+//!   both directions, so blocking it on a downstream consumer would stop
+//!   *RPC responses* from being read at all: a burst of inbound traffic
+//!   would time out every `send` and probe behind it, and a helper that was
+//!   answering perfectly would look dead. An overflow is therefore dropped,
+//!   counted in [`Shared::dropped_inbound`], and surfaced as degraded
+//!   health.
 //! - EOF (the helper exited) resolves every still-pending request with a
 //!   "helper exited" error, which is what turns an in-flight `send` into
 //!   [`SendOutcome::NeedsReconciliation`] rather than leaving it hanging
@@ -51,12 +57,28 @@ use little_monkey_lib::channels::types::{
 };
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
+#[cfg(not(test))]
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long to wait before spawning the helper again after an attempt. A
-/// helper that dies on startup (unregistered account, broken install) would
+/// The same budget, widened for tests. The fake helper is a `/bin/sh` script
+/// competing with the rest of the suite for the machine, and no test asserts
+/// that this deadline *fires* — a shorter one here only ever produces a
+/// timeout that means "the box was busy".
+#[cfg(test)]
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to wait before spawning the helper again after the first failure.
+///
+/// A helper that dies on startup (unregistered account, broken install) would
 /// otherwise be respawned once per `poll`, which is a process-spawn loop
 /// against the operator's own machine.
-const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+const INITIAL_RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+/// The ceiling that cooldown backs off to. A helper that has been failing for
+/// minutes is not going to be fixed by asking it again sooner, and an operator
+/// who repairs their install waits at most this long for the next attempt.
+const MAX_RESTART_COOLDOWN: Duration = Duration::from_secs(120);
+/// A helper that ran at least this long counts as having worked, so the next
+/// failure starts backing off from the beginning rather than inheriting the
+/// previous outage's delay.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Signal has no server-enforced hard cap; this is signal-cli's own
 /// practical ceiling before it starts truncating. Not a wire limit this
 /// adapter has verified against every server version — ponytail: revisit if
@@ -65,9 +87,10 @@ const MAX_TEXT_CHARS: usize = 2000;
 
 /// Outcome of one JSON-RPC round trip, distinguished by whether a request
 /// provably reached the helper's stdin.
+#[derive(Debug)]
 enum CallError {
-    /// Never written — the helper is not running or failed to start. Safe
-    /// to report as a permanent failure: nothing happened.
+    /// Never written — the helper is not running or failed to start. Nothing
+    /// happened, so this is the one arm a send may safely be retried from.
     NotSent(String),
     /// Written, but the outcome is unknown (write failed after some bytes
     /// may have gone out, the helper died before answering, or it never
@@ -92,6 +115,22 @@ struct Shared {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stdin: Mutex<Option<ChildStdin>>,
     alive: AtomicBool,
+    /// How long to wait before the next spawn attempt. Doubled by
+    /// [`run_rpc_loop`] each time a helper dies quickly, reset once one has run
+    /// for [`HEALTHY_RUN`] — so a broken install is retried at a decreasing
+    /// rate while a one-off crash is recovered from immediately.
+    restart_cooldown: Mutex<Duration>,
+    /// Notifications normalized but never handed on, because `poll` fell far
+    /// enough behind to fill the inbound queue.
+    ///
+    /// Counted rather than waited on: [`run_rpc_loop`] is the only reader of
+    /// the helper's stdout, and stdout carries JSON-RPC *responses* down the
+    /// same pipe. A reader parked on a full inbound queue stops resolving
+    /// pending requests, which turns a working helper into timed-out sends
+    /// and probes. Bounded and lossy beats unbounded and wedged — but a
+    /// message that never arrived must still be something an operator can
+    /// see, which is what [`SignalAdapter::probe`] reads this for.
+    dropped_inbound: AtomicU64,
 }
 
 pub struct SignalAdapter {
@@ -138,6 +177,8 @@ impl SignalAdapter {
                 pending: Mutex::new(HashMap::new()),
                 stdin: Mutex::new(None),
                 alive: AtomicBool::new(false),
+                restart_cooldown: Mutex::new(INITIAL_RESTART_COOLDOWN),
+                dropped_inbound: AtomicU64::new(0),
             }),
             last_start: Mutex::new(None),
             blobs: Arc::new(DaemonBlobs),
@@ -171,8 +212,9 @@ impl SignalAdapter {
         if self.shared.alive.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let cooldown = *self.shared.restart_cooldown.lock().await;
         if let Some(attempted_at) = *last_start {
-            if attempted_at.elapsed() < RESTART_COOLDOWN {
+            if attempted_at.elapsed() < cooldown {
                 return Err(
                     "The signal-cli helper stopped; waiting before starting it again".to_string(),
                 );
@@ -266,6 +308,7 @@ async fn run_rpc_loop(
     shared: Arc<Shared>,
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
 ) {
+    let started_at = Instant::now();
     let mut lines = BufReader::new(stdout).lines();
     loop {
         match lines.next_line().await {
@@ -284,7 +327,26 @@ async fn run_rpc_loop(
                     continue;
                 }
                 if let Some(envelope) = parse_event(&line) {
-                    let _ = inbound_tx.send(envelope).await;
+                    // `try_send`, never `send().await`: the next line down
+                    // this pipe may be the JSON-RPC response an in-flight
+                    // `send` is waiting on, and a reader parked on a full
+                    // inbound queue would never reach it. Backpressure is
+                    // kept — the queue stays bounded and the overflow is
+                    // counted — it just stops being applied to the one task
+                    // that must not absorb it.
+                    match inbound_tx.try_send(envelope) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            shared.dropped_inbound.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // The receiver lives in the adapter and is dropped
+                        // only when the adapter itself is, so a closed
+                        // channel means this helper has no owner left to
+                        // deliver to. Stop reading and run the same shutdown
+                        // the EOF arm does — the helper sees its stdin close
+                        // and exits.
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
                 }
             }
             Ok(None) | Err(_) => break,
@@ -292,6 +354,17 @@ async fn run_rpc_loop(
     }
     shared.alive.store(false, Ordering::SeqCst);
     *shared.stdin.lock().await = None;
+    // A helper that ran for a while and then died is a crash to recover from;
+    // one that died immediately is an install that is not going to work yet,
+    // and asking it again every five seconds forever helps nobody.
+    {
+        let mut cooldown = shared.restart_cooldown.lock().await;
+        *cooldown = if started_at.elapsed() >= HEALTHY_RUN {
+            INITIAL_RESTART_COOLDOWN
+        } else {
+            (*cooldown * 2).min(MAX_RESTART_COOLDOWN)
+        };
+    }
     // Dropped, not answered with an error: a request the helper never replied
     // to is *ambiguous*, not a provider rejection, and `call` distinguishes
     // the two by whether the sender was dropped. Sending `Err` here would
@@ -411,6 +484,30 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
     })
 }
 
+/// The registered numbers in a `listAccounts` result.
+///
+/// signal-cli has spelled this both as a bare array of objects and as one
+/// wrapped in `accounts` across versions, and the number field as `number` or
+/// `account`. All four are read rather than pinning one and reporting a working
+/// install as broken; `None` means the shape was none of them.
+fn registered_accounts(result: &Value) -> Option<Vec<String>> {
+    let entries = result
+        .as_array()
+        .or_else(|| result.get("accounts").and_then(Value::as_array))?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| entry.get("number").and_then(Value::as_str))
+                    .or_else(|| entry.get("account").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect(),
+    )
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -443,8 +540,52 @@ impl ChannelAdapter for SignalAdapter {
         if let Some(error) = self.helper_missing() {
             return ChannelHealth::unsupported(now, error);
         }
-        match self.call("version", json!({})).await {
-            Ok(_) => ChannelHealth::connected(now, Some(self.account.clone())),
+        // Registration, and nothing weaker. A helper process that starts fine
+        // but has never registered this number cannot send or receive a single
+        // message, so liveness — a `version` that answers, a process that is
+        // running — is not evidence of anything this account needs. When
+        // registration cannot be established, the honest answer is that setup
+        // is unfinished, never Connected.
+        match self.call("listAccounts", json!({})).await {
+            Ok(result) => match registered_accounts(&result) {
+                // Registration is established first and overflow is read only
+                // inside this arm: an account that is not registered, or a
+                // helper that cannot say, is a more fundamental failure than a
+                // queue that overran, and must never be softened into
+                // "connected but busy".
+                Some(accounts) if accounts.iter().any(|number| number == &self.account) => {
+                    match self.shared.dropped_inbound.load(Ordering::Relaxed) {
+                        0 => ChannelHealth::connected(now, Some(self.account.clone())),
+                        // No number, no message text, no helper path: an
+                        // operator needs the count and the cause, and the
+                        // count is not private.
+                        dropped => ChannelHealth::degraded(
+                            now,
+                            format!(
+                                "Signal is connected, but {dropped} inbound message(s) were \
+                                 dropped because Little Monkey fell behind reading them.",
+                            ),
+                        ),
+                    }
+                }
+                Some(_) => ChannelHealth::error(
+                    now,
+                    format!(
+                        "signal-cli is running but {} is not registered with it. Register the \
+                         number with signal-cli first.",
+                        self.account
+                    ),
+                ),
+                // The helper answered in a shape this adapter cannot read. It
+                // may well be working — but "may well be" is not what Connected
+                // means, and a silently unregistered account looks exactly like
+                // this.
+                None => ChannelHealth::unsupported(now, self.cannot_verify()),
+            },
+            // An older helper has no `listAccounts` at all. That is a helper
+            // this adapter cannot verify an account with, which is a setup step
+            // (update signal-cli), not a connection that is working.
+            Err(CallError::Remote(_)) => ChannelHealth::unsupported(now, self.cannot_verify()),
             Err(error) => ChannelHealth::error(now, error.into_message()),
         }
     }
@@ -497,7 +638,13 @@ impl ChannelAdapter for SignalAdapter {
                     .and_then(Value::as_i64)
                     .map(|timestamp| timestamp.to_string()),
             },
-            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            // Never written to the helper's stdin — it is not running, or the
+            // restart cooldown has not elapsed. Nothing happened, so this is
+            // the one shape that is provably safe to send again.
+            Err(CallError::NotSent(error)) => SendOutcome::RetryableFailure {
+                error,
+                retry_after_ms: Some(5_000),
+            },
             Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
             Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
         }
@@ -515,7 +662,10 @@ impl ChannelAdapter for SignalAdapter {
         attachment: &ChannelAttachment,
         limits: crate::daemon::channel_adapter::AttachmentLimits,
     ) -> Result<Vec<u8>, String> {
-        let max_bytes = MAX_ATTACHMENT_BYTES;
+        // The account's own cap, never above this adapter's ceiling: a
+        // configured limit that is ignored is a limit an operator set for
+        // nothing.
+        let max_bytes = limits.max_bytes.min(MAX_ATTACHMENT_BYTES);
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Signal attachment has no id.".to_string());
         };
@@ -558,6 +708,17 @@ impl ChannelAdapter for SignalAdapter {
 }
 
 impl SignalAdapter {
+    /// What health says when the helper is up but cannot be asked whether this
+    /// account is registered.
+    fn cannot_verify(&self) -> String {
+        format!(
+            "signal-cli is running, but this version cannot report which accounts are registered, \
+             so Little Monkey cannot confirm that {} is able to send or receive. Update \
+             signal-cli.",
+            self.account
+        )
+    }
+
     /// signal-cli takes attachments on the same `send` call, as RFC 2397 data
     /// URIs (`data:<mime>;filename=<name>;base64,<data>`) rather than paths —
     /// which means nothing has to write the bytes to a temporary file that a
@@ -594,7 +755,13 @@ impl SignalAdapter {
                     .and_then(Value::as_i64)
                     .map(|timestamp| timestamp.to_string()),
             },
-            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            // Never written to the helper's stdin — it is not running, or the
+            // restart cooldown has not elapsed. Nothing happened, so this is
+            // the one shape that is provably safe to send again.
+            Err(CallError::NotSent(error)) => SendOutcome::RetryableFailure {
+                error,
+                retry_after_ms: Some(5_000),
+            },
             Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
             Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
         }
@@ -642,6 +809,25 @@ mod tests {
         "timestamp": 1700000005000,
         "dataMessage": {"message": ""}
     }}}"#;
+
+    #[test]
+    fn every_shape_signal_cli_has_used_for_list_accounts_is_read() {
+        assert_eq!(
+            registered_accounts(&json!([{"number": "+15550000000"}])),
+            Some(vec!["+15550000000".to_string()])
+        );
+        assert_eq!(
+            registered_accounts(&json!({"accounts": [{"account": "+15550000000"}]})),
+            Some(vec!["+15550000000".to_string()])
+        );
+        assert_eq!(
+            registered_accounts(&json!(["+15550000000"])),
+            Some(vec!["+15550000000".to_string()])
+        );
+        // A shape none of them use is unknown, not "no accounts" — reporting
+        // a working install as unregistered is the worse mistake.
+        assert_eq!(registered_accounts(&json!({"version": "0.13.0"})), None);
+    }
 
     #[test]
     fn parses_a_direct_message() {
@@ -788,6 +974,61 @@ mod tests {
         assert!(SignalAdapter::new(&config).is_ok());
     }
 
+    /// An opt-in round trip through the operator's own signal-cli.
+    ///
+    /// Never runs unless all three variables are set, so CI and every
+    /// contributor's `cargo test` skip it. No number, no helper path and no
+    /// recipient is bundled anywhere in this tree: the destination is one the
+    /// person running it chose, and it is the only place a message is sent.
+    ///
+    /// ```text
+    /// LM_SIGNAL_LIVE_HELPER=/usr/local/bin/signal-cli \
+    /// LM_SIGNAL_LIVE_ACCOUNT=+15550000000 \
+    /// LM_SIGNAL_LIVE_RECIPIENT=+15550000001 \
+    ///   cargo test --bin monkey-cli a_live_signal_round_trip -- --nocapture
+    /// ```
+    #[tokio::test]
+    async fn a_live_signal_round_trip() {
+        let (Ok(helper), Ok(number), Ok(recipient)) = (
+            std::env::var("LM_SIGNAL_LIVE_HELPER"),
+            std::env::var("LM_SIGNAL_LIVE_ACCOUNT"),
+            std::env::var("LM_SIGNAL_LIVE_RECIPIENT"),
+        ) else {
+            return;
+        };
+        let account = test_account(json!({
+            "helper_path": helper,
+            "account": number,
+        }));
+        let adapter = SignalAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: String::new(),
+        })
+        .expect("adapter");
+
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Connected,
+            "{health:?} — register this number with signal-cli first"
+        );
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let outcome = adapter
+            .send(&OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Signal,
+                conversation_id: recipient,
+                thread_id: None,
+                text: format!("little-monkey live smoke test {marker}"),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: format!("live-{marker}"),
+            })
+            .await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+    }
+
     /// Everything below drives a *fake* helper: a shell script that speaks the
     /// same newline-delimited JSON-RPC signal-cli does. No real signal-cli, no
     /// Signal account, no network — which is what makes the lifecycle
@@ -814,22 +1055,109 @@ mod tests {
         /// line sitting in a shell's stdio buffer, which is the difference
         /// between this test being deterministic and being flaky.
         fn write_fake_helper(name: &str) -> std::path::PathBuf {
+            write_fake_helper_registering(name, "+15550000000")
+        }
+
+        /// The same fixture, claiming a specific number is registered.
+        ///
+        /// Baked into the script rather than read from the environment: these
+        /// tests share one process, and a process-wide variable would make the
+        /// answer depend on which test ran last.
+        fn write_fake_helper_registering(name: &str, registered: &str) -> std::path::PathBuf {
+            write_fake_helper_registering_bursting(name, registered, 0)
+        }
+
+        /// The same, ahead of a burst of inbound notifications.
+        fn write_fake_helper_registering_bursting(
+            name: &str,
+            registered: &str,
+            burst: usize,
+        ) -> std::path::PathBuf {
+            write_fake_helper_bursting(
+                name,
+                &format!(r#"\"result\":[{{\"number\":\"{registered}\"}}]"#),
+                burst,
+            )
+        }
+
+        /// One valid `receive` notification per iteration, each from its own
+        /// number so nothing downstream can collapse them into one event.
+        const BURST_COMMAND: &str = r#"awk 'BEGIN{for(i=0;i<__COUNT__;i++)printf "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+1555000%04d\",\"timestamp\":1700000000000,\"dataMessage\":{\"message\":\"burst\"}}}}\n", i}'"#;
+
+        /// More notifications than the inbound queue holds, so the tail of the
+        /// burst has nowhere to go while nothing is draining `poll`.
+        const OVERFLOW_BURST: usize = INBOUND_CHANNEL_CAPACITY + 32;
+
+        /// An adapter whose helper floods stdout before it will read a single
+        /// request, and whose `poll` is never called.
+        ///
+        /// Every RPC response therefore arrives behind a full inbound queue,
+        /// which is exactly the production shape: a Signal account under a
+        /// burst while the consumer is busy.
+        fn saturated_adapter(name: &str) -> (SignalAdapter, std::path::PathBuf) {
+            let path = write_fake_helper_registering_bursting(name, "+15550000000", OVERFLOW_BURST);
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+            (adapter, path)
+        }
+
+        /// The same fixture again, answering `listAccounts` with an arbitrary
+        /// JSON-RPC tail — a result in a shape this adapter cannot read, or an
+        /// outright error from a helper too old to have the method at all.
+        fn write_fake_helper_answering(name: &str, list_accounts_tail: &str) -> std::path::PathBuf {
+            write_fake_helper_bursting(name, list_accounts_tail, 0)
+        }
+
+        /// The same fixture once more, preceded by `burst` inbound
+        /// notifications written before it reads a single request.
+        ///
+        /// One `awk` rather than `burst` separate `/bin/echo`s: the point is a
+        /// crowd of lines arriving ahead of the RPC response, and spawning
+        /// three hundred processes to produce them makes the test slow without
+        /// making it stricter. It still exits before the read loop starts, so
+        /// nothing is left sitting in a buffer.
+        fn write_fake_helper_bursting(
+            name: &str,
+            list_accounts_tail: &str,
+            burst: usize,
+        ) -> std::path::PathBuf {
             let path = std::env::temp_dir().join(format!(
                 "monkey-fake-signal-{name}-{}",
                 uuid::Uuid::new_v4().simple()
             ));
+            let burst_line = if burst == 0 {
+                String::new()
+            } else {
+                BURST_COMMAND.replace("__COUNT__", &burst.to_string())
+            };
             let script = r#"#!/bin/sh
 /bin/echo '{"jsonrpc":"2.0","method":"receive","params":{"envelope":{"source":"+15551230001","sourceName":"Ada","timestamp":1700000000000,"dataMessage":{"message":"hello there"}}}}'
 /bin/echo 'this line is not JSON'
+__BURST__
 while IFS= read -r line; do
   case "$line" in
     *crash*) exit 7 ;;
   esac
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}"
+  case "$line" in
+    *listAccounts*)
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,__LIST_ACCOUNTS__}" ;;
+    *)
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}" ;;
+  esac
 done
 "#;
-            std::fs::write(&path, script).expect("write fake helper");
+            std::fs::write(
+                &path,
+                script
+                    .replace("__LIST_ACCOUNTS__", list_accounts_tail)
+                    .replace("__BURST__", &burst_line),
+            )
+            .expect("write fake helper");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake helper");
             path
@@ -845,6 +1173,161 @@ done
         }
 
         #[tokio::test]
+        async fn an_unregistered_number_is_a_real_error_not_a_connection() {
+            let path = write_fake_helper_registering("unregistered", "+15559999999");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let health = adapter.probe().await;
+            // The helper is running perfectly. It just cannot reach Signal as
+            // this number, which is not something to report as Connected.
+            assert_eq!(health.state, HealthState::Error);
+            let detail = health.last_error.expect("detail");
+            assert!(detail.contains("not registered"), "{detail}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Registration cannot be established, so nothing here may be
+        /// Connected — the failure class is a working *process* being mistaken
+        /// for a working *account*.
+        #[tokio::test]
+        async fn a_helper_that_cannot_prove_registration_is_never_connected() {
+            for (name, tail) in [
+                // A `listAccounts` result in a shape this adapter cannot read.
+                (
+                    "unknown-shape",
+                    r#"\"result\":{\"version\":\"0.13.0\"}"#.to_string(),
+                ),
+                // A helper old enough not to have the method at all.
+                (
+                    "no-method",
+                    r#"\"error\":{\"code\":-32601,\"message\":\"Unknown method\"}"#.to_string(),
+                ),
+            ] {
+                let path = write_fake_helper_answering(name, &tail);
+                let account = helper_account(&path);
+                let adapter = SignalAdapter::new(&AdapterConfig {
+                    account: &account,
+                    secret: String::new(),
+                })
+                .expect("adapter");
+
+                let health = adapter.probe().await;
+                assert_ne!(
+                    health.state,
+                    HealthState::Connected,
+                    "{name}: a helper that answers is not an account that is registered"
+                );
+                assert_eq!(health.state, HealthState::Unsupported, "{name}");
+                let detail = health.detail.unwrap_or_default();
+                assert!(detail.contains("Update signal-cli"), "{name}: {detail}");
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_send_the_helper_dies_during_is_reconciled_never_retried() {
+            let path = write_fake_helper("ambiguous-send");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            // The fixture exits on any line containing `crash`, which is what
+            // a helper killed mid-send looks like: written, never answered.
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "crash".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-crash".to_string(),
+                })
+                .await;
+            assert!(
+                matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+                "signal-cli may already have sent it: {outcome:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_send_that_never_reached_the_helper_is_retryable() {
+            let path = write_fake_helper("not-sent");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+            // Kill the helper, then send inside the restart cooldown: the
+            // request is never written, so nothing can have happened and the
+            // message must stay queued rather than be dropped. The attempt
+            // stamp is reset so the window starts now — otherwise a slow run
+            // spends the whole cooldown before the send and gets a fresh
+            // helper instead of the refusal being tested.
+            let _ = adapter.call("crash", json!({})).await;
+            *adapter.last_start.lock().await = Some(Instant::now());
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "still queued".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-2".to_string(),
+                })
+                .await;
+            assert!(
+                matches!(outcome, SendOutcome::RetryableFailure { .. }),
+                "a message that never left must not be thrown away: {outcome:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_helper_that_dies_at_once_is_retried_more_and_more_slowly() {
+            let path = write_fake_helper("backoff");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            assert_eq!(
+                *adapter.shared.restart_cooldown.lock().await,
+                INITIAL_RESTART_COOLDOWN
+            );
+            for expected in [INITIAL_RESTART_COOLDOWN * 2, INITIAL_RESTART_COOLDOWN * 4] {
+                // Clear the attempt stamp so the test does not sleep out the
+                // cooldown it is asserting on.
+                *adapter.last_start.lock().await = None;
+                let _ = adapter.call("crash", json!({})).await;
+                // The loop records the new cooldown as it exits.
+                for _ in 0..100 {
+                    if *adapter.shared.restart_cooldown.lock().await == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(*adapter.shared.restart_cooldown.lock().await, expected);
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
         async fn probes_over_the_helpers_own_json_rpc() {
             let path = write_fake_helper("probe");
             let account = helper_account(&path);
@@ -857,6 +1340,105 @@ done
             let health = adapter.probe().await;
             assert_eq!(health.state, HealthState::Connected);
             assert_eq!(health.detail.as_deref(), Some("+15550000000"));
+            // The overflow counter must stay a report of something that
+            // happened, not a state a healthy account drifts into: an account
+            // nothing was dropped on is Connected, permanently.
+            assert_eq!(adapter.shared.dropped_inbound.load(Ordering::Relaxed), 0);
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The one this whole mechanism exists for.
+        ///
+        /// One reader serves both directions of the helper's stdout, so a
+        /// reader that waits for inbound-queue capacity stops reading JSON-RPC
+        /// responses — and a helper answering perfectly starts timing out
+        /// every send and probe behind the burst. Fails against a reader that
+        /// awaits `inbound_tx.send`.
+        #[tokio::test]
+        async fn a_full_inbound_queue_never_blocks_an_rpc_response() {
+            let (adapter, path) = saturated_adapter("saturated-rpc");
+            // The burst is written before the fixture reads anything, so this
+            // response sits behind all of it in the same pipe.
+            let answered = tokio::time::timeout(
+                Duration::from_secs(15),
+                adapter.call("listAccounts", json!({})),
+            )
+            .await;
+            assert!(
+                matches!(answered, Ok(Ok(_))),
+                "a full inbound queue starved the RPC reader: {answered:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// The same starvation seen from the send path, where it costs more:
+        /// an RPC that times out is not a failed send, it is a send nobody can
+        /// classify, and it lands in reconciliation instead of being delivered.
+        #[tokio::test]
+        async fn a_full_inbound_queue_never_makes_a_send_ambiguous() {
+            let (adapter, path) = saturated_adapter("saturated-send");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(15),
+                adapter.send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "under load".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-saturated".to_string(),
+                }),
+            )
+            .await
+            .expect("the helper answered, so the send must not have hung");
+            match outcome {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => assert_eq!(provider_message_id.as_deref(), Some("1700000000001")),
+                other => panic!("inbound load must not make a send ambiguous: {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Dropping under load is the deliberate trade; dropping *silently* is
+        /// not.
+        #[tokio::test]
+        async fn inbound_the_queue_could_not_take_is_counted() {
+            let (adapter, path) = saturated_adapter("saturated-count");
+            // The response arrives behind the whole burst, so by the time this
+            // returns every line the queue refused has already been counted.
+            adapter.probe().await;
+            assert!(
+                adapter.shared.dropped_inbound.load(Ordering::Relaxed) > 0,
+                "the queue overran and nothing recorded it"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// And the count has to reach the operator, because the messages did
+        /// not reach the agent.
+        #[tokio::test]
+        async fn a_queue_that_overran_reports_degraded_with_the_count() {
+            let (adapter, path) = saturated_adapter("saturated-health");
+            let health = adapter.probe().await;
+            assert_eq!(
+                health.state,
+                HealthState::Degraded,
+                "messages were lost; this is not a clean connection"
+            );
+            let dropped = adapter.shared.dropped_inbound.load(Ordering::Relaxed);
+            let detail = health.detail.expect("detail");
+            assert!(detail.contains("dropped"), "{detail}");
+            assert!(detail.contains(&dropped.to_string()), "{detail}");
+            // A health string is read by whoever can see the account. Not the
+            // number, not a word anybody sent, not where the helper lives.
+            assert!(!detail.contains("+1555"), "{detail}");
+            assert!(!detail.contains("burst"), "{detail}");
+            assert!(
+                !detail.contains(&path.to_string_lossy().to_string()),
+                "{detail}"
+            );
             let _ = std::fs::remove_file(&path);
         }
 
