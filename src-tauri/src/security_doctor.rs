@@ -136,6 +136,24 @@ pub struct SecurityRuntimeSnapshot {
     pub device_state_observed: bool,
     pub device_state_error: Option<String>,
     pub push: Option<PushPrivacySnapshot>,
+    /// How a device reaches this runner, as the runner advertises it.
+    ///
+    /// Separate from `audit_remote_host`'s own checks because the question this
+    /// answers is a different one: that function asks whether the *listener* is
+    /// configured safely, and this asks whether the transport a phone with a
+    /// camera grant is talking over is pinned at all. A development listener on
+    /// plain loopback is a reasonable thing to have and an unreasonable thing to
+    /// hand a microphone.
+    pub transport: Option<TransportSnapshot>,
+}
+
+/// The advertised transport, reduced to what the device audit asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    pub enabled: bool,
+    pub advertise_url: String,
+    /// Whether the runner holds a certificate fingerprint for devices to pin.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1185,6 +1203,46 @@ fn audit_paired_devices(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Se
         }
     }
 
+    // The transport those grants are exercised over.
+    //
+    // A hardware grant is only as private as the connection that carries the
+    // photograph back. `pair-create` refuses a non-HTTPS advertised URL, so this
+    // is not a hole an operator can open by accident — but a certificate can be
+    // replaced, a fingerprint can go missing from the configuration, and a
+    // development listener set up for a laptop can outlive the afternoon it was
+    // meant for. The finding names the devices, because "your transport is
+    // unpinned" and "your transport is unpinned and three phones can hear the
+    // room over it" are different sentences.
+    if let Some(transport) = &runtime.transport {
+        let hardware: Vec<&str> = active
+            .iter()
+            .filter(|device| !device.granted_physical.is_empty())
+            .map(|device| device.device_name.as_str())
+            .collect();
+        let insecure = !transport.advertise_url.starts_with("https://");
+        if transport.enabled && !hardware.is_empty() && (insecure || !transport.pinned) {
+            findings.push(finding(
+                "devices.transport_unpinned",
+                "devices",
+                "Hardware grants are reachable over an unpinned transport",
+                &format!(
+                    "{} is {}, and {} hold hardware grants over it.",
+                    transport.advertise_url,
+                    if insecure {
+                        "not HTTPS"
+                    } else {
+                        "advertised without a certificate fingerprint for devices to pin"
+                    },
+                    hardware.join(", ")
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Reconfigure the remote host with a certificate valid for the advertised name, then re-pair: `monkey daemon remote host-configure --advertise-url https://… --tls-certificate … --tls-private-key …`."),
+            ));
+        }
+    }
+
     // A revoked device keeps nothing, including an address. This catches the
     // one row that could outlive a revocation and quietly keep a wiped phone
     // on the notification list.
@@ -1715,6 +1773,51 @@ mod tests {
         assert!(!has(&quiet, "devices.intimate_grant"));
         assert!(!has(&quiet, "devices.broad_grant"));
         assert!(!has(&quiet, "devices.stale_grant"));
+    }
+
+    /// A hardware grant is only as private as the connection carrying the
+    /// photograph back, and a development listener can outlive the afternoon it
+    /// was set up for.
+    #[test]
+    fn the_doctor_flags_hardware_grants_reachable_over_an_unpinned_transport() {
+        let now = now_ms();
+        let with_transport = |advertise_url: &str, pinned: bool, granted: &[&str]| {
+            device_findings(SecurityRuntimeSnapshot {
+                device_state_observed: true,
+                devices: vec![device("phone", granted, Some(now))],
+                transport: Some(TransportSnapshot {
+                    enabled: true,
+                    advertise_url: advertise_url.to_string(),
+                    pinned,
+                }),
+                ..Default::default()
+            })
+        };
+        let plain = with_transport("http://192.168.1.4:8443", true, &["camera_capture"]);
+        let finding = plain
+            .iter()
+            .find(|finding| finding.id == "devices.transport_unpinned")
+            .expect("an unencrypted transport carrying a camera grant must be reported");
+        assert_eq!(finding.status, FindingStatus::Critical);
+        // The devices are named: "unpinned" and "unpinned, and this phone can
+        // see through its camera over it" are different sentences.
+        assert!(finding.detail.contains("phone"));
+
+        assert!(has(
+            &with_transport("https://runner.example.net", false, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        // A pinned HTTPS transport, and a plain one that no hardware grant is
+        // reachable over, are both silent — the second because a development
+        // listener is a reasonable thing to have until a camera is behind it.
+        assert!(!has(
+            &with_transport("https://runner.example.net", true, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        assert!(!has(
+            &with_transport("http://127.0.0.1:8443", false, &[]),
+            "devices.transport_unpinned"
+        ));
     }
 
     /// A revoked device must keep nothing, an address included.

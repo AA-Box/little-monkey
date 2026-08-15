@@ -51,10 +51,17 @@ monkey daemon remote pair-create --output invite.json --run <run-id> \
   --action view-runs --device camera_capture --device location_read --qr
 ```
 
-`--qr` also prints a compact pairing code the phone can scan. It carries the
-same one-time token and pins the same certificate by SHA-256 fingerprint; the
-PEM is left out because that is what makes it small enough to read from a
-screen. The JSON invitation, paste, and file flows all still work.
+`--qr` prints an actual QR code in the terminal, in its own quiet zone and its
+own colours so a light theme cannot invert it. It carries the same one-time
+token and pins the same certificate by SHA-256 fingerprint; the PEM is left out
+because that is what makes it small enough to read from a screen. The same code
+appears in **Settings → Background agents → Remote handoff** the moment an
+invitation is created, beside the short `littlemonkey://pair/…` string for
+anyone without a camera. The JSON invitation, paste, and file flows all still
+work, and an old invitation keeps pairing exactly as it did.
+
+`--json` prints the invitation path, the bootstrap URI, its byte count and the
+code as an SVG, which is what the desktop panel reads.
 
 After pairing, grants are edited without re-pairing:
 
@@ -137,12 +144,42 @@ restart reports the old outcome rather than repeating it.
 Cancellation is truthful. A queued or leased command is cancelled outright; on a
 running one it raises a flag, and anything already captured stays captured.
 
+## What the paired device can do
+
+The bundled controller reaches every capability the runner can grant it, and the
+grant is what decides whether a surface appears at all:
+
+| Grant | On the phone |
+| --- | --- |
+| `view_runs`, `view_events`, `read_artifacts` | the run list, the replayed timeline, artifact fetch by id |
+| `approve`, `cancel`, `kill` | digest-bound approvals, cancellation, emergency stop |
+| `pause` | pause and resume, offered one at a time by what the run actually is |
+| `view_sessions`, `chat` | the paired conversation, and sending a message that becomes a durable run |
+| `view_tasks`, `run_workflows` | the runner's declared workflows, and launching one |
+| `capture` | filing a note or a file from the phone, digest-checked by the runner |
+
+A device can also revoke *itself* — its key stops working at once and any live
+session it owns is force-stopped, exactly as an operator revoke does.
+
+`control_desktop` deliberately has no surface here: this device is the *subject*
+of such a session, never its operator. A test asserts that every capability the
+runner can grant either reaches a surface or is written down as having none, so
+a capability added later cannot quietly become unreachable.
+
 ## Offline
 
-The device caches its last view of the runner and marks it stale, with the time
-it was taken. Every control whose effect leaves the device is disabled while
-stale — nothing is buffered for replay, because an approval queued against a
-view the device cannot refresh would act on a run it can no longer see.
+The device caches its last view of the runner — runs, the selected run's detail,
+its events, its approval metadata, the artifact metadata those events announce,
+the sessions and their messages — and marks all of it stale, with the time it
+was taken. Every cache is bounded by a count, and pruning happens on write.
+
+Every control whose effect leaves the device is disabled while stale. Nothing is
+buffered for replay, because an approval queued against a view the device cannot
+refresh would act on a run it can no longer see.
+
+A **draft** is the exception, and it is not an action: text typed into the
+composer is kept on the device and restored on the next load, because nothing
+has happened until it is sent.
 
 ## Push
 
@@ -167,6 +204,11 @@ The browser controller offers an **Enable notifications** button once the runner
 answers with a key. Turning it off unsubscribes the browser *and* tells the
 runner to forget the address; leaving either half would keep a path open that
 the user believes is closed.
+
+The same settings are in **Settings → Background agents → Remote handoff**:
+which backend is configured, whether it is on, whether a notification would put
+specifics on a lock screen, which devices registered an address, and a **Test
+push** per device.
 
 A native client that holds its own Firebase registration token can use FCM
 instead, against the operator's own project:
@@ -202,7 +244,8 @@ reads no keys.
 
 `monkey security audit` reports which device may hear the room, which holds a
 grant it has not used in a month, which is capturing right now, whether a
-revoked device can still be woken, and whether push would put run specifics on a
+revoked device can still be woken, whether the transport those grants are
+exercised over is pinned HTTPS, and whether push would put run specifics on a
 lock screen.
 
 ## Limits
