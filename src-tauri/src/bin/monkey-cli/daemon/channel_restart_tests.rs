@@ -28,14 +28,14 @@ use little_monkey_lib::channels::policy::{AccessPolicy, ChannelAccessPolicy, Gro
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{ChannelHealth, ChannelKind};
 
-const NOW: i64 = 1_700_000_000_000;
+pub(crate) const NOW: i64 = 1_700_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct FakeQueue {
+pub(crate) struct FakeQueue {
     submitted: StdMutex<Vec<String>>,
 }
 
@@ -64,6 +64,13 @@ impl RunQueue for FakeQueue {
 /// around a real provider account.
 pub(crate) fn seeded_store(account_id: &str, kind: ChannelKind) -> DaemonStore {
     let mut store = DaemonStore::open_in_memory().expect("open in-memory store");
+    seed_account_and_route(&mut store, account_id, kind);
+    store
+}
+
+/// The same minimal world in a store the caller already owns — a file-backed
+/// one, for the tests that close it and open it again.
+pub(crate) fn seed_account_and_route(store: &mut DaemonStore, account_id: &str, kind: ChannelKind) {
     store
         .upsert_channel_account(&ChannelAccountRecord {
             account_id: account_id.into(),
@@ -92,7 +99,6 @@ pub(crate) fn seeded_store(account_id: &str, kind: ChannelKind) -> DaemonStore {
             updated_at_ms: NOW,
         })
         .expect("route");
-    store
 }
 
 fn account_record(account_id: &str, kind: ChannelKind) -> ChannelAccountRecord {
@@ -243,7 +249,7 @@ pub(crate) fn frame_op(frame: &Value) -> i64 {
 /// The runs a queue was actually asked to create, counted by identity rather
 /// than by call: a recovery pass that races the original submission calls the
 /// queue twice with the same deterministic job id, and that is one run.
-fn distinct_runs(queue: &FakeQueue) -> usize {
+pub(crate) fn distinct_runs(queue: &FakeQueue) -> usize {
     let submitted = queue.submitted.lock().unwrap();
     let unique: std::collections::BTreeSet<&String> = submitted.iter().collect();
     unique.len()
@@ -275,7 +281,7 @@ fn assert_turn_awaits_its_first_submission(store: &DaemonStore) {
     );
 }
 
-fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, account_id: &str) {
+pub(crate) fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, account_id: &str) {
     let events = store.recent_channel_events(account_id, 10).unwrap();
     assert_eq!(events.len(), 1, "expected one durable event: {events:?}");
     let turns = store.recent_ingress_turns(10).unwrap();
@@ -287,7 +293,10 @@ fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, account_id: 
     );
     assert_eq!(distinct_runs(queue), 1, "expected exactly one run");
     assert!(
-        store.orphaned_accepted_events(10).unwrap().is_empty(),
+        store
+            .accepted_events_awaiting_processing(10)
+            .unwrap()
+            .is_empty(),
         "an accepted event with no turn behind it"
     );
 }
@@ -1487,7 +1496,7 @@ pub(crate) fn queue_reply_for_job(store: &mut DaemonStore, job_id: &str, text: &
         .expect("the reply is queued");
 }
 
-fn adapters_map(
+pub(crate) fn adapters_map(
     account_id: &str,
     adapter: Arc<dyn ChannelAdapter>,
 ) -> BTreeMap<String, Arc<dyn ChannelAdapter>> {
@@ -1497,7 +1506,7 @@ fn adapters_map(
 }
 
 /// The one outbound event the drain recorded for `account_id`.
-fn outbound_event_id(store: &mut DaemonStore, account_id: &str) -> String {
+pub(crate) fn outbound_event_id(store: &mut DaemonStore, account_id: &str) -> String {
     store
         .recent_channel_events(account_id, 10)
         .expect("events")
@@ -2036,6 +2045,11 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
             .any(|component| component.as_os_str() == "adapters")
             || name == "channel_worker.rs"
             || name == "channel_restart_tests.rs"
+            // The webhook providers' own suite, for the same reason this file
+            // is here: it drives `send` directly to pin down how each adapter
+            // classifies a refused connection against an ambiguous one. It has
+            // no production callers in it — this scan is about those.
+            || name == "channel_webhook_tests.rs"
             || name == "live_smoke.rs"
     };
     // The outbox enqueue has exactly three legitimate writers: the store

@@ -11,6 +11,9 @@ pub(crate) mod channel_ingress;
 mod channel_restart_tests;
 pub(crate) mod channel_store;
 pub(crate) mod channel_tool;
+/// Acknowledgement semantics for the four providers that are delivered to.
+#[cfg(test)]
+mod channel_webhook_tests;
 pub(crate) mod channel_worker;
 mod engine;
 pub(crate) mod fail_points;
