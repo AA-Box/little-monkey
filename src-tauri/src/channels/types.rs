@@ -622,6 +622,22 @@ impl ChannelHealth {
             probed_at_ms,
         }
     }
+
+    /// Working, but not fully: the connection is up and something measurable is
+    /// being lost.
+    ///
+    /// The detail carries the count, because "degraded" on its own tells an
+    /// operator nothing they can act on. Distinct from `error` — messages are
+    /// still flowing — and distinct from `connected`, which would claim
+    /// everything arrived.
+    pub fn degraded(probed_at_ms: i64, detail: impl Into<String>) -> Self {
+        Self {
+            state: HealthState::Degraded,
+            detail: Some(detail.into()),
+            last_error: None,
+            probed_at_ms,
+        }
+    }
 }
 
 /// An outbound attachment, referenced by artifact so the send path never carries
