@@ -620,11 +620,12 @@ pub fn verify_set_config(
 /// an evaluation arm is verified by the commands the user actually configured,
 /// not by ones invented for the evaluation.
 ///
-/// Which workspace's commands, specifically, comes from the sandbox's own
-/// marker rather than from whatever folder is open. A candidate learned in A
-/// can be evaluated while B is open — or with nothing open at all — and
-/// verifying its arms with B's commands would produce a bogus pass or a bogus
-/// failure against A's files.
+/// Which workspace's commands, specifically, comes from the backend's own
+/// registry of live sandboxes rather than from whatever folder is open — or
+/// from anything inside the sandbox, which the arm being evaluated can write
+/// to. A candidate learned in A can be evaluated while B is open, or with
+/// nothing open at all, and verifying its arms with B's commands would produce
+/// a bogus pass or a bogus failure against A's files.
 #[tauri::command]
 pub async fn verify_run(
     app: tauri::AppHandle,
@@ -642,16 +643,8 @@ pub async fn verify_run(
         Some(path) => {
             let data_root = crate::app_paths::data_dir()
                 .ok_or_else(|| "Could not resolve the application data directory".to_string())?;
-            let sandbox = crate::skill_learning::require_eval_sandbox(&data_root, path)?;
-            let source = crate::skill_learning::eval_sandbox_source(&sandbox).ok_or_else(|| {
-                format!("'{path}' does not record which workspace it is a copy of.")
-            })?;
-            let key = source
-                .canonicalize()
-                .unwrap_or(source)
-                .to_string_lossy()
-                .to_string();
-            (sandbox, key)
+            let (sandbox, source) = crate::skill_learning::eval_sandbox_identity(&data_root, path)?;
+            (sandbox, source.to_string_lossy().to_string())
         }
     };
     let configs = load_configs_from(&verify_configs_path(&app)?);

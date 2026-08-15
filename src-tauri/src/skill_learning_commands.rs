@@ -20,7 +20,8 @@ use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, reflection_brief, ApprovalGrant,
     CandidateProposal, CorrectedExecution, EffectivenessRecord, EvaluationCaseReport,
     EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary, LearningCandidate,
-    LearningMode, LearningSettings, PreTaskFile, PromotionOutcome, RunEvidence, SkillLearningStore,
+    LearningMode, LearningSettings, PreTaskFile, PreTaskState, PromotionOutcome, RunEvidence,
+    SkillLearningStore,
 };
 use crate::AppState;
 
@@ -273,24 +274,19 @@ pub async fn skill_learning_create_sandboxes(
             Some(checkpoint_id) => {
                 let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, checkpoint_id)
                     .map_err(invalid)?;
-                // A shell command's side effects are snapshotted by no
-                // checkpoint, so the rewind is partial and the copy may still
-                // hold what the procedure produced. When the observed run ended
-                // verified, the evaluator catches that by verifying the rewound
-                // sandbox before any arm runs. When it did not, nothing can
-                // tell a reproduced task from a leftover one, and a promotion
-                // -grade pass cannot honestly come out of it.
-                if state.shell_ran && !environment.self_checking {
-                    return Err(invalid(
-                        "the observed run used the shell, whose effects no checkpoint captures, and ended with no verification to check the rebuilt starting state against — so a reproducible evaluation environment cannot be confirmed"
-                            .to_string(),
-                    ));
+                PreTaskState {
+                    files: state
+                        .files
+                        .into_iter()
+                        .map(|file| PreTaskFile { path: file.path, contents: file.contents })
+                        .collect(),
+                    // No checkpoint captures what a shell command created,
+                    // changed or deleted, so a run that used one leaves a
+                    // rewind that cannot be shown to be complete. The store
+                    // refuses it rather than evaluating a starting state that
+                    // may still hold part of the procedure's own result.
+                    complete: !state.shell_ran,
                 }
-                state
-                    .files
-                    .into_iter()
-                    .map(|file| PreTaskFile { path: file.path, contents: file.contents })
-                    .collect::<Vec<_>>()
             }
             None if environment.requires_pre_task_state => {
                 return Err(invalid(
@@ -298,7 +294,7 @@ pub async fn skill_learning_create_sandboxes(
                         .to_string(),
                 ))
             }
-            None => Vec::new(),
+            None => PreTaskState { files: Vec::new(), complete: true },
         };
         let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms, &pre_task)?;
         Ok(created

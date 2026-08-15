@@ -173,19 +173,26 @@ arms to solve a solved problem. If the run changed files and its checkpoint is
 gone — pruned, or never taken — the environment cannot be rebuilt and the
 result is `unevaluated`.
 
-The rewind covers every file this app's own write and edit tools changed; no
-checkpoint captures what a shell command did. So the evaluation checks its own
-starting state: before any arm runs, it verifies one untouched copy, and if
-that copy *already* satisfies the workspace's verification, the case is a
-solved problem and the result is `unevaluated` — whatever the reason the state
-survived. When the observed run ended with no verification at all, there is
-nothing to check the rebuilt state against, and a run that also used the shell
-is refused rather than evaluated.
+The rewind covers every file this app's own write and edit tools changed. No
+checkpoint captures what a shell command created, changed or deleted, so a run
+that used the shell leaves a rewind that cannot be shown to be complete — its
+copy could still hold part of the procedure's own result, and an arm could then
+"reproduce" a step it never performed. That is refused up front: a real
+isolated evaluation of such a run is `unevaluated`, not attempted.
+
+The evaluation also checks its own starting state, for everything the rewind
+was never going to see. Before any arm runs it verifies one untouched copy, and
+if that copy *already* satisfies the workspace's verification, the case is a
+solved problem and the result is `unevaluated`.
 
 Verification uses the commands configured for the workspace the candidate was
-learned in, taken from the sandbox's own record of what it is a copy of — not
-from whichever folder happens to be open. Evaluating a candidate from a
-different workspace, or with none open, therefore still runs the right checks.
+learned in — not whichever folder happens to be open, and not anything read out
+of the sandbox. An arm may write anywhere inside its own copy, so what a
+sandbox *is*, and which workspace verifies it, come from a registry the app
+keeps outside every sandbox. The file inside marks ownership and authorizes
+nothing. Evaluating a candidate from a different workspace, or with none open,
+therefore still runs the right checks, and a candidate that rewrites that file
+does not change which commands judge it.
 
 The acceptance conditions come from the evidence, not from the proposal. A
 positive case requires every tool the working procedure actually succeeded

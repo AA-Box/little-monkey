@@ -75,10 +75,18 @@ const STATE_FILE: &str = "learning-state-v1.json";
 const STAGING_DIR: &str = "staging";
 /// Disposable per-arm workspaces live here — see [`SkillLearningStore::create_eval_sandboxes`].
 const EVAL_DIR: &str = "eval";
-/// Written into every sandbox the moment it is created. Nothing outside a
-/// directory carrying this marker, under the app's own evaluation root, is
-/// ever accepted as a tool-call workspace override.
+/// Written into every sandbox the moment it is created — an ownership marker,
+/// and nothing more. It lives inside a directory an evaluation arm may write
+/// to, so nothing read out of it is trusted; see [`EVAL_REGISTRY_FILE`].
 const SANDBOX_MARKER: &str = ".little-monkey-eval-sandbox.json";
+/// What each live sandbox actually is, kept beside the evaluation root rather
+/// than inside any sandbox.
+///
+/// An arm runs with its sandbox as its workspace root and may write anywhere
+/// in it, including over the marker. So the two things that decide what an
+/// evaluation *means* — that a path is a sandbox at all, and which workspace's
+/// verification configures it — are read from here, where no arm can reach.
+const EVAL_REGISTRY_FILE: &str = "eval-registry.json";
 /// Bounds on a disposable copy. A workspace that does not fit is not
 /// evaluated — an honest `unevaluated`, never a pass and never a run against
 /// the user's live files.
@@ -503,11 +511,6 @@ pub struct EvaluationEnvironment {
     /// reproducing an already-solved task. A caller that cannot rewind must
     /// refuse to build the environment rather than evaluate against the answer.
     pub requires_pre_task_state: bool,
-    /// The observed run ended on a passing verification, so the evaluation can
-    /// check its own starting state: if the rewound sandbox already satisfies
-    /// that verification, nothing an arm does there proves anything. Without
-    /// it there is no such check, and a partial rewind cannot be caught.
-    pub self_checking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1416,7 +1419,6 @@ impl SkillLearningStore {
             // from the answer.
             requires_pre_task_state: evidence
                 .is_some_and(|evidence| !evidence.changed_files.is_empty()),
-            self_checking: evidence.and_then(RunEvidence::final_verification) == Some(true),
         })
     }
 
@@ -2480,6 +2482,11 @@ impl SkillLearningStore {
         signed_packages: &[crate::native_skills::ExternalSignedSkill],
     ) -> Result<(), SkillError> {
         let _guard = self.lock()?;
+        // No evaluation survives a restart — an interrupted one comes back
+        // re-evaluable below — so every sandbox still on disk is a crash's
+        // leftovers, and a registry entry that outlived its directory would go
+        // on vouching for a path this app no longer owns.
+        self.sweep_eval_sandboxes()?;
         let mut state = self.load()?;
         let mut dirty = false;
         if let Some(marker) = state.in_flight.clone() {
@@ -2692,7 +2699,7 @@ impl SkillLearningStore {
         evaluation_id: &str,
         source: &Path,
         arms: &[String],
-        pre_task: &[PreTaskFile],
+        pre_task: &PreTaskState,
     ) -> Result<Vec<(String, PathBuf)>, SkillError> {
         validate_path_segment(evaluation_id, "an evaluation id")?;
         if !source.is_dir() {
@@ -2701,10 +2708,17 @@ impl SkillLearningStore {
                 source.display()
             )));
         }
+        if !pre_task.complete {
+            return Err(SkillError::Invalid(
+                "the observed run's starting state cannot be fully reproduced, so an isolated evaluation of it would not be measuring the task it claims to"
+                    .to_string(),
+            ));
+        }
         let root = self.root.join(EVAL_DIR).join(evaluation_id);
         let _ = remove_tree(&root);
         ensure_directory(&root)?;
         let mut created = Vec::new();
+        let mut registered = Vec::new();
         for arm in arms {
             validate_path_segment(arm, "an evaluation arm")?;
             let target = root.join(arm);
@@ -2713,30 +2727,78 @@ impl SkillLearningStore {
             copy_bounded(source, &target, &mut budget).inspect_err(|_| {
                 let _ = remove_tree(&root);
             })?;
-            rewind_to_pre_task(source, &target, pre_task).inspect_err(|_| {
+            rewind_to_pre_task(source, &target, &pre_task.files).inspect_err(|_| {
                 let _ = remove_tree(&root);
             })?;
+            // An ownership marker for anyone looking at the directory. It
+            // authorizes nothing: an arm can write anywhere inside its own
+            // sandbox, including here, so nothing that decides what an
+            // evaluation *means* may be read back out of it. That lives in the
+            // registry below, outside every sandbox.
             write_file(
                 &target.join(SANDBOX_MARKER),
                 serde_json::json!({
                     "evaluation_id": evaluation_id,
                     "arm": arm,
-                    "source": source.to_string_lossy(),
                     "created_at_unix_ms": now_unix_ms(),
+                    "note": "Ownership marker only. Nothing here is trusted; see eval-registry.json.",
                 })
                 .to_string()
                 .as_bytes(),
             )?;
+            registered.push((
+                canonical_key(&target),
+                EvalSandboxRecord {
+                    evaluation_id: evaluation_id.to_string(),
+                    arm: arm.clone(),
+                    source: canonical_key(source),
+                },
+            ));
             created.push((arm.clone(), target));
         }
+        self.update_eval_registry(|registry| registry.extend(registered))
+            .inspect_err(|_| {
+                let _ = remove_tree(&root);
+            })?;
         Ok(created)
     }
 
-    /// Removes an evaluation's sandboxes. Called when the evaluation finishes,
-    /// and again at startup for anything a crash left behind.
+    /// Removes an evaluation's sandboxes and their registry entries.
     pub fn destroy_eval_sandboxes(&self, evaluation_id: &str) -> Result<(), SkillError> {
         validate_path_segment(evaluation_id, "an evaluation id")?;
-        remove_tree(&self.root.join(EVAL_DIR).join(evaluation_id))
+        remove_tree(&self.root.join(EVAL_DIR).join(evaluation_id))?;
+        self.update_eval_registry(|registry| {
+            registry.retain(|_, record| record.evaluation_id != evaluation_id)
+        })
+    }
+
+    /// Drops every evaluation sandbox and its registry entry. Called at
+    /// startup: no evaluation survives a restart — an interrupted one comes
+    /// back re-evaluable — so anything still here is a crash's leftovers, and
+    /// a stale registry entry must never outlive the directory it names.
+    fn sweep_eval_sandboxes(&self) -> Result<(), SkillError> {
+        remove_tree(&self.root.join(EVAL_DIR))?;
+        self.update_eval_registry(|registry| registry.clear())
+    }
+
+    fn eval_registry_path(&self) -> PathBuf {
+        self.root.join(EVAL_REGISTRY_FILE)
+    }
+
+    fn update_eval_registry(
+        &self,
+        mutate: impl FnOnce(&mut EvalRegistry),
+    ) -> Result<(), SkillError> {
+        let path = self.eval_registry_path();
+        let mut registry = read_eval_registry(&path);
+        mutate(&mut registry);
+        let bytes = serde_json::to_vec_pretty(&registry)
+            .map_err(|error| SkillError::Io(format!("serialize evaluation registry: {error}")))?;
+        let temporary = path.with_extension("json.tmp");
+        let _ = fs::remove_file(&temporary);
+        write_file(&temporary, &bytes)?;
+        fs::rename(&temporary, &path)
+            .map_err(|error| SkillError::Io(format!("finalize evaluation registry: {error}")))
     }
 
     /// Which folder a workspace-scoped candidate belongs to.
@@ -3797,6 +3859,22 @@ fn same_folder(left: &Path, right: &Path) -> bool {
     }
 }
 
+/// The state the source workspace was in before the observed procedure ran.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreTaskState {
+    pub files: Vec<PreTaskFile>,
+    /// Every change the observed run made to the workspace is in `files`.
+    ///
+    /// False when the run ran a shell command: no checkpoint captures what a
+    /// shell created, changed or deleted, so the rewind would be partial and
+    /// the copy could still hold part of the procedure's own result. An arm
+    /// could then "reproduce" a step it never performed — and a leftover that
+    /// does not by itself satisfy the verification is invisible to any check
+    /// made after the fact. So a partial state is refused up front rather than
+    /// evaluated and second-guessed.
+    pub complete: bool,
+}
+
 /// One file as it stood before the observed procedure ran — the learning
 /// module's own view of `checkpoints::PreTurnFile`, so this module keeps
 /// depending on nothing but paths and bytes.
@@ -3914,41 +3992,73 @@ fn copy_bounded(source: &Path, target: &Path, budget: &mut CopyBudget) -> Result
 /// file this module writes. A forged value can therefore at worst name a
 /// directory the app itself created for exactly this purpose.
 pub fn require_eval_sandbox(data_root: &Path, path: &str) -> Result<PathBuf, String> {
-    let strip = |path: PathBuf| {
-        let text = path.to_string_lossy().to_string();
-        match text.strip_prefix(r"\\?\") {
-            Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
-            _ => path,
-        }
-    };
-    let canon = Path::new(path)
-        .canonicalize()
-        .map(strip)
-        .map_err(|_| format!("'{path}' is not a managed evaluation sandbox."))?;
-    let root = data_root
-        .join(LEARNING_ROOT)
-        .join(EVAL_DIR)
-        .canonicalize()
-        .map(strip)
-        .map_err(|_| format!("'{path}' is not a managed evaluation sandbox."))?;
-    if !canon.starts_with(&root) || !canon.join(SANDBOX_MARKER).is_file() {
-        return Err(format!("'{path}' is not a managed evaluation sandbox."));
-    }
-    Ok(canon)
+    Ok(eval_sandbox_identity(data_root, path)?.0)
 }
 
-/// The workspace a verified evaluation sandbox is a copy of, read from the
-/// marker this module wrote when it created the sandbox.
+/// A verified sandbox and the workspace it is a copy of.
 ///
-/// The configuration an arm is verified with has to come from the workspace
-/// the candidate was learned in — not from whichever folder happens to be
-/// open in the window. Pass a path [`require_eval_sandbox`] already accepted;
-/// this only reads the marker inside it.
-pub fn eval_sandbox_source(sandbox: &Path) -> Option<PathBuf> {
-    let raw = fs::read(sandbox.join(SANDBOX_MARKER)).ok()?;
-    let marker: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-    let source = marker.get("source")?.as_str()?;
-    (!source.is_empty()).then(|| PathBuf::from(source))
+/// Both answers come from the registry beside the evaluation root, never from
+/// the sandbox's own contents: an arm may write anywhere inside its sandbox,
+/// so a candidate that edited the marker could otherwise choose which
+/// workspace's verification commands decide whether it passed.
+pub fn eval_sandbox_identity(data_root: &Path, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    let learning_root = data_root.join(LEARNING_ROOT);
+    let canon = strip_verbatim(
+        Path::new(path)
+            .canonicalize()
+            .map_err(|_| format!("'{path}' is not a managed evaluation sandbox."))?,
+    );
+    let root = strip_verbatim(
+        learning_root
+            .join(EVAL_DIR)
+            .canonicalize()
+            .map_err(|_| format!("'{path}' is not a managed evaluation sandbox."))?,
+    );
+    let registry = read_eval_registry(&learning_root.join(EVAL_REGISTRY_FILE));
+    let record = registry
+        .get(&canon.to_string_lossy().to_string())
+        .ok_or_else(|| format!("'{path}' is not a managed evaluation sandbox."))?;
+    if !canon.starts_with(&root) {
+        return Err(format!("'{path}' is not a managed evaluation sandbox."));
+    }
+    Ok((canon, PathBuf::from(&record.source)))
+}
+
+/// Windows canonicalization returns `\\?\`-prefixed verbatim paths, which
+/// neither compare nor round-trip the way the rest of this module expects.
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+/// Canonical string form of a path, for use as a registry key. Falls back to
+/// the path as given when it cannot be canonicalized.
+fn canonical_key(path: &Path) -> String {
+    strip_verbatim(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Live evaluation sandboxes, keyed by canonical path. Missing or unreadable
+/// reads as empty, which fails every lookup closed.
+type EvalRegistry = BTreeMap<String, EvalSandboxRecord>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct EvalSandboxRecord {
+    evaluation_id: String,
+    arm: String,
+    /// Canonical path of the workspace this sandbox is a copy of.
+    source: String,
+}
+
+fn read_eval_registry(path: &Path) -> EvalRegistry {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// The digest an approval binds to: everything the user is shown before they
@@ -6186,7 +6296,7 @@ mod tests {
         let arms = vec!["baseline-positive".to_string()];
         // Without the rewind the sandbox is a copy of the solved workspace.
         let solved = store
-            .create_eval_sandboxes("eval-nostate", &workspace, &arms, &[])
+            .create_eval_sandboxes("eval-nostate", &workspace, &arms, &reproducible(Vec::new()))
             .unwrap();
         assert_eq!(
             fs::read_to_string(solved[0].1.join("src/uploader.rs")).unwrap(),
@@ -6218,10 +6328,10 @@ mod tests {
                 "eval-created",
                 &workspace,
                 &arms,
-                &[PreTaskFile {
+                &reproducible(vec![PreTaskFile {
                     path: created.clone(),
                     contents: None,
-                }],
+                }]),
             )
             .unwrap();
         assert!(!rewound[0].1.join("src/retry.rs").exists());
@@ -6233,10 +6343,10 @@ mod tests {
             "eval-elsewhere",
             &workspace,
             &arms,
-            &[PreTaskFile {
+            &reproducible(vec![PreTaskFile {
                 path: PathBuf::from("/somewhere/else/uploader.rs"),
                 contents: Some(b"whatever".to_vec()),
-            }],
+            }]),
         );
         assert!(matches!(elsewhere, Err(SkillError::Invalid(_))));
     }
@@ -6290,9 +6400,6 @@ mod tests {
         // The observed run changed files, so an arm that is not rewound would
         // start from the answer — the caller must refuse instead.
         assert!(environment.requires_pre_task_state);
-        // It ended verified, so the evaluator can check its own starting state
-        // and catch a rewind that a shell command left incomplete.
-        assert!(environment.self_checking);
     }
 
     /// A candidate belongs to the folder it was learned in. Acting on it from
@@ -6371,13 +6478,15 @@ mod tests {
             .any(|entry| entry.command == "retry-wrapper"));
     }
 
-    /// Every sandbox records which workspace it is a copy of, so the
-    /// verification an arm runs is configured by the workspace the candidate
-    /// was learned in — not by whichever folder is open, or none at all.
+    /// Which workspace's verification an arm is measured by comes from the
+    /// backend's registry, not from anything inside the sandbox. An arm may
+    /// write anywhere in its own copy, so a candidate that rewrote the marker
+    /// must not get to choose the commands that decide whether it passed.
     #[test]
-    fn a_sandbox_names_the_workspace_its_verification_must_come_from() {
+    fn a_sandbox_cannot_rewrite_which_workspace_verifies_it() {
         let directory = TestDirectory::new("sandbox-source");
         let work = TestDirectory::new("sandbox-source-workspace");
+        let elsewhere = TestDirectory::new("sandbox-source-elsewhere");
         let store = store(&directory);
         seed_workspace(work.path());
         let sandboxes = store
@@ -6385,16 +6494,107 @@ mod tests {
                 "eval-source",
                 work.path(),
                 &["candidate-positive".to_string()],
-                &[],
+                &reproducible(Vec::new()),
             )
             .unwrap();
+        let sandbox = sandboxes[0].1.to_string_lossy().to_string();
+        let identity = |path: &str| eval_sandbox_identity(directory.path(), path);
         assert_eq!(
-            eval_sandbox_source(&sandboxes[0].1),
-            Some(work.path().to_path_buf())
+            identity(&sandbox).unwrap().1,
+            work.path().canonicalize().unwrap()
         );
-        // A directory that is not a sandbox has no source to speak for it.
-        assert_eq!(eval_sandbox_source(work.path()), None);
+
+        // The arm rewrites the marker to name a workspace whose verification
+        // commands it would rather be judged by. The answer does not move.
+        fs::write(
+            sandboxes[0].1.join(SANDBOX_MARKER),
+            serde_json::json!({ "source": elsewhere.path().to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            identity(&sandbox).unwrap().1,
+            work.path().canonicalize().unwrap()
+        );
+
+        // Deleting the marker outright does not help either: membership is the
+        // registry's answer, and the registry is outside every sandbox.
+        fs::remove_file(sandboxes[0].1.join(SANDBOX_MARKER)).unwrap();
+        assert_eq!(
+            identity(&sandbox).unwrap().1,
+            work.path().canonicalize().unwrap()
+        );
+
+        // A directory this app did not create for the purpose is refused, and
+        // a destroyed sandbox stops being one the moment it is destroyed.
+        assert!(identity(&work.path().to_string_lossy()).is_err());
         store.destroy_eval_sandboxes("eval-source").unwrap();
+        assert!(identity(&sandbox).is_err());
+    }
+
+    /// A crash leaves sandboxes behind. Startup drops them AND the registry
+    /// entries that vouch for them, so a path this app no longer owns can
+    /// never be handed back as a workspace override.
+    #[test]
+    fn a_restart_forgets_every_sandbox_a_crash_left_behind() {
+        let directory = TestDirectory::new("sandbox-sweep");
+        let work = TestDirectory::new("sandbox-sweep-workspace");
+        seed_workspace(work.path());
+        let sandbox = {
+            let store = store(&directory);
+            let sandboxes = store
+                .create_eval_sandboxes(
+                    "eval-crash",
+                    work.path(),
+                    &["candidate-positive".to_string()],
+                    &reproducible(Vec::new()),
+                )
+                .unwrap();
+            sandboxes[0].1.to_string_lossy().to_string()
+        };
+        assert!(eval_sandbox_identity(directory.path(), &sandbox).is_ok());
+
+        let restarted = store(&directory);
+        let manager = manager(&directory);
+        restarted.reconcile(&manager, None, &[]).unwrap();
+        assert!(!Path::new(&sandbox).exists());
+        assert!(eval_sandbox_identity(directory.path(), &sandbox).is_err());
+    }
+
+    /// A run that used the shell cannot have its starting state reproduced —
+    /// no checkpoint captures what a shell created — so the environment is
+    /// refused rather than built out of a state that may still hold part of
+    /// the procedure's own result.
+    #[test]
+    fn a_starting_state_that_cannot_be_fully_rebuilt_is_refused() {
+        let directory = TestDirectory::new("partial-rewind");
+        let work = TestDirectory::new("partial-rewind-workspace");
+        let store = store(&directory);
+        seed_workspace(work.path());
+        let refused = store.create_eval_sandboxes(
+            "eval-partial",
+            work.path(),
+            &["candidate-positive".to_string()],
+            &PreTaskState {
+                files: Vec::new(),
+                complete: false,
+            },
+        );
+        assert!(
+            matches!(&refused, Err(SkillError::Invalid(message)) if message.contains("cannot be fully reproduced")),
+            "{refused:?}"
+        );
+        // Nothing was left on disk for an arm to run in anyway.
+        assert!(eval_sandbox_identity(
+            directory.path(),
+            &directory
+                .path()
+                .join(LEARNING_ROOT)
+                .join(EVAL_DIR)
+                .join("eval-partial")
+                .join("candidate-positive")
+                .to_string_lossy()
+        )
+        .is_err());
     }
 
     #[test]
@@ -6899,16 +7099,27 @@ mod tests {
 
     /// The pre-task state of the observed turn, read the way the production
     /// command reads it.
-    fn pre_task_of(checkpoints_dir: &Path, checkpoint_id: &str) -> Vec<PreTaskFile> {
-        crate::checkpoints::pre_turn_state(checkpoints_dir, checkpoint_id)
-            .unwrap()
-            .files
-            .into_iter()
-            .map(|file| PreTaskFile {
-                path: file.path,
-                contents: file.contents,
-            })
-            .collect()
+    fn pre_task_of(checkpoints_dir: &Path, checkpoint_id: &str) -> PreTaskState {
+        let state = crate::checkpoints::pre_turn_state(checkpoints_dir, checkpoint_id).unwrap();
+        PreTaskState {
+            files: state
+                .files
+                .into_iter()
+                .map(|file| PreTaskFile {
+                    path: file.path,
+                    contents: file.contents,
+                })
+                .collect(),
+            complete: !state.shell_ran,
+        }
+    }
+
+    /// A fully reproducible pre-task state made of these files.
+    fn reproducible(files: Vec<PreTaskFile>) -> PreTaskState {
+        PreTaskState {
+            files,
+            complete: true,
+        }
     }
 
     fn verification_command() -> crate::verify::VerifyCommand {
@@ -6993,7 +7204,7 @@ mod tests {
         store: &SkillLearningStore,
         candidate_id: &str,
         workspace: &Path,
-        pre_task: &[PreTaskFile],
+        pre_task: &PreTaskState,
     ) -> EvaluationRecord {
         let plan = store.plan_evaluation(candidate_id).unwrap();
         let arms = plan
