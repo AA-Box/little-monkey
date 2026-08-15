@@ -243,6 +243,16 @@ mod tools;
 // Long-running agent shell commands that outlive the turn that started them
 // (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
 pub mod background_shell;
+// The process-table lifecycle every bounded agent-controlled execution shares:
+// the verify runner, the hook runner and the sandbox run, which were bounded by
+// a resource controller long before any of them had a row.
+pub mod bounded_execution;
+// What a new app session may conclude about native work an old one left behind —
+// and, crucially, what it may not.
+pub mod orphan_reclaim;
+// The one Windows spawn ordering: suspended, assigned, verified, resumed — so no
+// agent-controlled workload runs an instruction before its job holds it.
+pub mod managed_spawn_windows;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;
@@ -334,6 +344,20 @@ pub mod process_table;
 // report. Separate from `process_table` because it is all platform syscalls and
 // no storage.
 pub mod process_usage;
+// The tree half of the same question: what does the workload rooted at this pid
+// hold, and how many processes are in it. Reads the kernel's own process table
+// rather than forking `ps`, so it can follow parent links a process group loses.
+pub mod process_tree;
+// The one contract every native child-process owner installs its limits
+// through: capability, preparation, attachment, sampling and tree termination.
+pub mod resource_control;
+// The two kernel-held backends behind that contract. Gated per OS rather than
+// stubbed: a host that cannot hold a bound must not compile a module that
+// claims to.
+#[cfg(target_os = "linux")]
+pub mod resource_control_cgroup;
+#[cfg(windows)]
+pub mod resource_control_job;
 // Policy shared by the two HTTP listeners, which default to the same port and
 // today report a bare "address already in use" naming neither the winner nor
 // the reason. Where the shared pieces accumulate as D1 collapses them into one.
@@ -1203,6 +1227,7 @@ pub fn run() {
             process_commands::process_link_run,
             process_commands::process_reap_missing,
             process_commands::process_usage_ledger,
+            process_commands::process_resource_report,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,

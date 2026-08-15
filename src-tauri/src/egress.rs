@@ -3011,7 +3011,27 @@ mod tests {
                 .iter()
                 .find(|(label, _)| *label == Unattributed::UserAction.code())
                 .expect("the request was logged under the reason it had no run");
-            assert_eq!(drain.seen.len(), 1);
+            // Identified by *this* host's port rather than by being the only
+            // entry. `exclusive_log` clears the sink on the way in, but the sink
+            // is process-wide and every other test in this binary that makes a
+            // scope-less request writes to it while this one runs — the closing
+            // comment below already says exactly that. `seen.len() == 1`
+            // therefore held only while the suite was small enough that nothing
+            // else landed inside the window, and began failing at four entries
+            // once the binary gained more parallel tests.
+            //
+            // The port makes this stricter than the count ever was: a `FakeHost`
+            // binds its own, so this now asserts that the destination recorded
+            // under the reason is the one *this* request went to, which a
+            // neighbouring test's entry could previously have satisfied.
+            let (destination, requests) = drain
+                .seen
+                .iter()
+                .find(|(destination, _)| destination.port == host.port())
+                .expect("this request's destination is recorded under its reason");
+            assert_eq!(destination.host, "127.0.0.1");
+            assert_eq!(destination.scheme, "http");
+            assert_eq!(*requests, 1);
             assert_eq!(drain.overflowed, 0);
 
             let ledger = RunLedger::open_in_memory().expect("an in-memory ledger opens");
@@ -3026,10 +3046,14 @@ mod tests {
             let recorded = stored
                 .get(Unattributed::UserAction.code())
                 .expect("the reason has a destination list");
-            assert_eq!(recorded.destinations.len(), 1);
-            assert_eq!(recorded.destinations[0].host, "127.0.0.1");
-            assert_eq!(recorded.destinations[0].scheme, "http");
-            assert_eq!(recorded.destinations[0].requests, 1);
+            let destination = recorded
+                .destinations
+                .iter()
+                .find(|destination| destination.port == host.port())
+                .expect("this request's destination round-trips through the ledger");
+            assert_eq!(destination.host, "127.0.0.1");
+            assert_eq!(destination.scheme, "http");
+            assert_eq!(destination.requests, 1);
             assert_eq!(recorded.dropped, 0);
 
             // The drain is a drain: a second one reports nothing *for this
@@ -3800,9 +3824,7 @@ mod tests {
     ///
     /// This scan used to look for `Client::new()` alone, and pinned **5** bare
     /// production sites in four files while **30** `Client::builder()` chains
-    /// stood next to them unseen. (`docs/agent-os-roadmap.md` said "8", which
-    /// matched neither the table below it nor the tree — a third wrong count in
-    /// an entry whose subject is wrong counts.) Both are the same defect class —
+    /// stood next to them unseen. Both are the same defect class —
     /// a client built somewhere
     /// other than [`hardened`], with whatever budget and redirect policy its
     /// author happened to think of — so the count that matters is the sum, and a
@@ -3924,8 +3946,7 @@ mod tests {
             // by construction. Its integrity guarantee is a SHA-256 check rather
             // than an origin pin, and reqwest strips `Authorization` cross-host
             // anyway. It sets a connect timeout, `egress::READ_TIMEOUT`, a hop cap
-            // and its own per-hop SSRF check. `docs/agent-os-roadmap.md` carries
-            // the long form.
+            // and its own per-hop SSRF check.
             ("model_sources.rs", 0, 1),
             // `download_to_file`, the same shape and the same reason, likewise on
             // `egress::READ_TIMEOUT`.
@@ -4068,7 +4089,6 @@ mod tests {
         /// B and C are recorded rather than fixed: both need a product decision
         /// about what the ceiling should be, not a mechanical conversion, and a
         /// `read_timeout` alone would let a wedged local model hang forever.
-        /// `docs/agent-os-roadmap.md` carries the detail.
         const TOTAL_TIMEOUT_ALLOWED: &[(&str, usize)] = &[
             // 8s for two favicon candidates. `MAX_FAVICON_BYTES` (256 KiB) is
             // checked *after* `bytes()` has already buffered the body, so the

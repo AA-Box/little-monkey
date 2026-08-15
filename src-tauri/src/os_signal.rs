@@ -118,6 +118,39 @@ const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_millis(25
 /// - **Windows**: `taskkill /T` walks the child tree by parent, so `pid` is just
 ///   the child's own id and no group is needed. TERM/KILL is not a distinction
 ///   Windows offers here, so it is one forced termination.
+/// SIGKILL one process, and only if it is still the process that was recorded.
+///
+/// The identity check is not a nicety: a pid the kernel has since handed to an
+/// unrelated process fails it and is skipped, because killing the user's editor
+/// because a compiler exited and its pid was reused is a far worse outcome than
+/// leaving one process alive.
+#[cfg(unix)]
+pub fn kill_by_identity(identity: crate::process_tree::ProcessIdentity) {
+    if !identity.is_still_alive() {
+        return;
+    }
+    let Ok(target) = libc::pid_t::try_from(identity.pid) else {
+        return;
+    };
+    // 0 is "every process in our own group" and negatives name a group, so
+    // neither is a question about one process — and one of them would signal this
+    // app. 1 is init.
+    if target <= 1 {
+        return;
+    }
+    // Safe: signals one pid whose identity was checked on the line above. A
+    // process that exited in between answers ESRCH, which is the wanted outcome.
+    unsafe { libc::kill(target, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+pub fn kill_by_identity(identity: crate::process_tree::ProcessIdentity) {
+    if !identity.is_still_alive() {
+        return;
+    }
+    let _ = terminate_process_group(identity.pid);
+}
+
 pub fn terminate_process_group(pid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
