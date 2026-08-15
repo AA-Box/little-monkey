@@ -1,19 +1,27 @@
-//! The two loops that make channels move: inbound polling and the outbox.
+//! The loops that make channels move: inbound polling, the accepted-message
+//! processor, and the outbox.
 //!
-//! Both are deliberately small and both are crash-safe by construction rather
-//! than by care:
+//! All three are deliberately small and all three are crash-safe by
+//! construction rather than by care:
 //!
-//! - **Inbound.** An adapter's batch is handed one envelope at a time to
-//!   `channel_ingress::plan_channel_ingress`, which records and deduplicates
+//! - **Polled inbound.** An adapter's batch is handed one envelope at a time to
+//!   `channel_ingress::accept_channel_envelope`, which records and deduplicates
 //!   before it decides anything. The transport cursor is only advanced *after*
 //!   the batch is durably recorded, so a crash mid-batch replays messages that
 //!   the event log then collapses — the opposite order would lose them.
+//! - **Delivered-to inbound.** A webhook provider is answered as soon as its
+//!   event is committed, which is before anything has been downloaded, routed
+//!   or run. Everything after that acknowledgement is
+//!   [`process_pending_channel_ingress`], which continues each accepted row —
+//!   hydrate, decide, freeze, submit — and picks up wherever a restart left
+//!   off. That split is the whole reason a provider is never made to wait on a
+//!   media host, a route table or a queue.
 //! - **Outbound.** A claimed row is in `sending` before the request goes out.
 //!   If the process dies there, `requeue_stuck_sending` moves it to
 //!   `needs_reconciliation` rather than retrying it, because a send that may
 //!   have reached the provider is not safe to repeat.
 //!
-//! Neither loop executes an agent. Inbound work becomes a normal durable run
+//! None of them executes an agent. Inbound work becomes a normal durable run
 //! through [`RunQueue`], which production implements with the daemon's one
 //! `enqueue`.
 
@@ -252,6 +260,211 @@ pub(crate) fn ingest_batch(
     report
 }
 
+/// How many accepted-but-unprocessed inbound events one pass continues.
+///
+/// Bounded like every other sweep here: a backlog must not hold the supervisor
+/// tick, and what is left is picked up two seconds later.
+const PENDING_BATCH: u32 = 32;
+
+/// How long one message's files may hold the channel worker.
+///
+/// No provider socket is waiting on this any more — the delivery was
+/// acknowledged before any of it started — so the budget is generous. It
+/// exists only so one media host that has gone quiet cannot stall every other
+/// account's messages behind it for the download client's own ten minutes.
+/// Blowing it costs the attachment, never the message.
+const HYDRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What one pass over the accepted-but-unprocessed events did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PendingIngressReport {
+    /// Messages that now own a queued run.
+    pub queued: u32,
+    /// Messages that reached a final decision that never runs — ignored,
+    /// challenged, refused, or already handled by an earlier pass.
+    pub settled: u32,
+    /// Durably accepted turns that did not reach the queue this pass. Not
+    /// lost: `recover_pending_ingress` owns them from here.
+    pub deferred: u32,
+    /// Rows recorded as failed, for an operator to look at.
+    pub parked: u32,
+}
+
+/// Continue every inbound event that was accepted but never processed.
+///
+/// **This is everything the webhook route deliberately does not do.** A
+/// delivered-to provider is acknowledged as soon as its event is committed, so
+/// each row here is a message that is already ours and is owed the rest of the
+/// path: download what it referenced, decide it against the operator's policy
+/// and routes, freeze what it will execute with, and submit the run.
+///
+/// Every step is restart-safe because each one commits before the next begins.
+/// A process that dies anywhere in here leaves a row that the next pass — in
+/// this process or the one after the restart — selects again and continues
+/// from, and the acceptance transaction underneath collapses a redelivery onto
+/// the same turn. The result either way is exactly one run per provider event.
+///
+/// `fetchers` are the account adapters the supervisor already keeps loaded; an
+/// account with no adapter loaded still has its message decided, with the files
+/// it could not fetch carrying that as their reason rather than silently
+/// looking like no attachment at all.
+pub(crate) async fn process_pending_channel_ingress(
+    store: &mut DaemonStore,
+    queue: &dyn RunQueue,
+    fetchers: &BTreeMap<String, Arc<dyn ChannelAdapter>>,
+    blobs: &dyn super::channel_adapter::BlobSource,
+    now_ms: i64,
+) -> Result<PendingIngressReport, String> {
+    let mut report = PendingIngressReport::default();
+    for pending in store.accepted_events_awaiting_processing(PENDING_BATCH)? {
+        let envelope: ChannelEnvelope = match serde_json::from_str(&pending.envelope_json) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                // Unreadable, so it can never be decided. Recorded as failed
+                // where an operator can see it rather than left to be selected
+                // again forever.
+                let _ = store.set_channel_event_disposition(
+                    &pending.event_id,
+                    EventDisposition::Failed,
+                    Some(&format!(
+                        "This message was accepted but its stored envelope cannot be read \
+                         back: {error}"
+                    )),
+                    None,
+                );
+                report.parked += 1;
+                continue;
+            }
+        };
+        let envelope = hydrate_pending_event(store, fetchers, blobs, &pending, envelope).await?;
+        super::fail_points::fire(super::fail_points::FailPoint::AfterAttachmentHydration)?;
+
+        match channel_ingress::accept_channel_envelope(store, queue, &envelope, now_ms) {
+            Ok(ChannelAcceptance::Run {
+                event_id,
+                ingress_id,
+                ingress,
+                params,
+                attempts,
+            }) => match channel_ingress::submit_accepted_turn(
+                store,
+                queue,
+                &ingress,
+                &params,
+                &ingress_id,
+                attempts,
+                now_ms,
+            ) {
+                Ok(SubmitOutcome::Queued { job_id, .. })
+                | Ok(SubmitOutcome::AlreadyQueued { job_id, .. }) => {
+                    report.queued += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        None,
+                        Some(&job_id),
+                    );
+                }
+                Ok(SubmitOutcome::Parked { .. }) => {
+                    report.parked += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Failed,
+                        Some("The turn could not be queued and was parked"),
+                        None,
+                    );
+                }
+                Ok(SubmitOutcome::Deferred { error, .. }) | Err(error) => {
+                    // The turn is durable and the event now points at it, so
+                    // this row leaves this queue and `recover_pending_ingress`
+                    // takes it from here.
+                    report.deferred += 1;
+                    let _ = store.set_channel_event_disposition(
+                        &event_id,
+                        EventDisposition::Accepted,
+                        Some(&error),
+                        None,
+                    );
+                }
+            },
+            Ok(_) => report.settled += 1,
+            // Nothing was committed, so the row keeps its place in this queue
+            // and the next pass tries again — a store that is briefly
+            // unavailable must not turn an accepted message into a failed one.
+            // The reason is written where an operator reads it, so a row that
+            // keeps failing is visible rather than silently stuck.
+            Err(error) => {
+                report.deferred += 1;
+                let _ = store.set_channel_event_disposition(
+                    &pending.event_id,
+                    EventDisposition::Accepted,
+                    Some(&error),
+                    None,
+                );
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Download whatever one accepted event referenced, and store the result.
+///
+/// Persisted before the message is routed, which is what makes a crash here
+/// cost nothing: a file already on disk is not fetched twice, and one that
+/// failed carries its reason into the turn instead of reading as no attachment
+/// at all.
+async fn hydrate_pending_event(
+    store: &mut DaemonStore,
+    fetchers: &BTreeMap<String, Arc<dyn ChannelAdapter>>,
+    blobs: &dyn super::channel_adapter::BlobSource,
+    pending: &super::channel_store::PendingChannelEvent,
+    envelope: ChannelEnvelope,
+) -> Result<ChannelEnvelope, String> {
+    let mut batch = [envelope];
+    if !super::channel_adapter::needs_hydration(&batch) {
+        let [envelope] = batch;
+        return Ok(envelope);
+    }
+    let limits = store
+        .channel_account(&pending.account_id)
+        .ok()
+        .flatten()
+        .map(|account| {
+            super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config)
+        })
+        .unwrap_or_default();
+    match fetchers.get(&pending.account_id) {
+        Some(adapter) => {
+            let hydration = super::channel_adapter::hydrate_attachments(
+                adapter.as_ref(),
+                blobs,
+                limits,
+                &mut batch,
+            );
+            if tokio::time::timeout(HYDRATION_BUDGET, hydration)
+                .await
+                .is_err()
+            {
+                super::channel_adapter::note_unfetched_attachments(
+                    &mut batch,
+                    "The provider's media host did not answer in time",
+                );
+            }
+        }
+        None => super::channel_adapter::note_unfetched_attachments(
+            &mut batch,
+            "This account's provider connection was not running when the file was due to be \
+             downloaded",
+        ),
+    }
+    store.set_channel_event_envelope(
+        &pending.event_id,
+        &serde_json::to_string(&batch[0]).map_err(|error| error.to_string())?,
+    )?;
+    let [envelope] = batch;
+    Ok(envelope)
+}
+
 /// Poll one account once and ingest whatever it returned.
 pub(crate) async fn poll_account_once(
     store: &mut DaemonStore,
@@ -466,27 +679,6 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
 
         let queue: Arc<dyn RunQueue> = Arc::new(super::DaemonChannelQueue::new(paths.clone()));
 
-        // Inbound events an older build recorded as accepted without ever
-        // creating the turn they promised. Once, at start: this build cannot
-        // produce one, so a sweep on every tick would be a query looking for a
-        // state its own code makes impossible.
-        if let (Ok(mut store), Ok(now)) = (DaemonStore::open(&paths), current_ms()) {
-            match channel_ingress::recover_orphaned_channel_events(&mut store, queue.as_ref(), now)
-            {
-                Ok(recovery) if recovery.recovered + recovery.deferred + recovery.parked > 0 => {
-                    eprintln!(
-                        "monkey daemon: recovered {} inbound message(s) left unfinished by an earlier build, {} parked",
-                        recovery.recovered + recovery.deferred,
-                        recovery.parked
-                    )
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    eprintln!("monkey daemon: could not check for unfinished messages: {error}")
-                }
-            }
-        }
-
         let mut workers: BTreeMap<String, AccountWorker> = BTreeMap::new();
         let mut next_reload_ms = 0_u64;
         // Zero, so the first pass through the loop is the startup recovery.
@@ -540,6 +732,30 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
                 .map(|(account_id, worker)| (account_id.clone(), worker.adapter.clone()))
                 .collect();
             let mut worked = false;
+            // Messages a delivered-to provider has already been told we have.
+            // Everything past the acknowledgement happens here — the download,
+            // the routing, the run — so this is also the pass that finishes
+            // whatever a restart interrupted.
+            match process_pending_channel_ingress(
+                &mut store,
+                queue.as_ref(),
+                &adapters,
+                &super::channel_adapter::DaemonBlobs,
+                now,
+            )
+            .await
+            {
+                Ok(report) => {
+                    worked |= report.queued + report.settled + report.parked > 0;
+                    if report.parked > 0 {
+                        eprintln!(
+                            "monkey daemon: {} accepted message(s) could not be handled",
+                            report.parked
+                        );
+                    }
+                }
+                Err(error) => eprintln!("monkey daemon: channel ingress: {error}"),
+            }
             match drain_outbox_once(&mut store, &adapters, now).await {
                 Ok(report) => worked |= report.sent + report.retrying > 0,
                 Err(error) => eprintln!("monkey daemon: channel outbox: {error}"),
@@ -856,10 +1072,13 @@ fn reconcile_workers_with(
         let built = if is_sms {
             build_sms_adapter(paths, store, secrets, &account.account_id)
         } else {
-            super::adapters::build_adapter(&AdapterConfig {
-                account: &account,
-                secret,
-            })
+            super::adapters::build_adapter(
+                &AdapterConfig {
+                    account: &account,
+                    secret,
+                },
+                Some(paths),
+            )
         };
         let adapter = match built {
             Ok(adapter) => adapter,
@@ -1164,8 +1383,11 @@ mod tests {
         assert_eq!(events[0].disposition, EventDisposition::Ignored);
         assert!(events[0].ingress_id.is_none());
         assert!(queue.submitted.lock().unwrap().is_empty());
-        // Nothing for a recovery pass to find: the decision is the whole story.
-        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+        // Nothing for a later pass to find: the decision is the whole story.
+        assert!(store
+            .accepted_events_awaiting_processing(10)
+            .unwrap()
+            .is_empty());
     }
 
     /// One envelope that could not be committed holds the ordinal cursor for
@@ -1932,7 +2154,16 @@ mod tests {
         let mut request = send_to("chat-9", "");
         request.artifact_ids = vec![blob.id.clone()];
         let plan = plan_send(&request, &account_authority(), None).expect("authorized");
-        queue_send(&mut store, &paths, &request, &plan, None, &invocation("job-a", "call-1"), NOW).expect("queued");
+        queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &invocation("job-a", "call-1"),
+            NOW,
+        )
+        .expect("queued");
 
         let adapter = Arc::new(FakeAdapter::new());
         let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 60_000)
@@ -2058,8 +2289,16 @@ mod tests {
         let request = send_to("chat-9", "the build passed");
         let plan = plan_send(&request, &account_authority(), None).expect("authorized");
 
-        let first =
-            queue_send(&mut store, &paths, &request, &plan, None, &invocation("job-x", "call-4"), NOW).expect("first");
+        let first = queue_send(
+            &mut store,
+            &paths,
+            &request,
+            &plan,
+            None,
+            &invocation("job-x", "call-4"),
+            NOW,
+        )
+        .expect("first");
         assert_eq!(first["status"], "queued");
 
         // The replay carries the same invocation identity, so it recomputes
@@ -2206,8 +2445,8 @@ mod tests {
 
         let first = send_to("C1", "hello");
         let plan = plan_send(&first, &both, None).expect("authorized");
-        let queued = queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW)
-            .expect("queued");
+        let queued =
+            queue_send(&mut store, &paths, &first, &plan, None, &same_call, NOW).expect("queued");
         assert_eq!(queued["status"], "queued");
 
         let elsewhere = ChannelSendRequest {
@@ -2356,8 +2595,16 @@ mod tests {
             },
         ] {
             let plan = plan_send(&changed, &account_authority(), None).expect("authorized");
-            let error = queue_send(&mut store, &paths, &changed, &plan, None, &same_call, NOW + 5)
-                .expect_err("the same invocation with a changed target");
+            let error = queue_send(
+                &mut store,
+                &paths,
+                &changed,
+                &plan,
+                None,
+                &same_call,
+                NOW + 5,
+            )
+            .expect_err("the same invocation with a changed target");
             assert!(error.contains("consistency"), "{error}");
         }
         assert_eq!(store.outbox_count_for_job("job-1").unwrap(), 1);
@@ -2411,10 +2658,9 @@ mod tests {
         assert_eq!(store.outbox_count_for_job("job-r").unwrap(), 1);
 
         let adapter = Arc::new(FakeAdapter::new());
-        let report =
-            drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 120_000)
-                .await
-                .expect("drain");
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW + 120_000)
+            .await
+            .expect("drain");
         assert_eq!(report.sent, 1);
         assert_eq!(adapter.sent.lock().unwrap().len(), 1);
     }

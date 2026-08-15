@@ -167,6 +167,29 @@ describe("provider settings", () => {
     expect(parts("google_chat")).toEqual([]);
   });
 
+  it("names the one Google Chat authentication audience the daemon verifies", () => {
+    // Google Chat mints a different token for each of its two Authentication
+    // Audience values, and only the Project Number one is verified here.
+    // Setup that left the choice open is how an operator ends up with a
+    // callback Google calls and this app refuses.
+    const guide = PROVIDER_GUIDES.find((entry) => entry.kind === "google_chat")!;
+    expect(guide.configFields.map((field) => field.key)).toEqual(["project_number", "bot_user_name"]);
+    const projectNumber = guide.configFields.find((field) => field.key === "project_number")!;
+    expect(projectNumber.required).toBe(true);
+    expect(guide.whereToGetIt).toContain("Connection settings: HTTP endpoint URL");
+    expect(guide.whereToGetIt).toContain("Authentication Audience: Project Number");
+    expect(guide.whereToGetIt).toContain("App URL is the other Authentication Audience value and is not supported");
+  });
+
+  it("offers no Microsoft Teams cloud setting, because only one cloud works", () => {
+    // A box for a sovereign-cloud endpoint would imply the rest of the Teams
+    // checks follow it. They do not: the issuer, the key document, the token
+    // scope and the reply hosts are all the public cloud's.
+    const guide = PROVIDER_GUIDES.find((entry) => entry.kind === "teams")!;
+    expect(guide.configFields.map((field) => field.key)).toEqual(["app_id", "tenant_id"]);
+    expect(guide.whereToGetIt).toContain("public Bot Framework cloud");
+  });
+
   it("has no duplicate providers", () => {
     const kinds = PROVIDER_GUIDES.map((guide) => guide.kind);
     expect(new Set(kinds).size).toBe(kinds.length);

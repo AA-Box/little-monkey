@@ -20,10 +20,21 @@ use std::sync::Mutex;
 
 /// One RSA public key's `n`/`e` components, raw big-endian bytes (already
 /// base64url-decoded from the JWKS JSON — never DER, never a PEM).
+///
+/// `endorsements` is carried because one of the two providers needs it: the
+/// Bot Framework publishes, per key, the list of channels that key is allowed
+/// to sign for, and dropping it here would make that check unimplementable
+/// without a second parser. Google's JWKS declares none, so the vector is
+/// empty there and nothing about that provider's verification changes.
 #[derive(Clone)]
 pub(crate) struct JwkRsaKey {
     pub(crate) n: Vec<u8>,
     pub(crate) e: Vec<u8>,
+    /// Channel ids this key may sign for, verbatim from the JWKS entry's
+    /// `endorsements` member. Empty means the document made no such claim,
+    /// which is not the same as "endorses nothing" — see the Teams adapter,
+    /// which is the only caller that reads it.
+    pub(crate) endorsements: Vec<String>,
 }
 
 /// A JWT decoded into its parts, without touching the signature's validity.
@@ -152,7 +163,18 @@ pub(crate) fn parse_jwks_body(bytes: &[u8]) -> Result<Vec<(String, JwkRsaKey)>, 
         let (Ok(n), Ok(e)) = (URL_SAFE_NO_PAD.decode(n_b64), URL_SAFE_NO_PAD.decode(e_b64)) else {
             continue;
         };
-        out.push((kid.to_string(), JwkRsaKey { n, e }));
+        let endorsements = key
+            .get("endorsements")
+            .and_then(JsonValue::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(JsonValue::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push((kid.to_string(), JwkRsaKey { n, e, endorsements }));
     }
     if out.is_empty() {
         return Err("JWKS response contained no usable RSA keys".to_string());
@@ -227,8 +249,54 @@ pub(crate) struct JwksCache {
     state: Mutex<JwksCacheState>,
 }
 
+/// Keys a test has "published", as the provider's own JWKS endpoint would.
+///
+/// A test that drives the production HTTP route cannot reach inside the adapter
+/// the route builds for itself, so the seeding has to happen where the cache is
+/// created rather than on an instance. Compiled out of every shipped build, and
+/// empty unless a test put something in it — a cache created with nothing
+/// published behaves exactly as it does in production.
+#[cfg(test)]
+pub(crate) mod test_keys {
+    use super::JwkRsaKey;
+    use std::sync::{Mutex, OnceLock};
+
+    fn table() -> &'static Mutex<Vec<(String, JwkRsaKey)>> {
+        static TABLE: OnceLock<Mutex<Vec<(String, JwkRsaKey)>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(crate) fn publish(kid: &str, key: JwkRsaKey) {
+        if let Ok(mut table) = table().lock() {
+            table.retain(|(existing, _)| existing != kid);
+            table.push((kid.to_string(), key));
+        }
+    }
+
+    pub(crate) fn published() -> Vec<(String, JwkRsaKey)> {
+        table()
+            .lock()
+            .map(|table| table.clone())
+            .unwrap_or_default()
+    }
+}
+
 impl JwksCache {
     pub(crate) fn new() -> Self {
+        #[cfg(test)]
+        {
+            let published = test_keys::published();
+            if !published.is_empty() {
+                return Self {
+                    state: Mutex::new(JwksCacheState {
+                        by_kid: published.into_iter().collect(),
+                        // Far in the future, so a seeded cache never looks
+                        // stale and reaches for the network.
+                        fetched_at_ms: i64::MAX / 2,
+                    }),
+                };
+            }
+        }
         Self {
             state: Mutex::new(JwksCacheState {
                 by_kid: BTreeMap::new(),
