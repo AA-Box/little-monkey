@@ -57,6 +57,133 @@ pub(crate) fn build(builder: tauri::Builder<MockRuntime>) -> tauri::App<MockRunt
     builder.build(context).expect("a mock app builds")
 }
 
+/// A [`crate::process_table::ProcessProjector`] over a ledger of this test's
+/// own.
+///
+/// Exists so a test of a *bounded execution* — a verify command, a hook, a
+/// sandbox run — can assert the row that execution wrote without standing up a
+/// Tauri app around it. In-memory rather than a temp file, so it shares nothing
+/// with the developer's real ledger and nothing with a parallel test.
+///
+/// Deliberately the real [`crate::process_table::ProcessTable::reconcile`] and
+/// the real SQL rather than a recording double: half of what these tests are
+/// checking is that the projection a runner builds is one the schema accepts,
+/// and a double would accept anything.
+pub(crate) struct RecordingProjector {
+    ledger: std::sync::Mutex<crate::run_ledger::RunLedger>,
+}
+
+impl RecordingProjector {
+    pub(crate) fn shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(RecordingProjector {
+            ledger: std::sync::Mutex::new(
+                crate::run_ledger::RunLedger::open_in_memory().expect("an in-memory ledger opens"),
+            ),
+        })
+    }
+
+    /// Every row of this kind, newest first.
+    pub(crate) fn rows(
+        &self,
+        kind: crate::process_table::ProcessKind,
+    ) -> Vec<crate::process_table::ProcessRecord> {
+        let ledger = self.ledger.lock().expect("not poisoned");
+        crate::process_table::ProcessTable::new(ledger.connection())
+            .list(&crate::process_table::ProcessFilter {
+                kinds: vec![kind],
+                ..crate::process_table::ProcessFilter::default()
+            })
+            .expect("the listing runs")
+    }
+
+    /// The single row of this kind, which is what every one of these tests
+    /// expects: a runner that wrote two rows for one execution has forked the
+    /// record, and a test that took the first would not notice.
+    pub(crate) fn only(
+        &self,
+        kind: crate::process_table::ProcessKind,
+    ) -> crate::process_table::ProcessRecord {
+        let mut rows = self.rows(kind);
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one {} row, found {}",
+            kind.as_str(),
+            rows.len()
+        );
+        rows.remove(0)
+    }
+}
+
+impl crate::process_table::ProcessProjector for RecordingProjector {
+    fn project(&self, projection: &crate::process_table::ProcessProjection) -> Result<(), String> {
+        // A fixed clock: these tests assert states and typed fields, never
+        // elapsed time, and a real one would make the assertions order-dependent.
+        let ledger = self.ledger.lock().map_err(|_| "poisoned".to_string())?;
+        crate::process_table::ProcessTable::new(ledger.connection())
+            .reconcile(projection, 1_800_000_000_000)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn record_owned(&self, owned: &crate::process_table::OwnedProcesses) -> Result<(), String> {
+        let ledger = self.ledger.lock().map_err(|_| "poisoned".to_string())?;
+        crate::process_table::ProcessTable::new(ledger.connection())
+            .record_owned(
+                owned.kind,
+                &owned.external_id,
+                &owned.members,
+                owned.session,
+                owned.boot_marker.as_deref(),
+                1_800_000_000_000,
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// A projector whose every write fails, for the tests that prove a bounded
+/// execution refuses to start rather than running outside the ledger.
+///
+/// Deliberately not "a projector that drops writes": the failure is the input
+/// those tests are about, and a fake that silently succeeded would let the
+/// fail-closed rule regress without a red test.
+pub(crate) struct FailingProjector {
+    /// Whether the ownership half fails too. A projector that admits rows and
+    /// then refuses to record ownership is the shape of a database that goes
+    /// away *after* a workload has started, which is a different failure from one
+    /// that was never writable.
+    ownership_only: bool,
+}
+
+impl FailingProjector {
+    /// Fails every write, including the admitting one.
+    pub(crate) fn shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FailingProjector {
+            ownership_only: false,
+        })
+    }
+
+    /// Admits rows, then refuses to record ownership.
+    pub(crate) fn shared_for_ownership_only() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FailingProjector {
+            ownership_only: true,
+        })
+    }
+}
+
+impl crate::process_table::ProcessProjector for FailingProjector {
+    fn project(&self, _projection: &crate::process_table::ProcessProjection) -> Result<(), String> {
+        match self.ownership_only {
+            true => Ok(()),
+            false => Err("the process table is unavailable".to_string()),
+        }
+    }
+
+    fn record_owned(&self, _owned: &crate::process_table::OwnedProcesses) -> Result<(), String> {
+        Err("the process table is unavailable".to_string())
+    }
+}
+
 /// The app-data directories this thread asked for, deleted when it exits.
 /// libtest gives each test its own thread, so "this thread" is "this test".
 struct OwnedDirs(RefCell<Vec<PathBuf>>);

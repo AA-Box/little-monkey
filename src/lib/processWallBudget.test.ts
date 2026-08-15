@@ -176,6 +176,16 @@ describe("which kinds a budget applies to", () => {
     remote_run: false,
     // Spawned with no timeout on purpose, so it can outlive its turn.
     background_shell: false,
+    // Bounded by their own owners, not by this sweep: a foreground shell by the
+    // resource controller its spawn site holds, a browser session by its
+    // watchdog. A second wall sweep over either would race the first.
+    foreground_shell: false,
+    browser_session: false,
+    // Bounded by the resource controller each one's runner holds, with its own
+    // deadline as the wall limit. A second sweep here would race that one.
+    verify_command: false,
+    hook_command: false,
+    sandbox_run: false,
   } satisfies Record<ProcessKind, boolean>;
 
   it("bounds exactly the kinds this WebView hosts", () => {
