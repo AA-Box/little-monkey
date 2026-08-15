@@ -60,6 +60,25 @@ jobs:
         # there as not being one.
         run: pnpm a11y
 
+      - name: Controller response policy, in a real browser engine
+        # The one gate jsdom cannot be: it enforces neither the permissions
+        # policy nor the CSP, so the headers that once forbade the paired
+        # controller its own camera, microphone, location and audio were
+        # invisible to every frontend test while all of them passed.
+        #
+        # This proves *policy*, never hardware — nothing here opens a device,
+        # and a headless runner has none. Real capture stays the deliberate
+        # manual check on a paired phone: `monkey daemon remote device-check
+        # --dangerous` (docs/paired-devices.md, "Checking a real device").
+        #
+        # REQUIRE_BROWSER=1 turns "no browser engine here" into a failure. The
+        # test skips with a reason when run on a machine without Chrome; a CI
+        # leg that silently skipped would be the same false green this exists to
+        # remove. The runner image ships Chrome, so it runs.
+        env:
+          REQUIRE_BROWSER: "1"
+        run: pnpm test:browser-policy
+
       - name: Install/upgrade smoke-test logic
         # The decision logic only. The install itself runs in `release.yml`,
         # where there are installers to install; this holds the rule that a leg

@@ -504,6 +504,27 @@ It needs no credentials, no account and no project: the pairing you already made
 is the whole setup. It is deliberately not part of a normal test run, because a
 photograph is not something CI should take.
 
+### What CI checks instead
+
+One thing between the simulated executor and a real phone *can* be automated,
+and had to be: the response policy the runner serves the controller under. A
+permissions policy with an empty allowlist — `camera=()` — disables the feature
+for the document, and a CSP without `media-src` falls back to `default-src
+'none'`. Both were once true of every response, so the controller was forbidden
+the camera, microphone, location, screen capture and audio it implements — and
+no frontend test could see it, because jsdom enforces neither header.
+
+`pnpm test:browser-policy` serves the real controller files with the runner's
+real header constants (parsed out of `web.rs`, not restated) and loads them in a
+real browser engine, asserting that the document permits each API the client
+calls and that both audio sources it loads — an artifact's `blob:` URL and the
+`data:` silence that unlocks autoplay — are allowed. The same page under the
+previous headers must report every one of them blocked, so the test can fail.
+
+It proves what the browser *permits*, never what hardware *does*: nothing there
+opens a device, and the permission prompt is never reached. Real capture stays
+the manual check above.
+
 ## Troubleshooting
 
 | What you see | What it means | What to do |
