@@ -7,6 +7,10 @@ const APP_JS: &str = include_str!("ui/app.js");
 /// without a browser. `app.js` imports it as a module; the CSP already allows
 /// `script-src 'self'`, so no policy change is needed.
 const DEVICE_CORE_JS: &str = include_str!("ui/device-core.js");
+/// Imported by `app.js` as `./talkProtocol.js`, which resolves under the same
+/// `/v1/remote/ui/` prefix. The page's CSP allows `script-src 'self'`, so a
+/// module served from this origin loads without any change to it.
+const TALK_PROTOCOL_JS: &str = include_str!("ui/talkProtocol.js");
 const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("ui/sw.js");
 const ICON: &str = include_str!("ui/icon.svg");
@@ -84,6 +88,10 @@ pub fn asset(method: &str, path_and_query: &str) -> Option<ApiResponse> {
         "/v1/remote/ui/device-core.js" => {
             ("text/javascript; charset=utf-8", DEVICE_CORE_JS.as_bytes())
         }
+        "/v1/remote/ui/talkProtocol.js" => (
+            "text/javascript; charset=utf-8",
+            TALK_PROTOCOL_JS.as_bytes(),
+        ),
         // At the root, not under `/v1/remote/ui/`: a worker's default scope is
         // its own directory, and the controller it must serve lives at `/`.
         "/sw.js" => ("text/javascript; charset=utf-8", SERVICE_WORKER.as_bytes()),
@@ -118,6 +126,8 @@ mod tests {
             "/remote",
             "/v1/remote/ui/app.css",
             "/v1/remote/ui/app.js",
+            "/v1/remote/ui/device-core.js",
+            "/v1/remote/ui/talkProtocol.js",
             "/v1/remote/ui/manifest.webmanifest",
             "/v1/remote/ui/icon.svg",
             "/sw.js",
@@ -507,7 +517,7 @@ mod tests {
         assert!(javascript.contains("URL.revokeObjectURL(url)"));
     }
 
-    /// Mobile Talk, pinned to the five properties that make it honest.
+    /// Mobile Talk, pinned to the properties that make it honest.
     ///
     /// Each assertion is a claim this client would otherwise be able to break
     /// quietly, and each has a matching guarantee on the runner side:
@@ -521,11 +531,29 @@ mod tests {
     ///   runner;
     /// - a backgrounded page **ends the conversation** rather than claiming a
     ///   background microphone neither mobile platform gives it.
+    ///
+    /// **What this test is structurally unable to check**, and why the
+    /// behavioural one exists: the runner refuses any opening frame that is not
+    /// a `hello`, and this client shipped without one — its first frame was
+    /// `audio`, so foreground Talk could not work at all. Every individual line
+    /// of the file was fine; the defect was the *order* the frames went out in,
+    /// which a source scan cannot see. The frame builders therefore live in
+    /// `ui/talkProtocol.js` and are driven through a whole session by
+    /// `src/lib/mobileTalkProtocol.test.ts`, which fails if the hello is
+    /// missing, late, or names a container the audio frames do not. The
+    /// assertions below check that the client still routes through those
+    /// builders rather than hand-rolling frames again.
     #[test]
     fn mobile_talk_is_ticketed_local_first_and_foreground_only() {
         let javascript = String::from_utf8(
             asset("GET", "/v1/remote/ui/app.js")
                 .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        let protocol = String::from_utf8(
+            asset("GET", "/v1/remote/ui/talkProtocol.js")
+                .expect("talk protocol module")
                 .body,
         )
         .unwrap();
@@ -539,21 +567,69 @@ mod tests {
             "the socket must be opened on the origin pairing pinned"
         );
 
-        // Local detection, and only a finished utterance leaves the device.
-        assert!(javascript.contains("function talkDetect("));
-        assert!(javascript.contains("talk.noiseFloor = talk.noiseFloor * 0.96"));
-        assert!(javascript.contains("last: true"));
+        // Every frame comes from the tested builder, and the first one is the
+        // hello the runner demands.
+        assert!(javascript.contains(r#"from "./talkProtocol.js""#));
+        assert!(javascript.contains("talk.frames = createTalkFrames({"));
         assert!(
-            javascript.contains("if (blob.size > 0 && talk.running)"),
-            "an empty recording must not be uploaded"
+            javascript.contains("talkSendFrame(talk.frames.hello());"),
+            "the runner refuses a Talk session whose first frame is not a hello"
+        );
+        assert!(
+            protocol.contains(r#"requireGreeted("audio")"#),
+            "the builder must refuse to produce audio before the hello"
+        );
+        assert!(
+            protocol.contains("const media = normalizeTalkMediaType(mediaType);"),
+            "one media type, fixed at construction, is what keeps hello and audio in agreement"
         );
 
-        // Barge-in stops this device's own speaker, not only the runner's.
+        // Local detection, and only a finished utterance leaves the device.
+        assert!(protocol.contains("export function createTalkDetector("));
+        assert!(protocol.contains("noiseFloor = noiseFloor * 0.96"));
+        assert!(javascript.contains("talk.detector = createTalkDetector();"));
+        assert!(javascript.contains("last: true"));
+        assert!(
+            javascript.contains("blob.size > 0 && talk.running"),
+            "an empty recording must not be uploaded"
+        );
+        // The recorder is armed by confirmed speech, not by the session. A
+        // recorder that runs continuously uploads the silence and the answer
+        // playing out of this device's own speaker along with the utterance.
+        assert!(
+            javascript.contains(r#"if (event === "speech-start") {"#)
+                && javascript.contains("talkBeginUtterance(speechDetectionMs);"),
+            "recording must start at confirmed speech rather than at capture start"
+        );
+        assert!(
+            javascript.contains("recorder.start(TALK_CHUNK_MS);"),
+            "the recorder is still chunked so a stop always yields a complete container"
+        );
+
+        // Telemetry is durations only. The frame has no field that could carry
+        // a transcript, and the client fills exactly three.
+        assert!(javascript.contains("talk.frames.metrics({"));
+        assert!(protocol.contains("speech_detection_ms: boundedSpan(speechDetectionMs)"));
+        assert!(protocol.contains("capture_ms: boundedSpan(captureMs)"));
+        assert!(protocol.contains("upload_ms: boundedSpan(uploadMs)"));
+
+        // Barge-in stops this device's own speaker, not only the runner's, and
+        // fires while the runner is still deciding what to say.
         assert!(javascript.contains("function talkStopPlayback()"));
         assert!(javascript.contains(r#"talkInterrupt("barge_in")"#));
+        assert!(
+            javascript.contains(
+                r#"talk.answering = frame.state === "thinking" || frame.state === "speaking""#
+            ),
+            "barge-in must follow what the runner said it is doing, not a DOM attribute"
+        );
 
-        // Foreground only, and the microphone is always released.
+        // Foreground only, and the microphone is always released. A hidden tab
+        // is not the only way a mobile page goes away: iOS bfcaches or evicts
+        // it and Chrome freezes it, neither of which raises visibilitychange.
         assert!(javascript.contains(r#"document.addEventListener("visibilitychange""#));
+        assert!(javascript.contains(r#"window.addEventListener("pagehide""#));
+        assert!(javascript.contains(r#"document.addEventListener("freeze""#));
         assert!(javascript.contains("stopTracks(talk.stream)"));
         assert!(
             javascript.contains("if (state.stale && talk.running)"),
@@ -564,6 +640,20 @@ mod tests {
         // leaving a button that silently does nothing.
         assert!(javascript.contains("Talk needs the voice_stream grant"));
         assert!(javascript.contains("cannot open a microphone stream"));
+
+        // One conversation, not two. Talk names the session the operator is
+        // already reading, rather than minting one of its own — a spoken turn
+        // and a typed one are the same thread, and voice is not a namespace the
+        // message list cannot see.
+        assert!(
+            javascript.contains("function mobileSessionId() {\n  return state.selectedSessionId;"),
+            "Talk must speak into the selected conversation"
+        );
+        assert!(javascript.contains("session_id: sessionId,"));
+        assert!(
+            javascript.contains("Choose a conversation above, then start Talk."),
+            "with no conversation selected there is nothing to speak into, and Talk says so"
+        );
     }
 
     /// Offline means read-only. A device showing cached runs must not offer

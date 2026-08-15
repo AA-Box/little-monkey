@@ -197,14 +197,7 @@ async fn serve_bound(
                     .accept(stream)
                     .await
                     .map_err(|error| format!("TLS handshake from {peer} failed: {error}"))?;
-                http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(
-                        TokioIo::new(tls),
-                        service_fn(move |request| handle_http(api.clone(), request)),
-                    )
-                    .await
-                    .map_err(|error| format!("Remote HTTP connection failed: {error}"))
+                serve_upgradable(TokioIo::new(tls), api).await
             }
             .await;
             if let Err(error) = result {
@@ -214,7 +207,31 @@ async fn serve_bound(
     }
 }
 
-async fn handle_http(
+/// Serves one already-accepted connection.
+///
+/// **`with_upgrades` is the whole reason this is a named function.** Without it
+/// the Talk route answers its `101` and then stops: `hyper::upgrade::on` only
+/// ever resolves for a connection served with upgrades enabled, so the
+/// handshake succeeds, the client waits, and the socket never arrives. That is
+/// invisible to every test that does not open a real WebSocket — so the test
+/// that does opens it through *this* function, and a future edit that drops the
+/// call takes the end-to-end Talk test down with it.
+pub(super) async fn serve_upgradable<I>(io: I, api: RemoteApi) -> Result<(), String>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(
+            io,
+            service_fn(move |request| handle_http(api.clone(), request)),
+        )
+        .with_upgrades()
+        .await
+        .map_err(|error| format!("Remote HTTP connection failed: {error}"))
+}
+
+pub(super) async fn handle_http(
     api: RemoteApi,
     mut request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -709,12 +726,15 @@ mod tests {
 
         // The microphone is open to this page and to nothing else. Both halves
         // matter: `()` would deny Talk and `voice_stream` outright, and `*`
-        // would hand the microphone to anything this page ever embeds.
+        // would hand the microphone to anything this page ever embeds. Which
+        // *other* features the document may use is
+        // `the_controller_document_is_permitted_to_use_what_it_implements`'s
+        // question, and asserting it twice from here would only mean this test
+        // failed every time a capability was added.
         let permissions = response.headers()["permissions-policy"].to_str().unwrap();
         assert!(permissions.contains("microphone=(self)"));
-        assert!(permissions.contains("camera=()"));
-        assert!(permissions.contains("geolocation=()"));
         assert!(!permissions.contains("microphone=*"));
+        assert!(permissions.contains("payment=()"));
     }
 
     /// The controller must be permitted to use the hardware it implements.

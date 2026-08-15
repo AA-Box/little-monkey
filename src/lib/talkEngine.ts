@@ -153,6 +153,17 @@ export class TalkSession {
 
   /** Identity of the utterance being recorded, minted before the audio is sent. */
   private utteranceId: string | null = null;
+  /**
+   * The turn this session is currently listening to, which is the utterance id
+   * the durable ingress was given.
+   *
+   * A cancelled run is not a stopped run: it keeps streaming, and by the time
+   * it does the operator may be two questions further on. Text that arrives
+   * under some other turn's id belongs to a conversation this session has
+   * already left — it is not spoken, it does not move this turn's cursor, and
+   * it cannot end it.
+   */
+  private currentTurnId: string | null = null;
   private utteranceStartedAt: number | null = null;
   private speechDetectedAt: number | null = null;
   private turnStartedAt: number | null = null;
@@ -222,6 +233,7 @@ export class TalkSession {
   async stop(): Promise<void> {
     this.running = false;
     this.held = false;
+    this.currentTurnId = null;
     this.playbackGeneration += 1;
     this.ports.stopPlayback();
     if (this.capturing) await this.ports.stopRecording();
@@ -261,8 +273,11 @@ export class TalkSession {
     this.inputLevel = frame.inputLevel;
     if (frame.event === 'speech-start') {
       this.speechDetectedAt = nowMs;
-      // Talking over the answer stops it, in Continuous as well as on a press.
-      if (this.state === 'speaking') this.interrupt('barge_in');
+      // Talking over the answer stops it, in Continuous as well as on a press —
+      // and talking over the wait before it is the same act. `interrupt` is
+      // what decides which states can be interrupted; this only reports that
+      // somebody started speaking.
+      this.interrupt('barge_in');
     }
     // Push-to-talk is bounded by the key, not by silence: a pause mid-sentence
     // must not end an utterance the operator is still holding.
@@ -294,12 +309,29 @@ export class TalkSession {
     this.ports.cancelTurn();
     void reason;
     this.finishTurnMetrics();
+    // Continuous has no key to press: the sentence that interrupted the answer
+    // is the next question, and it is already half-said. The recorder reopens
+    // here rather than in the cancelled run's `onTurnFinished`, which may be a
+    // whole answer away and, for a run that never settles, never comes at all.
+    // `beginUtterance` opens the microphone before it reports listening, so
+    // "Listening" cannot mean "nothing can hear you".
+    if (this.running && this.mode === 'continuous') {
+      void this.beginUtterance({ continuingSpeech: true });
+      return;
+    }
     this.setState(this.running ? 'listening' : 'idle');
   }
 
-  /** Streamed assistant text, as the ordinary session produces it. */
-  onAssistantDelta(delta: string): void {
+  /**
+   * Streamed assistant text, as the ordinary session produces it.
+   *
+   * `turnId` is optional because a caller that only ever runs one turn at a
+   * time has nothing to disambiguate. When it is given and does not match the
+   * turn in progress, the text is another turn's and is dropped here.
+   */
+  onAssistantDelta(delta: string, turnId?: string): void {
     if (!delta) return;
+    if (turnId !== undefined && turnId !== this.currentTurnId) return;
     if (this.firstTokenAt === null) this.firstTokenAt = this.ports.now();
     this.assistantText += delta;
     // An interrupted turn keeps arriving — it is durable, and cancellation is a
@@ -315,7 +347,9 @@ export class TalkSession {
   }
 
   /** The turn settled. Anything still buffered is spoken, then it is over. */
-  onTurnFinished(errorMessage?: string): void {
+  onTurnFinished(turnId?: string, errorMessage?: string): void {
+    if (turnId !== undefined && turnId !== this.currentTurnId) return;
+    this.currentTurnId = null;
     if (this.turnAbandoned) {
       // Its metrics were written when it was interrupted; there is nothing left
       // to say and nothing left to time.
@@ -341,15 +375,31 @@ export class TalkSession {
 
   // --- internals ---------------------------------------------------------
 
-  private async beginUtterance(): Promise<void> {
+  /**
+   * `continuingSpeech` is for the one case where an utterance begins in the
+   * middle of a sentence: a barge-in. The detector has already reported
+   * speech-start for what the operator is saying, and resetting it would leave
+   * it believing nobody is talking — the silence at the end of the sentence
+   * would then close nothing and the question would never be sent.
+   */
+  private async beginUtterance(options: { continuingSpeech?: boolean } = {}): Promise<void> {
     if (this.capturing || !this.running) return;
     try {
       await this.ports.startRecording();
       this.capturing = true;
       this.utteranceId = `talk-${crypto.randomUUID()}`;
-      this.utteranceStartedAt = this.ports.now();
-      this.speechDetectedAt = null;
-      this.vad.reset();
+      const startedAt = this.ports.now();
+      this.utteranceStartedAt = startedAt;
+      if (options.continuingSpeech) {
+        // This utterance starts with speech already underway, so the detection
+        // latency it reports is zero. That is the truthful number: nothing was
+        // waited for. Dating it from the interrupted turn's start instead would
+        // charge this utterance for the previous answer.
+        this.speechDetectedAt = startedAt;
+      } else {
+        this.speechDetectedAt = null;
+        this.vad.reset();
+      }
       this.setState('listening');
     } catch (reason) {
       this.fail(reason);
@@ -439,6 +489,7 @@ export class TalkSession {
       startedAt: this.utteranceStartedAt ?? this.turnStartedAt,
     };
     void reason;
+    this.currentTurnId = utteranceId;
     this.setState('thinking');
     try {
       await this.ports.submitTurn(spoken, utteranceId);

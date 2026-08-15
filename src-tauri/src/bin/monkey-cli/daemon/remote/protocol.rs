@@ -31,6 +31,9 @@ pub const MAX_TALK_SESSION_GENERATION_BYTES: usize = 128;
 pub const MAX_TALK_TICKET_BYTES: usize = 128;
 pub const DEFAULT_TALK_TICKET_TTL_MS: u64 = 30_000;
 pub const MAX_TALK_TICKET_TTL_MS: u64 = 60_000;
+/// The longest span a Talk latency sample may claim. Matches the desktop's own
+/// telemetry ceiling, so a phone and a laptop are graded on one scale.
+pub const MAX_TALK_LATENCY_MS: u64 = 10 * 60 * 1_000;
 const TALK_SESSION_GENERATION_RANDOM_BYTES: usize = 18;
 const TALK_TICKET_RANDOM_BYTES: usize = 32;
 
@@ -1654,6 +1657,21 @@ pub enum TalkClientFrameKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// What the device's half of one utterance cost, in milliseconds.
+    ///
+    /// The runner can time everything from transcription onwards itself, but
+    /// the three spans before that happen on the phone and are invisible here.
+    /// They ride their own frame, and they are durations — carrying the
+    /// transcript or the audio on a telemetry frame is exactly the mistake this
+    /// shape exists to make impossible.
+    Metrics {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speech_detection_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upload_ms: Option<u64>,
+    },
 }
 
 impl TalkClientFrame {
@@ -1692,6 +1710,22 @@ impl TalkClientFrame {
             TalkClientFrameKind::Interrupt { reason } => {
                 if let Some(reason) = reason {
                     validate_talk_text("interrupt reason", reason, MAX_TALK_ERROR_BYTES)?;
+                }
+            }
+            TalkClientFrameKind::Metrics {
+                speech_detection_ms,
+                capture_ms,
+                upload_ms,
+            } => {
+                for span in [speech_detection_ms, capture_ms, upload_ms]
+                    .into_iter()
+                    .flatten()
+                {
+                    if *span > MAX_TALK_LATENCY_MS {
+                        return Err(format!(
+                            "Talk latency spans must be at most {MAX_TALK_LATENCY_MS} ms"
+                        ));
+                    }
                 }
             }
         }

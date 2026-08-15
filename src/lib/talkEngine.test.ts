@@ -247,6 +247,119 @@ describe('TalkSession — barge-in', () => {
     expect(harness.metrics[harness.metrics.length - 1]?.interrupted).toBe(true);
   });
 
+  it('captures the sentence that interrupted the answer and sends it as its own turn', async () => {
+    const harness = new Harness();
+    harness.transcripts = ['what is the deploy status', 'never mind show me the logs'];
+    const session = new TalkSession(harness, { mode: 'continuous' });
+    const states: TalkState[] = [];
+    session.subscribe((snapshot) => {
+      if (states[states.length - 1] !== snapshot.state) states.push(snapshot.state);
+    });
+
+    await session.start();
+    speak(session, harness, 0.4, 400);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+    session.onAssistantDelta('The deploy finished. ');
+    await settle();
+    expect(session.snapshot().state).toBe('speaking');
+
+    // The user talks over the answer. The microphone has to be open for the
+    // rest of that sentence *now*, not whenever the cancelled run gets around
+    // to reporting that it stopped.
+    speak(session, harness, 0.4, 300);
+    expect(harness.stopPlaybackCalls).toBeGreaterThan(0);
+    expect(harness.cancelled).toBe(1);
+    expect(harness.recording).toBe(true);
+
+    await settle();
+    expect(session.snapshot().capturing).toBe(true);
+    // The detector still believes speech is in progress, so the sentence ends
+    // the way any other one does: by stopping.
+    speak(session, harness, 0.4, 300);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+
+    expect(harness.submitted.map((turn) => turn.text)).toEqual([
+      'what is the deploy status',
+      'never mind show me the logs',
+    ]);
+    expect(harness.submitted[1].utteranceId).not.toBe(harness.submitted[0].utteranceId);
+    // The ladder a subscriber sees, rather than a jump straight back to
+    // "Listening" that nothing can distinguish from never having been stopped.
+    expect(states.slice(states.indexOf('speaking'))).toEqual([
+      'speaking',
+      'interrupted',
+      'listening',
+      'transcribing',
+      'thinking',
+    ]);
+  });
+
+  it('lets the user talk over a turn that has not started answering yet', async () => {
+    const harness = new Harness();
+    harness.transcripts = ['first question', 'second question'];
+    const session = new TalkSession(harness, { mode: 'continuous' });
+    await session.start();
+    speak(session, harness, 0.4, 400);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+    // Nothing has been said out loud yet — the wait is the part being cut
+    // short, and it is the part most worth cutting short.
+    expect(session.snapshot().state).toBe('thinking');
+
+    speak(session, harness, 0.4, 300);
+    expect(harness.cancelled).toBe(1);
+    expect(harness.recording).toBe(true);
+    await settle();
+    speak(session, harness, 0.4, 300);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+
+    expect(harness.submitted.map((turn) => turn.text)).toEqual([
+      'first question',
+      'second question',
+    ]);
+  });
+
+  it('keeps a cancelled turn out of the turn that replaced it', async () => {
+    const harness = new Harness();
+    harness.transcripts = ['question a', 'question b'];
+    const session = new TalkSession(harness, { mode: 'continuous' });
+    await session.start();
+    speak(session, harness, 0.4, 400);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+    const turnA = harness.submitted[0].utteranceId;
+    session.onAssistantDelta('The first half. ', turnA);
+    await settle();
+
+    speak(session, harness, 0.4, 300);
+    await settle();
+    speak(session, harness, 0.4, 300);
+    speak(session, harness, 0.001, 1_000);
+    await settle();
+    const turnB = harness.submitted[1].utteranceId;
+    expect(turnB).not.toBe(turnA);
+    const spokenBefore = harness.synthesized.length;
+
+    // A is durable and settles in its own time, long after the question it was
+    // answering stopped mattering.
+    session.onAssistantDelta('The second half of the old answer. ', turnA);
+    session.onTurnFinished(turnA);
+    await settle();
+    expect(harness.synthesized).toHaveLength(spokenBefore);
+    expect(session.snapshot().assistantText).not.toContain('old answer');
+    // And B is still waiting for its own answer, not finished by A's.
+    expect(session.snapshot().state).toBe('thinking');
+
+    session.onAssistantDelta('The answer to the second question. ', turnB);
+    session.onTurnFinished(turnB);
+    await settle();
+    expect(harness.synthesized).toContain('The answer to the second question.');
+    expect(harness.recording).toBe(true);
+  });
+
   it('treats a push-to-talk press during the answer as an interruption', async () => {
     const harness = new Harness();
     harness.transcripts = ['first', 'second'];

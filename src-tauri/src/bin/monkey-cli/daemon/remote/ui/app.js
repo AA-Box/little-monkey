@@ -21,6 +21,15 @@ import {
   unknownOutcomeReport,
   waitOrAbort,
 } from "./device-core.js";
+import {
+  TALK_PROTOCOL_VERSION,
+  chooseTalkMediaType,
+  clampTalkChannels,
+  clampTalkSampleRateHz,
+  createTalkDetector,
+  createTalkFrames,
+  normalizeTalkMediaType,
+} from "./talkProtocol.js";
 
 const PROTOCOL_VERSION = 1;
 const DB_NAME = "little-monkey-remote-v1";
@@ -166,6 +175,19 @@ const CACHE_LIMITS = {
   artifactsPerRun: 50,
 };
 
+/**
+ * The conversation a spoken turn belongs to: the one the operator is looking at.
+ *
+ * Talk used to mint `talk-<device>`, a permanent per-device session in a
+ * namespace nothing else could read, so a spoken question and a typed one could
+ * never land in the same thread. There is a real session model on this page —
+ * a list, a selection and a draft per conversation — and voice uses it, which is
+ * what makes "typed and spoken turns share a session" true rather than claimed.
+ */
+function mobileSessionId() {
+  return state.selectedSessionId;
+}
+
 const ui = Object.fromEntries(
   [
     "pairingView",
@@ -250,6 +272,12 @@ const ui = Object.fromEntries(
     "talkTranscript",
     "talkAnswer",
     "talkError",
+    "chatPanel",
+    "chatEmpty",
+    "chatForm",
+    "chatInput",
+    "chatSendButton",
+    "chatRefreshButton",
     "connectionDot",
     "connectionText",
     "toast",
@@ -2781,16 +2809,21 @@ function stagedArtifactOutcome(outcome) {
 //
 // Voice activity detection is local and stays local: the phone decides where an
 // utterance ends and marks the last frame, so the runner never guesses from
-// silence it cannot hear. Nothing is uploaded while nobody is speaking.
+// silence it cannot hear. Nothing is uploaded while nobody is speaking — and
+// nothing is *recorded* while nobody is speaking either. The microphone is
+// observed continuously (barge-in depends on that) but the recorder is armed
+// only at confirmed speech and stopped at the end of it, so an uploaded blob
+// contains one utterance rather than every silent minute since the last one.
 //
 // Foreground only, and said so on screen. A page that is hidden loses its
 // microphone on iOS and Android alike, so the session is closed deliberately
 // rather than left looking alive.
+//
+// The frames themselves are built in `talkProtocol.js`, which owns the
+// sequences and refuses to build an audio frame before the hello. That is the
+// one property this file cannot be trusted with: the runner's first-frame rule
+// is invisible to anything that only reads the source.
 
-const TALK_PROTOCOL_VERSION = 1;
-const TALK_MIN_SPEECH_MS = 180;
-const TALK_SILENCE_MS = 800;
-const TALK_MAX_UTTERANCE_MS = 90_000;
 const TALK_CHUNK_MS = 250;
 
 const talk = {
@@ -2800,15 +2833,23 @@ const talk = {
   context: null,
   analyser: null,
   meterTimer: null,
-  frameSequence: 0,
-  audioSequence: 0,
+  /** The frame builder for this session; also the proof a hello was sent. */
+  frames: null,
+  detector: null,
+  /** Container this session's recorder is asked for, agreed with the hello. */
+  recorderOptions: null,
+  /** Timings for the utterance being recorded right now, and nothing else. */
+  utterance: null,
   sessionId: null,
   sessionGeneration: null,
-  /** Rolling ambient floor, the same shape the desktop detector uses. */
-  noiseFloor: 0.008,
-  candidateStartedAt: null,
-  speechStartedAt: null,
-  lastSpeechAt: null,
+  /**
+   * Whether the runner is mid-answer, as this client last heard it.
+   *
+   * Read instead of the panel's `data-state` attribute: barge-in has to work
+   * while the model is still generating, and reaching into the DOM for that
+   * made the answer depend on which frame last repainted a badge.
+   */
+  answering: false,
   /** Queue of synthesized chunks, played strictly in order. */
   playing: Promise.resolve(),
   playbackGeneration: 0,
@@ -2862,57 +2903,16 @@ function renderTalkPanel() {
   ui.talkUnavailable.hidden = true;
 }
 
-/** Adaptive local detector. Returns the event this frame produced, if any. */
-function talkDetect(rms, nowMs) {
-  const threshold = Math.max(0.012, talk.noiseFloor * 2.8);
-  const above = rms >= threshold;
-  ui.talkMeterFill.style.width = `${Math.min(100, Math.round((rms / Math.max(threshold * 2.5, 0.001)) * 100))}%`;
-  ui.talkMeter.setAttribute("aria-valuenow", String(Math.min(100, Math.round(rms * 1000))));
-  if (talk.speechStartedAt === null) {
-    if (above) {
-      if (talk.candidateStartedAt === null) talk.candidateStartedAt = nowMs;
-      if (nowMs - talk.candidateStartedAt >= TALK_MIN_SPEECH_MS) {
-        talk.speechStartedAt = talk.candidateStartedAt;
-        talk.lastSpeechAt = nowMs;
-        return "speech-start";
-      }
-    } else {
-      talk.candidateStartedAt = null;
-      const bounded = Math.min(Math.max(rms, 0.0005), 0.08);
-      talk.noiseFloor = talk.noiseFloor * 0.96 + bounded * 0.04;
-    }
-    return "none";
-  }
-  if (above) talk.lastSpeechAt = nowMs;
-  if (nowMs - talk.speechStartedAt >= TALK_MAX_UTTERANCE_MS) {
-    talkResetDetector();
-    return "max-utterance";
-  }
-  if (talk.lastSpeechAt !== null && nowMs - talk.lastSpeechAt >= TALK_SILENCE_MS) {
-    talkResetDetector();
-    return "utterance-end";
-  }
-  return "none";
-}
-
-function talkResetDetector() {
-  talk.candidateStartedAt = null;
-  talk.speechStartedAt = null;
-  talk.lastSpeechAt = null;
-}
-
-function talkSend(kind) {
+/**
+ * Hands one already-built frame to the socket.
+ *
+ * It takes a finished frame rather than building one, because the sequence
+ * numbers and the first-frame rule belong to `createTalkFrames` — a helper that
+ * built frames here is exactly how `audio` came to be sent before `hello`.
+ */
+function talkSendFrame(frame) {
   if (!talk.socket || talk.socket.readyState !== WebSocket.OPEN) return;
-  talk.frameSequence += 1;
-  talk.socket.send(
-    JSON.stringify({
-      protocol_version: TALK_PROTOCOL_VERSION,
-      session_id: talk.sessionId,
-      session_generation: talk.sessionGeneration,
-      frame_sequence: talk.frameSequence,
-      ...kind,
-    }),
-  );
+  talk.socket.send(JSON.stringify(frame));
 }
 
 /** Stop the speaker and drop everything queued behind it. */
@@ -2927,7 +2927,11 @@ function talkStopPlayback() {
 
 function talkInterrupt(reason) {
   talkStopPlayback();
-  talkSend({ type: "interrupt", reason });
+  // The runner will confirm with an `interrupted` state, but this device stops
+  // believing it is being answered right now — otherwise the next confirmed
+  // syllable sends a second interrupt for an answer already abandoned.
+  talk.answering = false;
+  if (talk.frames) talkSendFrame(talk.frames.interrupt(reason));
 }
 
 function talkQueueAudio(audioBase64, mediaType) {
@@ -2981,11 +2985,17 @@ function talkHandleFrame(raw) {
         }[frame.state] || frame.state,
         frame.state,
       );
+      // An answer is in flight from the moment the model starts generating, not
+      // from the moment audio arrives. Talking during "thinking" has to reach
+      // the runner, or the first thing the speaker does is talk over the user.
+      talk.answering = frame.state === "thinking" || frame.state === "speaking";
       if (frame.state === "interrupted") talkStopPlayback();
       break;
     case "transcript":
       ui.talkTranscript.textContent = frame.text;
       ui.talkAnswer.textContent = "—";
+      // A spoken turn becomes a message in the shared conversation, so the
+      // typed list has to hear about it too.
       break;
     case "assistant_delta":
       ui.talkAnswer.textContent =
@@ -3007,6 +3017,15 @@ async function startTalk() {
   if (talk.running) return;
   showTalkError("");
   setButtonBusy(ui.talkButton, true, "Connecting…");
+  const sessionId = mobileSessionId();
+  if (!sessionId) {
+    // Talk names the conversation the operator is looking at, so there has to
+    // be one. Minting a session of Talk's own is what put voice in a namespace
+    // the typed surface could not read.
+    showTalkError("Choose a conversation above, then start Talk.");
+    setButtonBusy(ui.talkButton, false);
+    return;
+  }
   try {
     // The microphone is opened BEFORE the ticket is asked for: a ticket lives
     // thirty seconds, and a permission prompt the user reads slowly would burn
@@ -3015,15 +3034,33 @@ async function startTalk() {
       audio: { echoCancellation: true, noiseSuppression: true },
       video: false,
     });
-    const sessionId = `talk-${state.profile.deviceId}`;
+    // Everything the hello has to state is settled here, before there is a
+    // socket to be wrong on. The container is the one the recorder will
+    // actually produce, and the rate and channel count are read from the
+    // microphone and the audio graph rather than invented — the runner refuses
+    // a hello outside 8 kHz–192 kHz or outside one or two channels, and a
+    // plausible-looking guess is still a guess about someone else's hardware.
+    const preferred = chooseTalkMediaType((type) => MediaRecorder.isTypeSupported(type));
+    talk.recorderOptions = preferred ? { mimeType: preferred } : undefined;
+    // No preference supported: a recorder still records in *something*, so ask
+    // a throwaway one what that is rather than naming a container this browser
+    // will not produce.
+    const mediaType = normalizeTalkMediaType(preferred || new MediaRecorder(talk.stream).mimeType);
+    const context = new AudioContext();
+    talk.context = context;
+    // A context created inside a gesture handler can still open suspended on
+    // iOS, and a suspended graph feeds the detector silence for ever.
+    if (context.state === "suspended") await context.resume().catch(() => undefined);
+    const settings = talk.stream.getAudioTracks()[0]?.getSettings?.() || {};
+    const sampleRateHz = clampTalkSampleRateHz(context.sampleRate);
+    const channels = clampTalkChannels(settings.channelCount);
+
     const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", {
       protocol_version: TALK_PROTOCOL_VERSION,
       session_id: sessionId,
     });
     talk.sessionId = ticket.session_id;
     talk.sessionGeneration = ticket.session_generation;
-    talk.frameSequence = 0;
-    talk.audioSequence = 0;
     // Same origin as this page, by construction: pairing already refused an
     // invitation whose runner URL was not this origin, so there is no second
     // host a socket could be pointed at.
@@ -3041,8 +3078,22 @@ async function startTalk() {
       if (talk.running) void stopTalk("The runner closed the conversation");
     };
     talk.running = true;
+    talk.answering = false;
     ui.talkButton.textContent = "End Talk";
-    talkStartCapture();
+    // Frame 1 is the hello, before anything can produce a frame 2: the runner
+    // refuses any other opening frame with `retryable: false`, which this
+    // client's own error handler turns into a torn-down session.
+    talk.frames = createTalkFrames({
+      sessionId: ticket.session_id,
+      sessionGeneration: ticket.session_generation,
+      mediaType,
+      sampleRateHz,
+      channels,
+    });
+    talkSendFrame(talk.frames.hello());
+    // Only now: the detector and the recorder it arms cannot run before the
+    // greeting they belong to.
+    talkStartCapture(context);
     setTalkState("Listening", "listening");
   } catch (error) {
     await stopTalk();
@@ -3053,82 +3104,137 @@ async function startTalk() {
   }
 }
 
-function talkStartCapture() {
-  const context = new AudioContext();
+function talkStartCapture(context) {
   const analyser = context.createAnalyser();
   analyser.fftSize = 1024;
   context.createMediaStreamSource(talk.stream).connect(analyser);
-  talk.context = context;
   talk.analyser = analyser;
+  talk.detector = createTalkDetector();
   const buffer = new Float32Array(analyser.fftSize);
-  talkResetDetector();
-  talkBeginUtterance();
+  // The microphone is observed for the whole session; only the recorder starts
+  // and stops. Barge-in needs to hear the user while the runner is speaking,
+  // which a detector that only ran during recording could not do.
   talk.meterTimer = setInterval(() => {
-    if (!talk.analyser) return;
+    if (!talk.analyser || !talk.detector) return;
     talk.analyser.getFloatTimeDomainData(buffer);
     let squares = 0;
     for (const sample of buffer) squares += sample * sample;
-    const event = talkDetect(Math.sqrt(squares / buffer.length), Date.now());
+    const rms = Math.sqrt(squares / buffer.length);
+    const { event, threshold, speechDetectionMs } = talk.detector.observe(rms, Date.now());
+    // The two writes the detector deliberately does not do, so that it can be
+    // tested without a document.
+    ui.talkMeterFill.style.width = `${Math.min(100, Math.round((rms / Math.max(threshold * 2.5, 0.001)) * 100))}%`;
+    ui.talkMeter.setAttribute("aria-valuenow", String(Math.min(100, Math.round(rms * 1000))));
     if (event === "speech-start") {
-      // Talking over the answer stops it, here and on the runner.
-      if (ui.talkPanel.dataset.state === "speaking") talkInterrupt("barge_in");
+      // Talking over the answer stops it, here and on the runner — whether the
+      // runner is speaking or still thinking about what to say.
+      if (talk.answering) talkInterrupt("barge_in");
+      talkBeginUtterance(speechDetectionMs);
     } else if (event === "utterance-end" || event === "max-utterance") {
       talkFinishUtterance();
     }
   }, 20);
 }
 
-/** One recorder per utterance, so every upload is a complete container. */
-function talkBeginUtterance() {
-  if (!talk.stream) return;
-  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((type) =>
-    MediaRecorder.isTypeSupported(type),
-  );
-  const recorder = preferred
-    ? new MediaRecorder(talk.stream, { mimeType: preferred })
+/**
+ * One recorder per utterance, armed at confirmed speech and not before.
+ *
+ * The recorder used to run continuously and re-arm itself, which meant every
+ * upload carried the whole silent gap since the last one — and, during a
+ * barge-in, the assistant's own answer coming back in through the speaker.
+ * Browser echo cancellation is not enough on its own: it is a best-effort DSP
+ * on a phone held at arm's length, and it is not what decides what leaves the
+ * device. Not recording is.
+ *
+ * The cost is the ~180 ms the detector spends confirming: the first syllable of
+ * each utterance is not in the recording. That is deliberate and tested — a
+ * pre-roll buffer would mean holding raw microphone audio that nobody asked to
+ * be recorded, which is the trade this client refuses to make.
+ */
+function talkBeginUtterance(speechDetectionMs) {
+  if (!talk.stream || !talk.running || !talk.frames) return;
+  // Anything still recording is discarded rather than continued. Nothing
+  // captured before this moment — including assistant audio that leaked back
+  // through the speaker — can ride along with what the user is saying now.
+  talkDiscardRecorder();
+  const recorder = talk.recorderOptions
+    ? new MediaRecorder(talk.stream, talk.recorderOptions)
     : new MediaRecorder(talk.stream);
   const chunks = [];
   recorder.ondataavailable = (event) => {
     if (event.data?.size) chunks.push(event.data);
   };
+  // Held in the closure rather than read back off `talk` when the recorder
+  // stops: `onstop` is asynchronous, and these three numbers belong to *this*
+  // utterance whatever the microphone has heard since.
+  const utterance = { speechDetectionMs, startedAtMs: Date.now(), stoppedAtMs: null };
   recorder.onstop = async () => {
-    const mediaType = voiceMediaType(recorder.mimeType);
-    const blob = new Blob(chunks, { type: mediaType });
-    if (blob.size > 0 && talk.running) {
-      talk.audioSequence += 1;
-      talkSend({
-        type: "audio",
-        audio_sequence: talk.audioSequence,
-        media_type: mediaType,
-        audio_base64: await blobToBase64(blob),
-        last: true,
-      });
+    const stoppedAtMs = utterance.stoppedAtMs ?? Date.now();
+    const blob = new Blob(chunks, { type: talk.frames?.mediaType || "audio/webm" });
+    if (blob.size > 0 && talk.running && talk.frames) {
+      const audioBase64 = await blobToBase64(blob);
+      try {
+        talkSendFrame(talk.frames.audio({ audioBase64, last: true }));
+      } catch (error) {
+        // An oversized utterance is refused here rather than by the runner,
+        // whose refusal is not retryable and would end the conversation.
+        showTalkError(String(error?.message || error));
+        return;
+      }
+      // Straight after the frame that closes the utterance: three durations,
+      // measured on this device, that the runner cannot see. Never a word of
+      // what was said — the frame has no room for one.
+      talkSendFrame(
+        talk.frames.metrics({
+          speechDetectionMs: utterance.speechDetectionMs,
+          captureMs: stoppedAtMs - utterance.startedAtMs,
+          uploadMs: Date.now() - stoppedAtMs,
+        }),
+      );
     }
-    if (talk.running) talkBeginUtterance();
+    // Deliberately NOT re-armed: the next recorder starts at the next confirmed
+    // speech-start, so the microphone is observed but nothing is captured while
+    // the runner answers.
   };
   talk.recorder = recorder;
+  talk.utterance = utterance;
   recorder.start(TALK_CHUNK_MS);
+}
+
+/** Drops a recorder without uploading what it holds. */
+function talkDiscardRecorder() {
+  const recorder = talk.recorder;
+  talk.recorder = null;
+  talk.utterance = null;
+  if (recorder && recorder.state !== "inactive") {
+    recorder.onstop = null;
+    recorder.stop();
+  }
 }
 
 function talkFinishUtterance() {
   const recorder = talk.recorder;
   talk.recorder = null;
-  if (recorder && recorder.state !== "inactive") recorder.stop();
+  if (!recorder || recorder.state === "inactive") return;
+  // Stamped before `stop()` so the upload span measures the encode and the
+  // base64, not the time the browser took to notice.
+  if (talk.utterance) talk.utterance.stoppedAtMs = Date.now();
+  talk.utterance = null;
+  recorder.stop();
 }
 
 async function stopTalk(reason) {
   talk.running = false;
+  talk.answering = false;
   talkStopPlayback();
   if (talk.meterTimer) {
     clearInterval(talk.meterTimer);
     talk.meterTimer = null;
   }
-  const recorder = talk.recorder;
-  talk.recorder = null;
-  if (recorder && recorder.state !== "inactive") {
-    recorder.onstop = null;
-    recorder.stop();
-  }
+  talkDiscardRecorder();
+  talk.detector = null;
+  talk.frames = null;
+  talk.recorderOptions = null;
   // Always: a microphone left open after a failed conversation is the failure
   // that matters here.
   stopTracks(talk.stream);
@@ -3153,8 +3259,26 @@ async function stopTalk(reason) {
 // A page that is hidden has no microphone on either mobile platform. Ending the
 // session is the honest response; a "background Talk" this cannot deliver would
 // be a promise the operating system breaks.
+//
+// Three hooks, because `visibilitychange` alone does not cover the ways a
+// mobile page actually goes away: iOS puts a page into the back/forward cache
+// or evicts it outright, and Chrome freezes a backgrounded tab. Either can
+// happen without a visibility change, and a session that ends only when the
+// process does holds the microphone and the socket until then.
+function endTalkForBackground(reason) {
+  if (talk.running) void stopTalk(reason);
+}
+
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && talk.running) void stopTalk("Talk ended: this page went to the background");
+  if (document.hidden) endTalkForBackground("Talk ended: this page went to the background");
+});
+window.addEventListener("pagehide", () => {
+  endTalkForBackground("Talk ended: this page was closed or put away");
+});
+// Not implemented everywhere; where it is, it is the last event a frozen tab
+// gets, and `stopTalk` is synchronous up to and including releasing the tracks.
+document.addEventListener("freeze", () => {
+  endTalkForBackground("Talk ended: this tab was frozen by the browser");
 });
 
 // --- The command loop ------------------------------------------------------

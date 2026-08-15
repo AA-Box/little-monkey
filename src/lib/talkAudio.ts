@@ -20,11 +20,17 @@ export const DEFAULT_VAD_CONFIG: VadConfig = {
   maxUtteranceMs: 90_000,
 };
 
+/**
+ * The bounds are the ones `validate_config` enforces on the Rust side, to the
+ * millisecond. A narrower clamp here would quietly run a machine at settings
+ * the operator never chose and the settings screen still shows: a saved 100 ms
+ * minimum would have become 80, and a saved 2 s monologue limit 5 s.
+ */
 export function normalizeVadConfig(config: Partial<VadConfig>): VadConfig {
   return {
-    minSpeechMs: Math.min(Math.max(Math.round(config.minSpeechMs ?? DEFAULT_VAD_CONFIG.minSpeechMs), 80), 1_000),
+    minSpeechMs: Math.min(Math.max(Math.round(config.minSpeechMs ?? DEFAULT_VAD_CONFIG.minSpeechMs), 50), 2_000),
     silenceMs: Math.min(Math.max(Math.round(config.silenceMs ?? DEFAULT_VAD_CONFIG.silenceMs), 400), 2_000),
-    maxUtteranceMs: Math.min(Math.max(Math.round(config.maxUtteranceMs ?? DEFAULT_VAD_CONFIG.maxUtteranceMs), 5_000), 90_000),
+    maxUtteranceMs: Math.min(Math.max(Math.round(config.maxUtteranceMs ?? DEFAULT_VAD_CONFIG.maxUtteranceMs), 1_000), 90_000),
   };
 }
 

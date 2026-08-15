@@ -29,7 +29,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use super::protocol::{
     TalkClientFrame, TalkClientFrameKind, TalkSequenceTracker, TalkServerFrame,
-    TalkServerFrameKind, TalkState, MAX_TALK_AUDIO_BYTES, MAX_TALK_TEXT_BYTES,
+    TalkServerFrameKind, TalkState, MAX_TALK_AUDIO_BYTES, MAX_TALK_LATENCY_MS, MAX_TALK_TEXT_BYTES,
     TALK_PROTOCOL_VERSION,
 };
 
@@ -46,6 +46,10 @@ pub const RUN_POLL_INTERVAL_MS: u64 = 120;
 /// to listening. The run itself is untouched — it is durable, and a long tool
 /// call is not an error.
 pub const MAX_TURN_WAIT_MS: u64 = 10 * 60 * 1_000;
+/// How often the grant is re-read while an answer is streaming. Between frames
+/// it is checked on arrival; during an answer nothing may arrive for minutes,
+/// and a revoked microphone that keeps working for minutes is not revoked.
+pub const GRANT_RECHECK_INTERVAL_MS: u64 = 1_000;
 
 /// One Talk socket, abstracted so the session loop can be driven by a test with
 /// no network and no browser.
@@ -109,6 +113,47 @@ pub struct TalkIdentity {
     pub session_generation: String,
 }
 
+/// One latency span across a session: how many samples, their total and the
+/// worst one. Three numbers rather than a list, so a long conversation cannot
+/// grow the thing that gets written to an audit row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TalkLatencySpan {
+    pub samples: u32,
+    pub total_ms: u64,
+    pub worst_ms: u64,
+}
+
+impl TalkLatencySpan {
+    pub fn observe(&mut self, span_ms: u64) {
+        let span_ms = span_ms.min(MAX_TALK_LATENCY_MS);
+        self.samples = self.samples.saturating_add(1);
+        self.total_ms = self.total_ms.saturating_add(span_ms);
+        self.worst_ms = self.worst_ms.max(span_ms);
+    }
+
+    pub fn mean_ms(&self) -> Option<u64> {
+        (self.samples > 0).then(|| self.total_ms / u64::from(self.samples))
+    }
+}
+
+/// Where a spoken turn spent its time, in the same seven spans the desktop
+/// measures — so one diagnostic model covers a phone and a laptop even though
+/// the transports have nothing else in common.
+///
+/// The first three are measured on the device and arrive on a `metrics` frame;
+/// the rest are measured here. All of them are durations. None of them can hold
+/// a word anybody said.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TalkSessionLatency {
+    pub speech_detection: TalkLatencySpan,
+    pub capture: TalkLatencySpan,
+    pub upload: TalkLatencySpan,
+    pub transcription: TalkLatencySpan,
+    pub model_first_token: TalkLatencySpan,
+    pub tts_first_audio: TalkLatencySpan,
+    pub end_to_end: TalkLatencySpan,
+}
+
 /// What one finished session did. Bounded counters and nothing said aloud: this
 /// is what may reach a log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -120,10 +165,14 @@ pub struct TalkSessionReport {
     /// Errors reported to the device. A misconfigured speech backend ends a
     /// turn, never the session.
     pub errors: u32,
+    /// Turns whose answer arrived as text but could not be spoken. The counter
+    /// the desktop calls `fallback`.
+    pub fallbacks: u32,
     /// The socket stopped carrying frames rather than being closed on purpose.
     pub stream_dropped: bool,
     /// The grant was withdrawn while the session was open.
     pub grant_revoked: bool,
+    pub latency: TalkSessionLatency,
 }
 
 /// Cuts streamed assistant text into sentence- or phrase-sized pieces safe to
@@ -304,6 +353,9 @@ pub async fn run_talk_session(
         utterance_media_type: None,
         utterance_index: 0,
         greeted: false,
+        revoked: false,
+        interrupting_utterance_complete: false,
+        pending_device_latency: DeviceLatency::default(),
     };
     if session
         .emit(socket, TalkServerFrameKind::Ready)
@@ -327,16 +379,7 @@ pub async fn run_talk_session(
         // rather than at the next network failure.
         if !turns.still_granted(&session.identity.device_id) {
             session.report.grant_revoked = true;
-            let _ = session
-                .emit(
-                    socket,
-                    TalkServerFrameKind::Error {
-                        code: "capability_revoked".into(),
-                        message: "The voice_stream grant was withdrawn.".into(),
-                        retryable: false,
-                    },
-                )
-                .await;
+            let _ = session.report_revocation(socket).await;
             break;
         }
         let frame = match session.parse(&raw) {
@@ -367,6 +410,11 @@ pub async fn run_talk_session(
                 session.utterance_media_type = Some(media_type);
             }
             TalkClientFrameKind::State { .. } => {}
+            TalkClientFrameKind::Metrics {
+                speech_detection_ms,
+                capture_ms,
+                upload_ms,
+            } => session.observe_device_latency(speech_detection_ms, capture_ms, upload_ms),
             TalkClientFrameKind::Interrupt { .. } => {
                 // Nothing is playing between turns; an interrupt that arrives
                 // here only clears whatever was half-buffered.
@@ -431,10 +479,63 @@ pub async fn run_talk_session(
                     session.report.stream_dropped = true;
                     break;
                 }
+                // Talking over the answer sends audio, and that audio is a
+                // complete utterance of its own. Answer it here rather than
+                // waiting for a frame the device has no reason to send.
+                while session.interrupting_utterance_complete && !session.revoked {
+                    session.interrupting_utterance_complete = false;
+                    if session
+                        .answer_utterance(socket, speech, turns)
+                        .await
+                        .is_err()
+                    {
+                        session.report.stream_dropped = true;
+                        break;
+                    }
+                }
+                // A grant withdrawn *during* the answer is noticed by the
+                // streaming loop, which stops speaking immediately; the session
+                // itself ends here, without waiting for a frame that a silent
+                // device is never going to send.
+                //
+                // The check is repeated once per turn as well as on the
+                // streaming loop's timer, because a short answer can finish
+                // before that timer comes round — and a device that then goes
+                // quiet would otherwise hold an open microphone on a grant it
+                // no longer has.
+                if !session.revoked
+                    && !session.report.stream_dropped
+                    && !turns.still_granted(&session.identity.device_id)
+                {
+                    session.report.grant_revoked = true;
+                    session.revoked = true;
+                    let _ = session.report_revocation(socket).await;
+                }
+                if session.revoked || session.report.stream_dropped {
+                    break;
+                }
             }
         }
     }
     session.report
+}
+
+/// The three spans the device measured for the utterance it just sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeviceLatency {
+    speech_detection_ms: Option<u64>,
+    capture_ms: Option<u64>,
+    upload_ms: Option<u64>,
+}
+
+impl DeviceLatency {
+    /// Everything the device spent before the runner heard anything, which is
+    /// the head of the end-to-end span the runner completes itself.
+    fn device_side_ms(&self) -> u64 {
+        self.capture_ms
+            .unwrap_or(0)
+            .saturating_add(self.upload_ms.unwrap_or(0))
+    }
 }
 
 struct Session {
@@ -447,6 +548,13 @@ struct Session {
     utterance_media_type: Option<String>,
     utterance_index: u32,
     greeted: bool,
+    /// Set when the grant went away mid-answer. The socket is finished; the run
+    /// it was narrating is not, and nothing here pretends otherwise.
+    revoked: bool,
+    /// The audio that interrupted an answer arrived complete, so it is already a
+    /// whole utterance and must be answered without waiting for another frame.
+    interrupting_utterance_complete: bool,
+    pending_device_latency: DeviceLatency,
 }
 
 impl Session {
@@ -514,6 +622,11 @@ impl Session {
         }
         self.report.utterances += 1;
         self.utterance_index += 1;
+        let device_latency = std::mem::take(&mut self.pending_device_latency);
+        // The clock the whole turn is measured against. It starts where the
+        // device's own spans end, so `end_to_end` means what it says: the first
+        // word spoken to the last thing said back.
+        let turn_started = std::time::Instant::now();
         self.emit(
             socket,
             TalkServerFrameKind::State {
@@ -524,11 +637,23 @@ impl Session {
         let text = match speech.transcribe(audio, &media_type).await {
             Ok(text) => text.trim().to_string(),
             Err(error) => {
+                self.report.fallbacks += 1;
                 return self
                     .fail_turn(socket, "transcription_failed", &error, true)
-                    .await
+                    .await;
             }
         };
+        self.report
+            .latency
+            .transcription
+            .observe(elapsed_ms(turn_started));
+        // A grant can be withdrawn while a long transcription runs. Noticing it
+        // here means the words are dropped rather than becoming a turn.
+        if !turns.still_granted(&self.identity.device_id) {
+            self.report.grant_revoked = true;
+            self.revoked = true;
+            return self.report_revocation(socket).await;
+        }
         if text.is_empty() {
             // Silence is not an error and must not become a turn.
             return self
@@ -565,9 +690,29 @@ impl Session {
         );
         let run_id = match turns.submit(&self.identity.session_id, &client_key, &text) {
             Ok(run_id) => run_id,
-            Err(error) => return self.fail_turn(socket, "turn_refused", &error, true).await,
+            Err(error) => {
+                self.report.fallbacks += 1;
+                return self.fail_turn(socket, "turn_refused", &error, true).await;
+            }
         };
-        self.stream_answer(socket, speech, turns, &run_id).await
+        let outcome = self
+            .stream_answer(socket, speech, turns, &run_id, turn_started)
+            .await;
+        if let Some(span) = device_latency.speech_detection_ms {
+            self.report.latency.speech_detection.observe(span);
+        }
+        if let Some(span) = device_latency.capture_ms {
+            self.report.latency.capture.observe(span);
+        }
+        if let Some(span) = device_latency.upload_ms {
+            self.report.latency.upload.observe(span);
+        }
+        self.report.latency.end_to_end.observe(
+            device_latency
+                .device_side_ms()
+                .saturating_add(elapsed_ms(turn_started)),
+        );
+        outcome
     }
 
     async fn stream_answer(
@@ -576,19 +721,44 @@ impl Session {
         speech: &dyn TalkSpeech,
         turns: &dyn TalkTurns,
         run_id: &str,
+        turn_started: std::time::Instant,
     ) -> Result<(), String> {
         let mut chunker = SpeechChunker::default();
         let mut cursor = 0u64;
         let mut spoken_bytes = 0usize;
         let mut speaking = false;
         let mut waited_ms = 0u64;
+        let mut since_grant_check_ms = 0u64;
+        let mut first_token_seen = false;
+        let mut first_audio_seen = false;
         loop {
+            // A grant is withdrawn by an operator, not by the device, so a
+            // silent phone must not be able to hold the microphone open for the
+            // length of a ten-minute answer. The check is on a timer of its own
+            // rather than on frame arrival for exactly that reason.
+            if since_grant_check_ms >= GRANT_RECHECK_INTERVAL_MS
+                && !turns.still_granted(&self.identity.device_id)
+            {
+                self.report.grant_revoked = true;
+                self.revoked = true;
+                // Stop the run as well: the authority to listen and the
+                // authority to keep answering into a closed microphone went
+                // away at the same moment.
+                let _ = turns.cancel(run_id);
+                return self.report_revocation(socket).await;
+            }
+            if since_grant_check_ms >= GRANT_RECHECK_INTERVAL_MS {
+                since_grant_check_ms = 0;
+            }
             // Barge-in is read *between* polls rather than waited on, so the
             // rest of an answer is dropped as soon as the user starts talking
             // over it. A frame already handed to the socket cannot be recalled;
             // everything after it can.
             if let Some(raw) = try_recv(socket).await {
                 match self.classify_during_playback(&raw) {
+                    Interjection::Metrics(latency) => {
+                        self.pending_device_latency = latency;
+                    }
                     Interjection::Interrupt => {
                         self.report.interruptions += 1;
                         // Truthful order: stop speaking, then ask the run to
@@ -634,6 +804,13 @@ impl Session {
             };
             cursor = progress.next_index;
             if !progress.delta.is_empty() {
+                if !first_token_seen {
+                    first_token_seen = true;
+                    self.report
+                        .latency
+                        .model_first_token
+                        .observe(elapsed_ms(turn_started));
+                }
                 self.emit(
                     socket,
                     TalkServerFrameKind::AssistantDelta {
@@ -656,7 +833,15 @@ impl Session {
                         )
                         .await?;
                     }
+                    let spoken_before = self.report.spoken_chunks;
                     self.speak(socket, speech, &chunk).await?;
+                    if !first_audio_seen && self.report.spoken_chunks > spoken_before {
+                        first_audio_seen = true;
+                        self.report
+                            .latency
+                            .tts_first_audio
+                            .observe(elapsed_ms(turn_started));
+                    }
                 }
             }
             if progress.finished {
@@ -678,6 +863,7 @@ impl Session {
                     self.speak(socket, speech, &chunk).await?;
                 }
                 if let Some(error) = progress.error {
+                    self.report.fallbacks += 1;
                     return self.fail_turn(socket, "run_failed", &error, true).await;
                 }
                 self.report.turns_submitted += 1;
@@ -692,6 +878,7 @@ impl Session {
             }
             tokio::time::sleep(std::time::Duration::from_millis(RUN_POLL_INTERVAL_MS)).await;
             waited_ms = waited_ms.saturating_add(RUN_POLL_INTERVAL_MS);
+            since_grant_check_ms = since_grant_check_ms.saturating_add(RUN_POLL_INTERVAL_MS);
             if waited_ms >= MAX_TURN_WAIT_MS {
                 // The run is durable and still going; this session simply stops
                 // narrating it. Saying so is more honest than a silent return
@@ -720,6 +907,7 @@ impl Session {
             Err(error) => {
                 // The answer is on screen either way; only the voice is missing.
                 self.report.errors += 1;
+                self.report.fallbacks += 1;
                 return self
                     .emit(
                         socket,
@@ -794,18 +982,99 @@ impl Session {
                 // device's own detector already decided it was speech, so this
                 // is the same event spelled differently, and treating it as
                 // anything else would leave the assistant talking into it.
-                TalkClientFrameKind::Audio { .. } => Interjection::Interrupt,
+                //
+                // The bytes are kept rather than dropped: what the user said to
+                // interrupt is the beginning of what they want answered next,
+                // and making them say it twice is the whole reason barge-in
+                // feels broken when it is done the other way.
+                TalkClientFrameKind::Audio {
+                    media_type,
+                    audio_base64,
+                    last,
+                    ..
+                } => {
+                    self.retain_interrupting_audio(&media_type, &audio_base64, last);
+                    Interjection::Interrupt
+                }
+                TalkClientFrameKind::Metrics {
+                    speech_detection_ms,
+                    capture_ms,
+                    upload_ms,
+                } => Interjection::Metrics(DeviceLatency {
+                    speech_detection_ms,
+                    capture_ms,
+                    upload_ms,
+                }),
                 _ => Interjection::Ignored,
             },
             Err(error) => Interjection::Refused(error),
         }
     }
+
+    /// Hold the audio that interrupted an answer so the next turn starts with
+    /// it. A payload that will not decode, or that would push the buffer past
+    /// the ceiling, is dropped — the interruption still stands.
+    fn retain_interrupting_audio(&mut self, media_type: &str, audio_base64: &str, last: bool) {
+        let Ok(bytes) = STANDARD.decode(audio_base64) else {
+            return;
+        };
+        if self.utterance.len() + bytes.len() > MAX_TALK_UTTERANCE_BYTES {
+            return;
+        }
+        self.utterance.extend_from_slice(&bytes);
+        if self.utterance_media_type.is_none() {
+            self.utterance_media_type = Some(media_type.to_string());
+        }
+        self.interrupting_utterance_complete = last;
+    }
+
+    /// Say plainly that the authority to listen is gone, then let the caller
+    /// close the socket.
+    async fn report_revocation(&mut self, socket: &mut dyn TalkSocket) -> Result<(), String> {
+        let _ = self
+            .emit(
+                socket,
+                TalkServerFrameKind::Error {
+                    code: "capability_revoked".into(),
+                    message: "The voice_stream grant was withdrawn.".into(),
+                    retryable: false,
+                },
+            )
+            .await;
+        self.emit(
+            socket,
+            TalkServerFrameKind::State {
+                state: TalkState::Idle,
+            },
+        )
+        .await
+    }
+
+    fn observe_device_latency(
+        &mut self,
+        speech_detection_ms: Option<u64>,
+        capture_ms: Option<u64>,
+        upload_ms: Option<u64>,
+    ) {
+        self.pending_device_latency = DeviceLatency {
+            speech_detection_ms,
+            capture_ms,
+            upload_ms,
+        };
+    }
 }
 
 enum Interjection {
     Interrupt,
+    Metrics(DeviceLatency),
     Refused(String),
     Ignored,
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis())
+        .unwrap_or(MAX_TALK_LATENCY_MS)
+        .min(MAX_TALK_LATENCY_MS)
 }
 
 /// One frame if the device already sent one, without waiting for it.
@@ -871,6 +1140,10 @@ mod tests {
         transcribed: Arc<Mutex<Vec<Vec<u8>>>>,
         spoken: Arc<Mutex<Vec<String>>>,
         fail: bool,
+        /// Flipped to `false` while transcription is in flight, so a test can
+        /// put the revocation exactly where a long local Whisper run would put
+        /// it rather than only between turns.
+        revoke_while_transcribing: Option<Arc<Mutex<bool>>>,
     }
 
     impl FakeSpeech {
@@ -880,6 +1153,7 @@ mod tests {
                 transcribed: Arc::new(Mutex::new(Vec::new())),
                 spoken: Arc::new(Mutex::new(Vec::new())),
                 fail: false,
+                revoke_while_transcribing: None,
             }
         }
     }
@@ -888,6 +1162,9 @@ mod tests {
     impl TalkSpeech for FakeSpeech {
         async fn transcribe(&self, audio: Vec<u8>, _media_type: &str) -> Result<String, String> {
             self.transcribed.lock().unwrap().push(audio);
+            if let Some(granted) = &self.revoke_while_transcribing {
+                *granted.lock().unwrap() = false;
+            }
             if self.fail {
                 return Err("no transcription backend is configured".to_string());
             }
@@ -906,15 +1183,20 @@ mod tests {
         cancelled: Mutex<Vec<String>>,
         /// Answer delivered one delta per poll, so streaming is exercised.
         deltas: Mutex<VecDeque<String>>,
-        granted: Mutex<bool>,
+        granted: Arc<Mutex<bool>>,
         refuse: bool,
+        /// Withdraw the grant after this many polls of a running answer, which
+        /// is how a revocation lands while the runner is thinking or speaking
+        /// rather than between turns.
+        revoke_after_polls: Mutex<Option<u32>>,
+        polls: Mutex<u32>,
     }
 
     impl FakeTurns {
         fn answering(parts: &[&str]) -> Self {
             Self {
                 deltas: Mutex::new(parts.iter().map(|part| part.to_string()).collect()),
-                granted: Mutex::new(true),
+                granted: Arc::new(Mutex::new(true)),
                 ..Self::default()
             }
         }
@@ -933,6 +1215,15 @@ mod tests {
         }
 
         fn progress(&self, _run_id: &str, from_index: u64) -> Result<TalkRunProgress, String> {
+            {
+                let mut polls = self.polls.lock().unwrap();
+                *polls += 1;
+                if let Some(after) = *self.revoke_after_polls.lock().unwrap() {
+                    if *polls >= after {
+                        *self.granted.lock().unwrap() = false;
+                    }
+                }
+            }
             let mut deltas = self.deltas.lock().unwrap();
             match deltas.pop_front() {
                 Some(delta) => Ok(TalkRunProgress {
@@ -1249,6 +1540,137 @@ mod tests {
             &frame.kind,
             TalkServerFrameKind::Error { code, .. } if code == "capability_revoked"
         )));
+    }
+
+    /// **Revocation reaches every phase of a turn, not only the gap between
+    /// two of them.**
+    ///
+    /// The grant used to be read in exactly one place: the top of the receive
+    /// loop. A device that is silent — which is what a device is for the whole
+    /// of a long answer — never went round that loop, so withdrawing
+    /// `voice_stream` while the runner was transcribing, thinking or speaking
+    /// left the microphone open until the answer finished or the hour ran out.
+    /// "Revoked at the next frame the user happens to send" is not revoked.
+    #[tokio::test]
+    async fn a_withdrawn_grant_ends_the_session_in_whichever_phase_it_lands() {
+        // While transcribing: the words are never submitted at all.
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio(&identity, 2, 1, b"speech", true),
+        ]);
+        let turns = FakeTurns::answering(&["An answer nobody asked for."]);
+        let mut speech = FakeSpeech::new("what is the deploy status");
+        speech.revoke_while_transcribing = Some(Arc::clone(&turns.granted));
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity.clone()).await;
+
+        assert!(report.grant_revoked);
+        assert!(
+            turns.submitted.lock().unwrap().is_empty(),
+            "a grant withdrawn during transcription must not let the words become a turn"
+        );
+
+        // While thinking or speaking: the answer stops and the run is asked to
+        // stop with it, without another frame from the device.
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio(&identity, 2, 1, b"speech", true),
+        ]);
+        let sent = socket.sent.clone();
+        let speech = FakeSpeech::new("what is the deploy status");
+        // Long enough that the streaming loop's own grant timer comes round
+        // mid-answer, which is the property under test: the revocation must not
+        // wait for the turn to end.
+        let answer: Vec<&str> = vec!["Another sentence. "; 24];
+        let turns = FakeTurns::answering(&answer);
+        *turns.revoke_after_polls.lock().unwrap() = Some(2);
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert!(report.grant_revoked);
+        assert_eq!(
+            turns.submitted.lock().unwrap().len(),
+            1,
+            "the turn was submitted before the grant went away"
+        );
+        assert_eq!(
+            turns.cancelled.lock().unwrap().len(),
+            1,
+            "the authority to listen and the authority to keep answering end together"
+        );
+        assert!(
+            speech.spoken.lock().unwrap().len() < answer.len(),
+            "speaking stops at the revocation rather than finishing the answer"
+        );
+        assert!(sent.lock().unwrap().iter().any(|frame| matches!(
+            &frame.kind,
+            TalkServerFrameKind::Error { code, .. } if code == "capability_revoked"
+        )));
+    }
+
+    /// The words somebody interrupts with are the next question, and the runner
+    /// keeps them rather than making the operator say them twice.
+    #[tokio::test]
+    async fn audio_that_interrupts_an_answer_becomes_the_next_turn() {
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio(&identity, 2, 1, b"first question", true),
+            audio(&identity, 3, 2, b"second question", true),
+        ]);
+        let speech = FakeSpeech::new("tell me about staging");
+        let turns = FakeTurns::answering(&["A long answer. ", "It keeps going. "]);
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert_eq!(report.interruptions, 1);
+        assert_eq!(
+            turns.submitted.lock().unwrap().len(),
+            2,
+            "the interrupting utterance becomes a second durable turn"
+        );
+        let heard = speech.transcribed.lock().unwrap();
+        assert_eq!(heard.len(), 2);
+        assert_eq!(
+            heard[1], b"second question",
+            "the interrupting audio is transcribed, not discarded"
+        );
+    }
+
+    /// Telemetry the device sends is folded into the session's counters, and
+    /// there is nowhere in the shape for a word of it to hide.
+    #[tokio::test]
+    async fn device_latency_is_kept_as_durations_and_nothing_else() {
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            client_frame(
+                &identity,
+                2,
+                TalkClientFrameKind::Metrics {
+                    speech_detection_ms: Some(180),
+                    capture_ms: Some(1_200),
+                    upload_ms: Some(40),
+                },
+            ),
+            audio(&identity, 3, 1, b"speech", true),
+        ]);
+        let speech = FakeSpeech::new("what is the deploy status");
+        let turns = FakeTurns::answering(&["Done."]);
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert_eq!(report.latency.speech_detection.samples, 1);
+        assert_eq!(report.latency.speech_detection.worst_ms, 180);
+        assert_eq!(report.latency.capture.worst_ms, 1_200);
+        assert_eq!(report.latency.upload.worst_ms, 40);
+        assert_eq!(report.latency.transcription.samples, 1);
+        assert_eq!(report.latency.model_first_token.samples, 1);
+        assert!(
+            report.latency.end_to_end.worst_ms >= 1_240,
+            "end to end includes what the device spent before the runner heard anything"
+        );
     }
 
     #[test]

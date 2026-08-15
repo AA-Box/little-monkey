@@ -208,6 +208,15 @@ pub struct SpeechAudioResult {
     pub audio_base64: String,
 }
 
+/// What Talk's transcription returns: the words, and no handle to anything kept,
+/// because nothing was kept.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkTranscript {
+    pub job_id: String,
+    pub text: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VoicePrivacySnapshot {
     pub wake_phrase_enabled: bool,
@@ -1455,6 +1464,77 @@ pub async fn m7_transcribe_audio(
     })
 }
 
+/// Transcribe one spoken Talk utterance and keep nothing.
+///
+/// **Why this is not `m7_transcribe_audio`.** That command exists to turn a
+/// recording into artifacts: it publishes the transcript, and when the operator
+/// asked for raw audio to be kept, the audio too. Those are the right semantics
+/// for a meeting somebody chose to record. They are the wrong semantics for a
+/// conversation: a spoken turn is a sentence, not a recording, and Talk promises
+/// that what is kept is the transcript in the session and bounded durations —
+/// nothing else.
+///
+/// It also makes the wake phrase honest. A fragment that turns out not to
+/// contain the phrase is dropped by the engine without ever becoming a turn; if
+/// transcription had already published it, "the detection stops on this machine"
+/// would be a claim contradicted by an artifact on disk.
+///
+/// The capture grant is still required — the microphone is still the
+/// microphone.
+#[tauri::command]
+pub async fn m7_talk_transcribe(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    grant_id: String,
+    job_id: String,
+    audio_base64: String,
+    media_type: String,
+) -> Result<TalkTranscript, String> {
+    ensure_main_window(&window)?;
+    let grant = state.require_grant(
+        &grant_id,
+        &BTreeSet::from([CaptureKind::Microphone, CaptureKind::Meeting]),
+    )?;
+    if !media_type.starts_with("audio/")
+        || audio_base64.len() as u64 > MAX_MEDIA_BYTES.saturating_mul(2)
+    {
+        return Err("Recorded audio media type or size is invalid".to_string());
+    }
+    let bytes = STANDARD
+        .decode(audio_base64)
+        .map_err(|_| "Recorded audio is not valid base64")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
+        return Err("Recorded audio is empty or exceeds its limit".to_string());
+    }
+    let extension = if media_type.contains("wav") {
+        "wav"
+    } else {
+        "webm"
+    };
+    let path =
+        state
+            .root
+            .join("tmp")
+            .join(format!("talk-{}.{}", Uuid::new_v4().simple(), extension));
+    fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(
+        &state,
+        &job_id,
+        &path,
+        &cancellation,
+        grant.kind == CaptureKind::Meeting,
+    )
+    .await;
+    state.finish_job(&job_id);
+    // On every exit: success, provider failure, cancellation and timeout all
+    // come through here, because the utterance's audio outliving the utterance
+    // is the one thing this path must never do.
+    let _ = fs::remove_file(&path);
+    let (text, _backend, _segments) = result?;
+    Ok(TalkTranscript { job_id, text })
+}
+
 /// Whether this machine can turn call audio into text at all.
 ///
 /// Answering the phone with no transcription backend configured is a feature
@@ -2293,6 +2373,48 @@ mod tests {
 
         config.voice.wake_phrase_enabled = false;
         assert!(validate_config(&config).is_err());
+    }
+
+    /// **A spoken turn leaves no artifact, whatever `saveRawAudio` says.**
+    ///
+    /// That switch means "keep the recordings I asked you to make" — a meeting
+    /// capture, a push-to-talk clip — and `m7_transcribe_audio` honours it by
+    /// publishing the transcript and, when it is on, the audio. A conversation
+    /// is not a recording somebody asked for, so Talk transcribes through its
+    /// own command, which publishes nothing at all. It is also what makes the
+    /// wake phrase's promise true: a fragment that turns out not to contain the
+    /// phrase is dropped by the engine, and if transcription had already
+    /// published it, "the detection stops on this machine" would be false.
+    ///
+    /// Scanned rather than executed because the alternative needs a whisper
+    /// build and a window. The defect class is a call site that looks fine on
+    /// its own, which is the same reason `egress.rs` and `web.rs` scan.
+    #[test]
+    fn talk_transcription_publishes_nothing_whatever_the_artifact_setting_says() {
+        const SOURCE: &str = include_str!("m7_companion.rs");
+        let body = SOURCE
+            .split_once("pub async fn m7_talk_transcribe(")
+            .expect("Talk has its own transcription command")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends")
+            .0;
+        assert!(
+            !body.contains("publish("),
+            "Talk's transcription must not publish an artifact: {body}"
+        );
+        assert!(
+            !body.contains("save_raw_audio"),
+            "Talk does not consult the keep-recordings setting at all"
+        );
+        assert!(
+            body.contains("fs::remove_file(&path)"),
+            "the utterance's audio must not outlive the utterance"
+        );
+        assert!(
+            body.contains("require_grant("),
+            "the microphone is still gated on a capture grant"
+        );
     }
 
     #[test]

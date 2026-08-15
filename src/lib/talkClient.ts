@@ -45,12 +45,30 @@ export interface SpeechAudioResult {
   audioBase64: string;
 }
 
+/** What Talk's own transcription returns: the text, and nothing kept. */
+export interface TalkTranscript {
+  jobId: string;
+  text: string;
+}
+
 export const talkClient = {
   status: () => invoke<TalkStatus>('m7_talk_status'),
   metrics: () => invoke<TalkMetricsSnapshot>('m7_talk_metrics'),
   recordMetric: (metric: TalkMetric) =>
     invoke<TalkMetricsSnapshot>('m7_talk_metric_record', { metric }),
   clearMetrics: () => invoke<TalkMetricsSnapshot>('m7_talk_metrics_clear'),
+  /**
+   * Transcribe one utterance for Talk.
+   *
+   * Deliberately not `m7_transcribe_audio`: that command publishes the
+   * transcript — and, when the operator turned `saveRawAudio` on, the audio
+   * itself — as artifacts. A spoken conversation is not a recording somebody
+   * asked to keep, and a wake-phrase fragment that turns out not to contain the
+   * phrase must leave nothing behind at all. This one holds the bytes for the
+   * length of the call and publishes nothing.
+   */
+  transcribe: (grantId: string, jobId: string, audioBase64: string, mediaType: string) =>
+    invoke<TalkTranscript>('m7_talk_transcribe', { grantId, jobId, audioBase64, mediaType }),
   /** Synthesize one chunk and hand back the bytes, rather than playing them on
    * this machine's default output — Talk chooses its own device. */
   synthesize: (jobId: string, text: string) =>

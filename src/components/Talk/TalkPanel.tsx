@@ -20,6 +20,7 @@ import { blobToBase64, companionClient, type CaptureGrant } from '../../lib/comp
 import { errorMessage } from '../../lib/errors';
 import { base64AudioBlob } from '../../lib/talkAudio';
 import { talkClient, type TalkStatus } from '../../lib/talkClient';
+import { createTalkPlayer } from '../../lib/talkPlayback';
 import {
   TalkSession,
   type TalkMode,
@@ -35,6 +36,14 @@ import { Button, IconButton } from '../ui';
 const GRANT_LIFETIME_MS = 30 * 60_000;
 /** How often the level meter samples the microphone. Matches the VAD's frame. */
 const METER_INTERVAL_MS = 20;
+
+/**
+ * The message the daemon route parks in the answer's place while the run is
+ * queued, replaced wholesale when the real text starts arriving. Reading it out
+ * would announce the queue and then, because it is replaced rather than
+ * appended to, swallow the first sentence of the answer that replaces it.
+ */
+const DAEMON_QUEUE_PLACEHOLDER = '⏳ Queued in the resident runner…';
 
 const STATE_LABEL: Record<TalkState, string> = {
   idle: 'Not listening',
@@ -85,12 +94,21 @@ export function TalkPanel({
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const meterRef = useRef<number | null>(null);
-  const playerRef = useRef<HTMLAudioElement | null>(null);
   const grantRef = useRef<CaptureGrant | null>(null);
-  const deltaCursorRef = useRef(0);
-  /** True once the store has confirmed this session's turn is running, so the
-   * end of a turn is an observed transition rather than an assumption. */
-  const turnWasRunningRef = useRef(false);
+  /**
+   * The turn Talk is waiting on: the utterance id the durable ingress was given,
+   * where in the transcript its answer will appear, and how much of that answer
+   * has already been handed to the engine.
+   *
+   * Bound to the submitted turn rather than to "the last assistant message",
+   * which is a different thing whenever anything else touches the session — a
+   * message typed in the composer, a completed answer the store mutates again,
+   * or the run this one interrupted.
+   */
+  const activeTurnRef = useRef<{ turnId: string; fromIndex: number; spoken: string } | null>(null);
+  /** The last output device successfully read from settings. */
+  const outputDeviceRef = useRef<string | null>(null);
+  const player = useMemo(() => createTalkPlayer(), []);
 
   useEffect(() => {
     grantRef.current = grant;
@@ -197,7 +215,12 @@ export function TalkPanel({
       transcribe: async (recording, jobId) => {
         const active = await ensureGrant();
         const audioBase64 = await blobToBase64(recording.blob);
-        const result = await companionClient.transcribeAudio(
+        // Talk's own transcription, not the companion's: that one publishes the
+        // transcript, and the raw audio too when the operator asked for
+        // artifacts. A spoken conversation is not a recording somebody asked to
+        // keep, so this path holds the bytes for the length of the call and
+        // publishes nothing.
+        const result = await talkClient.transcribe(
           active.grantId,
           jobId,
           audioBase64,
@@ -207,41 +230,50 @@ export function TalkPanel({
       },
       submitTurn: async (text, utteranceId) => {
         // The composer's own call. `voice` only labels where the turn was made.
-        deltaCursorRef.current = 0;
-        await runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, 'voice');
+        const session = useSessionStore
+          .getState()
+          .sessions.find((entry) => entry.id === sessionId);
+        activeTurnRef.current = {
+          turnId: utteranceId,
+          fromIndex: session?.messages.length ?? 0,
+          spoken: '',
+        };
+        try {
+          await runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, 'voice');
+        } finally {
+          // The turn is over when the call that ran it settles — a turn that
+          // only ran tools and said nothing included, which is why the
+          // microphone is released here and not on the arrival of some text.
+          // The store's running flag cannot tell two overlapping turns apart;
+          // this can, and the engine drops the id it has moved past.
+          activeTurnRef.current = null;
+          sessionRef.current?.onTurnFinished(utteranceId);
+        }
       },
       cancelTurn: () => stopTurn(sessionId),
       synthesize: async (text, jobId) => {
         const speech = await talkClient.synthesize(jobId, text);
         return { audioBase64: speech.audioBase64, mediaType: speech.mediaType };
       },
-      play: (audioBase64, mediaType) =>
-        new Promise<void>((resolve) => {
-          const url = URL.createObjectURL(base64AudioBlob(audioBase64, mediaType));
-          const player = new Audio(url);
-          playerRef.current = player;
-          const finish = () => {
-            URL.revokeObjectURL(url);
-            if (playerRef.current === player) playerRef.current = null;
-            resolve();
-          };
-          player.onended = finish;
-          // A speaker that refuses to play must not stall the queue behind it.
-          player.onerror = finish;
-          void player.play().catch(finish);
-        }),
-      stopPlayback: () => {
-        const player = playerRef.current;
-        if (!player) return;
-        player.pause();
-        player.currentTime = 0;
-        playerRef.current = null;
+      play: async (audioBase64, mediaType) => {
+        // Read the chosen output before every chunk rather than freezing it for
+        // the session: moving to headphones mid-conversation should be audible
+        // on the next sentence. `config()` is an in-memory read on the Rust
+        // side, and a read that fails is not worth dropping a sentence over —
+        // the device the operator last chose is still the best guess.
+        try {
+          outputDeviceRef.current = (await companionClient.config()).voice.outputDeviceId;
+        } catch {
+          /* keep the last known output */
+        }
+        await player.play(base64AudioBlob(audioBase64, mediaType), outputDeviceRef.current);
       },
+      stopPlayback: () => player.stop(),
       recordMetric: (metric) => {
         void talkClient.recordMetric(metric).catch(() => undefined);
       },
     };
-  }, [ensureGrant, sessionId]);
+  }, [ensureGrant, player, sessionId]);
 
   // One engine per session. Rebuilt when the session changes, because a Talk
   // session belongs to exactly one conversation.
@@ -265,6 +297,17 @@ export function TalkPanel({
         });
         sessionRef.current = engine;
         engine.subscribe(setSnapshot);
+        if (config.voice.alwaysListening) {
+          // The setting's entire claim is that Talk listens for as long as it is
+          // open, without anyone pressing Start. Continuous is the shape that
+          // makes that true, and the wake phrase — which the Rust side refuses
+          // to let this setting exist without — is what decides whether
+          // anything heard is submitted. Closing this surface closes the
+          // microphone: there is no listening behind the operator's back.
+          setMode('continuous');
+          engine.setMode('continuous');
+          void engine.start();
+        }
       })
       .catch((reason) => {
         if (!disposed) setSetupError(errorMessage(reason));
@@ -273,6 +316,10 @@ export function TalkPanel({
       disposed = true;
       void engine?.stop();
       sessionRef.current = null;
+      // A turn belongs to the conversation it was asked in. Leaving it here
+      // would point the next session's watcher at an index in the last one's
+      // transcript.
+      activeTurnRef.current = null;
       releaseDevices();
     };
     // `ports` is memoized on the session; `mode` is applied through `setMode`
@@ -289,32 +336,31 @@ export function TalkPanel({
    *
    * Read from the session store rather than from a Talk-specific stream: the
    * spoken turn and a typed one are the same turn, and there is only one
-   * transcript. The cursor is what turns "the message got longer" into the
-   * delta the speech chunker needs.
+   * transcript. What is spoken is only ever the answer to the turn Talk itself
+   * submitted — the last assistant message is somebody else's whenever the
+   * operator has also typed something, and a finished answer is still the last
+   * one long after it was read out.
    */
   useEffect(() => {
     return useSessionStore.subscribe((store) => {
       const engine = sessionRef.current;
-      if (!engine) return;
+      const active = activeTurnRef.current;
+      if (!engine || !active) return;
       const session = store.sessions.find((entry) => entry.id === sessionId);
       if (!session) return;
-      const last = session.messages[session.messages.length - 1];
-      const running = store.runningTurns[sessionId] === true;
-      if (last && last.role === 'assistant') {
-        const text = typeof last.content === 'string' ? last.content : '';
-        if (text.length > deltaCursorRef.current) {
-          engine.onAssistantDelta(text.slice(deltaCursorRef.current));
-          deltaCursorRef.current = text.length;
-        }
-      }
-      // The turn is over when the loop says so, whether or not it produced
-      // text — a turn that only ran tools still has to release the microphone.
-      if (!running && deltaCursorRef.current >= 0 && turnWasRunningRef.current) {
-        turnWasRunningRef.current = false;
-        deltaCursorRef.current = 0;
-        engine.onTurnFinished();
-      }
-      if (running) turnWasRunningRef.current = true;
+      const answer = session.messages.find(
+        (message, index) => index >= active.fromIndex && message.role === 'assistant',
+      );
+      if (!answer) return;
+      const text = typeof answer.content === 'string' ? answer.content : '';
+      if (!text || text === DAEMON_QUEUE_PLACEHOLDER) return;
+      // Both routes replace the message's content rather than appending to it,
+      // so "longer than last time" is not the same question as "continues what
+      // has already been spoken". When it does not continue it, the message was
+      // rewritten and none of what is there now has been said out loud.
+      const delta = text.startsWith(active.spoken) ? text.slice(active.spoken.length) : text;
+      active.spoken = text;
+      if (delta) engine.onAssistantDelta(delta, active.turnId);
     });
   }, [sessionId]);
 
@@ -383,7 +429,8 @@ export function TalkPanel({
           className="flex items-center gap-2 border-b border-danger/40 bg-danger/10 px-4 py-2 text-xs font-medium text-danger"
         >
           <Radio size={14} className="shrink-0 animate-pulse" />
-          Always-listening is on: this machine is listening for the wake phrase whenever Talk is open.
+          Always-listening is on: opening Talk starts capturing on this machine and closing it stops,
+          and only what follows the wake phrase is sent anywhere.
           <Button
             className="ml-auto"
             size="sm"

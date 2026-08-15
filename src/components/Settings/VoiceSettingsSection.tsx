@@ -10,17 +10,20 @@
  * "always listening" can never quietly mean "always uploading".
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, Gauge, Mic, Radio, Save, Trash2, Volume2 } from 'lucide-react';
 
 import {
   blobToBase64,
   companionClient,
   type CompanionConfig,
+  type TranscriptionBackendKind,
   type VoiceConfig,
 } from '../../lib/companionClient';
 import { errorMessage } from '../../lib/errors';
+import { base64AudioBlob } from '../../lib/talkAudio';
 import { latencySummary, talkClient, type TalkMetricsSnapshot } from '../../lib/talkClient';
+import { createTalkPlayer } from '../../lib/talkPlayback';
 import { Button } from '../ui';
 
 const INPUT =
@@ -28,6 +31,17 @@ const INPUT =
 
 /** How long the microphone test records before playing itself back. */
 const MIC_TEST_MS = 3_000;
+
+/**
+ * The transcription backend is chosen in “Voice and transcription” above, not
+ * here — but it decides whether the wake phrase can be armed at all, so this
+ * section has to be able to say which one is selected instead of asking the
+ * operator to go and find out.
+ */
+const BACKEND_LABEL: Record<TranscriptionBackendKind, string> = {
+  local_whisper: 'local whisper.cpp on this machine',
+  provider: 'a BYOK provider',
+};
 
 export interface VoiceSettingsSectionProps {
   config: CompanionConfig;
@@ -51,6 +65,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const [confirmingAlwaysListening, setConfirmingAlwaysListening] = useState(false);
 
   const voice = config.voice;
+  const player = useMemo(() => createTalkPlayer(), []);
 
   const loadDevices = useCallback(async () => {
     // Labels only exist after permission has been given once — an unlabelled
@@ -131,31 +146,30 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         jobId,
         'This is Little Monkey. If you can hear this, speech output is working.',
       );
-      const blob = new Blob(
-        [Uint8Array.from(atob(speech.audioBase64), (character) => character.charCodeAt(0))],
-        { type: speech.mediaType },
+      // The same player a conversation uses, so what this button proves is what
+      // Talk will do — including the chosen output, and including falling back
+      // to the system default where the browser cannot route at all.
+      const played = await player.play(
+        base64AudioBlob(speech.audioBase64, speech.mediaType),
+        voice.outputDeviceId,
       );
-      const url = URL.createObjectURL(blob);
-      const player = new Audio(url);
-      // `setSinkId` is how a chosen output is honoured; browsers that do not
-      // expose it play on the system default rather than failing the test.
-      const withSink = player as HTMLAudioElement & {
-        setSinkId?: (id: string) => Promise<void>;
-      };
-      if (voice.outputDeviceId && typeof withSink.setSinkId === 'function') {
-        await withSink.setSinkId(voice.outputDeviceId).catch(() => undefined);
-      }
-      await player.play();
-      player.onended = () => URL.revokeObjectURL(url);
-      setNote('Played a test phrase through the selected output.');
+      setNote(
+        played
+          ? 'Played a test phrase through the selected output.'
+          : 'The output refused to play the test phrase. Try another speaker.',
+      );
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setBusy(null);
     }
-  }, [voice.outputDeviceId]);
+  }, [player, voice.outputDeviceId]);
 
   const localOnly = voice.backend === 'local_whisper';
+  /** Wake listening left armed under a backend that cannot have it: the
+   * checkbox that turns it off is disabled by the same condition, so without a
+   * way out of this the whole configuration becomes unsaveable. */
+  const armedElsewhere = !localOnly && (voice.wakePhraseEnabled || voice.alwaysListening);
   const stt = metrics ? latencySummary(metrics.metrics, 'sttMs') : null;
   const firstToken = metrics ? latencySummary(metrics.metrics, 'modelFirstTokenMs') : null;
   const firstAudio = metrics ? latencySummary(metrics.metrics, 'ttsFirstAudioMs') : null;
@@ -169,6 +183,12 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
       </div>
       <p className="mt-1 text-xs text-muted">
         Devices, how Talk decides you have stopped speaking, and whether anything listens on its own.
+      </p>
+      <p className="mt-1 text-[11px] text-faint">
+        Transcription runs through {BACKEND_LABEL[voice.backend]}, chosen under “Voice and
+        transcription” above. A spoken turn goes through Talk&apos;s own transcription, which keeps
+        nothing: “Persist raw audio artifacts” there does not apply to a conversation, and no
+        recording of one is written anywhere.
       </p>
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -237,7 +257,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
             onChange={(event) => patch({ vadMinSpeechMs: Number(event.target.value) })}
           />
           <span className="mt-1 block text-[11px] text-faint">
-            How long a sound must last to count as speech rather than a door.
+            How long a sound must last to count as speech rather than a door. 50–2000.
           </span>
         </label>
         <label className="text-xs text-muted">
@@ -267,7 +287,7 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
             onChange={(event) => patch({ vadMaxUtteranceMs: Number(event.target.value) })}
           />
           <span className="mt-1 block text-[11px] text-faint">
-            A monologue is answered at this point rather than left running.
+            A monologue is answered at this point rather than left running. 1000–90000.
           </span>
         </label>
       </div>
@@ -283,10 +303,31 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
           )}
         </div>
         {!localOnly && (
-          <p className="mt-2 flex items-start gap-2 rounded border border-warning/40 bg-warning/10 p-2 text-[11px]">
+          <div className="mt-2 flex items-start gap-2 rounded border border-warning/40 bg-warning/10 p-2 text-[11px]">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
-            Wake detection is local-only. Switch transcription to local Whisper above to enable it.
-          </p>
+            <div>
+              Wake detection is local-only, and transcription is set to{' '}
+              {BACKEND_LABEL[voice.backend]}. Set Backend to “Local whisper.cpp” under “Voice and
+              transcription” above to enable it.
+              {armedElsewhere && (
+                <>
+                  {' '}
+                  Until then this pair cannot be saved at all — the checkbox below is left on and
+                  disabled, and every save is refused with it.
+                  <Button
+                    className="mt-2"
+                    size="sm"
+                    onClick={() => {
+                      setConfirmingAlwaysListening(false);
+                      patch({ wakePhraseEnabled: false, alwaysListening: false });
+                    }}
+                  >
+                    Turn wake listening off
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
         )}
         <label className="mt-2 flex items-center gap-2 text-xs">
           <input
@@ -302,8 +343,12 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
               });
             }}
           />
-          Listen for a wake phrase when Talk is open
+          Require the wake phrase before anything spoken is sent
         </label>
+        <span className="mt-1 block text-[11px] text-faint">
+          Applies while Talk is capturing continuously. Everything else said is transcribed on this
+          machine, matched against the phrase, and dropped.
+        </span>
         <label className="mt-2 block text-xs text-muted">
           Phrase
           <input
@@ -318,8 +363,9 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         {voice.alwaysListening ? (
           <div className="mt-3 rounded border border-danger/40 bg-danger/10 p-2">
             <p className="text-[11px] text-danger">
-              This machine keeps the microphone open and transcribes locally to hear the phrase.
-              Nothing is uploaded or sent to a model until it is heard.
+              Opening Talk starts capturing straight away, with nobody pressing Start. This machine
+              transcribes locally to hear the phrase, and nothing is uploaded or sent to a model
+              until it is heard. Closing Talk closes the microphone.
             </p>
             <Button
               className="mt-2"
@@ -336,9 +382,10 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         ) : confirmingAlwaysListening ? (
           <div className="mt-3 rounded border border-danger/40 bg-danger/10 p-2">
             <p className="text-[11px] text-danger">
-              Turning this on keeps your microphone open whenever Talk is open. Detection runs on
-              this machine and no audio is uploaded until the phrase is heard — but the microphone
-              is open the whole time.
+              Turning this on makes Talk start capturing the moment it is opened, without pressing
+              Start, and keep the microphone open until it is closed. Detection runs on this machine
+              and no audio is uploaded until the phrase is heard — but the microphone is open the
+              whole time.
             </p>
             <div className="mt-2 flex gap-2">
               <Button

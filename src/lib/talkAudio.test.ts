@@ -54,17 +54,25 @@ describe('AdaptiveVad', () => {
     expect(drive(noisy, level, 400, 10_000)).toEqual([]);
   });
 
-  it('bounds every configurable value to the documented range', () => {
+  it('bounds every configurable value to the range the settings accept', () => {
     expect(normalizeVadConfig({})).toEqual(DEFAULT_VAD_CONFIG);
     const clamped = normalizeVadConfig({
       minSpeechMs: 5,
       silenceMs: 50,
       maxUtteranceMs: 10 * 60_000,
     });
-    expect(clamped.minSpeechMs).toBe(80);
+    expect(clamped.minSpeechMs).toBe(50);
     expect(clamped.silenceMs).toBe(400);
     expect(clamped.maxUtteranceMs).toBe(90_000);
     expect(normalizeVadConfig({ silenceMs: 9_000 }).silenceMs).toBe(2_000);
+    // Anything the settings screen and `validate_config` accept survives the
+    // trip unchanged; a value that is clamped at runtime is a setting that
+    // lies.
+    expect(normalizeVadConfig({ minSpeechMs: 100, silenceMs: 1_500, maxUtteranceMs: 2_000 })).toEqual({
+      minSpeechMs: 100,
+      silenceMs: 1_500,
+      maxUtteranceMs: 2_000,
+    });
   });
 
   it('reports a level for a meter without being given the audio', () => {

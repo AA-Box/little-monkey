@@ -289,6 +289,11 @@ pub struct RemoteApi {
     /// Short-lived, one-use WebSocket admissions keyed by a digest of the
     /// opaque ticket. Device secrets never enter this map or a URL.
     talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
+    /// Speech backends for Talk sockets. `None` — always, in production — means
+    /// the operator's own configured stack, resolved per session. A test
+    /// substitutes the two things that are genuinely outside this process, a
+    /// transcriber and a synthesizer, and nothing else.
+    talk_speech: Option<Arc<dyn super::talk::TalkSpeech>>,
 }
 
 impl Clone for RemoteApi {
@@ -307,6 +312,7 @@ impl Clone for RemoteApi {
             terminal_commits: Arc::clone(&self.terminal_commits),
             audit: self.audit.clone(),
             talk_tickets: Arc::clone(&self.talk_tickets),
+            talk_speech: self.talk_speech.clone(),
         }
     }
 }
@@ -334,6 +340,7 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            talk_speech: None,
         })
     }
 
@@ -364,6 +371,7 @@ impl RemoteApi {
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
             talk_tickets: Arc::new(Mutex::new(HashMap::new())),
+            talk_speech: None,
         }
     }
 
@@ -373,6 +381,19 @@ impl RemoteApi {
     pub fn with_mobile_chat(mut self, mobile_chat: Arc<dyn MobileChatQueue>) -> Self {
         self.mobile_chat = Some(mobile_chat);
         self
+    }
+
+    /// Test builder: the injected API plus a scripted transcriber and
+    /// synthesizer, so a whole spoken conversation can be driven over a real
+    /// socket without a whisper build or a system voice.
+    #[cfg(test)]
+    pub fn with_talk_speech(mut self, speech: Arc<dyn super::talk::TalkSpeech>) -> Self {
+        self.talk_speech = Some(speech);
+        self
+    }
+
+    pub(crate) fn talk_speech(&self) -> Option<Arc<dyn super::talk::TalkSpeech>> {
+        self.talk_speech.clone()
     }
 
     /// Test builder: the injected API plus a fake placement queue, so the K17
@@ -2253,23 +2274,84 @@ impl RemoteApi {
                     "interruptions": report.interruptions,
                     "spokenChunks": report.spoken_chunks,
                     "errors": report.errors,
+                    "fallbacks": report.fallbacks,
                     "grantRevoked": report.grant_revoked,
+                    // Durations, in the same seven spans the desktop records.
+                    // Means and worst cases rather than samples, so a long
+                    // conversation cannot grow this row.
+                    "latencyMs": talk_latency_detail(&report.latency),
                 })),
             });
     }
 
-    /// Whether a device may still speak. Read between Talk turns so a grant
-    /// withdrawn mid-conversation closes the microphone.
+    /// Registers an open Talk socket as a live capture, and hands back the row
+    /// to close when it ends. A failure to register is not a reason to refuse
+    /// the conversation — but it is recorded, because an unobservable microphone
+    /// is the thing this exists to prevent.
+    pub(crate) fn open_talk_capture(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        expires_at_ms: u64,
+    ) -> Option<String> {
+        let now_ms = super::now_ms_public().ok()?;
+        let mut store = self.store.lock().ok()?;
+        match store.open_talk_capture(device_id, session_id, expires_at_ms, now_ms) {
+            Ok(record) => Some(record.command_id),
+            Err(error) => {
+                self.audit
+                    .record(little_monkey_lib::subsystem_audit::SubsystemAction {
+                        subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
+                        action: "TALK /v1/remote/device/talk/stream".to_string(),
+                        turn_id: None,
+                        permission_request_id: None,
+                        outcome: little_monkey_lib::subsystem_audit::outcome_for_status(500),
+                        detail: Some(serde_json::json!({
+                            "deviceId": device_id,
+                            "captureRegistrationFailed": error,
+                        })),
+                    });
+                None
+            }
+        }
+    }
+
+    pub(crate) fn close_talk_capture(
+        &self,
+        device_id: &str,
+        command_id: &str,
+        error: Option<&str>,
+    ) {
+        let Ok(now_ms) = super::now_ms_public() else {
+            return;
+        };
+        if let Ok(mut store) = self.store.lock() {
+            let _ = store.close_talk_capture(device_id, command_id, error, now_ms);
+        }
+    }
+
+    /// Whether a device may still speak. Read between Talk turns, and on a timer
+    /// while an answer streams, so a grant withdrawn mid-conversation closes the
+    /// microphone.
+    ///
+    /// Deliberately the *same* test the ticket route admits on — grant ∩
+    /// advertised surface ∩ OS permission — rather than the grant alone. A
+    /// microphone permission withdrawn on the phone half way through a
+    /// conversation is exactly the case where the weaker test would keep the
+    /// session alive, and it is the case that matters most.
     pub(crate) fn talk_capability_live(&self, device_id: &str) -> bool {
-        let Some(device) = self
-            .store
-            .lock()
-            .ok()
-            .and_then(|store| store.device(device_id).ok().flatten())
-        else {
+        let Ok(store) = self.store.lock() else {
             return false;
         };
-        device.active() && require_capability(&device, DeviceCapability::VoiceStream).is_ok()
+        let Some(device) = store.device(device_id).ok().flatten() else {
+            return false;
+        };
+        if !device.active() {
+            return false;
+        }
+        let surface = store.device_surface(device_id).ok().flatten();
+        effective_capabilities(&device.capabilities, surface.as_ref())
+            .contains(&DeviceCapability::VoiceStream)
     }
 
     fn talk_stream_needs_upgrade(
@@ -3843,6 +3925,36 @@ fn internal(error: impl std::fmt::Display) -> (u16, String) {
     (500, error.to_string())
 }
 
+/// One session's latency, as the audit is allowed to see it: for each span, how
+/// many samples, their mean and the worst one. Spans nobody measured are absent
+/// rather than zero, because "no sample" and "instant" are different facts.
+fn talk_latency_detail(latency: &super::talk::TalkSessionLatency) -> serde_json::Value {
+    let span = |value: &super::talk::TalkLatencySpan| {
+        value.mean_ms().map(|mean| {
+            serde_json::json!({
+                "samples": value.samples,
+                "meanMs": mean,
+                "worstMs": value.worst_ms,
+            })
+        })
+    };
+    let mut detail = serde_json::Map::new();
+    for (name, value) in [
+        ("speechDetection", &latency.speech_detection),
+        ("capture", &latency.capture),
+        ("upload", &latency.upload),
+        ("transcription", &latency.transcription),
+        ("modelFirstToken", &latency.model_first_token),
+        ("ttsFirstAudio", &latency.tts_first_audio),
+        ("endToEnd", &latency.end_to_end),
+    ] {
+        if let Some(entry) = span(value) {
+            detail.insert(name.to_string(), entry);
+        }
+    }
+    serde_json::Value::Object(detail)
+}
+
 /// A Talk session's turns, running through exactly the surface the typed mobile
 /// chat uses.
 ///
@@ -3898,7 +4010,19 @@ impl super::talk::TalkTurns for TalkSessionTurns {
                 created_at_ms: now_ms,
             })?;
         }
-        queue.queue_chat(session_id, client_key, text)
+        // A row that claims `queued` for a turn nothing ever queued is a lie the
+        // operator has no way to detect: the reply materializer skips it forever
+        // because its job never existed. Settle it here, exactly as
+        // `mobile_message_post` does, rather than leaving it to a sweep.
+        match queue.queue_chat(session_id, client_key, text) {
+            Ok(run_id) => Ok(run_id),
+            Err(error) => {
+                if let Ok(mut store) = self.api.store.lock() {
+                    let _ = store.set_mobile_message_state(client_key, "failed", now_ms);
+                }
+                Err(error)
+            }
+        }
     }
 
     fn progress(
@@ -4365,11 +4489,33 @@ mod tests {
         path: &str,
         body: &[u8],
     ) -> ApiRequest {
+        signed_at(
+            device_id, secret, sequence, command, method, path, body, 2_000,
+        )
+    }
+
+    /// The same signed request against a caller-chosen clock.
+    ///
+    /// Every other test drives the API at a fixed `now_ms`, which is what makes
+    /// them deterministic. A Talk ticket cannot: it is minted through the API
+    /// and redeemed by the socket layer, which reads the real clock — so a
+    /// ticket issued in 1970 is expired before the handshake starts.
+    #[allow(clippy::too_many_arguments)]
+    fn signed_at(
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        command: &str,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        timestamp_ms: u64,
+    ) -> ApiRequest {
         let mut auth = SignedRequestHeaders {
             device_id: device_id.into(),
             secret_generation: 1,
             sequence,
-            timestamp_ms: 2_000,
+            timestamp_ms,
             nonce: format!("nonce-{command}-0123456789"),
             command_id: command.into(),
             signature: String::new(),
@@ -6267,6 +6413,746 @@ mod tests {
         assert_eq!(response.status, 426);
         assert!(String::from_utf8_lossy(&response.body).contains("talk/ticket"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- Talk, on the wire -------------------------------------------------
+
+    /// A conversation queue that goes through the **real** durable ingress.
+    ///
+    /// The only thing standing in for production here is the run *executor*:
+    /// `submit_conversation_turn` writes a real `ingress_turns` row under a real
+    /// dedupe key, and the answer is a real run in a real ledger. That is the
+    /// boundary a test is allowed to draw — a fake ingress would make the whole
+    /// exercise meaningless, since "does a spoken turn become an ordinary
+    /// durable turn" is the question.
+    struct IngressTalkQueue {
+        paths: DaemonPaths,
+        runs: Mutex<HashMap<String, String>>,
+        /// The recorders the test plays the model's part through.
+        recorders: Mutex<HashMap<String, Arc<DurableRunRecorder>>>,
+        /// The turns that reached ingress, with the outcome each one got.
+        accepted: Mutex<Vec<(String, String)>>,
+    }
+
+    struct RecordingRunQueue;
+
+    impl crate::daemon::channel_worker::RunQueue for RecordingRunQueue {
+        fn freeze_execution(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+            Ok(crate::daemon::channel_worker::test_frozen_execution(
+                ingress,
+            ))
+        }
+
+        fn submit(
+            &self,
+            ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+            _params: Vec<String>,
+        ) -> Result<String, String> {
+            Ok(ingress.deterministic_job_id())
+        }
+    }
+
+    impl IngressTalkQueue {
+        fn new(paths: DaemonPaths) -> Self {
+            Self {
+                paths,
+                runs: Mutex::new(HashMap::new()),
+                recorders: Mutex::new(HashMap::new()),
+                accepted: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The run a spoken turn produced, so the test can play the model's part
+        /// by appending real events to it.
+        fn recorder(&self, client_key: &str) -> Option<Arc<DurableRunRecorder>> {
+            self.recorders.lock().unwrap().get(client_key).cloned()
+        }
+    }
+
+    impl MobileChatQueue for IngressTalkQueue {
+        fn queue_chat(
+            &self,
+            session_id: &str,
+            client_key: &str,
+            prompt: &str,
+        ) -> Result<String, String> {
+            use little_monkey_lib::channels::ingress::{ConversationIngress, ConversationSource};
+            use little_monkey_lib::channels::routing::RouteTarget;
+
+            let now_ms = crate::daemon::remote::now_ms_public()? as i64;
+            // Exactly the shape `queue_mobile_chat_recipe` builds, because a
+            // spoken turn is a mobile chat turn: same source, same session key,
+            // same recipe.
+            let ingress = ConversationIngress::direct(
+                ConversationSource::Mobile,
+                session_id,
+                client_key,
+                format!("mobile:{session_id}"),
+                prompt,
+                RouteTarget::new("mobile-chat"),
+                now_ms,
+            );
+            let mut store = crate::daemon::store::DaemonStore::open(&self.paths)
+                .map_err(|error| error.to_string())?;
+            let outcome = crate::daemon::channel_ingress::submit_conversation_turn(
+                &mut store,
+                &RecordingRunQueue,
+                &ingress,
+                &[format!("prompt={prompt}")],
+                now_ms,
+            )?;
+            self.accepted
+                .lock()
+                .unwrap()
+                .push((client_key.to_string(), format!("{outcome:?}")));
+
+            // One real run per turn, so the session reads its answer back out of
+            // the ledger the way it does in production.
+            let run_id = format!("run-{client_key}");
+            let ledger = RunLedger::open(&self.paths.ledger_db).map_err(|e| e.to_string())?;
+            let (recorder, _) = DurableRunRecorder::submit(
+                ledger,
+                &spec(&run_id, "workspace-talk"),
+                "talk-fixture".into(),
+            )
+            .map_err(|error| error.to_string())?;
+            recorder
+                .emit(RunEvent::Started {
+                    engine_id: "talk-fixture".into(),
+                })
+                .map_err(|error| error.to_string())?;
+            self.runs
+                .lock()
+                .unwrap()
+                .insert(client_key.to_string(), run_id.clone());
+            self.recorders
+                .lock()
+                .unwrap()
+                .insert(client_key.to_string(), recorder);
+            Ok(run_id)
+        }
+
+        fn chat_run_id(
+            &self,
+            _session_id: &str,
+            client_key: &str,
+        ) -> Result<Option<String>, String> {
+            Ok(self.runs.lock().unwrap().get(client_key).cloned())
+        }
+    }
+
+    /// A scripted transcriber and synthesizer — the two things genuinely outside
+    /// this process.
+    struct ScriptedSpeech {
+        transcripts: Mutex<std::collections::VecDeque<String>>,
+        heard_bytes: Mutex<Vec<usize>>,
+        spoken: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::talk::TalkSpeech for ScriptedSpeech {
+        async fn transcribe(&self, audio: Vec<u8>, _media_type: &str) -> Result<String, String> {
+            self.heard_bytes.lock().unwrap().push(audio.len());
+            Ok(self
+                .transcripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        async fn synthesize(&self, text: &str) -> Result<(Vec<u8>, String), String> {
+            self.spoken.lock().unwrap().push(text.to_string());
+            Ok((b"RIFFfake".to_vec(), "audio/wav".to_string()))
+        }
+    }
+
+    fn talk_frame(
+        session_id: &str,
+        generation: &str,
+        sequence: u64,
+        kind: serde_json::Value,
+    ) -> tokio_tungstenite::tungstenite::Message {
+        let mut frame = serde_json::json!({
+            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": session_id,
+            "session_generation": generation,
+            "frame_sequence": sequence,
+        });
+        let object = frame.as_object_mut().unwrap();
+        for (key, value) in kind.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        tokio_tungstenite::tungstenite::Message::Text(frame.to_string().into())
+    }
+
+    /// **The whole spoken path, over a real socket, with nothing internal
+    /// faked.**
+    ///
+    /// Every unit test in this repository passed while mobile Talk could not
+    /// complete a single utterance, because two defects lived in the seams no
+    /// unit test crosses: the shipped client never sent the `hello` the runner
+    /// demands, and the connection was served without upgrades so the socket
+    /// after the `101` never arrived. Both are invisible to a scripted socket
+    /// and to a source-string scan. So this drives the real thing:
+    ///
+    /// signed ticket → real HTTP upgrade → real `tokio-tungstenite` client →
+    /// hello → audio → transcription → **real durable ingress** → a real run in
+    /// a real ledger → assistant deltas → speech before the run finishes →
+    /// barge-in that cancels and becomes the next turn → revocation that closes
+    /// the socket.
+    #[tokio::test]
+    async fn a_paired_phone_holds_a_spoken_conversation_over_a_real_talk_socket() {
+        use futures_util::{SinkExt, StreamExt};
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::VoiceStream,
+                DeviceCapability::MicrophoneCapture,
+            ],
+        );
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::VoiceStream,
+                DeviceCapability::MicrophoneCapture,
+            ],
+            &[
+                (DeviceCapability::VoiceStream, OsPermission::Granted),
+                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+            ],
+        );
+
+        let queue = Arc::new(IngressTalkQueue::new(DaemonPaths::under(&root)));
+        let speech = Arc::new(ScriptedSpeech {
+            transcripts: Mutex::new(
+                [
+                    "what is the deploy status",
+                    "stop and tell me about staging",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ),
+            heard_bytes: Mutex::new(Vec::new()),
+            spoken: Mutex::new(Vec::new()),
+        });
+        let api = api
+            .with_mobile_chat(queue.clone())
+            .with_talk_speech(speech.clone());
+
+        // The real server, minus only TLS — which is the same listener every
+        // other route on this plane shares and is not what is under test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = api.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let served = served.clone();
+                tokio::spawn(async move {
+                    // Production's own connection path, so a regression there —
+                    // dropping `with_upgrades`, say — fails this test rather
+                    // than only the phone.
+                    let _ = super::super::server::serve_upgradable(
+                        hyper_util::rt::TokioIo::new(stream),
+                        served,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // One ordinary signed request mints the ticket.
+        let session_id = format!("mobile-{device_id}");
+        let ticket_body = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": session_id,
+        }))
+        .unwrap();
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        let issued = api.handle(
+            signed_at(
+                &device_id,
+                &secret,
+                2,
+                "cmd-talk-ticket",
+                "POST",
+                "/v1/remote/device/talk/ticket",
+                &ticket_body,
+                now_ms,
+            ),
+            now_ms,
+        );
+        assert_eq!(issued.status, 201, "the grant admits a ticket");
+        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let bearer = ticket["ticket"].as_str().unwrap().to_string();
+        let generation = ticket["session_generation"].as_str().unwrap().to_string();
+        let path = ticket["websocket_path"].as_str().unwrap().to_string();
+
+        let url = format!("ws://{address}{path}?ticket={bearer}");
+        let (mut socket, response) = tokio_tungstenite::connect_async(&url).await.expect(
+            "the ticket admits a real WebSocket — a 101 whose upgrade never \
+             resolves fails exactly here",
+        );
+        assert_eq!(response.status().as_u16(), 101);
+
+        let mut sequence = 0u64;
+        let mut next = |kind: serde_json::Value| {
+            sequence += 1;
+            talk_frame(&session_id, &generation, sequence, kind)
+        };
+
+        // Frame 1 is the hello, and its media type is the one the audio frames
+        // will actually carry.
+        socket
+            .send(next(serde_json::json!({
+                "type": "hello",
+                "media_type": "audio/webm;codecs=opus",
+                "sample_rate_hz": 48_000,
+                "channels": 1,
+            })))
+            .await
+            .unwrap();
+        socket
+            .send(next(serde_json::json!({
+                "type": "audio",
+                "audio_sequence": 1,
+                "media_type": "audio/webm;codecs=opus",
+                "audio_base64": STANDARD.encode(b"first utterance bytes"),
+                "last": true,
+            })))
+            .await
+            .unwrap();
+        socket
+            .send(next(serde_json::json!({
+                "type": "metrics",
+                "speech_detection_ms": 180,
+                "capture_ms": 1_200,
+                "upload_ms": 40,
+            })))
+            .await
+            .unwrap();
+
+        // The runner reaches transcription, which means the hello was accepted
+        // and the audio was not refused.
+        let transcript = read_until(&mut socket, "transcript").await;
+        assert_eq!(transcript["text"], "what is the deploy status");
+        assert!(!speech.heard_bytes.lock().unwrap().is_empty());
+
+        // The turn is a real durable one, under the utterance's own identity.
+        let first_key = queue.accepted.lock().unwrap()[0].0.clone();
+        assert!(first_key.starts_with("talk-"));
+        {
+            let store = crate::daemon::store::DaemonStore::open(&DaemonPaths::under(&root))
+                .expect("daemon store");
+            let dedupe = little_monkey_lib::channels::ingress::dedupe_key_for(
+                little_monkey_lib::channels::ingress::ConversationSource::Mobile,
+                &session_id,
+                &first_key,
+            );
+            let row = store
+                .ingress_turn_by_dedupe_key(&dedupe)
+                .expect("ingress lookup")
+                .expect("a spoken turn is an ordinary durable turn");
+            assert_eq!(row.source_account_id, session_id);
+        }
+
+        // The model answers, and the first sentence is spoken before the run
+        // completes — incremental synthesis, not a wait for the whole answer.
+        let recorder = queue.recorder(&first_key).expect("a run for the turn");
+        emit_delta(&recorder, "The deploy finished. ");
+        let delta = read_until(&mut socket, "assistant_delta").await;
+        assert_eq!(delta["text"], "The deploy finished. ");
+        let audio = read_until(&mut socket, "output_audio").await;
+        assert_eq!(audio["media_type"], "audio/wav");
+        assert!(
+            !speech.spoken.lock().unwrap().is_empty(),
+            "a sentence is synthesized while the run is still going"
+        );
+
+        // Talking over it: the audio that interrupts is the next utterance.
+        sequence += 1;
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                sequence,
+                serde_json::json!({
+                    "type": "audio",
+                    "audio_sequence": 2,
+                    "media_type": "audio/webm;codecs=opus",
+                    "audio_base64": STANDARD.encode(b"second utterance bytes"),
+                    "last": true,
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let second = read_until(&mut socket, "transcript").await;
+        assert_eq!(
+            second["text"], "stop and tell me about staging",
+            "the interrupting words become the next turn instead of being thrown away"
+        );
+        assert_eq!(
+            queue.accepted.lock().unwrap().len(),
+            2,
+            "two spoken turns, two durable turns"
+        );
+
+        // Withdrawing the grant closes the conversation rather than waiting for
+        // the device to say something.
+        revoke(&api, &device_id, DeviceCapability::VoiceStream);
+        let closed = read_until_closed(&mut socket).await;
+        assert!(
+            closed,
+            "a revoked voice_stream ends the socket without another frame from the device"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **A spoken turn that the queue refuses does not leave a row claiming to
+    /// be queued.**
+    ///
+    /// The transcript row and the durable turn live in two different SQLite
+    /// files, so they cannot be one transaction: the row is written first and
+    /// the turn is queued after. When that second step fails, the row is the
+    /// only thing left, and a row stuck at `queued` is worse than a lost one —
+    /// the reply materializer skips it forever (its job never existed), so the
+    /// operator sees a question of theirs waiting for an answer that no part of
+    /// the system is going to produce.
+    #[test]
+    fn a_spoken_turn_the_queue_refuses_settles_its_row_instead_of_stranding_it() {
+        use super::super::talk::TalkTurns;
+
+        struct RefusingQueue;
+        impl MobileChatQueue for RefusingQueue {
+            fn queue_chat(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+                Err("the daemon queue is not accepting work".to_string())
+            }
+            fn chat_run_id(&self, _: &str, _: &str) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+        }
+
+        let (root, api, _secrets, device_id, _secret) = fixture();
+        let api = api.with_mobile_chat(Arc::new(RefusingQueue));
+        let turns = TalkSessionTurns::new(
+            api.clone(),
+            &TalkSocketAuthorization {
+                device_id: device_id.clone(),
+                signed_request_sha256: "a".repeat(64),
+                session_id: "mobile-session".to_string(),
+                session_generation: "generation-one".to_string(),
+            },
+        );
+
+        let refused = turns.submit("mobile-session", "talk-generation-1", "what is the status");
+        assert!(
+            refused.is_err(),
+            "the caller is told the turn did not queue"
+        );
+
+        let store = api.store.lock().unwrap();
+        let messages = store.mobile_messages("mobile-session", 10).unwrap();
+        assert_eq!(messages.len(), 1, "the transcript keeps what was said");
+        assert_eq!(
+            messages[0].task_state, "failed",
+            "a turn nothing queued must not sit at 'queued' forever"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **The security audit sees a real Talk socket, not a fabricated row.**
+    ///
+    /// `docs/paired-devices.md` promises that an open Talk socket "shows up
+    /// there as a running `voice_stream` command, like any other capture in
+    /// flight". Until this test that promise was checked by handing the audit a
+    /// hand-built `DeviceCommandSnapshot` — which would have passed just as
+    /// happily with the entire Talk path deleted, and did pass while a live
+    /// socket wrote nothing anywhere.
+    ///
+    /// So: open a real admitted socket, then run the *production* device-state
+    /// reader against the same store and ask the real audit what it sees.
+    #[tokio::test]
+    async fn an_open_talk_socket_is_a_capture_the_security_audit_can_see() {
+        use futures_util::SinkExt;
+
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::VoiceStream,
+                DeviceCapability::MicrophoneCapture,
+            ],
+        );
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[
+                DeviceCapability::VoiceStream,
+                DeviceCapability::MicrophoneCapture,
+            ],
+            &[
+                (DeviceCapability::VoiceStream, OsPermission::Granted),
+                (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+            ],
+        );
+        let paths = DaemonPaths::under(&root);
+        let speech = Arc::new(ScriptedSpeech {
+            transcripts: Mutex::new(Default::default()),
+            heard_bytes: Mutex::new(Vec::new()),
+            spoken: Mutex::new(Vec::new()),
+        });
+        let api = api
+            .with_mobile_chat(Arc::new(IngressTalkQueue::new(paths.clone())))
+            .with_talk_speech(speech);
+
+        // Nothing is listening yet.
+        assert!(
+            !capture_in_flight(&paths),
+            "an idle runner reports no capture"
+        );
+
+        let address = spawn_talk_server(api.clone()).await;
+        let session_id = format!("mobile-{device_id}");
+        let (mut socket, generation) =
+            open_talk_socket(&api, &device_id, &secret, 2, &session_id, address).await;
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                1,
+                serde_json::json!({
+                    "type": "hello",
+                    "media_type": "audio/webm;codecs=opus",
+                    "sample_rate_hz": 48_000,
+                    "channels": 1,
+                }),
+            ))
+            .await
+            .unwrap();
+        // The `ready` frame proves the session is running, so the registration
+        // that happens before it has already landed.
+        let _ = read_until(&mut socket, "ready").await;
+
+        assert!(
+            capture_in_flight(&paths),
+            "an open Talk socket is a voice_stream capture in flight"
+        );
+
+        // Withdrawing the grant closes the socket, and the capture clears with
+        // it rather than outliving the authority that allowed it.
+        revoke(&api, &device_id, DeviceCapability::VoiceStream);
+        socket
+            .send(talk_frame(
+                &session_id,
+                &generation,
+                2,
+                serde_json::json!({ "type": "interrupt", "reason": "stop_button" }),
+            ))
+            .await
+            .unwrap();
+        assert!(read_until_closed(&mut socket).await);
+        for _ in 0..100 {
+            if !capture_in_flight(&paths) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !capture_in_flight(&paths),
+            "a closed Talk socket leaves no capture claiming to be open"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What the real audit says about this daemon root, right now.
+    fn capture_in_flight(paths: &DaemonPaths) -> bool {
+        let mut runtime = little_monkey_lib::security_doctor::SecurityRuntimeSnapshot::default();
+        crate::security_cli::collect_device_state_at(&mut runtime, paths);
+        let report = little_monkey_lib::security_doctor::run_security_audit(
+            &little_monkey_lib::security_doctor::SecurityAuditRequest {
+                app_data_dir: paths.root.clone(),
+                workspace: None,
+                deep: false,
+                fix: false,
+                runtime,
+            },
+        )
+        .expect("the audit runs");
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.id == "devices.capture_in_flight")
+    }
+
+    async fn spawn_talk_server(api: RemoteApi) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let api = api.clone();
+                tokio::spawn(async move {
+                    // Production's own connection path, so a regression there —
+                    // dropping `with_upgrades`, say — fails these tests rather
+                    // than only the phone.
+                    let _ = super::super::server::serve_upgradable(
+                        hyper_util::rt::TokioIo::new(stream),
+                        api,
+                    )
+                    .await;
+                });
+            }
+        });
+        address
+    }
+
+    /// Mints a ticket the ordinary signed way and spends it on a real socket.
+    async fn open_talk_socket(
+        api: &RemoteApi,
+        device_id: &str,
+        secret: &[u8],
+        sequence: u64,
+        session_id: &str,
+        address: std::net::SocketAddr,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        String,
+    ) {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": session_id,
+        }))
+        .unwrap();
+        let now_ms = crate::daemon::remote::now_ms_public().unwrap();
+        let issued = api.handle(
+            signed_at(
+                device_id,
+                secret,
+                sequence,
+                &format!("cmd-talk-ticket-{sequence}"),
+                "POST",
+                "/v1/remote/device/talk/ticket",
+                &body,
+                now_ms,
+            ),
+            now_ms,
+        );
+        assert_eq!(issued.status, 201, "the grant admits a ticket");
+        let ticket: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let url = format!(
+            "ws://{address}{}?ticket={}",
+            ticket["websocket_path"].as_str().unwrap(),
+            ticket["ticket"].as_str().unwrap()
+        );
+        let (socket, response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("the ticket admits a real WebSocket");
+        assert_eq!(response.status().as_u16(), 101);
+        (
+            socket,
+            ticket["session_generation"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// Reads server frames until one of `kind` arrives, or the socket ends.
+    async fn read_until(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        kind: &str,
+    ) -> serde_json::Value {
+        use futures_util::StreamExt;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let message = tokio::time::timeout_at(deadline, socket.next())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for a '{kind}' frame"));
+            let Some(Ok(message)) = message else {
+                panic!("the socket closed while waiting for a '{kind}' frame");
+            };
+            let Ok(text) = message.into_text() else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            if frame["type"] == kind {
+                return frame;
+            }
+        }
+    }
+
+    async fn read_until_closed(
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> bool {
+        use futures_util::StreamExt;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw_revocation = false;
+        loop {
+            let message = match tokio::time::timeout_at(deadline, socket.next()).await {
+                Ok(message) => message,
+                Err(_) => return false,
+            };
+            match message {
+                None => return saw_revocation,
+                Some(Ok(message)) => {
+                    if let Ok(text) = message.into_text() {
+                        if text.contains("capability_revoked") {
+                            saw_revocation = true;
+                        }
+                    }
+                }
+                Some(Err(_)) => return saw_revocation,
+            }
+        }
+    }
+
+    fn emit_delta(recorder: &DurableRunRecorder, text: &str) {
+        use crate::durable_run::CliRunEventSink;
+        recorder
+            .emit(RunEvent::ModelDelta {
+                message_id: "talk-answer".to_string(),
+                channel: OutputChannel::Assistant,
+                text: text.to_string(),
+            })
+            .expect("append an assistant delta");
+    }
+
+    /// Withdraws one capability and leaves the rest of the pairing intact —
+    /// which is what an operator revoking "may hear the room" actually does.
+    fn revoke(api: &RemoteApi, device_id: &str, capability: DeviceCapability) {
+        let mut store = api.store.lock().unwrap();
+        let mut capabilities = store.device(device_id).unwrap().unwrap().capabilities;
+        capabilities.remove(&capability);
+        store
+            .set_device_capabilities(device_id, &capabilities, 2_000)
+            .expect("revoke");
     }
 
     /// A whole voice stream over the signed plane: leased, started, audio

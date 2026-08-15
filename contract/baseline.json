@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.6.0",
+  "contract_version": "1.4.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -464,18 +464,6 @@
     },
     {
       "plane": "device",
-      "method": "POST",
-      "path": "/v1/remote/device/talk/ticket",
-      "gate": "capability:VoiceStream"
-    },
-    {
-      "plane": "device",
-      "method": "GET",
-      "path": "/v1/remote/device/talk/{session_id}/stream",
-      "gate": "capability:VoiceStream"
-    },
-    {
-      "plane": "device",
       "method": "GET",
       "path": "/v1/remote/device/push/key",
       "gate": "self_service"
@@ -527,18 +515,6 @@
       "method": "POST",
       "path": "/v1/remote/node/migration/accept",
       "gate": "capability:Migrate"
-    },
-    {
-      "plane": "peer",
-      "method": "POST",
-      "path": "/v1/remote/peer/messages",
-      "gate": "peer_standing"
-    },
-    {
-      "plane": "peer",
-      "method": "GET",
-      "path": "/v1/remote/peer/threads/{thread_id}",
-      "gate": "peer_standing"
     }
   ],
   "acp": {

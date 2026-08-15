@@ -231,22 +231,42 @@ answers `426` and says how to open one properly.
 per-socket random generation and a strictly increasing sequence; audio carries
 its own sequence as well. A frame from an earlier socket cannot be replayed into
 a later one even with a valid ticket, because the generation will not match. The
-device sends `hello`, `audio` (with `last` marking the end of an utterance),
-`state` and `interrupt`; the runner sends `ready`, `state`, `transcript`,
+device's first frame is always `hello`, which names the container, sample rate
+and channel count every later `audio` frame will actually carry; after it the
+device sends `audio` (with `last` marking the end of an utterance), `state`,
+`interrupt` and `metrics`. The runner sends `ready`, `state`, `transcript`,
 `assistant_delta`, `output_audio` and `error`.
 
 **Where the work happens.** Voice activity detection is on the device and stays
-there, so silence is never uploaded. The runner transcribes with the operator's
-own configured backend, submits the finalized transcript as an ordinary durable
-turn — same queue, same session, same tools and approvals as a typed message —
-streams the answer back, and speaks it on sentence boundaries. Talking over the
-answer stops the speech, drops what has not been said and cancels the run; what
-a tool already did in the world is not undone, and nothing claims it was.
-Withdrawing `voice_stream` mid-conversation closes the microphone at the next
-frame.
+there, so silence is never uploaded. The recorder is armed by confirmed speech
+rather than by the session, so what is uploaded is an utterance and not the gap
+before it — nor, during a barge-in, the answer coming out of the device's own
+speaker. The runner transcribes with the operator's own configured backend,
+submits the finalized transcript as an ordinary durable turn — same queue, same
+session, same tools and approvals as a typed message — streams the answer back,
+and speaks it on sentence boundaries. Talking over the answer stops the speech,
+drops what has not been said and cancels the run; what a tool already did in the
+world is not undone, and nothing claims it was. The audio that interrupted is
+kept and becomes the next turn, because it is the next question and nobody
+should have to say it twice.
 
-What survives a session is the transcript, the answer and bounded counters. The
-audio is held for the length of one utterance and dropped.
+**One conversation.** Talk speaks into the session the operator already has
+selected in the controller's own chat surface, rather than minting one of its
+own — so a spoken turn and a typed one are the same thread, and the message list
+shows both. With no conversation selected there is nothing to speak into, and
+Talk says so instead of starting.
+
+**Revocation.** Withdrawing `voice_stream` closes the session in whichever phase
+it lands — listening, transcribing, thinking or speaking — because the grant is
+re-read on a timer while an answer streams and once more when each turn ends,
+not only when the device happens to send a frame. A device that is silent for a
+ten-minute answer is exactly the case where "at the next frame" would have meant
+"not at all".
+
+What survives a session is the transcript, the answer and bounded counters: how
+many utterances, turns, interruptions and errors, and seven latency spans as
+sample counts, means and worst cases. The audio is held for the length of one
+utterance and dropped.
 
 ## At most once, and delivered at least once
 
@@ -528,8 +548,12 @@ reads no keys.
 grant it has not used in a month, which is capturing right now, whether a
 revoked device can still be woken, whether the transport those grants are
 exercised over is pinned HTTPS, and whether push would put run specifics on a
-lock screen. An open Talk socket shows up there as a running
-`voice_stream` command, like any other capture in flight.
+lock screen. An open Talk socket shows up there as a running `voice_stream`
+command, like any other capture in flight: the socket registers one when it is
+admitted and closes it when it ends, so the audit is reading the socket's actual
+lifetime rather than a guess. A runner that dies mid-conversation leaves a row
+behind, and the daemon's own expiry sweep terminates it as unproven — a capture
+that is reported open forever is an alarm nobody would believe.
 
 ## Checking a real device
 

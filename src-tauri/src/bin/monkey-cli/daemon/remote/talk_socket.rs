@@ -21,23 +21,49 @@ use super::talk::{run_talk_session, TalkIdentity, TalkSocket, TalkSpeech};
 /// reopened with a fresh ticket; a tab left open overnight is not a microphone
 /// left open overnight.
 const MAX_SESSION_MS: u64 = 60 * 60 * 1_000;
+/// How long a socket may carry nothing from the device before it is closed. A
+/// long answer is not idle — the runner is talking — but a phone that connected
+/// and then went quiet is holding a microphone open for no one.
+const MAX_IDLE_MS: u64 = 15 * 60 * 1_000;
 
 type Upgraded = TokioIo<hyper::upgrade::Upgraded>;
 
 struct WebSocketTalkSocket {
     inner: WebSocketStream<Upgraded>,
+    /// Absolute, so the bound survives `try_recv` dropping a read mid-poll
+    /// every hundred milliseconds for the length of an answer.
+    session_deadline: tokio::time::Instant,
+    idle_deadline: tokio::time::Instant,
+    /// What ended the socket, when it was not the device closing it politely.
+    violation: Option<&'static str>,
 }
 
 #[async_trait]
 impl TalkSocket for WebSocketTalkSocket {
     async fn recv(&mut self) -> Option<String> {
         loop {
-            match self.inner.next().await? {
-                Ok(Message::Text(text)) => return Some(text.to_string()),
+            let deadline = self.session_deadline.min(self.idle_deadline);
+            let next = match tokio::time::timeout_at(deadline, self.inner.next()).await {
+                Ok(next) => next?,
+                Err(_) => {
+                    self.violation = Some("timeout");
+                    return None;
+                }
+            };
+            match next {
+                Ok(Message::Text(text)) => {
+                    self.idle_deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_millis(MAX_IDLE_MS);
+                    return Some(text.to_string());
+                }
                 // Binary frames are not part of this protocol: audio rides
                 // base64 inside a versioned JSON envelope, so a binary frame is
-                // either a different protocol or a probe.
-                Ok(Message::Binary(_)) => return None,
+                // either a different protocol or a probe. Either way the socket
+                // ends here rather than becoming a session nobody is driving.
+                Ok(Message::Binary(_)) => {
+                    self.violation = Some("binary frame");
+                    return None;
+                }
                 Ok(Message::Close(_)) => return None,
                 Ok(Message::Ping(payload)) => {
                     if self.inner.send(Message::Pong(payload)).await.is_err() {
@@ -45,7 +71,10 @@ impl TalkSocket for WebSocketTalkSocket {
                     }
                 }
                 Ok(_) => {}
-                Err(_) => return None,
+                Err(_) => {
+                    self.violation = Some("transport error");
+                    return None;
+                }
             }
         }
     }
@@ -106,27 +135,55 @@ pub(crate) async fn serve(
     // client that ignores it is disconnected rather than allocated for.
     config.max_message_size = Some(MAX_TALK_FRAME_BYTES);
     config.max_frame_size = Some(MAX_TALK_FRAME_BYTES);
+    let started = tokio::time::Instant::now();
+    let started_ms = super::now_ms_public().unwrap_or_default();
     let mut socket = WebSocketTalkSocket {
         inner: WebSocketStream::from_raw_socket(connection, Role::Server, Some(config)).await,
+        session_deadline: started + std::time::Duration::from_millis(MAX_SESSION_MS),
+        idle_deadline: started + std::time::Duration::from_millis(MAX_IDLE_MS),
+        violation: None,
     };
-    let speech = ConfiguredTalkSpeech {
+    let configured = ConfiguredTalkSpeech {
         app_data_dir: api.app_data_dir_for_talk(),
+    };
+    let injected = api.talk_speech();
+    let speech: &dyn TalkSpeech = match injected.as_deref() {
+        Some(speech) => speech,
+        None => &configured,
     };
     let identity = TalkIdentity {
         device_id: authorization.device_id.clone(),
         session_id: authorization.session_id.clone(),
         session_generation: authorization.session_generation.clone(),
     };
+    // Registered before the first frame and closed after the last, so "this
+    // device is capturing right now" is true exactly while it is true.
+    let capture = api.open_talk_capture(
+        &authorization.device_id,
+        &authorization.session_id,
+        started_ms.saturating_add(MAX_SESSION_MS),
+    );
     let turns = TalkSessionTurns::new(api.clone(), &authorization);
-    let report = match tokio::time::timeout(
-        std::time::Duration::from_millis(MAX_SESSION_MS),
-        run_talk_session(&mut socket, &speech, &turns, identity),
-    )
-    .await
-    {
-        Ok(report) => report,
-        Err(_) => Default::default(),
-    };
+    // The session's bound is the socket's own deadline rather than a timeout
+    // wrapped around the conversation: cancelling the future here would drop the
+    // report with it, and a session that ran for an hour would be audited as
+    // though nothing had happened.
+    let mut report = run_talk_session(&mut socket, speech, &turns, identity).await;
+    if socket.violation.is_some() {
+        report.stream_dropped = true;
+    }
+    if let Some(command_id) = capture {
+        let ended = if report.grant_revoked {
+            Some("The voice_stream grant was withdrawn while the socket was open.")
+        } else {
+            socket.violation.map(|violation| match violation {
+                "timeout" => "The Talk socket reached its deadline.",
+                "binary frame" => "The device sent a frame this protocol does not carry.",
+                _ => "The Talk socket stopped carrying frames.",
+            })
+        };
+        api.close_talk_capture(&authorization.device_id, &command_id, ended);
+    }
     // Counters only. What was said, and the audio it was said in, stop at this
     // function — see `talk.rs`'s header.
     api.record_talk_session(&authorization.device_id, &report);

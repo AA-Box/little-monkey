@@ -1242,6 +1242,23 @@ fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
 /// external side effects before the network went, and this machine cannot know —
 /// so re-placing without a human is exactly the "confirmed mutations are not
 /// replayed" rule the daemon's own `reconcile_interrupted` already holds to.
+/// Terminates device work whose deadline has passed, including the capture rows
+/// an open Talk socket registers.
+///
+/// **Why this needs its own tick.** Both expiry sweeps used to run in exactly
+/// one place — the device long-poll — so nothing swept until some device asked
+/// for work. A runner that died mid-conversation therefore left a `running`
+/// `voice_stream` row behind, and the security audit went on reporting a
+/// microphone in flight for a socket that no longer existed. A stale "something
+/// is listening" is worse than useless: it is the alarm nobody believes.
+pub(crate) fn expire_device_work(paths: &DaemonPaths) -> Result<u64, String> {
+    let now = now_ms()?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    let expired = store.expire_device_commands(now)?;
+    voice::expire(&mut store, now)?;
+    Ok(expired)
+}
+
 pub(crate) async fn placement_sync(paths: &DaemonPaths) -> Result<(), String> {
     let now = now_ms()?;
     for alias in aliases(paths, None)? {

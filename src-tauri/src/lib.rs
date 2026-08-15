@@ -1721,6 +1721,7 @@ pub fn run() {
             m7_companion::m7_talk_metrics,
             m7_companion::m7_talk_metric_record,
             m7_companion::m7_talk_metrics_clear,
+            m7_companion::m7_talk_transcribe,
             m7_companion::m7_capture_grant,
             m7_companion::m7_capture_revoke,
             m7_companion::m7_capture_grants,
