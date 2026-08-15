@@ -30,6 +30,89 @@ Little Monkey runs against a managed `llama.cpp`, Ollama, MLX on supported Apple
 
 Every surface shares one set of contracts — workspace, permission, run, model, generation, package, browser, Git, background service — rather than reimplementing them per feature. Capability claims here describe the current `develop` tree; where a feature is narrower than its name suggests, the boundary is stated in **[Limitations](docs/limitations.md)** rather than left for you to discover.
 
+## What you can actually do with Little Monkey
+
+### Fix a real coding task end to end
+
+Give it a bug, a feature request, or a repository chore. It inspects the codebase, searches files, uses Git, runs commands, delegates work to subagents, executes tests and reviews the resulting diff — with the whole run behind explicit permissions.
+
+```text
+"Fix the authentication regression in this repo"
+
+→ inspect the repository
+→ trace the failing path
+→ create isolated working changes
+→ run tests and verification
+→ review the diff
+→ return the finished result
+```
+
+You can inspect what the agent did instead of treating execution as a black box.
+
+### Start a long-running agent job and come back later
+
+Agent work should not disappear because you closed the UI. Jobs are tracked durably — execution state, limits, checkpoints and the processes they own.
+
+```text
+"Refactor this module and verify every call site"
+
+→ agent starts working
+→ task continues through multiple steps
+→ Little Monkey is restarted
+→ job state is restored
+→ inspect, resume, stop, or intervene
+```
+
+This makes agents usable for work that takes longer than a single chat turn.
+
+### Let agents use your computer without unrestricted access
+
+An autonomous agent needs tools, but that should not mean handing a model your entire machine. Tool execution goes through one shared permission and isolation layer.
+
+```text
+Agent wants to run a command
+        ↓
+permission policy
+        ↓
+workspace boundary
+        ↓
+sandboxed process
+        ↓
+tracked execution
+```
+
+Processes, tool calls, network access and execution state stay inspectable and controllable.
+
+### Run capable agents locally without giving up real tools
+
+Use Ollama, `llama.cpp`, MLX or another configured provider while the agent runtime stays on your own machine.
+
+```text
+local model
+→ read workspace
+→ edit files
+→ run shell commands
+→ use Git
+→ search knowledge
+→ call approved tools
+```
+
+Local does not have to mean "chat only." The same agent infrastructure works whether the model runs locally or through a provider you configure.
+
+### Run several agents without turning your repository into chaos
+
+Break larger work into parallel agent tasks while keeping their changes isolated.
+
+```text
+Main task
+├── Agent A: backend change
+├── Agent B: frontend change
+├── Agent C: tests
+└── Coordinator: review + integration
+```
+
+Agents can work in isolated Git worktrees, report back to a coordinator, and be stopped or inspected individually — multi-agent execution for real software work instead of several chat responses.
+
 ## How it fits together
 
 ```mermaid
