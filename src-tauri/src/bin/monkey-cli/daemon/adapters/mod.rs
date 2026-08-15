@@ -134,6 +134,11 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
     const MATRIX: &[ConfigField] = &[
         required("homeserver_url", ConfigFieldKind::Text),
         required("user_id", ConfigFieldKind::Text),
+        // Which device the access token belongs to. Discovered from the
+        // homeserver when absent; naming it saves a round trip at startup and
+        // is the one way to be certain which session in the user's own list
+        // this app is.
+        optional("device_id", ConfigFieldKind::Text),
     ];
     const SIGNAL: &[ConfigField] = &[
         required("helper_path", ConfigFieldKind::Text),

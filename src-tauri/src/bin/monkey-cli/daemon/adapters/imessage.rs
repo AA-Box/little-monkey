@@ -752,6 +752,79 @@ mod macos {
             ));
         }
 
+        /// An opt-in smoke test against the Mac this runs on, using the
+        /// operator's own Messages account.
+        ///
+        /// Never runs unless all three variables are set, so CI and every
+        /// contributor's `cargo test` skip it. No Apple account is hard-coded
+        /// anywhere — the destination is one the person running it chose, and
+        /// it is the only place a message is ever sent.
+        ///
+        /// ```text
+        /// LM_IMESSAGE_LIVE_HELPER=/usr/local/bin/little-monkey-imessage-helper \
+        /// LM_IMESSAGE_LIVE_HANDLE=you@example.com \
+        /// LM_IMESSAGE_LIVE_TARGET=+15550000000 \
+        ///   cargo test --bin monkey-cli a_live_messages_round_trip -- --nocapture
+        /// ```
+        #[tokio::test]
+        async fn a_live_messages_round_trip() {
+            let (Ok(helper), Ok(handle), Ok(target)) = (
+                std::env::var("LM_IMESSAGE_LIVE_HELPER"),
+                std::env::var("LM_IMESSAGE_LIVE_HANDLE"),
+                std::env::var("LM_IMESSAGE_LIVE_TARGET"),
+            ) else {
+                return;
+            };
+            let account = test_account(json!({
+                "helper_path": helper,
+                "handle": handle,
+            }));
+            let adapter = ImessageAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let health = adapter.probe().await;
+            assert_eq!(
+                health.state,
+                HealthState::Connected,
+                "{:?}{:?} — grant the helper Full Disk Access and Automation for Messages first",
+                health.detail,
+                health.last_error
+            );
+
+            // A first poll records where the database is rather than replaying.
+            let batch = adapter.poll(None).await.expect("poll");
+            assert!(batch.envelopes.is_empty());
+            let cursor = batch.cursor.expect("a cursor");
+
+            let marker = uuid::Uuid::new_v4().simple().to_string();
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::IMessage,
+                    conversation_id: target,
+                    thread_id: None,
+                    text: format!("little-monkey live smoke test {marker}"),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: format!("live-{marker}"),
+                })
+                .await;
+            assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+
+            // Our own outbound message must never come back as an inbound turn.
+            let batch = adapter.poll(Some(&cursor)).await.expect("poll");
+            assert!(
+                !batch
+                    .envelopes
+                    .iter()
+                    .any(|envelope| envelope.text.contains(&marker)),
+                "an echo of our own send would make the agent answer itself"
+            );
+        }
+
         /// Everything below drives a *fake* helper — a shell script speaking
         /// the real protocol. No Messages.app, no Full Disk Access, no
         /// conversation: the lifecycle (spawn, request/response by id, poll

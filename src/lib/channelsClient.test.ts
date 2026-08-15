@@ -117,7 +117,7 @@ describe("channels setup guidance", () => {
   it("collects each server's own address rather than a hosted provider's", () => {
     const keys = (kind: string) =>
       (PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields ?? []).map((field) => field.key);
-    expect(keys("matrix")).toEqual(["homeserver_url", "user_id"]);
+    expect(keys("matrix")).toEqual(["homeserver_url", "user_id", "device_id"]);
     expect(keys("mattermost")).toEqual(["base_url"]);
     expect(keys("irc")).toEqual([
       "server",

@@ -50,7 +50,6 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex as AsyncMutex, OnceCell};
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::daemon::channel_adapter::{
@@ -1364,7 +1363,7 @@ mod tests {
             let shared = shared();
             // A server that truncates rather than refusing: `001` is the only
             // place that says what we actually got.
-            session(&shared, &identity(false), &[], |line: &str| {
+            let _ = session(&shared, &identity(false), &[], |line: &str| {
                 if line.starts_with("NICK ") {
                     return Some(vec![":irc.test 001 mnky :Welcome".to_string()]);
                 }
@@ -1406,7 +1405,7 @@ mod tests {
         #[tokio::test]
         async fn channel_and_direct_messages_normalize_against_the_active_nick() {
             let shared = shared();
-            session(&shared, &identity(false), &[], |line: &str| {
+            let _ = session(&shared, &identity(false), &[], |line: &str| {
                 if let Some(nick) = line.strip_prefix("NICK ") {
                     if nick == "monkey" {
                         return Some(vec![
@@ -1451,7 +1450,7 @@ mod tests {
         async fn a_reconnect_asks_for_the_preferred_nick_again() {
             let shared = shared();
             let identity = identity(false);
-            session(&shared, &identity, &[], welcome_after(1)).await;
+            let _ = session(&shared, &identity, &[], welcome_after(1)).await;
             assert_eq!(*shared.active_nick.lock().await, "monkey_");
 
             // What `connection_loop` does between attempts. The collision was
@@ -1470,7 +1469,7 @@ mod tests {
         #[tokio::test]
         async fn a_server_forced_rename_moves_the_active_nick_with_it() {
             let shared = shared();
-            session(&shared, &identity(false), &[], |line: &str| {
+            let _ = session(&shared, &identity(false), &[], |line: &str| {
                 if line.starts_with("NICK ") {
                     return Some(vec![
                         ":irc.test 001 monkey :Welcome".to_string(),

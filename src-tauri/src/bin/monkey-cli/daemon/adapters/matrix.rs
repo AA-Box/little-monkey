@@ -117,6 +117,9 @@ struct Shared {
 pub struct MatrixAdapter {
     homeserver_url: String,
     user_id: OwnedUserId,
+    /// The device the access token belongs to, when the operator told us.
+    /// Otherwise discovered from the homeserver — see [`discover_device_id`].
+    device_id: Option<OwnedDeviceId>,
     access_token: String,
     account_id: String,
     /// Built once, on first use, because it needs a round trip to learn which
@@ -129,6 +132,10 @@ pub struct MatrixAdapter {
     inbound_rx: Mutex<mpsc::Receiver<ChannelEnvelope>>,
     shared: Arc<Shared>,
     blobs: Arc<dyn BlobSource>,
+    /// Where the SDK store goes when a test owns it — see
+    /// [`MatrixAdapter::with_store_root`].
+    #[cfg(test)]
+    store_root: Option<std::path::PathBuf>,
 }
 
 impl MatrixAdapter {
@@ -152,10 +159,19 @@ impl MatrixAdapter {
             .ok_or_else(|| "Matrix account is missing user_id".to_string())?;
         let user_id = UserId::parse(raw_user_id)
             .map_err(|_| format!("'{raw_user_id}' is not a Matrix user id"))?;
+        let device_id = config
+            .account
+            .non_secret_config
+            .get("device_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(OwnedDeviceId::from);
         let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
         Ok(Self {
             homeserver_url,
             user_id,
+            device_id,
             access_token: config.secret.clone(),
             account_id: config.account.account_id.clone(),
             client: OnceCell::new(),
@@ -164,6 +180,8 @@ impl MatrixAdapter {
             inbound_rx: Mutex::new(inbound_rx),
             shared: Arc::new(Shared::default()),
             blobs: Arc::new(DaemonBlobs),
+            #[cfg(test)]
+            store_root: None,
         })
     }
 
@@ -173,8 +191,23 @@ impl MatrixAdapter {
     /// Per account, never shared: two Matrix accounts on one machine are two
     /// devices with two sets of keys, and a shared store would cross them.
     fn store_dir(&self) -> Result<std::path::PathBuf, String> {
+        #[cfg(test)]
+        if let Some(root) = &self.store_root {
+            return Ok(root.join(&self.account_id));
+        }
         let paths = crate::daemon::store::DaemonPaths::resolve()?;
         Ok(paths.root.join("matrix").join(&self.account_id))
+    }
+
+    /// Put this account's SDK store somewhere a test owns.
+    ///
+    /// A seam, not a setting: the daemon's own root is the only place a real
+    /// account's keys ever live, and there is no configuration key that could
+    /// move them.
+    #[cfg(test)]
+    fn with_store_root(mut self, root: std::path::PathBuf) -> Self {
+        self.store_root = Some(root);
+        self
     }
 
     /// The SDK client for this account, built and logged in exactly once.
@@ -196,6 +229,15 @@ impl MatrixAdapter {
         let http = little_monkey_lib::egress::hardened()
             .build()
             .map_err(|error| format!("Failed to build the Matrix HTTP client: {error}"))?;
+
+        // The device has to be known *before* the store is opened: the crypto
+        // store is keyed by device id, and opening it under the wrong one would
+        // create a second identity in the same account's keys.
+        let device_id = match &self.device_id {
+            Some(device_id) => device_id.clone(),
+            None => self.discover_device_id(http.clone()).await?,
+        };
+
         let client = Client::builder()
             .homeserver_url(&self.homeserver_url)
             .http_client(http)
@@ -206,10 +248,23 @@ impl MatrixAdapter {
             .build()
             .await
             .map_err(|error| format!("Could not reach the Matrix homeserver: {error}"))?;
+        client
+            .restore_session(AuthSession::Matrix(MatrixSession {
+                meta: SessionMeta {
+                    user_id: self.user_id.clone(),
+                    device_id: device_id.clone(),
+                },
+                tokens: SessionTokens {
+                    access_token: self.access_token.clone(),
+                    refresh_token: None,
+                },
+            }))
+            .await
+            .map_err(|error| format!("Could not restore the Matrix session: {error}"))?;
 
-        // The device id comes from the homeserver, never from us: an access
-        // token already belongs to a device in the user's own session list, and
-        // inventing one would add an unverified device on every restart.
+        // Only now can the homeserver be asked anything: every Client-Server
+        // endpoint worth calling is authenticated, and the SDK has no token
+        // until a session is restored.
         let whoami = client
             .whoami()
             .await
@@ -220,17 +275,38 @@ impl MatrixAdapter {
                 whoami.user_id
             ));
         }
-        let device_id: OwnedDeviceId = whoami.device_id.ok_or_else(|| {
-            "The Matrix homeserver reported no device for this access token, so encrypted \
-             rooms could never be read"
-                .to_string()
-        })?;
+        if let Some(actual) = whoami.device_id {
+            if actual != device_id {
+                return Err(format!(
+                    "That access token belongs to device {actual}, not to the configured {device_id}"
+                ));
+            }
+        }
+        Ok(client)
+    }
 
-        client
+    /// Ask the homeserver which device this access token belongs to.
+    ///
+    /// An access token already belongs to a device in the user's own session
+    /// list; inventing one would add an unverified device to their account on
+    /// every restart. The question is asked through a throwaway client with an
+    /// in-memory store, because asking it requires a restored session and the
+    /// real session cannot be restored until the answer is known. Nothing that
+    /// client does is written to disk, and it never syncs.
+    async fn discover_device_id(&self, http: reqwest::Client) -> Result<OwnedDeviceId, String> {
+        let probe = Client::builder()
+            .homeserver_url(&self.homeserver_url)
+            .http_client(http)
+            .build()
+            .await
+            .map_err(|error| format!("Could not reach the Matrix homeserver: {error}"))?;
+        probe
             .restore_session(AuthSession::Matrix(MatrixSession {
                 meta: SessionMeta {
                     user_id: self.user_id.clone(),
-                    device_id,
+                    // A placeholder, and never persisted: this client exists
+                    // for exactly one authenticated question.
+                    device_id: "LITTLEMONKEYDISCOVERY".into(),
                 },
                 tokens: SessionTokens {
                     access_token: self.access_token.clone(),
@@ -238,8 +314,16 @@ impl MatrixAdapter {
                 },
             }))
             .await
-            .map_err(|error| format!("Could not restore the Matrix session: {error}"))?;
-        Ok(client)
+            .map_err(|error| format!("Could not ask the Matrix homeserver who we are: {error}"))?;
+        let whoami = probe
+            .whoami()
+            .await
+            .map_err(|error| format!("Matrix rejected the access token: {error}"))?;
+        whoami.device_id.ok_or_else(|| {
+            "The Matrix homeserver reported no device for this access token, so encrypted \
+             rooms could never be read"
+                .to_string()
+        })
     }
 
     /// Register the event handlers and start syncing, once.
@@ -299,7 +383,7 @@ impl MatrixAdapter {
                 });
 
                 let shared = self.shared.clone();
-                tokio::spawn(run_sync_loop(client, shared));
+                tokio::spawn(run_sync_loop(client, shared, self.inbound_tx.clone()));
             })
             .await;
         Ok(())
@@ -379,20 +463,28 @@ fn encryption_decision(state: Option<EncryptionState>) -> Result<Encryption, Str
 /// Sync until it fails, then back off and sync again. The SDK owns the sync
 /// token — it lives in the same SQLite store as the crypto keys — so a restart
 /// resumes where this left off rather than replaying or skipping.
-async fn run_sync_loop(client: Client, shared: Arc<Shared>) {
+async fn run_sync_loop(client: Client, shared: Arc<Shared>, tx: mpsc::Sender<ChannelEnvelope>) {
     let mut backoff = MIN_BACKOFF;
     loop {
         let started_at = std::time::Instant::now();
         shared.status.set(HealthState::Connected);
-        let result = client
-            .sync(SyncSettings::default().timeout(SYNC_TIMEOUT))
-            .await;
+        // Stops the moment nobody is listening. The receiver lives on the
+        // adapter, so an account that is reloaded or disabled takes its sync
+        // with it instead of leaving a second loop syncing the same session
+        // forever.
+        let result = tokio::select! {
+            result = client.sync(SyncSettings::default().timeout(SYNC_TIMEOUT)) => result,
+            _ = tx.closed() => return,
+        };
         shared.status.set(HealthState::Degraded);
         if let Err(error) = result {
             *shared.last_error.lock().await = Some(format!("Matrix sync stopped: {error}"));
         }
         if started_at.elapsed() >= BACKOFF_RESET_AFTER {
             backoff = MIN_BACKOFF;
+        }
+        if tx.is_closed() {
+            return;
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -1392,5 +1484,555 @@ mod tests {
         .expect("adapter");
         assert!(adapter.client.get().is_none());
         assert!(adapter.started.get().is_none());
+    }
+
+    /// Everything below drives the *production* adapter — the real
+    /// `matrix_sdk::Client`, the real send path — against a homeserver fixture
+    /// on loopback. No mock adapter and no stubbed SDK: the point is that the
+    /// fail-closed rule holds through the code that actually ships.
+    mod against_a_fixture_homeserver {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Mutex as StdMutex;
+
+        /// What the fixture answers for `GET .../state/m.room.encryption`,
+        /// which is the one question the fail-closed rule turns on.
+        #[derive(Clone, Copy, PartialEq)]
+        enum RoomEncryption {
+            /// 404 — the room has no encryption event, so it is unencrypted.
+            Absent,
+            /// 200 with an `m.megolm` algorithm.
+            Enabled,
+            /// The homeserver refuses to answer, so the state is *unknown*.
+            ///
+            /// Modelled as a 403 rather than a 500 because the SDK retries
+            /// server errors with backoff — the refusal here is about what the
+            /// adapter does with an unanswerable question, not about how long
+            /// the SDK is willing to keep asking.
+            QueryFails,
+        }
+
+        struct Fixture {
+            base_url: String,
+            /// `METHOD path` for every request received, in order.
+            seen: Arc<StdMutex<Vec<String>>>,
+            stop: Arc<AtomicUsize>,
+        }
+
+        impl Fixture {
+            fn requests(&self) -> Vec<String> {
+                self.seen.lock().expect("seen").clone()
+            }
+
+            fn sent_events(&self) -> usize {
+                self.requests()
+                    .iter()
+                    .filter(|line| line.starts_with("PUT ") && line.contains("/send/"))
+                    .count()
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // One listener per test, closed with it: a fixture left
+                // accepting is how one test's server times out another's.
+                self.stop.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+        }
+
+        /// A homeserver that answers exactly what the SDK asks on this path.
+        ///
+        /// Hand-rolled HTTP/1.1 with `Connection: close`, so each request is
+        /// its own connection and the routing stays a single `match` on the
+        /// request line. Anything unrouted answers `{}` with 200 rather than
+        /// failing the test on an SDK call this fixture did not anticipate.
+        fn homeserver(encryption: RoomEncryption) -> Fixture {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("addr").port();
+            let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+            let stop = Arc::new(AtomicUsize::new(0));
+            let recorder = seen.clone();
+            let stopper = stop.clone();
+            std::thread::spawn(move || {
+                while stopper.load(AtomicOrdering::SeqCst) == 0 {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    // One thread per connection: the SDK opens several at
+                    // once, and answering them in a single queue turns a
+                    // concurrent request into a timeout rather than a reply.
+                    let recorder = recorder.clone();
+                    std::thread::spawn(move || {
+                        // macOS hands an accepted socket the listener's own
+                        // non-blocking flag. Left set, the first read returns
+                        // WouldBlock, this thread gives up, and the client sees
+                        // a connection that closed without answering.
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                        // The *whole* request, body included. Closing a socket
+                        // with unread bytes still in its receive buffer sends
+                        // an RST, which destroys the response already written —
+                        // which is what a POST body left undrained produces.
+                        let Some(request) = read_request(&mut stream) else {
+                            return;
+                        };
+                        let line = request.lines().next().unwrap_or_default().to_string();
+                        let mut parts = line.split_whitespace();
+                        let method = parts.next().unwrap_or_default().to_string();
+                        let path = parts.next().unwrap_or_default().to_string();
+                        recorder
+                            .lock()
+                            .expect("recorder")
+                            .push(format!("{method} {path}"));
+
+                        let (status, body) = route(&method, &path, encryption);
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    });
+                }
+            });
+            Fixture {
+                base_url: format!("http://127.0.0.1:{port}"),
+                seen,
+                stop,
+            }
+        }
+
+        const ROOM_ID: &str = "!room:fixture.test";
+
+        /// Read headers, then exactly `Content-Length` more bytes.
+        fn read_request(stream: &mut std::net::TcpStream) -> Option<String> {
+            let mut received = Vec::new();
+            let mut scratch = [0u8; 8 * 1024];
+            let mut header_end = None;
+            loop {
+                if let Some(start) = header_end {
+                    let length = content_length(&received[..start]);
+                    if received.len() >= start + length {
+                        break;
+                    }
+                } else if let Some(index) =
+                    received.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    header_end = Some(index + 4);
+                    continue;
+                }
+                match stream.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(read) => received.extend_from_slice(&scratch[..read]),
+                    Err(_) => return None,
+                }
+            }
+            Some(String::from_utf8_lossy(&received).to_string())
+        }
+
+        fn content_length(headers: &[u8]) -> usize {
+            String::from_utf8_lossy(headers)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0)
+        }
+
+        fn route(method: &str, path: &str, encryption: RoomEncryption) -> (&'static str, String) {
+            if path.starts_with("/_matrix/client/versions") {
+                return ("200 OK", r#"{"versions":["v1.11"]}"#.to_string());
+            }
+            if path.starts_with("/_matrix/client/v3/account/whoami") {
+                return (
+                    "200 OK",
+                    r#"{"user_id":"@self:fixture.test","device_id":"FIXTUREDEV"}"#.to_string(),
+                );
+            }
+            if path.contains(&format!("/rooms/{ROOM_ID}/state/m.room.encryption")) {
+                return match encryption {
+                    RoomEncryption::Absent => (
+                        "404 Not Found",
+                        r#"{"errcode":"M_NOT_FOUND","error":"no encryption"}"#.to_string(),
+                    ),
+                    RoomEncryption::Enabled => (
+                        "200 OK",
+                        r#"{"algorithm":"m.megolm.v1.aes-sha2"}"#.to_string(),
+                    ),
+                    RoomEncryption::QueryFails => (
+                        "403 Forbidden",
+                        r#"{"errcode":"M_FORBIDDEN","error":"cannot read that state event"}"#
+                            .to_string(),
+                    ),
+                };
+            }
+            if method == "PUT" && path.contains("/send/") {
+                return ("200 OK", r#"{"event_id":"$sent:fixture.test"}"#.to_string());
+            }
+            if path.starts_with("/_matrix/client/v3/sync") {
+                // Only the *first* sync carries the room. Every one after it
+                // long-polls and comes back empty, exactly as a real
+                // homeserver does — answering the same batch instantly forever
+                // would turn the SDK's sync loop into a busy loop.
+                if path.contains("since=") {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    return ("200 OK", r#"{"next_batch":"s1"}"#.to_string());
+                }
+                return ("200 OK", sync_body());
+            }
+            // The room's member list, which the SDK fetches before it will
+            // encrypt for anyone. Empty rather than absent: a missing `chunk`
+            // is a deserialization failure, not "nobody is in the room".
+            if path.contains("/members") {
+                return ("200 OK", r#"{"chunk":[]}"#.to_string());
+            }
+            // Every other call the SDK may make on this path — key uploads,
+            // filters, capabilities — is answered rather than failed, so a test
+            // fails on what it is asserting and not on an unanticipated call.
+            ("200 OK", "{}".to_string())
+        }
+
+        /// One joined room with one message in it, plus the `m.direct` account
+        /// data that makes it a DM. Everything the SDK needs to put the room in
+        /// its store and dispatch to a handler.
+        fn sync_body() -> String {
+            serde_json::json!({
+                "next_batch": "s1",
+                "account_data": {
+                    "events": [{
+                        "type": "m.direct",
+                        "content": { "@bob:fixture.test": [ROOM_ID] }
+                    }]
+                },
+                "rooms": {
+                    "join": {
+                        ROOM_ID: {
+                            "timeline": {
+                                "limited": false,
+                                "prev_batch": "p1",
+                                "events": [{
+                                    "type": "m.room.message",
+                                    "event_id": "$inbound:fixture.test",
+                                    "sender": "@bob:fixture.test",
+                                    "origin_server_ts": 1_700_000_000_000i64,
+                                    "content": {"msgtype": "m.text", "body": "hello from the fixture"}
+                                }]
+                            },
+                            "state": {
+                                "events": [{
+                                    "type": "m.room.member",
+                                    "state_key": "@self:fixture.test",
+                                    "sender": "@self:fixture.test",
+                                    "event_id": "$member:fixture.test",
+                                    "origin_server_ts": 1_700_000_000_000i64,
+                                    "content": {"membership": "join"}
+                                }]
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string()
+        }
+
+        fn adapter_for(fixture: &Fixture, store: &std::path::Path) -> MatrixAdapter {
+            let account = test_account(serde_json::json!({
+                "homeserver_url": fixture.base_url,
+                "user_id": "@self:fixture.test",
+            }));
+            MatrixAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: "fixture-token".to_string(),
+            })
+            .expect("adapter")
+            .with_store_root(store.to_path_buf())
+        }
+
+        fn temp_store() -> std::path::PathBuf {
+            let root =
+                std::env::temp_dir().join(format!("lm-matrix-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&root).expect("store root");
+            root
+        }
+
+        fn outbound(text: &str) -> OutboundMessage {
+            OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Matrix,
+                conversation_id: ROOM_ID.to_string(),
+                thread_id: None,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: "idem-1".to_string(),
+            }
+        }
+
+        /// Sync until the room is in the SDK's store, which is what `send`
+        /// needs and what a live adapter always has by the time it replies.
+        async fn wait_for_room(adapter: &MatrixAdapter) {
+            adapter.ensure_started().await.expect("sync starts");
+            let client = adapter.client().await.expect("client");
+            let room_id = RoomId::parse(ROOM_ID).expect("room id");
+            for _ in 0..200 {
+                if client.get_room(&room_id).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the fixture's room never reached the SDK store");
+        }
+
+        #[tokio::test]
+        async fn a_room_whose_encryption_cannot_be_determined_is_never_sent_to() {
+            // The regression test for the whole failure class: the homeserver
+            // cannot say whether this room is encrypted, so nothing goes out.
+            let fixture = homeserver(RoomEncryption::QueryFails);
+            let store = temp_store();
+            let adapter = adapter_for(&fixture, &store);
+            wait_for_room(&adapter).await;
+
+            let outcome = adapter.send(&outbound("this must not be sent")).await;
+            match outcome {
+                SendOutcome::PermanentFailure { error } => {
+                    assert!(error.contains("refused to send"), "{error}");
+                }
+                other => panic!(
+                    "an undetermined room must refuse, got {other:?} after {:?}",
+                    fixture.requests()
+                ),
+            }
+            assert_eq!(
+                fixture.sent_events(),
+                0,
+                "a plaintext event reached the homeserver for a room that may be encrypted"
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        #[tokio::test]
+        async fn a_known_unencrypted_room_takes_a_plaintext_message() {
+            let fixture = homeserver(RoomEncryption::Absent);
+            let store = temp_store();
+            let adapter = adapter_for(&fixture, &store);
+            wait_for_room(&adapter).await;
+
+            match adapter.send(&outbound("hello there")).await {
+                SendOutcome::Sent {
+                    provider_message_id,
+                } => assert_eq!(provider_message_id.as_deref(), Some("$sent:fixture.test")),
+                other => panic!(
+                    "expected Sent, got {other:?} after {:?}",
+                    fixture.requests()
+                ),
+            }
+            // The transaction id on the wire is the outbox's own key, which is
+            // what makes a retried send idempotent at the homeserver.
+            assert!(
+                fixture
+                    .requests()
+                    .iter()
+                    .any(|line| line.contains("/send/m.room.message/idem-1")),
+                "{:?}",
+                fixture.requests()
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        #[tokio::test]
+        async fn an_encrypted_room_never_falls_back_to_a_plaintext_event() {
+            // This fixture has no key infrastructure, so encrypting genuinely
+            // cannot succeed — which is exactly the case that must not degrade
+            // into a cleartext send.
+            let fixture = homeserver(RoomEncryption::Enabled);
+            let store = temp_store();
+            let adapter = adapter_for(&fixture, &store);
+            wait_for_room(&adapter).await;
+
+            let outcome = adapter.send(&outbound("secret")).await;
+            let plaintext_events = fixture
+                .requests()
+                .iter()
+                .filter(|line| line.contains("/send/m.room.message/"))
+                .count();
+            assert_eq!(
+                plaintext_events, 0,
+                "an encrypted room received a cleartext event: {outcome:?}"
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        #[tokio::test]
+        async fn an_inbound_message_arrives_through_the_sdks_own_sync() {
+            let fixture = homeserver(RoomEncryption::Absent);
+            let store = temp_store();
+            let adapter = adapter_for(&fixture, &store);
+
+            let batch = adapter.poll(None).await.expect("poll");
+            assert!(!batch.envelopes.is_empty(), "nothing came down the sync");
+            let envelope = &batch.envelopes[0];
+            assert_eq!(envelope.provider_event_id, "$inbound:fixture.test");
+            assert_eq!(envelope.text, "hello from the fixture");
+            assert_eq!(envelope.sender.sender_id, "@bob:fixture.test");
+            // DM rather than group, decided by the SDK's own account data
+            // rather than by a second partial Matrix implementation here.
+            assert_eq!(
+                envelope.conversation.kind,
+                little_monkey_lib::channels::types::ConversationKind::Direct
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        #[tokio::test]
+        async fn the_session_survives_a_restart_instead_of_registering_a_new_device() {
+            let fixture = homeserver(RoomEncryption::Absent);
+            let store = temp_store();
+
+            let first = adapter_for(&fixture, &store);
+            let device = first
+                .client()
+                .await
+                .expect("client")
+                .device_id()
+                .map(|id| id.to_string());
+            assert_eq!(device.as_deref(), Some("FIXTUREDEV"));
+            drop(first);
+
+            // A fresh adapter over the same store is what a daemon restart is.
+            let second = adapter_for(&fixture, &store);
+            assert_eq!(
+                second
+                    .client()
+                    .await
+                    .expect("client")
+                    .device_id()
+                    .map(|id| id.to_string()),
+                device,
+                "a restart must reuse the device the token belongs to"
+            );
+            // Nothing registered: the device came from `whoami`, and there is
+            // no login call anywhere in either lifetime.
+            assert!(
+                !fixture
+                    .requests()
+                    .iter()
+                    .any(|line| line.contains("/login") || line.contains("/register")),
+                "{:?}",
+                fixture.requests()
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+
+        #[tokio::test]
+        async fn a_threaded_reply_goes_out_as_a_real_thread_relation() {
+            let fixture = homeserver(RoomEncryption::Absent);
+            let store = temp_store();
+            let adapter = adapter_for(&fixture, &store);
+            wait_for_room(&adapter).await;
+
+            let mut message = outbound("answering in the thread");
+            message.thread_id = Some("$root:fixture.test".to_string());
+            message.reply_to_provider_id = Some("$earlier:fixture.test".to_string());
+            let outcome = adapter.send(&message).await;
+            assert!(
+                matches!(outcome, SendOutcome::Sent { .. }),
+                "{outcome:?} after {:?}",
+                fixture.requests()
+            );
+
+            // The relation itself is asserted by `outbound_relation`'s own
+            // tests; what this proves is that a threaded send reaches the
+            // homeserver at all rather than being refused.
+            assert_eq!(fixture.sent_events(), 1, "{:?}", fixture.requests());
+            let _ = std::fs::remove_dir_all(&store);
+        }
+    }
+
+    /// An opt-in round trip against a homeserver the *operator* names.
+    ///
+    /// Never runs unless all four variables are set, so CI and every
+    /// contributor's `cargo test` skip it. Nothing is bundled: there is no
+    /// maintainer homeserver, no maintainer account and no maintainer token
+    /// anywhere in this tree, and the room it posts to is one the person
+    /// running it chose.
+    ///
+    /// ```text
+    /// LM_MATRIX_LIVE_HOMESERVER=https://matrix.example.org \
+    /// LM_MATRIX_LIVE_USER_ID=@you:example.org \
+    /// LM_MATRIX_LIVE_TOKEN=… \
+    /// LM_MATRIX_LIVE_ROOM='!room:example.org' \
+    ///   cargo test --bin monkey-cli a_live_homeserver_round_trip -- --nocapture
+    /// ```
+    ///
+    /// Point it at an encrypted room to exercise the encrypted path end to
+    /// end; the adapter refuses rather than downgrades, so a failure here is a
+    /// real one.
+    #[tokio::test]
+    async fn a_live_homeserver_round_trip() {
+        let (Ok(homeserver), Ok(user_id), Ok(token), Ok(room)) = (
+            std::env::var("LM_MATRIX_LIVE_HOMESERVER"),
+            std::env::var("LM_MATRIX_LIVE_USER_ID"),
+            std::env::var("LM_MATRIX_LIVE_TOKEN"),
+            std::env::var("LM_MATRIX_LIVE_ROOM"),
+        ) else {
+            return;
+        };
+        let account = test_account(serde_json::json!({
+            "homeserver_url": homeserver,
+            "user_id": user_id,
+        }));
+        let store =
+            std::env::temp_dir().join(format!("lm-matrix-live-{}", uuid::Uuid::new_v4().simple()));
+        let adapter = MatrixAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: token,
+        })
+        .expect("adapter")
+        .with_store_root(store.clone());
+
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            HealthState::Connected,
+            "{:?}",
+            health.last_error
+        );
+
+        // Sync has to have seen the room before anything can be sent to it,
+        // which is also true of the running daemon.
+        adapter.ensure_started().await.expect("sync starts");
+        let room_id = RoomId::parse(&room).expect("LM_MATRIX_LIVE_ROOM is a room id");
+        let client = adapter.client().await.expect("client");
+        for _ in 0..120 {
+            if client.get_room(&room_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let outcome = adapter
+            .send(&OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Matrix,
+                conversation_id: room,
+                thread_id: None,
+                text: format!("little-monkey live smoke test {marker}"),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: format!("live-{marker}"),
+            })
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::Sent { .. }),
+            "{outcome:?} — an encrypted room that cannot be encrypted for refuses rather than \
+             downgrading, which is the intended behaviour"
+        );
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

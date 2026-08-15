@@ -239,6 +239,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     configFields: [
       { key: "homeserver_url", label: "Homeserver", type: "text", required: true, placeholder: "https://matrix.example.org" },
       { key: "user_id", label: "Your user ID", type: "text", required: true, placeholder: "@you:example.org" },
+      { key: "device_id", label: "Device ID (optional)", type: "text", placeholder: "ABCDEFGHIJ", hint: "The session this access token belongs to, as your other Matrix client lists it. Leave empty to ask the homeserver \u2014 either way, no new device is ever registered." },
     ],
   },
   {

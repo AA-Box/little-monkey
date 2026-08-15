@@ -3851,6 +3851,15 @@ mod tests {
         /// application layer instead of at the client, or unable to adopt
         /// [`hardened`] without losing the feature.
         const ALLOWED: &[(&str, usize, usize)] = &[
+            // Not a `reqwest` client at all: `matrix_sdk::Client::builder()`,
+            // which the unprefixed scan cannot tell apart from one. The HTTP
+            // client the SDK actually uses is handed to it by
+            // `ClientBuilder::http_client`, and it is `hardened()` — so every
+            // Matrix request goes through the same guard as everything else.
+            // Two builders because learning which device an access token
+            // belongs to needs a restored session, and the real session cannot
+            // be restored until that answer is known.
+            ("bin/monkey-cli/daemon/adapters/matrix.rs", 0, 2),
             // The daemon's client for a remote runner: `tls_certs_only` pins the
             // runner's certificate, plus `https_only`, a connect timeout and a
             // silence budget. Stricter than `hardened()`, which has no way to pin
