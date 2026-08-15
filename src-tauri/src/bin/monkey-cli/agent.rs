@@ -1259,7 +1259,14 @@ async fn execute_tool_call(
                             // durable run (the daemon's own dispatch) pass it.
                             source_run_id: None,
                             source_session_id: None,
-                            source_tool_call_id: None,
+                            source_tool_call_id: Some(tool_call_id.to_string()),
+                            // The same durable identity `send_message` keys its
+                            // deliveries on. A replayed turn reaches the same
+                            // pair and therefore the same command, so one tool
+                            // invocation can only ever take one photograph.
+                            invocation_id: crate::daemon::remote::device::invocation_identity(
+                                Some(tool_call_id),
+                            ),
                         },
                         now,
                     )
