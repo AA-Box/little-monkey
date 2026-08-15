@@ -181,6 +181,11 @@ describe("which kinds a budget applies to", () => {
     // watchdog. A second wall sweep over either would race the first.
     foreground_shell: false,
     browser_session: false,
+    // Bounded by the resource controller each one's runner holds, with its own
+    // deadline as the wall limit. A second sweep here would race that one.
+    verify_command: false,
+    hook_command: false,
+    sandbox_run: false,
   } satisfies Record<ProcessKind, boolean>;
 
   it("bounds exactly the kinds this WebView hosts", () => {

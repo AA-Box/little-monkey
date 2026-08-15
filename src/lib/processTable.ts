@@ -32,7 +32,12 @@ export type ProcessKind =
   // memory and process-count bounds are installed on.
   | "foreground_shell"
   | "side_task"
-  | "browser_session";
+  | "browser_session"
+  // The three bounded executions a turn blocks on. Each ran under the same
+  // resource controller as a foreground shell long before it had a row.
+  | "verify_command"
+  | "hook_command"
+  | "sandbox_run";
 
 export type ProcessState = "admitted" | "running" | "suspended" | "exited";
 
@@ -42,7 +47,10 @@ export type ProcessExitStatus =
   | "cancelled"
   | "limit_exceeded"
   | "lost"
-  | "needs_reconciliation";
+  | "needs_reconciliation"
+  // The row had to be closed and nothing proved the work was gone. Deliberately
+  // not `lost`, which asserts a fact: this one asserts the absence of one.
+  | "containment_lost";
 
 export interface ProcessLimits {
   maxWallMs?: number | null;
@@ -119,9 +127,20 @@ export interface ProcessLimitReport {
   /** `"enforced"`, `"owner-sourced"`, `"unavailable"` — the static per-kind matrix. */
   supportStatus: string;
   supportDetail: string;
-  /** Only for the kinds a resource controller owns. */
+  /**
+   * What actually held this limit, **for this process**, as its own controller
+   * recorded at attach time.
+   *
+   * Not what the machine reading the row would use for a new process — that was
+   * the old source and it made a workload the Linux kernel had held read back as
+   * `supervisor` on a Mac. Absent on a row that recorded no mechanism, which is
+   * a gap to show rather than one to fill in.
+   */
   host?: LimitCapability;
+  /** What it is holding now, or held last. Never 0 for "not measured". */
   observed?: number;
+  /** The highest anything ever measured — the number that says whether a limit was nearly hit. */
+  observedPeak?: number;
   observedUnavailable?: string;
 }
 
@@ -130,6 +149,10 @@ export interface ProcessResourceReport {
   kind: ProcessKind;
   backend?: string;
   treePrimitive?: string;
+  /** Whether `backend` came off the row rather than from nowhere. */
+  backendIsRecorded: boolean;
+  /** The durable containment handle: a cgroup path, a process group, a job. */
+  scope?: string;
   limits: ProcessLimitReport[];
   breach?: LimitBreach;
 }
@@ -191,6 +214,27 @@ export interface ProcessRecord {
    */
   nativeStartTime?: number | null;
   limits: ProcessLimits;
+  /**
+   * What actually enforced this process, recorded when it was attached.
+   *
+   * Absent for a kind that owns no OS process tree, and on a row written before
+   * migration V23.
+   */
+  containment?: {
+    backend: string;
+    treePrimitive: string;
+    scope?: string | null;
+    enforcement: Record<string, LimitCapability>;
+  } | null;
+  /** The controller's last measurement of the owned tree. */
+  usage?: {
+    rssBytes?: number | null;
+    peakRssBytes?: number | null;
+    processCount?: number | null;
+    peakProcessCount?: number | null;
+    outputBytes?: number | null;
+  } | null;
+  usageSampledAtMs?: number | null;
   /** What has been asked of this process. Delivery is `processSignalDelivery.ts`. */
   signalIntent: SignalIntent;
   signalReason: string | null;

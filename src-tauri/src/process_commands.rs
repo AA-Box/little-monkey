@@ -846,18 +846,32 @@ pub struct ProcessLimitReport {
     /// matrix `monkey processes limits` prints.
     pub support_status: &'static str,
     pub support_detail: &'static str,
-    /// What is holding it *on this host*, for the kinds a resource controller
-    /// owns. `None` for a kind that owns no OS process tree, where there is no
-    /// host-specific answer to give and inventing one would be the lie this whole
-    /// type exists to prevent.
+    /// What held it, **for this process**, as its own controller reported when it
+    /// was attached.
+    ///
+    /// Read off the row rather than rebuilt from the machine doing the reading.
+    /// A report assembled from the current host answers "what would this machine
+    /// use for a new process", which is a different question and was silently
+    /// being given as the answer to this one: a workload the Linux kernel had
+    /// held read back as `supervisor` on a Mac, and as `supervisor` on the same
+    /// Linux box once its delegation changed.
+    ///
+    /// `None` for a kind that owns no OS process tree, and for a row written
+    /// before V23 — where the truthful answer is that the mechanism was not
+    /// recorded, not a guess made now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<crate::resource_control::LimitCapability>,
-    /// The measurement, where one exists. Never zero for "not measured".
+    /// What the process is holding *now*, or held last. Never zero for "not
+    /// measured".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed: Option<u64>,
+    /// The highest value anything ever measured, which is the number that says
+    /// whether a limit was nearly hit by a process now sitting idle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_peak: Option<u64>,
     /// Why `observed` is absent, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_unavailable: Option<&'static str>,
+    pub observed_unavailable: Option<String>,
 }
 
 /// Everything the Processes panel needs to answer "what is bounding this, and
@@ -867,12 +881,22 @@ pub struct ProcessLimitReport {
 pub struct ProcessResourceReport {
     pub process_id: String,
     pub kind: ProcessKind,
-    /// The controller this host would build for a native process tree, named.
-    /// `None` for a kind that owns no tree.
+    /// The controller that actually held this process, named. `None` for a kind
+    /// that owns no tree and for a row that predates the recording.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tree_primitive: Option<String>,
+    /// True when [`Self::backend`] came from the row rather than from nowhere.
+    ///
+    /// The distinction a reader needs and could not otherwise draw: a process
+    /// with no recorded mechanism is one this app cannot say it bounded, and it
+    /// must not look the same as one it can.
+    pub backend_is_recorded: bool,
+    /// The durable containment handle, where the backend has one — a cgroup
+    /// scope path, a process group, a Windows job.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub limits: Vec<ProcessLimitReport>,
     /// The limit that ended this process, with the mechanism's own numbers.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -880,9 +904,15 @@ pub struct ProcessResourceReport {
 }
 
 const NOT_MEASURED_PER_PROCESS: &str =
-    "nothing measures this per process once it has ended; the limit is enforced while it runs";
+    "nothing measures this per process; the limit is enforced by its owner while the work runs";
 const NOT_SAMPLED: &str = "nothing sampled this process's resource use while it ran";
-const WALL_NOT_FINAL: &str = "this process has not exited, so its wall time is not final";
+const NOT_STARTED: &str = "this process never started, so no clock ran on it";
+const NO_CLOCK: &str = "the system clock could not be read, so elapsed time is not computable";
+/// The honest name for a bound the app deliberately does not terminate on.
+const OUTPUT_NOT_COUNTED: &str =
+    "no byte count reached this row; the output limit is a retention bound — both pipes keep \
+     draining past it and the capture is front-truncated, so a command that prints past it \
+     finishes normally";
 
 /// Whether this kind's OS process tree is owned by a [`ResourceController`].
 ///
@@ -915,25 +945,34 @@ fn origin_of(class_default: Option<u64>, effective: Option<u64>) -> LimitOrigin 
 
 /// The resource story of one process, from the one place that knows it.
 ///
-/// # Why this is a command and not four fields on the row
+/// # Two questions that had become one
 ///
-/// Three of the four answers a reader needs are not row data. "What does this
-/// kind declare" is a pure function of the kind; "what is holding it on this
-/// host" depends on the machine the app is running on right now, not on the
-/// machine the row was written on; and "who supplied the winning number" is the
-/// comparison between the first two. Storing them would freeze a host answer into
-/// a durable record and then be wrong the first time the app moved between a
-/// laptop with a delegated cgroup and one without.
+/// "What would this machine use for a new process" and "what enforced *that*
+/// process" are different, and this command used to answer the first while
+/// presenting it as the second: it built a fresh controller on the host doing the
+/// reading and reported its capabilities beside a row that might have been
+/// written on another machine, or on this one before its cgroup delegation
+/// changed. A workload the Linux kernel had held read back as `supervisor`.
 ///
-/// What *is* stored is the effective number and the typed breach, because those
-/// are facts about this process and nothing else can recover them later.
+/// So the mechanism now comes off the row, where its own controller recorded it
+/// at attach time, and a row that carries none says so rather than being handed
+/// a plausible answer. The host-capability question still has an API — it is what
+/// `monkey processes limits` and the panel's own probe ask — and it is a
+/// different one.
+///
+/// # Everything else is still derived
+///
+/// "What does this kind declare" is a pure function of the kind, and "who
+/// supplied the winning number" is the comparison between that and the effective
+/// value. Both are decidable wherever the row is read, forever, so storing them
+/// would be a second copy to disagree with.
 #[tauri::command]
 pub fn process_resource_report(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     process_id: String,
 ) -> Result<ProcessResourceReport, String> {
-    use crate::process_table::{ProcessLimitKind, ProcessUsageFilter};
+    use crate::process_table::ProcessUsageFilter;
 
     let (record, usage) = with_process_table(&app, state.inner(), |table| {
         let record = table.get(&process_id)?.ok_or(ProcessTableError::NotFound {
@@ -948,20 +987,41 @@ pub fn process_resource_report(
         Ok((record, usage))
     })?;
 
-    // Built once for the whole report rather than per limit: constructing a
-    // controller creates the host's containment primitive, and doing that five
-    // times to answer five questions about one process would be five cgroups.
-    let host = is_controller_owned(record.kind).then(|| {
-        crate::resource_control::ResourceController::new(crate::resource_control::probe_limits())
-            .capabilities()
-    });
-    let class = record.kind.default_limits();
-    let measured = usage.as_ref().map(|row| row.usage.measured());
+    let now_ms = crate::run_commands::unix_time_ms()
+        .ok()
+        .map(|now| now as i64);
+    Ok(build_resource_report(&record, usage.as_ref(), now_ms))
+}
 
+/// The report itself, with the clock and the database already read.
+///
+/// Pure, so the property that matters most can be tested without a host: a row
+/// recorded as held by a cgroup reports a cgroup on a machine that has none.
+pub(crate) fn build_resource_report(
+    record: &ProcessRecord,
+    usage: Option<&crate::process_table::ProcessUsageRow>,
+    now_ms: Option<i64>,
+) -> ProcessResourceReport {
+    use crate::process_table::ProcessLimitKind;
+
+    let class = record.kind.default_limits();
+    // The close-out ledger's peak, which is what a row written before the tree
+    // measurements existed still carries. Used only as a fallback, so a
+    // freshly-sampled row prefers its own controller's number.
+    let measured = usage.as_ref().map(|row| row.usage.measured());
+    let containment = record.containment.as_ref();
+    let tree = record.usage.as_ref();
+
+    // Live processes report elapsed time from `now`, finished ones from their own
+    // exit stamp. Reporting a running process's wall as unavailable — which this
+    // did — is the one measurement that is always takeable.
     let wall_observed = match (record.started_at_ms, record.exited_at_ms) {
         (Some(started), Some(exited)) => Ok(u64::try_from(exited - started).unwrap_or(0)),
-        (Some(_), None) => Err(WALL_NOT_FINAL),
-        _ => Err(NOT_SAMPLED),
+        (Some(started), None) => match now_ms {
+            Some(now) => Ok(u64::try_from(now - started).unwrap_or(0)),
+            None => Err(NO_CLOCK.to_string()),
+        },
+        _ => Err(NOT_STARTED.to_string()),
     };
 
     let limits = ProcessLimitKind::ALL
@@ -984,20 +1044,42 @@ pub fn process_resource_report(
                 }
             };
             let support = record.kind.limit_support(*limit);
-            // Peak rather than current, and only where something actually
-            // sampled: a resource ledger with an invented zero is worse than one
-            // with a gap, because the zero is indistinguishable from a real
-            // measurement of nothing.
-            let observed = match limit {
-                ProcessLimitKind::Wall => wall_observed.ok(),
-                ProcessLimitKind::Memory => measured.and_then(|measured| measured.peak_rss_bytes),
-                _ => None,
+            // Current and peak, from the controller's own sampling where it
+            // reached the row. Never a zero standing in for "not measured": the
+            // two are indistinguishable to a reader and one of them is a claim.
+            let (observed, observed_peak) = match limit {
+                ProcessLimitKind::Wall => (wall_observed.clone().ok(), wall_observed.clone().ok()),
+                ProcessLimitKind::Memory => (
+                    tree.and_then(|tree| tree.rss_bytes),
+                    tree.and_then(|tree| tree.peak_rss_bytes)
+                        .or_else(|| measured.and_then(|measured| measured.peak_rss_bytes)),
+                ),
+                ProcessLimitKind::ChildProcesses => (
+                    tree.and_then(|tree| tree.process_count).map(u64::from),
+                    tree.and_then(|tree| tree.peak_process_count).map(u64::from),
+                ),
+                ProcessLimitKind::Output => (
+                    tree.and_then(|tree| tree.output_bytes),
+                    tree.and_then(|tree| tree.output_bytes),
+                ),
+                ProcessLimitKind::ContextTokens => (None, None),
             };
-            let observed_unavailable = match (limit, observed) {
-                (_, Some(_)) => None,
-                (ProcessLimitKind::Wall, None) => Some(wall_observed.unwrap_err()),
-                (ProcessLimitKind::Memory, None) => Some(NOT_SAMPLED),
-                _ => Some(NOT_MEASURED_PER_PROCESS),
+            let observed_unavailable = match (limit, observed, observed_peak) {
+                (_, Some(_), _) | (_, _, Some(_)) => None,
+                (ProcessLimitKind::Wall, ..) => Some(
+                    wall_observed
+                        .clone()
+                        .err()
+                        .unwrap_or_else(|| NOT_SAMPLED.to_string()),
+                ),
+                (ProcessLimitKind::Output, ..) => Some(OUTPUT_NOT_COUNTED.to_string()),
+                (ProcessLimitKind::ContextTokens, ..) => Some(NOT_MEASURED_PER_PROCESS.to_string()),
+                // "Nobody sampled it" and "there is nothing here to sample" are
+                // different findings, and only the first one is a gap.
+                _ if !is_controller_owned(record.kind) => {
+                    Some(NOT_MEASURED_PER_PROCESS.to_string())
+                }
+                _ => Some(NOT_SAMPLED.to_string()),
             };
             ProcessLimitReport {
                 limit: limit.as_str(),
@@ -1006,27 +1088,28 @@ pub fn process_resource_report(
                 origin: origin_of(class_default, effective),
                 support_status: support.status(),
                 support_detail: support.detail(),
-                host: host
-                    .as_ref()
-                    .map(|host| host.for_limit(*limit).clone())
-                    // A resource the kind does not declare and nothing enforces
-                    // needs no host answer; reporting one would put a mechanism
-                    // beside a limit that is not in force.
+                // Off the row, so this names what held *this* process. A limit the
+                // kind does not declare gets no mechanism beside it either way.
+                host: containment
+                    .and_then(|containment| containment.for_limit(*limit).cloned())
                     .filter(|_| support.honours_caller_value()),
                 observed,
+                observed_peak,
                 observed_unavailable,
             }
         })
         .collect();
 
-    Ok(ProcessResourceReport {
+    ProcessResourceReport {
         process_id: record.process_id.clone(),
         kind: record.kind,
-        backend: host.as_ref().map(|host| host.backend.clone()),
-        tree_primitive: host.as_ref().map(|host| host.tree_primitive.clone()),
+        backend: containment.map(|containment| containment.backend.clone()),
+        tree_primitive: containment.map(|containment| containment.tree_primitive.clone()),
+        backend_is_recorded: containment.is_some(),
+        scope: containment.and_then(|containment| containment.scope.clone()),
         limits,
         breach: record.exit.as_ref().and_then(|exit| exit.breach.clone()),
-    })
+    }
 }
 
 /// Applies a projection through the shared reconcile, for native adopters that
@@ -1414,7 +1497,176 @@ mod tests {
 #[cfg(test)]
 mod resource_report {
     use super::*;
-    use crate::process_table::ProcessLimitKind;
+    use crate::process_table::{ProcessLimitKind, ProcessState, SignalIntent};
+
+    fn row(kind: ProcessKind) -> ProcessRecord {
+        ProcessRecord {
+            process_id: "fgsh-report".to_string(),
+            parent_process_id: None,
+            kind,
+            external_id: "ext".to_string(),
+            state: ProcessState::Running,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: Some(4242),
+            native_start_time: Some(99),
+            limits: kind.default_limits(),
+            containment: None,
+            usage: None,
+            usage_sampled_at_ms: None,
+            signal_intent: SignalIntent::default(),
+            signal_reason: None,
+            signal_requested_at_ms: None,
+            exit: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            exited_at_ms: None,
+        }
+    }
+
+    /// A cgroup this host has never had, as a row would carry it.
+    fn held_by_a_kernel_cgroup() -> crate::resource_control::Containment {
+        let kernel = |mechanism: &str| crate::resource_control::LimitCapability::Enforced {
+            level: crate::resource_control::EnforcementLevel::Kernel,
+            mechanism: mechanism.to_string(),
+        };
+        crate::resource_control::Containment {
+            backend: "cgroup v2".to_string(),
+            tree_primitive: "cgroup v2 scope at /sys/fs/cgroup/little-monkey-abc".to_string(),
+            scope: Some("cgroup2:/sys/fs/cgroup/little-monkey-abc".to_string()),
+            enforcement: [
+                (
+                    ProcessLimitKind::Memory.as_str().to_string(),
+                    kernel("cgroup v2 `memory.max`"),
+                ),
+                (
+                    ProcessLimitKind::ChildProcesses.as_str().to_string(),
+                    kernel("cgroup v2 `pids.max`"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    /// The defect this slice fixed, stated as a property.
+    ///
+    /// The report used to be built from a controller constructed *now*, on the
+    /// machine doing the reading. This test runs on a developer's Mac and on a
+    /// Windows CI runner, neither of which has a cgroup, and asserts the row's
+    /// own answer survives both — which is the whole point: a process's report
+    /// must describe what enforced it, not what its reader's host would use for
+    /// something else.
+    #[test]
+    fn a_finished_process_reports_the_mechanism_that_actually_held_it() {
+        let mut record = row(ProcessKind::ForegroundShell);
+        record.containment = Some(held_by_a_kernel_cgroup());
+        record.state = ProcessState::Exited;
+        record.exited_at_ms = Some(4_000);
+        record.exit = Some(crate::process_table::ProcessExit::succeeded());
+
+        let report = build_resource_report(&record, None, Some(9_999));
+        assert_eq!(report.backend.as_deref(), Some("cgroup v2"));
+        assert!(report.backend_is_recorded);
+        assert_eq!(
+            report.scope.as_deref(),
+            Some("cgroup2:/sys/fs/cgroup/little-monkey-abc")
+        );
+        let memory = report
+            .limits
+            .iter()
+            .find(|limit| limit.limit == ProcessLimitKind::Memory.as_str())
+            .expect("memory is reported");
+        assert_eq!(
+            memory.host,
+            Some(crate::resource_control::LimitCapability::Enforced {
+                level: crate::resource_control::EnforcementLevel::Kernel,
+                mechanism: "cgroup v2 `memory.max`".to_string(),
+            })
+        );
+    }
+
+    /// A row with no recorded mechanism must not be handed a plausible one.
+    #[test]
+    fn a_row_that_recorded_no_mechanism_says_so_rather_than_guessing() {
+        let record = row(ProcessKind::ForegroundShell);
+        let report = build_resource_report(&record, None, Some(9_999));
+        assert!(report.backend.is_none());
+        assert!(!report.backend_is_recorded);
+        assert!(report.limits.iter().all(|limit| limit.host.is_none()));
+    }
+
+    /// A running process's wall time is the one measurement that is always
+    /// takeable, and reporting it as unavailable — which this did — is the
+    /// report refusing to answer a question it can.
+    #[test]
+    fn a_live_process_reports_elapsed_wall_time_rather_than_calling_it_unavailable() {
+        let record = row(ProcessKind::ForegroundShell);
+        let report = build_resource_report(&record, None, Some(4_500));
+        let wall = report
+            .limits
+            .iter()
+            .find(|limit| limit.limit == ProcessLimitKind::Wall.as_str())
+            .expect("wall is reported");
+        assert_eq!(wall.observed, Some(3_500));
+        assert!(wall.observed_unavailable.is_none());
+    }
+
+    /// Current and peak answer different questions, and a process now sitting
+    /// idle is exactly the case where only the peak says whether a limit was
+    /// nearly hit.
+    #[test]
+    fn current_and_peak_are_reported_separately() {
+        let mut record = row(ProcessKind::ForegroundShell);
+        record.containment = Some(held_by_a_kernel_cgroup());
+        record.usage = Some(crate::resource_control::ResourceSample {
+            wall_ms: 0,
+            rss_bytes: Some(2 * 1024 * 1024 * 1024),
+            peak_rss_bytes: Some(6 * 1024 * 1024 * 1024),
+            process_count: Some(3),
+            peak_process_count: Some(41),
+            output_bytes: Some(1_700),
+        });
+
+        let report = build_resource_report(&record, None, Some(4_500));
+        let find = |name: &str| {
+            report
+                .limits
+                .iter()
+                .find(|limit| limit.limit == name)
+                .cloned()
+                .expect("the limit is reported")
+        };
+        let memory = find(ProcessLimitKind::Memory.as_str());
+        assert_eq!(memory.observed, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(memory.observed_peak, Some(6 * 1024 * 1024 * 1024));
+        let processes = find(ProcessLimitKind::ChildProcesses.as_str());
+        assert_eq!(processes.observed, Some(3));
+        assert_eq!(processes.observed_peak, Some(41));
+        let output = find(ProcessLimitKind::Output.as_str());
+        assert_eq!(output.observed, Some(1_700));
+    }
+
+    /// An unmeasured resource reports its reason, never a zero: a watchdog — or a
+    /// reader — comparing a fabricated zero against a budget is satisfied forever.
+    #[test]
+    fn an_unmeasured_resource_states_why_rather_than_reporting_zero() {
+        let record = row(ProcessKind::ForegroundShell);
+        let report = build_resource_report(&record, None, Some(4_500));
+        let memory = report
+            .limits
+            .iter()
+            .find(|limit| limit.limit == ProcessLimitKind::Memory.as_str())
+            .expect("memory is reported");
+        assert!(memory.observed.is_none());
+        assert!(memory.observed_peak.is_none());
+        assert!(memory
+            .observed_unavailable
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()));
+    }
 
     #[test]
     fn the_origin_of_a_number_is_decided_by_comparing_it_with_the_class_default() {

@@ -879,6 +879,13 @@ struct OwnedBrowser {
     /// by [`Self::project`] so the row's exit is `limit_exceeded` with the
     /// mechanism's own numbers rather than a generic cancellation.
     resource_breach: Mutex<Option<crate::resource_control::LimitBreach>>,
+    /// The last measurement the watchdog took of Chromium's tree.
+    ///
+    /// Held rather than discarded because the watchdog is the only thing that
+    /// samples a browser session, and until this existed its readings ended
+    /// inside `resource_bound_fired`'s `match` — so the panel could show a limit
+    /// but never what the session was actually holding against it.
+    last_sample: Mutex<Option<crate::resource_control::ResourceSample>>,
     cancelled: AtomicBool,
     /// Why `cancelled` was set. Not an `AtomicU8`-flavoured enum because the
     /// first-writer-wins rule needs a compare-and-set anyway, and a `Mutex` states
@@ -1072,6 +1079,7 @@ impl OwnedBrowser {
             limits: request.limits,
             controller: Mutex::new(controller),
             resource_breach: Mutex::new(None),
+            last_sample: Mutex::new(None),
             cancelled: AtomicBool::new(false),
             cancel_reason: Mutex::new(None),
             action_count: AtomicU64::new(0),
@@ -1119,7 +1127,20 @@ impl OwnedBrowser {
                         .lock()
                         .ok()
                         .and_then(|controller| controller.root()),
-                );
+                )
+                // What actually holds this Chromium tree, recorded rather than
+                // recomputed later: a row read on a different host — or after this
+                // one stopped delegating a cgroup — must still name the mechanism
+                // that enforced this session.
+                .with_containment(
+                    self.controller
+                        .lock()
+                        .ok()
+                        .map(|controller| controller.containment()),
+                )
+                // What the watchdog last measured, so a live session's row shows
+                // the memory and process count its Chromium is holding now.
+                .with_usage(self.last_sample.lock().ok().and_then(|held| *held));
         // Both owners, on one row: the session clock the sweep enforces, and the
         // process bounds the controller holds. Written from the effective limits
         // rather than from the class default, so what the row states is the number
@@ -1231,8 +1252,14 @@ impl OwnedBrowser {
             return false;
         };
         let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+        let remember = |sample: Option<crate::resource_control::ResourceSample>| {
+            if let (Some(sample), Ok(mut held)) = (sample, self.last_sample.lock()) {
+                *held = Some(sample);
+            }
+        };
         match controller.check(now) {
-            Ok(ResourceCheck::Breached { breach, .. }) => {
+            Ok(ResourceCheck::Breached { breach, sample }) => {
+                remember(sample);
                 if let Ok(mut recorded) = self.resource_breach.lock() {
                     // First writer wins, as with `cancel_reason`: the bound that
                     // fired first is the true cause.
@@ -1240,7 +1267,11 @@ impl OwnedBrowser {
                 }
                 true
             }
-            Ok(ResourceCheck::Running(_) | ResourceCheck::Gone) => false,
+            Ok(ResourceCheck::Running(sample)) => {
+                remember(Some(sample));
+                false
+            }
+            Ok(ResourceCheck::Gone) => false,
             Err(error) => {
                 eprintln!(
                     "browser worker: could not check session {} against its resource bounds: \
@@ -3455,6 +3486,7 @@ mod tests {
                     browser_process_limits(),
                 )),
                 resource_breach: Mutex::new(None),
+                last_sample: Mutex::new(None),
                 cancelled: AtomicBool::new(false),
                 cancel_reason: Mutex::new(None),
                 action_count: AtomicU64::new(0),

@@ -329,6 +329,9 @@ impl ForegroundShell {
         stdout: AsyncShellReader,
         stderr: AsyncShellReader,
         output_cap: Option<usize>,
+        // Every measurement as it is taken, so a shell's row shows what the tree
+        // is holding *now* rather than only what it held once it was over.
+        observe: impl FnMut(&crate::resource_control::ResourceSample),
     ) -> io::Result<crate::resource_control::Supervised<io::Result<CapturedShell>>> {
         let child = &mut self.child;
         #[cfg(not(target_os = "windows"))]
@@ -371,7 +374,12 @@ impl ForegroundShell {
                 stderr,
             })
         };
-        crate::resource_control::run_under(&mut self.controller, work).await
+        crate::resource_control::run_under_observed(&mut self.controller, work, observe).await
+    }
+
+    /// What actually holds this shell, for the row.
+    pub(crate) fn containment(&self) -> crate::resource_control::Containment {
+        self.controller.containment()
     }
 
     /// Wait for the leader alone, with nothing supervising.
@@ -644,6 +652,11 @@ pub fn foreground_projection(
     workspace: &Path,
     identity: Option<crate::process_tree::ProcessIdentity>,
     effective: EffectiveLimits,
+    // What actually held it, and what it was last measured holding. Both are
+    // `Option` because the row is written once before either is known: a shell
+    // that failed to spawn has no containment to state and nothing measured it.
+    containment: Option<crate::resource_control::Containment>,
+    usage: Option<crate::resource_control::ResourceSample>,
 ) -> crate::process_table::ProcessProjection {
     crate::process_table::ProcessProjection::new(ProcessKind::ForegroundShell, external_id, state)
         .with_workspace(Some(workspace.to_string_lossy().into_owned()))
@@ -651,6 +664,8 @@ pub fn foreground_projection(
         // reconciled after a restart without risking an unrelated process.
         .with_native_identity(identity)
         .with_limits(effective.to_process_limits())
+        .with_containment(containment)
+        .with_usage(usage)
 }
 
 /// Bring a freshly spawned shell under its controller, or refuse to run it.
@@ -934,6 +949,9 @@ pub struct ShellOutput {
     pub usage: crate::resource_control::ResourceSample,
     /// What was holding each limit on this host.
     pub enforcement: crate::resource_control::ControllerCapabilities,
+    /// The same answer in the form a row stores, so what a reader sees later is
+    /// what held *this* shell rather than what this machine would build today.
+    pub containment: crate::resource_control::Containment,
     pub limits: EffectiveLimits,
     pub native_pid: u32,
     /// The identity the controller attached to, so a record of this shell names
@@ -962,6 +980,7 @@ pub async fn run_to_output(
 ) -> io::Result<ShellOutput> {
     let mut shell = spawn_foreground(workspace_root, cwd, shell_command, limits)?;
     let enforcement = shell.capabilities();
+    let containment = shell.containment();
     let effective = shell.effective_limits();
     let native_pid = shell.native_pid();
     let identity = shell.identity();
@@ -977,8 +996,14 @@ pub async fn run_to_output(
     // `limit_exceeded`. The caller's timeout belongs to the *call* — a tool that
     // gives up after 120 s has not observed a resource breach, so it wraps the
     // supervision rather than being expressed as a wall limit inside it.
-    let supervised =
-        tokio::time::timeout(timeout, shell.wait_supervised(stdout, stderr, output_cap)).await;
+    let supervised = tokio::time::timeout(
+        timeout,
+        // No per-tick observer here: this entry point has no live row to update —
+        // `monkey-cli` writes one record for the whole command — and the final
+        // sample it returns carries the peaks anything reached.
+        shell.wait_supervised(stdout, stderr, output_cap, |_| {}),
+    )
+    .await;
 
     let finish = |breach,
                   stdout: crate::output_cap::CappedStream,
@@ -995,6 +1020,7 @@ pub async fn run_to_output(
             breach,
             usage,
             enforcement,
+            containment: containment.clone(),
             limits: effective,
             native_pid,
             identity,

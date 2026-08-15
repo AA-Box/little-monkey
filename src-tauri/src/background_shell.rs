@@ -102,6 +102,13 @@ struct BackgroundProcess {
     /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping this kills the tree —
     /// which is correct at teardown and catastrophic anywhere earlier.
     controller: Mutex<crate::resource_control::ResourceController>,
+    /// The last measurement the exit watcher took of this command's tree.
+    ///
+    /// Held rather than discarded because that watcher is the only thing that
+    /// samples a background shell — nothing is blocked on it — and until this
+    /// existed its readings ended inside `check_resource_limits`' `match`, so the
+    /// row could state a memory ceiling and never what was held against it.
+    last_sample: Mutex<Option<crate::resource_control::ResourceSample>>,
     /// Byte offset into `view.output` already returned by
     /// `background_shell_output` in draining mode — the "only new output"
     /// cursor the model's polling tool reads through. Kept out of the view so
@@ -340,12 +347,34 @@ fn project_process<R: tauri::Runtime>(
         ),
     };
 
+    // What holds this shell and what it was last measured holding, read from the
+    // live process rather than threaded through every status call site. Both are
+    // absent once the shell has left the manager, which is exactly when there is
+    // nothing left to measure — and `reconcile` leaves a `None` alone rather than
+    // clearing what was already recorded.
+    let (containment, usage) = match app
+        .state::<crate::AppState>()
+        .background_shell
+        .get(&view.id)
+    {
+        Ok(process) => (
+            process
+                .controller
+                .lock()
+                .ok()
+                .map(|controller| controller.containment()),
+            process.last_sample.lock().ok().and_then(|held| *held),
+        ),
+        Err(_) => (None, None),
+    };
     let mut projection =
         ProcessProjection::new(ProcessKind::BackgroundShell, view.id.clone(), state)
             .with_workspace(Some(view.cwd.clone()))
             // The identity rather than the pid, so a restart can tell this
             // process from whatever the kernel later gave its pid to.
-            .with_native_identity(identity);
+            .with_native_identity(identity)
+            .with_containment(containment)
+            .with_usage(usage);
     projection.exit = exit;
 
     let state_handle = app.state::<crate::AppState>();
@@ -544,11 +573,23 @@ fn check_resource_limits(
     use crate::resource_control::ResourceCheck;
 
     let mut controller = process.controller.lock().ok()?;
+    let remember = |sample: Option<crate::resource_control::ResourceSample>| {
+        if let (Some(sample), Ok(mut held)) = (sample, process.last_sample.lock()) {
+            *held = Some(sample);
+        }
+    };
     match controller.check(now_ms().ok()? as i64) {
         // The tree is already reclaimed by `check`: a bound that reports a breach
         // and leaves the workload running has reclaimed nothing.
-        Ok(ResourceCheck::Breached { breach, .. }) => Some(breach),
-        Ok(ResourceCheck::Running(_) | ResourceCheck::Gone) => None,
+        Ok(ResourceCheck::Breached { breach, sample }) => {
+            remember(sample);
+            Some(breach)
+        }
+        Ok(ResourceCheck::Running(sample)) => {
+            remember(Some(sample));
+            None
+        }
+        Ok(ResourceCheck::Gone) => None,
         Err(error) => {
             eprintln!("background shell: could not check a command against its limits: {error}");
             None
@@ -848,6 +889,7 @@ pub(crate) fn start_background_command<R: tauri::Runtime>(
         // the manager, which outlives every turn, which is what makes a
         // background command's bounds survive the turn that started it.
         controller: Mutex::new(controller),
+        last_sample: Mutex::new(None),
         read_cursor: Mutex::new(0),
     });
     state
@@ -1118,6 +1160,7 @@ mod tests {
                     controller: Mutex::new(crate::resource_control::ResourceController::new(
                         crate::resource_control::EffectiveLimits::default(),
                     )),
+                    last_sample: Mutex::new(None),
                     read_cursor: Mutex::new(0),
                 }),
             )

@@ -50,6 +50,7 @@ function report(overrides: Partial<ProcessResourceReport> = {}): ProcessResource
     kind: "foreground_shell",
     backend: "supervisor",
     treePrimitive: "POSIX process group, unioned with the parent-link closure",
+    backendIsRecorded: true,
     limits: [limit()],
     ...overrides,
   };
@@ -216,12 +217,45 @@ describe("the resource view", () => {
     ).toBeTruthy();
   });
 
-  it("shows usage where it was measured", () => {
+  it("shows what a process is holding now beside the highest it ever held", () => {
+    render(
+      <ProcessResources
+        report={report({
+          limits: [
+            limit({ observed: 3 * 1024 * 1024, observedPeak: 7 * 1024 * 1024 * 1024 }),
+          ],
+        })}
+      />,
+    );
+
+    // Both numbers, because only the second one says whether an 8 GiB ceiling
+    // was nearly hit by a build that is now idle.
+    expect(screen.getByText("Now 3 MiB · peak 7 GiB")).toBeTruthy();
+  });
+
+  it("marks a half-measured resource rather than printing a zero for the other half", () => {
     render(
       <ProcessResources report={report({ limits: [limit({ observed: 3 * 1024 * 1024 })] })} />,
     );
 
-    expect(screen.getByText("Used: 3 MiB")).toBeTruthy();
+    expect(screen.getByText("Now 3 MiB · peak not measured")).toBeTruthy();
+  });
+
+  it("says so when a process recorded no enforcement mechanism at all", () => {
+    // The distinction the panel must not blur: a row that cannot name what held
+    // it is not the same as one that can, and rendering nothing made them look
+    // identical.
+    render(
+      <ProcessResources
+        report={report({ backend: undefined, backendIsRecorded: false })}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "This process recorded no enforcement mechanism, so what held it cannot be stated.",
+      ),
+    ).toBeTruthy();
   });
 });
 

@@ -414,6 +414,28 @@ fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
     }
 }
 
+/// Wall time a reader can act on: elapsed for a live process, final for a
+/// finished one.
+///
+/// `None` only where the process never started — reporting a running process's
+/// wall as unmeasured is the report refusing a question it can answer.
+fn elapsed_ms(record: &ProcessRecord) -> Option<i64> {
+    let started = record.started_at_ms?;
+    match record.exited_at_ms {
+        Some(exited) => Some(exited - started),
+        None => {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis(),
+            )
+            .ok()?;
+            Some(now - started)
+        }
+    }
+}
+
 fn print_detail(record: &ProcessRecord) {
     println!("process      {}", record.process_id);
     println!("kind         {}", record.kind.as_str());
@@ -466,7 +488,80 @@ fn print_detail(record: &ProcessRecord) {
                 support.status(),
                 support.detail()
             );
+            // What *this* process ran under, from its own row — never from a
+            // controller built on the machine reading it, which is a different
+            // question and was for a long time silently given as the answer to
+            // this one.
+            if let Some(capability) = record
+                .containment
+                .as_ref()
+                .and_then(|containment| containment.for_limit(limit))
+            {
+                let (level, detail) = match capability {
+                    little_monkey_lib::resource_control::LimitCapability::Enforced {
+                        level,
+                        mechanism,
+                    } => (level.as_str(), mechanism.as_str()),
+                    little_monkey_lib::resource_control::LimitCapability::NotApplicable {
+                        reason,
+                    } => ("not-applicable", reason.as_str()),
+                    little_monkey_lib::resource_control::LimitCapability::Unavailable {
+                        reason,
+                    } => ("unavailable", reason.as_str()),
+                };
+                println!("  {:<20} {:<16} {:<14} {}", "", "held by", level, detail);
+            }
         }
+    }
+    // The mechanism that actually enforced this process, and the durable handle a
+    // later session could reclaim it by. Absent on a row written before either was
+    // recorded, which is reported as the gap it is rather than filled in.
+    match &record.containment {
+        Some(containment) => {
+            println!("backend      {}", containment.backend);
+            println!("tree         {}", containment.tree_primitive);
+            println!(
+                "scope        {}",
+                containment.scope.as_deref().unwrap_or("-")
+            );
+        }
+        None => println!("backend      not recorded for this process"),
+    }
+    // What it was last measured holding. Current and peak both, because a process
+    // now sitting idle is exactly the case where only the peak says whether a
+    // limit was nearly hit.
+    match &record.usage {
+        Some(usage) => {
+            let show = |name: &str, current: Option<u64>, peak: Option<u64>| {
+                let render = |value: Option<u64>| {
+                    value
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "not measured".to_string())
+                };
+                println!(
+                    "  {:<20} current={:<16} peak={}",
+                    name,
+                    render(current),
+                    render(peak)
+                );
+            };
+            println!("usage");
+            show("rss_bytes", usage.rss_bytes, usage.peak_rss_bytes);
+            show(
+                "process_count",
+                usage.process_count.map(u64::from),
+                usage.peak_process_count.map(u64::from),
+            );
+            show("output_bytes", usage.output_bytes, usage.output_bytes);
+            println!(
+                "  {:<20} {}",
+                "wall_ms",
+                elapsed_ms(record)
+                    .map(|elapsed| elapsed.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
+            );
+        }
+        None => println!("usage        nothing sampled this process"),
     }
     match &record.exit {
         Some(exit) => {

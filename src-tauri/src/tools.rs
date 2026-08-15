@@ -913,12 +913,18 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
     let shell_workspace = cwd_path.to_path_buf();
     let shell_limits = child.effective_limits();
     let shell_identity = child.identity();
+    // Recorded from the controller that attached this shell, not derived later by
+    // whoever reads the row: a row outlives its host, and "what would this machine
+    // build for a new process" is a different question from "what held this one".
+    let shell_containment = child.containment();
     let running = crate::workspace_shell::foreground_projection(
         &shell_process_id,
         crate::process_table::ProcessState::Running,
         &shell_workspace,
         shell_identity,
         shell_limits,
+        Some(shell_containment.clone()),
+        None,
     );
     // The turn is the parent when there is one, which is what makes
     // `monkey processes list --parent` answer "what did this turn run".
@@ -962,24 +968,56 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
     // has to reach the row as typed fields — which limit, configured, observed,
     // backend, level — and not only as prose the UI would have to parse back.
     let mut limit_breach: Option<crate::resource_control::LimitBreach> = None;
+    // The last measurement anything took, so the terminal row carries the peaks
+    // rather than dropping them at the moment they stop changing.
+    let mut last_sample: Option<crate::resource_control::ResourceSample> = None;
     let outcome = tokio::select! {
-        result = child.wait_supervised(stdout_pipe, stderr_pipe, cap) => {
+        result = child.wait_supervised(stdout_pipe, stderr_pipe, cap, |sample| {
+            // Every tick, so the Processes panel shows a running build's current
+            // memory and process count instead of a blank until it finishes.
+            let sampled = crate::workspace_shell::foreground_projection(
+                &shell_process_id,
+                crate::process_table::ProcessState::Running,
+                &shell_workspace,
+                shell_identity,
+                shell_limits,
+                None,
+                Some(*sample),
+            );
+            project_foreground_shell(app, state, &sampled);
+        }) => {
             match result {
                 // A limit fired: the tree is already down, and the message names
                 // which limit with both numbers so a reader can tell a wrong
                 // budget from a wrong command.
-                Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+                Ok(crate::resource_control::Supervised::Breached(breach, sample)) => {
                     let described = breach.describe();
                     limit_breach = Some(breach);
+                    last_sample = Some(sample);
                     Err(described)
                 }
-                Ok(crate::resource_control::Supervised::Completed(captured, _)) => captured
+                Ok(crate::resource_control::Supervised::Completed(captured, sample)) => {
+                    // The byte count the *owner* knows and no backend can: a pipe
+                    // is not a cgroup resource, so the drain is the only thing
+                    // that can say how much the child produced. Folded into the
+                    // sample rather than fed to the controller on purpose — the
+                    // output bound is a retention bound here, and telling the
+                    // controller would make it terminate the tree instead.
+                    let produced = captured.as_ref().ok().map(|captured| {
+                        captured.stdout.total_bytes() + captured.stderr.total_bytes()
+                    });
+                    last_sample = Some(crate::resource_control::ResourceSample {
+                        output_bytes: produced,
+                        ..sample
+                    });
+                    captured
                     .map(|captured| ShellCapture {
                         status: captured.status,
                         stdout: captured.stdout,
                         stderr: captured.stderr,
                     })
-                    .map_err(|e| format!("Failed to run command: {}", e)),
+                    .map_err(|e| format!("Failed to run command: {}", e))
+                }
                 Err(e) => Err(format!("Failed to run command: {}", e)),
             }
         }
@@ -1041,6 +1079,8 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
         &shell_workspace,
         shell_identity,
         shell_limits,
+        Some(shell_containment),
+        last_sample,
     );
     exited.exit = Some(exit);
     project_foreground_shell(app, state, &exited);

@@ -123,16 +123,41 @@ function LimitRow({ report }: { report: ProcessLimitReport }) {
       </div>
       {origin && <p className="mt-0.5 text-[11px] text-faint">{origin}</p>}
       <p className="mt-0.5 text-[11px] text-faint">{enforcementDetail(report)}</p>
-      <p className="mt-0.5 text-[11px] text-faint">
-        {report.observed === undefined
-          ? t("ProcessesPanel.usageUnavailable", {
-              reason: report.observedUnavailable ?? "",
-            })
-          : t("ProcessesPanel.usageObserved", {
-              observed: formatLimitValue(report.limit, report.observed),
-            })}
-      </p>
+      <UsageLine report={report} />
     </div>
+  );
+}
+
+/**
+ * Current and peak, side by side, or the reason there is neither.
+ *
+ * Two numbers rather than one because they answer different questions and only
+ * one of them used to be shown: a build that peaked at 7.6 GiB against an 8 GiB
+ * ceiling and is now idle at 300 MiB is a job about to be killed, and "Used:
+ * 300 MiB" is the reading that hides it.
+ *
+ * A missing measurement renders as its reason. Never as "0" — the two are
+ * indistinguishable to a reader, and one of them is a claim that a process is
+ * holding nothing.
+ */
+function UsageLine({ report }: { report: ProcessLimitReport }) {
+  const { t } = useT();
+  if (report.observed === undefined && report.observedPeak === undefined) {
+    return (
+      <p className="mt-0.5 text-[11px] text-faint">
+        {t("ProcessesPanel.usageUnavailable", { reason: report.observedUnavailable ?? "" })}
+      </p>
+    );
+  }
+  const value = (raw: number | undefined) =>
+    raw === undefined ? t("ProcessesPanel.usageNotMeasured") : formatLimitValue(report.limit, raw);
+  return (
+    <p className="mt-0.5 font-mono text-[11px] text-faint">
+      {t("ProcessesPanel.usageCurrentAndPeak", {
+        current: value(report.observed),
+        peak: value(report.observedPeak),
+      })}
+    </p>
   );
 }
 
@@ -189,14 +214,26 @@ export function ProcessResources({ report }: { report: ProcessResourceReport }) 
       className="mt-2 rounded-lg border border-border bg-surface p-2"
       aria-label={t("ProcessesPanel.resourcesAriaLabel")}
     >
-      {report.backend && (
+      {report.backend ? (
         <p className="mb-1 text-[11px] text-faint">
           {t("ProcessesPanel.resourceBackend", { backend: report.backend })}
+        </p>
+      ) : (
+        // Said rather than left blank: a process whose mechanism was never
+        // recorded is one this app cannot claim it bounded, and that must not
+        // look the same as one it can.
+        <p className="mb-1 text-[11px] text-faint">
+          {t("ProcessesPanel.resourceBackendUnrecorded")}
         </p>
       )}
       {report.treePrimitive && (
         <p className="mb-1 text-[11px] text-faint">
           {t("ProcessesPanel.resourceTree", { primitive: report.treePrimitive })}
+        </p>
+      )}
+      {report.scope && (
+        <p className="mb-1 font-mono text-[11px] text-faint">
+          {t("ProcessesPanel.resourceScope", { scope: report.scope })}
         </p>
       )}
       {report.limits.map((limit) => (

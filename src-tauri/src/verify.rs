@@ -913,6 +913,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// A running process's row shows what it is holding, not a blank until it
+    /// ends.
+    ///
+    /// The gap: the sampling loop's readings never left it — only the final
+    /// sample reached a caller — so a build sitting at gigabytes for ten minutes
+    /// displayed nothing at all. The child here holds a real process tree for
+    /// longer than one sample interval, and the assertions are that the *live*
+    /// row carries a current measurement and a peak at least as large.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_live_command_reports_what_its_tree_is_holding_now() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_live_usage");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        // Three live processes for two seconds: comfortably more than one
+        // 500 ms sampling interval, and a tree rather than a single process, so
+        // the process count is a number a single `sleep` could not produce.
+        let mut cmd = command("c1", "sleep 2 & sleep 2 & sleep 2");
+        cmd.timeout_secs = Some(30);
+
+        let watcher = {
+            let projector = projector.clone();
+            tokio::spawn(async move {
+                // Sampled from outside the runner, while it is still running:
+                // reading after it returns would prove only that a final sample
+                // was written, which is the thing that already worked.
+                for _ in 0..60 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let rows = projector.rows(ProcessKind::VerifyCommand);
+                    let Some(row) = rows.into_iter().next() else {
+                        continue;
+                    };
+                    if row.state != crate::process_table::ProcessState::Running {
+                        continue;
+                    }
+                    if let Some(usage) = row.usage {
+                        if usage.rss_bytes.is_some() || usage.process_count.is_some() {
+                            return Some((usage, row.usage_sampled_at_ms));
+                        }
+                    }
+                }
+                None
+            })
+        };
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        assert_eq!(result.code, Some(0), "{result:?}");
+
+        let (usage, sampled_at) = watcher
+            .await
+            .expect("the watcher finishes")
+            .expect("a running command's row must carry a measurement while it is running");
+        assert!(
+            sampled_at.is_some(),
+            "a measurement is stamped with when it was taken"
+        );
+        if let Some(rss) = usage.rss_bytes {
+            assert!(
+                rss > 0,
+                "a live tree holding zero bytes is not a measurement"
+            );
+            assert!(
+                usage.peak_rss_bytes.unwrap_or(0) >= rss,
+                "a peak below the current reading is not a peak: {usage:?}"
+            );
+        }
+        if let Some(count) = usage.process_count {
+            assert!(count >= 1, "{usage:?}");
+            assert!(usage.peak_process_count.unwrap_or(0) >= count, "{usage:?}");
+        }
+
+        // And the wall clock is answerable for a *live* process, which is the
+        // other half of the same defect.
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let report = crate::process_commands::build_resource_report(&row, None, Some(i64::MAX / 2));
+        let wall = report
+            .limits
+            .iter()
+            .find(|limit| limit.limit == ProcessLimitKind::Wall.as_str())
+            .expect("wall is reported");
+        assert!(wall.observed.is_some(), "{wall:?}");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
     /// A verify command's deadline ends the *tree*, not the shell it named.
     ///
     /// The property the resource controller brought to this path. A verify

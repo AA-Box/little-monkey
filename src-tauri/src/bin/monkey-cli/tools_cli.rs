@@ -400,6 +400,8 @@ fn record_foreground_shell(
         cwd,
         output.identity,
         output.limits,
+        Some(output.containment.clone()),
+        Some(output.usage),
     );
     projection.exit = Some(match &output.breach {
         Some(breach) => ProcessExit::limit_exceeded(breach.clone()),
