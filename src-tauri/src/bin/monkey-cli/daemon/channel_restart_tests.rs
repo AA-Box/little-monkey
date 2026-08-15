@@ -293,7 +293,10 @@ pub(crate) fn assert_one_of_everything(store: &DaemonStore, queue: &FakeQueue, a
     );
     assert_eq!(distinct_runs(queue), 1, "expected exactly one run");
     assert!(
-        store.orphaned_accepted_events(10).unwrap().is_empty(),
+        store
+            .accepted_events_awaiting_processing(10)
+            .unwrap()
+            .is_empty(),
         "an accepted event with no turn behind it"
     );
 }
@@ -2042,6 +2045,11 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
             .any(|component| component.as_os_str() == "adapters")
             || name == "channel_worker.rs"
             || name == "channel_restart_tests.rs"
+            // The webhook providers' own suite, for the same reason this file
+            // is here: it drives `send` directly to pin down how each adapter
+            // classifies a refused connection against an ambiguous one. It has
+            // no production callers in it — this scan is about those.
+            || name == "channel_webhook_tests.rs"
             || name == "live_smoke.rs"
     };
     // The outbox enqueue has exactly three legitimate writers: the store

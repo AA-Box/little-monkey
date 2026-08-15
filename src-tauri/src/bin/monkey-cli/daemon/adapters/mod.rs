@@ -144,13 +144,19 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         optional("osascript_path", ConfigFieldKind::Text),
     ];
     const WHATSAPP: &[ConfigField] = &[required("phone_number_id", ConfigFieldKind::Text)];
+    // No cloud/environment key: the issuer, the key document, the OAuth
+    // authority, the token scope and the reply hosts are one setting, not
+    // five, and only the public cloud is implemented — see `TeamsEnvironment`.
     const TEAMS: &[ConfigField] = &[
         required("app_id", ConfigFieldKind::Text),
         required("tenant_id", ConfigFieldKind::Text),
-        optional("open_id_metadata_url", ConfigFieldKind::Text),
     ];
+    // `project_number` is required by the default authentication audience and
+    // unused by the other, so which one is missing is the adapter's to say —
+    // it is the half that has to agree with Google's console.
     const GOOGLE_CHAT: &[ConfigField] = &[
-        required("project_number", ConfigFieldKind::Text),
+        optional("project_number", ConfigFieldKind::Text),
+        optional("auth_audience", ConfigFieldKind::Text),
         optional("bot_user_name", ConfigFieldKind::Text),
     ];
     const SMS: &[ConfigField] = &[
@@ -239,7 +245,10 @@ pub(crate) fn validate_non_secret_config(
 /// The one place a `ChannelKind` becomes code. Exhaustive on purpose: a new
 /// provider kind fails to compile here until somebody decides what it maps to,
 /// rather than silently becoming an account that never runs.
-pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn ChannelAdapter>, String> {
+pub(crate) fn build_adapter(
+    config: &AdapterConfig<'_>,
+    state: Option<&super::store::DaemonPaths>,
+) -> Result<Arc<dyn ChannelAdapter>, String> {
     Ok(match config.account.kind {
         ChannelKind::Telegram => Arc::new(telegram::TelegramAdapter::new(config)?),
         ChannelKind::Discord => Arc::new(discord::DiscordAdapter::new(config)?),
@@ -248,7 +257,7 @@ pub(crate) fn build_adapter(config: &AdapterConfig<'_>) -> Result<Arc<dyn Channe
         ChannelKind::Irc => Arc::new(irc::IrcAdapter::new(config)?),
         ChannelKind::WhatsApp => Arc::new(whatsapp::WhatsAppAdapter::new(config)?),
         ChannelKind::Line => Arc::new(line::LineAdapter::new(config)?),
-        ChannelKind::Teams => Arc::new(teams::TeamsAdapter::new(config)?),
+        ChannelKind::Teams => Arc::new(teams::TeamsAdapter::new(config)?.with_state(state)),
         ChannelKind::GoogleChat => Arc::new(google_chat::GoogleChatAdapter::new(config)?),
         ChannelKind::Matrix => Arc::new(matrix::MatrixAdapter::new(config)?),
         ChannelKind::Signal => Arc::new(signal::SignalAdapter::new(config)?),
@@ -353,10 +362,13 @@ mod tests {
             ChannelKind::Mattermost,
             serde_json::json!({"base_url": "http://chat.example.com"}),
         );
-        let error = match build_adapter(&AdapterConfig {
-            account: &broken,
-            secret: "token".to_string(),
-        }) {
+        let error = match build_adapter(
+            &AdapterConfig {
+                account: &broken,
+                secret: "token".to_string(),
+            },
+            None,
+        ) {
             Err(error) => error,
             Ok(_) => panic!("plain http to a remote host must be refused"),
         };
@@ -366,10 +378,13 @@ mod tests {
             ChannelKind::Mattermost,
             serde_json::json!({"base_url": "https://chat.example.com"}),
         );
-        let adapter = build_adapter(&AdapterConfig {
-            account: &fixed,
-            secret: "token".to_string(),
-        })
+        let adapter = build_adapter(
+            &AdapterConfig {
+                account: &fixed,
+                secret: "token".to_string(),
+            },
+            None,
+        )
         .expect("the edited row builds");
         assert_eq!(adapter.kind(), ChannelKind::Mattermost);
     }
@@ -382,11 +397,12 @@ mod tests {
 /// providers that are delivered to can answer it at all.
 pub(crate) fn build_webhook_adapter(
     config: &AdapterConfig<'_>,
+    state: Option<&super::store::DaemonPaths>,
 ) -> Result<Box<dyn super::channel_adapter::WebhookChannelAdapter>, String> {
     Ok(match config.account.kind {
         ChannelKind::WhatsApp => Box::new(whatsapp::WhatsAppAdapter::new(config)?),
         ChannelKind::Line => Box::new(line::LineAdapter::new(config)?),
-        ChannelKind::Teams => Box::new(teams::TeamsAdapter::new(config)?),
+        ChannelKind::Teams => Box::new(teams::TeamsAdapter::new(config)?.with_state(state)),
         ChannelKind::GoogleChat => Box::new(google_chat::GoogleChatAdapter::new(config)?),
         other => {
             return Err(format!(

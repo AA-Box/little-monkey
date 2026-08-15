@@ -2152,14 +2152,14 @@ const DAEMON_V15_CHECKSUM: &str = "daemon-jobs-v15-channel-conversation-refs";
 /// `serviceUrl` on a Microsoft-owned host — so an unauthenticated request can
 /// never plant an outbound destination.
 ///
-/// A **credential** may never live here: the bot access tokens both Teams and
-/// Google Chat acquire stay in memory with their expiry, and the operator's own
-/// long-lived tokens stay in the keychain, exactly as they do today. LINE's
-/// `replyToken` is the one thing stored here that reads like a secret and is
-/// not one — it authorizes nothing, names one inbound event, is spent by a
-/// single use and is abandoned once stale — so it is stored with the moment it
-/// arrived and the adapter refuses it past its window rather than trusting the
-/// row. Nothing reads this table but the adapters; no status API projects it.
+/// A **credential** may never live here, and nothing that expires does either.
+/// The bot access tokens both Teams and Google Chat acquire stay in memory with
+/// their expiry, and the operator's own long-lived tokens stay in the keychain.
+/// LINE's `replyToken` is deliberately not here: it authorizes answering as the
+/// bot, is valid for seconds, and belongs to one event rather than to the
+/// conversation this table is keyed by — so that adapter pushes instead, and
+/// stores nothing. Teams is currently the only writer. Nothing reads this table
+/// but the adapters; no status API projects it.
 ///
 /// The size check keeps a provider from turning a reply address into unbounded
 /// storage.
@@ -2561,7 +2561,7 @@ mod tests {
             .find(|event| event.event_id == "evt-orphan")
             .expect("the orphaned event");
         assert_eq!(orphan.ingress_id, None);
-        let unfinished = store.orphaned_accepted_events(10).unwrap();
+        let unfinished = store.accepted_events_awaiting_processing(10).unwrap();
         assert_eq!(unfinished.len(), 1);
         assert_eq!(unfinished[0].event_id, "evt-orphan");
     }

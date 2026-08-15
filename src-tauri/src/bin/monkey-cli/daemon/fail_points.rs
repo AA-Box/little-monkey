@@ -25,6 +25,9 @@ pub(crate) enum FailPoint {
     /// Inside the acceptance transaction, after the accepted turn is inserted
     /// and before the commit.
     BeforeAcceptCommit,
+    /// After the attachments of an accepted event are downloaded and their
+    /// results stored, before the message is routed.
+    AfterAttachmentHydration,
     /// After the acceptance is committed, before the run reaches the queue.
     BeforeQueueSubmit,
     /// After the queue took the run, before the turn is marked queued.
@@ -40,6 +43,7 @@ impl FailPoint {
         match self {
             FailPoint::AfterEventInsert => "after the provider event was recorded",
             FailPoint::BeforeAcceptCommit => "before the acceptance was committed",
+            FailPoint::AfterAttachmentHydration => "after the attachments were stored",
             FailPoint::BeforeQueueSubmit => "before the run reached the queue",
             FailPoint::BeforeQueuedState => "before the turn was marked queued",
             FailPoint::BeforeCursorCommit => "before the provider cursor was committed",

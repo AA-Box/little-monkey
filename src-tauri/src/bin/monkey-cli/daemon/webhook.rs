@@ -203,43 +203,26 @@ async fn handle_channel_delivery(
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "clock_error"),
     };
 
-    let (mut store, adapter, fetcher) = match open_webhook_adapter(&paths, &account_id) {
+    let (mut store, adapter) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
-    // What this account allows an attachment to cost, which the operator may
-    // have tuned. Read once per delivery rather than per file.
-    let limits = store
-        .channel_account(&account_id)
-        .ok()
-        .flatten()
-        .map(|account| {
-            super::channel_adapter::AttachmentLimits::for_account(&account.non_secret_config)
-        })
-        .unwrap_or_default();
 
     // The operator's advertised base, for providers whose signatures cover
     // the full callback URL. Absent is fine: adapters that need nothing
     // ignore it, and one that requires it refuses its delivery itself.
     let public_base_url = store.channel_public_base_url().ok().flatten();
-    let queue = super::DaemonChannelQueue::new(paths.clone());
     let outcome = accept_webhook_delivery(
         &mut store,
-        &queue,
         adapter.as_ref(),
-        fetcher.as_deref(),
-        &super::channel_adapter::DaemonBlobs,
         &WebhookDelivery {
             headers: &headers,
             body: &body,
             public_base_url: public_base_url.as_deref(),
-            limits,
-            attachment_budget: ATTACHMENT_BUDGET,
             now_ms,
         },
-    )
-    .await;
-    outcome.into_response()
+    );
+    outcome.into_response(adapter.ack())
 }
 
 /// One delivery as it reached the listener, before any of it is trusted.
@@ -251,11 +234,6 @@ pub(crate) struct WebhookDelivery<'a> {
     /// providers signs the body it sent, not a normalization of it.
     pub body: &'a [u8],
     pub public_base_url: Option<&'a str>,
-    pub limits: super::channel_adapter::AttachmentLimits,
-    /// How long the provider's socket may be held downloading what it
-    /// referenced. Always [`ATTACHMENT_BUDGET`] in production; a test sets its
-    /// own so proving the budget exists does not cost ten seconds.
-    pub attachment_budget: std::time::Duration,
     pub now_ms: i64,
 }
 
@@ -269,8 +247,8 @@ pub(crate) enum DeliveryOutcome {
     /// Nothing proved the request came from the provider. No durable trace is
     /// left, deliberately: an unverified body has not earned a row.
     Rejected,
-    /// Authenticated, and carrying no turn — a status-only body, or an event
-    /// type this provider maps to nothing.
+    /// Authenticated, and carrying no message — a status-only body, or an
+    /// event type this provider maps to nothing.
     Nothing { receipts: usize },
     /// Every message in it crossed the durable acceptance boundary. Safe to
     /// acknowledge: a redelivery from here collapses onto the rows already
@@ -279,26 +257,20 @@ pub(crate) enum DeliveryOutcome {
     /// At least one message left no durable trace. Must NOT be acknowledged —
     /// only the provider's redelivery can bring it back.
     NotAccepted,
-    /// Durable, but nothing in the delivery could be planned into a turn (no
-    /// route, or a store that refused). The operator can see the failed rows;
-    /// a redelivery would only repeat them, so this is not a plain success
-    /// either.
-    NotQueued,
 }
 
 impl DeliveryOutcome {
-    fn into_response(self) -> Response<Full<Bytes>> {
+    fn into_response(self, ack: super::channel_adapter::WebhookAck) -> Response<Full<Bytes>> {
         match self {
             DeliveryOutcome::Rejected => response(StatusCode::UNAUTHORIZED, "rejected"),
-            DeliveryOutcome::Nothing { receipts } => response(
-                StatusCode::OK,
-                if receipts > 0 { "recorded" } else { "ignored" },
-            ),
-            DeliveryOutcome::Accepted { .. } => response(StatusCode::ACCEPTED, "accepted"),
+            // A body that authenticated and carried nothing this provider maps
+            // to a message is still finished with, so it gets the provider's
+            // own success rather than a different status it would read as a
+            // reason to send it again.
+            DeliveryOutcome::Nothing { .. } | DeliveryOutcome::Accepted { .. } => ack_response(ack),
             DeliveryOutcome::NotAccepted => {
                 response(StatusCode::INTERNAL_SERVER_ERROR, "not_accepted")
             }
-            DeliveryOutcome::NotQueued => response(StatusCode::INTERNAL_SERVER_ERROR, "not_queued"),
         }
     }
 
@@ -317,70 +289,46 @@ impl DeliveryOutcome {
     }
 }
 
-/// How long a provider's own delivery may be held open fetching the files it
-/// referenced.
-///
-/// The download client's read budget is ten minutes, which is right for the
-/// polling worker it was written for and wrong on this path: here the socket
-/// being held is the provider's, and all four of these give up and redeliver in
-/// far less than that. A media host that stalls would otherwise turn one
-/// message into a redelivery loop, and Meta disables a callback URL that keeps
-/// timing out.
-///
-/// Blowing the budget costs the attachment, never the message: the turn still
-/// commits, and [`note_unfetched_attachments`] leaves the agent a real reason
-/// instead of a file that silently is not there.
-const ATTACHMENT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Say so on every attachment the budget ran out on.
-///
-/// An attachment with neither stored bytes nor an error reads as "nothing to
-/// fetch", which is exactly the wrong thing for the agent to conclude about a
-/// photo somebody sent.
-fn note_unfetched_attachments(
-    envelopes: &mut [little_monkey_lib::channels::types::ChannelEnvelope],
-) {
-    for attachment in envelopes
-        .iter_mut()
-        .flat_map(|envelope| envelope.attachments.iter_mut())
-        .filter(|attachment| {
-            attachment.stored_artifact_id.is_none() && attachment.fetch_error.is_none()
-        })
-    {
-        attachment.fetch_error = Some(
-            "The provider's own delivery had to be acknowledged before this file finished \
-             downloading"
-                .to_string(),
-        );
-    }
+/// Answer with exactly what this provider asked for.
+fn ack_response(ack: super::channel_adapter::WebhookAck) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::from_u16(ack.status).unwrap_or(StatusCode::OK))
+        .header(CONTENT_TYPE, ack.content_type)
+        .body(Full::new(Bytes::from(ack.body)))
+        .unwrap_or_else(|_| response(StatusCode::INTERNAL_SERVER_ERROR, "response_failed"))
 }
 
 /// Authenticate one delivery, then durably accept whatever it carries.
 ///
-/// The order is the whole point, and it is the same for all four providers:
+/// **This function is the whole of what happens before a provider is told
+/// "yes".** The order is the point, and it is the same for all four:
 ///
 /// 1. the provider's own adapter verifies the signature over the exact bytes
 ///    received — nothing is parsed before that, and a failure returns
 ///    [`DeliveryOutcome::Rejected`] having written nothing;
 /// 2. the verified body is normalized into envelopes;
-/// 3. every envelope crosses `accept_channel_envelope`'s single-transaction
-///    acceptance boundary, which is what makes the provider's `provider_event_id`
-///    the durable dedupe identity;
-/// 4. only then may the caller answer with a success.
+/// 3. each envelope is committed to `channel_events`, whose
+///    `UNIQUE(source, account_id, direction, provider_event_id)` is what makes
+///    the provider's own event id the durable dedupe identity;
+/// 4. only then may the caller answer with this provider's success.
 ///
-/// No agent runs on this path. What acceptance commits is the turn; running it
-/// is the queue's job, asynchronously, and a turn that was committed but not
-/// yet queued is picked up by the daemon's recovery pass rather than being
-/// waited for here.
-pub(crate) async fn accept_webhook_delivery(
+/// What is deliberately *not* here: no file is downloaded, no media endpoint is
+/// asked anything, no blob is written, no route is resolved, no execution
+/// context is frozen, no run is submitted and no agent runs. Every one of those
+/// can fail for reasons that have nothing to do with whether the provider's
+/// message reached us, and a provider that is not acknowledged sends the
+/// message again. They belong to
+/// [`channel_worker::process_pending_channel_ingress`], which continues each
+/// accepted row asynchronously and picks up wherever a restart left off.
+///
+/// The committed row is enough to finish from a cold start: it carries the
+/// envelope, and the account it arrived on.
+pub(crate) fn accept_webhook_delivery(
     store: &mut DaemonStore,
-    queue: &dyn super::channel_worker::RunQueue,
     adapter: &dyn super::channel_adapter::WebhookChannelAdapter,
-    fetcher: Option<&dyn super::channel_adapter::ChannelAdapter>,
-    blobs: &dyn super::channel_adapter::BlobSource,
     delivery: &WebhookDelivery<'_>,
 ) -> DeliveryOutcome {
-    let mut envelopes = match adapter.verify_and_normalize(
+    let envelopes = match adapter.verify_and_normalize(
         delivery.headers,
         delivery.body,
         delivery.public_base_url,
@@ -403,50 +351,56 @@ pub(crate) async fn accept_webhook_delivery(
         return DeliveryOutcome::Nothing { receipts };
     }
 
-    // Same as the polled path: the bytes are fetched before the turn is
-    // durable, so what is stored is what the agent will be shown. Unlike the
-    // polled path it is on a clock — see [`ATTACHMENT_BUDGET`].
-    if let Some(fetcher) = fetcher {
-        let hydration = super::channel_adapter::hydrate_attachments(
-            fetcher,
-            blobs,
-            delivery.limits,
-            &mut envelopes,
-        );
-        if tokio::time::timeout(delivery.attachment_budget, hydration)
-            .await
-            .is_err()
-        {
-            note_unfetched_attachments(&mut envelopes);
+    let mut accepted = 0;
+    let mut duplicates = 0;
+    for envelope in &envelopes {
+        match record_accepted_event(store, envelope) {
+            Ok(super::channel_store::EventRecording::Recorded { .. }) => accepted += 1,
+            Ok(super::channel_store::EventRecording::Duplicate { .. }) => duplicates += 1,
+            // Nothing was committed for this message, so the provider must be
+            // left to redeliver the whole thing. The siblings that did commit
+            // collapse when it arrives.
+            Err(_) => return DeliveryOutcome::NotAccepted,
         }
     }
-
-    let report = super::channel_worker::ingest_batch(store, queue, &envelopes, delivery.now_ms);
-    // The HTTP response *is* this transport's acknowledgement, so it may only
-    // be a success when every message in the delivery crossed the durable
-    // acceptance boundary. One that did not has no durable trace at all, and
-    // only the provider's redelivery can bring it back; the ones that did
-    // commit are deduplicated when it arrives.
-    if report.unrecorded > 0 {
-        return DeliveryOutcome::NotAccepted;
-    }
-    if report.failed > 0 && report.accepted == 0 {
-        return DeliveryOutcome::NotQueued;
-    }
     DeliveryOutcome::Accepted {
-        accepted: report.accepted,
-        duplicates: report.duplicates,
+        accepted,
+        duplicates,
     }
+}
+
+/// Commit one authenticated envelope as accepted-and-unprocessed.
+///
+/// `accepted` with no turn behind it is exactly the state
+/// `DaemonStore::accepted_events_awaiting_processing` selects, and the worker
+/// makes the real decision — run, ignore, challenge or refuse — from the
+/// envelope stored here. Nothing about the sender's access, the route or the
+/// recipe is consulted at this point: those are reads of operator
+/// configuration, and none of them change whether this message arrived.
+fn record_accepted_event(
+    store: &mut DaemonStore,
+    envelope: &little_monkey_lib::channels::types::ChannelEnvelope,
+) -> Result<super::channel_store::EventRecording, String> {
+    use super::channel_store::{EventDirection, EventDisposition, NewChannelEvent};
+
+    store.record_channel_event(&NewChannelEvent {
+        account_id: envelope.account_id.clone(),
+        source: little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
+        direction: EventDirection::Inbound,
+        provider_event_id: envelope.provider_event_id.clone(),
+        conversation_id: envelope.conversation.conversation_id.clone(),
+        thread_id: envelope.conversation.thread_id.clone(),
+        sender_id: Some(envelope.sender.sender_id.clone()),
+        envelope_json: serde_json::to_string(envelope).map_err(|error| error.to_string())?,
+        disposition: EventDisposition::Accepted,
+        received_at_ms: envelope.received_at_ms.max(1),
+    })
 }
 
 /// An open store plus the adapter for the account the request named.
 type OpenedWebhookAccount = (
     DaemonStore,
     Box<dyn super::channel_adapter::WebhookChannelAdapter>,
-    // The same provider as a polling adapter, when it is also one. Only used
-    // to download attachments — the two halves are the same struct for every
-    // provider that is delivered to.
-    Option<std::sync::Arc<dyn super::channel_adapter::ChannelAdapter>>,
 );
 
 /// Open the store and build one account's webhook adapter, or the response
@@ -484,10 +438,9 @@ fn open_webhook_adapter(
         account: &account,
         secret,
     };
-    let adapter = super::adapters::build_webhook_adapter(&config)
+    let adapter = super::adapters::build_webhook_adapter(&config, Some(paths))
         .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
-    let fetcher = super::adapters::build_adapter(&config).ok();
-    Ok((store, adapter, fetcher))
+    Ok((store, adapter))
 }
 
 /// Record what a provider says happened to messages we already sent.
@@ -560,7 +513,7 @@ fn handle_channel_verification(
     account_id: String,
     query: &str,
 ) -> Response<Full<Bytes>> {
-    let (_store, adapter, _fetcher) = match open_webhook_adapter(&paths, &account_id) {
+    let (_store, adapter) = match open_webhook_adapter(&paths, &account_id) {
         Ok(pair) => pair,
         Err(refusal) => return *refusal,
     };
@@ -790,6 +743,103 @@ fn json_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .header(CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body)))
         .expect("static webhook error response is valid")
+}
+
+/// Drive the production HTTP route the way a provider does.
+///
+/// The service under test is [`handle`] itself, served by the same hyper
+/// `http1` server the listener uses, over an in-memory duplex instead of a
+/// socket. Real request bytes are parsed by hyper, the real router picks the
+/// path, the real adapter verifies, and the real status line and headers come
+/// back — which is the only way to assert on what a provider is actually told.
+/// Binding a TCP port per test would prove nothing more and would cost every
+/// test in the binary on a loaded CI machine.
+#[cfg(test)]
+pub(crate) mod test_route {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What the route answered, as the provider would see it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct RouteResponse {
+        pub status: u16,
+        pub content_type: Option<String>,
+        pub body: String,
+    }
+
+    /// One POST through the production route.
+    pub(crate) async fn post(
+        paths: &DaemonPaths,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> RouteResponse {
+        let mut raw = format!(
+            "POST {path} HTTP/1.1\r\nhost: monkey.test\r\ncontent-length: {}\r\nconnection: close\r\n",
+            body.len()
+        )
+        .into_bytes();
+        for (name, value) in headers {
+            raw.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\r\n");
+        raw.extend_from_slice(body);
+        send_raw(paths, &raw).await
+    }
+
+    /// One GET through the production route, for a provider handshake.
+    pub(crate) async fn get(paths: &DaemonPaths, path_and_query: &str) -> RouteResponse {
+        let raw = format!(
+            "GET {path_and_query} HTTP/1.1\r\nhost: monkey.test\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        send_raw(paths, &raw).await
+    }
+
+    async fn send_raw(paths: &DaemonPaths, raw: &[u8]) -> RouteResponse {
+        let (mut client, server) = tokio::io::duplex(1024 * 1024);
+        let served = paths.clone();
+        let connection = tokio::spawn(async move {
+            let service = service_fn(move |request| {
+                let paths = served.clone();
+                async move { Ok::<_, Infallible>(handle(paths, request).await) }
+            });
+            let _ = http1::Builder::new()
+                .serve_connection(TokioIo::new(server), service)
+                .await;
+        });
+        client.write_all(raw).await.expect("write request");
+        client.flush().await.expect("flush request");
+        let mut received = Vec::new();
+        client
+            .read_to_end(&mut received)
+            .await
+            .expect("read response");
+        let _ = connection.await;
+        parse(&received)
+    }
+
+    fn parse(raw: &[u8]) -> RouteResponse {
+        let text = String::from_utf8_lossy(raw).to_string();
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("not an HTTP response: {text:?}"));
+        let mut lines = head.split("\r\n");
+        let status = lines
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("no status line in {head:?}"));
+        let content_type = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.trim().to_string());
+        RouteResponse {
+            status,
+            content_type,
+            body: body.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]

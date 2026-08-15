@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, WebhookAck, WebhookChannelAdapter,
 };
 
 const GRAPH_API_BASE: &str = "https://graph.facebook.com/v21.0";
@@ -145,6 +145,13 @@ impl WhatsAppAdapter {
 impl WebhookChannelAdapter for WhatsAppAdapter {
     fn kind(&self) -> ChannelKind {
         ChannelKind::WhatsApp
+    }
+
+    /// Meta asks for a `200` and reads nothing else. Anything else — including
+    /// a `202` — counts as a failed delivery, is retried, and eventually gets
+    /// the callback URL disabled.
+    fn ack(&self) -> WebhookAck {
+        WebhookAck::empty_ok()
     }
 
     fn verify_and_normalize(

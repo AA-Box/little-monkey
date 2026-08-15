@@ -341,6 +341,34 @@ pub async fn hydrate_attachments(
     }
 }
 
+/// Say so on every attachment that was never fetched.
+///
+/// An attachment with neither stored bytes nor an error reads as "nothing to
+/// fetch", which is exactly the wrong thing for the agent to conclude about a
+/// photo somebody sent. Called wherever hydration was skipped or cut short, so
+/// what the turn carries is always either the file or the reason.
+pub fn note_unfetched_attachments(envelopes: &mut [ChannelEnvelope], reason: &str) {
+    for attachment in envelopes
+        .iter_mut()
+        .flat_map(|envelope| envelope.attachments.iter_mut())
+        .filter(|attachment| {
+            attachment.stored_artifact_id.is_none() && attachment.fetch_error.is_none()
+        })
+    {
+        attachment.fetch_error = Some(reason.to_string());
+    }
+}
+
+/// Whether anything on these envelopes still has to be downloaded.
+pub fn needs_hydration(envelopes: &[ChannelEnvelope]) -> bool {
+    envelopes.iter().any(|envelope| {
+        envelope
+            .attachments
+            .iter()
+            .any(|attachment| attachment.stored_artifact_id.is_none())
+    })
+}
+
 /// The image types this tree's encoders can name a MIME type for.
 ///
 /// A file whose type is not one of these is stored but never offered to a
@@ -355,6 +383,42 @@ pub fn vision_extension(mime: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// The exact success one provider requires of its callback endpoint.
+///
+/// Not a single generic `202 Accepted`, because these four do not agree on
+/// what "we have it" looks like on the wire: Google Chat reads the body of a
+/// `200` as an optional synchronous reply and treats anything else as an
+/// error, the Bot Framework expects a `200` with a JSON body, and Meta and
+/// LINE want a `200` and ignore what is in it. A provider answered with the
+/// wrong thing retries a message it already delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebhookAck {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub body: &'static str,
+}
+
+impl WebhookAck {
+    /// `200` with an empty body, for a provider that reads only the status.
+    pub const fn empty_ok() -> Self {
+        Self {
+            status: 200,
+            content_type: "text/plain; charset=utf-8",
+            body: "",
+        }
+    }
+
+    /// `200` carrying an empty JSON object, which is how a provider that would
+    /// read the body as an immediate reply is told there is not one.
+    pub const fn json_ok() -> Self {
+        Self {
+            status: 200,
+            content_type: "application/json",
+            body: "{}",
+        }
+    }
+}
+
 /// Providers that are delivered to rather than polled.
 ///
 /// Signature verification happens here, over the exact bytes received, because
@@ -364,6 +428,14 @@ pub fn vision_extension(mime: Option<&str>) -> Option<&'static str> {
 /// public base URL instead when a provider's signature covers it.
 pub trait WebhookChannelAdapter: Send + Sync {
     fn kind(&self) -> ChannelKind;
+
+    /// What this provider needs to see to consider the delivery finished.
+    ///
+    /// The default is the one every provider accepts; each adapter that wants
+    /// something more specific says so, and the route sends exactly that.
+    fn ack(&self) -> WebhookAck {
+        WebhookAck::empty_ok()
+    }
 
     /// Verify and normalize one delivery. `headers` are lowercase-keyed.
     ///
@@ -440,9 +512,9 @@ pub trait BlobSource: Send + Sync {
 ///
 /// A trait for the same reasons [`BlobSource`] is one: the real implementation
 /// resolves the daemon's own paths, and a test has no business creating those.
-/// Only the providers whose reply address is not derivable from a conversation
-/// id use it — Teams cannot address an activity without the `serviceUrl` its
-/// inbound delivery carried, and LINE's reply token is valid only briefly.
+/// Only a provider whose reply address is not derivable from a conversation id
+/// uses it, which today is Teams alone: the Bot Framework cannot address an
+/// activity without the `serviceUrl` its inbound delivery carried.
 ///
 /// Reads and writes are best-effort by signature: an adapter that cannot reach
 /// the store must fail its send with a real message rather than panicking
@@ -458,8 +530,6 @@ pub trait ConversationReferences: Send + Sync {
         conversation_id: &str,
         reference: &serde_json::Value,
     ) -> Result<(), String>;
-
-    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String>;
 }
 
 /// The production source: the daemon's own state database.
@@ -467,9 +537,36 @@ pub trait ConversationReferences: Send + Sync {
 /// Opened per call rather than held, which is what lets one adapter be shared
 /// by the webhook route and the outbox drain without either holding a
 /// connection open across an await.
-pub struct DaemonConversationReferences;
+pub struct DaemonConversationReferences {
+    /// Which daemon's state to open. `None` — what every adapter builds —
+    /// resolves the running daemon's own paths on each call. A test points it
+    /// at its own temporary daemon instead, so the code under test is this
+    /// implementation and not a stand-in for it.
+    paths: Option<super::store::DaemonPaths>,
+}
 
 impl DaemonConversationReferences {
+    pub fn new() -> Self {
+        Self { paths: None }
+    }
+
+    /// Read and write one specific daemon's state.
+    ///
+    /// Used by the callers that already know where it is — the webhook route
+    /// and the channel worker both resolved it before they built the adapter —
+    /// so the reference store is not the daemon looking itself up from inside
+    /// itself on every call.
+    pub(crate) fn at(paths: super::store::DaemonPaths) -> Self {
+        Self { paths: Some(paths) }
+    }
+
+    fn paths(&self) -> Result<super::store::DaemonPaths, String> {
+        match &self.paths {
+            Some(paths) => Ok(paths.clone()),
+            None => super::store::DaemonPaths::resolve(),
+        }
+    }
+
     fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -481,7 +578,7 @@ impl DaemonConversationReferences {
 
 impl ConversationReferences for DaemonConversationReferences {
     fn get(&self, account_id: &str, conversation_id: &str) -> Option<serde_json::Value> {
-        let paths = super::store::DaemonPaths::resolve().ok()?;
+        let paths = self.paths().ok()?;
         let store = super::store::DaemonStore::open(&paths).ok()?;
         store
             .channel_conversation_ref(account_id, conversation_id)
@@ -495,15 +592,8 @@ impl ConversationReferences for DaemonConversationReferences {
         conversation_id: &str,
         reference: &serde_json::Value,
     ) -> Result<(), String> {
-        let paths = super::store::DaemonPaths::resolve()?;
-        let mut store = super::store::DaemonStore::open(&paths)?;
+        let mut store = super::store::DaemonStore::open(&self.paths()?)?;
         store.set_channel_conversation_ref(account_id, conversation_id, reference, Self::now_ms())
-    }
-
-    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
-        let paths = super::store::DaemonPaths::resolve()?;
-        let mut store = super::store::DaemonStore::open(&paths)?;
-        store.clear_channel_conversation_ref(account_id, conversation_id)
     }
 }
 
@@ -542,14 +632,6 @@ impl ConversationReferences for MemoryConversationReferences {
                 (account_id.to_string(), conversation_id.to_string()),
                 reference.clone(),
             );
-        Ok(())
-    }
-
-    fn clear(&self, account_id: &str, conversation_id: &str) -> Result<(), String> {
-        self.entries
-            .lock()
-            .map_err(|_| "conversation reference store poisoned".to_string())?
-            .remove(&(account_id.to_string(), conversation_id.to_string()));
         Ok(())
     }
 }
@@ -738,6 +820,33 @@ pub trait ChannelSecrets: Send + Sync {
     fn delete(&self, credential_ref: &str) -> Result<(), String>;
 }
 
+/// Credentials seeded in-process for the tests that drive the production
+/// webhook route, which resolves an account's secret through
+/// [`KeyringChannelSecrets`] exactly as the daemon does.
+///
+/// Nothing here reaches the operator's keychain, and none of it is compiled
+/// into a shipped build.
+#[cfg(test)]
+pub(crate) mod test_secrets {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn table() -> &'static Mutex<BTreeMap<String, String>> {
+        static TABLE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    pub(crate) fn put(credential_ref: &str, secret: &str) {
+        if let Ok(mut table) = table().lock() {
+            table.insert(credential_ref.to_string(), secret.to_string());
+        }
+    }
+
+    pub(crate) fn get(credential_ref: &str) -> Option<String> {
+        table().lock().ok()?.get(credential_ref).cloned()
+    }
+}
+
 pub struct KeyringChannelSecrets;
 
 impl KeyringChannelSecrets {
@@ -761,6 +870,15 @@ impl ChannelSecrets for KeyringChannelSecrets {
     }
 
     fn get(&self, credential_ref: &str) -> Result<String, String> {
+        // A test drives the production route, which resolves credentials
+        // exactly the way the daemon does. Nothing may be put in the operator's
+        // real keychain to make that work, so in a test build only, a
+        // seeded in-process value answers first. Compiled out of every shipped
+        // build.
+        #[cfg(test)]
+        if let Some(secret) = test_secrets::get(credential_ref) {
+            return Ok(secret);
+        }
         Self::entry(credential_ref)?
             .get_password()
             .map_err(|error| format!("Failed to read the messaging credential: {error}"))
@@ -1187,23 +1305,35 @@ pub(crate) mod test_http {
         (format!("http://127.0.0.1:{port}"), receiver)
     }
 
-    /// A host that accepts the connection and then says nothing.
+    /// A host that reads the request and then drops the connection without
+    /// answering.
     ///
-    /// The failure mode a read timeout exists for, and the one a test cannot
-    /// produce with [`serve`]: a refused connection fails immediately, while a
-    /// media host that has gone quiet holds the socket. Held for a minute and
-    /// then dropped, which is long enough for any budget under test and short
-    /// enough that the thread cannot outlive the run.
-    pub(crate) fn stall() -> String {
+    /// The ambiguous outbound failure: the bytes went out, the provider may
+    /// well have acted on them, and nothing came back to say either way. It is
+    /// a different failure from a refused connection — which provably never
+    /// reached anyone — and the two must not be classified the same.
+    pub(crate) fn accept_then_hangup() -> String {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
-            let Ok((stream, _)) = listener.accept() else {
-                return;
-            };
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            drop(stream);
+            while let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut scratch = [0u8; 4096];
+                // Read whatever arrives first, so the request is provably on
+                // the wire before the socket goes away.
+                let _ = stream.read(&mut scratch);
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
         });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A port nothing is listening on, so a connection attempt is refused
+    /// outright — the one failure that proves the request never left.
+    pub(crate) fn refused() -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
         format!("http://127.0.0.1:{port}")
     }
 

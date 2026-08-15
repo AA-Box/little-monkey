@@ -169,6 +169,18 @@ pub struct ExistingChannelEvent {
     pub envelope_json: String,
 }
 
+/// One durably accepted inbound event that has not been processed yet.
+///
+/// Deliberately only what continuing it needs: the row to finalize, the
+/// account whose adapter downloads its files, and the envelope the decision is
+/// made from again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChannelEvent {
+    pub event_id: String,
+    pub account_id: String,
+    pub envelope_json: String,
+}
+
 /// What the caller decided one inbound envelope means, with everything that
 /// decision has to write.
 ///
@@ -799,22 +811,26 @@ impl DaemonStore {
             .transpose()
     }
 
-    /// Inbound events that were recorded as accepted but own no turn.
+    /// Inbound events that are durably accepted and own no turn yet.
     ///
-    /// A row here is the shape this subsystem now makes impossible — it can
-    /// only come from a database an older build wrote, where the event and the
-    /// accepted turn were two transactions and a crash could land between them.
-    /// The daemon re-decides these from the envelope they still carry rather
-    /// than letting the event log go on suppressing a provider redelivery for a
-    /// message that never ran.
-    pub fn orphaned_accepted_events(
+    /// **This is the queue the webhook route feeds.** A delivered-to provider
+    /// is acknowledged the moment its event is committed, which is before
+    /// anything has been downloaded, routed or run; the row sits in exactly
+    /// this shape until the channel worker picks it up. Ordering by arrival
+    /// means the oldest unfinished message is always the next one continued,
+    /// including the ones a restart interrupted.
+    ///
+    /// A database an older build wrote can hold the same shape for a different
+    /// reason — a crash between two transactions that are now one — and it is
+    /// continued identically, from the envelope the row still carries.
+    pub fn accepted_events_awaiting_processing(
         &self,
         limit: u32,
-    ) -> Result<Vec<ExistingChannelEvent>, String> {
+    ) -> Result<Vec<PendingChannelEvent>, String> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT event_id, disposition, ingress_id, job_id, envelope_json
+                "SELECT event_id, account_id, envelope_json
                  FROM channel_events
                  WHERE direction='inbound' AND disposition='accepted'
                    AND ingress_id IS NULL AND job_id IS NULL
@@ -824,28 +840,39 @@ impl DaemonStore {
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([i64::from(limit)], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
+                Ok(PendingChannelEvent {
+                    event_id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    envelope_json: row.get(2)?,
+                })
             })
             .map_err(|error| error.to_string())?;
-        let mut events = Vec::new();
-        for row in rows {
-            let (event_id, disposition, ingress_id, job_id, envelope_json) =
-                row.map_err(|error| error.to_string())?;
-            events.push(ExistingChannelEvent {
-                event_id,
-                disposition: EventDisposition::parse(&disposition)?,
-                ingress_id,
-                job_id,
-                envelope_json,
-            });
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Replace one event's stored envelope.
+    ///
+    /// The only writer is attachment hydration, and the reason it writes at all
+    /// is restart safety: a file that was downloaded and stored before the
+    /// process died must not be downloaded again, and one that failed must
+    /// carry its reason into the turn. Nothing else about the row moves.
+    pub fn set_channel_event_envelope(
+        &mut self,
+        event_id: &str,
+        envelope_json: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE channel_events SET envelope_json=?2 WHERE event_id=?1",
+                params![event_id, envelope_json],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed != 1 {
+            return Err(format!("Unknown channel event '{event_id}'"));
         }
-        Ok(events)
+        Ok(())
     }
 
     /// Record one inbound provider event and everything its decision implies,
@@ -1442,27 +1469,6 @@ impl DaemonStore {
                     reference_json = excluded.reference_json,
                     updated_at_ms = excluded.updated_at_ms",
                 params![account_id, conversation_id, json, now_ms],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    /// Drop one conversation's reference.
-    ///
-    /// Used for the parts of a reference that are single-use — a LINE reply
-    /// token is spent by the reply that uses it — so a second send falls back
-    /// to the durable path instead of replaying a token the provider has
-    /// already retired.
-    pub fn clear_channel_conversation_ref(
-        &mut self,
-        account_id: &str,
-        conversation_id: &str,
-    ) -> Result<(), String> {
-        self.connection
-            .execute(
-                "DELETE FROM channel_conversation_refs
-                 WHERE account_id=?1 AND conversation_id=?2",
-                params![account_id, conversation_id],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
