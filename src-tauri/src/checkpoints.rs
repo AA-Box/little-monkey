@@ -484,7 +484,7 @@ impl CheckpointInfo {
     }
 }
 
-fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?
@@ -1163,6 +1163,58 @@ fn external_effects_of(manifest: &CheckpointManifest) -> Vec<ExternalEffectKind>
     effects.sort();
     effects.dedup();
     effects
+}
+
+/// One file as it stood *before* checkpoint `id`'s turn ran.
+pub struct PreTurnFile {
+    /// Absolute path of the workspace file the turn mutated.
+    pub path: PathBuf,
+    /// Its content before the turn, or `None` when the turn created it — so
+    /// rewinding to this state means deleting the file, not writing it.
+    pub contents: Option<Vec<u8>>,
+}
+
+/// Reads checkpoint `id`'s pre-turn state: every file its turn mutated, with
+/// the content each had beforehand.
+///
+/// Read-only, unlike [`revert_impl`], which rewinds the live workspace. The
+/// caller here rewinds a disposable *copy*: the learning loop's evaluation
+/// runs in a copy of the workspace the procedure was learned in, and that
+/// workspace already contains the procedure's result — reproducing the
+/// original task against it would be reproducing a solved one. Applying this
+/// state to the copy puts the task back.
+///
+/// Fails when the checkpoint is gone (pruned, or its turn never recorded one)
+/// or a backup is unreadable. That is a refusal to build the environment, and
+/// the caller records the evaluation as unevaluated: a pre-task state that
+/// cannot be reproduced is not one to guess at.
+///
+/// Covers the files this app's own write/edit tools mutated. Side effects a
+/// shell command had are not snapshotted by any checkpoint (see
+/// `CheckpointManifest::shell_ran`) and so are not rewound here either.
+pub fn pre_turn_state(base_dir: &Path, id: &str) -> Result<Vec<PreTurnFile>, String> {
+    validate_id(id)?;
+    let dir = base_dir.join(id);
+    let manifest = read_manifest(base_dir, id)?;
+    manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let contents = match &entry.backup {
+                None => None,
+                Some(name) => Some(std::fs::read(dir.join(name)).map_err(|e| {
+                    format!(
+                        "Checkpoint '{}' cannot reproduce '{}': {}",
+                        id, entry.path, e
+                    )
+                })?),
+            };
+            Ok(PreTurnFile {
+                path: PathBuf::from(&entry.path),
+                contents,
+            })
+        })
+        .collect()
 }
 
 /// Parses a raw `manifest.json`, falling back from the versioned v2 struct
@@ -3121,6 +3173,49 @@ mod tests {
             !created.exists(),
             "file created during the turn must be deleted on revert"
         );
+    }
+
+    /// The learning loop reads this to rewind a *copy* of the workspace back
+    /// to the task a procedure was learned on, so it must report the pre-turn
+    /// state without touching the live workspace at all.
+    #[test]
+    fn pre_turn_state_reports_the_before_content_without_restoring_anything() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "original").unwrap();
+        let created = ws.path.join("created.txt");
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &existing).unwrap();
+        std::fs::write(&existing, "mutated").unwrap();
+        record_original(&state, Some(&id), &created).unwrap();
+        std::fs::write(&created, "brand new").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let files = pre_turn_state(&base.path, &id).unwrap();
+        let before = |path: &Path| {
+            files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.contents.clone())
+                .expect("every mutated file is reported")
+        };
+        assert_eq!(before(&existing), Some(b"original".to_vec()));
+        // Created by the turn, so rewinding to before it means no file.
+        assert_eq!(before(&created), None);
+        // Read-only: the workspace still holds the turn's own result.
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "mutated");
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), "brand new");
+
+        // A checkpoint that has been pruned cannot be reproduced, and says so
+        // rather than reporting an empty state that would read as "nothing
+        // changed".
+        std::fs::remove_dir_all(base.path.join(&id)).unwrap();
+        assert!(pre_turn_state(&base.path, &id).is_err());
+        assert!(pre_turn_state(&base.path, "../escape").is_err());
     }
 
     #[test]

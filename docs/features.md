@@ -165,6 +165,24 @@ are pointed at that copy, so tool calls really execute, permission policy
 really applies, and the workspace's own configured verification commands really
 run against what the arm produced. Your live files are never touched.
 
+Each copy is then rewound to the state your workspace was in *before* the run
+the candidate was learned from, taken from that turn's own checkpoint. Learning
+happens after a run succeeds, so the folder on disk already contains the
+answer; without the rewind, "reproduce the observed task" would be asking both
+arms to solve a solved problem. If the run changed files and its checkpoint is
+gone — pruned, or never taken — the environment cannot be rebuilt and the
+result is `unevaluated`.
+
+The acceptance conditions come from the evidence, not from the proposal. A
+positive case requires every tool the working procedure actually succeeded
+with, so a proposal that declares a narrower tool list fails its evaluation
+rather than deleting the requirement it cannot meet. The candidate arm runs
+under exactly the tool restriction the skill will carry once installed, so it
+cannot pass using something it will not have afterwards. And when the observed
+run ended on a passing verification, the arm has to verify too: a failed
+verification fails the case, and a *missing* verification result leaves the
+whole evaluation `unevaluated` — "we never checked" is not evidence.
+
 Evaluations are recorded with the mode that produced them. A **preflight**
 record only captured which tools a model asked for and executed none of them:
 useful as a diagnostic, and never a pass — the backend downgrades even a clean

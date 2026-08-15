@@ -35,6 +35,7 @@ function plan(overrides: Partial<EvaluationPlan> = {}): EvaluationPlan {
         prompt: "wrap the uploader",
         required_tools: ["edit_file"],
         forbidden_tools: [],
+        verification_required: true,
       },
       {
         case_id: "regression",
@@ -43,6 +44,7 @@ function plan(overrides: Partial<EvaluationPlan> = {}): EvaluationPlan {
         prompt: "Reply with OK.",
         required_tools: [],
         forbidden_tools: ["edit_file"],
+        verification_required: false,
       },
     ],
     workspace_path: "/tmp/workspace",
@@ -135,6 +137,23 @@ describe("runCandidateEvaluation", () => {
     expect(withSkill).toHaveLength(2);
     // The two arms are otherwise identical, so the skill is the only variable.
     expect(prompts.filter((prompt: string) => !prompt.includes("withRetry"))).toHaveLength(2);
+  });
+
+  it("runs the candidate arm under the restriction the skill will carry once installed", async () => {
+    // Otherwise an arm could pass using a tool the installed skill will not
+    // have, and the evaluation would not be measuring what ships.
+    const api = client();
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    const byArm = new Map(
+      runHeadlessAgent.mock.calls.map((call: unknown[]) => {
+        const params = call[0] as { runId: string; allowedTools?: string[] };
+        return [params.runId, params.allowedTools];
+      }),
+    );
+    expect(byArm.get("eval-abc-candidate-positive")).toEqual(["read_file", "edit_file"]);
+    // The baseline has no skill, so it has the profile's own tools — exactly
+    // what an ordinary turn has, which is what it is standing in for.
+    expect(byArm.get("eval-abc-baseline-positive")).toBeUndefined();
   });
 
   it("is unevaluated, never a pass, when no reproducible environment exists", async () => {

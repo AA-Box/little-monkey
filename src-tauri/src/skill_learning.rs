@@ -36,7 +36,7 @@ use crate::native_skills::{
     LearnedProvenance, NativeSkillManager, SkillDescriptor, SkillError, SkillMutationResult,
     SkillScope,
 };
-use crate::run_protocol::{RunEvent, RunEventEnvelope, ToolOutcome};
+use crate::run_protocol::{CheckpointKind, RunEvent, RunEventEnvelope, ToolOutcome};
 
 pub const SKILL_LEARNING_SCHEMA_VERSION: u32 = 1;
 pub const MAX_CANDIDATES: usize = 64;
@@ -453,6 +453,15 @@ pub struct EvaluationCase {
     pub prompt: String,
     pub required_tools: Vec<String>,
     pub forbidden_tools: Vec<String>,
+    /// The observed run ended on a passing verification, so this case only
+    /// counts as reproduced if the arm's verification passes too.
+    ///
+    /// A missing verification result is not a pass here. An arm that could not
+    /// verify — the command was unreachable, the harness itself errored —
+    /// leaves the evaluation `unevaluated`, because "we never checked" is not
+    /// evidence that the procedure works. See [`score_evaluation`].
+    #[serde(default)]
+    pub verification_required: bool,
 }
 
 /// Everything a runtime needs to execute one evaluation, handed out by the
@@ -480,6 +489,20 @@ pub struct EvaluationPlan {
     /// rather than running the arms against the user's live files.
     #[serde(default)]
     pub workspace_path: Option<String>,
+}
+
+/// Where an evaluation's disposable arms come from — see
+/// [`SkillLearningStore::evaluation_environment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationEnvironment {
+    pub workspace: Option<PathBuf>,
+    /// The observed turn's workspace checkpoint, holding the pre-task content
+    /// of every file that turn mutated. `None` when the run linked none.
+    pub checkpoint_id: Option<String>,
+    /// The observed run mutated files, so an arm that is not rewound would be
+    /// reproducing an already-solved task. A caller that cannot rewind must
+    /// refuse to build the environment rather than evaluate against the answer.
+    pub requires_pre_task_state: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -688,6 +711,16 @@ pub struct RunEvidence {
     /// compared against it without re-deriving them from raw text.
     #[serde(default)]
     pub failure_signatures: Vec<String>,
+    /// The turn checkpoint this run linked, naming the snapshot of every file
+    /// the turn was about to mutate — i.e. the state the workspace was in
+    /// *before* the procedure ran.
+    ///
+    /// This is what makes an evaluation reproduce the original task rather
+    /// than a solved one: learning happens after a successful run, so the
+    /// workspace on disk already contains the answer. See
+    /// [`SkillLearningStore::create_eval_sandboxes`].
+    #[serde(default)]
+    pub checkpoint_id: Option<String>,
 }
 
 impl RunEvidence {
@@ -871,6 +904,13 @@ pub fn evidence_from_events(
                     path: proposal.path,
                 });
             }
+            // The turn's own workspace checkpoint. Last one wins: a turn links
+            // at most one, and a later link supersedes an earlier one.
+            RunEvent::CheckpointLinked {
+                checkpoint_id,
+                kind: CheckpointKind::Workspace,
+                ..
+            } => evidence.checkpoint_id = Some(checkpoint_id.clone()),
             RunEvent::VerificationFinished {
                 name,
                 passed,
@@ -1344,24 +1384,34 @@ impl SkillLearningStore {
             .ok_or_else(|| SkillError::NotFound(format!("evaluation {evaluation_id}")))
     }
 
-    /// The workspace an evaluation's arms must be copied from — the one its
-    /// candidate was observed in. Resolved here rather than accepted from the
-    /// caller, so an executing runtime cannot point an evaluation at a folder
-    /// the evidence never came from.
-    pub fn evaluation_source_workspace(
+    /// What an evaluation's arms must be built from: the workspace its
+    /// candidate was observed in, and the turn checkpoint naming that
+    /// workspace's state before the observed procedure ran.
+    ///
+    /// Resolved here rather than accepted from the caller, so an executing
+    /// runtime cannot point an evaluation at a folder the evidence never came
+    /// from, nor at some other turn's starting state.
+    pub fn evaluation_environment(
         &self,
         evaluation_id: &str,
-    ) -> Result<Option<PathBuf>, SkillError> {
+    ) -> Result<EvaluationEnvironment, SkillError> {
         let _guard = self.lock()?;
         let state = self.load()?;
         let record = state
             .evaluations
             .get(evaluation_id)
             .ok_or_else(|| SkillError::NotFound(format!("evaluation {evaluation_id}")))?;
-        Ok(candidate_of(&state, &record.candidate_id)?
-            .workspace_path
-            .clone()
-            .map(PathBuf::from))
+        let candidate = candidate_of(&state, &record.candidate_id)?;
+        let evidence = candidate.evidence.as_ref();
+        Ok(EvaluationEnvironment {
+            workspace: candidate.workspace_path.clone().map(PathBuf::from),
+            checkpoint_id: evidence.and_then(|evidence| evidence.checkpoint_id.clone()),
+            // The observed procedure changed files, so the workspace on disk
+            // now holds its result. Without a rewind the arms would start
+            // from the answer.
+            requires_pre_task_state: evidence
+                .is_some_and(|evidence| !evidence.changed_files.is_empty()),
+        })
     }
 
     pub fn evaluations_for(&self, candidate_id: &str) -> Result<Vec<EvaluationRecord>, SkillError> {
@@ -2619,6 +2669,14 @@ impl SkillLearningStore {
     /// state — running the baseline first and handing its mutated files to the
     /// candidate would measure the two arms against different worlds.
     ///
+    /// Each copy is then rewound to `pre_task` — the state the source
+    /// workspace was in *before* the observed procedure ran, read from that
+    /// turn's checkpoint. Without this the arms would start from a workspace
+    /// that already contains the procedure's own result, and "reproduce the
+    /// observed task" would be asking both arms to solve a solved problem.
+    /// The caller supplies it because reading checkpoints needs the app's
+    /// data directory; this function owns applying it.
+    ///
     /// The copy is bounded. A workspace that does not fit within
     /// [`MAX_SANDBOX_FILES`]/[`MAX_SANDBOX_BYTES`] produces an error, which the
     /// caller records as `unevaluated`: an evaluation that cannot be
@@ -2628,6 +2686,7 @@ impl SkillLearningStore {
         evaluation_id: &str,
         source: &Path,
         arms: &[String],
+        pre_task: &[PreTaskFile],
     ) -> Result<Vec<(String, PathBuf)>, SkillError> {
         validate_path_segment(evaluation_id, "an evaluation id")?;
         if !source.is_dir() {
@@ -2646,6 +2705,9 @@ impl SkillLearningStore {
             ensure_directory(&target)?;
             let mut budget = CopyBudget { files: 0, bytes: 0 };
             copy_bounded(source, &target, &mut budget).inspect_err(|_| {
+                let _ = remove_tree(&root);
+            })?;
+            rewind_to_pre_task(source, &target, pre_task).inspect_err(|_| {
                 let _ = remove_tree(&root);
             })?;
             write_file(
@@ -3484,12 +3546,19 @@ fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
     } else {
         candidate.observed_prompt.clone()
     };
-    let required = candidate
-        .observed_tools
-        .iter()
-        .filter(|tool| candidate.allowed_tools.is_empty() || candidate.allowed_tools.contains(tool))
-        .cloned()
-        .collect::<Vec<_>>();
+    // Every tool the observed procedure actually succeeded with, taken
+    // straight from the evidence and NOT intersected with the proposal's own
+    // `allowed_tools`. The acceptance condition is what the working procedure
+    // did; a proposal that declares too narrow a tool list therefore fails its
+    // evaluation instead of quietly deleting the requirement it cannot meet.
+    let required = candidate.observed_tools.clone();
+    // The observed run ended verified, so a reproduction that does not verify
+    // has not reproduced it — see [`EvaluationCase::verification_required`].
+    let verification_required = candidate
+        .evidence
+        .as_ref()
+        .and_then(RunEvidence::final_verification)
+        == Some(true);
     vec![
         EvaluationCase {
             case_id: "positive".to_string(),
@@ -3501,6 +3570,7 @@ fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
             prompt,
             required_tools: required,
             forbidden_tools: Vec::new(),
+            verification_required,
         },
         EvaluationCase {
             case_id: "regression".to_string(),
@@ -3521,6 +3591,7 @@ fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect(),
+            verification_required: false,
         },
     ]
 }
@@ -3538,6 +3609,7 @@ fn score_evaluation(
             .find(|report| report.case_id == case_id && report.arm == arm)
     };
     let mut failures = Vec::new();
+    let mut unverifiable = Vec::new();
     let mut candidate_passes = 0usize;
     let mut baseline_passes = 0usize;
     for case in cases {
@@ -3582,6 +3654,14 @@ fn score_evaluation(
         if candidate.verification_passed == Some(false) {
             case_failures.push("verification failed".to_string());
         }
+        // An absent result is not a pass. The observed run ended verified, so
+        // an arm whose verification never produced an answer cannot be scored
+        // as one that reproduced it. Collected rather than returned here: a
+        // case that genuinely failed is a stronger, more useful answer than
+        // "we could not tell", so real failures below still win.
+        if case.verification_required && candidate.verification_passed.is_none() {
+            unverifiable.push(case.case_id.clone());
+        }
         if case_failures.is_empty() {
             candidate_passes += 1;
         } else {
@@ -3597,7 +3677,10 @@ fn score_evaluation(
                 && !case
                     .forbidden_tools
                     .iter()
-                    .any(|tool| baseline.used_tools.contains(tool));
+                    .any(|tool| baseline.used_tools.contains(tool))
+                // Held to the same bar as the candidate, so "the baseline
+                // already did it" can never rest on an unverified arm.
+                && (!case.verification_required || baseline.verification_passed == Some(true));
             if baseline_ok {
                 baseline_passes += 1;
             }
@@ -3648,6 +3731,19 @@ fn score_evaluation(
             format!("Preflight only (no tool call was executed): {detail}"),
         );
     }
+    // Every case's tool contract held, but a case that had to end verified
+    // produced no verification result at all — the command was unreachable,
+    // or the harness itself errored. "We never checked" is not evidence that
+    // the procedure works, so this stops short of a pass.
+    if !unverifiable.is_empty() {
+        return (
+            EvaluationVerdict::Unevaluated,
+            format!(
+                "no verification result was produced for {} (the observed run ended verified, so this proves nothing): {detail}",
+                unverifiable.join(", ")
+            ),
+        );
+    }
     (EvaluationVerdict::Passed, detail)
 }
 
@@ -3666,6 +3762,73 @@ pub fn descriptor_scope(descriptor: &SkillDescriptor) -> Option<SkillScope> {
 struct CopyBudget {
     files: usize,
     bytes: u64,
+}
+
+/// One file as it stood before the observed procedure ran — the learning
+/// module's own view of `checkpoints::PreTurnFile`, so this module keeps
+/// depending on nothing but paths and bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreTaskFile {
+    /// Absolute path in the source workspace.
+    pub path: PathBuf,
+    /// Content before the procedure ran, or `None` when the procedure created
+    /// the file — in which case rewinding removes it.
+    pub contents: Option<Vec<u8>>,
+}
+
+/// Puts `target` (a fresh copy of `source`) back into the state `source` was in
+/// before the observed procedure ran.
+///
+/// Entries outside `source` are skipped: they are not in the copy to begin
+/// with. If every entry is skipped, the copy is still the solved workspace and
+/// the evaluation would be measuring nothing, so that is an error rather than
+/// a silent no-op.
+fn rewind_to_pre_task(
+    source: &Path,
+    target: &Path,
+    pre_task: &[PreTaskFile],
+) -> Result<(), SkillError> {
+    let mut applied = 0usize;
+    for entry in pre_task {
+        let Ok(relative) = entry.path.strip_prefix(source) else {
+            continue;
+        };
+        let destination = target.join(relative);
+        match &entry.contents {
+            Some(bytes) => {
+                if let Some(parent) = destination.parent() {
+                    ensure_directory(parent)?;
+                }
+                // Overwrites: the copy already holds the post-task content of
+                // every file the procedure changed, which is the whole reason
+                // this rewind exists.
+                fs::write(&destination, bytes).map_err(|error| {
+                    SkillError::Io(format!(
+                        "rewind {} for evaluation: {error}",
+                        destination.display()
+                    ))
+                })?;
+            }
+            None => {
+                if destination.exists() {
+                    fs::remove_file(&destination).map_err(|error| {
+                        SkillError::Io(format!(
+                            "rewind {} for evaluation: {error}",
+                            destination.display()
+                        ))
+                    })?;
+                }
+            }
+        }
+        applied += 1;
+    }
+    if !pre_task.is_empty() && applied == 0 {
+        return Err(SkillError::Invalid(format!(
+            "the observed run changed no file inside {}, so its starting state cannot be reproduced there",
+            source.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Recursive, bounded, symlink-refusing copy. Symlinks are skipped rather than
@@ -4196,18 +4359,6 @@ mod tests {
             approval_id: format!("test-approval-{candidate_id}"),
             operation_sha256: approval_operation_digest(&candidate),
         }
-    }
-
-    fn promote_approved(
-        store: &SkillLearningStore,
-        manager: &NativeSkillManager,
-        candidate_id: &str,
-        workspace: Option<&Path>,
-    ) -> PromotionOutcome {
-        let grant = approve(store, candidate_id);
-        store
-            .promote(candidate_id, Some(&grant), false, manager, workspace)
-            .unwrap()
     }
 
     fn pass_evaluation(store: &SkillLearningStore, candidate_id: &str) {
@@ -5809,6 +5960,291 @@ mod tests {
         assert!(reasons[0].contains("really executed"));
     }
 
+    /// The acceptance condition comes from the evidence, not from the
+    /// proposal. A proposal that declares fewer tools than the working
+    /// procedure used cannot make the missing one stop being required — it
+    /// fails, rather than passing a test it quietly shrank.
+    #[test]
+    fn a_proposal_cannot_narrow_its_way_out_of_what_it_must_do() {
+        let directory = TestDirectory::new("narrowed-proposal");
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let detected = store
+            .detect(
+                &evidence_from_events("run-1", "add retries", &verified_procedure_events()),
+                SkillScope::Workspace,
+                Some(directory.path()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(detected.observed_tools.contains(&"run_shell".to_string()));
+        // The proposal leaves out the shell the observed procedure ran in.
+        let mut narrow = proposal("retry-wrapper", "Read the call site and edit it.");
+        narrow.scope = SkillScope::Workspace;
+        narrow.allowed_tools = vec!["read_file".to_string(), "edit_file".to_string()];
+        store
+            .propose(
+                &detected.candidate_id,
+                None,
+                &narrow,
+                &manager,
+                Some(directory.path()),
+                &[],
+            )
+            .unwrap();
+        let plan = store.plan_evaluation(&detected.candidate_id).unwrap();
+        let positive = plan
+            .cases
+            .iter()
+            .find(|case| case.kind == EvaluationCaseKind::Positive)
+            .unwrap();
+        assert!(
+            positive.required_tools.contains(&"run_shell".to_string()),
+            "the requirement survives a proposal that cannot meet it"
+        );
+        // An arm doing everything the narrowed proposal allows still fails.
+        let reports = plan
+            .cases
+            .iter()
+            .flat_map(|case| {
+                [EvaluationArm::Candidate, EvaluationArm::Baseline]
+                    .into_iter()
+                    .map(|arm| EvaluationCaseReport {
+                        case_id: case.case_id.clone(),
+                        arm,
+                        completed: true,
+                        used_tools: narrow.allowed_tools.clone(),
+                        verification_passed: Some(true),
+                        latency_ms: 1,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cost_micros: None,
+                        permission_requests: Vec::new(),
+                        tool_failures: Vec::new(),
+                        error: None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let record = store
+            .report_evaluation(&plan.evaluation_id, EvaluationMode::RealIsolated, &reports)
+            .unwrap();
+        assert_eq!(record.verdict, EvaluationVerdict::Failed);
+        assert!(record.summary.contains("did not use run_shell"));
+    }
+
+    /// An arm that ran everything it had to but produced no verification
+    /// result has not shown the procedure works. The observed run ended
+    /// verified; silence is not the same answer.
+    #[test]
+    fn an_arm_that_never_verified_is_not_a_pass() {
+        let directory = TestDirectory::new("unverified-arm");
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let detected = store
+            .detect(
+                &evidence_from_events("run-1", "add retries", &verified_procedure_events()),
+                SkillScope::Workspace,
+                Some(directory.path()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut full = proposal("retry-wrapper", "Read, edit, then run the tests.");
+        full.scope = SkillScope::Workspace;
+        full.allowed_tools = detected.observed_tools.clone();
+        store
+            .propose(
+                &detected.candidate_id,
+                None,
+                &full,
+                &manager,
+                Some(directory.path()),
+                &[],
+            )
+            .unwrap();
+        let plan = store.plan_evaluation(&detected.candidate_id).unwrap();
+        assert!(
+            plan.cases
+                .iter()
+                .find(|case| case.kind == EvaluationCaseKind::Positive)
+                .unwrap()
+                .verification_required
+        );
+        let report = |case: &EvaluationCase, verified: Option<bool>| EvaluationCaseReport {
+            case_id: case.case_id.clone(),
+            arm: EvaluationArm::Candidate,
+            completed: true,
+            used_tools: case.required_tools.clone(),
+            verification_passed: verified,
+            latency_ms: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_micros: None,
+            permission_requests: Vec::new(),
+            tool_failures: Vec::new(),
+            error: None,
+        };
+        // Every tool contract satisfied, no failure anywhere — and no
+        // verification result. Unevaluated, never Passed.
+        let silent = plan
+            .cases
+            .iter()
+            .map(|case| report(case, None))
+            .collect::<Vec<_>>();
+        let record = store
+            .report_evaluation(&plan.evaluation_id, EvaluationMode::RealIsolated, &silent)
+            .unwrap();
+        assert_eq!(record.verdict, EvaluationVerdict::Unevaluated);
+        assert!(record.summary.contains("no verification result"));
+        // The same arms, once the verification actually answers, do pass.
+        let plan = store.plan_evaluation(&detected.candidate_id).unwrap();
+        let verified = plan
+            .cases
+            .iter()
+            .map(|case| {
+                report(
+                    case,
+                    (case.kind == EvaluationCaseKind::Positive).then_some(true),
+                )
+            })
+            .collect::<Vec<_>>();
+        let record = store
+            .report_evaluation(&plan.evaluation_id, EvaluationMode::RealIsolated, &verified)
+            .unwrap();
+        assert_eq!(
+            record.verdict,
+            EvaluationVerdict::Passed,
+            "{}",
+            record.summary
+        );
+    }
+
+    /// Learning happens *after* a run succeeds, so the workspace on disk holds
+    /// the answer. Every arm is rewound to the turn's own checkpoint first, or
+    /// the positive case would be asking both arms to solve a solved problem.
+    #[test]
+    fn an_evaluation_starts_from_the_task_and_not_from_its_solution() {
+        let directory = TestDirectory::new("pre-task-state");
+        let work = TestDirectory::new("pre-task-workspace");
+        let checkpoints = TestDirectory::new("pre-task-checkpoints");
+        let workspace = work.path().to_path_buf();
+        let store = store(&directory);
+        seed_workspace(&workspace);
+        let checkpoint_id = solve_workspace(&workspace, checkpoints.path());
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/uploader.rs")).unwrap(),
+            SOLVED
+        );
+
+        let arms = vec!["baseline-positive".to_string()];
+        // Without the rewind the sandbox is a copy of the solved workspace.
+        let solved = store
+            .create_eval_sandboxes("eval-nostate", &workspace, &arms, &[])
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(solved[0].1.join("src/uploader.rs")).unwrap(),
+            SOLVED
+        );
+        store.destroy_eval_sandboxes("eval-nostate").unwrap();
+
+        // With it, the arm starts from the task the procedure was learned on,
+        // and the user's own workspace is left exactly as it was.
+        let pre_task = pre_task_of(checkpoints.path(), &checkpoint_id);
+        let rewound = store
+            .create_eval_sandboxes("eval-withstate", &workspace, &arms, &pre_task)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(rewound[0].1.join("src/uploader.rs")).unwrap(),
+            UNSOLVED
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/uploader.rs")).unwrap(),
+            SOLVED
+        );
+        store.destroy_eval_sandboxes("eval-withstate").unwrap();
+
+        // A file the procedure created is removed by the rewind, not kept.
+        let created = workspace.join("src/retry.rs");
+        fs::write(&created, "pub fn with_retry() {}\n").unwrap();
+        let rewound = store
+            .create_eval_sandboxes(
+                "eval-created",
+                &workspace,
+                &arms,
+                &[PreTaskFile {
+                    path: created.clone(),
+                    contents: None,
+                }],
+            )
+            .unwrap();
+        assert!(!rewound[0].1.join("src/retry.rs").exists());
+        store.destroy_eval_sandboxes("eval-created").unwrap();
+
+        // And a pre-task state that names nothing inside this workspace is a
+        // refusal, not a sandbox that quietly stayed solved.
+        let elsewhere = store.create_eval_sandboxes(
+            "eval-elsewhere",
+            &workspace,
+            &arms,
+            &[PreTaskFile {
+                path: PathBuf::from("/somewhere/else/uploader.rs"),
+                contents: Some(b"whatever".to_vec()),
+            }],
+        );
+        assert!(matches!(elsewhere, Err(SkillError::Invalid(_))));
+    }
+
+    /// The checkpoint the evaluation rewinds to is the run's own, taken from
+    /// the ledger rather than from whatever checkpoint happens to be newest.
+    #[test]
+    fn the_evaluation_environment_names_the_runs_own_checkpoint() {
+        let directory = TestDirectory::new("eval-environment");
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let mut events = verified_procedure_events();
+        let sequence = events.len() as u64 + 1;
+        events.push(RunEventEnvelope {
+            schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+            event_id: "run-1-checkpoint".to_string(),
+            run_id: "run-1".to_string(),
+            sequence,
+            occurred_at_ms: 1_700_000_000_300,
+            actor_id: None,
+            emitter: identity(),
+            event: RunEvent::CheckpointLinked {
+                checkpoint_id: "checkpoint-7".to_string(),
+                kind: CheckpointKind::Workspace,
+                label: "add retries".to_string(),
+                content_sha256: None,
+            },
+        });
+        let evidence = evidence_from_events("run-1", "add retries", &events);
+        assert_eq!(evidence.checkpoint_id.as_deref(), Some("checkpoint-7"));
+        let detected = store
+            .detect(&evidence, SkillScope::Workspace, Some(directory.path()))
+            .unwrap()
+            .unwrap();
+        let mut scoped = proposal("retry-wrapper", "Wrap the call.");
+        scoped.scope = SkillScope::Workspace;
+        store
+            .propose(
+                &detected.candidate_id,
+                None,
+                &scoped,
+                &manager,
+                Some(directory.path()),
+                &[],
+            )
+            .unwrap();
+        let plan = store.plan_evaluation(&detected.candidate_id).unwrap();
+        let environment = store.evaluation_environment(&plan.evaluation_id).unwrap();
+        assert_eq!(environment.checkpoint_id.as_deref(), Some("checkpoint-7"));
+        assert_eq!(environment.workspace, Some(directory.path().to_path_buf()));
+        // The observed run changed files, so an arm that is not rewound would
+        // start from the answer — the caller must refuse instead.
+        assert!(environment.requires_pre_task_state);
+    }
+
     #[test]
     fn a_failed_run_is_recorded_against_the_exact_version_it_used() {
         let directory = TestDirectory::new("failed-run");
@@ -6273,17 +6709,53 @@ mod tests {
         assert_eq!(staged.status, CandidateStatus::Staged);
     }
 
+    const UNSOLVED: &str = "pub fn upload() { send(); }\n";
+    const SOLVED: &str = "pub fn upload() { with_retry(send); }\n";
+
     /// A real workspace for the loop to be learned in and evaluated against.
     /// The verification script passes only once the procedure has actually
     /// been applied to the file on disk, so nothing here can be satisfied by
     /// reporting that work happened.
     fn seed_workspace(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("src/uploader.rs"),
-            "pub fn upload() { send(); }\n",
+        fs::write(root.join("src/uploader.rs"), UNSOLVED).unwrap();
+    }
+
+    /// Puts the workspace in the state it is really in when learning happens:
+    /// the successful turn already applied the procedure, so the file on disk
+    /// holds the answer. Runs through the production checkpoint machinery —
+    /// `begin`, `record_original` before the write, `end` — and returns the
+    /// checkpoint id the run would link, so the pre-task state an evaluation
+    /// rewinds to is read back out of a real checkpoint, not a fixture.
+    fn solve_workspace(workspace: &Path, checkpoints_dir: &Path) -> String {
+        let state = crate::AppState::default();
+        let id = crate::checkpoints::begin_impl(
+            &state,
+            checkpoints_dir,
+            "session-1".to_string(),
+            0,
+            "wrap the flaky call".to_string(),
+            None,
         )
         .unwrap();
+        let target = workspace.join("src/uploader.rs");
+        crate::checkpoints::record_original(&state, Some(&id), &target).unwrap();
+        fs::write(&target, SOLVED).unwrap();
+        crate::checkpoints::end_impl(&state, &id).unwrap();
+        id
+    }
+
+    /// The pre-task state of the observed turn, read the way the production
+    /// command reads it.
+    fn pre_task_of(checkpoints_dir: &Path, checkpoint_id: &str) -> Vec<PreTaskFile> {
+        crate::checkpoints::pre_turn_state(checkpoints_dir, checkpoint_id)
+            .unwrap()
+            .into_iter()
+            .map(|file| PreTaskFile {
+                path: file.path,
+                contents: file.contents,
+            })
+            .collect()
     }
 
     fn verification_command() -> crate::verify::VerifyCommand {
@@ -6334,6 +6806,10 @@ mod tests {
                 crate::test_support::RecordingProjector::shared(),
             )
             .await;
+            // The verification really is a shell command, so the arm really
+            // used the shell — reported the way the production evaluator
+            // reports the tools an arm executed.
+            used_tools.push("run_shell".to_string());
             let passed = !result.timed_out && result.code == Some(0);
             verification_passed = Some(passed);
             if !passed {
@@ -6364,6 +6840,7 @@ mod tests {
         store: &SkillLearningStore,
         candidate_id: &str,
         workspace: &Path,
+        pre_task: &[PreTaskFile],
     ) -> EvaluationRecord {
         let plan = store.plan_evaluation(candidate_id).unwrap();
         let arms = plan
@@ -6377,7 +6854,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let sandboxes = store
-            .create_eval_sandboxes(&plan.evaluation_id, workspace, &arms)
+            .create_eval_sandboxes(&plan.evaluation_id, workspace, &arms, pre_task)
             .unwrap();
         let path_for = |arm: &str| {
             sandboxes
@@ -6386,12 +6863,20 @@ mod tests {
                 .map(|(_, path)| path.clone())
                 .unwrap()
         };
-        // Both arms start from an untouched copy: the baseline's mutations are
-        // never what the candidate is measured against.
+        // The user's workspace holds the solved file — that is what learning
+        // happens on top of. Every arm nonetheless starts from the state
+        // before the observed procedure ran, so the positive case is a real
+        // task and not an already-finished one. (Identical across arms too:
+        // the baseline's mutations are never what the candidate is measured
+        // against.)
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/uploader.rs")).unwrap(),
+            SOLVED
+        );
         for (_, path) in &sandboxes {
             assert_eq!(
                 fs::read_to_string(path.join("src/uploader.rs")).unwrap(),
-                "pub fn upload() { send(); }\n"
+                UNSOLVED
             );
         }
         let mut reports = Vec::new();
@@ -6422,9 +6907,12 @@ mod tests {
                 .unwrap()
                 .contains("with_retry(send)")
         );
-        assert!(!fs::read_to_string(workspace.join("src/uploader.rs"))
-            .unwrap()
-            .contains("with_retry("));
+        // The user's own workspace is exactly as it was: an arm mutated its
+        // sandbox, never the folder the sandbox was copied from.
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/uploader.rs")).unwrap(),
+            SOLVED
+        );
         let record = store
             .report_evaluation(&plan.evaluation_id, EvaluationMode::RealIsolated, &reports)
             .unwrap();
@@ -6441,7 +6929,15 @@ mod tests {
             proposed_command: command.to_string(),
             proposed_skill_content: content.to_string(),
             proposed_resource_files: Vec::new(),
-            allowed_tools: vec!["read_file".to_string(), "edit_file".to_string()],
+            // Every tool the observed procedure used, including the shell the
+            // verification runs in. A proposal that declared fewer would fail
+            // its own evaluation rather than quietly dropping the requirement
+            // — see `a_proposal_cannot_narrow_its_way_out_of_what_it_must_do`.
+            allowed_tools: vec![
+                "read_file".to_string(),
+                "edit_file".to_string(),
+                "run_shell".to_string(),
+            ],
             requirements: CandidateRequirements::default(),
         }
     }
@@ -6541,8 +7037,14 @@ mod tests {
     async fn the_whole_loop_runs_end_to_end_across_a_restart() {
         let directory = TestDirectory::new("end-to-end");
         let work = TestDirectory::new("end-to-end-workspace");
+        let checkpoints = TestDirectory::new("end-to-end-checkpoints");
         let workspace = work.path().to_path_buf();
         seed_workspace(&workspace);
+        // The successful turn already applied the procedure, which is the
+        // state learning actually starts from. Its checkpoint is what puts the
+        // task back for the evaluation.
+        let checkpoint_id = solve_workspace(&workspace, checkpoints.path());
+        let pre_task = pre_task_of(checkpoints.path(), &checkpoint_id);
 
         let candidate_id;
         let first_sha;
@@ -6588,7 +7090,7 @@ mod tests {
 
             // 4. A real isolated evaluation: both arms execute in their own
             //    disposable copies, and the candidate arm really verifies.
-            let record = evaluate_for_real(&store, &candidate_id, &workspace).await;
+            let record = evaluate_for_real(&store, &candidate_id, &workspace, &pre_task).await;
             assert_eq!(record.mode, EvaluationMode::RealIsolated);
             assert_eq!(
                 record.verdict,
@@ -6711,7 +7213,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        let record = evaluate_for_real(&store, &update.candidate_id, &workspace).await;
+        let record = evaluate_for_real(&store, &update.candidate_id, &workspace, &pre_task).await;
         assert_eq!(
             record.verdict,
             EvaluationVerdict::Passed,

@@ -20,7 +20,7 @@ use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, reflection_brief, ApprovalGrant,
     CandidateProposal, CorrectedExecution, EffectivenessRecord, EvaluationCaseReport,
     EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary, LearningCandidate,
-    LearningMode, LearningSettings, PromotionOutcome, RunEvidence, SkillLearningStore,
+    LearningMode, LearningSettings, PreTaskFile, PromotionOutcome, RunEvidence, SkillLearningStore,
 };
 use crate::AppState;
 
@@ -244,21 +244,46 @@ pub async fn skill_learning_mark_unevaluated(
 /// bounds returns an error, which the caller records as `unevaluated`: an
 /// evaluation that cannot be reproduced is never a pass, and never runs
 /// against the user's live files.
+///
+/// Each copy is rewound to the state the workspace was in before the observed
+/// procedure ran, read from that turn's own checkpoint. Learning happens after
+/// a run succeeds, so without the rewind every arm would start from a
+/// workspace that already contains the answer. A run that changed files and
+/// whose checkpoint is gone (pruned, or never linked) therefore cannot be
+/// evaluated at all — that is an error here, and an `unevaluated` above.
 #[tauri::command]
 pub async fn skill_learning_create_sandboxes(
+    app: tauri::AppHandle,
     learning: tauri::State<'_, SkillLearningCommandState>,
     evaluation_id: String,
     arms: Vec<String>,
 ) -> Result<Vec<EvaluationSandbox>, String> {
     let store = learning.store.clone();
+    let checkpoints_dir = crate::checkpoints::checkpoints_base_dir(&app)?;
     run_blocking(move || {
-        let source = store.evaluation_source_workspace(&evaluation_id)?.ok_or_else(|| {
-            crate::native_skills::SkillError::Invalid(
+        let environment = store.evaluation_environment(&evaluation_id)?;
+        let invalid = crate::native_skills::SkillError::Invalid;
+        let source = environment.workspace.ok_or_else(|| {
+            invalid(
                 "this candidate has no recorded workspace, so no reproducible evaluation environment can be built"
                     .to_string(),
             )
         })?;
-        let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms)?;
+        let pre_task = match &environment.checkpoint_id {
+            Some(checkpoint_id) => crate::checkpoints::pre_turn_state(&checkpoints_dir, checkpoint_id)
+                .map_err(invalid)?
+                .into_iter()
+                .map(|file| PreTaskFile { path: file.path, contents: file.contents })
+                .collect::<Vec<_>>(),
+            None if environment.requires_pre_task_state => {
+                return Err(invalid(
+                    "the observed run changed files but its checkpoint is no longer available, so the task it solved cannot be put back for evaluation"
+                        .to_string(),
+                ))
+            }
+            None => Vec::new(),
+        };
+        let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms, &pre_task)?;
         Ok(created
             .into_iter()
             .map(|(arm, path)| EvaluationSandbox {

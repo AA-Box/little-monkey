@@ -22,6 +22,7 @@ import {
   isToolCallAllowed,
   stringifyToolError,
 } from './turnEngine';
+import { applyAllowedToolsRestriction } from './allowedTools';
 import { protectToolResult } from './untrustedContent';
 import { isVisionCapableProviderModel } from './visionModels';
 import { errorMessage } from "./errors";
@@ -89,6 +90,13 @@ export interface RunHeadlessAgentParams {
    * directory this app did not create for the purpose. The learning loop's
    * evaluation uses it to run an arm inside its disposable sandbox. */
   workspaceRootOverride?: string;
+  /** Narrows this run to the intersection of its profile and this list — the
+   * same restriction an installed skill's `allowed_tools` puts on a normal
+   * turn, applied through the same helpers. The learning loop's candidate arm
+   * passes the staged skill's list so an evaluation cannot be passed using a
+   * tool the skill will not have once installed. Empty or omitted leaves the
+   * profile's own list alone; it can only ever narrow. */
+  allowedTools?: string[];
   durableRun: HeadlessAgentDurableRunSpec;
   onToolActivity?: (label: string) => void;
   /** Optional feature-level validation of the final reply. Throwing converts
@@ -155,7 +163,10 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
     const target = await resolveTarget();
     const effort = effortForTarget(target);
     const toolProfile = params.toolProfile ?? 'code';
-    const tools = toolsForProfile(toolProfile);
+    const tools = applyAllowedToolsRestriction(
+      toolsForProfile(toolProfile),
+      params.allowedTools?.length ? new Set(params.allowedTools) : null,
+    );
     const mcpRegistry = emptyMcpRegistry();
     let messages: ChatMessage[] = [{ role: 'user', content: params.userContent ?? params.userMessage }];
 

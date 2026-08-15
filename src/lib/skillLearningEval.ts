@@ -111,6 +111,11 @@ async function runArm(
       toolProfile: "code",
       executionSource: "skill-learning-evaluation",
       workspaceRootOverride: sandboxPath,
+      // The candidate arm runs under exactly the tool restriction the skill
+      // will carry once installed, so it cannot pass an evaluation using a
+      // tool it will not have afterwards. The baseline has no skill and so
+      // keeps the profile's own list, which is what a normal turn has.
+      allowedTools: arm === "candidate" ? plan.allowed_tools : undefined,
       durableRun: {
         task: `Learning evaluation ${arm}: ${testCase.name}`,
         instructions: `Candidate /${plan.command} (${plan.evaluation_id})`,

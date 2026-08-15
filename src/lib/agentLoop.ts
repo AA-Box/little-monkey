@@ -24,6 +24,7 @@
  * same mechanism a manual model switch uses — no separate sticky field.
  */
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
@@ -632,30 +633,12 @@ export function toolsForSettings(
  * only when EVERY invoked skill declares one does this return the union of
  * their sets, so stacking a restrictive skill with a permissive one never
  * silently locks the model out of tools the permissive skill actually needs.
+ *
+ * Implemented in `allowedTools.ts` and re-exported here, where every caller
+ * already looks for it: `headlessAgentRunner.ts` applies the same narrowing to
+ * an evaluation arm and cannot import this module.
  */
-export function allowedToolsRestriction(
-  invokedCommands: ReadonlySet<string>,
-  availableSkills: SlashSkill[],
-): ReadonlySet<string> | null {
-  const invoked = availableSkills.filter((candidate) => invokedCommands.has(candidate.command));
-  if (invoked.length === 0 || invoked.some((candidate) => !candidate.allowedTools || candidate.allowedTools.length === 0)) {
-    return null;
-  }
-  return new Set(invoked.flatMap((candidate) => candidate.allowedTools ?? []));
-}
-
-/**
- * Applies `allowedToolsRestriction`'s result (if any) to a per-turn tool
- * list — the `skill` tool itself always stays offered even under a
- * restrictive list (deliberate exception): this app stacks up to
- * `MAX_SKILLS_PER_TURN` skills per turn (unlike a single-skill-at-a-time
- * model), so a restrictive skill must never strand the model unable to
- * invoke a different, less-restricted one.
- */
-export function applyAllowedToolsRestriction(tools: ToolDef[], restriction: ReadonlySet<string> | null): ToolDef[] {
-  if (restriction === null) return tools;
-  return tools.filter((tool) => tool.function.name === 'skill' || restriction.has(tool.function.name));
-}
+export { allowedToolsRestriction, applyAllowedToolsRestriction };
 
 /** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
  * `KnowledgeStack` — kept local (rather than importing the full interface)

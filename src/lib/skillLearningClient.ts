@@ -178,6 +178,10 @@ export interface EvaluationCase {
   prompt: string;
   required_tools: string[];
   forbidden_tools: string[];
+  /** The observed run ended verified, so this case is only reproduced if the
+   * arm verifies too. A missing result leaves the evaluation unevaluated —
+   * scored in the backend, never here. */
+  verification_required: boolean;
 }
 
 export interface EvaluationPlan {

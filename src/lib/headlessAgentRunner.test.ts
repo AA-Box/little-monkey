@@ -297,6 +297,43 @@ describe('runHeadlessAgent', () => {
       .toContain('Tool \\"task\\" was not offered to this run.');
   });
 
+  it('narrows the run to an allowed-tools list, and refuses a call outside it', async () => {
+    // The learning loop's candidate arm runs under the staged skill's own
+    // list, so it cannot pass an evaluation using a tool the skill will not
+    // have once installed. Structural, not advisory: absent from the schema
+    // AND refused at execution.
+    mocks.attemptStream
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [toolCall('run_shell', 'call-shell', '{"command":"pnpm test"}')],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: 'Stopped.', toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runHeadlessAgent(baseParams({ allowedTools: ['read_file'] }));
+
+    expect(result.outcome).toBe('completed');
+    expect(mocks.executeToolCall).not.toHaveBeenCalled();
+    const offered = mocks.attemptStream.mock.calls[0][2] as Array<{ function: { name: string } }>;
+    expect(offered.map((tool) => tool.function.name)).toEqual(['read_file']);
+    expect(result.evidence.executedTools).toEqual([]);
+  });
+
+  it('leaves the profile alone when no allowed-tools list is given', async () => {
+    mocks.attemptStream.mockResolvedValue({
+      content: 'Done.',
+      toolCalls: [],
+      streamError: null,
+      contentStarted: true,
+    });
+
+    await runHeadlessAgent(baseParams({ allowedTools: [] }));
+
+    const offered = mocks.attemptStream.mock.calls[0][2] as Array<{ function: { name: string } }>;
+    expect(offered.map((tool) => tool.function.name)).toEqual(['read_file', 'run_shell']);
+  });
+
   it('denies tools that omit or escape a required attached worktree root', async () => {
     const call = toolCall('run_shell', 'call-root', '{"command":"pnpm test","cwd":"workspace"}');
     mocks.attemptStream
