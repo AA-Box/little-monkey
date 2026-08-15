@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
-import { MoreVertical, Plus } from "lucide-react";
+import { AlertTriangle, MoreVertical, Plus } from "lucide-react";
 
 import { sessionDisplayTitle, type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { SessionMenu } from "./SessionMenu";
+import { usePermissionStore } from "../../store/permissionStore";
+import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from "./sessionStatus";
 
 /**
  * Claude-Desktop-style session list for the left sidebar: a "New session"
@@ -13,10 +15,43 @@ import { SessionMenu } from "./SessionMenu";
  * Click a row to switch, hover for the kebab menu (rename/pin/fork/group/
  * archive/delete/"open in" — see `SessionMenu`).
  */
+/** Tailwind classes for each status' dot. `working` animates — a row that
+ * is doing something should be the one thing moving in the sidebar. */
+const STATUS_DOT: Record<Exclude<SessionStatus, "attention">, string> = {
+  working: "bg-accent animate-pulse",
+  finished: "bg-accent",
+  error: "bg-danger",
+};
+
+/** The leading status marker on a session row. Never color alone: the
+ * hover/screen-reader label names the state, and the two states worth
+ * interrupting for carry a shape of their own (a pulse, a triangle). */
+function StatusMarker({ status, label }: { status: SessionStatus; label: string }) {
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      title={label}
+      className="mr-1.5 inline-flex shrink-0 items-center align-middle"
+    >
+      {status === "attention" ? (
+        <AlertTriangle size={12} className="text-warning" aria-hidden />
+      ) : (
+        <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[status]}`} />
+      )}
+    </span>
+  );
+}
+
 export default function ChatSessionList() {
   const sessions = useSessionStore((state) => state.sessions);
   const groups = useSessionStore((state) => state.groups);
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
+  const runningTurns = useSessionStore((state) => state.runningTurns);
+  const turnOutcomes = useSessionStore((state) => state.turnOutcomes);
+  const turnSessions = useSessionStore((state) => state.turnSessions);
+  const permissionQueue = usePermissionStore((state) => state.queue);
+  const awaitingPermission = sessionsAwaitingPermission(permissionQueue, turnSessions);
   const newSession = useSessionStore((state) => state.newSession);
   const switchSession = useSessionStore((state) => state.switchSession);
   const renameSession = useSessionStore((state) => state.renameSession);
@@ -78,6 +113,12 @@ export default function ChatSessionList() {
     const isActive = session.id === activeSessionId;
     const isRenaming = renamingId === session.id;
     const isMenuOpen = menuOpenId === session.id;
+    const status = sessionStatus(
+      session,
+      runningTurns[session.id] === true,
+      turnOutcomes[session.id],
+      awaitingPermission.has(session.id),
+    );
 
     return (
       <div
@@ -112,9 +153,7 @@ export default function ChatSessionList() {
           />
         ) : (
           <span className={`truncate ${session.unread ? "font-semibold" : ""}`}>
-            {session.unread && (
-              <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-accent align-middle" />
-            )}
+            {status && <StatusMarker status={status} label={t(`ChatSessionList.status.${status}`)} />}
             {sessionDisplayTitle(session)}
           </span>
         )}
