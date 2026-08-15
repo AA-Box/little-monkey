@@ -68,7 +68,6 @@
     "@types/sql.js": "^1.4.11",
     "@vitejs/plugin-react": "^4.6.0",
     "jsdom": "^26.1.0",
-    "puppeteer-core": "^24.10.2",
     "tailwindcss": "^4.3.2",
     "tauri-liquid-icon": "^1.1.0",
     "typescript": "~5.8.3",

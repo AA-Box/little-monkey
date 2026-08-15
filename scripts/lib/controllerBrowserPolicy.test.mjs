@@ -15,9 +15,9 @@
  * **What this does NOT prove:** that a camera, a microphone or a GPS works.
  * Nothing here opens a device — a headless browser has none to open, and a
  * request for one is answered by the browser's own permission layer, which this
- * deliberately never reaches. Real hardware stays a manual smoke test on a real
- * paired phone: pair it, press each preparation control, run one command per
- * capability.
+ * deliberately never reaches. Real hardware stays the explicit manual check:
+ * `monkey daemon remote device-check --dangerous` against a paired phone (see
+ * docs/paired-devices.md, "Checking a real device").
  *
  * The page is served from a throwaway HTTP server on `127.0.0.1` — a secure
  * context, so nothing here is refused for the *lack* of one — with the header
@@ -27,12 +27,24 @@
  * A negative control runs in the same session: the same page under the headers
  * this runner used to send must report every one of those features disabled and
  * both audio sources blocked. A test that cannot fail proves nothing.
+ *
+ * **No browser-driver dependency.** The engine is whichever Chrome or Chromium
+ * the machine already has, driven over the DevTools protocol with Node's own
+ * `WebSocket` — about sixty lines below. A driver library would have been the
+ * obvious choice and was the first attempt; `puppeteer-core` pulls
+ * `extract-zip@2.0.1` for unpacking browser downloads this never does, and that
+ * package carries an unfixed high-severity advisory (GHSA-jmr9-qjv8-65gv) with
+ * no release to upgrade to. Taking a known-vulnerable transitive dependency into
+ * the lockfile to test a policy would be a poor trade, and silencing the
+ * advisory a worse one.
  */
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { existsSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 
 const REMOTE = join(
@@ -49,6 +61,7 @@ const PREVIOUS_CSP =
   "frame-ancestors 'none'; object-src 'none'";
 
 const FEATURES = ["camera", "microphone", "geolocation", "display-capture"];
+const LAUNCH_TIMEOUT_MS = 30_000;
 
 const ASSETS = {
   "/remote": ["text/html; charset=utf-8", "ui/index.html"],
@@ -138,7 +151,7 @@ function serveController(policy) {
 
 /** A browser engine this machine already has. Never downloads one. */
 export function findBrowser(env = process.env, exists = existsSync) {
-  for (const named of [env.PUPPETEER_EXECUTABLE_PATH, env.CHROME_PATH]) {
+  for (const named of [env.CHROME_PATH, env.PUPPETEER_EXECUTABLE_PATH]) {
     if (named && exists(named)) return named;
   }
   const candidates = {
@@ -158,6 +171,130 @@ export function findBrowser(env = process.env, exists = existsSync) {
     ],
   };
   return (candidates[process.platform] || []).find((path) => exists(path)) || null;
+}
+
+/**
+ * The smallest DevTools client that can answer this question: launch, open one
+ * page per URL, evaluate one expression in it, and shut down.
+ */
+class Chrome {
+  static async launch(executablePath) {
+    const profile = mkdtempSync(join(tmpdir(), "little-monkey-policy-"));
+    const child = spawn(
+      executablePath,
+      [
+        "--headless=new",
+        "--remote-debugging-port=0",
+        `--user-data-dir=${profile}`,
+        // Hosted runners have no user namespaces to sandbox into. Nothing
+        // untrusted is loaded here: the page is this repository's own files.
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-extensions",
+        "about:blank",
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    const endpoint = await new Promise((resolve, reject) => {
+      let stderr = "";
+      const timer = setTimeout(
+        () => reject(new Error(`the browser printed no DevTools endpoint:\n${stderr}`)),
+        LAUNCH_TIMEOUT_MS,
+      );
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+        const match = stderr.match(/DevTools listening on (ws:\/\/\S+)/u);
+        if (match) {
+          clearTimeout(timer);
+          resolve(match[1]);
+        }
+      });
+      child.on("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Error(`the browser exited with ${code} before listening:\n${stderr}`));
+      });
+    });
+    const socket = new WebSocket(endpoint);
+    await new Promise((resolve, reject) => {
+      socket.addEventListener("open", resolve, { once: true });
+      socket.addEventListener("error", () => reject(new Error("could not attach to the browser")), {
+        once: true,
+      });
+    });
+    return new Chrome(child, socket, profile);
+  }
+
+  constructor(child, socket, profile) {
+    this.child = child;
+    this.socket = socket;
+    this.profile = profile;
+    this.nextId = 0;
+    this.pending = new Map();
+    this.events = [];
+    socket.addEventListener("message", (message) => {
+      const frame = JSON.parse(message.data);
+      if (frame.id !== undefined) {
+        const settle = this.pending.get(frame.id);
+        this.pending.delete(frame.id);
+        if (!settle) return;
+        if (frame.error) settle.reject(new Error(`${frame.error.message} (${frame.error.code})`));
+        else settle.resolve(frame.result);
+        return;
+      }
+      for (const waiter of this.events.splice(0)) waiter(frame);
+    });
+  }
+
+  send(method, params = {}, sessionId) {
+    const id = (this.nextId += 1);
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+    });
+  }
+
+  /** Loads one URL in its own page and returns what `expression` resolves to. */
+  async evaluate(url, expression) {
+    const { targetId } = await this.send("Target.createTarget", { url: "about:blank" });
+    try {
+      const { sessionId } = await this.send("Target.attachToTarget", { targetId, flatten: true });
+      await this.send("Page.enable", {}, sessionId);
+      const loaded = new Promise((resolve) => {
+        const waitFor = (frame) => {
+          if (frame.method === "Page.loadEventFired") resolve();
+          else this.events.push(waitFor);
+        };
+        this.events.push(waitFor);
+      });
+      await this.send("Page.navigate", { url }, sessionId);
+      await Promise.race([loaded, new Promise((resolve) => setTimeout(resolve, 10_000))]);
+      const answer = await this.send(
+        "Runtime.evaluate",
+        { expression, awaitPromise: true, returnByValue: true },
+        sessionId,
+      );
+      assert.equal(
+        answer.exceptionDetails,
+        undefined,
+        `the page threw: ${answer.exceptionDetails?.text}`,
+      );
+      return answer.result.value;
+    } finally {
+      await this.send("Target.closeTarget", { targetId }).catch(() => {});
+    }
+  }
+
+  async close() {
+    this.socket.close();
+    this.child.kill();
+    await new Promise((resolve) => this.child.on("exit", resolve));
+    rmSync(this.profile, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -188,44 +325,27 @@ const INSPECT = `(async () => {
 
 test("the served controller policy permits every browser API the client calls", async (t) => {
   const required = process.env.REQUIRE_BROWSER === "1";
-  let puppeteer;
-  try {
-    puppeteer = (await import("puppeteer-core")).default;
-  } catch {
-    const reason = "puppeteer-core is not installed";
+  const refuse = (reason) => {
     assert.ok(!required, `REQUIRE_BROWSER=1 and ${reason}`);
     t.skip(`SKIPPED: ${reason}`);
+  };
+  if (typeof WebSocket !== "function") {
+    // Node 22 and later. The client below speaks DevTools over the runtime's
+    // own socket rather than taking a driver dependency for it.
+    refuse("this Node has no global WebSocket");
     return;
   }
   const executablePath = findBrowser();
   if (!executablePath) {
-    const reason = "no Chrome or Chromium on this machine (set PUPPETEER_EXECUTABLE_PATH)";
-    assert.ok(!required, `REQUIRE_BROWSER=1 and ${reason}`);
-    t.skip(`SKIPPED: ${reason}`);
+    refuse("no Chrome or Chromium on this machine (set CHROME_PATH)");
     return;
   }
 
   const policy = policies();
   const { server, origin } = await serveController(policy);
-  const browser = await puppeteer.launch({
-    executablePath,
-    headless: true,
-    // Hosted runners have no user namespaces to sandbox into. Nothing untrusted
-    // is loaded here: the page comes from this repository's own files.
-    args: ["--no-sandbox", "--disable-dev-shm-usage"],
-  });
+  const chrome = await Chrome.launch(executablePath);
   try {
-    const inspect = async (path) => {
-      const page = await browser.newPage();
-      try {
-        await page.goto(`${origin}${path}`, { waitUntil: "domcontentloaded" });
-        return await page.evaluate(INSPECT);
-      } finally {
-        await page.close();
-      }
-    };
-
-    const controller = await inspect("/remote");
+    const controller = await chrome.evaluate(`${origin}/remote`, INSPECT);
     assert.equal(controller.error, undefined, controller.error);
     assert.equal(controller.secureContext, true, "127.0.0.1 must be a secure context");
     for (const feature of FEATURES) {
@@ -247,7 +367,7 @@ test("the served controller policy permits every browser API the client calls", 
 
     // The negative control. Without it this test could pass against a browser
     // that enforces no policy at all.
-    const previous = await inspect("/legacy");
+    const previous = await chrome.evaluate(`${origin}/legacy`, INSPECT);
     for (const feature of FEATURES) {
       assert.equal(
         previous.allowed[feature],
@@ -258,7 +378,7 @@ test("the served controller policy permits every browser API the client calls", 
     assert.equal(previous.dataAudio, false, "the previous CSP must block data: audio");
     assert.equal(previous.blobAudio, false, "the previous CSP must block blob: audio");
   } finally {
-    await browser.close();
+    await chrome.close();
     await new Promise((resolve) => server.close(resolve));
   }
 });
