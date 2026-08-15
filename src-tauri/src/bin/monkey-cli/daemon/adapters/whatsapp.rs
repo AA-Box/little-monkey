@@ -21,7 +21,8 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookAck,
+    WebhookChannelAdapter,
 };
 
 const GRAPH_API_BASE: &str = "https://graph.facebook.com/v21.0";
@@ -89,13 +90,13 @@ impl WhatsAppAdapter {
     }
 
     #[cfg(test)]
-    fn with_base_url(mut self, base: &str) -> Self {
+    pub(crate) fn with_base_url(mut self, base: &str) -> Self {
         self.graph_api_base = base.to_string();
         self
     }
 
     #[cfg(test)]
-    fn with_blobs(
+    pub(crate) fn with_blobs(
         mut self,
         blobs: std::sync::Arc<dyn crate::daemon::channel_adapter::BlobSource>,
     ) -> Self {
@@ -147,13 +148,20 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         ChannelKind::WhatsApp
     }
 
+    /// Meta asks for a `200` and reads nothing else. Anything else — including
+    /// a `202` — counts as a failed delivery, is retried, and eventually gets
+    /// the callback URL disabled.
+    fn ack(&self) -> WebhookAck {
+        WebhookAck::empty_ok()
+    }
+
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // WhatsApp's signature covers only the body, so `public_base_url` is
         // unused here — it exists for providers whose signature *does* cover
         // the delivery URL, and reconstructing one from request headers would
@@ -169,7 +177,13 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
 
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("WhatsApp webhook body is not valid JSON: {error}"))?;
-        Ok(normalize_payload(&payload, &self.account_id, now_ms))
+        // A Graph reply is addressed by the recipient's own phone number, which
+        // the envelope carries, so there is no addressing to make durable here.
+        Ok(VerifiedWebhookDelivery::messages_only(normalize_payload(
+            &payload,
+            &self.account_id,
+            now_ms,
+        )))
     }
 
     /// Meta reports what happened to a message we sent — `sent`, `delivered`,
@@ -336,18 +350,25 @@ impl ChannelAdapter for WhatsAppAdapter {
         let mut last = SendOutcome::Sent {
             provider_message_id: None,
         };
+        // WhatsApp quotes exactly one message, so the reply marker goes on the
+        // first thing sent and the rest of the burst follows it unquoted —
+        // quoting the same message three times reads as three separate answers
+        // to the same question.
+        let mut quote = message
+            .reply_to_provider_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
         if !message.text.trim().is_empty() {
-            last = self
-                .post_message(
-                    &client,
-                    serde_json::json!({
-                        "messaging_product": "whatsapp",
-                        "to": message.conversation_id,
-                        "type": "text",
-                        "text": { "body": message.text },
-                    }),
-                )
-                .await;
+            let mut body = serde_json::json!({
+                "messaging_product": "whatsapp",
+                "to": message.conversation_id,
+                "type": "text",
+                "text": { "body": message.text },
+            });
+            if let Some(quoted) = quote.take() {
+                body["context"] = serde_json::json!({ "message_id": quoted });
+            }
+            last = self.post_message(&client, body).await;
             if !matches!(last, SendOutcome::Sent { .. }) {
                 return last;
             }
@@ -365,17 +386,16 @@ impl ChannelAdapter for WhatsAppAdapter {
                     media["filename"] = JsonValue::from(filename);
                 }
             }
-            last = self
-                .post_message(
-                    &client,
-                    serde_json::json!({
-                        "messaging_product": "whatsapp",
-                        "to": message.conversation_id,
-                        "type": media_type,
-                        media_type: media,
-                    }),
-                )
-                .await;
+            let mut body = serde_json::json!({
+                "messaging_product": "whatsapp",
+                "to": message.conversation_id,
+                "type": media_type,
+                media_type: media,
+            });
+            if let Some(quoted) = quote.take() {
+                body["context"] = serde_json::json!({ "message_id": quoted });
+            }
+            last = self.post_message(&client, body).await;
             if !matches!(last, SendOutcome::Sent { .. }) {
                 return last;
             }
@@ -756,7 +776,7 @@ fn attachment_kind_for(message_type: &str) -> Option<AttachmentKind> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use little_monkey_lib::channels::policy::ChannelAccessPolicy;
@@ -765,7 +785,7 @@ mod tests {
 
     // --- Test fixtures -----------------------------------------------------
 
-    fn test_account(non_secret_config: JsonValue) -> ChannelAccountRecord {
+    pub(crate) fn test_account(non_secret_config: JsonValue) -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-wa".to_string(),
             kind: ChannelKind::WhatsApp,
@@ -864,7 +884,8 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].provider_event_id, "wamid.ABC123");
         assert_eq!(envelopes[0].sender.sender_id, "15550001111");
@@ -1236,7 +1257,8 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert!(envelopes.is_empty());
     }
 
@@ -1270,7 +1292,8 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].attachments.len(), 1);
         match &envelopes[0].attachments[0].source {
@@ -1291,7 +1314,8 @@ mod tests {
                 None,
                 0,
             )
-            .unwrap();
+            .unwrap()
+            .envelopes;
         let second = adapter
             .verify_and_normalize(
                 &[("x-hub-signature-256".to_string(), signature)],
@@ -1299,7 +1323,8 @@ mod tests {
                 None,
                 0,
             )
-            .unwrap();
+            .unwrap()
+            .envelopes;
         assert_eq!(first[0].provider_event_id, second[0].provider_event_id);
     }
 

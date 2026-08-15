@@ -314,10 +314,11 @@ pub(crate) fn accept_channel_envelope(
 /// What an event this account already recorded means for this delivery.
 ///
 /// `None` is the one interesting answer: an event recorded as accepted that
-/// owns no turn. That state cannot be produced by this build — the two are one
-/// transaction — so it can only come from a database an older one wrote, and
-/// returning `Duplicate` for it would acknowledge the provider for a message
-/// that never ran and never will. The caller re-decides it instead.
+/// owns no turn. That is the resting state of every message a delivered-to
+/// provider has been acknowledged for and the worker has not continued yet —
+/// and it is also what a crash between two older transactions used to leave
+/// behind. Either way, answering `Duplicate` would suppress the provider's
+/// redelivery for a message that never ran, so the caller decides it again.
 fn classify_existing_event(
     store: &mut DaemonStore,
     existing: ExistingChannelEvent,
@@ -454,88 +455,6 @@ pub(crate) fn submit_accepted_turn(
     Ok(finish_submission(
         store, queue, ingress, params, ingress_id, attempts, now_ms,
     ))
-}
-
-/// How many orphaned events one recovery pass repairs. Bounded like every other
-/// startup sweep: a large backlog must not hold the daemon's start.
-const ORPHAN_BATCH: u32 = 64;
-
-/// Re-decide inbound events an older build recorded as accepted without ever
-/// creating the turn they promised.
-///
-/// This is the defensive half of the fix, and only that: the acceptance
-/// transaction is what makes the state impossible going forward. What it repairs
-/// is a database written before it, where a crash between the two commits left a
-/// row that suppresses the provider's redelivery for a message nothing ran.
-///
-/// Each row still carries the envelope it arrived as, so the decision can be
-/// made again from the same input. One that cannot be read back is not quietly
-/// treated as complete — it is recorded as failed, where an operator can see it.
-pub(crate) fn recover_orphaned_channel_events(
-    store: &mut DaemonStore,
-    queue: &dyn super::channel_worker::RunQueue,
-    now_ms: i64,
-) -> Result<OrphanRecovery, String> {
-    let mut recovery = OrphanRecovery::default();
-    for orphan in store.orphaned_accepted_events(ORPHAN_BATCH)? {
-        let envelope: ChannelEnvelope = match serde_json::from_str(&orphan.envelope_json) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                let _ = store.set_channel_event_disposition(
-                    &orphan.event_id,
-                    EventDisposition::Failed,
-                    Some(&format!(
-                        "This message was recorded as accepted but no turn was ever created for \
-                         it, and its stored envelope cannot be read back: {error}"
-                    )),
-                    None,
-                );
-                recovery.parked += 1;
-                continue;
-            }
-        };
-        match accept_channel_envelope(store, queue, &envelope, now_ms) {
-            Ok(ChannelAcceptance::Run {
-                ingress,
-                params,
-                ingress_id,
-                ..
-            }) => {
-                match submit_accepted_turn(store, queue, &ingress, &params, &ingress_id, 0, now_ms)
-                {
-                    Ok(SubmitOutcome::Queued { .. }) | Ok(SubmitOutcome::AlreadyQueued { .. }) => {
-                        recovery.recovered += 1
-                    }
-                    _ => recovery.deferred += 1,
-                }
-            }
-            Ok(_) => recovery.recovered += 1,
-            Err(error) => {
-                let _ = store.set_channel_event_disposition(
-                    &orphan.event_id,
-                    EventDisposition::Failed,
-                    Some(&format!(
-                        "This message was recorded as accepted but no turn was ever created for \
-                         it, and it cannot be accepted now: {error}"
-                    )),
-                    None,
-                );
-                recovery.parked += 1;
-            }
-        }
-    }
-    Ok(recovery)
-}
-
-/// What one orphan sweep did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct OrphanRecovery {
-    /// Rows that now own a turn (or a final decision).
-    pub recovered: u32,
-    /// Rows durably accepted whose run has not been queued yet.
-    pub deferred: u32,
-    /// Rows recorded as failed, for an operator to look at.
-    pub parked: u32,
 }
 
 fn sender_authorization(stored: &StoredSenderAuthorization) -> SenderAuthorization {
@@ -1454,7 +1373,10 @@ mod tests {
         assert_eq!(events[0].event_id, event_id);
         assert_eq!(events[0].ingress_id.as_deref(), Some(ingress_id.as_str()));
         assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
-        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+        assert!(store
+            .accepted_events_awaiting_processing(10)
+            .unwrap()
+            .is_empty());
     }
 
     /// The same, one step later: the turn is written and the commit never
@@ -1559,59 +1481,6 @@ mod tests {
         assert_eq!(store.recent_channel_events("acct-1", 10).unwrap().len(), 1);
     }
 
-    /// The defensive half: a row an older build left accepted with no turn is
-    /// re-decided from the envelope it still carries, rather than reported as a
-    /// finished duplicate while the provider is told the message was handled.
-    #[test]
-    fn an_event_left_accepted_without_a_turn_is_recovered_not_acknowledged() {
-        let mut store = store_with_account(open_policy());
-        let queue = FakeQueue::default();
-        let envelope = dm("ship it", "1");
-        // Exactly what the old path committed first, and could crash after.
-        store
-            .record_channel_event(&NewChannelEvent {
-                account_id: "acct-1".into(),
-                source: ConversationSource::MessagingChannel,
-                direction: EventDirection::Inbound,
-                provider_event_id: "1".into(),
-                conversation_id: "chat-7".into(),
-                thread_id: None,
-                sender_id: Some("user-3".into()),
-                envelope_json: serde_json::to_string(&envelope).unwrap(),
-                disposition: EventDisposition::Accepted,
-                received_at_ms: NOW,
-            })
-            .expect("legacy event");
-
-        // Left alone, that row is what the provider's redelivery would hit.
-        assert_eq!(store.orphaned_accepted_events(10).unwrap().len(), 1);
-
-        let recovery =
-            recover_orphaned_channel_events(&mut store, &queue, NOW + 1).expect("recover");
-        assert_eq!(
-            recovery,
-            OrphanRecovery {
-                recovered: 1,
-                deferred: 0,
-                parked: 0
-            }
-        );
-        let events = store.recent_channel_events("acct-1", 10).unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(events[0].ingress_id.is_some());
-        assert_eq!(store.recent_ingress_turns(10).unwrap().len(), 1);
-        assert_eq!(queue.submissions().len(), 1);
-        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
-
-        // And the provider's own redelivery, arriving after the repair, is now
-        // a duplicate of a message that really did run.
-        assert!(matches!(
-            plan(&mut store, &envelope),
-            ChannelAcceptance::Duplicate { .. }
-        ));
-        assert_eq!(queue.submissions().len(), 1);
-    }
-
     /// The other shape an older build left: both rows were written, but no link
     /// between them, because the column did not exist. The migration backfills
     /// what it can pair by dedupe key; this covers the row it reaches at run
@@ -1654,7 +1523,7 @@ mod tests {
             .expect("legacy queued");
 
         // The provider redelivers. The turn already ran, so this must collapse
-        // — and must not be mistaken for the orphan case, which would decide
+        // — and must not be mistaken for an unprocessed one, which would decide
         // the message again and queue a second run for a message already run.
         assert!(matches!(
             plan(&mut store, &envelope),
@@ -1667,43 +1536,10 @@ mod tests {
         // to derive it again.
         let events = store.recent_channel_events("acct-1", 10).unwrap();
         assert_eq!(events[0].ingress_id.as_deref(), Some(ingress_id.as_str()));
-        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
-    }
-
-    /// The same repair, for a row whose envelope cannot be read back: parked as
-    /// failed, where an operator sees it. Never silently counted as handled.
-    #[test]
-    fn an_orphan_that_cannot_be_read_back_is_parked_rather_than_dropped() {
-        let mut store = store_with_account(open_policy());
-        let queue = FakeQueue::default();
-        store
-            .record_channel_event(&NewChannelEvent {
-                account_id: "acct-1".into(),
-                source: ConversationSource::MessagingChannel,
-                direction: EventDirection::Inbound,
-                provider_event_id: "1".into(),
-                conversation_id: "chat-7".into(),
-                thread_id: None,
-                sender_id: Some("user-3".into()),
-                envelope_json: "{not an envelope".into(),
-                disposition: EventDisposition::Accepted,
-                received_at_ms: NOW,
-            })
-            .expect("legacy event");
-
-        let recovery =
-            recover_orphaned_channel_events(&mut store, &queue, NOW + 1).expect("recover");
-        assert_eq!(recovery.parked, 1);
-        assert_eq!(recovery.recovered, 0);
-        let events = store.recent_channel_events("acct-1", 10).unwrap();
-        assert_eq!(events[0].disposition, EventDisposition::Failed);
-        assert!(events[0]
-            .ignore_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("no turn was ever created"));
-        assert!(queue.submissions().is_empty());
-        assert!(store.orphaned_accepted_events(10).unwrap().is_empty());
+        assert!(store
+            .accepted_events_awaiting_processing(10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

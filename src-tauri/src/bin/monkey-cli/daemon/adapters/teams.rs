@@ -3,29 +3,79 @@
 //! # Inbound trust — read this before touching `verify_and_normalize`
 //!
 //! The Bot Framework authenticates a webhook delivery with a JWT in
-//! `Authorization: Bearer`. Full validation is: verify issuer, audience and
-//! expiry (structural — cheap, no network), *and* verify the RS256 signature
-//! against a key from Microsoft's OpenID metadata document, which has to be
-//! fetched and cached (JWKS).
+//! `Authorization: Bearer`. Full validation is five things, and this adapter
+//! does all five:
 //!
-//! This adapter implements both halves. The signature check reuses the
-//! provider-agnostic JWKS core in `google_chat.rs` (`super::google_chat`) —
-//! JWT decoding without re-serialization, `alg` pinned to `RS256` by name,
-//! the cache, and the bounded synchronous refresh bridge — since both
-//! providers publish RSA keys the same way (a JWKS document with `n`/`e`
-//! members). What is Teams-specific is *where* the document lives: rather
-//! than a fixed JWKS URL, Bot Framework publishes an OpenID Connect discovery
-//! document (default [`DEFAULT_OPENID_METADATA_URL`], overridable per account)
-//! whose `jwks_uri` names the actual JWKS. [`TeamsAdapter::refresh_keys`] is
-//! that two-step fetch; [`TeamsAdapter::ensure_key_for_kid`] is the sync-side
-//! lookup with the one-shot catch-up on an unknown `kid` — see
+//! 1. `alg` pinned to RS256 by name, never read from the token;
+//! 2. the RS256 signature, against a key from Microsoft's own OpenID metadata
+//!    document (fetched and cached as a JWKS);
+//! 3. issuer, audience, `exp` and `nbf`;
+//! 4. the activity's channel identity and the signing key's **endorsements** —
+//!    the activity must name the Teams channel, and the Bot Framework
+//!    publishes, per key, which channels that key may sign for, so the key must
+//!    be endorsed for Teams ([`validate_channel_is_endorsed`]);
+//! 5. the token's `serviceurl` claim against the activity's own `serviceUrl`
+//!    ([`validate_service_url_claim`]) — the JWT signs its claims, not the
+//!    body, and this is the claim that binds the two. Without it a valid token
+//!    could be replayed with a body naming a different endpoint, and the reply
+//!    address stored below would be that endpoint.
+//!
+//! The signature machinery itself is the provider-agnostic JWKS core in
+//! `jwt.rs`, shared with Google Chat, since both publish RSA keys the same way.
+//! What is Teams-specific is *where* the document lives: rather than a fixed
+//! JWKS URL, Bot Framework publishes an OpenID Connect discovery document whose
+//! `jwks_uri` names the actual JWKS. [`TeamsAdapter::refresh_keys`] is that
+//! two-step fetch; [`TeamsAdapter::ensure_key_for_kid`] is the sync-side lookup
+//! with the one-shot catch-up on an unknown `kid` — see
 //! `jwt::try_refresh_blocking`'s doc for why that bridge is safe.
+//!
+//! # Which cloud
+//!
+//! The issuer, the metadata document, the OAuth authority, the token scope and
+//! the hosts a reply may be sent to are one thing, not five: they all name the
+//! same Bot Framework cloud, and any one of them set independently describes a
+//! cloud the other four do not. [`TeamsEnvironment`] holds them together and
+//! is the only source for all five, inbound and outbound alike.
 //!
 //! [`normalize_activity`] is the pure mapping from a verified activity to an
 //! envelope, unit-tested against fixtures independently of verification.
 //!
 //! Outbound uses the client-credentials flow against the configured tenant,
 //! with the resulting token cached and refreshed on expiry.
+//!
+//! # Where a reply is addressed — read this before touching `send`
+//!
+//! The Bot Framework does not accept a conversation id alone. A reply is POSTed
+//! to the `serviceUrl` the inbound activity carried, which is per conversation
+//! and per region, so without it there is no endpoint at all. That value is
+//! therefore *durable state*, not a cache: a turn accepted before a restart
+//! still owes an answer afterwards, and a process-local map cannot give it one.
+//! [`TeamsAdapter::conversation_reference_for`] produces it — only from an
+//! activity whose JWT has already verified, and only after
+//! [`validate_service_url`] — and it leaves this adapter as the
+//! [`DurableAddressing`] half of the [`VerifiedWebhookDelivery`] that
+//! `verify_and_normalize` returns, which the webhook acceptance path commits
+//! *before* the provider is answered. `send` loads it back through
+//! [`ConversationReferences`]. Nothing derives, reconstructs or defaults it.
+//!
+//! That the address is committed by the acceptance path rather than written
+//! here is the correctness property, not a refactor: a message this build has
+//! acknowledged but cannot address is a message nobody will ever get an answer
+//! to, and no amount of retrying fixes it because the provider considers it
+//! delivered. So the two are one acceptance — event and address together, or
+//! neither and a redelivery.
+//!
+//! Which is why an activity that normalizes into an inbound envelope and whose
+//! address cannot be produced — no conversation id, no `serviceUrl`, or a
+//! `serviceUrl` on a host this cloud does not own — fails
+//! `verify_and_normalize` outright. It is returned as one result rather than
+//! staged on the adapter precisely so that failure cannot quietly read as
+//! "there was no addressing to commit": the two are not the same answer, and
+//! only the second may be acknowledged.
+//!
+//! The bearer token is the opposite and stays that way: acquired from the
+//! operator's own app credentials, cached in memory with its expiry, never
+//! written anywhere.
 
 use async_trait::async_trait;
 use little_monkey_lib::channels::types::{
@@ -35,7 +85,6 @@ use little_monkey_lib::channels::types::{
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use super::jwt::{
@@ -43,34 +92,66 @@ use super::jwt::{
     try_refresh_blocking, validate_alg_is_rs256, verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    fetch_url, AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    fetch_url, AdapterConfig, ChannelAdapter, ConversationReferences, DaemonConversationReferences,
+    DurableAddressing, InboundBatch, VerifiedWebhookDelivery, WebhookChannelAdapter,
 };
 
-const LOGIN_BASE: &str = "https://login.microsoftonline.com";
-/// The Bot Framework's own fixed token issuer.
-const EXPECTED_ISSUER: &str = "https://api.botframework.com";
 /// Applies to `exp`/`nbf` alike, per the shared skew rule this file follows.
 const SKEW_SECS: i64 = 300;
 /// Refresh this many seconds before the token's own `expires_in` — never cut
 /// it exactly at the edge, or a request built just before expiry could be
 /// sent with a token that dies in flight.
 const TOKEN_REFRESH_SKEW_SECS: i64 = 60;
-/// The Bot Framework's own OpenID Connect discovery document, whose
-/// `jwks_uri` names the JWKS this adapter verifies signatures against.
-/// Fixed for every tenant in production; [`TeamsNonSecretConfig`] allows an
-/// account to override it, since Microsoft's own docs describe a government
-/// cloud variant at a different host.
-const DEFAULT_OPENID_METADATA_URL: &str =
-    "https://login.botframework.com/v1/.well-known/openidconfiguration";
+
+/// The five values a Bot Framework cloud is defined by, held together so they
+/// cannot drift apart.
+///
+/// Every one of them is security-sensitive and every one of them is only
+/// meaningful in combination: the issuer a token must claim, the metadata
+/// document its signing keys are published in, the authority the bot's own
+/// token is bought from, the scope it is bought for, and the hosts a reply may
+/// be POSTed to. An account that could set any one of them on its own — which
+/// is what a free-form "OpenID metadata URL" box was — could point key
+/// discovery at one cloud while the rest of the checks still described
+/// another.
+///
+/// Only the public cloud is offered, because it is the only one this build can
+/// be shown working end to end. A sovereign-cloud variant is five constants,
+/// but five constants nobody here can verify are five ways to accept a token
+/// that should have been refused, so the option is absent rather than
+/// advertised — see the PR notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TeamsEnvironment {
+    openid_metadata_url: &'static str,
+    oauth_authority: &'static str,
+    token_scope: &'static str,
+    expected_issuer: &'static str,
+    /// A `serviceUrl` host must equal one of these or end with a dot and one
+    /// of these — never a bare suffix match, which `evil-botframework.com`
+    /// passes.
+    allowed_service_url_hosts: &'static [&'static str],
+}
+
+impl TeamsEnvironment {
+    /// The public Bot Framework cloud, which is what `teams.microsoft.com`
+    /// tenants and the Azure Bot resource default to.
+    const PUBLIC: Self = Self {
+        openid_metadata_url: "https://login.botframework.com/v1/.well-known/openidconfiguration",
+        oauth_authority: "https://login.microsoftonline.com",
+        token_scope: "https://api.botframework.com/.default",
+        expected_issuer: "https://api.botframework.com",
+        allowed_service_url_hosts: &[
+            "api.botframework.com",
+            "botframework.com",
+            "trafficmanager.net",
+        ],
+    };
+}
 
 #[derive(Debug, Deserialize)]
 struct TeamsNonSecretConfig {
     app_id: String,
     tenant_id: String,
-    /// Overrides [`DEFAULT_OPENID_METADATA_URL`]. Non-secret: it names an
-    /// endpoint, not a credential.
-    #[serde(default)]
-    open_id_metadata_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,26 +164,38 @@ struct CachedToken {
     expires_at_ms: i64,
 }
 
+/// The addressing a reply needs, read back out of the durable reference.
+struct TeamsConversation {
+    /// Already trailing-slash trimmed and re-validated.
+    service_url: String,
+    bot_id: Option<String>,
+    bot_name: Option<String>,
+}
+
 pub struct TeamsAdapter {
     account_id: String,
     app_id: String,
     tenant_id: String,
     app_password: String,
     token_cache: Mutex<Option<CachedToken>>,
-    /// Validated `serviceUrl` per conversation. Only ever written by
-    /// [`TeamsAdapter::record_conversation_service_url`], which validates
-    /// before inserting — `send` refuses to guess or derive one. Populated
-    /// from every activity `verify_and_normalize` accepts (see that method).
-    service_urls: Mutex<BTreeMap<String, String>>,
-    /// Identity provider origin. Always [`LOGIN_BASE`] in production;
-    /// swappable in tests.
+    /// Where a reply to each conversation is addressed. Durable, because a
+    /// turn accepted before a restart still owes an answer after one — see the
+    /// module doc. Read here and written by the acceptance path; `send`
+    /// refuses to guess or derive an endpoint.
+    references: std::sync::Arc<dyn ConversationReferences>,
+    /// Which Bot Framework cloud this account belongs to. Decides the issuer
+    /// that is accepted, where signing keys come from, where the bot's own
+    /// token is bought and what a reply may be addressed to — all five
+    /// together, never one at a time.
+    environment: TeamsEnvironment,
+    /// Identity provider origin. Always the environment's own authority in
+    /// production; swappable in tests.
     login_base: String,
     /// Cached RS256 JWKS keys for verifying inbound deliveries. See the
     /// module doc for how this is kept warm.
     jwks_cache: JwksCache,
-    /// The OpenID Connect discovery document this adapter's `jwks_uri` comes
-    /// from. [`DEFAULT_OPENID_METADATA_URL`] unless overridden by account
-    /// config; swappable in tests.
+    /// Where the `jwks_uri` is discovered. Always the environment's own
+    /// metadata document in production; swappable in tests.
     metadata_url: String,
 }
 
@@ -119,32 +212,69 @@ impl TeamsAdapter {
         if secrets.app_password.trim().is_empty() {
             return Err("Teams account credential is missing app_password".to_string());
         }
-        let metadata_url = non_secret
-            .open_id_metadata_url
-            .filter(|url| !url.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_OPENID_METADATA_URL.to_string());
+        let environment = TeamsEnvironment::PUBLIC;
         Ok(Self {
             account_id: config.account.account_id.clone(),
             app_id: non_secret.app_id,
             tenant_id: non_secret.tenant_id,
             app_password: secrets.app_password,
             token_cache: Mutex::new(None),
-            service_urls: Mutex::new(BTreeMap::new()),
-            login_base: LOGIN_BASE.to_string(),
+            references: std::sync::Arc::new(DaemonConversationReferences::new()),
+            environment,
+            login_base: environment.oauth_authority.to_string(),
             jwks_cache: JwksCache::new(),
-            metadata_url,
+            metadata_url: environment.openid_metadata_url.to_string(),
         })
     }
 
+    /// Point the durable reply-address store at a specific daemon's state.
+    ///
+    /// `None` leaves it resolving the running daemon's own paths, which is what
+    /// a caller with no state of its own (the `channels probe` command) wants.
+    pub(crate) fn with_state(mut self, state: Option<&crate::daemon::store::DaemonPaths>) -> Self {
+        if let Some(paths) = state {
+            self.references = std::sync::Arc::new(DaemonConversationReferences::at(paths.clone()));
+        }
+        self
+    }
+
     #[cfg(test)]
-    fn with_login_base(mut self, base: &str) -> Self {
+    pub(crate) fn with_login_base(mut self, base: &str) -> Self {
         self.login_base = base.to_string();
         self
     }
 
     #[cfg(test)]
-    fn with_metadata_url(mut self, url: &str) -> Self {
+    pub(crate) fn with_metadata_url(mut self, url: &str) -> Self {
         self.metadata_url = url.to_string();
+        self
+    }
+
+    /// Stand in for the JWKS fetch with this file's own test key, so a test
+    /// can verify a genuinely signed token without reaching Microsoft.
+    #[cfg(test)]
+    pub(crate) fn seed_jwks_for_test(&self) {
+        self.jwks_cache
+            .seed_for_test("test-key-1", tests::test_jwk());
+    }
+
+    /// The same, with the key published as endorsing exactly `channels`, so a
+    /// test can drive the endorsement check from both sides.
+    #[cfg(test)]
+    pub(crate) fn seed_jwks_endorsing_for_test(&self, channels: &[&str]) {
+        self.jwks_cache
+            .seed_for_test("test-key-1", tests::test_jwk_endorsing(channels));
+    }
+
+    /// Swap the durable reference store. Used by the restart tests, which build
+    /// two adapters over one store to prove the second can address a
+    /// conversation the first was told about.
+    #[cfg(test)]
+    pub(crate) fn with_references(
+        mut self,
+        references: std::sync::Arc<dyn ConversationReferences>,
+    ) -> Self {
+        self.references = references;
         self
     }
 
@@ -181,27 +311,124 @@ impl TeamsAdapter {
         None
     }
 
-    /// Records a `serviceUrl` for a conversation, refusing anything that is
-    /// not `https` on a Microsoft-owned Bot Framework host. This is the only
-    /// way `send` learns where to POST — it never reconstructs or trusts a
-    /// value handed to it any other way.
-    fn record_conversation_service_url(
+    /// Where replies to one conversation go, refusing any `serviceUrl` that is
+    /// not `https` on a Microsoft-owned Bot Framework host.
+    ///
+    /// This is the only way `send` learns where to POST — it never
+    /// reconstructs a URL or trusts one handed to it another way — and it is
+    /// only ever called from [`WebhookChannelAdapter::verify_and_normalize`]
+    /// *after* the activity's JWT has verified. That ordering is the security
+    /// property: an unauthenticated request cannot make this process POST an
+    /// operator's bot token to a host of its choosing.
+    ///
+    /// No token is produced. What is produced is addressing: the endpoint, the
+    /// tenant and conversation shape the Bot Framework needs to route a reply,
+    /// and when it was last confirmed.
+    fn conversation_reference_for(
         &self,
         conversation_id: &str,
-        service_url: &str,
-    ) -> Result<(), String> {
-        validate_service_url(service_url)?;
-        if let Ok(mut cache) = self.service_urls.lock() {
-            cache.insert(conversation_id.to_string(), service_url.to_string());
-        }
-        Ok(())
+        activity: &JsonValue,
+        now_ms: i64,
+    ) -> Result<DurableAddressing, String> {
+        let service_url = activity
+            .get("serviceUrl")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "Activity carries no serviceUrl".to_string())?;
+        validate_service_url(service_url, self.environment)?;
+
+        let conversation = activity.get("conversation");
+        let mut reference = serde_json::json!({
+            "service_url": service_url,
+            "last_updated_at_ms": now_ms,
+        });
+        // Everything below is optional because Teams omits each of them in
+        // some shapes: a personal chat has no tenant on the conversation, and
+        // `conversationType` is absent outside channels. What is present is
+        // kept, because a proactive reply is addressed with it.
+        let mut put = |key: &str, value: Option<&str>| {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                reference[key] = JsonValue::from(value);
+            }
+        };
+        put(
+            "tenant_id",
+            activity
+                .get("channelData")
+                .and_then(|data| data.get("tenant"))
+                .and_then(|tenant| tenant.get("id"))
+                .and_then(JsonValue::as_str)
+                .or_else(|| {
+                    conversation
+                        .and_then(|conversation| conversation.get("tenantId"))
+                        .and_then(JsonValue::as_str)
+                }),
+        );
+        put(
+            "conversation_type",
+            conversation
+                .and_then(|conversation| conversation.get("conversationType"))
+                .and_then(JsonValue::as_str),
+        );
+        put(
+            "channel_id",
+            activity.get("channelId").and_then(JsonValue::as_str),
+        );
+        // The bot's own identity on this conversation, which a proactive
+        // activity has to name as its `from`.
+        put(
+            "bot_id",
+            activity
+                .get("recipient")
+                .and_then(|recipient| recipient.get("id"))
+                .and_then(JsonValue::as_str),
+        );
+        put(
+            "bot_name",
+            activity
+                .get("recipient")
+                .and_then(|recipient| recipient.get("name"))
+                .and_then(JsonValue::as_str),
+        );
+        Ok(DurableAddressing {
+            account_id: self.account_id.clone(),
+            conversation_id: conversation_id.to_string(),
+            reference,
+        })
     }
 
-    #[cfg(test)]
-    fn seed_service_url_for_test(&self, conversation_id: &str, service_url: &str) {
-        if let Ok(mut cache) = self.service_urls.lock() {
-            cache.insert(conversation_id.to_string(), service_url.to_string());
-        }
+    /// The stored reference for a conversation, or the reason there is none.
+    fn conversation_reference(&self, conversation_id: &str) -> Result<TeamsConversation, String> {
+        let stored = self
+            .references
+            .get(&self.account_id, conversation_id)
+            .ok_or_else(|| {
+                format!(
+                    "No verified serviceUrl on file for conversation '{conversation_id}'; Teams \
+                     requires an inbound activity to establish where to send before it can be \
+                     messaged"
+                )
+            })?;
+        let service_url = stored
+            .get("service_url")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| {
+                format!("The stored Teams reference for '{conversation_id}' names no serviceUrl")
+            })?;
+        // Re-validated on the way out as well as in. The row is only ever
+        // written by the path above, but a database is a file on disk and this
+        // is the moment a bot token would be sent somewhere.
+        validate_service_url(service_url, self.environment)?;
+        Ok(TeamsConversation {
+            service_url: service_url.trim_end_matches('/').to_string(),
+            bot_id: stored
+                .get("bot_id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+            bot_name: stored
+                .get("bot_name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string),
+        })
     }
 
     /// A cached client-credentials token, fetching and caching a new one when
@@ -223,7 +450,9 @@ impl TeamsAdapter {
             ("grant_type", "client_credentials"),
             ("client_id", self.app_id.as_str()),
             ("client_secret", self.app_password.as_str()),
-            ("scope", "https://api.botframework.com/.default"),
+            // The same environment that decided which issuer is accepted
+            // inbound decides what this token is bought for.
+            ("scope", self.environment.token_scope),
         ];
         let request = client.post(url).form(&params);
         let response = little_monkey_lib::egress::send(request)
@@ -266,13 +495,20 @@ impl WebhookChannelAdapter for TeamsAdapter {
         ChannelKind::Teams
     }
 
+    /// The Bot Framework connector treats `200` as delivered and reads the
+    /// body as an optional response activity; an empty JSON object is how a
+    /// bot that will answer later says there is nothing to send back now.
+    fn ack(&self) -> crate::daemon::channel_adapter::WebhookAck {
+        crate::daemon::channel_adapter::WebhookAck::json_ok()
+    }
+
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // `public_base_url` is unused: the Bot Framework's JWT signs the
         // token's own claims, never the delivery URL, so there is nothing
         // here that would ever need it.
@@ -287,7 +523,12 @@ impl WebhookChannelAdapter for TeamsAdapter {
 
         let decoded = decode_jwt(token)?;
         validate_alg_is_rs256(&decoded.header)?;
-        validate_claims_structurally(&decoded.claims, &self.app_id, now_ms)?;
+        validate_claims_structurally(
+            &decoded.claims,
+            &self.app_id,
+            self.environment.expected_issuer,
+            now_ms,
+        )?;
         let kid = decoded
             .header
             .get("kid")
@@ -304,32 +545,140 @@ impl WebhookChannelAdapter for TeamsAdapter {
         let activity: JsonValue = serde_json::from_slice(body)
             .map_err(|_| "Teams activity body is not valid JSON".to_string())?;
 
-        // The `serviceUrl` this specific activity carries is the only way
-        // `send` learns where to POST for this conversation — record it now
-        // that the activity is verified, per `record_conversation_service_url`'s
-        // own doc. Best-effort: an invalid or absent `serviceUrl` still lets a
-        // valid activity normalize, it just cannot be replied to yet.
-        if let (Some(conversation_id), Some(service_url)) = (
-            activity
-                .get("conversation")
-                .and_then(|conversation| conversation.get("id"))
-                .and_then(JsonValue::as_str),
-            activity.get("serviceUrl").and_then(JsonValue::as_str),
-        ) {
-            let _ = self.record_conversation_service_url(conversation_id, service_url);
-        }
+        // The token proves the Bot Framework issued it for this bot. It does
+        // not, on its own, say anything about the body it arrived with — the
+        // JWT signs its own claims, not the activity. Two claims are what tie
+        // the two together, and both are checked before a single field of the
+        // body is believed.
+        validate_channel_is_endorsed(&activity, &key)?;
+        validate_service_url_claim(&decoded.claims, &activity)?;
 
         let bot_id = activity
             .get("recipient")
             .and_then(|recipient| recipient.get("id"))
             .and_then(JsonValue::as_str)
             .unwrap_or_default();
-        Ok(
-            normalize_activity(&activity, &self.account_id, bot_id, now_ms)
-                .into_iter()
-                .collect(),
+        let envelopes: Vec<ChannelEnvelope> = normalize_activity(
+            &activity,
+            &self.account_id,
+            bot_id,
+            self.environment,
+            now_ms,
         )
+        .into_iter()
+        .collect();
+
+        // The `serviceUrl` this specific activity carries is the only way
+        // `send` learns where to POST for this conversation — produce it now
+        // that the activity is verified *and* bound to the token, per
+        // `conversation_reference_for`'s own doc, and return it alongside the
+        // envelopes so the acceptance path commits it before this provider is
+        // told anything. It has to be durable rather than cached: the turn
+        // this delivery becomes may well outlive the process that received it.
+        let addressing = activity
+            .get("conversation")
+            .and_then(|conversation| conversation.get("id"))
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| "Teams activity has no conversation id".to_string())
+            .and_then(|conversation_id| {
+                self.conversation_reference_for(conversation_id, &activity, now_ms)
+            });
+        let durable_addressing = match addressing {
+            Ok(addressing) => vec![addressing],
+            // An activity that becomes an inbound turn owes an answer, and the
+            // Bot Framework does not accept a conversation id alone: without a
+            // usable address there is no endpoint at all, and no later moment
+            // can invent one. So the whole delivery is refused rather than
+            // acknowledged — the provider redelivers, and the alternative is a
+            // message that is durably accepted and permanently unanswerable.
+            Err(error) if !envelopes.is_empty() => return Err(error),
+            // An authenticated activity this adapter maps to no message —
+            // `conversationUpdate`, a reaction, a typing indicator. Nothing
+            // owes it a reply, so an address that could not be produced costs
+            // nothing and the delivery is still finished with.
+            Err(_) => Vec::new(),
+        };
+
+        Ok(VerifiedWebhookDelivery {
+            envelopes,
+            durable_addressing,
+        })
     }
+}
+
+/// Refuse an activity whose `serviceUrl` the token does not vouch for.
+///
+/// A Bot Framework channel token carries a `serviceurl` claim naming the
+/// endpoint the activity it accompanies came from. Without this check the JWT
+/// only ever proves "somebody holds a token minted for this bot" — a token
+/// obtained from one legitimate context could then be replayed with a body
+/// naming any Bot Framework host, and this process would durably store that as
+/// where to POST the bot's own bearer token. Trailing slashes differ between
+/// Microsoft's own payloads, so they are not part of the comparison.
+///
+/// A token carrying no `serviceurl` claim at all is refused rather than waved
+/// through: the claim is what binds token to body, and a delivery this build
+/// cannot bind is a delivery it cannot vouch for.
+fn validate_service_url_claim(claims: &JsonValue, activity: &JsonValue) -> Result<(), String> {
+    let claimed = claims
+        .get("serviceurl")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "JWT carries no serviceurl claim to bind the activity to".to_string())?;
+    let activity_url = activity
+        .get("serviceUrl")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "Activity carries no serviceUrl to check against the token".to_string())?;
+    if claimed.trim_end_matches('/') != activity_url.trim_end_matches('/') {
+        return Err(
+            "The activity's serviceUrl is not the one this token was issued for".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The only channel identity this adapter accepts.
+///
+/// This is the Teams adapter: the account it belongs to was configured against
+/// an Azure Bot resource's Teams channel, its reply endpoints are Teams', and
+/// the operator's policy was written about Teams. An activity naming any other
+/// Bot Framework channel — `directline`, `webchat`, `emulator`, anything a bot
+/// may also be connected to — is a different product arriving at this door, and
+/// is refused rather than normalized into a Teams conversation.
+const TEAMS_CHANNEL_ID: &str = "msteams";
+
+/// Refuse an activity that is not Teams', or whose signing key is not endorsed
+/// for Teams.
+///
+/// Two separate facts, both required. The `channelId` is the activity's own
+/// claim about where it came from, and it must be Teams. The **endorsements**
+/// are what the Bot Framework publishes alongside each key in its OpenID key
+/// document: the list of channels that key is permitted to sign for. A key not
+/// endorsed for Teams signing an activity that claims to be Teams is exactly
+/// the substitution this closes, so the endorsement must be *present* and must
+/// name Teams.
+///
+/// A key that publishes no endorsements at all therefore cannot sign a Teams
+/// activity here. That is deliberate: an empty list is an absent claim, and
+/// waving one through would let any Bot Framework key sign for this channel —
+/// which is the whole of what the check is for. Microsoft's Teams signing keys
+/// carry the endorsement; a fixture that omits it is a wrong fixture, not a
+/// reason to relax this.
+fn validate_channel_is_endorsed(activity: &JsonValue, key: &JwkRsaKey) -> Result<(), String> {
+    let channel_id = activity
+        .get("channelId")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "Activity names no channelId".to_string())?;
+    if channel_id != TEAMS_CHANNEL_ID {
+        return Err("This activity is not from the Microsoft Teams channel".to_string());
+    }
+    if !key
+        .endorsements
+        .iter()
+        .any(|endorsed| endorsed == TEAMS_CHANNEL_ID)
+    {
+        return Err("The signing key is not endorsed for this activity's channel".to_string());
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -369,25 +718,11 @@ impl ChannelAdapter for TeamsAdapter {
     }
 
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
-        let service_url = {
-            let cache = match self.service_urls.lock() {
-                Ok(cache) => cache,
-                Err(_) => {
-                    return SendOutcome::PermanentFailure {
-                        error: "Teams service URL cache is poisoned".to_string(),
-                    }
-                }
-            };
-            cache.get(&message.conversation_id).cloned()
-        };
-        let Some(service_url) = service_url else {
-            return SendOutcome::PermanentFailure {
-                error: format!(
-                    "No verified serviceUrl on file for conversation '{}'; Teams requires an \
-                     inbound activity to establish where to send before it can be messaged",
-                    message.conversation_id
-                ),
-            };
+        // Loaded, never remembered: this is the same lookup whether the
+        // activity arrived a second ago or before the last restart.
+        let conversation = match self.conversation_reference(&message.conversation_id) {
+            Ok(conversation) => conversation,
+            Err(error) => return SendOutcome::PermanentFailure { error },
         };
         let token = match self.access_token().await {
             Ok(token) => token,
@@ -406,15 +741,37 @@ impl ChannelAdapter for TeamsAdapter {
                 }
             }
         };
-        let url = format!(
-            "{}/v3/conversations/{}/activities",
-            service_url.trim_end_matches('/'),
-            message.conversation_id
-        );
-        let body = serde_json::json!({
+        // Replying to a specific activity keeps the answer under the message
+        // that prompted it, which in a Teams channel is the difference between
+        // a threaded reply and a new post nobody connects to the question.
+        // Falling back to the conversation endpoint is what a proactive
+        // message — one with no activity to hang from — needs.
+        let reply_to = message
+            .reply_to_provider_id
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let url = match activity_url(
+            &conversation.service_url,
+            &message.conversation_id,
+            reply_to,
+        ) {
+            Ok(url) => url,
+            Err(error) => return SendOutcome::PermanentFailure { error },
+        };
+        let mut body = serde_json::json!({
             "type": "message",
             "text": message.text,
         });
+        if let Some(activity_id) = reply_to {
+            body["replyToId"] = JsonValue::from(activity_id);
+        }
+        if let Some(bot_id) = conversation.bot_id.as_deref() {
+            let mut from = serde_json::json!({ "id": bot_id });
+            if let Some(name) = conversation.bot_name.as_deref() {
+                from["name"] = JsonValue::from(name);
+            }
+            body["from"] = from;
+        }
         let request = client.post(url).bearer_auth(&token).json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
             Ok(response) => response,
@@ -502,26 +859,70 @@ fn is_bot_framework_host(url: &str) -> bool {
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
-/// `https` on a Microsoft-owned Bot Framework host. Bot Framework
-/// `serviceUrl`s are `api.botframework.com` or a regional
-/// `*.botframework.com` / `*.trafficmanager.net` name (e.g.
-/// `smba.trafficmanager.net`); nothing else is a real Bot Framework
-/// endpoint, so nothing else is trusted.
-fn validate_service_url(candidate: &str) -> Result<(), String> {
+/// The Bot Framework endpoint one reply is POSTed to.
+///
+/// Built with the URL parser rather than by formatting, so a conversation or
+/// activity id is percent-encoded into exactly one path segment. Those ids come
+/// from a provider payload: a `/` inside one, formatted straight into a path,
+/// would move the request to an endpoint of the sender's choosing — with the
+/// bot's own bearer token attached.
+fn activity_url(
+    service_url: &str,
+    conversation_id: &str,
+    reply_to_activity_id: Option<&str>,
+) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(service_url)
+        .map_err(|_| "The stored Teams serviceUrl is not a valid URL".to_string())?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "The stored Teams serviceUrl cannot carry a path".to_string())?;
+        // The stored value is a base like `https://smba.trafficmanager.net/amer/`,
+        // whose trailing slash would otherwise leave an empty segment.
+        segments.pop_if_empty();
+        segments.extend(["v3", "conversations"]);
+        segments.push(conversation_id);
+        segments.push("activities");
+        if let Some(activity_id) = reply_to_activity_id {
+            segments.push(activity_id);
+        }
+    }
+    Ok(url.to_string())
+}
+
+/// `https` on a host the configured cloud owns.
+///
+/// The host list comes from [`TeamsEnvironment`] rather than from constants
+/// here, so it can never describe a different cloud than the issuer and token
+/// scope do. Matching is on a label boundary — `evil-botframework.com` must not
+/// pass as `botframework.com`, and neither must `botframework.com.example`.
+fn validate_service_url(candidate: &str, environment: TeamsEnvironment) -> Result<(), String> {
     let url =
         reqwest::Url::parse(candidate).map_err(|_| "serviceUrl is not a valid URL".to_string())?;
+    // A loopback fixture stands in for the Bot Framework in this file's own
+    // tests, which is the only way to drive the real send path without the
+    // network. Compiled out of every shipped build, so the rule below is the
+    // only one production has.
+    #[cfg(test)]
+    if url
+        .host_str()
+        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        return Ok(());
+    }
     if url.scheme() != "https" {
         return Err("serviceUrl must be https".to_string());
     }
     let host = url
         .host_str()
-        .ok_or_else(|| "serviceUrl has no host".to_string())?;
-    let host = host.to_ascii_lowercase();
-    let allowed = host == "api.botframework.com"
-        || host.ends_with(".botframework.com")
-        || host.ends_with(".trafficmanager.net");
+        .ok_or_else(|| "serviceUrl has no host".to_string())?
+        .to_ascii_lowercase();
+    let allowed = environment
+        .allowed_service_url_hosts
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")));
     if !allowed {
-        return Err("serviceUrl is not on a Microsoft-owned Bot Framework host".to_string());
+        return Err("serviceUrl is not on a host this Bot Framework cloud owns".to_string());
     }
     Ok(())
 }
@@ -529,13 +930,14 @@ fn validate_service_url(candidate: &str) -> Result<(), String> {
 fn validate_claims_structurally(
     claims: &JsonValue,
     expected_app_id: &str,
+    expected_issuer: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     let issuer = claims
         .get("iss")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| "JWT is missing iss".to_string())?;
-    if issuer != EXPECTED_ISSUER {
+    if issuer != expected_issuer {
         return Err("JWT issuer is not the Bot Framework".to_string());
     }
     let audience = claims
@@ -602,6 +1004,7 @@ fn normalize_activity(
     activity: &JsonValue,
     account_id: &str,
     bot_id: &str,
+    environment: TeamsEnvironment,
     fallback_received_at_ms: i64,
 ) -> Option<ChannelEnvelope> {
     if activity.get("type").and_then(JsonValue::as_str) != Some("message") {
@@ -688,7 +1091,7 @@ fn normalize_activity(
 
     let mut metadata = BoundedMetadata::new();
     if let Some(service_url) = activity.get("serviceUrl").and_then(JsonValue::as_str) {
-        if validate_service_url(service_url).is_ok() {
+        if validate_service_url(service_url, environment).is_ok() {
             metadata.insert("teams_service_url", service_url);
         }
     }
@@ -719,8 +1122,9 @@ fn normalize_activity(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::daemon::channel_adapter::MemoryConversationReferences;
     use crate::daemon::channel_store::ChannelAccountRecord;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine as _;
@@ -728,7 +1132,7 @@ mod tests {
     use little_monkey_lib::channels::types::{ConversationKind, HealthState};
     use std::io::{Read, Write};
 
-    fn test_account() -> ChannelAccountRecord {
+    pub(crate) fn test_account() -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-teams".to_string(),
             kind: ChannelKind::Teams,
@@ -758,7 +1162,11 @@ mod tests {
             account: &account,
             secret,
         };
-        TeamsAdapter::new(&config).expect("adapter builds")
+        // Never the daemon-backed reference store: a unit test must not reach
+        // for the operator's real state database to find a reply address.
+        TeamsAdapter::new(&config)
+            .expect("adapter builds")
+            .with_references(std::sync::Arc::new(MemoryConversationReferences::default()))
     }
 
     /// A structurally-shaped but unsigned JWT: real base64url in all three
@@ -775,10 +1183,38 @@ mod tests {
         format!("{header}.{payload}.{signature}")
     }
 
-    fn valid_claims(now_secs: i64) -> JsonValue {
+    /// The `serviceUrl` every activity fixture in these tests carries, and so
+    /// the one a genuine token for them names.
+    pub(crate) const TEST_SERVICE_URL: &str = "https://smba.trafficmanager.net/amer/";
+
+    pub(crate) fn valid_claims(now_secs: i64) -> JsonValue {
+        claims_for_service_url(now_secs, TEST_SERVICE_URL)
+    }
+
+    /// A token that is valid on any clock a test in this tree runs on.
+    ///
+    /// The production route reads the real system clock, while the fixtures
+    /// around it are pinned to a fixed instant, so a token minted relative to
+    /// either one is refused by the other. Expiry and not-yet-valid have their
+    /// own tests above; this fixture is for the paths where the clock is not
+    /// what is under test.
+    pub(crate) fn long_lived_claims(service_url: &str) -> JsonValue {
         serde_json::json!({
-            "iss": EXPECTED_ISSUER,
+            "iss": TeamsEnvironment::PUBLIC.expected_issuer,
             "aud": "app-id-1",
+            "serviceurl": service_url,
+            "exp": 4_000_000_000i64,
+            "nbf": 1_500_000_000i64,
+        })
+    }
+
+    /// The same claims with a chosen `serviceurl`, so a test can drive the
+    /// binding between the token and the activity from both sides.
+    pub(crate) fn claims_for_service_url(now_secs: i64, service_url: &str) -> JsonValue {
+        serde_json::json!({
+            "iss": TeamsEnvironment::PUBLIC.expected_issuer,
+            "aud": "app-id-1",
+            "serviceurl": service_url,
             "exp": now_secs + 3600,
             "nbf": now_secs - 60,
         })
@@ -789,7 +1225,7 @@ mod tests {
     /// A 2048-bit RSA test key generated locally for these tests only, whose
     /// public half is seeded into the JWKS cache as the "genuine" signer.
     /// Not used anywhere else and grants access to nothing.
-    const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDSxaufYG907lGy
 3EZKuTZSppsN3d4R8whFTFsFgo+11Zp5plEImzXl469p+Nc4/afv56nsig4MegEe
 0A7jiBHSnLBSBnsvuCCEoXY+T1QXyDOmZ3ycr9uSkRmSXon/wglUIbs4VaYCg2SS
@@ -820,7 +1256,7 @@ nJ6EyR9+bBW08LJfpDG+U7oWYA==
 
     /// A second, unrelated 2048-bit RSA test key: only ever used as the
     /// "wrong signer" in tests below.
-    const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQDzgzLmiwnyEOF1
 FnDCygqdjmbhjbJjW2d5W5VC2cWTbqpJA+UitbAn9zalMm8HDxazOGn5VVMZU7Rj
 LFRqBsVStj8CKxzT/gSuODI8RQCgSSQV/RnymWmjk46E1/a3ArNMTuxK9oSqmPpG
@@ -856,10 +1292,28 @@ Z4Cr3JR0FbjywTd4IHU6
     const TEST_JWK_N: &str = "0sWrn2BvdO5RstxGSrk2UqabDd3eEfMIRUxbBYKPtdWaeaZRCJs15eOvafjXOP2n7-ep7IoODHoBHtAO44gR0pywUgZ7L7gghKF2Pk9UF8gzpmd8nK_bkpEZkl6J_8IJVCG7OFWmAoNkkrRT8jlfheHmwjReWmNUaHGYXurXEsllBwcVeVjClzjQifOKrzjdH_Nevx1GIDp5DftkAosKLvtdg6jwvMzpTLVwSVZ_xiY2UMCDjmnPC7RUnopE1wz9UGoj9Gb1QgV6APHEfZ1kym4Fqsdsi1bDiUdq2buWQgrZVKCGXXXo9KG-dtIYQw12YJJv23wFxKWxlzW2dGUR4w";
     const TEST_JWK_E: &str = "AQAB";
 
-    fn test_jwk() -> JwkRsaKey {
+    pub(crate) fn test_jwk() -> JwkRsaKey {
+        test_jwk_endorsing(&["msteams"])
+    }
+
+    /// The `kid` this file's test key is published under for the tests that
+    /// drive the production HTTP route, which builds its own adapter and so
+    /// cannot be handed a seeded cache.
+    pub(crate) const ROUTE_KID: &str = "teams-route-key";
+
+    /// Publish the test key as the Bot Framework's own JWKS would, so every
+    /// cache built from here on can verify a token signed with it.
+    pub(crate) fn publish_route_jwk() {
+        super::super::jwt::test_keys::publish(ROUTE_KID, test_jwk());
+    }
+
+    /// The same key published with a chosen endorsement list, so a test can
+    /// drive the channel check both ways.
+    pub(crate) fn test_jwk_endorsing(channels: &[&str]) -> JwkRsaKey {
         JwkRsaKey {
             n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
             e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
+            endorsements: channels.iter().map(|value| value.to_string()).collect(),
         }
     }
 
@@ -878,7 +1332,7 @@ Z4Cr3JR0FbjywTd4IHU6
     }
 
     /// Signs `claims` with `kid` in the header, using `private_key_pem`.
-    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+    pub(crate) fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
         use ring::rand::SystemRandom;
         use ring::signature::{RsaKeyPair, RSA_PKCS1_SHA256};
 
@@ -920,15 +1374,33 @@ Z4Cr3JR0FbjywTd4IHU6
                 None,
                 now_ms,
             )
-            .expect("a genuinely signed, structurally valid token must verify");
+            .expect("a genuinely signed, structurally valid token must verify")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].text, "hello bot");
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
     }
 
+    /// What the webhook acceptance path does with the addressing a verified
+    /// delivery returned: commit it. Here the store is the in-memory one,
+    /// because what these tests are about is the *value* the verifier produced
+    /// — `channel_webhook_tests` proves the real path commits it to the real
+    /// database before the provider is answered.
+    fn commit_addressing(
+        verified: &VerifiedWebhookDelivery,
+        references: &dyn ConversationReferences,
+    ) {
+        for entry in &verified.durable_addressing {
+            references
+                .put(&entry.account_id, &entry.conversation_id, &entry.reference)
+                .expect("store the address");
+        }
+    }
+
     #[test]
     fn a_verified_activity_records_its_service_url_for_send() {
-        let adapter = adapter();
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        let adapter = adapter().with_references(references.clone());
         adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
         let now_ms = 1_700_000_000_000i64;
         let jwt = sign_test_jwt(
@@ -937,7 +1409,7 @@ Z4Cr3JR0FbjywTd4IHU6
             TEST_PRIVATE_KEY_PEM,
         );
         let body = serde_json::to_vec(&personal_activity()).unwrap();
-        adapter
+        let verified = adapter
             .verify_and_normalize(
                 &[("authorization".to_string(), format!("Bearer {jwt}"))],
                 &body,
@@ -945,16 +1417,373 @@ Z4Cr3JR0FbjywTd4IHU6
                 now_ms,
             )
             .expect("verification should succeed");
-        let cached = adapter
-            .service_urls
-            .lock()
-            .unwrap()
-            .get("19:conv1")
-            .cloned();
+        commit_addressing(&verified, references.as_ref());
+        let stored = references
+            .get("acct-teams", "19:conv1")
+            .expect("the verified activity's address is durable");
         assert_eq!(
-            cached.as_deref(),
+            stored.get("service_url").and_then(JsonValue::as_str),
             Some("https://smba.trafficmanager.net/amer/")
         );
+        // Addressing, and nothing that authorizes anything.
+        assert_eq!(
+            stored.get("bot_id").and_then(JsonValue::as_str),
+            Some("28:bot-id")
+        );
+        assert_eq!(
+            stored.get("conversation_type").and_then(JsonValue::as_str),
+            Some("personal")
+        );
+        assert!(
+            stored.get("last_updated_at_ms").is_some(),
+            "the operator can see how fresh an address is"
+        );
+        let serialized = stored.to_string();
+        assert!(
+            !serialized.contains("Bearer") && !serialized.contains("access_token"),
+            "no token may be written to the reference table: {serialized}"
+        );
+    }
+
+    /// A message this adapter cannot address is not a message it may hand on.
+    ///
+    /// The token is genuine and vouches for exactly the `serviceUrl` the
+    /// activity carries, so every binding check passes; the endpoint is simply
+    /// on a host no Bot Framework cloud this build knows owns. Since the reply
+    /// address is the only endpoint `send` will ever have, that failure is the
+    /// whole delivery's — returned as `Err`, which the acceptance path refuses,
+    /// rather than as a verified delivery carrying no addressing.
+    #[test]
+    fn a_message_whose_address_cannot_be_produced_fails_verification() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let off_cloud = "https://smba.example.com/amer/";
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, off_cloud),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity["serviceUrl"] = JsonValue::from(off_cloud);
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&activity).unwrap(),
+            None,
+            now_ms,
+        );
+
+        assert!(
+            result.is_err(),
+            "a message with no usable reply address must not verify: {result:?}"
+        );
+    }
+
+    /// The same unusable endpoint on an activity that is not a message at all.
+    ///
+    /// Nothing here owes anyone an answer — no envelope is produced, so no
+    /// reply address is required — and refusing it would only make the Bot
+    /// Framework redeliver a `conversationUpdate` forever. It verifies, carries
+    /// no message and carries no addressing.
+    #[test]
+    fn a_non_message_activity_needs_no_reply_address() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let off_cloud = "https://smba.example.com/amer/";
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, off_cloud),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity["type"] = JsonValue::from("conversationUpdate");
+        activity["serviceUrl"] = JsonValue::from(off_cloud);
+
+        let verified = adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &serde_json::to_vec(&activity).unwrap(),
+                None,
+                now_ms,
+            )
+            .expect("an activity that becomes no turn needs no reply address");
+
+        assert!(verified.envelopes.is_empty());
+        assert!(verified.durable_addressing.is_empty());
+    }
+
+    /// A second adapter over the same store, as a restart produces: the
+    /// process that received the activity is gone and this one has to answer.
+    #[tokio::test]
+    async fn a_reply_is_addressed_from_the_store_after_the_receiving_adapter_is_gone() {
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        let now_ms = 1_700_000_000_000i64;
+        {
+            let receiver = adapter().with_references(references.clone());
+            receiver.jwks_cache.seed_for_test("test-key-1", test_jwk());
+            let jwt = sign_test_jwt(
+                &valid_claims(now_ms / 1000),
+                "test-key-1",
+                TEST_PRIVATE_KEY_PEM,
+            );
+            let verified = receiver
+                .verify_and_normalize(
+                    &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                    &serde_json::to_vec(&personal_activity()).unwrap(),
+                    None,
+                    now_ms,
+                )
+                .expect("verification should succeed");
+            commit_addressing(&verified, references.as_ref());
+        }
+
+        let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
+        let send_base = serve_once("200 OK", r#"{"id":"activity-out-1"}"#);
+        // The sender is told nothing about the conversation beyond its id, and
+        // its own reference store starts empty of anything it learned itself.
+        let sender = adapter()
+            .with_login_base(&token_base)
+            .with_references(references.clone());
+        // Rewrite only the endpoint the fixture listens on, keeping every
+        // other field the verified activity produced.
+        let mut stored = references.get("acct-teams", "19:conv1").expect("stored");
+        stored["service_url"] = JsonValue::from(send_base);
+        references.put("acct-teams", "19:conv1", &stored).unwrap();
+
+        let outcome = sender.send(&outbound_message()).await;
+        assert!(
+            matches!(outcome, SendOutcome::Sent { .. }),
+            "a restart must not strand a durable reply: {outcome:?}"
+        );
+    }
+
+    /// The claim that binds a token to the body it arrived with. Without it,
+    /// any valid token for this bot could be replayed alongside a body naming
+    /// a different endpoint — and that endpoint is where the bot's own bearer
+    /// token would then be POSTed.
+    #[test]
+    fn a_token_issued_for_another_service_url_cannot_carry_this_activity() {
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        let adapter = adapter().with_references(references.clone());
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, "https://smba.trafficmanager.net/emea/"),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&personal_activity()).unwrap(),
+            None,
+            now_ms,
+        );
+
+        assert!(
+            result.unwrap_err().contains("serviceUrl"),
+            "a token for one endpoint must not vouch for another"
+        );
+        // A refusal returns no delivery at all, so there is nothing for the
+        // acceptance path to commit — the reference store stays empty because
+        // no addressing was ever produced, not because a commit was skipped.
+        assert!(
+            references.get("acct-teams", "19:conv1").is_none(),
+            "a mismatched token planted a reply address"
+        );
+    }
+
+    /// A trailing slash is not a difference: Microsoft's own payloads are not
+    /// consistent about one, and refusing over it would refuse real traffic.
+    #[test]
+    fn a_trailing_slash_is_not_a_service_url_mismatch() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &claims_for_service_url(now_ms / 1000, "https://smba.trafficmanager.net/amer"),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+
+        adapter
+            .verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &serde_json::to_vec(&personal_activity()).unwrap(),
+                None,
+                now_ms,
+            )
+            .expect("the same endpoint, spelled with and without its slash");
+    }
+
+    /// A token with no `serviceurl` claim binds to nothing, so there is
+    /// nothing to check the body against and the delivery is refused.
+    #[test]
+    fn a_token_that_binds_to_no_service_url_is_refused() {
+        let adapter = adapter();
+        adapter.jwks_cache.seed_for_test("test-key-1", test_jwk());
+        let now_ms = 1_700_000_000_000i64;
+        let mut claims = valid_claims(now_ms / 1000);
+        claims.as_object_mut().unwrap().remove("serviceurl");
+        let jwt = sign_test_jwt(&claims, "test-key-1", TEST_PRIVATE_KEY_PEM);
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&personal_activity()).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("serviceurl"));
+    }
+
+    /// The Bot Framework says, per signing key, which channels that key may
+    /// sign for. A key endorsed for one channel signing an activity claiming
+    /// another is the case this refuses.
+    #[test]
+    fn an_activity_from_a_channel_the_signing_key_is_not_endorsed_for_is_refused() {
+        let adapter = adapter();
+        adapter.seed_jwks_endorsing_for_test(&["skype"]);
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&personal_activity()).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(
+            result.unwrap_err().contains("endorsed"),
+            "an unendorsed channel must not be accepted"
+        );
+    }
+
+    /// An empty endorsement list is an absent claim, not a wildcard. Accepting
+    /// one would let any Bot Framework signing key sign for Teams, which is
+    /// exactly what the endorsement exists to stop.
+    #[test]
+    fn a_key_publishing_no_endorsements_cannot_sign_for_teams() {
+        let adapter = adapter();
+        adapter.seed_jwks_endorsing_for_test(&[]);
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&personal_activity()).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(
+            result.unwrap_err().contains("endorsed"),
+            "a key claiming no channel cannot claim this one"
+        );
+    }
+
+    /// This is the Teams adapter. An activity from another Bot Framework
+    /// channel the same bot is connected to — Direct Line, Web Chat, the
+    /// emulator — is a different product arriving at this door.
+    #[test]
+    fn an_activity_from_another_bot_framework_channel_is_refused() {
+        for channel_id in ["directline", "webchat", "emulator", "skype"] {
+            let adapter = adapter();
+            // Endorsed for both, so what refuses the activity is its own
+            // channel identity rather than the key's endorsements.
+            adapter.seed_jwks_endorsing_for_test(&["msteams", channel_id]);
+            let now_ms = 1_700_000_000_000i64;
+            let jwt = sign_test_jwt(
+                &valid_claims(now_ms / 1000),
+                "test-key-1",
+                TEST_PRIVATE_KEY_PEM,
+            );
+            let mut activity = personal_activity();
+            activity["channelId"] = JsonValue::from(channel_id);
+
+            let result = adapter.verify_and_normalize(
+                &[("authorization".to_string(), format!("Bearer {jwt}"))],
+                &serde_json::to_vec(&activity).unwrap(),
+                None,
+                now_ms,
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("not from the Microsoft Teams channel"),
+                "{channel_id} is not Teams"
+            );
+        }
+    }
+
+    /// An activity naming no channel at all cannot be checked, and is refused
+    /// rather than assumed to be Teams.
+    #[test]
+    fn an_activity_naming_no_channel_is_refused() {
+        let adapter = adapter();
+        adapter.seed_jwks_for_test();
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity.as_object_mut().unwrap().remove("channelId");
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&activity).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("channelId"));
+    }
+
+    /// The endorsement list is what the JWKS document publishes, so it has to
+    /// survive parsing — a key representation that dropped it would make the
+    /// check above unimplementable rather than merely unused.
+    #[test]
+    fn endorsements_survive_the_jwks_parser() {
+        let document = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": "test-key-1",
+                "n": TEST_JWK_N,
+                "e": TEST_JWK_E,
+                "endorsements": ["msteams", "skype"],
+            }]
+        })
+        .to_string();
+        let keys = super::super::jwt::parse_jwks_body(document.as_bytes()).expect("parses");
+        assert_eq!(keys[0].1.endorsements, vec!["msteams", "skype"]);
+    }
+
+    /// The five values that define a cloud move together or not at all.
+    #[test]
+    fn one_environment_decides_both_directions() {
+        let environment = TeamsEnvironment::PUBLIC;
+        assert!(environment.expected_issuer.contains("botframework.com"));
+        assert!(environment
+            .token_scope
+            .starts_with(environment.expected_issuer));
+        assert!(environment
+            .openid_metadata_url
+            .starts_with("https://login.botframework.com/"));
+        assert!(environment.oauth_authority.starts_with("https://login."));
+        assert!(environment
+            .allowed_service_url_hosts
+            .contains(&"trafficmanager.net"));
+        // And a host from no cloud at all is refused by the same list.
+        assert!(validate_service_url("https://smba.example.com/amer/", environment).is_err());
     }
 
     #[test]
@@ -1175,7 +2004,8 @@ Z4Cr3JR0FbjywTd4IHU6
             "type": "message",
             "id": "activity-1",
             "timestamp": "2024-01-01T00:00:00.000Z",
-            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+            "serviceUrl": TEST_SERVICE_URL,
+            "channelId": "msteams",
             "conversation": {"id": "19:conv1", "conversationType": "personal"},
             "from": {"id": "29:user1", "name": "Ada"},
             "recipient": {"id": "28:bot-id"},
@@ -1185,8 +2015,14 @@ Z4Cr3JR0FbjywTd4IHU6
 
     #[test]
     fn a_personal_conversation_normalizes_to_direct() {
-        let envelope =
-            normalize_activity(&personal_activity(), "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &personal_activity(),
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert_eq!(envelope.conversation.kind, ConversationKind::Direct);
         assert_eq!(envelope.provider_event_id, "activity-1");
         assert_eq!(envelope.text, "hello bot");
@@ -1196,7 +2032,14 @@ Z4Cr3JR0FbjywTd4IHU6
     fn a_channel_conversation_normalizes_to_group() {
         let mut activity = personal_activity();
         activity["conversation"]["conversationType"] = serde_json::json!("channel");
-        let envelope = normalize_activity(&activity, "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert_eq!(envelope.conversation.kind, ConversationKind::Group);
     }
 
@@ -1204,7 +2047,14 @@ Z4Cr3JR0FbjywTd4IHU6
     fn a_group_chat_conversation_normalizes_to_group() {
         let mut activity = personal_activity();
         activity["conversation"]["conversationType"] = serde_json::json!("groupChat");
-        let envelope = normalize_activity(&activity, "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert_eq!(envelope.conversation.kind, ConversationKind::Group);
     }
 
@@ -1217,7 +2067,14 @@ Z4Cr3JR0FbjywTd4IHU6
             "text": "<at>Bot</at>",
             "mentioned": {"id": "28:bot-id", "name": "Bot"}
         }]);
-        let envelope = normalize_activity(&activity, "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert!(envelope.mentions_self);
         assert_eq!(envelope.text, "Bot please help");
         assert!(!envelope.text.contains("<at>"));
@@ -1230,7 +2087,14 @@ Z4Cr3JR0FbjywTd4IHU6
             "type": "mention",
             "mentioned": {"id": "29:someone-else"}
         }]);
-        let envelope = normalize_activity(&activity, "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert!(!envelope.mentions_self);
     }
 
@@ -1242,7 +2106,14 @@ Z4Cr3JR0FbjywTd4IHU6
             "contentUrl": "https://example.com/file.png",
             "name": "file.png"
         }]);
-        let envelope = normalize_activity(&activity, "acct-teams", "28:bot-id", 0).unwrap();
+        let envelope = normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert_eq!(envelope.attachments.len(), 1);
         match &envelope.attachments[0].source {
             AttachmentSource::Url { url } => assert_eq!(url, "https://example.com/file.png"),
@@ -1254,14 +2125,34 @@ Z4Cr3JR0FbjywTd4IHU6
     fn a_non_message_activity_normalizes_to_nothing() {
         let mut activity = personal_activity();
         activity["type"] = serde_json::json!("conversationUpdate");
-        assert!(normalize_activity(&activity, "acct-teams", "28:bot-id", 0).is_none());
+        assert!(normalize_activity(
+            &activity,
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0
+        )
+        .is_none());
     }
 
     #[test]
     fn provider_event_ids_are_deterministic() {
-        let first = normalize_activity(&personal_activity(), "acct-teams", "28:bot-id", 0).unwrap();
-        let second =
-            normalize_activity(&personal_activity(), "acct-teams", "28:bot-id", 0).unwrap();
+        let first = normalize_activity(
+            &personal_activity(),
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
+        let second = normalize_activity(
+            &personal_activity(),
+            "acct-teams",
+            "28:bot-id",
+            TeamsEnvironment::PUBLIC,
+            0,
+        )
+        .unwrap();
         assert_eq!(first.provider_event_id, second.provider_event_id);
     }
 
@@ -1269,18 +2160,58 @@ Z4Cr3JR0FbjywTd4IHU6
 
     #[test]
     fn a_microsoft_https_service_url_validates() {
-        assert!(validate_service_url("https://smba.trafficmanager.net/amer/").is_ok());
-        assert!(validate_service_url("https://api.botframework.com/").is_ok());
+        assert!(validate_service_url(
+            "https://smba.trafficmanager.net/amer/",
+            TeamsEnvironment::PUBLIC
+        )
+        .is_ok());
+        assert!(
+            validate_service_url("https://api.botframework.com/", TeamsEnvironment::PUBLIC).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_conversation_id_cannot_walk_the_reply_out_of_its_own_endpoint() {
+        // Ids arrive in a provider payload. One containing a path separator,
+        // formatted straight into a URL, would move the POST — and the bot's
+        // bearer token with it — somewhere the sender chose.
+        let url = activity_url(
+            "https://smba.trafficmanager.net/amer",
+            "19:conv1/../../../v3/conversations/19:victim",
+            None,
+        )
+        .expect("a hostile id still produces a URL, just not that one");
+        assert!(
+            url.starts_with("https://smba.trafficmanager.net/amer/v3/conversations/"),
+            "{url}"
+        );
+        assert!(
+            !url.contains("/../"),
+            "the id escaped its own path segment: {url}"
+        );
+        // The ordinary shape, with the base's trailing slash: no empty segment.
+        let url = activity_url("https://smba.trafficmanager.net/amer/", "19:conv1", None).unwrap();
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/amer/v3/conversations/19:conv1/activities"
+        );
     }
 
     #[test]
     fn a_non_https_service_url_is_refused() {
-        assert!(validate_service_url("http://smba.trafficmanager.net/amer/").is_err());
+        assert!(validate_service_url(
+            "http://smba.trafficmanager.net/amer/",
+            TeamsEnvironment::PUBLIC
+        )
+        .is_err());
     }
 
     #[test]
     fn a_non_microsoft_host_is_refused() {
-        assert!(validate_service_url("https://evil.example.com/amer/").is_err());
+        assert!(
+            validate_service_url("https://evil.example.com/amer/", TeamsEnvironment::PUBLIC)
+                .is_err()
+        );
     }
 
     // --- Outbound mapping ---------------------------------------------------
@@ -1327,6 +2258,24 @@ Z4Cr3JR0FbjywTd4IHU6
         format!("http://127.0.0.1:{port}")
     }
 
+    /// A reference store already holding one conversation addressed at a
+    /// loopback fixture, which is what an inbound activity would have written.
+    fn references_at(service_url: &str) -> std::sync::Arc<MemoryConversationReferences> {
+        let references = std::sync::Arc::new(MemoryConversationReferences::default());
+        references
+            .put(
+                "acct-teams",
+                "19:conv1",
+                &serde_json::json!({
+                    "service_url": service_url,
+                    "bot_id": "28:bot",
+                    "last_updated_at_ms": 1_700_000_000_000i64,
+                }),
+            )
+            .expect("seed reference");
+        references
+    }
+
     fn outbound_message() -> OutboundMessage {
         OutboundMessage {
             account_id: "acct-teams".to_string(),
@@ -1353,8 +2302,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_429_activity_response_maps_to_retryable_failure() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("429 Too Many Requests", "{}");
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         assert!(
             matches!(outcome, SendOutcome::RetryableFailure { .. }),
@@ -1366,8 +2316,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_401_activity_response_maps_to_permanent_failure() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("401 Unauthorized", "{}");
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         assert!(
             matches!(outcome, SendOutcome::PermanentFailure { .. }),
@@ -1379,8 +2330,9 @@ Z4Cr3JR0FbjywTd4IHU6
     async fn a_successful_send_extracts_the_provider_message_id() {
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
         let send_base = serve_once("200 OK", r#"{"id":"activity-out-1"}"#);
-        let adapter = adapter().with_login_base(&token_base);
-        adapter.seed_service_url_for_test("19:conv1", &send_base);
+        let adapter = adapter()
+            .with_login_base(&token_base)
+            .with_references(references_at(&send_base));
         let outcome = adapter.send(&outbound_message()).await;
         match outcome {
             SendOutcome::Sent {

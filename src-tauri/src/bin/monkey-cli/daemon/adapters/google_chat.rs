@@ -3,9 +3,18 @@
 //! # Inbound trust — read this before touching `verify_and_normalize`
 //!
 //! Google Chat authenticates a delivery with a JWT in `Authorization: Bearer`,
-//! issued by `chat@system.gserviceaccount.com`, audience the configured
-//! project number. Full validation is: verify issuer, audience and expiry
-//! (structural — cheap, no network), *and* verify the RS256 signature against
+//! issued by `chat@system.gserviceaccount.com`. What it puts in `aud` is the
+//! app's own **Authentication Audience** setting, and only the *Project Number*
+//! value of that setting is supported here: it is the one whose token is this
+//! self-signed Chat service-account JWT, which is what the verifier below
+//! actually checks. Google's other value, *App URL*, is a different token
+//! issued by a different Google identity, and verifying it means a second,
+//! genuinely separate OIDC path — swapping the expected `aud` on this verifier
+//! would accept the wrong signer, so the option is absent rather than faked.
+//! The setup panel names the same setting and the same single value.
+//!
+//! Full validation is: verify issuer, audience and expiry (structural — cheap,
+//! no network), *and* verify the RS256 signature against
 //! one of Google's rotating public keys, published as a JWKS document at
 //! `https://www.googleapis.com/service_accounts/v1/jwk/chat@system.gserviceaccount.com`
 //! and cached.
@@ -55,7 +64,7 @@ use super::jwt::{
     verify_rs256_signature, JwkRsaKey, JwksCache,
 };
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookChannelAdapter,
 };
 
 const CHAT_API_BASE: &str = "https://chat.googleapis.com";
@@ -73,6 +82,9 @@ const CHAT_BOT_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
 
 #[derive(Debug, Deserialize)]
 struct GoogleChatNonSecretConfig {
+    /// The Cloud project number this app's deliveries are minted for, which is
+    /// the `aud` every delivery must carry. Required — there is nothing to
+    /// verify a token against without it.
     project_number: String,
     /// This app's own Chat resource name (`users/<id>`), used only to detect
     /// whether an inbound message `@mentions` this app. Optional and
@@ -95,6 +107,8 @@ struct CachedToken {
 
 pub struct GoogleChatAdapter {
     account_id: String,
+    /// What an inbound token's `aud` must be: the operator's Cloud project
+    /// number, exactly as their Authentication Audience setting mints it.
     project_number: String,
     client_email: String,
     /// PKCS8 DER, parsed once at construction so a malformed key is rejected
@@ -121,7 +135,11 @@ impl GoogleChatAdapter {
             serde_json::from_value(config.account.non_secret_config.clone())
                 .map_err(|error| format!("Invalid Google Chat account config: {error}"))?;
         if non_secret.project_number.trim().is_empty() {
-            return Err("Google Chat account is missing project_number".to_string());
+            return Err(
+                "Google Chat account is missing project_number, which is what its \
+                 Authentication Audience setting of Project Number verifies against"
+                    .to_string(),
+            );
         }
         let secrets: GoogleChatSecrets = serde_json::from_str(&config.secret)
             .map_err(|_| "Google Chat account credential is missing or malformed".to_string())?;
@@ -138,7 +156,7 @@ impl GoogleChatAdapter {
         })?;
         Ok(Self {
             account_id: config.account.account_id.clone(),
-            project_number: non_secret.project_number,
+            project_number: non_secret.project_number.trim().to_string(),
             client_email: secrets.client_email,
             private_key_der,
             bot_user_name: non_secret.bot_user_name.unwrap_or_default(),
@@ -151,14 +169,22 @@ impl GoogleChatAdapter {
     }
 
     #[cfg(test)]
-    fn with_bases(mut self, chat_api_base: &str, oauth_token_base: &str) -> Self {
+    pub(crate) fn with_bases(mut self, chat_api_base: &str, oauth_token_base: &str) -> Self {
         self.chat_api_base = chat_api_base.to_string();
         self.oauth_token_base = oauth_token_base.to_string();
         self
     }
 
+    /// Stand in for the JWKS fetch with this file's own test key, so a test can
+    /// verify a genuinely signed token without reaching Google.
     #[cfg(test)]
-    fn with_jwks_url(mut self, jwks_url: &str) -> Self {
+    pub(crate) fn seed_jwks_for_test(&self) {
+        self.jwks_cache
+            .seed_for_test("test-key-1", tests::test_jwk());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_jwks_url(mut self, jwks_url: &str) -> Self {
         self.jwks_url = jwks_url.to_string();
         self
     }
@@ -257,15 +283,24 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         ChannelKind::GoogleChat
     }
 
+    /// Google Chat reads a `200`'s body as an optional immediate reply and
+    /// treats any other status as a failed delivery. An empty JSON object is
+    /// how an app that will answer through the API later says there is nothing
+    /// to post right now.
+    fn ack(&self) -> crate::daemon::channel_adapter::WebhookAck {
+        crate::daemon::channel_adapter::WebhookAck::json_ok()
+    }
+
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
-        // `public_base_url` is unused: Google's JWT signs the token's own
-        // claims, never the delivery URL.
+    ) -> Result<VerifiedWebhookDelivery, String> {
+        // `public_base_url` is unused: the only supported Authentication
+        // Audience is the project number, so nothing here is ever compared
+        // against a URL — least of all one a request could choose.
         let authorization = headers
             .iter()
             .find(|(name, _)| name == "authorization")
@@ -292,11 +327,13 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         // Google's own JWKS — the body is never parsed before that.
         let event: JsonValue = serde_json::from_slice(body)
             .map_err(|_| "Google Chat event body is not valid JSON".to_string())?;
-        Ok(
+        // A Chat reply is addressed by space name alone, so this delivery
+        // establishes no addressing that has to outlive it.
+        Ok(VerifiedWebhookDelivery::messages_only(
             normalize_event(&event, &self.account_id, &self.bot_user_name, now_ms)
                 .into_iter()
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -312,7 +349,8 @@ impl ChannelAdapter for GoogleChatAdapter {
             supports_threads: true,
             supports_attachments: false,
             supports_mention_metadata: true,
-            supports_idempotency_key: false,
+            // `requestId` on messages.create, which the send always carries.
+            supports_idempotency_key: true,
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::GoogleChat, InboundTransport::Webhook)
         }
@@ -356,13 +394,25 @@ impl ChannelAdapter for GoogleChatAdapter {
                 }
             }
         };
-        let url = format!(
-            "{}/v1/{}/messages",
-            self.chat_api_base, message.conversation_id
+        // `requestId` is Chat's own idempotency: creating a message with a
+        // request id it has already seen returns that message rather than
+        // posting a second one. The outbox's key is stable across retries of
+        // the same row, which is the only thing that makes it useful.
+        let mut url = format!(
+            "{}/v1/{}/messages?requestId={}",
+            self.chat_api_base,
+            message.conversation_id,
+            request_id(&message.idempotency_key)
         );
         let mut body = serde_json::json!({ "text": message.text });
         if let Some(thread_id) = &message.thread_id {
             body["thread"] = serde_json::json!({ "name": thread_id });
+            // Naming a thread is not by itself a reply: without this the API
+            // starts a new thread and the answer is posted away from the
+            // question. The fallback is deliberate — a thread that has since
+            // been deleted should still get the answer somewhere visible
+            // rather than nowhere.
+            url.push_str("&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
         }
         let request = client.post(url).bearer_auth(&token).json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
@@ -433,6 +483,19 @@ impl ChannelAdapter for GoogleChatAdapter {
     }
 }
 
+/// The outbox's idempotency key as a Chat `requestId`.
+///
+/// Hex of a digest rather than the key itself: the key is an internal id of no
+/// fixed alphabet, and this ends up in a query string. Deterministic, because a
+/// request id that changed per attempt would collapse nothing.
+fn request_id(idempotency_key: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, idempotency_key.as_bytes());
+    digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// Strips PEM armor and base64-decodes to PKCS8 DER.
 fn pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, ()> {
     let body: String = pem
@@ -486,7 +549,7 @@ fn mint_service_account_jwt(
 
 fn validate_claims_structurally(
     claims: &JsonValue,
-    expected_project_number: &str,
+    expected_audience: &str,
     now_ms: i64,
 ) -> Result<(), String> {
     let issuer = claims
@@ -500,8 +563,11 @@ fn validate_claims_structurally(
         .get("aud")
         .and_then(JsonValue::as_str)
         .ok_or_else(|| "JWT is missing aud".to_string())?;
-    if audience != expected_project_number {
-        return Err("JWT audience does not match the configured project number".to_string());
+    if audience != expected_audience {
+        return Err(
+            "JWT audience does not match this account's configured authentication audience"
+                .to_string(),
+        );
     }
     let now_secs = now_ms / 1000;
     let exp = claims
@@ -683,7 +749,7 @@ fn normalize_event(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #[test]
     fn an_uploaded_file_becomes_an_attachment_the_adapter_can_fetch() {
@@ -722,7 +788,7 @@ mod tests {
 
     /// A 2048-bit RSA test key generated locally for these tests only. Not
     /// used anywhere else and grants access to nothing.
-    const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDazRpB7LGR9vNE
 et1N+4LHeMOtHD6zHXy7bx4t/YlI0EVVPbekoxkqG5TXLIzrOoKcDoEgOvs5ZpZV
 zdaFW55J1YnUdS84Wiu3rfcBNCNOZXC/ovOpLvTOIU/gqjFM05QqsrXQVK6/iRHO
@@ -751,7 +817,7 @@ sYUI1xZFJBXRBoaBu6eF94YD5JKHxsm80gSsAHACPui5VVoMSoHPA8YXxlHh5nFC
 rBTxwRqn0v9lv8H7GtnYwaw=
 -----END PRIVATE KEY-----";
 
-    fn test_account() -> ChannelAccountRecord {
+    pub(crate) fn test_account() -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-gchat".to_string(),
             kind: ChannelKind::GoogleChat,
@@ -799,12 +865,102 @@ rBTxwRqn0v9lv8H7GtnYwaw=
         format!("{header}.{payload}.{signature}")
     }
 
-    fn valid_claims(now_secs: i64) -> JsonValue {
+    pub(crate) fn valid_claims(now_secs: i64) -> JsonValue {
         serde_json::json!({
             "iss": EXPECTED_ISSUER,
             "aud": "123456789",
             "exp": now_secs + 3600,
             "iat": now_secs - 60,
+        })
+    }
+
+    // --- Authentication audience ------------------------------------------
+
+    fn signed(claims: &JsonValue) -> Vec<(String, String)> {
+        vec![(
+            "authorization".to_string(),
+            format!(
+                "Bearer {}",
+                sign_test_jwt(claims, "test-key-1", TEST_PRIVATE_KEY_PEM)
+            ),
+        )]
+    }
+
+    /// The one supported Authentication Audience: `aud` is the project number,
+    /// and a genuinely signed token carrying it verifies.
+    #[test]
+    fn the_project_number_is_what_a_delivery_is_verified_against() {
+        let adapter = adapter();
+        adapter.seed_jwks_for_test();
+        let now_ms = 1_700_000_000_000i64;
+        adapter
+            .verify_and_normalize(
+                &signed(&valid_claims(now_ms / 1000)),
+                &serde_json::to_vec(&dm_message_event()).unwrap(),
+                Some("https://monkey.example.test"),
+                now_ms,
+            )
+            .expect("the project number is the audience");
+    }
+
+    /// The callback URL is Google's *other* Authentication Audience setting,
+    /// which mints a different token from a different issuer. Nothing here
+    /// accepts one, and the operator's own public base cannot make it so.
+    #[test]
+    fn a_token_whose_audience_is_the_callback_url_is_refused() {
+        let adapter = adapter();
+        adapter.seed_jwks_for_test();
+        let now_ms = 1_700_000_000_000i64;
+        let mut claims = valid_claims(now_ms / 1000);
+        claims["aud"] = JsonValue::from("https://monkey.example.test/v1/channels/acct-gchat");
+
+        let result = adapter.verify_and_normalize(
+            &signed(&claims),
+            &serde_json::to_vec(&dm_message_event()).unwrap(),
+            Some("https://monkey.example.test"),
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("audience"));
+    }
+
+    /// An account cannot select an audience mode at all: the key is not a
+    /// Google Chat setting, so a config carrying it is refused before it is
+    /// ever stored.
+    #[test]
+    fn an_audience_mode_is_not_a_setting_this_provider_has() {
+        let error = crate::daemon::adapters::validate_non_secret_config(
+            ChannelKind::GoogleChat,
+            &serde_json::json!({ "project_number": "123456789", "auth_audience": "app_url" }),
+        )
+        .expect_err("there is no audience mode to choose");
+        assert!(error.contains("auth_audience"), "{error}");
+    }
+
+    #[test]
+    fn the_project_number_is_required() {
+        let mut account = test_account();
+        account.non_secret_config = serde_json::json!({});
+        let error = GoogleChatAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: serde_json::json!({
+                "client_email": "bot@test-project.iam.gserviceaccount.com",
+                "private_key": TEST_PRIVATE_KEY_PEM,
+            })
+            .to_string(),
+        })
+        .err()
+        .expect("no audience to verify against");
+        assert!(error.contains("project_number"));
+    }
+
+    /// A token that is valid on any clock a test in this tree runs on — see
+    /// the Teams adapter's helper of the same name for why.
+    pub(crate) fn long_lived_claims() -> JsonValue {
+        serde_json::json!({
+            "iss": EXPECTED_ISSUER,
+            "aud": "123456789",
+            "exp": 4_000_000_000i64,
+            "iat": 1_500_000_000i64,
         })
     }
 
@@ -871,10 +1027,24 @@ Z4Cr3JR0FbjywTd4IHU6
     const TEST_JWK_N: &str = "2s0aQeyxkfbzRHrdTfuCx3jDrRw-sx18u28eLf2JSNBFVT23pKMZKhuU1yyM6zqCnA6BIDr7OWaWVc3WhVueSdWJ1HUvOFort633ATQjTmVwv6LzqS70ziFP4KoxTNOUKrK10FSuv4kRznKDli7vOrOxq8JIyd0NK5GoyyjZV42eM2ZPHMqNxcEwKJtCc_GdZPwB7wp7k1u6JnFUTZyp-LzSs3W50lu8Bo1zbrr3CHvhHhCHwqXXfrtvjY-ILesDcRtDeMpZ8HfYn6mWl1-gnRfVqMopI1eWhQeSr58NgKlfJgKkAsJrFx5igpgJwkQK9M_Y3aeslGVumlsZybwJBw";
     const TEST_JWK_E: &str = "AQAB";
 
-    fn test_jwk() -> JwkRsaKey {
+    /// The `kid` this file's test key is published under for the tests that
+    /// drive the production HTTP route, which builds its own adapter and so
+    /// cannot be handed a seeded cache.
+    pub(crate) const ROUTE_KID: &str = "gchat-route-key";
+
+    /// Publish the test key as Google's own JWKS would, so every cache built
+    /// from here on can verify a token signed with it.
+    pub(crate) fn publish_route_jwk() {
+        super::super::jwt::test_keys::publish(ROUTE_KID, test_jwk());
+    }
+
+    pub(crate) fn test_jwk() -> JwkRsaKey {
         JwkRsaKey {
             n: URL_SAFE_NO_PAD.decode(TEST_JWK_N).unwrap(),
             e: URL_SAFE_NO_PAD.decode(TEST_JWK_E).unwrap(),
+            // Google's JWKS declares no endorsements, and nothing in this
+            // adapter reads them.
+            endorsements: Vec::new(),
         }
     }
 
@@ -883,7 +1053,7 @@ Z4Cr3JR0FbjywTd4IHU6
     /// verifier the same way [`the_service_account_jwt_signs_and_verifies_with_its_own_public_key`]
     /// already does for the outbound assertion — this is the same technique
     /// aimed at an inbound delivery instead.
-    fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
+    pub(crate) fn sign_test_jwt(claims: &JsonValue, kid: &str, private_key_pem: &str) -> String {
         let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": kid});
         let signing_input = format!(
             "{}.{}",
@@ -935,7 +1105,8 @@ Z4Cr3JR0FbjywTd4IHU6
                 None,
                 now_ms,
             )
-            .expect("a genuinely signed, structurally valid token must verify");
+            .expect("a genuinely signed, structurally valid token must verify")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].text, "hello there");
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
