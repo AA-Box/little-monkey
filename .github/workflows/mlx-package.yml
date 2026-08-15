@@ -36,7 +36,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
 
       # Pinned to a commit rather than the `v4` tag the other workflows use.
       # This is the one workflow that holds MLX_SIGNING_PRIVATE_KEY, and a

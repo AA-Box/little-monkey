@@ -83,6 +83,9 @@ pub async fn start(
             source_run_id: source_run_id.map(str::to_string),
             source_session_id: source_session_id.map(str::to_string),
             source_tool_call_id: None,
+            // No invocation identity: a stream is opened by an operator asking
+            // for one, and two deliberate asks are two streams.
+            invocation_id: None,
             // The same clock as the session's, deliberately. A discrete command
             // expires in five minutes so a camera cannot fire long after the
             // conversation moved on; a stream's control command has to outlive
@@ -376,6 +379,7 @@ pub fn expire(store: &mut RemoteStore, now_ms: u64) -> Result<usize, String> {
                 "The stream passed its deadline without the device closing it; whether the \
                  microphone is still open is unproven",
             ),
+            None,
             now_ms,
         );
     }
@@ -580,6 +584,7 @@ mod tests {
                     source_run_id: None,
                     source_session_id: None,
                     source_tool_call_id: None,
+                    invocation_id: None,
                     expires_at_ms: 1_000_000,
                 },
                 1,
@@ -589,9 +594,12 @@ mod tests {
             .lease_device_command(&device, 30_000, 2)
             .unwrap()
             .unwrap();
-        assert!(store
-            .start_device_command(&device, &command.command_id, 3)
-            .unwrap());
+        assert!(
+            store
+                .start_device_command(&device, &command.command_id, Some("exec-voice"), 3)
+                .unwrap()
+                .started
+        );
         let session_id = format!(
             "vs-{}",
             super::super::protocol::random_token_id(18).unwrap()

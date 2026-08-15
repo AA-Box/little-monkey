@@ -1133,8 +1133,20 @@ pub async fn remote_host_disable() -> Result<String, String> {
     .await
 }
 
+/// Creates one invitation and hands the panel everything it needs to show it.
+///
+/// Returns JSON rather than the CLI's own sentence because the pairing panel
+/// has to *render* the compact code as a scannable image, and a webview cannot
+/// do that from a line of prose. `--qr --json` is always passed: the code costs
+/// nothing to compute, and an operator who has a phone in their hand should not
+/// have to re-run the command with another flag to get it — the invitation is
+/// one-time, so re-running it would strand the first one.
+///
+/// The doc comment sits *above* the attribute deliberately: `lib.rs`'s
+/// reachability guard scans the text between `#[tauri::command` and `fn`, and
+/// anything in that gap makes the command invisible to it.
 #[tauri::command]
-pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, String> {
+pub async fn remote_pair_create(request: RemotePairRequest) -> Result<Value, String> {
     validate_output_path(&request.output)?;
     validate_remote_pair_request(&request)?;
     let mut args = vec![
@@ -1147,6 +1159,8 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
         request.expires_minutes.to_string(),
         "--max-artifact-bytes".into(),
         request.max_artifact_bytes.to_string(),
+        "--qr".into(),
+        "--json".into(),
     ];
     for action in request.actions {
         args.extend(["--action".into(), action]);
@@ -1165,7 +1179,89 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
     for capability in request.device_capabilities {
         args.extend(["--device".into(), capability]);
     }
+    parse_json(&command(args).await?)
+}
+
+// --- Push, as the operator's own configuration ------------------------------
+//
+// Little Monkey ships no push project, no key and no relay, so every one of
+// these commands acts on state the operator created on this machine. They are
+// here because the settings panel is where somebody decides whether their phone
+// may be woken at all, and shelling out to a terminal for that decision is how
+// a feature ends up switched on by nobody.
+
+#[tauri::command]
+pub async fn remote_push_status() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "push-status".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Turns push on, either as Web Push (this runner's own VAPID identity, no
+/// account anywhere) or against the operator's own Firebase project.
+///
+/// `include_detail` is passed through rather than defaulted here: it decides
+/// whether run specifics reach a lock screen, and the panel states that in the
+/// sentence beside the checkbox.
+#[tauri::command]
+pub async fn remote_push_configure(
+    web_push: bool,
+    vapid_subject: Option<String>,
+    project_id: Option<String>,
+    service_account: Option<String>,
+    include_detail: bool,
+) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "push-configure".into()];
+    if web_push {
+        args.push("--web-push".into());
+        if let Some(subject) = vapid_subject {
+            validate_token("VAPID subject", &subject, 512)?;
+            args.extend(["--vapid-subject".into(), subject]);
+        }
+    } else {
+        let project = project_id.ok_or("A Firebase project id is required")?;
+        validate_token("project id", &project, 256)?;
+        let account = service_account.ok_or("A service account JSON key is required")?;
+        validate_existing_private_input("service account key", &account)?;
+        args.extend([
+            "--project-id".into(),
+            project,
+            "--service-account".into(),
+            account,
+        ]);
+    }
+    if include_detail {
+        args.push("--include-detail".into());
+    }
     command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_push_disable() -> Result<String, String> {
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "push-disable".into(),
+    ])
+    .await
+}
+
+#[tauri::command]
+pub async fn remote_push_test(device_id: String) -> Result<String, String> {
+    validate_id("device id", &device_id)?;
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "push-test".into(),
+        device_id,
+    ])
+    .await
 }
 
 #[tauri::command]
@@ -1440,6 +1536,17 @@ pub async fn tool_device_action(
     }
     if let Some(wait_ms) = wait_ms {
         args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    }
+    // The turn and the call inside it: the desktop's durable identity for this
+    // invocation, and the only thing that stops a replayed turn from taking a
+    // second photograph. Both come from the runtime, never from the model.
+    if let (Some(turn_id), Some(tool_call_id)) = (&turn_id, &tool_call_id) {
+        validate_id("turn id", turn_id)?;
+        validate_id("tool call id", tool_call_id)?;
+        args.extend([
+            "--invocation-id".into(),
+            format!("{turn_id}:{tool_call_id}"),
+        ]);
     }
     parse_json(&command(args).await?)
 }
