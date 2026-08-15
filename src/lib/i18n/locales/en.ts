@@ -27,6 +27,7 @@ import { knowledgeGraphExplorerLocale } from "./knowledgeGraphExplorer";
 import { spreadsheetCopilotLocale } from "./spreadsheetCopilot";
 import { onboardingLocale } from "./onboarding";
 import { dailyBriefLocale } from "./dailyBrief";
+import { talkLocale } from "./talk";
 import { apiContractDiffLabLocale } from "./apiContractDiffLab";
 import { migrationAgentLocale } from "./migrationAgent";
 import { dataNotebookLocale } from "./dataNotebook";
@@ -76,6 +77,7 @@ export const en: Record<string, string> = {
   ...spreadsheetCopilotLocale,
   ...onboardingLocale,
   ...dailyBriefLocale,
+  ...talkLocale,
   ...apiContractDiffLabLocale,
   ...migrationAgentLocale,
   ...dataNotebookLocale,

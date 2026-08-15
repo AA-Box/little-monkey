@@ -198,6 +198,37 @@
           </form>
         </section>
 
+        <section id="talkPanel" class="panel talk-panel" aria-labelledby="talkTitle" hidden>
+          <header class="panel-header">
+            <div class="panel-heading">
+              <span class="talk-dot" id="talkDot" aria-hidden="true"></span>
+              <h2 id="talkTitle">Talk</h2>
+            </div>
+            <span id="talkState" class="count-pill" role="status" aria-live="polite">Not connected</span>
+          </header>
+          <p id="talkUnavailable" class="field-help" hidden></p>
+          <div class="talk-controls">
+            <button id="talkButton" class="button primary" type="button">Start Talk</button>
+            <button id="talkInterruptButton" class="button danger" type="button" disabled>Interrupt</button>
+          </div>
+          <div class="talk-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="talkMeter">
+            <div id="talkMeterFill" class="talk-meter-fill"></div>
+          </div>
+          <div class="talk-transcript">
+            <p class="field-label">What you said</p>
+            <p id="talkTranscript" class="talk-text">—</p>
+          </div>
+          <div class="talk-transcript">
+            <p class="field-label">Answer</p>
+            <p id="talkAnswer" class="talk-text">—</p>
+          </div>
+          <p id="talkError" class="field-help talk-error" hidden></p>
+          <p class="field-help">
+            Talk needs this page open and in the foreground. Locking the phone or switching apps
+            ends the conversation; nothing keeps listening in the background.
+          </p>
+        </section>
+
         <div class="workspace-grid">
           <aside class="panel run-sidebar" aria-labelledby="runsTitle">
             <div class="panel-heading compact">

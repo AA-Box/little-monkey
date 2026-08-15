@@ -1652,6 +1652,79 @@ impl RemoteStore {
             .ok_or_else(|| "Queued device command disappeared".to_string())
     }
 
+    /// Registers an open Talk socket as a capture that is happening right now.
+    ///
+    /// **Why a device command row.** "Which device can hear the room, and is it
+    /// hearing it now" is a question the security audit already answers, and it
+    /// answers it by reading non-terminal `remote_device_actions`. A Talk socket
+    /// that did not appear there would be the one microphone in the product
+    /// that an audit could not see — so it appears there, as the `voice_stream`
+    /// capture it is.
+    ///
+    /// It goes straight to `running` rather than through `queued`/`leased`
+    /// because there is nothing to lease: the socket is the transport, it is
+    /// already open, and the audio is already flowing. The expiry is the
+    /// socket's own ceiling, so a runner that dies mid-conversation leaves a row
+    /// that the ordinary sweep terminates as unproven rather than one that
+    /// claims a microphone is open forever.
+    pub fn open_talk_capture(
+        &mut self,
+        device_id: &str,
+        session_id: &str,
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<DeviceCommandRecord, String> {
+        let record = self.enqueue_device_command(
+            &DeviceCommandRequest {
+                device_id: device_id.to_string(),
+                capability: DeviceCapability::VoiceStream,
+                // Bounded, and nothing anybody said: which conversation, over
+                // which transport.
+                arguments: serde_json::json!({
+                    "transport": "talk_socket",
+                    "sessionId": session_id,
+                }),
+                source_run_id: None,
+                source_session_id: Some(session_id.to_string()),
+                source_tool_call_id: None,
+                // A socket is not an invocation delivered twice: the ticket is
+                // one-use, so every admitted socket is its own capture and the
+                // idempotency this field buys has nothing to collapse.
+                invocation_id: None,
+                expires_at_ms,
+            },
+            now_ms,
+        )?;
+        self.connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='running', started_at_ms=?2, updated_at_ms=?2
+                 WHERE command_id=?1",
+                params![record.command_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        self.device_command(&record.command_id)?
+            .ok_or_else(|| "Open Talk capture disappeared".to_string())
+    }
+
+    /// Ends the capture a Talk socket registered. Idempotent, and safe to call
+    /// for a row the expiry sweep already terminated.
+    pub fn close_talk_capture(
+        &mut self,
+        device_id: &str,
+        command_id: &str,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let outcome = if error.is_some() {
+            DeviceCommandState::Failed
+        } else {
+            DeviceCommandState::Succeeded
+        };
+        self.complete_device_command(device_id, command_id, outcome, None, None, error, None, now_ms)
+            .map(|_| ())
+    }
+
     /// Advances every command whose deadline has passed.
     ///
     /// Two different rules, which is the safety property this whole design

@@ -26,6 +26,8 @@ export interface CompanionArtifact {
   createdAtMs: number;
 }
 
+export type SpeechBackendKind = 'system';
+
 export interface VoiceConfig {
   backend: TranscriptionBackendKind;
   whisperBinary: string | null;
@@ -35,6 +37,20 @@ export interface VoiceConfig {
   language: string;
   ttsVoice: string | null;
   saveRawAudio: boolean;
+  /** `MediaDeviceInfo.deviceId` of the chosen microphone, or null for the
+   * system default. Talk and the companion overlay both honour it. */
+  inputDeviceId: string | null;
+  outputDeviceId: string | null;
+  ttsBackend: SpeechBackendKind;
+  vadMinSpeechMs: number;
+  vadSilenceMs: number;
+  vadMaxUtteranceMs: number;
+  /** Local wake-phrase detection. Off by default; the Rust side refuses to
+   * enable it unless transcription runs on this machine. */
+  wakePhraseEnabled: boolean;
+  wakePhrase: string;
+  /** Continuous local listening for the wake phrase. Requires the phrase. */
+  alwaysListening: boolean;
 }
 
 export interface ImageEndpointConfig {

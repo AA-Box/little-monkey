@@ -21,6 +21,16 @@ import {
   unknownOutcomeReport,
   waitOrAbort,
 } from "./device-core.js";
+import {
+  TALK_PROTOCOL_VERSION,
+  chooseTalkMediaType,
+  clampTalkChannels,
+  clampTalkSampleRateHz,
+  createTalkDetector,
+  createTalkFrames,
+  normalizeTalkMediaType,
+  splitTalkAudioBase64,
+} from "./talkProtocol.js";
 
 const PROTOCOL_VERSION = 1;
 const DB_NAME = "little-monkey-remote-v1";
@@ -166,6 +176,19 @@ const CACHE_LIMITS = {
   artifactsPerRun: 50,
 };
 
+/**
+ * The conversation a spoken turn belongs to: the one the operator is looking at.
+ *
+ * Talk used to mint `talk-<device>`, a permanent per-device session in a
+ * namespace nothing else could read, so a spoken question and a typed one could
+ * never land in the same thread. There is a real session model on this page —
+ * a list, a selection and a draft per conversation — and voice uses it, which is
+ * what makes "typed and spoken turns share a session" true rather than claimed.
+ */
+function mobileSessionId() {
+  return state.selectedSessionId;
+}
+
 const ui = Object.fromEntries(
   [
     "pairingView",
@@ -239,6 +262,23 @@ const ui = Object.fromEntries(
     "captureText",
     "captureFile",
     "captureButton",
+    "talkPanel",
+    "talkDot",
+    "talkState",
+    "talkUnavailable",
+    "talkButton",
+    "talkInterruptButton",
+    "talkMeter",
+    "talkMeterFill",
+    "talkTranscript",
+    "talkAnswer",
+    "talkError",
+    "chatPanel",
+    "chatEmpty",
+    "chatForm",
+    "chatInput",
+    "chatSendButton",
+    "chatRefreshButton",
     "connectionDot",
     "connectionText",
     "toast",
@@ -1903,6 +1943,11 @@ function bindEvents() {
   });
   ui.captureForm?.addEventListener("submit", (event) => void fileCapture(event));
 
+  ui.talkButton?.addEventListener("click", () => {
+    if (talk.running) void stopTalk();
+    else void startTalk();
+  });
+  ui.talkInterruptButton?.addEventListener("click", () => talkInterrupt("stop_button"));
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -2149,6 +2194,7 @@ function renderDeviceState() {
   ui.deviceGranted.textContent = capabilityList(value.granted);
   ui.deviceSupported.textContent = capabilityList(value.advertised);
   ui.deviceEffective.textContent = capabilityList(value.effective);
+  renderTalkPanel();
   const permissions = value.os_permissions || {};
   const entries = Object.entries(permissions);
   ui.devicePermissions.textContent = entries.length
@@ -2752,6 +2798,510 @@ function stagedArtifactOutcome(outcome) {
 }
 
 // --- The durable command journal -------------------------------------------
+
+// --- Talk: a live conversation over a dedicated socket ----------------------
+//
+// Everything else this client does is a signed request: HMAC over method, path,
+// body, sequence, nonce and key generation. A WebSocket handshake takes no
+// headers, so Talk cannot be authenticated the same way — instead it makes ONE
+// ordinary signed request for a one-use ticket and spends it immediately on the
+// socket. The socket carries no other credential, and the ticket is gone the
+// moment it is used.
+//
+// Voice activity detection is local and stays local: the phone decides where an
+// utterance ends and marks the last frame, so the runner never guesses from
+// silence it cannot hear. Nothing is uploaded while nobody is speaking — and
+// nothing is *recorded* while nobody is speaking either. The microphone is
+// observed continuously (barge-in depends on that) but the recorder is armed
+// only at confirmed speech and stopped at the end of it, so an uploaded blob
+// contains one utterance rather than every silent minute since the last one.
+//
+// Foreground only, and said so on screen. A page that is hidden loses its
+// microphone on iOS and Android alike, so the session is closed deliberately
+// rather than left looking alive.
+//
+// The frames themselves are built in `talkProtocol.js`, which owns the
+// sequences and refuses to build an audio frame before the hello. That is the
+// one property this file cannot be trusted with: the runner's first-frame rule
+// is invisible to anything that only reads the source.
+
+const TALK_CHUNK_MS = 250;
+
+const talk = {
+  socket: null,
+  stream: null,
+  recorder: null,
+  context: null,
+  analyser: null,
+  meterTimer: null,
+  /** The frame builder for this session; also the proof a hello was sent. */
+  frames: null,
+  detector: null,
+  /** Container this session's recorder is asked for, agreed with the hello. */
+  recorderOptions: null,
+  /** Timings for the utterance being recorded right now, and nothing else. */
+  utterance: null,
+  sessionId: null,
+  sessionGeneration: null,
+  /**
+   * Whether the runner is mid-answer, as this client last heard it.
+   *
+   * Read instead of the panel's `data-state` attribute: barge-in has to work
+   * while the model is still generating, and reaching into the DOM for that
+   * made the answer depend on which frame last repainted a badge.
+   */
+  answering: false,
+  /** Queue of synthesized chunks, played strictly in order. */
+  playing: Promise.resolve(),
+  playbackGeneration: 0,
+  player: null,
+  running: false,
+};
+
+function talkSupported() {
+  return Boolean(
+    window.WebSocket &&
+      window.MediaRecorder &&
+      window.AudioContext &&
+      navigator.mediaDevices?.getUserMedia,
+  );
+}
+
+function setTalkState(label, key) {
+  ui.talkState.textContent = label;
+  ui.talkPanel.dataset.state = key;
+  ui.talkInterruptButton.disabled = !(key === "thinking" || key === "speaking");
+}
+
+function showTalkError(message) {
+  ui.talkError.hidden = !message;
+  ui.talkError.textContent = message || "";
+}
+
+// The runner's effective set is the authority; a capability this device
+// advertises but was not granted must read as unavailable, not as broken.
+function renderTalkPanel() {
+  if (!ui.talkPanel) return;
+  const effective = state.deviceState?.effective || [];
+  const granted = state.deviceState?.granted || [];
+  const permitted = effective.includes("voice_stream");
+  ui.talkPanel.hidden = !state.profile;
+  ui.talkButton.disabled = !permitted || state.stale;
+  if (!talkSupported()) {
+    ui.talkUnavailable.hidden = false;
+    ui.talkUnavailable.textContent =
+      "This browser cannot open a microphone stream, so Talk is unavailable here.";
+    ui.talkButton.disabled = true;
+    return;
+  }
+  if (!permitted) {
+    ui.talkUnavailable.hidden = false;
+    ui.talkUnavailable.textContent = granted.includes("voice_stream")
+      ? "Talk is granted, but this device's microphone permission has not been given. Allow the microphone and reload."
+      : "Talk needs the voice_stream grant. Grant it on the runner's device card.";
+    return;
+  }
+  ui.talkUnavailable.hidden = true;
+}
+
+/**
+ * Hands one already-built frame to the socket.
+ *
+ * It takes a finished frame rather than building one, because the sequence
+ * numbers and the first-frame rule belong to `createTalkFrames` — a helper that
+ * built frames here is exactly how `audio` came to be sent before `hello`.
+ */
+function talkSendFrame(frame) {
+  if (!talk.socket || talk.socket.readyState !== WebSocket.OPEN) return;
+  talk.socket.send(JSON.stringify(frame));
+}
+
+/** Stop the speaker and drop everything queued behind it. */
+function talkStopPlayback() {
+  talk.playbackGeneration += 1;
+  talk.playing = Promise.resolve();
+  if (talk.player) {
+    talk.player.pause();
+    talk.player = null;
+  }
+}
+
+function talkInterrupt(reason) {
+  talkStopPlayback();
+  // The runner will confirm with an `interrupted` state, but this device stops
+  // believing it is being answered right now — otherwise the next confirmed
+  // syllable sends a second interrupt for an answer already abandoned.
+  talk.answering = false;
+  if (talk.frames) talkSendFrame(talk.frames.interrupt(reason));
+}
+
+function talkQueueAudio(audioBase64, mediaType) {
+  const generation = talk.playbackGeneration;
+  talk.playing = talk.playing.then(
+    () =>
+      new Promise((resolve) => {
+        if (generation !== talk.playbackGeneration) {
+          resolve();
+          return;
+        }
+        const bytes = Uint8Array.from(atob(audioBase64), (character) => character.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: mediaType || "audio/wav" }));
+        const player = new Audio(url);
+        talk.player = player;
+        const finish = () => {
+          URL.revokeObjectURL(url);
+          if (talk.player === player) talk.player = null;
+          resolve();
+        };
+        player.onended = finish;
+        player.onerror = finish;
+        player.play().catch(finish);
+      }),
+  );
+}
+
+function talkHandleFrame(raw) {
+  let frame;
+  try {
+    frame = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (frame.session_generation !== talk.sessionGeneration) return;
+  switch (frame.type) {
+    case "ready":
+      setTalkState("Listening", "listening");
+      break;
+    case "state":
+      setTalkState(
+        {
+          idle: "Idle",
+          starting: "Starting",
+          listening: "Listening",
+          transcribing: "Transcribing",
+          thinking: "Thinking",
+          speaking: "Speaking",
+          interrupted: "Interrupted",
+          error: "Error",
+        }[frame.state] || frame.state,
+        frame.state,
+      );
+      // An answer is in flight from the moment the model starts generating, not
+      // from the moment audio arrives. Talking during "thinking" has to reach
+      // the runner, or the first thing the speaker does is talk over the user.
+      talk.answering = frame.state === "thinking" || frame.state === "speaking";
+      if (frame.state === "interrupted") talkStopPlayback();
+      break;
+    case "transcript":
+      ui.talkTranscript.textContent = frame.text;
+      ui.talkAnswer.textContent = "—";
+      // A spoken turn becomes a message in the shared conversation, so the
+      // typed list has to hear about it too.
+      break;
+    case "assistant_delta":
+      ui.talkAnswer.textContent =
+        ui.talkAnswer.textContent === "—" ? frame.text : ui.talkAnswer.textContent + frame.text;
+      break;
+    case "output_audio":
+      talkQueueAudio(frame.audio_base64, frame.media_type);
+      break;
+    case "error":
+      showTalkError(frame.message);
+      if (!frame.retryable) void stopTalk();
+      break;
+    default:
+      break;
+  }
+}
+
+async function startTalk() {
+  if (talk.running) return;
+  showTalkError("");
+  setButtonBusy(ui.talkButton, true, "Connecting…");
+  const sessionId = mobileSessionId();
+  if (!sessionId) {
+    // Talk names the conversation the operator is looking at, so there has to
+    // be one. Minting a session of Talk's own is what put voice in a namespace
+    // the typed surface could not read.
+    showTalkError("Choose a conversation above, then start Talk.");
+    setButtonBusy(ui.talkButton, false);
+    return;
+  }
+  try {
+    // The microphone is opened BEFORE the ticket is asked for: a ticket lives
+    // thirty seconds, and a permission prompt the user reads slowly would burn
+    // it before the socket ever opened.
+    talk.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: false,
+    });
+    // Everything the hello has to state is settled here, before there is a
+    // socket to be wrong on. The container is the one the recorder will
+    // actually produce, and the rate and channel count are read from the
+    // microphone and the audio graph rather than invented — the runner refuses
+    // a hello outside 8 kHz–192 kHz or outside one or two channels, and a
+    // plausible-looking guess is still a guess about someone else's hardware.
+    const preferred = chooseTalkMediaType((type) => MediaRecorder.isTypeSupported(type));
+    talk.recorderOptions = preferred ? { mimeType: preferred } : undefined;
+    // No preference supported: a recorder still records in *something*, so ask
+    // a throwaway one what that is rather than naming a container this browser
+    // will not produce.
+    const recorded = preferred || new MediaRecorder(talk.stream).mimeType;
+    const mediaType = normalizeTalkMediaType(recorded);
+    if (!mediaType) {
+      // Sending the bytes anyway under a container name they do not have would
+      // hand the transcriber a file whose header contradicts its media type.
+      throw new RemoteError(`This browser records in ${recorded || "a container"} that Talk cannot transcribe`, 0);
+    }
+    const context = new AudioContext();
+    talk.context = context;
+    // A context created inside a gesture handler can still open suspended on
+    // iOS, and a suspended graph feeds the detector silence for ever.
+    if (context.state === "suspended") await context.resume().catch(() => undefined);
+    const settings = talk.stream.getAudioTracks()[0]?.getSettings?.() || {};
+    const sampleRateHz = clampTalkSampleRateHz(context.sampleRate);
+    const channels = clampTalkChannels(settings.channelCount);
+
+    const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", {
+      protocol_version: TALK_PROTOCOL_VERSION,
+      session_id: sessionId,
+    });
+    talk.sessionId = ticket.session_id;
+    talk.sessionGeneration = ticket.session_generation;
+    // Same origin as this page, by construction: pairing already refused an
+    // invitation whose runner URL was not this origin, so there is no second
+    // host a socket could be pointed at.
+    const url = new URL(ticket.websocket_path, location.origin);
+    url.protocol = "wss:";
+    url.searchParams.set("ticket", ticket.ticket);
+    const socket = new WebSocket(url.toString());
+    talk.socket = socket;
+    await new Promise((resolve, reject) => {
+      socket.onopen = resolve;
+      socket.onerror = () => reject(new RemoteError("The Talk socket could not be opened", 0));
+    });
+    socket.onmessage = (event) => talkHandleFrame(event.data);
+    socket.onclose = () => {
+      if (talk.running) void stopTalk("The runner closed the conversation");
+    };
+    talk.running = true;
+    talk.answering = false;
+    ui.talkButton.textContent = "End Talk";
+    // Frame 1 is the hello, before anything can produce a frame 2: the runner
+    // refuses any other opening frame with `retryable: false`, which this
+    // client's own error handler turns into a torn-down session.
+    talk.frames = createTalkFrames({
+      sessionId: ticket.session_id,
+      sessionGeneration: ticket.session_generation,
+      mediaType,
+      sampleRateHz,
+      channels,
+    });
+    talkSendFrame(talk.frames.hello());
+    // Only now: the detector and the recorder it arms cannot run before the
+    // greeting they belong to.
+    talkStartCapture(context);
+    setTalkState("Listening", "listening");
+  } catch (error) {
+    await stopTalk();
+    handleError(error, "Talk could not be started");
+  } finally {
+    setButtonBusy(ui.talkButton, false);
+    if (talk.running) ui.talkButton.textContent = "End Talk";
+  }
+}
+
+function talkStartCapture(context) {
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 1024;
+  context.createMediaStreamSource(talk.stream).connect(analyser);
+  talk.analyser = analyser;
+  talk.detector = createTalkDetector();
+  const buffer = new Float32Array(analyser.fftSize);
+  // The microphone is observed for the whole session; only the recorder starts
+  // and stops. Barge-in needs to hear the user while the runner is speaking,
+  // which a detector that only ran during recording could not do.
+  talk.meterTimer = setInterval(() => {
+    if (!talk.analyser || !talk.detector) return;
+    talk.analyser.getFloatTimeDomainData(buffer);
+    let squares = 0;
+    for (const sample of buffer) squares += sample * sample;
+    const rms = Math.sqrt(squares / buffer.length);
+    const { event, threshold, speechDetectionMs } = talk.detector.observe(rms, Date.now());
+    // The two writes the detector deliberately does not do, so that it can be
+    // tested without a document.
+    ui.talkMeterFill.style.width = `${Math.min(100, Math.round((rms / Math.max(threshold * 2.5, 0.001)) * 100))}%`;
+    ui.talkMeter.setAttribute("aria-valuenow", String(Math.min(100, Math.round(rms * 1000))));
+    if (event === "speech-start") {
+      // Talking over the answer stops it, here and on the runner — whether the
+      // runner is speaking or still thinking about what to say.
+      if (talk.answering) talkInterrupt("barge_in");
+      talkBeginUtterance(speechDetectionMs);
+    } else if (event === "utterance-end" || event === "max-utterance") {
+      talkFinishUtterance();
+    }
+  }, 20);
+}
+
+/**
+ * One recorder per utterance, armed at confirmed speech and not before.
+ *
+ * The recorder used to run continuously and re-arm itself, which meant every
+ * upload carried the whole silent gap since the last one — and, during a
+ * barge-in, the assistant's own answer coming back in through the speaker.
+ * Browser echo cancellation is not enough on its own: it is a best-effort DSP
+ * on a phone held at arm's length, and it is not what decides what leaves the
+ * device. Not recording is.
+ *
+ * The cost is the ~180 ms the detector spends confirming: the first syllable of
+ * each utterance is not in the recording. That is deliberate and tested — a
+ * pre-roll buffer would mean holding raw microphone audio that nobody asked to
+ * be recorded, which is the trade this client refuses to make.
+ */
+function talkBeginUtterance(speechDetectionMs) {
+  if (!talk.stream || !talk.running || !talk.frames) return;
+  // Anything still recording is discarded rather than continued. Nothing
+  // captured before this moment — including assistant audio that leaked back
+  // through the speaker — can ride along with what the user is saying now.
+  talkDiscardRecorder();
+  const recorder = talk.recorderOptions
+    ? new MediaRecorder(talk.stream, talk.recorderOptions)
+    : new MediaRecorder(talk.stream);
+  const chunks = [];
+  recorder.ondataavailable = (event) => {
+    if (event.data?.size) chunks.push(event.data);
+  };
+  // Held in the closure rather than read back off `talk` when the recorder
+  // stops: `onstop` is asynchronous, and these three numbers belong to *this*
+  // utterance whatever the microphone has heard since.
+  const utterance = { speechDetectionMs, startedAtMs: Date.now(), stoppedAtMs: null };
+  recorder.onstop = async () => {
+    const stoppedAtMs = utterance.stoppedAtMs ?? Date.now();
+    const blob = new Blob(chunks, { type: talk.frames?.mediaType || "audio/webm" });
+    if (blob.size > 0 && talk.running && talk.frames) {
+      const audioBase64 = await blobToBase64(blob);
+      // Ninety seconds of Opus is far more than one frame may carry, so the
+      // utterance goes out as however many frames it takes; the runner
+      // reassembles them and only the last one closes it.
+      const chunks = splitTalkAudioBase64(audioBase64);
+      try {
+        // Before the audio, not after: the runner answers the moment the
+        // closing frame lands, so metrics sent afterwards would arrive too late
+        // to belong to this utterance. They name it explicitly as well, so a
+        // future reordering loses the telemetry instead of misfiling it.
+        //
+        // Three durations, measured on this device, that the runner cannot see.
+        // Never a word of what was said — the frame has no room for one.
+        talkSendFrame(
+          talk.frames.metrics({
+            audioSequence: talk.frames.audioSequence + 1,
+            speechDetectionMs: utterance.speechDetectionMs,
+            captureMs: stoppedAtMs - utterance.startedAtMs,
+            uploadMs: Date.now() - stoppedAtMs,
+          }),
+        );
+        chunks.forEach((chunk, at) => {
+          talkSendFrame(talk.frames.audio({ audioBase64: chunk, last: at === chunks.length - 1 }));
+        });
+      } catch (error) {
+        // Refused here rather than by the runner, whose refusal is not
+        // retryable and would end the conversation.
+        showTalkError(String(error?.message || error));
+        return;
+      }
+    }
+    // Deliberately NOT re-armed: the next recorder starts at the next confirmed
+    // speech-start, so the microphone is observed but nothing is captured while
+    // the runner answers.
+  };
+  talk.recorder = recorder;
+  talk.utterance = utterance;
+  recorder.start(TALK_CHUNK_MS);
+}
+
+/** Drops a recorder without uploading what it holds. */
+function talkDiscardRecorder() {
+  const recorder = talk.recorder;
+  talk.recorder = null;
+  talk.utterance = null;
+  if (recorder && recorder.state !== "inactive") {
+    recorder.onstop = null;
+    recorder.stop();
+  }
+}
+
+function talkFinishUtterance() {
+  const recorder = talk.recorder;
+  talk.recorder = null;
+  if (!recorder || recorder.state === "inactive") return;
+  // Stamped before `stop()` so the upload span measures the encode and the
+  // base64, not the time the browser took to notice.
+  if (talk.utterance) talk.utterance.stoppedAtMs = Date.now();
+  talk.utterance = null;
+  recorder.stop();
+}
+
+async function stopTalk(reason) {
+  talk.running = false;
+  talk.answering = false;
+  talkStopPlayback();
+  if (talk.meterTimer) {
+    clearInterval(talk.meterTimer);
+    talk.meterTimer = null;
+  }
+  talkDiscardRecorder();
+  talk.detector = null;
+  talk.frames = null;
+  talk.recorderOptions = null;
+  // Always: a microphone left open after a failed conversation is the failure
+  // that matters here.
+  stopTracks(talk.stream);
+  talk.stream = null;
+  if (talk.context) {
+    void talk.context.close().catch(() => undefined);
+    talk.context = null;
+  }
+  talk.analyser = null;
+  if (talk.socket) {
+    talk.socket.onclose = null;
+    if (talk.socket.readyState === WebSocket.OPEN) talk.socket.close();
+    talk.socket = null;
+  }
+  talk.sessionId = null;
+  talk.sessionGeneration = null;
+  ui.talkButton.textContent = "Start Talk";
+  setTalkState(reason || "Not connected", "idle");
+  if (reason) showTalkError(reason);
+}
+
+// A page that is hidden has no microphone on either mobile platform. Ending the
+// session is the honest response; a "background Talk" this cannot deliver would
+// be a promise the operating system breaks.
+//
+// Three hooks, because `visibilitychange` alone does not cover the ways a
+// mobile page actually goes away: iOS puts a page into the back/forward cache
+// or evicts it outright, and Chrome freezes a backgrounded tab. Either can
+// happen without a visibility change, and a session that ends only when the
+// process does holds the microphone and the socket until then.
+function endTalkForBackground(reason) {
+  if (talk.running) void stopTalk(reason);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) endTalkForBackground("Talk ended: this page went to the background");
+});
+window.addEventListener("pagehide", () => {
+  endTalkForBackground("Talk ended: this page was closed or put away");
+});
+// Not implemented everywhere; where it is, it is the last event a frozen tab
+// gets, and `stopTalk` is synchronous up to and including releasing the tracks.
+document.addEventListener("freeze", () => {
+  endTalkForBackground("Talk ended: this tab was frozen by the browser");
+});
+
+// --- The command loop ------------------------------------------------------
+
+// Long-polls for work, performs it, and reports back.
 //
 // One record per command this device has been handed, holding the phase it
 // reached and — once it has one — the staged result including its bytes. It is
@@ -3282,6 +3832,10 @@ function applyStaleState() {
   ]) {
     if (button) button.disabled = state.stale;
   }
+  // A conversation cannot continue against a runner this device cannot reach,
+  // and a microphone must not stay open while it tries.
+  if (state.stale && talk.running) void stopTalk("Talk ended: the runner is unreachable");
+  renderTalkPanel();
   for (const button of ui.approvalsList?.querySelectorAll("button") || []) {
     button.disabled = state.stale;
   }
@@ -3423,6 +3977,7 @@ async function initialize() {
   // runner acting on a stale surface refuses what is possible or queues what
   // will fail.
   watchDeviceReadiness();
+  renderTalkPanel();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }
