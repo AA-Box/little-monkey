@@ -52,11 +52,20 @@ use little_monkey_lib::channels::types::{
 
 const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long to wait before spawning the helper again after an attempt. A
-/// helper that dies on startup (unregistered account, broken install) would
+/// How long to wait before spawning the helper again after the first failure.
+///
+/// A helper that dies on startup (unregistered account, broken install) would
 /// otherwise be respawned once per `poll`, which is a process-spawn loop
 /// against the operator's own machine.
-const RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+const INITIAL_RESTART_COOLDOWN: Duration = Duration::from_secs(5);
+/// The ceiling that cooldown backs off to. A helper that has been failing for
+/// minutes is not going to be fixed by asking it again sooner, and an operator
+/// who repairs their install waits at most this long for the next attempt.
+const MAX_RESTART_COOLDOWN: Duration = Duration::from_secs(120);
+/// A helper that ran at least this long counts as having worked, so the next
+/// failure starts backing off from the beginning rather than inheriting the
+/// previous outage's delay.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
 /// Signal has no server-enforced hard cap; this is signal-cli's own
 /// practical ceiling before it starts truncating. Not a wire limit this
 /// adapter has verified against every server version — ponytail: revisit if
@@ -92,6 +101,11 @@ struct Shared {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>,
     stdin: Mutex<Option<ChildStdin>>,
     alive: AtomicBool,
+    /// How long to wait before the next spawn attempt. Doubled by
+    /// [`run_rpc_loop`] each time a helper dies quickly, reset once one has run
+    /// for [`HEALTHY_RUN`] — so a broken install is retried at a decreasing
+    /// rate while a one-off crash is recovered from immediately.
+    restart_cooldown: Mutex<Duration>,
 }
 
 pub struct SignalAdapter {
@@ -138,6 +152,7 @@ impl SignalAdapter {
                 pending: Mutex::new(HashMap::new()),
                 stdin: Mutex::new(None),
                 alive: AtomicBool::new(false),
+                restart_cooldown: Mutex::new(INITIAL_RESTART_COOLDOWN),
             }),
             last_start: Mutex::new(None),
             blobs: Arc::new(DaemonBlobs),
@@ -171,8 +186,9 @@ impl SignalAdapter {
         if self.shared.alive.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let cooldown = *self.shared.restart_cooldown.lock().await;
         if let Some(attempted_at) = *last_start {
-            if attempted_at.elapsed() < RESTART_COOLDOWN {
+            if attempted_at.elapsed() < cooldown {
                 return Err(
                     "The signal-cli helper stopped; waiting before starting it again".to_string(),
                 );
@@ -266,6 +282,7 @@ async fn run_rpc_loop(
     shared: Arc<Shared>,
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
 ) {
+    let started_at = Instant::now();
     let mut lines = BufReader::new(stdout).lines();
     loop {
         match lines.next_line().await {
@@ -292,6 +309,17 @@ async fn run_rpc_loop(
     }
     shared.alive.store(false, Ordering::SeqCst);
     *shared.stdin.lock().await = None;
+    // A helper that ran for a while and then died is a crash to recover from;
+    // one that died immediately is an install that is not going to work yet,
+    // and asking it again every five seconds forever helps nobody.
+    {
+        let mut cooldown = shared.restart_cooldown.lock().await;
+        *cooldown = if started_at.elapsed() >= HEALTHY_RUN {
+            INITIAL_RESTART_COOLDOWN
+        } else {
+            (*cooldown * 2).min(MAX_RESTART_COOLDOWN)
+        };
+    }
     // Dropped, not answered with an error: a request the helper never replied
     // to is *ambiguous*, not a provider rejection, and `call` distinguishes
     // the two by whether the sender was dropped. Sending `Err` here would
@@ -411,6 +439,30 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
     })
 }
 
+/// The registered numbers in a `listAccounts` result.
+///
+/// signal-cli has spelled this both as a bare array of objects and as one
+/// wrapped in `accounts` across versions, and the number field as `number` or
+/// `account`. All four are read rather than pinning one and reporting a working
+/// install as broken; `None` means the shape was none of them.
+fn registered_accounts(result: &Value) -> Option<Vec<String>> {
+    let entries = result
+        .as_array()
+        .or_else(|| result.get("accounts").and_then(Value::as_array))?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| entry.get("number").and_then(Value::as_str))
+                    .or_else(|| entry.get("account").and_then(Value::as_str))
+                    .map(str::to_string)
+            })
+            .collect(),
+    )
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -443,8 +495,29 @@ impl ChannelAdapter for SignalAdapter {
         if let Some(error) = self.helper_missing() {
             return ChannelHealth::unsupported(now, error);
         }
-        match self.call("version", json!({})).await {
-            Ok(_) => ChannelHealth::connected(now, Some(self.account.clone())),
+        // Registration, not just liveness. A helper that starts fine but has
+        // never registered this number cannot send or receive anything, and
+        // answering `version` proves only that a process is running.
+        match self.call("listAccounts", json!({})).await {
+            Ok(result) => match registered_accounts(&result) {
+                Some(accounts) if accounts.iter().any(|number| number == &self.account) => {
+                    ChannelHealth::connected(now, Some(self.account.clone()))
+                }
+                Some(_) => ChannelHealth::error(
+                    now,
+                    format!(
+                        "signal-cli is running but {} is not registered with it. Register the \
+                         number with signal-cli first.",
+                        self.account
+                    ),
+                ),
+                // The helper answered in a shape this adapter does not know.
+                // Falling back is better than calling a working install broken.
+                None => self.probe_version(now).await,
+            },
+            // An older helper has no `listAccounts`; a rejection is not proof
+            // of anything except that this method is unavailable.
+            Err(CallError::Remote(_)) => self.probe_version(now).await,
             Err(error) => ChannelHealth::error(now, error.into_message()),
         }
     }
@@ -558,6 +631,15 @@ impl ChannelAdapter for SignalAdapter {
 }
 
 impl SignalAdapter {
+    /// The fallback probe for a helper too old to list its accounts: liveness
+    /// only, and honest about being that.
+    async fn probe_version(&self, now: i64) -> ChannelHealth {
+        match self.call("version", json!({})).await {
+            Ok(_) => ChannelHealth::connected(now, Some(self.account.clone())),
+            Err(error) => ChannelHealth::error(now, error.into_message()),
+        }
+    }
+
     /// signal-cli takes attachments on the same `send` call, as RFC 2397 data
     /// URIs (`data:<mime>;filename=<name>;base64,<data>`) rather than paths —
     /// which means nothing has to write the bytes to a temporary file that a
@@ -642,6 +724,25 @@ mod tests {
         "timestamp": 1700000005000,
         "dataMessage": {"message": ""}
     }}}"#;
+
+    #[test]
+    fn every_shape_signal_cli_has_used_for_list_accounts_is_read() {
+        assert_eq!(
+            registered_accounts(&json!([{"number": "+15550000000"}])),
+            Some(vec!["+15550000000".to_string()])
+        );
+        assert_eq!(
+            registered_accounts(&json!({"accounts": [{"account": "+15550000000"}]})),
+            Some(vec!["+15550000000".to_string()])
+        );
+        assert_eq!(
+            registered_accounts(&json!(["+15550000000"])),
+            Some(vec!["+15550000000".to_string()])
+        );
+        // A shape none of them use is unknown, not "no accounts" — reporting
+        // a working install as unregistered is the worse mistake.
+        assert_eq!(registered_accounts(&json!({"version": "0.13.0"})), None);
+    }
 
     #[test]
     fn parses_a_direct_message() {
@@ -814,6 +915,15 @@ mod tests {
         /// line sitting in a shell's stdio buffer, which is the difference
         /// between this test being deterministic and being flaky.
         fn write_fake_helper(name: &str) -> std::path::PathBuf {
+            write_fake_helper_registering(name, "+15550000000")
+        }
+
+        /// The same fixture, claiming a specific number is registered.
+        ///
+        /// Baked into the script rather than read from the environment: these
+        /// tests share one process, and a process-wide variable would make the
+        /// answer depend on which test ran last.
+        fn write_fake_helper_registering(name: &str, registered: &str) -> std::path::PathBuf {
             let path = std::env::temp_dir().join(format!(
                 "monkey-fake-signal-{name}-{}",
                 uuid::Uuid::new_v4().simple()
@@ -826,10 +936,16 @@ while IFS= read -r line; do
     *crash*) exit 7 ;;
   esac
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}"
+  case "$line" in
+    *listAccounts*)
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"number\":\"__REGISTERED__\"}]}" ;;
+    *)
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}" ;;
+  esac
 done
 "#;
-            std::fs::write(&path, script).expect("write fake helper");
+            std::fs::write(&path, script.replace("__REGISTERED__", registered))
+                .expect("write fake helper");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake helper");
             path
@@ -842,6 +958,56 @@ done
                 "helper_path": path.to_string_lossy(),
                 "account": "+15550000000",
             }))
+        }
+
+        #[tokio::test]
+        async fn an_unregistered_number_is_a_real_error_not_a_connection() {
+            let path = write_fake_helper_registering("unregistered", "+15559999999");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            let health = adapter.probe().await;
+            // The helper is running perfectly. It just cannot reach Signal as
+            // this number, which is not something to report as Connected.
+            assert_eq!(health.state, HealthState::Error);
+            let detail = health.last_error.expect("detail");
+            assert!(detail.contains("not registered"), "{detail}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_helper_that_dies_at_once_is_retried_more_and_more_slowly() {
+            let path = write_fake_helper("backoff");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            assert_eq!(
+                *adapter.shared.restart_cooldown.lock().await,
+                INITIAL_RESTART_COOLDOWN
+            );
+            for expected in [INITIAL_RESTART_COOLDOWN * 2, INITIAL_RESTART_COOLDOWN * 4] {
+                // Clear the attempt stamp so the test does not sleep out the
+                // cooldown it is asserting on.
+                *adapter.last_start.lock().await = None;
+                let _ = adapter.call("crash", json!({})).await;
+                // The loop records the new cooldown as it exits.
+                for _ in 0..100 {
+                    if *adapter.shared.restart_cooldown.lock().await == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(*adapter.shared.restart_cooldown.lock().await, expected);
+            }
+            let _ = std::fs::remove_file(&path);
         }
 
         #[tokio::test]

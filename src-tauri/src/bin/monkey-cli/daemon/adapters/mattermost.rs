@@ -37,6 +37,12 @@ const INBOUND_CHANNEL_CAPACITY: usize = 256;
 const POLL_WAIT: Duration = Duration::from_secs(20);
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A connection that stayed up at least this long counts as recovered, so the
+/// next drop backs off from the beginning. Measured on the connection's own
+/// lifetime rather than on "did we reach the socket at all": a server that
+/// accepts and immediately closes would otherwise reset the backoff every time
+/// and turn reconnection into a tight loop against it.
+const STABLE_AFTER: Duration = Duration::from_secs(30);
 /// Mattermost's default `MaxPostSize`. Server-configurable, not fetched here —
 /// ponytail: a wrong-way-round split (limit raised on the server, adapter
 /// still splits at the stock default) costs nothing but an unnecessary extra
@@ -94,6 +100,15 @@ struct Shared {
     /// returns an empty batch whether the socket is live or dropped, so it
     /// cannot answer this.
     status: TransportStatus,
+    /// Posts normalized but never handed on, because `poll` fell far enough
+    /// behind to fill the inbound queue.
+    ///
+    /// Counted rather than waited on: the reader must never block on a
+    /// downstream consumer, or it stops answering the server's pings and
+    /// Mattermost closes the socket underneath it. Surfaced as degraded health
+    /// so an overflow is something an operator sees rather than a message that
+    /// quietly never arrived.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 pub struct MattermostAdapter {
@@ -187,10 +202,25 @@ impl ChannelAdapter for MattermostAdapter {
             return ChannelHealth::error(now, error);
         }
         match fetch_me(&self.http, &self.base_url, &self.token).await {
-            Ok(me) => ChannelHealth::connected(
-                now,
-                Some(format!("Connected to Mattermost as {}", me.username)),
-            ),
+            Ok(me) => {
+                let dropped = self
+                    .shared
+                    .dropped
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    return ChannelHealth::degraded(
+                        now,
+                        format!(
+                            "Connected to Mattermost as {} · {dropped} post(s) dropped under load",
+                            me.username
+                        ),
+                    );
+                }
+                ChannelHealth::connected(
+                    now,
+                    Some(format!("Connected to Mattermost as {}", me.username)),
+                )
+            }
             Err(error) => ChannelHealth::error(
                 now,
                 scrub(&format!("Mattermost probe failed: {error}"), &self.token),
@@ -680,33 +710,54 @@ async fn run_socket_loop(
 ) {
     let mut backoff = MIN_BACKOFF;
     loop {
-        let me = match fetch_me(&http, &base_url, &token).await {
-            Ok(me) => Some(me),
+        // Identity first, and no connection without it. `is_self` and mention
+        // detection are both keyed on who we are, so a socket opened while that
+        // is unknown would let the account answer its own posts — a loop that
+        // is much worse than waiting one backoff for `/users/me`.
+        match fetch_me(&http, &base_url, &token).await {
+            Ok(me) => {
+                let connected_at = std::time::Instant::now();
+                run_one_connection(&account_id, &base_url, &token, &me, &tx, &shared).await;
+                shared.status.set(HealthState::Degraded);
+                if tx.is_closed() {
+                    return;
+                }
+                if connected_at.elapsed() >= STABLE_AFTER {
+                    backoff = MIN_BACKOFF;
+                }
+            }
             Err(FetchMeError::Permanent(error)) => {
                 shared.status.set(HealthState::Error);
                 *shared.permanent_error.lock().await = Some(error);
                 return;
             }
-            Err(FetchMeError::Retryable(_)) => None,
-        };
-        let reconnected = run_one_connection(
-            &account_id,
-            &base_url,
-            &token,
-            me.as_ref(),
-            &tx,
-            &shared.status,
-        )
-        .await;
-        shared.status.set(HealthState::Degraded);
-        if tx.is_closed() {
-            return;
-        }
-        if reconnected {
-            backoff = MIN_BACKOFF;
+            Err(FetchMeError::Retryable(error)) => {
+                shared.status.set(HealthState::Degraded);
+                *shared.permanent_error.lock().await = None;
+                if tx.is_closed() {
+                    return;
+                }
+                let _ = error;
+            }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Hand one normalized post to `poll`, or count it as lost.
+///
+/// Never `send().await`. The caller is the WebSocket reader, and the reader is
+/// also what answers the server's pings: blocking it on a downstream consumer
+/// is how the socket gets closed underneath a connection that looked healthy.
+/// An overflow is therefore dropped, counted, and reported as degraded — the
+/// one thing it must never be is silently treated as delivered.
+fn deliver(shared: &Arc<Shared>, tx: &mpsc::Sender<ChannelEnvelope>, envelope: ChannelEnvelope) {
+    if tx.try_send(envelope).is_err() {
+        shared
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shared.status.set(HealthState::Degraded);
     }
 }
 
@@ -714,13 +765,14 @@ async fn run_one_connection(
     account_id: &str,
     base_url: &str,
     token: &str,
-    me: Option<&Me>,
+    me: &Me,
     tx: &mpsc::Sender<ChannelEnvelope>,
-    status: &TransportStatus,
-) -> bool {
+    shared: &Arc<Shared>,
+) {
+    let status = &shared.status;
     let (mut ws, _) = match tokio_tungstenite::connect_async(websocket_url(base_url)).await {
         Ok(pair) => pair,
-        Err(_) => return false,
+        Err(_) => return,
     };
     let challenge = authentication_challenge(token);
     if ws
@@ -728,12 +780,12 @@ async fn run_one_connection(
         .await
         .is_err()
     {
-        return false;
+        return;
     }
     status.set(HealthState::Connected);
 
-    let our_user_id = me.map(|me| me.user_id.as_str());
-    let our_username = me.map(|me| me.username.as_str());
+    let our_user_id = Some(me.user_id.as_str());
+    let our_username = Some(me.username.as_str());
 
     loop {
         match ws.next().await {
@@ -742,18 +794,16 @@ async fn run_one_connection(
                     handle_socket_frame(account_id, &text, our_user_id, our_username, now_ms())
                 {
                     match action {
-                        Action::Envelope(envelope) => {
-                            let _ = tx.send(*envelope).await;
-                        }
+                        Action::Envelope(envelope) => deliver(shared, tx, *envelope),
                     }
                 }
             }
             Some(Ok(Message::Ping(payload))) => {
                 let _ = ws.send(Message::Pong(payload)).await;
             }
-            Some(Ok(Message::Close(_))) => return true,
+            Some(Ok(Message::Close(_))) => return,
             Some(Ok(_)) => {}
-            Some(Err(_)) | None => return true,
+            Some(Err(_)) | None => return,
         }
     }
 }
@@ -1054,5 +1104,123 @@ mod tests {
         let me = fetch_me(&client, &base, "tok").await.unwrap();
         assert_eq!(me.user_id, "user-9");
         assert_eq!(me.username, "bot");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_permanent_and_a_server_error_is_not() {
+        let client = little_monkey_lib::egress::hardened().build().unwrap();
+        let base = fixture_server("401 Unauthorized", "{}".to_string()).await;
+        assert!(matches!(
+            fetch_me(&client, &base, "tok").await,
+            Err(FetchMeError::Permanent(_))
+        ));
+        let base = fixture_server("503 Service Unavailable", "{}".to_string()).await;
+        assert!(matches!(
+            fetch_me(&client, &base, "tok").await,
+            Err(FetchMeError::Retryable(_))
+        ));
+    }
+
+    // -- the reader must never block on the consumer --------------------------
+
+    fn posted_envelope(id: &str) -> ChannelEnvelope {
+        let mut event = posted_event_fixture();
+        let post = event["data"]["post"].as_str().expect("post").to_string();
+        event["data"]["post"] = Value::String(post.replace("post-1", id));
+        normalize_posted_event("acct-1", &event, Some("user-9"), Some("bot"), 0)
+            .expect("normalizes")
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_drops_and_reports_rather_than_stalling_the_reader() {
+        let shared = Arc::new(Shared::default());
+        let (tx, _rx) = mpsc::channel(1);
+
+        deliver(&shared, &tx, posted_envelope("post-a"));
+        assert_eq!(shared.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        // The queue is now full. A second post must not park the reader here —
+        // the reader is also what answers the server's pings.
+        let overflowed = tokio::time::timeout(Duration::from_millis(200), async {
+            deliver(&shared, &tx, posted_envelope("post-b"));
+        })
+        .await;
+        assert!(overflowed.is_ok(), "the reader blocked on a full queue");
+        assert_eq!(shared.dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            shared.status.get(),
+            HealthState::Degraded,
+            "an overflow an operator cannot see is a message that silently vanished"
+        );
+    }
+
+    // -- WebSocket ------------------------------------------------------------
+
+    /// A Mattermost stand-in: one HTTP reply to `/users/me`, then a WebSocket
+    /// that expects the authentication challenge and pushes one `posted` event.
+    ///
+    /// Two connections, because that is what the adapter makes: identity first,
+    /// socket second.
+    async fn websocket_fixture() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept identity request");
+            let body = r#"{"id":"user-9","username":"bot"}"#;
+            let mut request = vec![0u8; 8 * 1024];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            drop(stream);
+
+            let (socket, _) = listener.accept().await.expect("accept websocket");
+            let mut ws = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("websocket handshake");
+            // The adapter authenticates before anything else, and a server that
+            // never saw the challenge would happily deliver to a stranger.
+            let challenge = ws.next().await.expect("a frame").expect("a text frame");
+            let challenge: Value =
+                serde_json::from_str(challenge.to_text().expect("text")).expect("json");
+            assert_eq!(challenge["action"], "authentication_challenge");
+            assert_eq!(challenge["data"]["token"], "tok");
+
+            let _ = ws
+                .send(Message::Text(posted_event_fixture().to_string().into()))
+                .await;
+            // Held open: closing here would look like a dropped connection.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_posted_event_travels_the_whole_socket_path_into_poll() {
+        let base = websocket_fixture().await;
+        let account = account_fixture(&base);
+        let adapter = MattermostAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: "tok".to_string(),
+        })
+        .expect("adapter");
+
+        let batch = adapter.poll(None).await.expect("poll");
+        assert_eq!(batch.envelopes.len(), 1, "{batch:?}");
+        let envelope = &batch.envelopes[0];
+        assert_eq!(envelope.provider_event_id, "post-1");
+        assert_eq!(envelope.conversation.conversation_id, "chan-1");
+        // Identity was resolved before the socket opened, so our own posts are
+        // recognizable rather than answered.
+        assert!(!envelope.sender.is_self);
+        assert_eq!(
+            adapter.live_transport(),
+            Some(HealthState::Connected),
+            "a live socket is what Connected means here"
+        );
     }
 }
