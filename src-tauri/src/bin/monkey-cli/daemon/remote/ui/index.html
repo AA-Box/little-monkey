@@ -6,7 +6,12 @@
     <meta name="color-scheme" content="dark light">
     <meta name="theme-color" content="#0f172a">
     <meta name="description" content="Securely inspect and control scoped Little Monkey runs on your own runner.">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
+    <!-- Kept identical to the response header (web.rs CONTROLLER_CSP): both are
+         enforced and the browser applies the intersection, so a directive
+         missing from either one blocks. media-src covers the two audio sources
+         this controller really uses — a blob: URL for a played artifact and a
+         data: URL for the silence that unlocks autoplay. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
     <title>Little Monkey Remote</title>
     <link rel="manifest" href="/v1/remote/ui/manifest.webmanifest">
     <link rel="icon" href="/v1/remote/ui/icon.svg" type="image/svg+xml">

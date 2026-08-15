@@ -11,6 +11,63 @@ const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("ui/sw.js");
 const ICON: &str = include_str!("ui/icon.svg");
 
+/// What the controller document is permitted to do, and nothing more.
+///
+/// A permissions policy with an empty allowlist — `camera=()` — disables the
+/// feature for the document outright, whatever the user later allows in the
+/// browser's own prompt. Sent on every response, that header denied this page
+/// the four APIs it is *for*: `getUserMedia`, `getDisplayMedia` and
+/// `getCurrentPosition` would have been refused before any permission was ever
+/// asked for, so every preparation control on the device screen was dead in a
+/// browser that enforces the header.
+///
+/// `(self)` is the narrowest allowlist that still permits them: this origin
+/// only, never an embedded frame from anywhere else. Everything the controller
+/// does not use stays denied — and the API responses keep the deny-everything
+/// policy below, since nothing but this document has a reason to reach hardware.
+pub const CONTROLLER_PERMISSIONS_POLICY: &str =
+    "camera=(self), microphone=(self), geolocation=(self), display-capture=(self), \
+     payment=(), usb=()";
+
+/// The policy for everything that is not the controller document: the signed
+/// API, and the assets the document loads.
+pub const API_PERMISSIONS_POLICY: &str =
+    "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=()";
+
+/// The controller document's content security policy.
+///
+/// Must be kept identical to the `<meta http-equiv>` copy in `ui/index.html`:
+/// both are enforced, and the browser applies the *intersection*, so a
+/// directive missing from either one is a directive that blocks.
+///
+/// `media-src` is the one that was missing. There is no default for it beyond
+/// `default-src 'none'`, so the artifact playback path (`createObjectURL` → a
+/// `blob:` URL) and the autoplay-unlocking silence (a `data:` URL) were both
+/// refused. `worker-src` was missing from the header for the same reason, which
+/// blocked the service worker the push path needs.
+pub const CONTROLLER_CSP: &str = "default-src 'none'; script-src 'self'; worker-src 'self'; \
+     style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; \
+     manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; \
+     object-src 'none'";
+
+/// The policy for everything that is not the controller document.
+///
+/// Unchanged from what every response used to carry. It is not only about the
+/// signed API's JSON: a service worker script's own response policy governs the
+/// worker's context, so narrowing this would take the offline cache's fetches
+/// with it.
+pub const API_CSP: &str = "default-src 'none'; script-src 'self'; worker-src 'self'; \
+     style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; \
+     base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'";
+
+/// Whether a response is the controller document rather than API JSON.
+///
+/// The permissions policy is a property of a *document*; nothing else can use a
+/// camera, and nothing else should be permitted to.
+pub fn is_controller_document(content_type: &str) -> bool {
+    content_type.starts_with("text/html")
+}
+
 /// Public, credential-free controller shell. All run data still flows through
 /// the signed `/v1/remote` API; the page contains no runner state or secret.
 pub fn asset(method: &str, path_and_query: &str) -> Option<ApiResponse> {
@@ -632,6 +689,53 @@ mod tests {
                 javascript.contains(listener),
                 "the surface must be re-advertised on {listener}"
             );
+        }
+    }
+
+    /// Every browser API the client calls has to be one the served policy
+    /// permits, and every URL scheme it loads from has to be one the CSP allows.
+    ///
+    /// The mapping is derived from `app.js` itself rather than restated, so a
+    /// capability that starts using a new API — or a new scheme — fails here
+    /// instead of failing silently on a phone, which is exactly how
+    /// `getUserMedia` came to be called on a document that forbade it.
+    #[test]
+    fn every_browser_api_the_client_calls_is_one_the_served_policy_permits() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        for (call, feature) in [
+            ("getUserMedia({ video: true })", "camera"),
+            ("getUserMedia({ audio: true, video: false })", "microphone"),
+            ("getDisplayMedia(", "display-capture"),
+            ("geolocation.getCurrentPosition(", "geolocation"),
+        ] {
+            if !javascript.contains(call) {
+                continue;
+            }
+            assert!(
+                CONTROLLER_PERMISSIONS_POLICY.contains(&format!("{feature}=(self)")),
+                "the client calls {call} and the served policy does not permit {feature}"
+            );
+        }
+        // The two audio sources the client really loads, and the directive that
+        // has to allow them. `default-src 'none'` is what they fall back to.
+        if javascript.contains("URL.createObjectURL(blob)") {
+            assert!(CONTROLLER_CSP.contains("media-src") && CONTROLLER_CSP.contains("blob:"));
+        }
+        if javascript.contains("new Audio(\n      \"data:audio/wav;base64,")
+            || javascript.contains("\"data:audio/wav;base64,")
+        {
+            assert!(CONTROLLER_CSP.contains("media-src") && CONTROLLER_CSP.contains("data:"));
+        }
+        // A worker the header used to forbid while the document's own copy
+        // allowed it: both are enforced, so the push path needs both.
+        if javascript.contains("navigator.serviceWorker.register(\"/sw.js\")") {
+            assert!(CONTROLLER_CSP.contains("worker-src 'self'"));
+            assert!(API_CSP.contains("worker-src 'self'"));
         }
     }
 
