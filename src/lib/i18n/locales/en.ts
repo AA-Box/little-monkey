@@ -1574,6 +1574,7 @@ export const en: Record<string, string> = {
   "PermissionModal.riskReasonLabel": "Why:",
   "PermissionModal.riskFlooredText": "Sensitive path — always requires confirmation",
   "PermissionModal.subagentAttribution": "Requested by subagent \"{{description}}\"",
+  "PermissionModal.fromOtherConversation": "From \"{{title}}\"",
   "PermissionModal.denyButton": "Deny",
   "PermissionModal.allowOnceButton": "Allow Once",
   "PermissionModal.allowForSessionButton": "Allow for Session",

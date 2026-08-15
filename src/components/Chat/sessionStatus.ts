@@ -1,12 +1,13 @@
 import { parsePlanNotice } from "../../lib/agentLoop";
+import type { PermissionRequest } from "../../store/permissionStore";
 import type { ChatSession } from "../../store/sessionStore";
 
 /**
  * What a sidebar row says about a conversation without opening it:
  *
  * - `working` — a turn is in flight (the row animates).
- * - `attention` — the turn stopped on something only the user can answer:
- *   today that means a plan still waiting to be approved.
+ * - `attention` — the conversation is stopped on something only the user can
+ *   answer: a permission prompt, or a plan still waiting to be approved.
  * - `error` — the last turn threw.
  * - `finished` — the last turn ended cleanly while you were elsewhere, or
  *   the row was hand-marked unread.
@@ -15,17 +16,40 @@ import type { ChatSession } from "../../store/sessionStore";
 export type SessionStatus = "working" | "attention" | "error" | "finished";
 
 /**
- * Derives one row's status from state that already exists — `runningTurns`
- * and `turnOutcomes` (sessionStore) plus the transcript itself. Ordered by
- * urgency: a running turn outranks a stale outcome (a session that failed,
- * then was retried, is "working", not "error"), and something the user has
- * to answer outranks how the previous turn ended.
+ * The sessions blocked on an unanswered permission prompt, resolved through
+ * `sessionStore`'s `turnSessions` (`turnId -> sessionId`). A request whose
+ * turn isn't in the map — one raised outside any turn, or by a turn this
+ * window doesn't own — belongs to no row and is simply left out; the modal
+ * still shows it.
+ */
+export function sessionsAwaitingPermission(
+  queue: readonly PermissionRequest[],
+  turnSessions: Record<string, string>,
+): Set<string> {
+  const blocked = new Set<string>();
+  for (const request of queue) {
+    const sessionId = request.turn_id ? turnSessions[request.turn_id] : undefined;
+    if (sessionId) blocked.add(sessionId);
+  }
+  return blocked;
+}
+
+/**
+ * Derives one row's status from state that already exists — `runningTurns`,
+ * `turnOutcomes` and `turnSessions` (sessionStore), the permission queue,
+ * and the transcript itself. Ordered by urgency: anything the user has to
+ * answer comes first (a turn waiting on a permission prompt is stopped, not
+ * working, even though its turn is still in flight), then a running turn —
+ * which outranks a stale outcome, so a session that failed and was retried
+ * reads as "working", not "error".
  */
 export function sessionStatus(
   session: ChatSession,
   running: boolean,
   outcome: "done" | "error" | undefined,
+  awaitingPermission = false,
 ): SessionStatus | null {
+  if (awaitingPermission) return "attention";
   if (running) return "working";
   if (awaitsPlanApproval(session)) return "attention";
   if (outcome === "error") return "error";

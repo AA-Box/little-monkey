@@ -5,7 +5,8 @@ import { sessionDisplayTitle, type ChatSession, useSessionStore } from "../../st
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { SessionMenu } from "./SessionMenu";
-import { sessionStatus, type SessionStatus } from "./sessionStatus";
+import { usePermissionStore } from "../../store/permissionStore";
+import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from "./sessionStatus";
 
 /**
  * Claude-Desktop-style session list for the left sidebar: a "New session"
@@ -48,6 +49,9 @@ export default function ChatSessionList() {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
   const runningTurns = useSessionStore((state) => state.runningTurns);
   const turnOutcomes = useSessionStore((state) => state.turnOutcomes);
+  const turnSessions = useSessionStore((state) => state.turnSessions);
+  const permissionQueue = usePermissionStore((state) => state.queue);
+  const awaitingPermission = sessionsAwaitingPermission(permissionQueue, turnSessions);
   const newSession = useSessionStore((state) => state.newSession);
   const switchSession = useSessionStore((state) => state.switchSession);
   const renameSession = useSessionStore((state) => state.renameSession);
@@ -109,7 +113,12 @@ export default function ChatSessionList() {
     const isActive = session.id === activeSessionId;
     const isRenaming = renamingId === session.id;
     const isMenuOpen = menuOpenId === session.id;
-    const status = sessionStatus(session, runningTurns[session.id] === true, turnOutcomes[session.id]);
+    const status = sessionStatus(
+      session,
+      runningTurns[session.id] === true,
+      turnOutcomes[session.id],
+      awaitingPermission.has(session.id),
+    );
 
     return (
       <div

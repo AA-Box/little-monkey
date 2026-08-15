@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, Brain, FilePenLine, FileText, Folder, Globe, Plug, Search, TerminalSquare } from "lucide-react";
 import { usePermissionStore, type PermissionRequest } from "../../store/permissionStore";
+import { sessionDisplayTitle, useSessionStore } from "../../store/sessionStore";
 import { Button, StatusPill } from "../ui";
 import type { PillTone } from "../ui";
 import { useT } from "../../lib/i18n";
@@ -97,6 +98,10 @@ export function canRememberForSession(pending: PermissionRequest): boolean {
 export function PermissionModal() {
   const pending = usePermissionStore((s) => s.pending);
   const respond = usePermissionStore((s) => s.respond);
+  const sessions = useSessionStore((s) => s.sessions);
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const splitSessionId = useSessionStore((s) => s.splitSessionId);
+  const turnSessions = useSessionStore((s) => s.turnSessions);
   const [entered, setEntered] = useState(false);
   const { t } = useT();
 
@@ -149,6 +154,17 @@ export function PermissionModal() {
   // attribution).
   const subagentDescription = pending.agent_label ?? null;
   const displayDetail = pending.detail;
+  // Which conversation is blocked on this prompt, named only when it is one
+  // the user cannot see — a prompt raised by a background turn otherwise
+  // arrives with no hint of where it came from, and the answer decides what
+  // gets written. On-screen sessions say nothing: the transcript behind the
+  // dialog already is the answer. Resolved through the same `turnSessions`
+  // map the sidebar marker uses, so the two can never disagree.
+  const originSessionId = pending.turn_id ? turnSessions[pending.turn_id] : undefined;
+  const offscreenOrigin =
+    originSessionId && originSessionId !== activeSessionId && originSessionId !== splitSessionId
+      ? sessions.find((session) => session.id === originSessionId)
+      : undefined;
 
   return (
     <div
@@ -175,6 +191,12 @@ export function PermissionModal() {
             </p>
           </div>
         </div>
+
+        {offscreenOrigin && (
+          <p className="mt-2 truncate text-xs text-muted">
+            {t("PermissionModal.fromOtherConversation", { title: sessionDisplayTitle(offscreenOrigin) })}
+          </p>
+        )}
 
         {subagentDescription && (
           <p className="mt-2 text-xs font-medium text-accent">

@@ -412,6 +412,13 @@ export interface SessionStore {
    * cleared the moment one is opened. Never persisted: a badge that outlives
    * the app would point at an outcome the user can no longer act on. */
   turnOutcomes: Record<string, "done" | "error">;
+  /** `turnId -> sessionId` for every turn in flight in this window, so a
+   * permission prompt (which arrives from Rust carrying only its `turn_id`)
+   * can be attributed to the conversation it blocks. Registered by
+   * `runAgentTurn` alongside `runningTurns` and dropped in the same finally;
+   * a subagent's prompts resolve through it too, since they borrow the
+   * parent turn's id. Never persisted. */
+  turnSessions: Record<string, string>;
   /** Last file-persistence failure, surfaced in the UI (ChatWindow banner)
    * instead of silently dropping history; cleared by the next successful
    * save. */
@@ -553,6 +560,10 @@ export interface SessionStore {
    * either pane, and when the turn was cancelled by the user (they already
    * know how that one ended). */
   noteTurnOutcome: (sessionId: string, outcome: "done" | "error") => void;
+  /** Record (or, with a null `sessionId`, drop) which session `turnId` is
+   * running in — called by `runAgentTurn` around the same boundaries as
+   * `markTurnRunning`. */
+  markTurnSession: (turnId: string, sessionId: string | null) => void;
   /** Sets (or clears with `null`) the label of the verification command
    * currently executing for `sessionId` — called only by
    * `runVerificationPhase` (agentLoop.ts), around each `verify_run` invoke,
@@ -1773,7 +1784,18 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   runningCrews: {},
   runningVerifyLabel: {},
   turnOutcomes: {},
+  turnSessions: {},
   persistError: null,
+
+  markTurnSession: (turnId, sessionId) => {
+    set((state) => {
+      if (sessionId) return { turnSessions: { ...state.turnSessions, [turnId]: sessionId } };
+      if (!(turnId in state.turnSessions)) return state;
+      const turnSessions = { ...state.turnSessions };
+      delete turnSessions[turnId];
+      return { turnSessions };
+    });
+  },
 
   noteTurnOutcome: (sessionId, outcome) => {
     set((state) => {
