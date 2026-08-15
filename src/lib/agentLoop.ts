@@ -1449,13 +1449,26 @@ const cancellationDisposers = new Map<AbortController, Array<() => void>>();
  * around the wait. */
 const chatTurnProcesses = new Map<string, string>();
 
-function registerDurableController(runId: string, controller: AbortController): void {
+/** Registers `runId` as cancellable through `controller`, and — same call,
+ * same lifetime — as belonging to `sessionId`, so a permission prompt
+ * arriving from Rust under that id can be attributed to the conversation it
+ * blocks (`sessionStore.turnSessions`). The two are registered together
+ * because they answer the same question about the same ids: every id a
+ * durable run can be cancelled by is an id a prompt can arrive under —
+ * this turn's own, a daemon run's, a failover's fresh recorder run. Both
+ * are released by the same disposer list in `runAgentTurn`'s finally. */
+function registerDurableController(
+  runId: string,
+  controller: AbortController,
+  sessionId: string,
+): void {
   const dispose = registerRunCancellation(runId, () => {
     externallyRequestedCancellations.add(runId);
     controller.abort();
   });
+  useSessionStore.getState().markTurnSession(runId, sessionId);
   const existing = cancellationDisposers.get(controller) ?? [];
-  existing.push(dispose);
+  existing.push(dispose, () => useSessionStore.getState().markTurnSession(runId, null));
   cancellationDisposers.set(controller, existing);
 }
 
@@ -1533,7 +1546,7 @@ export async function runAgentTurn(
     else signal.addEventListener('abort', () => controller.abort(), { once: true });
   }
   turnControllers.set(sessionId, controller);
-  registerDurableController(turnId, controller);
+  registerDurableController(turnId, controller, sessionId);
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
@@ -1657,6 +1670,12 @@ export async function runAgentTurn(
     chatTurnProcesses.delete(turnId);
     forgetPause(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    // Badge the sidebar row for a session the user has navigated away from.
+    // A cancelled turn records nothing: the user pressed Stop, so there is
+    // no outcome to go back and look at.
+    if (!controller.signal.aborted) {
+      useSessionStore.getState().noteTurnOutcome(sessionId, turnError ? 'error' : 'done');
+    }
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
     if (processId) {
@@ -1773,7 +1792,7 @@ async function watchResumedDesktopTurn(
     source: origin,
   };
   saveActiveDaemonTurn(link);
-  registerDurableController(resume.accepted.runId, controller);
+  registerDurableController(resume.accepted.runId, controller, sessionId);
   await attachDaemonTurnToChat(link, controller);
 }
 
@@ -2034,7 +2053,7 @@ async function runDaemonAgentTurn(
   saveActiveDaemonTurn(link);
   const controller = turnControllers.get(sessionId);
   if (!controller) throw new Error('Desktop turn controller disappeared before daemon attach.');
-  registerDurableController(queued.run_id, controller);
+  registerDurableController(queued.run_id, controller, sessionId);
   await attachDaemonTurnToChat(link, controller);
   maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
 }
@@ -2052,7 +2071,7 @@ export function recoverDaemonDesktopTurns(): void {
     const controller = new AbortController();
     turnControllers.set(link.sessionId, controller);
     useSessionStore.getState().markTurnRunning(link.sessionId, true);
-    registerDurableController(link.runId, controller);
+    registerDurableController(link.runId, controller, link.sessionId);
     void attachDaemonTurnToChat(link, controller).finally(() => {
       turnControllers.delete(link.sessionId);
       cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
@@ -2545,7 +2564,7 @@ async function runAgentTurnBody(
     });
     if (durable.recorder) {
       const controller = turnControllers.get(sessionId);
-      if (controller) registerDurableController(durable.recorder.runId, controller);
+      if (controller) registerDurableController(durable.recorder.runId, controller, sessionId);
     }
     return local;
   };
@@ -3067,7 +3086,7 @@ async function runAgentTurnBody(
       });
       if (durable.recorder) {
         const controller = turnControllers.get(sessionId);
-        if (controller) registerDurableController(durable.recorder.runId, controller);
+        if (controller) registerDurableController(durable.recorder.runId, controller, sessionId);
       }
       applyTargetSwitch(target);
       removeLastMessage();
