@@ -12,6 +12,8 @@ pub(crate) mod push;
 pub(crate) mod qr;
 mod server;
 pub(crate) mod store;
+pub(crate) mod talk;
+pub(crate) mod talk_socket;
 pub(crate) mod voice;
 pub(crate) mod watch;
 mod web;

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use little_monkey_lib::run_ledger::StoredRun;
 use ring::rand::SecureRandom;
@@ -16,6 +16,23 @@ pub const DEFAULT_REQUEST_SKEW_MS: u64 = 5 * 60 * 1_000;
 /// grant after authentication.
 pub const MAX_REMOTE_BODY_BYTES: usize = 48 * 1024 * 1024;
 pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Dedicated Talk frames are versioned independently so their WebSocket wire
+/// shape can evolve without changing the signed HTTP remote plane.
+pub const TALK_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
+pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
+pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
+pub const MAX_TALK_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_TALK_ERROR_BYTES: usize = 4 * 1024;
+pub const MAX_TALK_MEDIA_TYPE_BYTES: usize = 128;
+pub const MAX_TALK_SESSION_ID_BYTES: usize = 256;
+pub const MAX_TALK_SESSION_GENERATION_BYTES: usize = 128;
+pub const MAX_TALK_TICKET_BYTES: usize = 128;
+pub const DEFAULT_TALK_TICKET_TTL_MS: u64 = 30_000;
+pub const MAX_TALK_TICKET_TTL_MS: u64 = 60_000;
+const TALK_SESSION_GENERATION_RANDOM_BYTES: usize = 18;
+const TALK_TICKET_RANDOM_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1500,6 +1517,435 @@ impl VoiceCloseRequest {
     }
 }
 
+// --- Realtime Talk --------------------------------------------------------
+
+/// Audio formats accepted on the dedicated Talk WebSocket. The capture
+/// formats match the existing voice upload surface; MPEG is also accepted for
+/// speech output produced by a configured TTS backend.
+pub const TALK_MEDIA_TYPES: &[&str] = &[
+    "audio/webm",
+    "audio/webm;codecs=opus",
+    "audio/ogg",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+    "audio/wav",
+    "audio/mpeg",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkState {
+    Idle,
+    Starting,
+    Listening,
+    Transcribing,
+    Thinking,
+    Speaking,
+    Interrupted,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TalkTicketRequest {
+    pub protocol_version: u32,
+    pub session_id: String,
+}
+
+impl TalkTicketRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_protocol_version(self.protocol_version)?;
+        validate_talk_session_id(&self.session_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TalkTicketResponse {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub ticket: String,
+    pub expires_at_ms: u64,
+    /// Does not contain the bearer ticket. Clients append it as the `ticket`
+    /// query parameter immediately before opening the WebSocket.
+    pub websocket_path: String,
+}
+
+impl TalkTicketResponse {
+    pub fn issue(session_id: impl Into<String>, now_ms: u64, ttl_ms: u64) -> Result<Self, String> {
+        if ttl_ms == 0 || ttl_ms > MAX_TALK_TICKET_TTL_MS {
+            return Err(format!(
+                "Talk ticket lifetime must be between 1 and {MAX_TALK_TICKET_TTL_MS} ms"
+            ));
+        }
+        let session_id = session_id.into();
+        validate_talk_session_id(&session_id)?;
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| "Talk ticket expiry overflowed".to_string())?;
+        let response = Self {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            websocket_path: format!("/v1/remote/device/talk/{session_id}/stream"),
+            session_id,
+            session_generation: random_token(TALK_SESSION_GENERATION_RANDOM_BYTES)?,
+            ticket: random_token(TALK_TICKET_RANDOM_BYTES)?,
+            expires_at_ms,
+        };
+        response.validate(now_ms)?;
+        Ok(response)
+    }
+
+    pub fn validate(&self, now_ms: u64) -> Result<(), String> {
+        validate_talk_protocol_version(self.protocol_version)?;
+        validate_talk_session_id(&self.session_id)?;
+        validate_talk_session_generation(&self.session_generation)?;
+        validate_talk_token("ticket", &self.ticket, 32, MAX_TALK_TICKET_BYTES)?;
+        if self.expires_at_ms <= now_ms {
+            return Err("Talk ticket has expired".to_string());
+        }
+        if self.expires_at_ms.saturating_sub(now_ms) > MAX_TALK_TICKET_TTL_MS {
+            return Err("Talk ticket expiry exceeds the maximum lifetime".to_string());
+        }
+        let expected_path = format!("/v1/remote/device/talk/{}/stream", self.session_id);
+        if self.websocket_path != expected_path {
+            return Err("Talk WebSocket path does not match its session".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Envelope shared by every device-to-runner Talk frame. The generation is a
+/// random token issued with the one-use ticket; sequences restart only when a
+/// new generation is issued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkClientFrame {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub frame_sequence: u64,
+    #[serde(flatten)]
+    pub kind: TalkClientFrameKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TalkClientFrameKind {
+    Hello {
+        media_type: String,
+        sample_rate_hz: u32,
+        channels: u8,
+    },
+    Audio {
+        audio_sequence: u64,
+        media_type: String,
+        audio_base64: String,
+        /// Last chunk of this utterance. The device's own local voice activity
+        /// detector decides where an utterance ends — the runner never guesses
+        /// from silence it cannot hear — so this flag is what hands one
+        /// complete recording over to transcription.
+        #[serde(default)]
+        last: bool,
+    },
+    State {
+        state: TalkState,
+    },
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+impl TalkClientFrame {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_envelope(
+            self.protocol_version,
+            &self.session_id,
+            &self.session_generation,
+            self.frame_sequence,
+        )?;
+        match &self.kind {
+            TalkClientFrameKind::Hello {
+                media_type,
+                sample_rate_hz,
+                channels,
+            } => {
+                validate_talk_media_type(media_type)?;
+                if !(8_000..=192_000).contains(sample_rate_hz) {
+                    return Err("Talk sample rate must be between 8000 and 192000 Hz".to_string());
+                }
+                if !(1..=2).contains(channels) {
+                    return Err("Talk audio must have one or two channels".to_string());
+                }
+            }
+            TalkClientFrameKind::Audio {
+                audio_sequence,
+                media_type,
+                audio_base64,
+                ..
+            } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
+                validate_talk_media_type(media_type)?;
+                validate_talk_audio(audio_base64)?;
+            }
+            TalkClientFrameKind::State { .. } => {}
+            TalkClientFrameKind::Interrupt { reason } => {
+                if let Some(reason) = reason {
+                    validate_talk_text("interrupt reason", reason, MAX_TALK_ERROR_BYTES)?;
+                }
+            }
+        }
+        validate_talk_frame_size(self)
+    }
+
+    pub fn audio_sequence(&self) -> Option<u64> {
+        match &self.kind {
+            TalkClientFrameKind::Audio { audio_sequence, .. } => Some(*audio_sequence),
+            _ => None,
+        }
+    }
+}
+
+/// Envelope shared by every runner-to-device Talk frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkServerFrame {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub frame_sequence: u64,
+    #[serde(flatten)]
+    pub kind: TalkServerFrameKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TalkServerFrameKind {
+    Ready,
+    State {
+        state: TalkState,
+    },
+    Transcript {
+        text: String,
+        is_final: bool,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    OutputAudio {
+        audio_sequence: u64,
+        media_type: String,
+        audio_base64: String,
+    },
+    Error {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl TalkServerFrame {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_envelope(
+            self.protocol_version,
+            &self.session_id,
+            &self.session_generation,
+            self.frame_sequence,
+        )?;
+        match &self.kind {
+            TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::Transcript { text, .. }
+            | TalkServerFrameKind::AssistantDelta { text } => {
+                validate_talk_text("Talk text", text, MAX_TALK_TEXT_BYTES)?;
+            }
+            TalkServerFrameKind::OutputAudio {
+                audio_sequence,
+                media_type,
+                audio_base64,
+            } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
+                validate_talk_media_type(media_type)?;
+                validate_talk_audio(audio_base64)?;
+            }
+            TalkServerFrameKind::Error { code, message, .. } => {
+                if code.is_empty()
+                    || code.len() > 128
+                    || !code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-' | b'.')
+                    })
+                {
+                    return Err("Talk error code is invalid".to_string());
+                }
+                validate_talk_text("Talk error message", message, MAX_TALK_ERROR_BYTES)?;
+            }
+        }
+        validate_talk_frame_size(self)
+    }
+}
+
+/// Stateful replay guard for one direction of one session generation. Use one
+/// tracker for client frames and another for server frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TalkSequenceTracker {
+    last_frame_sequence: u64,
+    last_audio_sequence: u64,
+}
+
+impl TalkSequenceTracker {
+    pub fn accept(
+        &mut self,
+        frame_sequence: u64,
+        audio_sequence: Option<u64>,
+    ) -> Result<(), String> {
+        if frame_sequence == 0 || frame_sequence <= self.last_frame_sequence {
+            return Err(format!(
+                "Talk frame sequence must increase beyond {}",
+                self.last_frame_sequence
+            ));
+        }
+        if let Some(audio_sequence) = audio_sequence {
+            if audio_sequence == 0 || audio_sequence <= self.last_audio_sequence {
+                return Err(format!(
+                    "Talk audio sequence must increase beyond {}",
+                    self.last_audio_sequence
+                ));
+            }
+        }
+        self.last_frame_sequence = frame_sequence;
+        if let Some(audio_sequence) = audio_sequence {
+            self.last_audio_sequence = audio_sequence;
+        }
+        Ok(())
+    }
+
+    pub fn last_frame_sequence(&self) -> u64 {
+        self.last_frame_sequence
+    }
+
+    pub fn last_audio_sequence(&self) -> u64 {
+        self.last_audio_sequence
+    }
+}
+
+fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
+    if protocol_version != TALK_PROTOCOL_VERSION {
+        return Err(format!(
+            "Unsupported Talk protocol version {protocol_version}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.len() > MAX_TALK_SESSION_ID_BYTES {
+        return Err(format!(
+            "Talk session id exceeds {MAX_TALK_SESSION_ID_BYTES} bytes"
+        ));
+    }
+    validate_id(session_id)
+}
+
+fn validate_talk_session_generation(session_generation: &str) -> Result<(), String> {
+    validate_talk_token(
+        "session generation",
+        session_generation,
+        16,
+        MAX_TALK_SESSION_GENERATION_BYTES,
+    )?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(session_generation)
+        .map_err(|_| "Talk session generation is not URL-safe base64".to_string())?;
+    if decoded.len() != TALK_SESSION_GENERATION_RANDOM_BYTES {
+        return Err("Talk session generation has the wrong entropy length".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_token(
+    label: &str,
+    value: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if value.len() < min_bytes
+        || value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!("Talk {label} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_talk_envelope(
+    protocol_version: u32,
+    session_id: &str,
+    session_generation: &str,
+    frame_sequence: u64,
+) -> Result<(), String> {
+    validate_talk_protocol_version(protocol_version)?;
+    validate_talk_session_id(session_id)?;
+    validate_talk_session_generation(session_generation)?;
+    if frame_sequence == 0 {
+        return Err("Talk frame sequence must be positive".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_audio_sequence(audio_sequence: u64) -> Result<(), String> {
+    if audio_sequence == 0 {
+        return Err("Talk audio sequence must be positive".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_media_type(media_type: &str) -> Result<(), String> {
+    if media_type.len() > MAX_TALK_MEDIA_TYPE_BYTES || !TALK_MEDIA_TYPES.contains(&media_type) {
+        return Err(format!("Unsupported Talk media type '{media_type}'"));
+    }
+    Ok(())
+}
+
+fn validate_talk_audio(audio_base64: &str) -> Result<(), String> {
+    if audio_base64.is_empty() {
+        return Err("Talk audio payload is empty".to_string());
+    }
+    if audio_base64.len() > MAX_TALK_AUDIO_BASE64_BYTES {
+        return Err(format!(
+            "Talk audio payload exceeds {MAX_TALK_AUDIO_BYTES} decoded bytes"
+        ));
+    }
+    let decoded = STANDARD
+        .decode(audio_base64)
+        .map_err(|_| "Talk audio payload is not valid base64".to_string())?;
+    if decoded.len() > MAX_TALK_AUDIO_BYTES {
+        return Err(format!(
+            "Talk audio payload exceeds {MAX_TALK_AUDIO_BYTES} decoded bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_text(label: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > max_bytes {
+        return Err(format!(
+            "{label} must contain between 1 and {max_bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_frame_size(frame: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec(frame)
+        .map_err(|error| format!("Talk frame cannot be serialized: {error}"))?;
+    if bytes.len() > MAX_TALK_FRAME_BYTES {
+        return Err(format!("Talk frame exceeds {MAX_TALK_FRAME_BYTES} bytes"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEntry {
@@ -2035,6 +2481,187 @@ mod tests {
         assert!(validate_capabilities(&capabilities, &scopes).is_err());
         capabilities.insert(DeviceCapability::MicrophoneCapture);
         assert!(validate_capabilities(&capabilities, &scopes).is_ok());
+    }
+
+    fn talk_generation() -> String {
+        random_token(TALK_SESSION_GENERATION_RANDOM_BYTES).unwrap()
+    }
+
+    fn client_talk_frame(frame_sequence: u64, kind: TalkClientFrameKind) -> TalkClientFrame {
+        TalkClientFrame {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            session_generation: talk_generation(),
+            frame_sequence,
+            kind,
+        }
+    }
+
+    fn server_talk_frame(frame_sequence: u64, kind: TalkServerFrameKind) -> TalkServerFrame {
+        TalkServerFrame {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            session_generation: talk_generation(),
+            frame_sequence,
+            kind,
+        }
+    }
+
+    #[test]
+    fn talk_tickets_bind_random_generations_to_a_bounded_session_path() {
+        let first =
+            TalkTicketResponse::issue("session-one", 1_000, DEFAULT_TALK_TICKET_TTL_MS).unwrap();
+        let second =
+            TalkTicketResponse::issue("session-one", 1_000, DEFAULT_TALK_TICKET_TTL_MS).unwrap();
+        assert_ne!(first.session_generation, second.session_generation);
+        assert_ne!(first.ticket, second.ticket);
+        assert_eq!(
+            first.websocket_path,
+            "/v1/remote/device/talk/session-one/stream"
+        );
+        assert!(!first.websocket_path.contains(&first.ticket));
+        assert!(first.validate(1_000).is_ok());
+        assert!(first.validate(first.expires_at_ms).is_err());
+        assert!(TalkTicketResponse::issue("bad/session", 1_000, 1_000).is_err());
+    }
+
+    #[test]
+    fn every_talk_frame_kind_round_trips_and_validates() {
+        let audio = STANDARD.encode(b"bounded audio");
+        let client_frames = vec![
+            client_talk_frame(
+                1,
+                TalkClientFrameKind::Hello {
+                    media_type: "audio/webm;codecs=opus".into(),
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                },
+            ),
+            client_talk_frame(
+                2,
+                TalkClientFrameKind::Audio {
+                    audio_sequence: 1,
+                    media_type: "audio/webm;codecs=opus".into(),
+                    audio_base64: audio.clone(),
+                    last: false,
+                },
+            ),
+            client_talk_frame(
+                3,
+                TalkClientFrameKind::State {
+                    state: TalkState::Listening,
+                },
+            ),
+            client_talk_frame(
+                4,
+                TalkClientFrameKind::Interrupt {
+                    reason: Some("barge_in".into()),
+                },
+            ),
+        ];
+        for frame in client_frames {
+            frame.validate().unwrap();
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TalkClientFrame>(&json).unwrap(),
+                frame
+            );
+        }
+
+        let server_frames = vec![
+            server_talk_frame(1, TalkServerFrameKind::Ready),
+            server_talk_frame(
+                2,
+                TalkServerFrameKind::State {
+                    state: TalkState::Thinking,
+                },
+            ),
+            server_talk_frame(
+                3,
+                TalkServerFrameKind::Transcript {
+                    text: "hello".into(),
+                    is_final: true,
+                },
+            ),
+            server_talk_frame(4, TalkServerFrameKind::AssistantDelta { text: "hi".into() }),
+            server_talk_frame(
+                5,
+                TalkServerFrameKind::OutputAudio {
+                    audio_sequence: 1,
+                    media_type: "audio/mpeg".into(),
+                    audio_base64: audio,
+                },
+            ),
+            server_talk_frame(
+                6,
+                TalkServerFrameKind::Error {
+                    code: "provider_unavailable".into(),
+                    message: "Try again".into(),
+                    retryable: true,
+                },
+            ),
+        ];
+        for frame in server_frames {
+            frame.validate().unwrap();
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TalkServerFrame>(&json).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn talk_frames_reject_unversioned_unbounded_or_malformed_payloads() {
+        let mut frame = client_talk_frame(
+            1,
+            TalkClientFrameKind::Audio {
+                audio_sequence: 1,
+                media_type: "audio/webm".into(),
+                audio_base64: STANDARD.encode(b"audio"),
+                last: false,
+            },
+        );
+        frame.protocol_version += 1;
+        assert!(frame.validate().is_err());
+        frame.protocol_version = TALK_PROTOCOL_VERSION;
+        frame.session_generation = "predictable".into();
+        assert!(frame.validate().is_err());
+        frame.session_generation = talk_generation();
+        frame.kind = TalkClientFrameKind::Audio {
+            audio_sequence: 1,
+            media_type: "video/webm".into(),
+            audio_base64: STANDARD.encode(b"audio"),
+            last: false,
+        };
+        assert!(frame.validate().is_err());
+        frame.kind = TalkClientFrameKind::Audio {
+            audio_sequence: 1,
+            media_type: "audio/webm".into(),
+            audio_base64: STANDARD.encode(vec![0; MAX_TALK_AUDIO_BYTES + 1]),
+            last: false,
+        };
+        assert!(frame.validate().is_err());
+
+        let oversized_text = server_talk_frame(
+            1,
+            TalkServerFrameKind::AssistantDelta {
+                text: "x".repeat(MAX_TALK_TEXT_BYTES + 1),
+            },
+        );
+        assert!(oversized_text.validate().is_err());
+    }
+
+    #[test]
+    fn talk_sequence_tracker_rejects_frame_and_audio_replay() {
+        let mut tracker = TalkSequenceTracker::default();
+        tracker.accept(1, None).unwrap();
+        tracker.accept(2, Some(1)).unwrap();
+        assert!(tracker.accept(2, None).is_err());
+        assert!(tracker.accept(3, Some(1)).is_err());
+        assert_eq!(tracker.last_frame_sequence(), 2);
+        assert_eq!(tracker.last_audio_sequence(), 1);
+        tracker.accept(4, Some(2)).unwrap();
     }
 
     /// The size claim the compact code exists for. A realistic runner URL,

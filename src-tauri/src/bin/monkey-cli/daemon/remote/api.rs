@@ -29,9 +29,9 @@ use super::protocol::{
     DeviceCommandControl, DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest,
     DeviceCommandState, DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest,
     MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
-    SignedRequestHeaders, VoiceChunkRequest, VoiceCloseRequest, DEVICE_LEASE_MS,
-    MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES,
-    REMOTE_PROTOCOL_VERSION,
+    SignedRequestHeaders, TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest,
+    VoiceCloseRequest, DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES,
+    MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
     CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
@@ -190,6 +190,33 @@ pub struct ApiResponse {
     pub body: Vec<u8>,
 }
 
+/// Unspent admissions held at once. A ticket lives thirty seconds and is spent
+/// immediately, so this is a ceiling on a burst rather than on conversations.
+const MAX_PENDING_TALK_TICKETS: usize = 64;
+
+#[derive(Debug, Clone)]
+struct PendingTalkTicket {
+    device_id: String,
+    secret_generation: u64,
+    signed_request_sha256: String,
+    session_id: String,
+    session_generation: String,
+    expires_at_ms: u64,
+}
+
+/// Identity frozen into a consumed Talk ticket. The ticket itself is removed
+/// before the HTTP 101 is returned and is never retained in this value.
+#[derive(Debug, Clone)]
+pub(crate) struct TalkSocketAuthorization {
+    pub device_id: String,
+    /// Digest of the signed request that minted this admission. Every turn the
+    /// socket submits is keyed on it, so a spoken turn's durable identity traces
+    /// back to a request that carried a valid signature, sequence and nonce.
+    pub signed_request_sha256: String,
+    pub session_id: String,
+    pub session_generation: String,
+}
+
 impl ApiResponse {
     fn json<T: Serialize>(status: u16, value: &T) -> Self {
         match serde_json::to_vec(value) {
@@ -259,6 +286,9 @@ pub struct RemoteApi {
     /// can be read alongside them; it does not replace `remote_audit`, which
     /// holds the protocol-level denial detail this stream deliberately does not.
     audit: little_monkey_lib::subsystem_audit::SubsystemAudit,
+    /// Short-lived, one-use WebSocket admissions keyed by a digest of the
+    /// opaque ticket. Device secrets never enter this map or a URL.
+    talk_tickets: Arc<Mutex<HashMap<String, PendingTalkTicket>>>,
 }
 
 impl Clone for RemoteApi {
@@ -276,6 +306,7 @@ impl Clone for RemoteApi {
             // be two locks over one command, which is no lock at all.
             terminal_commits: Arc::clone(&self.terminal_commits),
             audit: self.audit.clone(),
+            talk_tickets: Arc::clone(&self.talk_tickets),
         }
     }
 }
@@ -302,6 +333,7 @@ impl RemoteApi {
             peer_runs: Some(peer_runs),
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
+            talk_tickets: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -331,6 +363,7 @@ impl RemoteApi {
             peer_runs: None,
             terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
+            talk_tickets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -787,6 +820,24 @@ impl RemoteApi {
             ("POST", ["v1", "remote", "device", "voice", session_id, "close"]) => {
                 require_capability(device, DeviceCapability::VoiceStream)
                     .and_then(|_| self.voice_close(&request.body, device, session_id, now_ms))
+            }
+            // A live conversation, not a recording. The ticket is the whole of
+            // the authentication story for the socket that follows: a browser
+            // cannot put signed headers on a WebSocket handshake, so the device
+            // proves itself here — with the same signature, sequence, nonce and
+            // key generation as any other route — and receives a one-use,
+            // 30-second bearer it immediately spends. See `consume_talk_ticket`.
+            ("POST", ["v1", "remote", "device", "talk", "ticket"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.talk_ticket(&request.body, device, request_sha256, now_ms))
+            }
+            // The upgrade itself never reaches this match — `server.rs` answers
+            // it before a body is collected. A *signed* GET that is not an
+            // upgrade does reach here, and is told what it is missing rather
+            // than 404ing on a route the contract publishes.
+            ("GET", ["v1", "remote", "device", "talk", session_id, "stream"]) => {
+                require_capability(device, DeviceCapability::VoiceStream)
+                    .and_then(|_| self.talk_stream_needs_upgrade(session_id))
             }
             // Registering where to reach this device, and withdrawing it. Both
             // self-service for the same reason as the routes above: a push
@@ -2028,6 +2079,209 @@ impl RemoteApi {
             200,
             device_state_json(device, Some(&surface)),
             Some(device.device_id.clone()),
+        ))
+    }
+
+    // --- Realtime Talk -----------------------------------------------------
+
+    /// Issues the one-use bearer that admits a Talk WebSocket.
+    ///
+    /// **Why a ticket exists at all.** Every other route on this plane is a
+    /// signed request: HMAC over method, path, body, sequence, nonce and key
+    /// generation. A browser cannot put any of that on a WebSocket handshake —
+    /// the API takes no headers — so the choice is a socket authenticated by
+    /// something weaker, or a signed request that *mints* the admission. This
+    /// is the second: the ticket is issued only to a request that already
+    /// passed the full signature, replay and revocation checks, it is random,
+    /// it is single-use, it dies in thirty seconds, and it is spent
+    /// immediately. The identity it carries is the identity of the signed
+    /// request that made it, frozen — the socket cannot claim any other device.
+    ///
+    /// The ticket is never put in the response's `websocket_path`; the client
+    /// appends it as a query parameter at the moment it opens the socket, so a
+    /// path that ends up in a log or a history entry carries no bearer.
+    fn talk_ticket(
+        &self,
+        body: &[u8],
+        device: &DeviceRecord,
+        request_sha256: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let request: TalkTicketRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid Talk ticket request: {error}")))?;
+        request.validate().map_err(|error| (400, error))?;
+        // The surface matters as much as the grant: a device whose OS refused
+        // the microphone must not be handed a socket that can only fail.
+        let surface = self
+            .locked_store()?
+            .device_surface(&device.device_id)
+            .map_err(internal)?;
+        if !effective_capabilities(&device.capabilities, surface.as_ref())
+            .contains(&DeviceCapability::VoiceStream)
+        {
+            return Err((
+                403,
+                "This device's microphone is not effective: the grant, the device's own \
+                 advertisement and its operating system permission must all allow it."
+                    .to_string(),
+            ));
+        }
+        let issued = TalkTicketResponse::issue(
+            request.session_id.clone(),
+            now_ms,
+            DEFAULT_TALK_TICKET_TTL_MS,
+        )
+        .map_err(|error| (400, error))?;
+        let mut tickets = self
+            .talk_tickets
+            .lock()
+            .map_err(|_| (500, "Talk ticket state was poisoned".to_string()))?;
+        // Expired admissions are swept on every issue rather than on a timer:
+        // this is the only path that adds to the map, so it is the only place
+        // it can grow.
+        tickets.retain(|_, pending| pending.expires_at_ms > now_ms);
+        if tickets.len() >= MAX_PENDING_TALK_TICKETS {
+            return Err((
+                429,
+                "Too many Talk sockets are being opened at once.".to_string(),
+            ));
+        }
+        tickets.insert(
+            sha256_hex(issued.ticket.as_bytes()),
+            PendingTalkTicket {
+                device_id: device.device_id.clone(),
+                secret_generation: device.secret_generation,
+                signed_request_sha256: request_sha256.to_string(),
+                session_id: issued.session_id.clone(),
+                session_generation: issued.session_generation.clone(),
+                expires_at_ms: issued.expires_at_ms,
+            },
+        );
+        drop(tickets);
+        Ok((
+            201,
+            serde_json::to_value(&issued).map_err(internal)?,
+            Some(device.device_id.clone()),
+        ))
+    }
+
+    /// Spends a ticket, returning the identity the socket then holds.
+    ///
+    /// `None` for anything at all wrong — unknown, expired, already spent,
+    /// wrong session, a device revoked or re-keyed in the meantime — with no
+    /// distinction between them, because a caller guessing tickets learns
+    /// nothing from which of those it hit. Removal happens under the same lock
+    /// as the lookup, which is what makes "one use" true against two sockets
+    /// racing with the same ticket.
+    pub(crate) fn consume_talk_ticket(
+        &self,
+        session_id: &str,
+        ticket: &str,
+        now_ms: u64,
+    ) -> Option<TalkSocketAuthorization> {
+        let pending = {
+            let mut tickets = self.talk_tickets.lock().ok()?;
+            let digest = sha256_hex(ticket.as_bytes());
+            let pending = tickets.get(&digest)?.clone();
+            if pending.expires_at_ms <= now_ms || pending.session_id != session_id {
+                // Removed either way: an expired or misdirected ticket has no
+                // second chance.
+                tickets.remove(&digest);
+                return None;
+            }
+            tickets.remove(&digest);
+            pending
+        };
+        // Re-checked at the moment of admission, not only at issue: thirty
+        // seconds is long enough for an operator to revoke a device, and the
+        // socket that follows can stay open for an hour.
+        let device = self
+            .store
+            .lock()
+            .ok()?
+            .device(&pending.device_id)
+            .ok()
+            .flatten()?;
+        if !device.active() || device.secret_generation != pending.secret_generation {
+            return None;
+        }
+        require_capability(&device, DeviceCapability::VoiceStream).ok()?;
+        Some(TalkSocketAuthorization {
+            device_id: pending.device_id,
+            signed_request_sha256: pending.signed_request_sha256,
+            session_id: pending.session_id,
+            session_generation: pending.session_generation,
+        })
+    }
+
+    /// Where the desktop half keeps its configuration, which is where the
+    /// operator's own speech backends are read from.
+    pub(crate) fn app_data_dir_for_talk(&self) -> std::path::PathBuf {
+        self.paths
+            .ledger_db
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.paths.root.clone())
+    }
+
+    /// What a finished Talk session leaves behind: bounded counters, on the
+    /// same audit stream every other remote action is written to.
+    ///
+    /// Deliberately not the transcript, not the assistant's answer and not one
+    /// byte of audio. A support bundle collects this stream, and a recording of
+    /// somebody's room is not a thing to put in one.
+    pub(crate) fn record_talk_session(
+        &self,
+        device_id: &str,
+        report: &super::talk::TalkSessionReport,
+    ) {
+        self.audit
+            .record(little_monkey_lib::subsystem_audit::SubsystemAction {
+                subsystem: little_monkey_lib::run_ledger::Subsystem::Remote,
+                action: "TALK /v1/remote/device/talk/stream".to_string(),
+                turn_id: None,
+                permission_request_id: None,
+                outcome: if report.stream_dropped || report.grant_revoked {
+                    little_monkey_lib::subsystem_audit::outcome_for_status(499)
+                } else {
+                    little_monkey_lib::subsystem_audit::outcome_for_status(200)
+                },
+                detail: Some(serde_json::json!({
+                    "deviceId": device_id,
+                    "utterances": report.utterances,
+                    "turns": report.turns_submitted,
+                    "interruptions": report.interruptions,
+                    "spokenChunks": report.spoken_chunks,
+                    "errors": report.errors,
+                    "grantRevoked": report.grant_revoked,
+                })),
+            });
+    }
+
+    /// Whether a device may still speak. Read between Talk turns so a grant
+    /// withdrawn mid-conversation closes the microphone.
+    pub(crate) fn talk_capability_live(&self, device_id: &str) -> bool {
+        let Some(device) = self
+            .store
+            .lock()
+            .ok()
+            .and_then(|store| store.device(device_id).ok().flatten())
+        else {
+            return false;
+        };
+        device.active() && require_capability(&device, DeviceCapability::VoiceStream).is_ok()
+    }
+
+    fn talk_stream_needs_upgrade(
+        &self,
+        session_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        Err((
+            426,
+            format!(
+                "Talk session '{session_id}' is a WebSocket endpoint. Request a ticket at \
+                 POST /v1/remote/device/talk/ticket and upgrade with it."
+            ),
         ))
     }
 
@@ -3587,6 +3841,128 @@ fn audit_for(paths: &DaemonPaths) -> little_monkey_lib::subsystem_audit::Subsyst
 
 fn internal(error: impl std::fmt::Display) -> (u16, String) {
     (500, error.to_string())
+}
+
+/// A Talk session's turns, running through exactly the surface the typed mobile
+/// chat uses.
+///
+/// **Why the mobile message rows are written here too.** A spoken turn and a
+/// typed one land in the same session; if only the typed ones left a row, the
+/// operator would open the chat after a conversation and find half of it
+/// missing. The user row is written before the turn is queued and the assistant
+/// row when it settles — the same two writes, in the same order, that
+/// `mobile_message_post` and `materialize_mobile_replies` make, so the two
+/// surfaces converge on one transcript instead of two.
+pub(crate) struct TalkSessionTurns {
+    api: RemoteApi,
+    device_id: String,
+    /// See [`TalkSocketAuthorization::signed_request_sha256`].
+    admission_sha256: String,
+}
+
+impl TalkSessionTurns {
+    pub(crate) fn new(api: RemoteApi, authorization: &TalkSocketAuthorization) -> Self {
+        Self {
+            api,
+            device_id: authorization.device_id.clone(),
+            admission_sha256: authorization.signed_request_sha256.clone(),
+        }
+    }
+}
+
+impl super::talk::TalkTurns for TalkSessionTurns {
+    fn submit(&self, session_id: &str, client_key: &str, text: &str) -> Result<String, String> {
+        let queue = self
+            .api
+            .mobile_chat
+            .as_ref()
+            .ok_or_else(|| "This node build does not execute conversation turns".to_string())?;
+        let now_ms = super::now_ms_public()?;
+        {
+            let mut store = self
+                .api
+                .store
+                .lock()
+                .map_err(|_| "Remote state lock was poisoned".to_string())?;
+            store.insert_mobile_message(&MobileMessageRecord {
+                message_id: client_key.to_string(),
+                session_id: session_id.to_string(),
+                device_id: self.device_id.clone(),
+                role: "user".to_string(),
+                text: text.to_string(),
+                // A Talk turn is admitted by the ticket the socket was opened
+                // with, whose own signed request digest is this. Naming it keeps
+                // the row auditable in the same way a typed one is.
+                request_sha256: self.admission_sha256.clone(),
+                task_state: "queued".to_string(),
+                created_at_ms: now_ms,
+            })?;
+        }
+        queue.queue_chat(session_id, client_key, text)
+    }
+
+    fn progress(
+        &self,
+        run_id: &str,
+        from_index: u64,
+    ) -> Result<super::talk::TalkRunProgress, String> {
+        let ledger =
+            RunLedger::open(&self.api.paths.ledger_db).map_err(|error| error.to_string())?;
+        let events = match ledger.load_events(run_id, from_index, 500) {
+            Ok(events) => events,
+            // Not an error: the run row is written by the worker, and a turn
+            // queued microseconds ago may not have one yet.
+            Err(_) => {
+                return Ok(super::talk::TalkRunProgress {
+                    next_index: from_index,
+                    ..super::talk::TalkRunProgress::default()
+                })
+            }
+        };
+        let mut progress = super::talk::TalkRunProgress {
+            next_index: from_index.saturating_add(events.len() as u64),
+            ..super::talk::TalkRunProgress::default()
+        };
+        for envelope in &events {
+            match &envelope.event {
+                RunEvent::ModelDelta { channel, text, .. } => {
+                    if matches!(channel, OutputChannel::Assistant) {
+                        progress.delta.push_str(text);
+                    }
+                }
+                RunEvent::Completed { .. } => progress.finished = true,
+                RunEvent::Failed { message, .. } => {
+                    progress.finished = true;
+                    progress.error = Some(message.clone());
+                }
+                RunEvent::Cancelled { .. } => {
+                    progress.finished = true;
+                    if progress.delta.trim().is_empty() {
+                        progress.error = Some("This turn was cancelled.".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(progress)
+    }
+
+    fn cancel(&self, run_id: &str) -> Result<(), String> {
+        // The same two steps the run centre and the phone's cancel button take:
+        // ask the store to stop the job, and append the durable cancellation
+        // event. What a tool already did in the world is not undone by either,
+        // and nothing in Talk claims otherwise.
+        let now_ms = super::now_ms_public()?;
+        DaemonStore::open(&self.api.paths)
+            .and_then(|mut store| store.request_cancel(run_id, now_ms))
+            .map_err(|error| error.to_string())?;
+        super::super::append_cancellation(&self.api.paths, run_id, "Interrupted by speech")
+            .map_err(|error| error.to_string())
+    }
+
+    fn still_granted(&self, device_id: &str) -> bool {
+        self.api.talk_capability_live(device_id)
+    }
 }
 
 #[cfg(test)]
@@ -5729,6 +6105,168 @@ mod tests {
             ),
             2_000,
         )
+    }
+
+    /// Everything a Talk ticket has to be, in one pass.
+    ///
+    /// A ticket is the only credential a WebSocket handshake can carry, so the
+    /// properties below are the whole of that surface's security and each one
+    /// fails loudly here rather than in a reviewer's memory:
+    ///
+    /// - it is issued **only** to a request that already passed the signature,
+    ///   sequence, nonce and revocation checks, and **only** with the grant;
+    /// - it admits **once** — a second socket with the same ticket is refused;
+    /// - it is bound to **its own session**, so a ticket for one conversation
+    ///   cannot open another;
+    /// - it **expires**, in seconds rather than for the life of the socket;
+    /// - the bearer never appears in the path that a log or a history entry
+    ///   would keep.
+    #[test]
+    fn a_talk_ticket_admits_one_socket_once_and_only_with_the_grant() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": super::super::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": "talk-session-one",
+        }))
+        .unwrap();
+        let ask = |sequence: u64| {
+            signed(
+                &device_id,
+                &secret,
+                sequence,
+                &format!("cmd-talk-{sequence}"),
+                "POST",
+                "/v1/remote/device/talk/ticket",
+                &body,
+            )
+        };
+
+        // No grant, no ticket — before anything about sockets is considered.
+        assert_eq!(api.handle(ask(1), 2_000).status, 403);
+
+        // `voice_stream` is not grantable on its own — a stream is a
+        // microphone — so the pair is what an operator actually grants.
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+        );
+        assert_eq!(
+            advertise(
+                &api,
+                &device_id,
+                &secret,
+                2,
+                &[
+                    DeviceCapability::MicrophoneCapture,
+                    DeviceCapability::VoiceStream
+                ],
+                &[
+                    (DeviceCapability::MicrophoneCapture, OsPermission::Granted),
+                    (DeviceCapability::VoiceStream, OsPermission::Granted),
+                ],
+            )
+            .status,
+            200
+        );
+        let response = api.handle(ask(3), 2_000);
+        assert_eq!(response.status, 201);
+        let issued: TalkTicketResponse = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            issued.websocket_path,
+            "/v1/remote/device/talk/talk-session-one/stream"
+        );
+        assert!(
+            !issued.websocket_path.contains(&issued.ticket),
+            "the bearer must not be part of the path"
+        );
+
+        // A ticket for this session opens no other one.
+        assert!(api
+            .consume_talk_ticket("talk-session-two", &issued.ticket, 2_100)
+            .is_none());
+        // …and that misdirected attempt burned it, so the right session cannot
+        // use it afterwards either.
+        assert!(api
+            .consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
+            .is_none());
+
+        let second = api.handle(ask(4), 2_000);
+        let issued: TalkTicketResponse = serde_json::from_slice(&second.body).unwrap();
+        let admitted = api
+            .consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
+            .expect("a fresh ticket admits its own session");
+        assert_eq!(admitted.device_id, device_id);
+        assert_eq!(admitted.session_generation, issued.session_generation);
+        assert!(
+            api.consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
+                .is_none(),
+            "one use only: a captured ticket cannot open a second socket"
+        );
+
+        // Expiry is real, and short.
+        let third = api.handle(ask(5), 2_000);
+        let issued: TalkTicketResponse = serde_json::from_slice(&third.body).unwrap();
+        assert!(api
+            .consume_talk_ticket("talk-session-one", &issued.ticket, issued.expires_at_ms)
+            .is_none());
+
+        // A grant withdrawn between issue and handshake closes the door, which
+        // is why the check is repeated at admission rather than trusted from
+        // issue time.
+        let fourth = api.handle(ask(6), 2_000);
+        let issued: TalkTicketResponse = serde_json::from_slice(&fourth.body).unwrap();
+        {
+            let mut store = api.store.lock().unwrap();
+            // Exactly what an operator withdrawing one capability does: the
+            // rest of the grant is untouched.
+            let mut kept = store.device(&device_id).unwrap().unwrap().capabilities;
+            kept.remove(&DeviceCapability::VoiceStream);
+            store
+                .set_device_capabilities(&device_id, &kept, 2_000)
+                .unwrap();
+        }
+        assert!(
+            api.consume_talk_ticket("talk-session-one", &issued.ticket, 2_100)
+                .is_none(),
+            "a revoked grant must not be admitted by a ticket minted before it"
+        );
+        assert!(!api.talk_capability_live(&device_id));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A signed GET on the stream route is not the way in, and says so rather
+    /// than 404ing on a route the published contract names.
+    #[test]
+    fn a_plain_get_on_the_talk_stream_route_asks_for_an_upgrade() {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(
+            &api,
+            &device_id,
+            &[
+                DeviceCapability::MicrophoneCapture,
+                DeviceCapability::VoiceStream,
+            ],
+        );
+        let response = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                1,
+                "cmd-talk-get",
+                "GET",
+                "/v1/remote/device/talk/talk-session-one/stream",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(response.status, 426);
+        assert!(String::from_utf8_lossy(&response.body).contains("talk/ticket"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A whole voice stream over the signed plane: leased, started, audio

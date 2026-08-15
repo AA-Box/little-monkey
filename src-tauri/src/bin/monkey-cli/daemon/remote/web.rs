@@ -507,6 +507,65 @@ mod tests {
         assert!(javascript.contains("URL.revokeObjectURL(url)"));
     }
 
+    /// Mobile Talk, pinned to the five properties that make it honest.
+    ///
+    /// Each assertion is a claim this client would otherwise be able to break
+    /// quietly, and each has a matching guarantee on the runner side:
+    ///
+    /// - the socket is opened with a **one-use ticket** from a signed request,
+    ///   never with a long-lived credential in a URL;
+    /// - it is opened **on this origin**, which pairing already pinned;
+    /// - voice activity detection is **local**, and only a complete utterance
+    ///   is uploaded — silence never is;
+    /// - talking over the answer **stops the speaker** as well as telling the
+    ///   runner;
+    /// - a backgrounded page **ends the conversation** rather than claiming a
+    ///   background microphone neither mobile platform gives it.
+    #[test]
+    fn mobile_talk_is_ticketed_local_first_and_foreground_only() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+
+        // A ticket, from a signed request, spent on the socket.
+        assert!(javascript.contains(r#"signedRequest("POST", "/v1/remote/device/talk/ticket""#));
+        assert!(javascript.contains(r#"url.searchParams.set("ticket", ticket.ticket)"#));
+        assert!(javascript.contains("new WebSocket(url.toString())"));
+        assert!(
+            javascript.contains("new URL(ticket.websocket_path, location.origin)"),
+            "the socket must be opened on the origin pairing pinned"
+        );
+
+        // Local detection, and only a finished utterance leaves the device.
+        assert!(javascript.contains("function talkDetect("));
+        assert!(javascript.contains("talk.noiseFloor = talk.noiseFloor * 0.96"));
+        assert!(javascript.contains("last: true"));
+        assert!(
+            javascript.contains("if (blob.size > 0 && talk.running)"),
+            "an empty recording must not be uploaded"
+        );
+
+        // Barge-in stops this device's own speaker, not only the runner's.
+        assert!(javascript.contains("function talkStopPlayback()"));
+        assert!(javascript.contains(r#"talkInterrupt("barge_in")"#));
+
+        // Foreground only, and the microphone is always released.
+        assert!(javascript.contains(r#"document.addEventListener("visibilitychange""#));
+        assert!(javascript.contains("stopTracks(talk.stream)"));
+        assert!(
+            javascript.contains("if (state.stale && talk.running)"),
+            "an unreachable runner must not leave a microphone open"
+        );
+
+        // The capability-denied and unsupported states are shown rather than
+        // leaving a button that silently does nothing.
+        assert!(javascript.contains("Talk needs the voice_stream grant"));
+        assert!(javascript.contains("cannot open a microphone stream"));
+    }
+
     /// Offline means read-only. A device showing cached runs must not offer
     /// controls whose effect it cannot see, and must never buffer them for
     /// replay on reconnect.

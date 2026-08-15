@@ -24,6 +24,11 @@ use crate::artifact_store::{ArtifactBlob, ArtifactStore};
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "companion-config-v1.json";
 const GALLERY_FILE: &str = "image-gallery-v1.json";
+const TALK_METRICS_FILE: &str = "talk-metrics-v1.json";
+const MAX_TALK_METRICS: usize = 100;
+const MAX_TALK_LATENCY_MS: u64 = 10 * 60 * 1_000;
+const MAX_TALK_TTS_TEXT_BYTES: usize = 32 * 1024;
+const MAX_TALK_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CAPTURE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
@@ -70,17 +75,73 @@ pub enum TranscriptionBackendKind {
     Provider,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechBackendKind {
+    #[default]
+    System,
+}
+
+fn default_provider_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_language() -> String {
+    "auto".to_string()
+}
+
+fn default_vad_min_speech_ms() -> u64 {
+    180
+}
+
+fn default_vad_silence_ms() -> u64 {
+    800
+}
+
+fn default_vad_max_utterance_ms() -> u64 {
+    90_000
+}
+
+fn default_wake_phrase() -> String {
+    "hey little monkey".to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VoiceConfig {
     pub backend: TranscriptionBackendKind,
+    #[serde(default)]
     pub whisper_binary: Option<String>,
+    #[serde(default)]
     pub whisper_model: Option<String>,
+    #[serde(default)]
     pub provider_id: Option<String>,
+    #[serde(default = "default_provider_model")]
     pub provider_model: String,
+    #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default)]
     pub tts_voice: Option<String>,
+    #[serde(default)]
     pub save_raw_audio: bool,
+    #[serde(default)]
+    pub input_device_id: Option<String>,
+    #[serde(default)]
+    pub output_device_id: Option<String>,
+    #[serde(default)]
+    pub tts_backend: SpeechBackendKind,
+    #[serde(default = "default_vad_min_speech_ms")]
+    pub vad_min_speech_ms: u64,
+    #[serde(default = "default_vad_silence_ms")]
+    pub vad_silence_ms: u64,
+    #[serde(default = "default_vad_max_utterance_ms")]
+    pub vad_max_utterance_ms: u64,
+    #[serde(default)]
+    pub wake_phrase_enabled: bool,
+    #[serde(default = "default_wake_phrase")]
+    pub wake_phrase: String,
+    #[serde(default)]
+    pub always_listening: bool,
 }
 
 impl Default for VoiceConfig {
@@ -94,8 +155,64 @@ impl Default for VoiceConfig {
             language: "auto".to_string(),
             tts_voice: None,
             save_raw_audio: false,
+            input_device_id: None,
+            output_device_id: None,
+            tts_backend: SpeechBackendKind::System,
+            vad_min_speech_ms: default_vad_min_speech_ms(),
+            vad_silence_ms: default_vad_silence_ms(),
+            vad_max_utterance_ms: default_vad_max_utterance_ms(),
+            wake_phrase_enabled: false,
+            wake_phrase: default_wake_phrase(),
+            always_listening: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TalkMetric {
+    pub created_at_ms: u64,
+    pub speech_detection_ms: Option<u64>,
+    pub stt_ms: Option<u64>,
+    pub model_first_token_ms: Option<u64>,
+    pub tts_first_audio_ms: Option<u64>,
+    pub end_to_end_ms: Option<u64>,
+    pub interrupted: bool,
+    pub fallback: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkMetricsSnapshot {
+    pub metrics: Vec<TalkMetric>,
+    pub interrupt_count: usize,
+    pub fallback_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkStatus {
+    pub configured: bool,
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    pub backend: TranscriptionBackendKind,
+    pub active_jobs: usize,
+    pub active_microphone_grants: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechAudioResult {
+    pub job_id: String,
+    pub media_type: String,
+    pub audio_base64: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoicePrivacySnapshot {
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    pub local_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -211,6 +328,7 @@ pub struct M7CompanionState {
     grants: Mutex<BTreeMap<String, CaptureGrant>>,
     jobs: Mutex<BTreeMap<String, CancellationToken>>,
     gallery: Mutex<Vec<ImageGalleryEntry>>,
+    talk_metrics: Mutex<Vec<TalkMetric>>,
     artifacts: ArtifactStore,
 }
 
@@ -223,12 +341,19 @@ impl M7CompanionState {
         validate_config(&config)?;
         let gallery =
             load_json::<Vec<ImageGalleryEntry>>(&root.join(GALLERY_FILE))?.unwrap_or_default();
+        let mut talk_metrics =
+            load_json::<Vec<TalkMetric>>(&root.join(TALK_METRICS_FILE))?.unwrap_or_default();
+        talk_metrics.retain(|metric| validate_talk_metric(metric).is_ok());
+        if talk_metrics.len() > MAX_TALK_METRICS {
+            talk_metrics.drain(..talk_metrics.len() - MAX_TALK_METRICS);
+        }
         Ok(Self {
             root,
             config: Mutex::new(config),
             grants: Mutex::new(BTreeMap::new()),
             jobs: Mutex::new(BTreeMap::new()),
             gallery: Mutex::new(gallery),
+            talk_metrics: Mutex::new(talk_metrics),
             artifacts: ArtifactStore::with_max_blob_size(
                 app_data_dir.join("content-v1"),
                 MAX_MEDIA_BYTES,
@@ -268,6 +393,50 @@ impl M7CompanionState {
                 grant
             })
             .collect())
+    }
+
+    pub fn security_voice_privacy(&self) -> Result<VoicePrivacySnapshot, String> {
+        let voice = self.config()?.voice;
+        Ok(VoicePrivacySnapshot {
+            wake_phrase_enabled: voice.wake_phrase_enabled,
+            always_listening: voice.always_listening,
+            local_only: voice.backend == TranscriptionBackendKind::LocalWhisper,
+        })
+    }
+
+    fn talk_metrics(&self) -> Result<TalkMetricsSnapshot, String> {
+        let metrics = lock(&self.talk_metrics, "talk metrics")?.clone();
+        Ok(TalkMetricsSnapshot {
+            interrupt_count: metrics.iter().filter(|metric| metric.interrupted).count(),
+            fallback_count: metrics.iter().filter(|metric| metric.fallback).count(),
+            metrics,
+        })
+    }
+
+    fn record_talk_metric(&self, metric: TalkMetric) -> Result<TalkMetricsSnapshot, String> {
+        validate_talk_metric(&metric)?;
+        let snapshot = {
+            let mut metrics = lock(&self.talk_metrics, "talk metrics")?;
+            metrics.push(metric);
+            if metrics.len() > MAX_TALK_METRICS {
+                let remove = metrics.len() - MAX_TALK_METRICS;
+                metrics.drain(..remove);
+            }
+            atomic_write_json(&self.root.join(TALK_METRICS_FILE), metrics.as_slice())?;
+            metrics.clone()
+        };
+        Ok(TalkMetricsSnapshot {
+            interrupt_count: snapshot.iter().filter(|metric| metric.interrupted).count(),
+            fallback_count: snapshot.iter().filter(|metric| metric.fallback).count(),
+            metrics: snapshot,
+        })
+    }
+
+    fn clear_talk_metrics(&self) -> Result<(), String> {
+        let mut metrics = lock(&self.talk_metrics, "talk metrics")?;
+        atomic_write_json(&self.root.join(TALK_METRICS_FILE), &[] as &[TalkMetric])?;
+        metrics.clear();
+        Ok(())
     }
 
     fn require_grant(
@@ -464,8 +633,38 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || config.voice.provider_model.is_empty()
         || config.voice.provider_model.len() > 256
         || config.voice.language.len() > 32
+        || !(50..=2_000).contains(&config.voice.vad_min_speech_ms)
+        || !(400..=2_000).contains(&config.voice.vad_silence_ms)
+        || !(1_000..=90_000).contains(&config.voice.vad_max_utterance_ms)
+        || config.voice.vad_min_speech_ms >= config.voice.vad_max_utterance_ms
     {
         return Err("Companion configuration is invalid".to_string());
+    }
+    for device_id in [
+        config.voice.input_device_id.as_deref(),
+        config.voice.output_device_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if device_id.is_empty() || device_id.len() > 512 || device_id.chars().any(char::is_control)
+        {
+            return Err("Voice device selection is invalid".to_string());
+        }
+    }
+    if config.voice.wake_phrase.is_empty()
+        || config.voice.wake_phrase.len() > 128
+        || config.voice.wake_phrase.chars().any(char::is_control)
+    {
+        return Err("Wake phrase is invalid".to_string());
+    }
+    if config.voice.always_listening && !config.voice.wake_phrase_enabled {
+        return Err("Always-listening requires the wake phrase to be enabled".to_string());
+    }
+    if (config.voice.wake_phrase_enabled || config.voice.always_listening)
+        && config.voice.backend != TranscriptionBackendKind::LocalWhisper
+    {
+        return Err("Wake phrase listening is local-only and requires local Whisper".to_string());
     }
     config
         .overlay_shortcut
@@ -489,6 +688,27 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         validate_url(&endpoint.base_url)?;
         if endpoint.kind == ImageEndpointKind::ComfyUi && endpoint.workflow_template.is_none() {
             return Err("ComfyUI endpoints require a workflow template".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_talk_metric(metric: &TalkMetric) -> Result<(), String> {
+    if metric.created_at_ms == 0 {
+        return Err("Talk metric timestamp is invalid".to_string());
+    }
+    for value in [
+        metric.speech_detection_ms,
+        metric.stt_ms,
+        metric.model_first_token_ms,
+        metric.tts_first_audio_ms,
+        metric.end_to_end_ms,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value > MAX_TALK_LATENCY_MS {
+            return Err("Talk latency metric exceeds its limit".to_string());
         }
     }
     Ok(())
@@ -703,6 +923,67 @@ pub fn m7_config_save(
         ));
     }
     Ok(state.config()?)
+}
+
+#[tauri::command]
+pub fn m7_talk_status(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkStatus, String> {
+    ensure_main_window(&window)?;
+    let voice = state.config()?.voice;
+    let configured = match voice.backend {
+        TranscriptionBackendKind::LocalWhisper => {
+            voice.whisper_binary.is_some() && voice.whisper_model.is_some()
+        }
+        TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
+    };
+    let now = now_ms();
+    let active_microphone_grants = lock(&state.grants, "capture grants")?
+        .values()
+        .filter(|grant| {
+            grant.active
+                && grant.expires_at_ms > now
+                && matches!(grant.kind, CaptureKind::Microphone | CaptureKind::Meeting)
+        })
+        .count();
+    Ok(TalkStatus {
+        configured,
+        wake_phrase_enabled: voice.wake_phrase_enabled,
+        always_listening: voice.always_listening,
+        backend: voice.backend,
+        active_jobs: lock(&state.jobs, "companion jobs")?.len(),
+        active_microphone_grants,
+    })
+}
+
+#[tauri::command]
+pub fn m7_talk_metrics(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.talk_metrics()
+}
+
+#[tauri::command]
+pub fn m7_talk_metric_record(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    metric: TalkMetric,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.record_talk_metric(metric)
+}
+
+#[tauri::command]
+pub fn m7_talk_metrics_clear(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.clear_talk_metrics()?;
+    state.talk_metrics()
 }
 
 #[tauri::command]
@@ -1224,6 +1505,45 @@ pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
 ///
 /// No capture grant is involved because no capture happens: the audio is
 /// already in hand, having arrived from the carrier the operator configured.
+/// Transcribe audio already in memory with the operator's own backend.
+///
+/// The Talk sockets' entry point. Same [`M7CompanionState`], same
+/// `transcribe_path`, same rule as [`transcribe_call_audio`]: a spoken turn must
+/// not get a speech stack of its own. The bytes are written to a private
+/// temporary file because that is what both backends take — whisper.cpp reads a
+/// path, and the provider upload needs a filename whose extension tells it what
+/// the container is — and the file is removed on every exit path.
+///
+/// No capture grant is involved because no capture happens here: the audio
+/// arrived from a device the operator paired and granted `voice_stream`.
+pub async fn transcribe_audio_bytes(
+    app_data_dir: &Path,
+    audio: &[u8],
+    media_type: &str,
+) -> Result<String, String> {
+    if audio.is_empty() || audio.len() as u64 > MAX_MEDIA_BYTES {
+        return Err("Spoken audio is empty or exceeds its limit".to_string());
+    }
+    let extension = match media_type {
+        value if value.contains("wav") => "wav",
+        value if value.contains("ogg") => "ogg",
+        value if value.contains("mp4") => "m4a",
+        value if value.contains("mpeg") => "mp3",
+        _ => "webm",
+    };
+    let state = M7CompanionState::production(app_data_dir)?;
+    let directory = state.root.join("tmp");
+    ensure_private_directory(&directory)?;
+    let path = directory.join(format!("talk-{}.{extension}", Uuid::new_v4().simple()));
+    fs::write(&path, audio).map_err(|error| format!("Could not stage spoken audio: {error}"))?;
+    let job_id = format!("talk-stt-{}", Uuid::new_v4().simple());
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(&state, &job_id, &path, &cancellation, false).await;
+    state.finish_job(&job_id);
+    let _ = fs::remove_file(&path);
+    result.map(|(text, _backend, _segments)| text)
+}
+
 pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<String, String> {
     let state = M7CompanionState::production(app_data_dir)?;
     let job_id = format!("call-stt-{}", Uuid::new_v4().simple());
@@ -1244,14 +1564,22 @@ pub async fn synthesize_speech_to_wav(
     text: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
-        return Err("Speech text is empty or exceeds its limit".to_string());
-    }
     let voice = M7CompanionState::production(app_data_dir)?
         .config()?
         .voice
         .tts_voice
         .filter(|value| !value.is_empty());
+    synthesize_speech_to_wav_with_voice(voice, text, destination).await
+}
+
+async fn synthesize_speech_to_wav_with_voice(
+    voice: Option<String>,
+    text: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
+        return Err("Speech text is empty or exceeds its limit".to_string());
+    }
     let destination_arg = destination.to_string_lossy().to_string();
 
     #[cfg(target_os = "macos")]
@@ -1311,6 +1639,53 @@ pub async fn synthesize_speech_to_wav(
         return Err("System speech produced no audio".to_string());
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn m7_tts_synthesize(
+    state: tauri::State<'_, M7CompanionState>,
+    job_id: String,
+    text: String,
+) -> Result<SpeechAudioResult, String> {
+    if text.is_empty() || text.len() > MAX_TALK_TTS_TEXT_BYTES {
+        return Err("Speech text is empty or exceeds its Talk limit".to_string());
+    }
+    let cancellation = state.begin_job(&job_id)?;
+    let destination = state
+        .root
+        .join("tmp")
+        .join(format!("talk-speech-{}.wav", Uuid::new_v4().simple()));
+    let voice = state
+        .config()?
+        .voice
+        .tts_voice
+        .filter(|value| !value.is_empty());
+    let synthesis = synthesize_speech_to_wav_with_voice(voice, &text, &destination);
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err("Speech synthesis cancelled".to_string()),
+        result = synthesis => result,
+    };
+    state.finish_job(&job_id);
+    let output = match result {
+        Ok(()) => (|| {
+            let metadata = fs::metadata(&destination)
+                .map_err(|error| format!("Could not inspect synthesized speech: {error}"))?;
+            if metadata.len() > MAX_TALK_AUDIO_BYTES {
+                Err("Synthesized speech exceeds its Talk limit".to_string())
+            } else {
+                fs::read(&destination)
+                    .map_err(|error| format!("Could not read synthesized speech: {error}"))
+                    .map(|bytes| SpeechAudioResult {
+                        job_id: job_id.clone(),
+                        media_type: "audio/wav".to_string(),
+                        audio_base64: STANDARD.encode(bytes),
+                    })
+            }
+        })(),
+        Err(error) => Err(error),
+    };
+    let _ = fs::remove_file(destination);
+    output
 }
 
 #[tauri::command]
@@ -1875,5 +2250,77 @@ mod tests {
         let mut invalid_shortcut = state.config().unwrap();
         invalid_shortcut.overlay_shortcut = "definitely not a shortcut".to_string();
         assert!(state.save_config(invalid_shortcut).is_err());
+    }
+
+    #[test]
+    fn legacy_voice_config_gets_private_talk_defaults() {
+        let config: CompanionConfig = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "overlayShortcut": "CommandOrControl+Shift+Space",
+            "voice": {
+                "backend": "local_whisper",
+                "whisperBinary": null,
+                "whisperModel": null,
+                "providerId": null,
+                "providerModel": "whisper-1",
+                "language": "auto",
+                "ttsVoice": null,
+                "saveRawAudio": false
+            },
+            "imageEndpoints": []
+        }))
+        .unwrap();
+        assert_eq!(config.voice.vad_min_speech_ms, 180);
+        assert_eq!(config.voice.vad_silence_ms, 800);
+        assert_eq!(config.voice.vad_max_utterance_ms, 90_000);
+        assert!(!config.voice.wake_phrase_enabled);
+        assert!(!config.voice.always_listening);
+        assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn wake_phrase_is_opt_in_and_local_only() {
+        let mut config = CompanionConfig::default();
+        config.voice.backend = TranscriptionBackendKind::Provider;
+        config.voice.provider_id = Some("operator-provider".to_string());
+        config.voice.wake_phrase_enabled = true;
+        assert!(validate_config(&config).is_err());
+
+        config.voice.backend = TranscriptionBackendKind::LocalWhisper;
+        config.voice.always_listening = true;
+        assert!(validate_config(&config).is_ok());
+
+        config.voice.wake_phrase_enabled = false;
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn talk_metrics_are_bounded_and_contain_no_audio() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        for offset in 0..105 {
+            state
+                .record_talk_metric(TalkMetric {
+                    created_at_ms: 1_000 + offset,
+                    speech_detection_ms: Some(180),
+                    stt_ms: Some(240),
+                    model_first_token_ms: Some(320),
+                    tts_first_audio_ms: Some(410),
+                    end_to_end_ms: Some(720),
+                    interrupted: offset % 2 == 0,
+                    fallback: offset % 3 == 0,
+                })
+                .unwrap();
+        }
+        let snapshot = state.talk_metrics().unwrap();
+        assert_eq!(snapshot.metrics.len(), MAX_TALK_METRICS);
+        assert_eq!(snapshot.metrics[0].created_at_ms, 1_005);
+        let persisted = fs::read_to_string(state.root.join(TALK_METRICS_FILE)).unwrap();
+        assert!(!persisted.contains("audio"));
+        assert!(!persisted.contains("transcript"));
+
+        state.clear_talk_metrics().unwrap();
+        assert!(state.talk_metrics().unwrap().metrics.is_empty());
     }
 }

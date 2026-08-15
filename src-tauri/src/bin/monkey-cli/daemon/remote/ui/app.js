@@ -239,6 +239,17 @@ const ui = Object.fromEntries(
     "captureText",
     "captureFile",
     "captureButton",
+    "talkPanel",
+    "talkDot",
+    "talkState",
+    "talkUnavailable",
+    "talkButton",
+    "talkInterruptButton",
+    "talkMeter",
+    "talkMeterFill",
+    "talkTranscript",
+    "talkAnswer",
+    "talkError",
     "connectionDot",
     "connectionText",
     "toast",
@@ -1903,6 +1914,11 @@ function bindEvents() {
   });
   ui.captureForm?.addEventListener("submit", (event) => void fileCapture(event));
 
+  ui.talkButton?.addEventListener("click", () => {
+    if (talk.running) void stopTalk();
+    else void startTalk();
+  });
+  ui.talkInterruptButton?.addEventListener("click", () => talkInterrupt("stop_button"));
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
   ui.forgetButton.addEventListener("click", async () => {
@@ -2149,6 +2165,7 @@ function renderDeviceState() {
   ui.deviceGranted.textContent = capabilityList(value.granted);
   ui.deviceSupported.textContent = capabilityList(value.advertised);
   ui.deviceEffective.textContent = capabilityList(value.effective);
+  renderTalkPanel();
   const permissions = value.os_permissions || {};
   const entries = Object.entries(permissions);
   ui.devicePermissions.textContent = entries.length
@@ -2752,6 +2769,397 @@ function stagedArtifactOutcome(outcome) {
 }
 
 // --- The durable command journal -------------------------------------------
+
+// --- Talk: a live conversation over a dedicated socket ----------------------
+//
+// Everything else this client does is a signed request: HMAC over method, path,
+// body, sequence, nonce and key generation. A WebSocket handshake takes no
+// headers, so Talk cannot be authenticated the same way — instead it makes ONE
+// ordinary signed request for a one-use ticket and spends it immediately on the
+// socket. The socket carries no other credential, and the ticket is gone the
+// moment it is used.
+//
+// Voice activity detection is local and stays local: the phone decides where an
+// utterance ends and marks the last frame, so the runner never guesses from
+// silence it cannot hear. Nothing is uploaded while nobody is speaking.
+//
+// Foreground only, and said so on screen. A page that is hidden loses its
+// microphone on iOS and Android alike, so the session is closed deliberately
+// rather than left looking alive.
+
+const TALK_PROTOCOL_VERSION = 1;
+const TALK_MIN_SPEECH_MS = 180;
+const TALK_SILENCE_MS = 800;
+const TALK_MAX_UTTERANCE_MS = 90_000;
+const TALK_CHUNK_MS = 250;
+
+const talk = {
+  socket: null,
+  stream: null,
+  recorder: null,
+  context: null,
+  analyser: null,
+  meterTimer: null,
+  frameSequence: 0,
+  audioSequence: 0,
+  sessionId: null,
+  sessionGeneration: null,
+  /** Rolling ambient floor, the same shape the desktop detector uses. */
+  noiseFloor: 0.008,
+  candidateStartedAt: null,
+  speechStartedAt: null,
+  lastSpeechAt: null,
+  /** Queue of synthesized chunks, played strictly in order. */
+  playing: Promise.resolve(),
+  playbackGeneration: 0,
+  player: null,
+  running: false,
+};
+
+function talkSupported() {
+  return Boolean(
+    window.WebSocket &&
+      window.MediaRecorder &&
+      window.AudioContext &&
+      navigator.mediaDevices?.getUserMedia,
+  );
+}
+
+function setTalkState(label, key) {
+  ui.talkState.textContent = label;
+  ui.talkPanel.dataset.state = key;
+  ui.talkInterruptButton.disabled = !(key === "thinking" || key === "speaking");
+}
+
+function showTalkError(message) {
+  ui.talkError.hidden = !message;
+  ui.talkError.textContent = message || "";
+}
+
+// The runner's effective set is the authority; a capability this device
+// advertises but was not granted must read as unavailable, not as broken.
+function renderTalkPanel() {
+  if (!ui.talkPanel) return;
+  const effective = state.deviceState?.effective || [];
+  const granted = state.deviceState?.granted || [];
+  const permitted = effective.includes("voice_stream");
+  ui.talkPanel.hidden = !state.profile;
+  ui.talkButton.disabled = !permitted || state.stale;
+  if (!talkSupported()) {
+    ui.talkUnavailable.hidden = false;
+    ui.talkUnavailable.textContent =
+      "This browser cannot open a microphone stream, so Talk is unavailable here.";
+    ui.talkButton.disabled = true;
+    return;
+  }
+  if (!permitted) {
+    ui.talkUnavailable.hidden = false;
+    ui.talkUnavailable.textContent = granted.includes("voice_stream")
+      ? "Talk is granted, but this device's microphone permission has not been given. Allow the microphone and reload."
+      : "Talk needs the voice_stream grant. Grant it on the runner's device card.";
+    return;
+  }
+  ui.talkUnavailable.hidden = true;
+}
+
+/** Adaptive local detector. Returns the event this frame produced, if any. */
+function talkDetect(rms, nowMs) {
+  const threshold = Math.max(0.012, talk.noiseFloor * 2.8);
+  const above = rms >= threshold;
+  ui.talkMeterFill.style.width = `${Math.min(100, Math.round((rms / Math.max(threshold * 2.5, 0.001)) * 100))}%`;
+  ui.talkMeter.setAttribute("aria-valuenow", String(Math.min(100, Math.round(rms * 1000))));
+  if (talk.speechStartedAt === null) {
+    if (above) {
+      if (talk.candidateStartedAt === null) talk.candidateStartedAt = nowMs;
+      if (nowMs - talk.candidateStartedAt >= TALK_MIN_SPEECH_MS) {
+        talk.speechStartedAt = talk.candidateStartedAt;
+        talk.lastSpeechAt = nowMs;
+        return "speech-start";
+      }
+    } else {
+      talk.candidateStartedAt = null;
+      const bounded = Math.min(Math.max(rms, 0.0005), 0.08);
+      talk.noiseFloor = talk.noiseFloor * 0.96 + bounded * 0.04;
+    }
+    return "none";
+  }
+  if (above) talk.lastSpeechAt = nowMs;
+  if (nowMs - talk.speechStartedAt >= TALK_MAX_UTTERANCE_MS) {
+    talkResetDetector();
+    return "max-utterance";
+  }
+  if (talk.lastSpeechAt !== null && nowMs - talk.lastSpeechAt >= TALK_SILENCE_MS) {
+    talkResetDetector();
+    return "utterance-end";
+  }
+  return "none";
+}
+
+function talkResetDetector() {
+  talk.candidateStartedAt = null;
+  talk.speechStartedAt = null;
+  talk.lastSpeechAt = null;
+}
+
+function talkSend(kind) {
+  if (!talk.socket || talk.socket.readyState !== WebSocket.OPEN) return;
+  talk.frameSequence += 1;
+  talk.socket.send(
+    JSON.stringify({
+      protocol_version: TALK_PROTOCOL_VERSION,
+      session_id: talk.sessionId,
+      session_generation: talk.sessionGeneration,
+      frame_sequence: talk.frameSequence,
+      ...kind,
+    }),
+  );
+}
+
+/** Stop the speaker and drop everything queued behind it. */
+function talkStopPlayback() {
+  talk.playbackGeneration += 1;
+  talk.playing = Promise.resolve();
+  if (talk.player) {
+    talk.player.pause();
+    talk.player = null;
+  }
+}
+
+function talkInterrupt(reason) {
+  talkStopPlayback();
+  talkSend({ type: "interrupt", reason });
+}
+
+function talkQueueAudio(audioBase64, mediaType) {
+  const generation = talk.playbackGeneration;
+  talk.playing = talk.playing.then(
+    () =>
+      new Promise((resolve) => {
+        if (generation !== talk.playbackGeneration) {
+          resolve();
+          return;
+        }
+        const bytes = Uint8Array.from(atob(audioBase64), (character) => character.charCodeAt(0));
+        const url = URL.createObjectURL(new Blob([bytes], { type: mediaType || "audio/wav" }));
+        const player = new Audio(url);
+        talk.player = player;
+        const finish = () => {
+          URL.revokeObjectURL(url);
+          if (talk.player === player) talk.player = null;
+          resolve();
+        };
+        player.onended = finish;
+        player.onerror = finish;
+        player.play().catch(finish);
+      }),
+  );
+}
+
+function talkHandleFrame(raw) {
+  let frame;
+  try {
+    frame = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (frame.session_generation !== talk.sessionGeneration) return;
+  switch (frame.type) {
+    case "ready":
+      setTalkState("Listening", "listening");
+      break;
+    case "state":
+      setTalkState(
+        {
+          idle: "Idle",
+          starting: "Starting",
+          listening: "Listening",
+          transcribing: "Transcribing",
+          thinking: "Thinking",
+          speaking: "Speaking",
+          interrupted: "Interrupted",
+          error: "Error",
+        }[frame.state] || frame.state,
+        frame.state,
+      );
+      if (frame.state === "interrupted") talkStopPlayback();
+      break;
+    case "transcript":
+      ui.talkTranscript.textContent = frame.text;
+      ui.talkAnswer.textContent = "—";
+      break;
+    case "assistant_delta":
+      ui.talkAnswer.textContent =
+        ui.talkAnswer.textContent === "—" ? frame.text : ui.talkAnswer.textContent + frame.text;
+      break;
+    case "output_audio":
+      talkQueueAudio(frame.audio_base64, frame.media_type);
+      break;
+    case "error":
+      showTalkError(frame.message);
+      if (!frame.retryable) void stopTalk();
+      break;
+    default:
+      break;
+  }
+}
+
+async function startTalk() {
+  if (talk.running) return;
+  showTalkError("");
+  setButtonBusy(ui.talkButton, true, "Connecting…");
+  try {
+    // The microphone is opened BEFORE the ticket is asked for: a ticket lives
+    // thirty seconds, and a permission prompt the user reads slowly would burn
+    // it before the socket ever opened.
+    talk.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+      video: false,
+    });
+    const sessionId = `talk-${state.profile.deviceId}`;
+    const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", {
+      protocol_version: TALK_PROTOCOL_VERSION,
+      session_id: sessionId,
+    });
+    talk.sessionId = ticket.session_id;
+    talk.sessionGeneration = ticket.session_generation;
+    talk.frameSequence = 0;
+    talk.audioSequence = 0;
+    // Same origin as this page, by construction: pairing already refused an
+    // invitation whose runner URL was not this origin, so there is no second
+    // host a socket could be pointed at.
+    const url = new URL(ticket.websocket_path, location.origin);
+    url.protocol = "wss:";
+    url.searchParams.set("ticket", ticket.ticket);
+    const socket = new WebSocket(url.toString());
+    talk.socket = socket;
+    await new Promise((resolve, reject) => {
+      socket.onopen = resolve;
+      socket.onerror = () => reject(new RemoteError("The Talk socket could not be opened", 0));
+    });
+    socket.onmessage = (event) => talkHandleFrame(event.data);
+    socket.onclose = () => {
+      if (talk.running) void stopTalk("The runner closed the conversation");
+    };
+    talk.running = true;
+    ui.talkButton.textContent = "End Talk";
+    talkStartCapture();
+    setTalkState("Listening", "listening");
+  } catch (error) {
+    await stopTalk();
+    handleError(error, "Talk could not be started");
+  } finally {
+    setButtonBusy(ui.talkButton, false);
+    if (talk.running) ui.talkButton.textContent = "End Talk";
+  }
+}
+
+function talkStartCapture() {
+  const context = new AudioContext();
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 1024;
+  context.createMediaStreamSource(talk.stream).connect(analyser);
+  talk.context = context;
+  talk.analyser = analyser;
+  const buffer = new Float32Array(analyser.fftSize);
+  talkResetDetector();
+  talkBeginUtterance();
+  talk.meterTimer = setInterval(() => {
+    if (!talk.analyser) return;
+    talk.analyser.getFloatTimeDomainData(buffer);
+    let squares = 0;
+    for (const sample of buffer) squares += sample * sample;
+    const event = talkDetect(Math.sqrt(squares / buffer.length), Date.now());
+    if (event === "speech-start") {
+      // Talking over the answer stops it, here and on the runner.
+      if (ui.talkPanel.dataset.state === "speaking") talkInterrupt("barge_in");
+    } else if (event === "utterance-end" || event === "max-utterance") {
+      talkFinishUtterance();
+    }
+  }, 20);
+}
+
+/** One recorder per utterance, so every upload is a complete container. */
+function talkBeginUtterance() {
+  if (!talk.stream) return;
+  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((type) =>
+    MediaRecorder.isTypeSupported(type),
+  );
+  const recorder = preferred
+    ? new MediaRecorder(talk.stream, { mimeType: preferred })
+    : new MediaRecorder(talk.stream);
+  const chunks = [];
+  recorder.ondataavailable = (event) => {
+    if (event.data?.size) chunks.push(event.data);
+  };
+  recorder.onstop = async () => {
+    const mediaType = voiceMediaType(recorder.mimeType);
+    const blob = new Blob(chunks, { type: mediaType });
+    if (blob.size > 0 && talk.running) {
+      talk.audioSequence += 1;
+      talkSend({
+        type: "audio",
+        audio_sequence: talk.audioSequence,
+        media_type: mediaType,
+        audio_base64: await blobToBase64(blob),
+        last: true,
+      });
+    }
+    if (talk.running) talkBeginUtterance();
+  };
+  talk.recorder = recorder;
+  recorder.start(TALK_CHUNK_MS);
+}
+
+function talkFinishUtterance() {
+  const recorder = talk.recorder;
+  talk.recorder = null;
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+async function stopTalk(reason) {
+  talk.running = false;
+  talkStopPlayback();
+  if (talk.meterTimer) {
+    clearInterval(talk.meterTimer);
+    talk.meterTimer = null;
+  }
+  const recorder = talk.recorder;
+  talk.recorder = null;
+  if (recorder && recorder.state !== "inactive") {
+    recorder.onstop = null;
+    recorder.stop();
+  }
+  // Always: a microphone left open after a failed conversation is the failure
+  // that matters here.
+  stopTracks(talk.stream);
+  talk.stream = null;
+  if (talk.context) {
+    void talk.context.close().catch(() => undefined);
+    talk.context = null;
+  }
+  talk.analyser = null;
+  if (talk.socket) {
+    talk.socket.onclose = null;
+    if (talk.socket.readyState === WebSocket.OPEN) talk.socket.close();
+    talk.socket = null;
+  }
+  talk.sessionId = null;
+  talk.sessionGeneration = null;
+  ui.talkButton.textContent = "Start Talk";
+  setTalkState(reason || "Not connected", "idle");
+  if (reason) showTalkError(reason);
+}
+
+// A page that is hidden has no microphone on either mobile platform. Ending the
+// session is the honest response; a "background Talk" this cannot deliver would
+// be a promise the operating system breaks.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && talk.running) void stopTalk("Talk ended: this page went to the background");
+});
+
+// --- The command loop ------------------------------------------------------
+
+// Long-polls for work, performs it, and reports back.
 //
 // One record per command this device has been handed, holding the phase it
 // reached and — once it has one — the staged result including its bytes. It is
@@ -3282,6 +3690,10 @@ function applyStaleState() {
   ]) {
     if (button) button.disabled = state.stale;
   }
+  // A conversation cannot continue against a runner this device cannot reach,
+  // and a microphone must not stay open while it tries.
+  if (state.stale && talk.running) void stopTalk("Talk ended: the runner is unreachable");
+  renderTalkPanel();
   for (const button of ui.approvalsList?.querySelectorAll("button") || []) {
     button.disabled = state.stale;
   }
@@ -3423,6 +3835,7 @@ async function initialize() {
   // runner acting on a stale surface refuses what is possible or queues what
   // will fail.
   watchDeviceReadiness();
+  renderTalkPanel();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }

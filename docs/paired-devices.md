@@ -201,6 +201,53 @@ tunnel leaves a closed session behind, not an open one.
 
 There is no transcription here. The audio is stored as audio.
 
+## Talking: the Talk socket
+
+A voice stream records a room. Talk is a conversation, so it needs the other
+half — transcript, thinking, an answer, spoken audio coming back — and a queue of
+appends cannot carry that. It gets a dedicated WebSocket, on the same listener,
+the same TLS and the same pairing as everything above, gated on the same
+`voice_stream` grant.
+
+**How a socket is authenticated.** Every other route here is a signed request:
+HMAC over method, path, body, sequence, nonce and key generation. A browser
+cannot put any of that on a WebSocket handshake — the API takes no headers — so
+the device makes one ordinary signed request for a ticket and spends it
+immediately:
+
+```
+POST /v1/remote/device/talk/ticket        (signed, gated on voice_stream)
+GET  /v1/remote/device/talk/{id}/stream?ticket=…   (Upgrade: websocket)
+```
+
+The ticket is random, single-use, lives thirty seconds, and carries the identity
+of the signed request that minted it. Grant, key generation and revocation are
+re-checked at the moment the socket is admitted, not only when the ticket was
+issued — thirty seconds is long enough to revoke a device, and the socket that
+follows can stay open for an hour. A plain signed `GET` on the stream route
+answers `426` and says how to open one properly.
+
+**Frames.** Both directions carry the protocol version, the session id, a
+per-socket random generation and a strictly increasing sequence; audio carries
+its own sequence as well. A frame from an earlier socket cannot be replayed into
+a later one even with a valid ticket, because the generation will not match. The
+device sends `hello`, `audio` (with `last` marking the end of an utterance),
+`state` and `interrupt`; the runner sends `ready`, `state`, `transcript`,
+`assistant_delta`, `output_audio` and `error`.
+
+**Where the work happens.** Voice activity detection is on the device and stays
+there, so silence is never uploaded. The runner transcribes with the operator's
+own configured backend, submits the finalized transcript as an ordinary durable
+turn — same queue, same session, same tools and approvals as a typed message —
+streams the answer back, and speaks it on sentence boundaries. Talking over the
+answer stops the speech, drops what has not been said and cancels the run; what
+a tool already did in the world is not undone, and nothing claims it was.
+Withdrawing `voice_stream` mid-conversation closes the microphone at the next
+frame.
+
+What survives a session is the transcript, the answer and bounded counters. The
+audio is held for the length of one utterance and dropped.
+
 ## At most once, and delivered at least once
 
 The physical world has no transactions. A photograph cannot be un-taken, and no
@@ -481,7 +528,8 @@ reads no keys.
 grant it has not used in a month, which is capturing right now, whether a
 revoked device can still be woken, whether the transport those grants are
 exercised over is pinned HTTPS, and whether push would put run specifics on a
-lock screen.
+lock screen. An open Talk socket shows up there as a running
+`voice_stream` command, like any other capture in flight.
 
 ## Checking a real device
 

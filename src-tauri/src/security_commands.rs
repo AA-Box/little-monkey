@@ -9,7 +9,7 @@ use crate::native_skill_commands::NativeSkillsCommandState;
 use crate::native_skills::{ExternalSignedSkill, SkillSource};
 use crate::security_doctor::{
     run_security_audit, BrowserGrantSnapshot, CompanionGrantSnapshot, NativeSkillSnapshot,
-    SecurityAuditReport, SecurityAuditRequest, SecurityRuntimeSnapshot,
+    SecurityAuditReport, SecurityAuditRequest, SecurityRuntimeSnapshot, VoicePrivacySnapshot,
 };
 use crate::AppState;
 
@@ -64,6 +64,17 @@ pub async fn security_audit(
                 .collect();
         }
         Err(error) => runtime.companion_error = Some(error),
+    }
+    // Voice settings are this machine's own, not a device grant, so they reach
+    // the audit through the companion state rather than the device store. A
+    // read that fails leaves `None`, which the audit reads as "not observed"
+    // rather than as "nothing is listening".
+    if let Ok(voice) = companion.security_voice_privacy() {
+        runtime.voice = Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: voice.wake_phrase_enabled,
+            always_listening: voice.always_listening,
+            local_only: voice.local_only,
+        });
     }
 
     let package_skills = match m4.packages.active_skills() {
