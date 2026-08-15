@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.5.0";
+pub const CONTRACT_VERSION: &str = "1.6.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -314,6 +314,18 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         plane: RemotePlane::Device,
         method: "POST",
         path: "/v1/remote/device/voice/{session_id}/close",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/talk/ticket",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/talk/{session_id}/stream",
         gate: RemoteGate::Capability("VoiceStream"),
     },
     RemoteRouteSpec {

@@ -18,6 +18,7 @@ import {
   GitPullRequest,
   Globe,
   HelpCircle,
+  Mic,
   LayoutDashboard,
   ListTodo,
   Inbox,
@@ -75,6 +76,7 @@ interface AppMenuProps {
   onOpenDbAdminGuardrails: () => void;
   onRestartOnboarding: () => void;
   onOpenDailyBrief: () => void;
+  onOpenTalk: () => void;
   onOpenApiContractDiffLab: () => void;
   onOpenGoldenDatasetBuilder: () => void;
   onOpenDataNotebook: () => void;
@@ -188,6 +190,7 @@ export function AppMenu({
   onOpenDbAdminGuardrails,
   onRestartOnboarding,
   onOpenDailyBrief,
+  onOpenTalk,
   onOpenApiContractDiffLab,
   onOpenGoldenDatasetBuilder,
   onOpenDataNotebook,
@@ -239,6 +242,7 @@ export function AppMenu({
     { key: "globalSearch", icon: <Search size={14} className={iconClass} />, label: t("AppMenu.globalSearch"), onOpen: onOpenGlobalSearch },
     { key: "commandPalette", icon: <Command size={14} className={iconClass} />, label: t("AppMenu.commandPalette"), onOpen: onOpenCommandPalette },
     { key: "dailyBrief", icon: <Newspaper size={14} className={iconClass} />, label: t("AppMenu.dailyBrief"), onOpen: onOpenDailyBrief },
+    { key: "talk", icon: <Mic size={14} className={iconClass} />, label: t("AppMenu.talk"), onOpen: onOpenTalk },
     { key: "agentInbox", icon: <Inbox size={14} className={iconClass} />, label: t("AppMenu.agentInbox"), onOpen: onOpenAgentInbox },
     { key: "runCenter", icon: <Activity size={14} className={iconClass} />, label: t("AppMenu.runCenter"), onOpen: onOpenRunCenter },
   ];

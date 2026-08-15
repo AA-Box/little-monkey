@@ -2852,6 +2852,13 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
             if let Err(error) = remote::placement_sync(&paths).await {
                 eprintln!("monkey daemon: placement sync paused: {error}");
             }
+            // On the same tick, and for the same reason: a device deadline that
+            // only advances when some device happens to ask for work is not a
+            // deadline. An open Talk socket registers a live capture, and a
+            // runner that dies must not leave one claiming to be open.
+            if let Err(error) = remote::expire_device_work(&paths) {
+                eprintln!("monkey daemon: device expiry sweep paused: {error}");
+            }
         }
         if let Err(error) =
             workflow_trigger_sync.sync_if_changed(&paths.root, &mut engine.shared, now)

@@ -9,6 +9,7 @@ import {
   type CompanionConfig,
 } from "../../lib/companionClient";
 import { Button } from "../ui";
+import { VoiceSettingsSection } from "./VoiceSettingsSection";
 import { errorMessage } from "../../lib/errors";
 
 const INPUT = "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
@@ -190,6 +191,12 @@ export function CompanionPanel() {
         </label>
         {transcript && <textarea className={`${INPUT} mt-3 min-h-24`} value={transcript} onChange={(event) => setTranscript(event.target.value)} aria-label="Transcript result" />}
       </section>
+
+      <VoiceSettingsSection
+        config={config}
+        onChange={(voice) => setConfig({ ...config, voice })}
+        onSave={saveConfig}
+      />
 
       {status && <p role="status" className="text-xs text-success">{status}</p>}
       {error && <p role="alert" className="rounded-md border border-danger/40 bg-danger/10 p-3 text-xs text-danger">{error}</p>}

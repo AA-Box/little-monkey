@@ -1287,4 +1287,69 @@ dialog p:not(.eyebrow) {
   .workflow-row .button {
     width: 100%;
   }
+/* --- Talk ---------------------------------------------------------------- */
+
+.talk-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 999px;
+  background: var(--muted, #7b8794);
+  display: inline-block;
 }
+
+.talk-panel[data-state="listening"] .talk-dot,
+.talk-panel[data-state="transcribing"] .talk-dot,
+.talk-panel[data-state="thinking"] .talk-dot {
+  background: var(--accent, #3b82f6);
+  animation: talk-pulse 1.2s ease-in-out infinite;
+}
+
+.talk-panel[data-state="speaking"] .talk-dot {
+  background: var(--success, #16a34a);
+}
+
+.talk-panel[data-state="interrupted"] .talk-dot,
+.talk-panel[data-state="error"] .talk-dot {
+  background: var(--danger, #dc2626);
+}
+
+@keyframes talk-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.talk-controls {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin: 0.75rem 0;
+}
+
+.talk-meter {
+  height: 0.35rem;
+  border-radius: 999px;
+  background: var(--border, #d7dce2);
+  overflow: hidden;
+}
+
+.talk-meter-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--success, #16a34a);
+  transition: width 80ms linear;
+}
+
+.talk-transcript {
+  margin-top: 0.75rem;
+}
+
+.talk-text {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.talk-error {
+  color: var(--danger, #dc2626);
+}
+
