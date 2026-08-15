@@ -16,6 +16,19 @@ default-run = "little-monkey"
 name = "little_monkey_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# The macOS iMessage helper. A separate process on purpose: Full Disk Access
+# and Automation for Messages.app are permissions the *daemon* must never hold,
+# so the code that needs them lives here and talks JSON-RPC over its own stdio.
+# The operator installs and points an account at it; nothing downloads or
+# launches it behind their back.
+#
+# Declared explicitly rather than discovered under `src/bin/` so the name the
+# operator types matches the product. It compiles on every platform and refuses
+# to run anywhere but macOS — see its `main`.
+[[bin]]
+name = "little-monkey-imessage-helper"
+path = "src/imessage_helper/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 sha2 = "0.10.9"
@@ -241,25 +254,31 @@ rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
 # workspace validation all remain in Rust.
 portable-pty = "0.9.0"
 enigo = "0.6.1"
-# Matrix end-to-end encryption. `matrix-sdk-crypto` owns the Olm/Megolm
-# ratchets and the key store; this tree only ships its requests over its own
-# hardened HTTP. Hand-rolling either the crypto or its persistence is how
-# someone's private conversation becomes a bug report, so both come from the
-# crate the Matrix Rust SDK is built on.
+# Matrix. The whole client — sync, room state, media, threads, and the Olm /
+# Megolm lifecycle — comes from the maintained SDK rather than from hand-built
+# Client-Server requests. `adapters/matrix.rs` owns only normalization into
+# `ChannelEnvelope` and the fail-closed rules around encryption.
 #
-# `crypto-store` pulls `matrix-sdk-base` (and with it `decancer`, whose
-# `impl Add<_> for String` makes `String + &String` ambiguous tree-wide —
-# write `format!` instead). That, and the rusqlite pin above, are the price
-# of not maintaining a crypto store here. Both are compile-time loud.
-matrix-sdk-crypto = "0.18"
-matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store"] }
-# Ruma types are reached through `matrix-sdk-common`'s re-export rather than a
-# second direct `ruma`, so this tree cannot compile against a different
-# feature set from the one the crypto machine was built with.
-matrix-sdk-common = "0.18"
-# Only for rebuilding a homeserver reply into the `http::Response` that ruma's
-# `IncomingResponse` parses.
-http = "1"
+# `e2e-encryption` is what makes an encrypted room work at all; `sqlite` is
+# what makes it survive a restart, by persisting the crypto store *and* the
+# session under the daemon's own private state directory. Without persistence
+# every restart would register a new device against the user's account.
+#
+# Two known costs, both compile-time loud: the SDK's `matrix-sdk-sqlite` is
+# what holds `rusqlite` at 0.37 above, and `matrix-sdk-base` pulls `decancer`,
+# whose `impl Add<_> for String` makes `String + &String` ambiguous tree-wide
+# (write `format!` instead). Its HTTP is this tree's own `egress::hardened()`
+# client, handed to `ClientBuilder::http_client`, so no Matrix request escapes
+# the egress guard.
+#
+# Ruma types are reached through `matrix_sdk::ruma` rather than a second direct
+# `ruma` dependency, so this tree cannot compile against a different feature
+# set from the one the SDK itself was built with.
+matrix-sdk = { version = "0.18", default-features = false, features = ["e2e-encryption", "sqlite"] }
+# `mime::Mime` is the type `Room::send_attachment` takes for a file's content
+# type. Already in the tree via reqwest/matrix-sdk; named here because this is
+# the one place our own code constructs one.
+mime = "0.3"
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.
@@ -326,3 +345,24 @@ pdf-extraction = ["dep:pdf-extract"]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
 # command-macro argument-key matching can be exercised in unit tests.
 tauri = { version = "2", features = ["test"] }
+# The same Matrix SDK as above, plus its `testing` feature, which is only ever
+# compiled for `cargo test`.
+#
+# It brings `matrix_sdk::test_utils::mocks::MatrixMockServer`: a homeserver
+# stand-in that implements the *crypto* endpoints for real — `/keys/upload`,
+# `/keys/query`, `/keys/claim`, `/sendToDevice` — so two SDK clients perform a
+# genuine Olm/Megolm key exchange against it. That is what makes "encryption
+# actually works" provable in CI rather than only "plaintext is refused": a
+# hand-written protocol fixture can prove a refusal, but it cannot decrypt
+# anything, so it can never prove a success.
+#
+# The production `MatrixAdapter` is the client under test in every one of those
+# tests. Nothing here replaces it.
+matrix-sdk = { version = "0.18", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    "testing",
+] }
+# The sync-response builder those helpers take, for putting a room, a timeline
+# event or a to-device message into one `/sync` answer.
+matrix-sdk-test = "0.18"
