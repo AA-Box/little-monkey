@@ -1633,6 +1633,78 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// The same stand-in, but it serves `rounds` identity+socket pairs and
+    /// drops each socket after one event — which is what an unreliable server
+    /// looks like, and what the reconnect loop exists for.
+    async fn dropping_websocket_fixture(rounds: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fixture server");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            for round in 0..rounds {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = r#"{"id":"user-9","username":"bot"}"#;
+                let mut request = vec![0u8; 8 * 1024];
+                let _ = stream.read(&mut request).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
+                     {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                drop(stream);
+
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                    return;
+                };
+                let _ = ws.next().await;
+                let mut event = posted_event_fixture();
+                let post = event["data"]["post"].as_str().expect("post").to_string();
+                event["data"]["post"] =
+                    Value::String(post.replace("post-1", &format!("post-{round}")));
+                let _ = ws.send(Message::Text(event.to_string().into())).await;
+                // Dropped, not held: the adapter has to notice and come back.
+                let _ = ws.close(None).await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_dropped_socket_is_reconnected_and_keeps_delivering() {
+        // Inbound stops forever if the reader gives up on the first close, and
+        // that failure is invisible: `poll` returns empty batches exactly as it
+        // does on a quiet channel.
+        let base = dropping_websocket_fixture(2).await;
+        let account = account_fixture(&base);
+        let adapter = MattermostAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: "tok".to_string(),
+        })
+        .expect("adapter");
+
+        let first = adapter.poll(None).await.expect("poll");
+        assert_eq!(first.envelopes.len(), 1, "{first:?}");
+        assert_eq!(first.envelopes[0].provider_event_id, "post-0");
+
+        // The second one can only arrive over a connection the loop made
+        // itself, after backing off from the first drop.
+        let second = adapter.poll(None).await.expect("poll");
+        assert_eq!(
+            second.envelopes.len(),
+            1,
+            "the adapter never came back: {second:?}"
+        );
+        assert_eq!(second.envelopes[0].provider_event_id, "post-1");
+    }
+
     #[tokio::test]
     async fn a_posted_event_travels_the_whole_socket_path_into_poll() {
         let base = websocket_fixture().await;
