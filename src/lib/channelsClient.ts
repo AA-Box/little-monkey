@@ -213,7 +213,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   { kind: "slack", label: "Slack", transport: "socket", credentialLabel: "Bot and app tokens (JSON)", whereToGetIt: "Slack API → your app → OAuth (xoxb bot token) and Basic Information (xapp app-level token with connections:write).", docsUrl: "https://api.slack.com/apis/socket-mode", configFields: [] },
   {
     kind: "mattermost", label: "Mattermost", transport: "socket", credentialLabel: "Personal access token",
-    whereToGetIt: "Your Mattermost profile → Security → Personal Access Tokens.",
+    whereToGetIt: "Your Mattermost profile → Security → Personal Access Tokens. Messages arrive over a WebSocket, so health reports the connection as well as the token: an account whose token works but whose socket is down is shown as degraded rather than connected, and so is one dropping posts because replies are running behind.",
     docsUrl: "https://developers.mattermost.com/integrate/reference/personal-access-token/",
     configFields: [
       { key: "base_url", label: "Server URL", type: "text", required: true, placeholder: "https://chat.example.com", hint: "Your own server's origin. Plain http is accepted only for localhost, so a token can never be walked to an unencrypted host." },
@@ -221,7 +221,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "irc", label: "IRC", transport: "socket", credentialLabel: "SASL password", credentialOptional: true,
-    whereToGetIt: "The account password registered with the network's services (NickServ). Only needed if you turn SASL on. If the nickname you ask for is already in use, the connection takes the next free one (littlemonkey_, littlemonkey_2, \u2026) and health shows which one it ended up with.",
+    whereToGetIt: "The account password registered with the network's services (NickServ). Only needed if you turn SASL on. If the nickname you ask for is already in use, the connection takes the next free one (littlemonkey_, littlemonkey_2, \u2026) and health shows which one it ended up with. With SASL on, a failed login stays a failure: the connection is never completed as an anonymous one, and health names the account that could not authenticate.",
     docsUrl: "https://ircv3.net/specs/extensions/sasl-3.1",
     configFields: [
       { key: "server", label: "Server", type: "text", required: true, placeholder: "irc.libera.chat" },
@@ -233,7 +233,11 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
     ],
   },
   {
-    kind: "matrix", label: "Matrix", transport: "long_poll", credentialLabel: "Access token",
+    // Socket, not long-poll: the SDK holds `/sync` open in a background task
+    // and dispatches to handlers, which is the same shape as Discord's gateway
+    // and Mattermost's WebSocket. The daemon's own capability says
+    // `InboundTransport::Socket`, and there is one truthful answer.
+    kind: "matrix", label: "Matrix", transport: "socket", credentialLabel: "Access token",
     whereToGetIt: "Your own homeserver account's access token \u2014 in Element: Settings \u2192 Help & About \u2192 Advanced \u2192 Access Token. Treat it like a password. Encrypted rooms, encrypted files and threads all work: this app appears as the device that token already belongs to rather than adding a new one, and it keeps that device across restarts. Messages sent before it joined stay unreadable until you verify it from another of your clients. If it ever cannot tell whether a room is encrypted, it refuses to send rather than risk sending in the clear.",
     docsUrl: "https://spec.matrix.org/latest/client-server-api/",
     configFields: [
@@ -253,7 +257,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "imessage", label: "iMessage", transport: "helper", credentialLabel: "None — macOS holds the account", credentialOptional: true, requiresPlatform: "macos",
-    whereToGetIt: "macOS only, using the Mac you are already signed in to Messages on. Install little-monkey-imessage-helper and grant it two normal macOS permissions: Full Disk Access, so the Messages database can be read, and Automation for Messages, so replies can be sent. The helper holds both \u2014 Little Monkey itself never opens the Messages database and never sends an Apple event. Nothing disables SIP, injects into Messages, or asks for your Apple ID password.",
+    whereToGetIt: "macOS only, using the Mac you are already signed in to Messages on. Install little-monkey-imessage-helper and grant it two normal macOS permissions: Full Disk Access, so the Messages database can be read, and Automation for Messages, so replies can be sent. Both are checked for real \u2014 health tells you which one is still missing, and whether Messages has a usable account \u2014 rather than assumed from the helper being installed. The helper holds both permissions; Little Monkey itself never opens the Messages database, never sends an Apple event, and never learns where an attachment is stored. Nothing disables SIP, injects into Messages, or asks for your Apple ID password.",
     docsUrl: "https://support.apple.com/guide/messages/welcome/mac",
     configFields: [
       { key: "handle", label: "Your iMessage handle", type: "text", required: true, placeholder: "you@example.com" },

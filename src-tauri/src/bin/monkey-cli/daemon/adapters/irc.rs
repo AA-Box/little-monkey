@@ -86,6 +86,19 @@ const POLL_WAIT: Duration = Duration::from_secs(20);
 /// hammer the server while reporting nothing.
 const MAX_NICK_ATTEMPTS: usize = 5;
 
+/// How long a SASL exchange gets from the first line read to `903`.
+///
+/// A server that acknowledges the capability and then goes quiet would
+/// otherwise hold a connection open that can never authenticate and can never
+/// register, which reads as "connecting" forever.
+#[cfg(not(test))]
+const SASL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The same deadline, shortened so the timeout arm is provable in CI. Every
+/// test exchange runs over an in-memory pipe and answers in microseconds, so
+/// this is only ever reached by a server that deliberately says nothing.
+#[cfg(test)]
+const SASL_TIMEOUT: Duration = Duration::from_millis(150);
+
 const INITIAL_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
 /// A connection that stayed registered at least this long is treated as
@@ -336,14 +349,28 @@ impl ChannelAdapter for IrcAdapter {
         }
         let target = &message.conversation_id;
         let chunks = split_privmsg_chunks(target, &message.text);
-        for chunk in &chunks {
+        for (index, chunk) in chunks.iter().enumerate() {
             let line = format!("PRIVMSG {target} :{chunk}");
-            if let Err(error) = write_line(&self.shared, &line).await {
-                // IRC gives no delivery acknowledgement. Once `send` has
-                // confirmed we were registered, any failure here means bytes
-                // may already be on the wire, so the safe answer is "unknown"
-                // rather than "safe to retry".
-                return SendOutcome::NeedsReconciliation { error };
+            match write_line(&self.shared, &line).await {
+                Ok(()) => {}
+                // The socket went away between the registration check above and
+                // this write, and no part of this message has gone out yet:
+                // nothing was sent, so a retry cannot duplicate anything.
+                Err(WriteError::NotConnected) if index == 0 => {
+                    return SendOutcome::RetryableFailure {
+                        error: "Lost the IRC connection before the message was written".to_string(),
+                        retry_after_ms: Some(2_000),
+                    }
+                }
+                // IRC gives no delivery acknowledgement. A write that failed
+                // part-way, or one that follows a chunk already on the wire,
+                // may already have been delivered — "unknown" is the only safe
+                // answer, never "retry".
+                Err(error) => {
+                    return SendOutcome::NeedsReconciliation {
+                        error: String::from(error),
+                    }
+                }
             }
         }
         SendOutcome::Sent {
@@ -379,24 +406,48 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
         .clone()
 }
 
+/// Why one line did not go out.
+///
+/// The distinction is the outbound-certainty one: with no socket at all
+/// nothing was written and a retry is provably safe, while a write that
+/// failed part-way may already have put bytes on the wire — and IRC
+/// acknowledges nothing, so those bytes can never be un-sent.
+#[derive(Debug)]
+enum WriteError {
+    NotConnected,
+    Failed(String),
+}
+
+impl From<WriteError> for String {
+    fn from(error: WriteError) -> String {
+        match error {
+            WriteError::NotConnected => "not connected to the IRC server".to_string(),
+            WriteError::Failed(message) => message,
+        }
+    }
+}
+
 /// Writes one line plus `\r\n` to the current socket, or fails if there is
 /// none. Shared by the connection task (registration, `PONG`) and
 /// [`IrcAdapter::send`], so both go through the same `Mutex` and neither can
 /// interleave a half-written line with the other.
-async fn write_line(shared: &Shared, line: &str) -> Result<(), String> {
+async fn write_line(shared: &Shared, line: &str) -> Result<(), WriteError> {
     let mut guard = shared.write_half.lock().await;
     let Some(write_half) = guard.as_mut() else {
-        return Err("not connected to the IRC server".to_string());
+        return Err(WriteError::NotConnected);
     };
     write_half
         .write_all(line.as_bytes())
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| WriteError::Failed(error.to_string()))?;
     write_half
         .write_all(b"\r\n")
         .await
-        .map_err(|error| error.to_string())?;
-    write_half.flush().await.map_err(|error| error.to_string())
+        .map_err(|error| WriteError::Failed(error.to_string()))?;
+    write_half
+        .flush()
+        .await
+        .map_err(|error| WriteError::Failed(error.to_string()))
 }
 
 /// Connects, registers, and reads forever, reconnecting with backoff whenever
@@ -500,14 +551,33 @@ async fn register_and_read<R: AsyncRead + Unpin>(
     )
     .await?;
 
+    let mut state = RegistrationState::NegotiatingCapabilities;
+    // Only meaningful when `use_sasl`; the whole point is that `001` may not be
+    // believed until this is true.
+    let mut sasl_succeeded = false;
+    // A server that acknowledges `sasl` and then says nothing must not hold the
+    // connection open forever pretending to authenticate.
+    let sasl_deadline = tokio::time::Instant::now() + SASL_TIMEOUT;
+
     let mut lines = BufReader::new(read_half).lines();
     loop {
-        let raw_line = match lines
-            .next_line()
-            .await
-            .map_err(|error| format!("read failed: {error}"))?
-        {
+        let next = lines.next_line();
+        let read = if use_sasl && !sasl_succeeded {
+            match tokio::time::timeout_at(sasl_deadline, next).await {
+                Ok(read) => read,
+                Err(_) => return Err(sasl_failure(sasl_username, "it did not answer in time")),
+            }
+        } else {
+            next.await
+        };
+        let raw_line = match read.map_err(|error| format!("read failed: {error}"))? {
             Some(line) => line,
+            None if use_sasl && !sasl_succeeded => {
+                return Err(sasl_failure(
+                    sasl_username,
+                    "the server closed the connection during authentication",
+                ))
+            }
             None => return Err("connection closed by server".to_string()),
         };
         let Some(parsed) = parse_line(&raw_line) else {
@@ -518,16 +588,41 @@ async fn register_and_read<R: AsyncRead + Unpin>(
                 let token = parsed.params.first().copied().unwrap_or("");
                 write_line(shared, &format!("PONG :{token}")).await?;
             }
+            // The `CAP LS` listing. Without SASL nothing was ever requested, so
+            // negotiation is over the moment the listing is complete — and it
+            // has to be ended explicitly, because a server that saw `CAP LS`
+            // holds registration until `CAP END` and would otherwise never send
+            // `001`. A `*` in the third parameter marks a continuation line.
+            "CAP"
+                if !use_sasl
+                    && parsed.params.get(1).copied() == Some("LS")
+                    && parsed.params.get(2).copied() != Some("*") =>
+            {
+                write_line(shared, "CAP END").await?;
+                state = RegistrationState::Registering;
+            }
             "CAP" if use_sasl && parsed.params.get(1).copied() == Some("ACK") => {
+                state = RegistrationState::Authenticating;
                 write_line(shared, "AUTHENTICATE PLAIN").await?;
             }
             "CAP" if parsed.params.get(1).copied() == Some("NAK") => {
-                // Server refused a requested capability. Only `sasl` is ever
-                // requested, so there is nothing left to negotiate; proceed
-                // to registration unauthenticated rather than hang here.
+                if use_sasl {
+                    // The operator asked for SASL and this server will not do
+                    // it. Continuing would register anonymously — an
+                    // unauthenticated connection wearing a healthy badge — so
+                    // the attempt fails instead.
+                    return Err(sasl_failure(
+                        sasl_username,
+                        "the server refused the SASL capability",
+                    ));
+                }
                 write_line(shared, "CAP END").await?;
+                state = RegistrationState::Registering;
             }
-            "AUTHENTICATE" if parsed.params.first().copied() == Some("+") => {
+            "AUTHENTICATE"
+                if state == RegistrationState::Authenticating
+                    && parsed.params.first().copied() == Some("+") =>
+            {
                 // `\0<authzid>\0<authcid>\0<password>` with an empty
                 // authorization identity, per SASL PLAIN (RFC 4616). The
                 // authentication identity is the configured *account*, never
@@ -537,14 +632,24 @@ async fn register_and_read<R: AsyncRead + Unpin>(
                 let encoded = BASE64.encode(payload.as_bytes());
                 write_line(shared, &format!("AUTHENTICATE {encoded}")).await?;
             }
-            "900" | "903" => {
-                // RPL_LOGGEDIN / RPL_SASLSUCCESS.
+            // RPL_LOGGEDIN / RPL_SASLSUCCESS. Only believed while an
+            // authentication this connection started is actually in flight.
+            "900" | "903" if state == RegistrationState::Authenticating => {
+                sasl_succeeded = true;
+                state = RegistrationState::Registering;
                 write_line(shared, "CAP END").await?;
             }
+            // ERR_SASLFAIL / ERR_SASLTOOLONG / ERR_SASLABORTED /
+            // ERR_SASLALREADY. With SASL explicitly enabled every one of these
+            // ends the attempt: the alternative is an anonymous registration
+            // the operator never asked for.
             "904" | "905" | "906" | "907" => {
-                // SASL failed or is already done; end negotiation and let
-                // registration continue rather than hang waiting for a
-                // capability response that is not coming.
+                if use_sasl {
+                    return Err(sasl_failure(
+                        sasl_username,
+                        "the server rejected the credentials",
+                    ));
+                }
                 write_line(shared, "CAP END").await?;
             }
             "433" => {
@@ -582,9 +687,19 @@ async fn register_and_read<R: AsyncRead + Unpin>(
                 }
             }
             "001" => {
-                // RPL_WELCOME: registration is complete. This is the one and
-                // only place `registered` becomes true — see `probe`'s doc
-                // for why nothing earlier may set it.
+                // RPL_WELCOME: the server says registration is complete. When
+                // SASL was asked for, that is not enough on its own — a server
+                // will happily register an unauthenticated connection, and
+                // treating this as success is exactly the silent downgrade this
+                // state machine exists to prevent.
+                if use_sasl && !sasl_succeeded {
+                    return Err(sasl_failure(
+                        sasl_username,
+                        "the server completed registration without authenticating",
+                    ));
+                }
+                // This is the one and only place `registered` becomes true —
+                // see `probe`'s doc for why nothing earlier may set it.
                 //
                 // The nick recorded is `001`'s own first parameter, which is
                 // the server's answer to what we asked for. Trusting our own
@@ -597,8 +712,10 @@ async fn register_and_read<R: AsyncRead + Unpin>(
                     .filter(|value| !value.is_empty())
                     .unwrap_or(attempted_nick.as_str());
                 *shared.active_nick.lock().await = assigned.to_string();
+                state = RegistrationState::Registered;
                 shared.registered.store(true, Ordering::SeqCst);
                 shared.status.set(HealthState::Connected);
+                *shared.last_error.lock().await = None;
                 for channel in channels {
                     write_line(shared, &format!("JOIN {channel}")).await?;
                 }
@@ -627,6 +744,34 @@ async fn register_and_read<R: AsyncRead + Unpin>(
             _ => {}
         }
     }
+}
+
+/// How far one connection attempt has got.
+///
+/// Tracked explicitly rather than inferred from what has been written, because
+/// the question "may `001` be believed?" has no correct answer without it: a
+/// server registers an unauthenticated connection just as happily as an
+/// authenticated one, and the difference is only visible in this state plus
+/// whether SASL actually succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationState {
+    /// Capabilities requested, nothing settled yet.
+    NegotiatingCapabilities,
+    /// SASL is in flight. Only reachable when the account enabled it.
+    Authenticating,
+    /// Negotiation is over (`CAP END` sent); waiting for `001`.
+    Registering,
+    /// `001` arrived and, if SASL was required, it succeeded first.
+    Registered,
+}
+
+/// The health sentence for a SASL failure.
+///
+/// Names the account so an operator knows *which* credential to fix, and never
+/// the password — this string is written into the account's health, which is
+/// shown in the UI and returned by the CLI.
+fn sasl_failure(sasl_username: &str, reason: &str) -> String {
+    format!("IRC SASL authentication failed for account {sasl_username}: {reason}")
 }
 
 /// Who this connection is, in the two senses IRC keeps separate: the nick it
@@ -1156,6 +1301,96 @@ mod tests {
         assert_eq!(parse_nick_len(&["monkey", "NICKLEN=0"]), None);
     }
 
+    /// An opt-in round trip against an IRC network the *operator* names.
+    ///
+    /// Never runs unless the server, nick and target are all set, so CI and
+    /// every contributor's `cargo test` skip it. No network, no nickname and no
+    /// channel is bundled anywhere in this tree: the destination is one the
+    /// person running it chose, and it is the only place a message is sent.
+    /// SASL is exercised only when a username and password are given too.
+    ///
+    /// ```text
+    /// LM_IRC_LIVE_SERVER=irc.libera.chat \
+    /// LM_IRC_LIVE_NICK=littlemonkey \
+    /// LM_IRC_LIVE_TARGET='#your-own-channel' \
+    /// LM_IRC_LIVE_SASL_USERNAME=littlemonkey \
+    /// LM_IRC_LIVE_SASL_PASSWORD=… \
+    ///   cargo test --bin monkey-cli a_live_irc_round_trip -- --nocapture
+    /// ```
+    #[tokio::test]
+    async fn a_live_irc_round_trip() {
+        let (Ok(server), Ok(nick), Ok(target)) = (
+            std::env::var("LM_IRC_LIVE_SERVER"),
+            std::env::var("LM_IRC_LIVE_NICK"),
+            std::env::var("LM_IRC_LIVE_TARGET"),
+        ) else {
+            return;
+        };
+        let sasl_username = std::env::var("LM_IRC_LIVE_SASL_USERNAME").ok();
+        let password = std::env::var("LM_IRC_LIVE_SASL_PASSWORD").unwrap_or_default();
+        let mut config = serde_json::json!({
+            "server": server,
+            "port": std::env::var("LM_IRC_LIVE_PORT")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(6697),
+            "nick": nick,
+            "channels": [target.clone()],
+            "use_sasl": !password.is_empty(),
+        });
+        if let Some(username) = sasl_username {
+            config["sasl_username"] = serde_json::Value::String(username);
+        }
+        let account = super::super::super::channel_store::ChannelAccountRecord {
+            account_id: "acct-1".to_string(),
+            kind: ChannelKind::Irc,
+            label: "IRC".to_string(),
+            enabled: true,
+            non_secret_config: config,
+            credential_ref: Some("irc/acct-1".to_string()),
+            access_policy: Default::default(),
+            health: ChannelHealth::error(0, "unused"),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let adapter = IrcAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: password,
+        })
+        .expect("adapter");
+
+        adapter.ensure_started().await;
+        for _ in 0..120 {
+            if adapter.shared.registered.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            HealthState::Connected,
+            "{:?}{:?}",
+            health.detail,
+            health.last_error
+        );
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let outcome = adapter
+            .send(&OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Irc,
+                conversation_id: target,
+                thread_id: None,
+                text: format!("little-monkey live smoke test {marker}"),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: format!("live-{marker}"),
+            })
+            .await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+    }
+
     /// Everything below drives the *production* registration state machine over
     /// an in-memory pipe: the same `register_and_read` a TLS socket reaches,
     /// with a scripted server on the other end. No TLS, no certificate, no
@@ -1231,7 +1466,7 @@ mod tests {
             // connection does. Stopping the watch is not a failure; a real
             // failure resolves long before this.
             let result = match tokio::time::timeout(
-                Duration::from_millis(500),
+                Duration::from_secs(1),
                 register_and_read(shared, "irc.test", identity, channels, client_read),
             )
             .await
@@ -1317,7 +1552,10 @@ mod tests {
         #[tokio::test]
         async fn sasl_authenticates_as_the_account_even_after_the_nick_changed() {
             let shared = shared();
-            let refused = std::sync::Mutex::new(false);
+            // A server that holds registration until `CAP END`, which is what
+            // the protocol says and what makes `001` mean anything: welcoming
+            // a connection mid-authentication would be the downgrade.
+            let state = std::sync::Mutex::new((false, "monkey".to_string()));
             let (_result, sent) = session(&shared, &identity(true), &[], move |line: &str| {
                 if line == "CAP REQ :sasl" {
                     return Some(vec![":irc.test CAP * ACK :sasl".to_string()]);
@@ -1328,15 +1566,20 @@ mod tests {
                 if line.starts_with("AUTHENTICATE ") {
                     return Some(vec![":irc.test 903 monkey :SASL successful".to_string()]);
                 }
+                if line == "CAP END" {
+                    let nick = state.lock().expect("state").1.clone();
+                    return Some(vec![format!(":irc.test 001 {nick} :Welcome")]);
+                }
                 if let Some(nick) = line.strip_prefix("NICK ") {
-                    let mut refused = refused.lock().expect("flag");
-                    if !*refused {
-                        *refused = true;
+                    let mut state = state.lock().expect("state");
+                    state.1 = nick.to_string();
+                    if !state.0 {
+                        state.0 = true;
                         return Some(vec![format!(
                             ":irc.test 433 * {nick} :Nickname is already in use"
                         )]);
                     }
-                    return Some(vec![format!(":irc.test 001 {nick} :Welcome")]);
+                    return Some(Vec::new());
                 }
                 Some(Vec::new())
             })
@@ -1464,6 +1707,234 @@ mod tests {
                 Some(&"NICK monkey".to_string())
             );
             assert_eq!(*shared.active_nick.lock().await, "monkey");
+        }
+
+        // -- SASL fails closed ------------------------------------------------
+        //
+        // The failure class: SASL was explicitly enabled, authentication did
+        // not happen, and the connection registered anyway. That is an
+        // anonymous IRC session flying a healthy badge — and on most networks
+        // it silently loses every channel that requires an account.
+
+        /// A server that welcomes any nick it is asked for, and answers the
+        /// SASL exchange with `refusal` at the point named by `at`.
+        fn welcome_but_refuse_sasl(
+            at: &'static str,
+            refusal: &'static str,
+        ) -> impl Fn(&str) -> Option<Vec<String>> + Send {
+            move |line: &str| {
+                if line == at {
+                    return Some(vec![refusal.to_string()]);
+                }
+                if line == "CAP REQ :sasl" {
+                    return Some(vec![":irc.test CAP * ACK :sasl".to_string()]);
+                }
+                if line == "AUTHENTICATE PLAIN" {
+                    return Some(vec!["AUTHENTICATE +".to_string()]);
+                }
+                if let Some(nick) = line.strip_prefix("NICK ") {
+                    return Some(vec![format!(":irc.test 001 {nick} :Welcome")]);
+                }
+                Some(Vec::new())
+            }
+        }
+
+        /// Every SASL failure asserts the same three things, so they are
+        /// asserted in one place: the attempt fails, nothing is Connected, and
+        /// the reason names the account rather than the password.
+        async fn assert_failed_closed(result: Result<(), String>, shared: &Arc<Shared>) {
+            let error = result.expect_err("an unauthenticated session is not a connection");
+            assert!(
+                error.contains("SASL authentication failed"),
+                "the reason has to be actionable: {error}"
+            );
+            assert!(
+                error.contains("monkey-account"),
+                "an operator needs to know which account to fix: {error}"
+            );
+            assert!(!error.contains("hunter2"), "the password leaked: {error}");
+            assert!(
+                !shared.registered.load(Ordering::SeqCst),
+                "registered without authenticating"
+            );
+            assert_ne!(shared.status.get(), HealthState::Connected);
+        }
+
+        #[tokio::test]
+        async fn a_refused_sasl_capability_fails_the_connection() {
+            let shared = shared();
+            let (result, sent) = session(
+                &shared,
+                &identity(true),
+                &[],
+                welcome_but_refuse_sasl("CAP REQ :sasl", ":irc.test CAP * NAK :sasl"),
+            )
+            .await;
+            assert_failed_closed(result, &shared).await;
+            assert!(
+                !sent.iter().any(|line| line == "CAP END"),
+                "ending negotiation here is what continues anonymously: {sent:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_rejected_credential_fails_the_connection() {
+            for code in ["904", "905", "906", "907"] {
+                let shared = shared();
+                let refusal: &'static str = match code {
+                    "904" => ":irc.test 904 * :SASL authentication failed",
+                    "905" => ":irc.test 905 * :SASL message too long",
+                    "906" => ":irc.test 906 * :SASL aborted",
+                    _ => ":irc.test 907 * :Already authenticated",
+                };
+                let (result, _) = session(
+                    &shared,
+                    &identity(true),
+                    &[],
+                    welcome_but_refuse_sasl("AUTHENTICATE PLAIN", refusal),
+                )
+                .await;
+                assert_failed_closed(result, &shared).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_welcome_without_authentication_is_not_a_connection() {
+            // The exact silent downgrade: the server never mentions SASL at
+            // all and goes straight to `001`. Believing it would report an
+            // anonymous session as Connected.
+            let shared = shared();
+            let (result, _) = session(&shared, &identity(true), &[], |line: &str| {
+                if let Some(nick) = line.strip_prefix("NICK ") {
+                    return Some(vec![format!(":irc.test 001 {nick} :Welcome")]);
+                }
+                Some(Vec::new())
+            })
+            .await;
+            assert_failed_closed(result, &shared).await;
+        }
+
+        #[tokio::test]
+        async fn a_sasl_exchange_that_never_answers_fails_rather_than_hanging() {
+            // The server acknowledges the capability and then says nothing at
+            // all — no `903`, no `904`, no close. Without a deadline this holds
+            // a connection open that can never register.
+            let shared = shared();
+            let (result, _) = session(&shared, &identity(true), &[], |line: &str| {
+                if line == "CAP REQ :sasl" {
+                    return Some(vec![":irc.test CAP * ACK :sasl".to_string()]);
+                }
+                Some(Vec::new())
+            })
+            .await;
+            assert_failed_closed(result, &shared).await;
+        }
+
+        #[tokio::test]
+        async fn a_successful_sasl_session_registers_and_reports_the_active_nick() {
+            let shared = shared();
+            let (_result, sent) = session(&shared, &identity(true), &[], |line: &str| {
+                if line == "CAP REQ :sasl" {
+                    return Some(vec![":irc.test CAP * ACK :sasl".to_string()]);
+                }
+                if line == "AUTHENTICATE PLAIN" {
+                    return Some(vec!["AUTHENTICATE +".to_string()]);
+                }
+                if line.starts_with("AUTHENTICATE ") {
+                    return Some(vec![":irc.test 903 monkey :SASL successful".to_string()]);
+                }
+                if line == "CAP END" {
+                    return Some(vec![":irc.test 001 monkey :Welcome".to_string()]);
+                }
+                Some(Vec::new())
+            })
+            .await;
+            assert!(shared.registered.load(Ordering::SeqCst));
+            assert_eq!(shared.status.get(), HealthState::Connected);
+            assert_eq!(*shared.active_nick.lock().await, "monkey");
+            assert!(sent.iter().any(|line| line == "CAP END"));
+            assert!(
+                !sent.iter().any(|line| line.contains("hunter2")),
+                "the password is base64 in the payload and plaintext nowhere: {sent:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn without_sasl_capability_negotiation_is_ended_explicitly() {
+            // `CAP LS` suspends registration until `CAP END`. Nothing is ever
+            // requested without SASL, so the listing has to be answered or the
+            // server never sends `001`.
+            let shared = shared();
+            let (_result, sent) = session(&shared, &identity(false), &[], |line: &str| {
+                if line == "CAP LS 302" {
+                    return Some(vec![
+                        ":irc.test CAP * LS :multi-prefix sasl account-tag".to_string()
+                    ]);
+                }
+                if line == "CAP END" {
+                    return Some(vec![":irc.test 001 monkey :Welcome".to_string()]);
+                }
+                Some(Vec::new())
+            })
+            .await;
+            assert!(sent.iter().any(|line| line == "CAP END"), "{sent:?}");
+            assert!(shared.registered.load(Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn health_reports_the_nick_the_server_gave_and_never_the_password() {
+            let account = super::super::super::super::channel_store::ChannelAccountRecord {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Irc,
+                label: "IRC".to_string(),
+                enabled: true,
+                non_secret_config: serde_json::json!({
+                    "server": "irc.test",
+                    "nick": "monkey",
+                    "use_sasl": true,
+                    "sasl_username": "monkey-account",
+                }),
+                credential_ref: Some("irc/acct-1".to_string()),
+                access_policy: Default::default(),
+                health: ChannelHealth::error(0, "unused"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            };
+            let adapter = IrcAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: "hunter2".to_string(),
+            })
+            .expect("adapter");
+            // Stand in for a completed registration without opening a socket:
+            // this is the state `001` leaves behind.
+            adapter.shared.registered.store(true, Ordering::SeqCst);
+            *adapter.shared.active_nick.lock().await = "monkey_2".to_string();
+
+            let health = adapter.probe().await;
+            assert_eq!(health.state, HealthState::Connected);
+            let detail = health.detail.unwrap_or_default();
+            assert!(detail.contains("monkey_2"), "{detail}");
+            assert!(!detail.contains("hunter2"), "{detail}");
+        }
+
+        #[tokio::test]
+        async fn a_sasl_failure_is_what_health_reports() {
+            let shared = shared();
+            let (result, _) = session(
+                &shared,
+                &identity(true),
+                &[],
+                welcome_but_refuse_sasl("CAP REQ :sasl", ":irc.test CAP * NAK :sasl"),
+            )
+            .await;
+            // What `connection_loop` does with the failure.
+            *shared.last_error.lock().await = result.err();
+            let reported = shared.last_error.lock().await.clone().expect("a reason");
+            assert!(
+                reported.contains("SASL authentication failed"),
+                "{reported}"
+            );
+            assert!(!reported.contains("hunter2"), "{reported}");
         }
 
         #[tokio::test]

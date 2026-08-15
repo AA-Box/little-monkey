@@ -210,6 +210,14 @@ impl MatrixAdapter {
         self
     }
 
+    /// Read outbound attachment bytes from somewhere a test owns rather than
+    /// from the daemon's content store.
+    #[cfg(test)]
+    fn with_blobs(mut self, blobs: Arc<dyn BlobSource>) -> Self {
+        self.blobs = blobs;
+        self
+    }
+
     /// The SDK client for this account, built and logged in exactly once.
     async fn client(&self) -> Result<&Client, String> {
         self.client
@@ -331,59 +339,78 @@ impl MatrixAdapter {
         let client = self.client().await?.clone();
         self.started
             .get_or_init(|| async {
-                let tx = self.inbound_tx.clone();
-                let shared = self.shared.clone();
-                let self_user = self.user_id.clone();
-
-                // Decrypted (or never-encrypted) room messages. The SDK has
-                // already turned an `m.room.encrypted` event into this one by
-                // the time a handler sees it.
-                {
-                    let tx = tx.clone();
-                    let shared = shared.clone();
-                    client.add_event_handler(
-                        move |event: OriginalSyncRoomMessageEvent, room: Room| {
-                            let tx = tx.clone();
-                            let shared = shared.clone();
-                            let self_user = self_user.clone();
-                            async move {
-                                if room.state() != RoomState::Joined {
-                                    return;
-                                }
-                                let is_direct = room.is_direct().await.unwrap_or(false);
-                                let Some(envelope) = normalize_message(
-                                    &event,
-                                    room.room_id().as_str(),
-                                    is_direct,
-                                    &self_user,
-                                ) else {
-                                    return;
-                                };
-                                // `try_send`, never `send`: the sync task must
-                                // not stall behind a slow consumer, or the SDK
-                                // stops absorbing to-device key traffic and
-                                // encrypted rooms go dark. An overflow is
-                                // counted and surfaced instead.
-                                if tx.try_send(envelope).is_err() {
-                                    shared.dropped.fetch_add(1, Ordering::Relaxed);
-                                    shared.status.set(HealthState::Degraded);
-                                }
-                            }
-                        },
-                    );
-                }
-
-                // Anything still encrypted here is an event the SDK could not
-                // decrypt. It is counted and never invented into plaintext.
-                client.add_event_handler(move |_: SyncRoomEncryptedEvent, _: Room| {
-                    let shared = shared.clone();
-                    async move {
-                        shared.undecryptable.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-
+                self.register_event_handlers(&client);
                 let shared = self.shared.clone();
                 tokio::spawn(run_sync_loop(client, shared, self.inbound_tx.clone()));
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Turn the SDK's dispatched events into [`ChannelEnvelope`]s.
+    ///
+    /// Separate from the sync loop because they are separate jobs: this is the
+    /// whole inbound normalization path, and *what* drives the sync — the
+    /// daemon's own loop in production, one `sync_once` in an integration test
+    /// — is not part of it.
+    fn register_event_handlers(&self, client: &Client) {
+        let tx = self.inbound_tx.clone();
+        let shared = self.shared.clone();
+        let self_user = self.user_id.clone();
+
+        // Decrypted (or never-encrypted) room messages. The SDK has already
+        // turned an `m.room.encrypted` event into this one by the time a
+        // handler sees it.
+        {
+            let tx = tx.clone();
+            let shared = shared.clone();
+            client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
+                let tx = tx.clone();
+                let shared = shared.clone();
+                let self_user = self_user.clone();
+                async move {
+                    if room.state() != RoomState::Joined {
+                        return;
+                    }
+                    let is_direct = room.is_direct().await.unwrap_or(false);
+                    let Some(envelope) =
+                        normalize_message(&event, room.room_id().as_str(), is_direct, &self_user)
+                    else {
+                        return;
+                    };
+                    // `try_send`, never `send`: the sync task must not stall
+                    // behind a slow consumer, or the SDK stops absorbing
+                    // to-device key traffic and encrypted rooms go dark. An
+                    // overflow is counted and surfaced instead.
+                    if tx.try_send(envelope).is_err() {
+                        shared.dropped.fetch_add(1, Ordering::Relaxed);
+                        shared.status.set(HealthState::Degraded);
+                    }
+                }
+            });
+        }
+
+        // Anything still encrypted here is an event the SDK could not decrypt.
+        // It is counted and never invented into plaintext.
+        client.add_event_handler(move |_: SyncRoomEncryptedEvent, _: Room| {
+            let shared = shared.clone();
+            async move {
+                shared.undecryptable.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Register the inbound handlers without starting a sync loop.
+    ///
+    /// The seam an integration test needs: the production normalization path,
+    /// driven by a sync the test issues itself, so one `/sync` answer is one
+    /// deterministic step instead of a race with a background loop.
+    #[cfg(test)]
+    async fn attach_handlers_without_syncing(&self) -> Result<(), String> {
+        let client = self.client().await?.clone();
+        self.started
+            .get_or_init(|| async {
+                self.register_event_handlers(&client);
             })
             .await;
         Ok(())
@@ -1953,35 +1980,722 @@ mod tests {
         }
     }
 
+    /// Real Olm/Megolm, against a homeserver stand-in that implements the
+    /// crypto endpoints for real.
+    ///
+    /// The module above proves the *refusals*: an undetermined room is never
+    /// sent to, an encrypted room never receives cleartext. Necessary, and not
+    /// sufficient — a hand-written fixture holds no keys, so it can only ever
+    /// prove that nothing happened. Everything here proves the other half:
+    /// encryption actually working, through the production [`MatrixAdapter`].
+    /// `/keys/upload`, `/keys/query`, `/keys/claim` and `/sendToDevice` are
+    /// answered by [`MatrixMockServer::mock_crypto_endpoints_preset`], so the
+    /// two clients perform a genuine key exchange and a genuine Megolm session,
+    /// and the bytes captured below are the bytes a homeserver would have got.
+    ///
+    /// Nothing here replaces the adapter. Every send goes through
+    /// `MatrixAdapter::send`, every inbound event through its own registered
+    /// handlers and `poll`, every attachment through `fetch_attachment`.
+    mod real_e2ee {
+        use super::*;
+        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::ruma::serde::Raw;
+        use matrix_sdk::ruma::{device_id, event_id, mxc_uri, room_id, user_id, DeviceId};
+        use matrix_sdk::test_utils::mocks::encryption::PendingToDeviceMessages;
+        use matrix_sdk::test_utils::mocks::MatrixMockServer;
+        use matrix_sdk_test::event_factory::EventFactory;
+        use matrix_sdk_test::JoinedRoomBuilder;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        /// `mock_who_am_i` answers with this user, so the account under test is
+        /// it. Nothing about the adapter cares which id it is.
+        fn our_user() -> &'static UserId {
+            user_id!("@joe:example.org")
+        }
+        fn our_device() -> &'static DeviceId {
+            device_id!("MONKEYDEVICE")
+        }
+        fn bob_user() -> &'static UserId {
+            user_id!("@bob:example.org")
+        }
+        fn encrypted_room() -> &'static RoomId {
+            room_id!("!secret:example.org")
+        }
+
+        struct Fixture {
+            server: MatrixMockServer,
+            adapter: MatrixAdapter,
+            /// The adapter's own SDK client, so a test can drive exactly one
+            /// `/sync` rather than race a background loop.
+            client: Client,
+            /// The other participant, with a real device and real keys.
+            bob: Client,
+            store: std::path::PathBuf,
+        }
+
+        fn temp_store() -> std::path::PathBuf {
+            let root = std::env::temp_dir()
+                .join(format!("lm-matrix-e2ee-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&root).expect("store root");
+            root
+        }
+
+        /// Build the production adapter against `server`, with an access token
+        /// the crypto endpoints recognize.
+        ///
+        /// The token has to be one `client_builder_for_crypto_end_to_end`
+        /// issued, because that is how the stand-in knows which user is
+        /// uploading keys. The client it builds is dropped unused — only its
+        /// token is wanted, and a client that never syncs uploads nothing.
+        async fn adapter_against(
+            server: &MatrixMockServer,
+            store: &std::path::Path,
+            blob: Option<Vec<u8>>,
+        ) -> MatrixAdapter {
+            let token = server
+                .client_builder_for_crypto_end_to_end(our_user(), device_id!("TOKENONLY"))
+                .build()
+                .await
+                .access_token()
+                .expect("the stand-in issues a token");
+            let account = test_account(serde_json::json!({
+                "homeserver_url": server.uri(),
+                "user_id": our_user().as_str(),
+                "device_id": our_device().as_str(),
+            }));
+            let adapter = MatrixAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: token,
+            })
+            .expect("adapter")
+            .with_store_root(store.to_path_buf());
+            match blob {
+                Some(bytes) => adapter.with_blobs(Arc::new(
+                    crate::daemon::channel_adapter::test_http::FixtureBlobs(bytes),
+                )),
+                None => adapter,
+            }
+        }
+
+        /// One encrypted room both participants have joined, with device keys
+        /// exchanged and the member list answerable.
+        async fn encrypted_fixture(store: &std::path::Path, blob: Option<Vec<u8>>) -> Fixture {
+            let server = MatrixMockServer::new().await;
+            server.mock_crypto_endpoints_preset().await;
+            server.mock_versions().ok().mount().await;
+            server
+                .mock_who_am_i()
+                // The token is the one the stand-in issued for this account,
+                // not the builder's stock one.
+                .expect_any_access_token()
+                .ok_with_device_id(our_device())
+                .mount()
+                .await;
+
+            let adapter = adapter_against(&server, store, blob).await;
+            let client = adapter.client().await.expect("client").clone();
+            let bob = server
+                .client_builder_for_crypto_end_to_end(bob_user(), device_id!("BOBDEVICE"))
+                .build()
+                .await;
+            // Real `/keys/upload` and `/keys/query`: after this each side holds
+            // the other's device keys, which is what an Olm session needs.
+            server.exchange_e2ee_identities(&client, &bob).await;
+
+            let room = encrypted_room();
+            let factory = EventFactory::new().room(room).sender(our_user());
+            for participant in [&client, &bob] {
+                server
+                    .mock_sync()
+                    .ok_and_run(participant, |builder| {
+                        builder.add_joined_room(
+                            JoinedRoomBuilder::new(room)
+                                .add_state_event(factory.member(our_user()))
+                                .add_state_event(factory.member(bob_user()))
+                                .add_state_event(factory.room_encryption()),
+                        );
+                    })
+                    .await;
+            }
+            // Whom the Megolm key is shared with.
+            server
+                .mock_get_members()
+                .ok(vec![
+                    factory.member(our_user()).into_raw(),
+                    factory.member(bob_user()).into_raw(),
+                ])
+                .mount()
+                .await;
+
+            Fixture {
+                server,
+                adapter,
+                client,
+                bob,
+                store: store.to_path_buf(),
+            }
+        }
+
+        fn outbound_secret(text: &str) -> OutboundMessage {
+            OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Matrix,
+                conversation_id: encrypted_room().to_string(),
+                thread_id: None,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: "idem-e2ee".to_string(),
+            }
+        }
+
+        /// What the homeserver received, as JSON.
+        fn as_json(raw: &Raw<AnySyncTimelineEvent>) -> serde_json::Value {
+            serde_json::from_str(raw.json().get()).expect("the captured event is JSON")
+        }
+
+        /// The captured event must be `m.room.encrypted`, with real Megolm
+        /// ciphertext and the plaintext nowhere in it.
+        fn assert_encrypted_on_the_wire(raw: &Raw<AnySyncTimelineEvent>, plaintext: &str) {
+            let json = as_json(raw);
+            assert_eq!(
+                json["type"], "m.room.encrypted",
+                "the homeserver received a cleartext event: {json}"
+            );
+            assert!(
+                json["content"]["ciphertext"].is_string(),
+                "no Megolm ciphertext in {json}"
+            );
+            let wire = json.to_string();
+            assert!(
+                !wire.contains(plaintext),
+                "the plaintext reached the homeserver: {wire}"
+            );
+        }
+
+        /// Hand one already-captured event to a client through `/sync`.
+        async fn deliver(server: &MatrixMockServer, to: &Client, raw: Raw<AnySyncTimelineEvent>) {
+            server
+                .mock_sync()
+                .ok_and_run(to, |builder| {
+                    builder.add_joined_room(
+                        JoinedRoomBuilder::new(encrypted_room()).add_timeline_event(raw),
+                    );
+                })
+                .await;
+        }
+
+        /// Whether anything at all reached the adapter's inbound queue.
+        ///
+        /// Used instead of `poll` for the negative assertions, which would
+        /// otherwise each cost a full `POLL_WAIT`.
+        async fn nothing_queued(adapter: &MatrixAdapter) -> bool {
+            adapter.inbound_rx.lock().await.try_recv().is_err()
+        }
+
+        // -- Test A: encrypted outbound text ---------------------------------
+
+        #[tokio::test]
+        async fn an_encrypted_room_gets_an_event_only_the_recipient_can_read() {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, None).await;
+            let secret = "the sailing club meets at six";
+
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(our_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$secret:example.org"), our_user());
+            send_mock.mock_once().mount().await;
+
+            let outcome = fixture.adapter.send(&outbound_secret(secret)).await;
+            assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+
+            let raw = captured.await.expect("the homeserver received the event");
+            assert_encrypted_on_the_wire(&raw, secret);
+            drop(key_guard);
+
+            // The recipient gets the Megolm key, then the event. The SDK
+            // decrypts before dispatch, which is the claim being tested.
+            let (tx, mut rx) = mpsc::channel::<String>(4);
+            fixture
+                .bob
+                .add_event_handler(move |event: OriginalSyncRoomMessageEvent| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(event.content.body().to_string()).await;
+                    }
+                });
+            fixture
+                .server
+                .sync_back_pending_to_device_messages(keys, &fixture.bob)
+                .await;
+            deliver(&fixture.server, &fixture.bob, raw).await;
+
+            let decrypted = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("nothing was decrypted in time")
+                .expect("a decrypted message");
+            assert_eq!(decrypted, secret);
+            let _ = std::fs::remove_dir_all(&fixture.store);
+        }
+
+        // -- Test B: encrypted inbound text ----------------------------------
+
+        #[tokio::test]
+        async fn an_encrypted_message_from_the_other_side_arrives_as_plaintext() {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, None).await;
+            let secret = "answering from the other device";
+
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(bob_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$inbound:example.org"), bob_user());
+            send_mock.mock_once().mount().await;
+
+            fixture
+                .bob
+                .get_room(encrypted_room())
+                .expect("bob is joined")
+                .send(RoomMessageEventContent::text_plain(secret))
+                .await
+                .expect("bob sends");
+            let raw = captured.await.expect("the homeserver received the event");
+            assert_encrypted_on_the_wire(&raw, secret);
+            drop(key_guard);
+
+            // The production inbound path: SDK decryption, the adapter's own
+            // handlers, `normalize_message`, `poll`.
+            fixture
+                .adapter
+                .attach_handlers_without_syncing()
+                .await
+                .expect("handlers");
+            fixture
+                .server
+                .sync_back_pending_to_device_messages(keys, &fixture.client)
+                .await;
+            deliver(&fixture.server, &fixture.client, raw).await;
+
+            let batch = fixture.adapter.poll(None).await.expect("poll");
+            let envelope = batch
+                .envelopes
+                .iter()
+                .find(|envelope| envelope.text == secret)
+                .unwrap_or_else(|| panic!("no decrypted envelope in {batch:?}"));
+            assert_eq!(envelope.provider_event_id, "$inbound:example.org");
+            assert_eq!(envelope.sender.sender_id, bob_user().as_str());
+            assert_eq!(
+                fixture.adapter.shared.undecryptable.load(Ordering::Relaxed),
+                0,
+                "a message that decrypted must not also count as undecryptable"
+            );
+            let _ = std::fs::remove_dir_all(&fixture.store);
+        }
+
+        // -- Test C: an event whose key has not arrived ----------------------
+
+        #[tokio::test]
+        async fn an_event_that_cannot_be_decrypted_is_counted_never_invented() {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, None).await;
+            let secret = "this key arrives late";
+
+            // The room key is captured and deliberately not delivered yet.
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(bob_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$late:example.org"), bob_user());
+            send_mock.mock_once().mount().await;
+            fixture
+                .bob
+                .get_room(encrypted_room())
+                .expect("bob is joined")
+                .send(RoomMessageEventContent::text_plain(secret))
+                .await
+                .expect("bob sends");
+            let raw = captured.await.expect("the homeserver received the event");
+            drop(key_guard);
+
+            fixture
+                .adapter
+                .attach_handlers_without_syncing()
+                .await
+                .expect("handlers");
+            deliver(&fixture.server, &fixture.client, raw.clone()).await;
+
+            assert!(
+                nothing_queued(&fixture.adapter).await,
+                "an undecryptable event reached the agent path"
+            );
+            assert!(
+                fixture.adapter.shared.undecryptable.load(Ordering::Relaxed) > 0,
+                "an event nobody could read was not counted"
+            );
+            let health = fixture.adapter.probe().await;
+            assert_ne!(
+                health.state,
+                HealthState::Connected,
+                "keys are not arriving, which is not a healthy account: {health:?}"
+            );
+
+            // The key turns up later and the same event becomes readable. Its
+            // id is unchanged, which is what lets durable ingress dedupe the
+            // second delivery instead of running the turn twice.
+            fixture
+                .server
+                .sync_back_pending_to_device_messages(keys, &fixture.client)
+                .await;
+            deliver(&fixture.server, &fixture.client, raw).await;
+            let batch = fixture.adapter.poll(None).await.expect("poll");
+            let envelope = batch
+                .envelopes
+                .iter()
+                .find(|envelope| envelope.text == secret)
+                .unwrap_or_else(|| panic!("the late key did not make it readable: {batch:?}"));
+            assert_eq!(envelope.provider_event_id, "$late:example.org");
+            let _ = std::fs::remove_dir_all(&fixture.store);
+        }
+
+        // -- Tests D and E: encrypted attachments, both directions -----------
+
+        /// Send one file into the encrypted room, then read it back through the
+        /// adapter's own `fetch_attachment`.
+        ///
+        /// Both halves in one test on purpose: the bytes asserted at the end
+        /// are the bytes that went in, so "the media was uploaded encrypted"
+        /// and "the SDK decrypts it back" are one claim rather than two that
+        /// could each be true of a different file.
+        async fn encrypted_attachment_round_trip(filename: &str, mime_type: &str, bytes: &[u8]) {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, Some(bytes.to_vec())).await;
+
+            fixture
+                .server
+                .mock_authenticated_media_config()
+                .ok_default()
+                .mount()
+                .await;
+            let (uploaded, upload_mock) = fixture
+                .server
+                .mock_upload()
+                .ok_with_capture(mxc_uri!("mxc://example.org/secretfile"));
+            upload_mock.mock_once().mount().await;
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(our_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$file:example.org"), our_user());
+            send_mock.mock_once().mount().await;
+
+            let mut message = outbound_secret("here is the file");
+            message.attachments = vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "artifact-1".to_string(),
+                filename: Some(filename.to_string()),
+                mime_type: Some(mime_type.to_string()),
+            }];
+            let outcome = fixture.adapter.send(&message).await;
+            assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+            drop(key_guard);
+
+            // Never the plaintext bytes: an encrypted room's media goes to the
+            // repository already encrypted, and its key rides inside the event.
+            let on_the_media_repo = uploaded.await.expect("an upload");
+            assert_ne!(
+                on_the_media_repo, bytes,
+                "plaintext media was uploaded for an encrypted room"
+            );
+            let raw = captured.await.expect("the homeserver received the event");
+            assert_eq!(as_json(&raw)["type"], "m.room.encrypted");
+
+            // Back in: the same event, normalized by the production adapter,
+            // then fetched through the SDK's authenticated, decrypting media
+            // API.
+            fixture
+                .adapter
+                .attach_handlers_without_syncing()
+                .await
+                .expect("handlers");
+            fixture
+                .server
+                .sync_back_pending_to_device_messages(keys, &fixture.client)
+                .await;
+            deliver(&fixture.server, &fixture.client, raw).await;
+
+            let batch = fixture.adapter.poll(None).await.expect("poll");
+            let envelope = batch
+                .envelopes
+                .iter()
+                .find(|envelope| !envelope.attachments.is_empty())
+                .unwrap_or_else(|| panic!("no attachment came back: {batch:?}"));
+            let attachment = &envelope.attachments[0];
+            // The whole `MediaSource` travels, not a bare `mxc://`: an
+            // encrypted file cannot be downloaded into anything readable
+            // without the key that rides beside the URI.
+            let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
+                panic!("expected a provider handle, got {:?}", attachment.source);
+            };
+            let source: MediaSource =
+                serde_json::from_str(handle).expect("the handle is a media source");
+            assert!(
+                matches!(source, MediaSource::Encrypted(_)),
+                "an encrypted room's attachment came back as plain media"
+            );
+
+            fixture
+                .server
+                .mock_authed_media_download()
+                .expect_any_access_token()
+                .ok_bytes(on_the_media_repo)
+                .mount()
+                .await;
+            let fetched = fixture
+                .adapter
+                .fetch_attachment(attachment, Default::default())
+                .await
+                .expect("the SDK decrypts what it encrypted");
+            assert_eq!(fetched, bytes, "the decrypted bytes are not the ones sent");
+            let _ = std::fs::remove_dir_all(&fixture.store);
+        }
+
+        #[tokio::test]
+        async fn an_encrypted_image_round_trips_through_the_sdk() {
+            encrypted_attachment_round_trip(
+                "photo.png",
+                "image/png",
+                b"\x89PNG\r\n\x1a\nnot really a png",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn an_encrypted_file_round_trips_through_the_sdk() {
+            encrypted_attachment_round_trip(
+                "notes.txt",
+                "text/plain",
+                b"minutes of the sailing club",
+            )
+            .await;
+        }
+
+        // -- Test G: an encrypted threaded reply -----------------------------
+
+        #[tokio::test]
+        async fn an_encrypted_thread_keeps_both_relations() {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, None).await;
+            let secret = "answering inside the thread";
+
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(our_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$threaded:example.org"), our_user());
+            send_mock.mock_once().mount().await;
+
+            let mut message = outbound_secret(secret);
+            message.thread_id = Some("$root:example.org".to_string());
+            message.reply_to_provider_id = Some("$earlier:example.org".to_string());
+            let outcome = fixture.adapter.send(&message).await;
+            assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+
+            let raw = captured.await.expect("the homeserver received the event");
+            // Encrypted first: a relation is no excuse for a cleartext body.
+            assert_encrypted_on_the_wire(&raw, secret);
+            drop(key_guard);
+
+            fixture
+                .adapter
+                .attach_handlers_without_syncing()
+                .await
+                .expect("handlers");
+            fixture
+                .server
+                .sync_back_pending_to_device_messages(keys, &fixture.client)
+                .await;
+            deliver(&fixture.server, &fixture.client, raw).await;
+
+            let batch = fixture.adapter.poll(None).await.expect("poll");
+            let envelope = batch
+                .envelopes
+                .iter()
+                .find(|envelope| envelope.text == secret)
+                .unwrap_or_else(|| panic!("the threaded reply never came back: {batch:?}"));
+            assert_eq!(
+                envelope.conversation.thread_id.as_deref(),
+                Some("$root:example.org"),
+                "the thread relation was lost"
+            );
+            assert_eq!(
+                envelope.reply_to_provider_id.as_deref(),
+                Some("$earlier:example.org"),
+                "the reply relation was lost"
+            );
+            let _ = std::fs::remove_dir_all(&fixture.store);
+        }
+
+        // -- Test F: crypto state survives a restart -------------------------
+
+        #[tokio::test]
+        async fn a_restart_keeps_the_device_and_the_crypto_state_that_goes_with_it() {
+            let store = temp_store();
+            let fixture = encrypted_fixture(&store, None).await;
+            let secret = "written before the restart";
+
+            let keys: StdArc<StdMutex<PendingToDeviceMessages>> = Default::default();
+            let key_guard = fixture
+                .server
+                .capture_put_to_device_traffic(our_user(), keys.clone())
+                .await;
+            let (captured, send_mock) = fixture
+                .server
+                .mock_room_send()
+                .ok_with_capture(event_id!("$before:example.org"), our_user());
+            send_mock.mock_once().mount().await;
+            let outcome = fixture.adapter.send(&outbound_secret(secret)).await;
+            assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+            let raw = captured.await.expect("the homeserver received the event");
+            drop(key_guard);
+
+            let first_device = fixture
+                .client
+                .device_id()
+                .map(|id| id.to_string())
+                .expect("a device");
+
+            // The instance goes away entirely — adapter, client, crypto store
+            // handle — which is what a daemon restart is.
+            let Fixture {
+                server,
+                adapter,
+                client,
+                bob,
+                store,
+            } = fixture;
+            drop(adapter);
+            drop(client);
+            drop(bob);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let restarted = adapter_against(&server, &store, None).await;
+            let restarted_client = restarted.client().await.expect("client").clone();
+            assert_eq!(
+                restarted_client.device_id().map(|id| id.to_string()),
+                Some(first_device),
+                "a restart must reuse the device the token belongs to"
+            );
+
+            // Device identity alone would prove nothing. This is the crypto
+            // continuity: the Megolm session the *first* instance created is
+            // still in the store, so what it encrypted is still readable.
+            restarted
+                .attach_handlers_without_syncing()
+                .await
+                .expect("handlers");
+            server
+                .sync_back_pending_to_device_messages(keys, &restarted_client)
+                .await;
+            deliver(&server, &restarted_client, raw).await;
+            let batch = restarted.poll(None).await.expect("poll");
+            assert!(
+                batch
+                    .envelopes
+                    .iter()
+                    .any(|envelope| envelope.text == secret),
+                "the crypto store did not survive the restart: {batch:?}"
+            );
+
+            // And nothing logged in or registered along the way: the session
+            // was restored from the operator's own token, twice.
+            let requests = server
+                .server()
+                .received_requests()
+                .await
+                .expect("recorded requests");
+            assert!(
+                !requests.iter().any(|request| {
+                    let path = request.url.path();
+                    path.ends_with("/login") || path.ends_with("/register")
+                }),
+                "a restart registered a new device"
+            );
+            let _ = std::fs::remove_dir_all(&store);
+        }
+    }
+
     /// An opt-in round trip against a homeserver the *operator* names.
     ///
-    /// Never runs unless all four variables are set, so CI and every
+    /// Never runs unless the three account variables are set, so CI and every
     /// contributor's `cargo test` skip it. Nothing is bundled: there is no
     /// maintainer homeserver, no maintainer account and no maintainer token
-    /// anywhere in this tree, and the room it posts to is one the person
+    /// anywhere in this tree, and every room it posts to is one the person
     /// running it chose.
+    ///
+    /// Each destination is separately opt-in, so a run can exercise as much or
+    /// as little as the operator has set up. A destination that is not named is
+    /// silently skipped; nothing is ever sent to a room this test discovered
+    /// for itself.
     ///
     /// ```text
     /// LM_MATRIX_LIVE_HOMESERVER=https://matrix.example.org \
     /// LM_MATRIX_LIVE_USER_ID=@you:example.org \
     /// LM_MATRIX_LIVE_TOKEN=… \
-    /// LM_MATRIX_LIVE_ROOM='!room:example.org' \
+    /// LM_MATRIX_LIVE_ROOM='!plain:example.org' \
+    /// LM_MATRIX_LIVE_ENCRYPTED_ROOM='!secret:example.org' \
+    /// LM_MATRIX_LIVE_ATTACHMENT_ROOM='!secret:example.org' \
+    /// LM_MATRIX_LIVE_THREAD_ROOM='!secret:example.org' \
+    /// LM_MATRIX_LIVE_THREAD_ROOT='$root:example.org' \
     ///   cargo test --bin monkey-cli a_live_homeserver_round_trip -- --nocapture
     /// ```
     ///
-    /// Point it at an encrypted room to exercise the encrypted path end to
-    /// end; the adapter refuses rather than downgrades, so a failure here is a
-    /// real one.
+    /// A send into an encrypted room that cannot be encrypted for *fails* here
+    /// rather than arriving in the clear, so a failure is a real one.
     #[tokio::test]
     async fn a_live_homeserver_round_trip() {
-        let (Ok(homeserver), Ok(user_id), Ok(token), Ok(room)) = (
+        let (Ok(homeserver), Ok(user_id), Ok(token)) = (
             std::env::var("LM_MATRIX_LIVE_HOMESERVER"),
             std::env::var("LM_MATRIX_LIVE_USER_ID"),
             std::env::var("LM_MATRIX_LIVE_TOKEN"),
-            std::env::var("LM_MATRIX_LIVE_ROOM"),
         ) else {
             return;
         };
+        let destination = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+        let plaintext_room = destination("LM_MATRIX_LIVE_ROOM");
+        let encrypted_room = destination("LM_MATRIX_LIVE_ENCRYPTED_ROOM");
+        let attachment_room = destination("LM_MATRIX_LIVE_ATTACHMENT_ROOM");
+        let thread_room = destination("LM_MATRIX_LIVE_THREAD_ROOM");
+        let thread_root = destination("LM_MATRIX_LIVE_THREAD_ROOT");
+        if plaintext_room.is_none()
+            && encrypted_room.is_none()
+            && attachment_room.is_none()
+            && thread_room.is_none()
+        {
+            return;
+        }
+
         let account = test_account(serde_json::json!({
             "homeserver_url": homeserver,
             "user_id": user_id,
@@ -1993,7 +2707,12 @@ mod tests {
             secret: token,
         })
         .expect("adapter")
-        .with_store_root(store.clone());
+        .with_store_root(store.clone())
+        .with_blobs(Arc::new(
+            crate::daemon::channel_adapter::test_http::FixtureBlobs(
+                b"little-monkey live smoke attachment".to_vec(),
+            ),
+        ));
 
         let health = adapter.probe().await;
         assert_eq!(
@@ -2003,36 +2722,71 @@ mod tests {
             health.last_error
         );
 
-        // Sync has to have seen the room before anything can be sent to it,
+        // Sync has to have seen a room before anything can be sent to it,
         // which is also true of the running daemon.
         adapter.ensure_started().await.expect("sync starts");
-        let room_id = RoomId::parse(&room).expect("LM_MATRIX_LIVE_ROOM is a room id");
-        let client = adapter.client().await.expect("client");
-        for _ in 0..120 {
-            if client.get_room(&room_id).is_some() {
-                break;
+        let known = |room: &str| {
+            let room_id = RoomId::parse(room).expect("a room id");
+            let adapter = &adapter;
+            async move {
+                let client = adapter.client().await.expect("client");
+                for _ in 0..120 {
+                    if client.get_room(&room_id).is_some() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let mut sends: Vec<(&str, OutboundMessage)> = Vec::new();
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let mut message_for = |room: String, text: String| OutboundMessage {
+            account_id: "acct-1".to_string(),
+            kind: ChannelKind::Matrix,
+            conversation_id: room,
+            thread_id: None,
+            text,
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            idempotency_key: format!("live-{marker}-{}", uuid::Uuid::new_v4().simple()),
+        };
+        if let Some(room) = plaintext_room {
+            sends.push((
+                "plaintext room",
+                message_for(room, format!("little-monkey live smoke test {marker}")),
+            ));
+        }
+        if let Some(room) = encrypted_room {
+            sends.push((
+                "encrypted room",
+                message_for(room, format!("little-monkey encrypted smoke test {marker}")),
+            ));
+        }
+        if let Some(room) = attachment_room {
+            let mut message = message_for(room, format!("smoke attachment {marker}"));
+            message.attachments = vec![little_monkey_lib::channels::types::OutboundAttachment {
+                artifact_id: "live-artifact".to_string(),
+                filename: Some("smoke.txt".to_string()),
+                mime_type: Some("text/plain".to_string()),
+            }];
+            sends.push(("encrypted attachment", message));
+        }
+        if let (Some(room), Some(root)) = (thread_room, thread_root) {
+            let mut message = message_for(room, format!("smoke thread reply {marker}"));
+            message.thread_id = Some(root.clone());
+            message.reply_to_provider_id = Some(root);
+            sends.push(("threaded reply", message));
         }
 
-        let marker = uuid::Uuid::new_v4().simple().to_string();
-        let outcome = adapter
-            .send(&OutboundMessage {
-                account_id: "acct-1".to_string(),
-                kind: ChannelKind::Matrix,
-                conversation_id: room,
-                thread_id: None,
-                text: format!("little-monkey live smoke test {marker}"),
-                attachments: Vec::new(),
-                reply_to_provider_id: None,
-                idempotency_key: format!("live-{marker}"),
-            })
-            .await;
-        assert!(
-            matches!(outcome, SendOutcome::Sent { .. }),
-            "{outcome:?} — an encrypted room that cannot be encrypted for refuses rather than \
-             downgrading, which is the intended behaviour"
-        );
+        for (what, message) in sends {
+            known(&message.conversation_id).await;
+            let outcome = adapter.send(&message).await;
+            assert!(
+                matches!(outcome, SendOutcome::Sent { .. }),
+                "{what}: {outcome:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&store);
     }
 }

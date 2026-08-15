@@ -19,12 +19,28 @@
 //!
 //! ```text
 //! version           → { "version": …, "platform": "macos" }
-//! probe             → { "handles": n, "canSend": bool }
+//! probe             → { "protocol": …, "databaseReadable": bool,
+//!                       "automationAuthorized": bool,
+//!                       "messagesAvailable": bool, "handles": n,
+//!                       "detail": …|null }
 //! poll   { since }  → { "cursor": rowid, "messages": [ … ] }
 //! send   { target, text, isGroup } → { "sent": true }
-//! fetchAttachment { path, maxBytes } → { "base64": … }
+//! fetchAttachment { handle, maxBytes } → { "base64": … }
 //! shutdown          → { "ok": true }, then exit
 //! ```
+//!
+//! `probe` measures three separate capabilities rather than reporting one
+//! boolean, because they fail separately and are fixed in three different
+//! places. It never sends a message: Automation is checked by asking Messages a
+//! read-only question, which is enough to make macOS run the authorization
+//! check.
+//!
+//! # The daemon never learns a path
+//!
+//! `poll` reports attachments by an opaque handle this helper issued, and
+//! `fetchAttachment` takes that handle back. A method that accepted a *path*
+//! would turn a process holding Full Disk Access into an arbitrary-file reader
+//! for anything that can write to its stdin.
 //!
 //! `poll` with a null `since` reports the current maximum row and no messages:
 //! connecting an account is not a reason to replay every conversation on the
@@ -64,8 +80,13 @@ const CODE_SETUP: i64 = -32002;
 const CODE_UNKNOWN_METHOD: i64 = -32601;
 
 /// The helper's own protocol version, bumped when the shape above changes.
+///
+/// `2` replaced `probe`'s single `canSend` boolean with measured capabilities
+/// and `fetchAttachment`'s `path` with an opaque handle. The daemon refuses to
+/// speak to a helper that answers anything else rather than guessing at an
+/// older shape — see `adapters/imessage.rs`.
 #[cfg(target_os = "macos")]
-const PROTOCOL_VERSION: &str = "1";
+const PROTOCOL_VERSION: &str = "2";
 
 /// What one attachment may cost, unless the caller asks for less.
 ///
@@ -188,14 +209,18 @@ async fn dispatch(
             "version": PROTOCOL_VERSION,
             "platform": "macos",
         })),
+        // Never an error: a capability that is missing *is* the answer, and the
+        // daemon has to be able to tell the three apart — they are three
+        // different things for a person to fix.
         "probe" => {
-            let handles = messages::probe(config).map_err(|error| (CODE_SETUP, error))?;
+            let capabilities = messages::probe(config).await;
             Ok(serde_json::json!({
-                "handles": handles,
-                // Reported rather than assumed: Automation permission is a
-                // separate grant from Full Disk Access, and an operator whose
-                // reads work but whose sends do not needs to be told which.
-                "canSend": config.osascript_path.exists(),
+                "protocol": PROTOCOL_VERSION,
+                "databaseReadable": capabilities.database_readable,
+                "automationAuthorized": capabilities.automation_authorized,
+                "messagesAvailable": capabilities.messages_available,
+                "handles": capabilities.handles,
+                "detail": capabilities.detail,
             }))
         }
         "poll" => {
@@ -223,14 +248,17 @@ async fn dispatch(
                 messages::SendResult::Ambiguous(error) => Err((CODE_AMBIGUOUS, error)),
             }
         }
+        // The daemon names a handle this helper issued, never a path. See
+        // `messages::read_attachment` for why a process holding Full Disk
+        // Access must not accept one.
         "fetchAttachment" => {
-            let path = string_param(params, "path")?;
+            let handle = string_param(params, "handle")?;
             let max_bytes = params
                 .get("maxBytes")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(MAX_ATTACHMENT_BYTES)
                 .min(MAX_ATTACHMENT_BYTES);
-            let bytes = messages::read_attachment(&path, max_bytes)
+            let bytes = messages::read_attachment(config, &handle, max_bytes)
                 .map_err(|error| (CODE_REFUSED, error))?;
             Ok(serde_json::json!({
                 "base64": base64::Engine::encode(
@@ -276,6 +304,7 @@ mod tests {
     fn config() -> messages::MessagesConfig {
         messages::MessagesConfig {
             db_path: std::env::temp_dir().join("no-such-chat.db"),
+            attachments_root: std::env::temp_dir().join("no-such-attachments"),
             osascript_path: std::path::PathBuf::from("/usr/bin/osascript"),
         }
     }
@@ -325,14 +354,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unreadable_database_is_a_setup_problem_not_a_send_failure() {
-        // The difference matters: one is for a person to fix in System
-        // Settings, the other would be retried forever.
+    async fn a_probe_reports_capabilities_rather_than_failing() {
+        // Which capability is missing is the answer, not an error: Full Disk
+        // Access and Automation are two different things for a person to fix,
+        // and one error code cannot say which.
         let response = answer(serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "probe"
         }))
         .await;
-        assert_eq!(response["error"]["code"], CODE_SETUP);
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
+        assert_eq!(response["result"]["databaseReadable"], false);
+        assert!(response["result"]["detail"]
+            .as_str()
+            .expect("a reason")
+            .contains("Messages"));
+    }
+
+    #[tokio::test]
+    async fn fetch_attachment_takes_a_handle_and_refuses_a_path() {
+        // The whole point of the handle: this process holds Full Disk Access,
+        // so a `path` parameter would make it a general file reader.
+        let response = answer(serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "method": "fetchAttachment",
+            "params": {"path": "/etc/passwd"}
+        }))
+        .await;
+        assert_eq!(response["error"]["code"], CODE_REFUSED);
+        assert!(response["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("handle"));
+
+        let response = answer(serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "fetchAttachment",
+            "params": {"handle": "/etc/passwd"}
+        }))
+        .await;
+        assert_eq!(response["error"]["code"], CODE_REFUSED);
     }
 
     #[tokio::test]
@@ -384,6 +443,7 @@ mod tests {
             .expect("schema");
         let config = messages::MessagesConfig {
             db_path: path.clone(),
+            attachments_root: std::env::temp_dir().join("no-such-attachments"),
             osascript_path: std::path::PathBuf::from("/usr/bin/osascript"),
         };
         (path, config)

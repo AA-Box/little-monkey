@@ -605,6 +605,20 @@ impl ChannelHealth {
         }
     }
 
+    /// The transport is on its way up and has not proved itself yet.
+    ///
+    /// Distinct from `connected`, which claims a working capability, and from
+    /// `degraded`, which claims a connection that is losing something: this is
+    /// the honest answer while a socket is still being opened.
+    pub fn connecting(probed_at_ms: i64, detail: Option<String>) -> Self {
+        Self {
+            state: HealthState::Connecting,
+            detail,
+            last_error: None,
+            probed_at_ms,
+        }
+    }
+
     pub fn error(probed_at_ms: i64, error: impl Into<String>) -> Self {
         Self {
             state: HealthState::Error,

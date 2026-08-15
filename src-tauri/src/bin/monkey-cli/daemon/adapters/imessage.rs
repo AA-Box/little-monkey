@@ -74,12 +74,18 @@ mod macos {
     const CODE_AMBIGUOUS: i64 = -32001;
     const CODE_SETUP: i64 = -32002;
 
+    /// The helper protocol this adapter speaks. A helper answering anything
+    /// else is refused rather than guessed at: the difference between versions
+    /// is which permissions were actually measured and whether an attachment is
+    /// named by handle or by path.
+    const HELPER_PROTOCOL: &str = "2";
+
     /// Outcome of one JSON-RPC round trip, distinguished by whether a command
     /// provably reached the helper's stdin.
     #[derive(Debug)]
     enum CallError {
-        /// Never written — the helper is not running or failed to start. Safe
-        /// to report as permanent: nothing happened.
+        /// Never written — the helper is not running or failed to start.
+        /// Nothing happened, so this is the one arm a send may be retried from.
         NotSent(String),
         /// Written, but the outcome is unknown (the write failed after some
         /// bytes may have gone out, the helper died before answering, or it
@@ -348,7 +354,7 @@ mod macos {
                 items
                     .iter()
                     .filter_map(|item| {
-                        let path = item.get("path").and_then(Value::as_str)?.to_string();
+                        let id = item.get("id").and_then(Value::as_str)?.to_string();
                         let mime_type = item
                             .get("mimeType")
                             .and_then(Value::as_str)
@@ -369,10 +375,12 @@ mod macos {
                                 .map(str::to_string),
                             mime_type,
                             declared_size_bytes: item.get("size").and_then(Value::as_u64),
-                            // The path is a handle the *helper* resolves. This
-                            // process never opens it — that is the whole point
-                            // of the helper holding Full Disk Access.
-                            source: AttachmentSource::ProviderHandle { handle: path },
+                            // An opaque handle the *helper* issued and only the
+                            // helper can resolve. This process never learns
+                            // where the file is, let alone opens it — which is
+                            // what keeps a Full Disk Access process from being
+                            // usable as a general file reader.
+                            source: AttachmentSource::ProviderHandle { handle: id },
                         })
                     })
                     .collect()
@@ -450,41 +458,83 @@ mod macos {
             }
         }
 
+        /// What this Mac can actually do, as the helper measured it.
+        ///
+        /// Every arm below is a capability that was *tested*, not one that was
+        /// inferred from a file existing. `Connected` needs all three: a
+        /// readable database (nothing arrives without it), an authorized
+        /// Automation grant (nothing can be answered without it), and a
+        /// Messages account that is actually signed in.
         async fn probe(&self) -> ChannelHealth {
             let now = now_ms();
             if let Some(error) = self.helper_missing() {
                 return ChannelHealth::unsupported(now, error);
             }
-            match self.call("probe", json!({})).await {
-                Ok(result) => {
-                    let handles = result.get("handles").and_then(Value::as_u64).unwrap_or(0);
-                    let can_send = result
-                        .get("canSend")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if !can_send {
-                        return ChannelHealth::degraded(
-                            now,
-                            format!(
-                                "{} · reading Messages works, but sending does not — grant \
-                                 Automation access for Messages.app to the helper",
-                                self.handle
-                            ),
-                        );
-                    }
-                    ChannelHealth::connected(
-                        now,
-                        Some(format!("{} · {handles} known handles", self.handle)),
-                    )
-                }
+            let result = match self.call("probe", json!({})).await {
+                Ok(result) => result,
                 // A missing permission is not a connection that failed, it is a
                 // setup step nobody has done — and retrying it forever would
                 // never fix it.
                 Err(CallError::Remote { code, message }) if code == CODE_SETUP => {
-                    ChannelHealth::unsupported(now, message)
+                    return ChannelHealth::unsupported(now, message)
                 }
-                Err(error) => ChannelHealth::error(now, error.into_message()),
+                Err(error) => return ChannelHealth::error(now, error.into_message()),
+            };
+            // An older helper answers a different shape — `canSend`, no
+            // `protocol`. Guessing at it would mean guessing at permissions,
+            // so it is a setup step instead.
+            if result.get("protocol").and_then(Value::as_str) != Some(HELPER_PROTOCOL) {
+                return ChannelHealth::unsupported(
+                    now,
+                    "The installed little-monkey-imessage-helper is too old for this version of \
+                     Little Monkey. Install the matching helper.",
+                );
             }
+            let capability = |key: &str| result.get(key).and_then(Value::as_bool).unwrap_or(false);
+            let detail = result
+                .get("detail")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let handles = result.get("handles").and_then(Value::as_u64).unwrap_or(0);
+
+            // Full Disk Access. Named first: without it nothing arrives at all.
+            if !capability("databaseReadable") {
+                return ChannelHealth::unsupported(
+                    now,
+                    detail.unwrap_or_else(|| {
+                        "The helper cannot read the Messages database. Grant it Full Disk Access \
+                         in System Settings → Privacy & Security."
+                            .to_string()
+                    }),
+                );
+            }
+            // Automation for Messages.app. A separate grant, in a separate
+            // pane, so it is a separate sentence.
+            if !capability("automationAuthorized") {
+                return ChannelHealth::unsupported(
+                    now,
+                    detail.unwrap_or_else(|| {
+                        "The helper is not allowed to control Messages. Allow it under System \
+                         Settings → Privacy & Security → Automation."
+                            .to_string()
+                    }),
+                );
+            }
+            // Both permissions granted and Messages still cannot act: an
+            // account that is not signed in is a real error, not a setup step
+            // the operator has not reached yet.
+            if !capability("messagesAvailable") {
+                return ChannelHealth::error(
+                    now,
+                    detail.unwrap_or_else(|| {
+                        "Messages has no usable iMessage account on this Mac.".to_string()
+                    }),
+                );
+            }
+            ChannelHealth::connected(
+                now,
+                Some(format!("{} · {handles} known handles", self.handle)),
+            )
         }
 
         /// Ask the helper for everything after `cursor`.
@@ -534,7 +584,13 @@ mod macos {
                     // inventing one would poison dedupe.
                     provider_message_id: None,
                 },
-                Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+                // Never written to the helper's stdin: it is not installed, not
+                // running, or inside its restart cooldown. Nothing happened, so
+                // the reply stays queued rather than being thrown away.
+                Err(CallError::NotSent(error)) => SendOutcome::RetryableFailure {
+                    error,
+                    retry_after_ms: Some(5_000),
+                },
                 Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
                 // The helper's own "it may have happened" — Messages was asked
                 // and did not answer in time. Retrying blind would double-send.
@@ -547,23 +603,31 @@ mod macos {
             }
         }
 
-        /// Ask the helper for one attachment's bytes.
+        /// Ask the helper for one attachment's bytes, by the handle it issued.
         ///
-        /// Nothing here opens the file. The Messages attachment store is behind
-        /// Full Disk Access, which this process does not have and must not
-        /// need.
+        /// Nothing here opens a file, and nothing here *could*: the handle is
+        /// opaque — a Messages row id, not a path — and the helper resolves it
+        /// against its own database and refuses anything outside Messages' own
+        /// attachment store. The Messages attachment store is behind Full Disk
+        /// Access, which this process does not have and must not need.
         async fn fetch_attachment(
             &self,
             attachment: &ChannelAttachment,
             limits: crate::daemon::channel_adapter::AttachmentLimits,
         ) -> Result<Vec<u8>, String> {
             let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
-                return Err("This iMessage attachment has no path.".to_string());
+                return Err("This iMessage attachment has no handle.".to_string());
             };
+            // Checked here as well as in the helper: a handle is a row id, so
+            // anything that is not one is a bug or an attempt, and neither
+            // deserves a round trip.
+            if handle.is_empty() || !handle.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err("That is not an iMessage attachment handle.".to_string());
+            }
             let result = self
                 .call(
                     "fetchAttachment",
-                    json!({ "path": handle, "maxBytes": limits.max_bytes }),
+                    json!({ "handle": handle, "maxBytes": limits.max_bytes }),
                 )
                 .await
                 .map_err(CallError::into_message)?;
@@ -646,7 +710,7 @@ mod macos {
             let envelope = normalize_record(&record(json!({
                 "text": "",
                 "attachments": [{
-                    "path": "~/Library/Messages/Attachments/aa/photo.png",
+                    "id": "17",
                     "mimeType": "image/png",
                     "filename": "photo.png",
                     "size": 4096,
@@ -658,10 +722,24 @@ mod macos {
             assert_eq!(attachment.declared_size_bytes, Some(4096));
             match &attachment.source {
                 AttachmentSource::ProviderHandle { handle } => {
-                    assert!(handle.ends_with("photo.png"));
+                    // Opaque: the daemon never learns where the file is, which
+                    // is what stops it from being able to ask for another one.
+                    assert_eq!(handle, "17");
+                    assert!(!handle.contains('/'), "a path leaked into the daemon");
                 }
                 other => panic!("expected a provider handle, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn an_attachment_the_helper_did_not_name_is_not_carried() {
+            // An older helper's `path` field is not a handle and must not be
+            // treated as one.
+            let envelope = normalize_record(&record(json!({
+                "attachments": [{ "path": "~/Library/Messages/Attachments/aa/x.png" }],
+            })))
+            .expect("the text alone is still a turn");
+            assert!(envelope.attachments.is_empty());
         }
 
         #[test]
@@ -837,6 +915,17 @@ mod macos {
             /// Each line goes out through `/bin/echo` so no shell stdio buffer
             /// can hold it back.
             fn write_fake_helper(name: &str) -> std::path::PathBuf {
+                write_fake_helper_probing(
+                    name,
+                    r#"\"result\":{\"protocol\":\"2\",\"databaseReadable\":true,\"automationAuthorized\":true,\"messagesAvailable\":true,\"handles\":12,\"detail\":null}"#,
+                )
+            }
+
+            /// The same fixture, answering `probe` with an arbitrary JSON-RPC
+            /// tail — which is how each capability state, and a helper too old
+            /// to have measured them at all, is driven through the real health
+            /// mapping.
+            fn write_fake_helper_probing(name: &str, probe_tail: &str) -> std::path::PathBuf {
                 let path = std::env::temp_dir().join(format!(
                     "monkey-fake-imessage-{name}-{}",
                     uuid::Uuid::new_v4().simple()
@@ -847,9 +936,7 @@ while IFS= read -r line; do
   case "$line" in
     *\"crash\"*) exit 7 ;;
     *\"probe\"*)
-      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"handles\":12,\"canSend\":true}}" ;;
-    *\"noAutomation\"*)
-      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"handles\":12,\"canSend\":false}}" ;;
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,__PROBE__}" ;;
     *\"needsSetup\"*)
       /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"error\":{\"code\":-32002,\"message\":\"Grant Full Disk Access\"}}" ;;
     *\"ambiguous\"*)
@@ -865,7 +952,8 @@ while IFS= read -r line; do
   esac
 done
 "#;
-                std::fs::write(&path, script).expect("write fake helper");
+                std::fs::write(&path, script.replace("__PROBE__", probe_tail))
+                    .expect("write fake helper");
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                     .expect("chmod fake helper");
                 path
@@ -925,8 +1013,9 @@ done
                     mime_type: Some("image/png".to_string()),
                     declared_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
-                        // A path this process cannot read, and never tries to.
-                        handle: "~/Library/Messages/Attachments/aa/x.png".to_string(),
+                        // An opaque row id. This process could not open the file
+                        // if it wanted to — it does not know where it is.
+                        handle: "17".to_string(),
                     },
                 };
                 let bytes = adapter(&path)
@@ -991,18 +1080,108 @@ done
                 let _ = std::fs::remove_file(&path);
             }
 
+            /// One probe answer per capability state, through the real health
+            /// mapping. The failure class this replaces: `/usr/bin/osascript`
+            /// existing was once reported as "sending works".
             #[tokio::test]
-            async fn automation_that_was_never_granted_reads_as_degraded_not_connected() {
-                let path = write_fake_helper("automation");
+            async fn each_missing_capability_is_named_rather_than_called_connected() {
+                let cases: [(&str, &str, HealthState, &str); 4] = [
+                    (
+                        "no-fda",
+                        r#"\"result\":{\"protocol\":\"2\",\"databaseReadable\":false,\"automationAuthorized\":true,\"messagesAvailable\":true,\"handles\":0,\"detail\":\"Grant Full Disk Access\"}"#,
+                        HealthState::Unsupported,
+                        "Full Disk Access",
+                    ),
+                    (
+                        "no-automation",
+                        r#"\"result\":{\"protocol\":\"2\",\"databaseReadable\":true,\"automationAuthorized\":false,\"messagesAvailable\":false,\"handles\":12,\"detail\":\"Allow it under Automation\"}"#,
+                        HealthState::Unsupported,
+                        "Automation",
+                    ),
+                    (
+                        "no-account",
+                        r#"\"result\":{\"protocol\":\"2\",\"databaseReadable\":true,\"automationAuthorized\":true,\"messagesAvailable\":false,\"handles\":12,\"detail\":\"Sign in to Messages on this Mac\"}"#,
+                        HealthState::Error,
+                        "Sign in to Messages",
+                    ),
+                    (
+                        "old-helper",
+                        r#"\"result\":{\"handles\":12,\"canSend\":true}"#,
+                        HealthState::Unsupported,
+                        "too old",
+                    ),
+                ];
+                for (name, probe_tail, expected, expected_detail) in cases {
+                    let path = write_fake_helper_probing(name, probe_tail);
+                    let health = adapter(&path).probe().await;
+                    assert_eq!(health.state, expected, "{name}: {health:?}");
+                    let reported = health.detail.or(health.last_error).unwrap_or_default();
+                    assert!(
+                        reported.contains(expected_detail),
+                        "{name}: {reported} does not name what to fix"
+                    );
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+
+            #[tokio::test]
+            async fn a_handle_shaped_like_a_path_is_refused_without_asking_the_helper() {
+                // Belt and braces with the helper's own containment check: a
+                // path never becomes a fetch, on either side of the pipe.
+                let path = write_fake_helper("path-handle");
+                for hostile in [
+                    "/etc/passwd",
+                    "~/Library/Messages/Attachments/aa/x.png",
+                    "../../etc/passwd",
+                    "",
+                ] {
+                    let attachment = ChannelAttachment {
+                        stored_artifact_id: None,
+                        text_excerpt: None,
+                        fetch_error: None,
+                        provider_id: None,
+                        kind: AttachmentKind::Other,
+                        filename: None,
+                        mime_type: None,
+                        declared_size_bytes: None,
+                        source: AttachmentSource::ProviderHandle {
+                            handle: hostile.to_string(),
+                        },
+                    };
+                    assert!(
+                        adapter(&path)
+                            .fetch_attachment(&attachment, Default::default())
+                            .await
+                            .is_err(),
+                        "{hostile} was accepted as a handle"
+                    );
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+
+            #[tokio::test]
+            async fn a_send_that_never_reached_the_helper_is_retryable() {
+                let path = write_fake_helper("not-sent");
                 let adapter = adapter(&path);
-                // Overriding the method the probe sends is not possible from
-                // out here, so this drives the same branch through `call` and
-                // asserts on the health `probe` would build from it.
-                let result = adapter
-                    .call("noAutomation", json!({}))
-                    .await
-                    .expect("the helper answered");
-                assert_eq!(result["canSend"], false);
+                // Kill the helper, then send inside the restart cooldown. The
+                // request is never written, so the reply must stay queued.
+                let _ = adapter.call("crash", json!({})).await;
+                let outcome = adapter
+                    .send(&OutboundMessage {
+                        account_id: "acct-1".to_string(),
+                        kind: ChannelKind::IMessage,
+                        conversation_id: "+15551230001".to_string(),
+                        thread_id: None,
+                        text: "still queued".to_string(),
+                        attachments: Vec::new(),
+                        reply_to_provider_id: None,
+                        idempotency_key: "idem-2".to_string(),
+                    })
+                    .await;
+                assert!(
+                    matches!(outcome, SendOutcome::RetryableFailure { .. }),
+                    "a message that never left must not be thrown away: {outcome:?}"
+                );
                 let _ = std::fs::remove_file(&path);
             }
 

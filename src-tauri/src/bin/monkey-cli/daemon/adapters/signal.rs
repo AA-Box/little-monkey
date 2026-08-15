@@ -15,8 +15,8 @@
 //! its stdin/stdout to a background task ([`run_rpc_loop`]) that is the only
 //! code in this module allowed to touch the child process directly:
 //! - A line with an `id` is a JSON-RPC *response* to a request this adapter
-//!   made (`send`, a probe's `version` call) — routed to the matching entry
-//!   in `pending` and never seen by `poll`.
+//!   made (`send`, a probe's `listAccounts` call) — routed to the matching
+//!   entry in `pending` and never seen by `poll`.
 //! - A line with `"method": "receive"` and no `id` is an inbound
 //!   *notification* — parsed by [`parse_event`] and pushed onto `poll`'s
 //!   channel.
@@ -75,8 +75,8 @@ const MAX_TEXT_CHARS: usize = 2000;
 /// Outcome of one JSON-RPC round trip, distinguished by whether a request
 /// provably reached the helper's stdin.
 enum CallError {
-    /// Never written — the helper is not running or failed to start. Safe
-    /// to report as a permanent failure: nothing happened.
+    /// Never written — the helper is not running or failed to start. Nothing
+    /// happened, so this is the one arm a send may safely be retried from.
     NotSent(String),
     /// Written, but the outcome is unknown (write failed after some bytes
     /// may have gone out, the helper died before answering, or it never
@@ -495,9 +495,12 @@ impl ChannelAdapter for SignalAdapter {
         if let Some(error) = self.helper_missing() {
             return ChannelHealth::unsupported(now, error);
         }
-        // Registration, not just liveness. A helper that starts fine but has
-        // never registered this number cannot send or receive anything, and
-        // answering `version` proves only that a process is running.
+        // Registration, and nothing weaker. A helper process that starts fine
+        // but has never registered this number cannot send or receive a single
+        // message, so liveness — a `version` that answers, a process that is
+        // running — is not evidence of anything this account needs. When
+        // registration cannot be established, the honest answer is that setup
+        // is unfinished, never Connected.
         match self.call("listAccounts", json!({})).await {
             Ok(result) => match registered_accounts(&result) {
                 Some(accounts) if accounts.iter().any(|number| number == &self.account) => {
@@ -511,13 +514,16 @@ impl ChannelAdapter for SignalAdapter {
                         self.account
                     ),
                 ),
-                // The helper answered in a shape this adapter does not know.
-                // Falling back is better than calling a working install broken.
-                None => self.probe_version(now).await,
+                // The helper answered in a shape this adapter cannot read. It
+                // may well be working — but "may well be" is not what Connected
+                // means, and a silently unregistered account looks exactly like
+                // this.
+                None => ChannelHealth::unsupported(now, self.cannot_verify()),
             },
-            // An older helper has no `listAccounts`; a rejection is not proof
-            // of anything except that this method is unavailable.
-            Err(CallError::Remote(_)) => self.probe_version(now).await,
+            // An older helper has no `listAccounts` at all. That is a helper
+            // this adapter cannot verify an account with, which is a setup step
+            // (update signal-cli), not a connection that is working.
+            Err(CallError::Remote(_)) => ChannelHealth::unsupported(now, self.cannot_verify()),
             Err(error) => ChannelHealth::error(now, error.into_message()),
         }
     }
@@ -570,7 +576,13 @@ impl ChannelAdapter for SignalAdapter {
                     .and_then(Value::as_i64)
                     .map(|timestamp| timestamp.to_string()),
             },
-            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            // Never written to the helper's stdin — it is not running, or the
+            // restart cooldown has not elapsed. Nothing happened, so this is
+            // the one shape that is provably safe to send again.
+            Err(CallError::NotSent(error)) => SendOutcome::RetryableFailure {
+                error,
+                retry_after_ms: Some(5_000),
+            },
             Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
             Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
         }
@@ -588,7 +600,10 @@ impl ChannelAdapter for SignalAdapter {
         attachment: &ChannelAttachment,
         limits: crate::daemon::channel_adapter::AttachmentLimits,
     ) -> Result<Vec<u8>, String> {
-        let max_bytes = MAX_ATTACHMENT_BYTES;
+        // The account's own cap, never above this adapter's ceiling: a
+        // configured limit that is ignored is a limit an operator set for
+        // nothing.
+        let max_bytes = limits.max_bytes.min(MAX_ATTACHMENT_BYTES);
         let AttachmentSource::ProviderHandle { handle } = &attachment.source else {
             return Err("This Signal attachment has no id.".to_string());
         };
@@ -631,13 +646,15 @@ impl ChannelAdapter for SignalAdapter {
 }
 
 impl SignalAdapter {
-    /// The fallback probe for a helper too old to list its accounts: liveness
-    /// only, and honest about being that.
-    async fn probe_version(&self, now: i64) -> ChannelHealth {
-        match self.call("version", json!({})).await {
-            Ok(_) => ChannelHealth::connected(now, Some(self.account.clone())),
-            Err(error) => ChannelHealth::error(now, error.into_message()),
-        }
+    /// What health says when the helper is up but cannot be asked whether this
+    /// account is registered.
+    fn cannot_verify(&self) -> String {
+        format!(
+            "signal-cli is running, but this version cannot report which accounts are registered, \
+             so Little Monkey cannot confirm that {} is able to send or receive. Update \
+             signal-cli.",
+            self.account
+        )
     }
 
     /// signal-cli takes attachments on the same `send` call, as RFC 2397 data
@@ -676,7 +693,13 @@ impl SignalAdapter {
                     .and_then(Value::as_i64)
                     .map(|timestamp| timestamp.to_string()),
             },
-            Err(CallError::NotSent(error)) => SendOutcome::PermanentFailure { error },
+            // Never written to the helper's stdin — it is not running, or the
+            // restart cooldown has not elapsed. Nothing happened, so this is
+            // the one shape that is provably safe to send again.
+            Err(CallError::NotSent(error)) => SendOutcome::RetryableFailure {
+                error,
+                retry_after_ms: Some(5_000),
+            },
             Err(CallError::Ambiguous(error)) => SendOutcome::NeedsReconciliation { error },
             Err(CallError::Remote(error)) => SendOutcome::PermanentFailure { error },
         }
@@ -889,6 +912,61 @@ mod tests {
         assert!(SignalAdapter::new(&config).is_ok());
     }
 
+    /// An opt-in round trip through the operator's own signal-cli.
+    ///
+    /// Never runs unless all three variables are set, so CI and every
+    /// contributor's `cargo test` skip it. No number, no helper path and no
+    /// recipient is bundled anywhere in this tree: the destination is one the
+    /// person running it chose, and it is the only place a message is sent.
+    ///
+    /// ```text
+    /// LM_SIGNAL_LIVE_HELPER=/usr/local/bin/signal-cli \
+    /// LM_SIGNAL_LIVE_ACCOUNT=+15550000000 \
+    /// LM_SIGNAL_LIVE_RECIPIENT=+15550000001 \
+    ///   cargo test --bin monkey-cli a_live_signal_round_trip -- --nocapture
+    /// ```
+    #[tokio::test]
+    async fn a_live_signal_round_trip() {
+        let (Ok(helper), Ok(number), Ok(recipient)) = (
+            std::env::var("LM_SIGNAL_LIVE_HELPER"),
+            std::env::var("LM_SIGNAL_LIVE_ACCOUNT"),
+            std::env::var("LM_SIGNAL_LIVE_RECIPIENT"),
+        ) else {
+            return;
+        };
+        let account = test_account(json!({
+            "helper_path": helper,
+            "account": number,
+        }));
+        let adapter = SignalAdapter::new(&AdapterConfig {
+            account: &account,
+            secret: String::new(),
+        })
+        .expect("adapter");
+
+        let health = adapter.probe().await;
+        assert_eq!(
+            health.state,
+            little_monkey_lib::channels::types::HealthState::Connected,
+            "{health:?} — register this number with signal-cli first"
+        );
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let outcome = adapter
+            .send(&OutboundMessage {
+                account_id: "acct-1".to_string(),
+                kind: ChannelKind::Signal,
+                conversation_id: recipient,
+                thread_id: None,
+                text: format!("little-monkey live smoke test {marker}"),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                idempotency_key: format!("live-{marker}"),
+            })
+            .await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+    }
+
     /// Everything below drives a *fake* helper: a shell script that speaks the
     /// same newline-delimited JSON-RPC signal-cli does. No real signal-cli, no
     /// Signal account, no network — which is what makes the lifecycle
@@ -924,6 +1002,16 @@ mod tests {
         /// tests share one process, and a process-wide variable would make the
         /// answer depend on which test ran last.
         fn write_fake_helper_registering(name: &str, registered: &str) -> std::path::PathBuf {
+            write_fake_helper_answering(
+                name,
+                &format!(r#"\"result\":[{{\"number\":\"{registered}\"}}]"#),
+            )
+        }
+
+        /// The same fixture again, answering `listAccounts` with an arbitrary
+        /// JSON-RPC tail — a result in a shape this adapter cannot read, or an
+        /// outright error from a helper too old to have the method at all.
+        fn write_fake_helper_answering(name: &str, list_accounts_tail: &str) -> std::path::PathBuf {
             let path = std::env::temp_dir().join(format!(
                 "monkey-fake-signal-{name}-{}",
                 uuid::Uuid::new_v4().simple()
@@ -938,14 +1026,17 @@ while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *listAccounts*)
-      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"number\":\"__REGISTERED__\"}]}" ;;
+      /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,__LIST_ACCOUNTS__}" ;;
     *)
       /bin/echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"version\":\"0.13.0\",\"timestamp\":1700000000001}}" ;;
   esac
 done
 "#;
-            std::fs::write(&path, script.replace("__REGISTERED__", registered))
-                .expect("write fake helper");
+            std::fs::write(
+                &path,
+                script.replace("__LIST_ACCOUNTS__", list_accounts_tail),
+            )
+            .expect("write fake helper");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake helper");
             path
@@ -976,6 +1067,107 @@ done
             assert_eq!(health.state, HealthState::Error);
             let detail = health.last_error.expect("detail");
             assert!(detail.contains("not registered"), "{detail}");
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Registration cannot be established, so nothing here may be
+        /// Connected — the failure class is a working *process* being mistaken
+        /// for a working *account*.
+        #[tokio::test]
+        async fn a_helper_that_cannot_prove_registration_is_never_connected() {
+            for (name, tail) in [
+                // A `listAccounts` result in a shape this adapter cannot read.
+                (
+                    "unknown-shape",
+                    r#"\"result\":{\"version\":\"0.13.0\"}"#.to_string(),
+                ),
+                // A helper old enough not to have the method at all.
+                (
+                    "no-method",
+                    r#"\"error\":{\"code\":-32601,\"message\":\"Unknown method\"}"#.to_string(),
+                ),
+            ] {
+                let path = write_fake_helper_answering(name, &tail);
+                let account = helper_account(&path);
+                let adapter = SignalAdapter::new(&AdapterConfig {
+                    account: &account,
+                    secret: String::new(),
+                })
+                .expect("adapter");
+
+                let health = adapter.probe().await;
+                assert_ne!(
+                    health.state,
+                    HealthState::Connected,
+                    "{name}: a helper that answers is not an account that is registered"
+                );
+                assert_eq!(health.state, HealthState::Unsupported, "{name}");
+                let detail = health.detail.unwrap_or_default();
+                assert!(detail.contains("Update signal-cli"), "{name}: {detail}");
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_send_the_helper_dies_during_is_reconciled_never_retried() {
+            let path = write_fake_helper("ambiguous-send");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+
+            // The fixture exits on any line containing `crash`, which is what
+            // a helper killed mid-send looks like: written, never answered.
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "crash".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-crash".to_string(),
+                })
+                .await;
+            assert!(
+                matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+                "signal-cli may already have sent it: {outcome:?}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[tokio::test]
+        async fn a_send_that_never_reached_the_helper_is_retryable() {
+            let path = write_fake_helper("not-sent");
+            let account = helper_account(&path);
+            let adapter = SignalAdapter::new(&AdapterConfig {
+                account: &account,
+                secret: String::new(),
+            })
+            .expect("adapter");
+            // Kill the helper, then send inside the restart cooldown: the
+            // request is never written, so nothing can have happened and the
+            // message must stay queued rather than be dropped.
+            let _ = adapter.call("crash", json!({})).await;
+            let outcome = adapter
+                .send(&OutboundMessage {
+                    account_id: "acct-1".to_string(),
+                    kind: ChannelKind::Signal,
+                    conversation_id: "+15551230001".to_string(),
+                    thread_id: None,
+                    text: "still queued".to_string(),
+                    attachments: Vec::new(),
+                    reply_to_provider_id: None,
+                    idempotency_key: "idem-2".to_string(),
+                })
+                .await;
+            assert!(
+                matches!(outcome, SendOutcome::RetryableFailure { .. }),
+                "a message that never left must not be thrown away: {outcome:?}"
+            );
             let _ = std::fs::remove_file(&path);
         }
 

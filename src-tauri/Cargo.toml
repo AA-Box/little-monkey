@@ -345,3 +345,24 @@ pdf-extraction = ["dep:pdf-extract"]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
 # command-macro argument-key matching can be exercised in unit tests.
 tauri = { version = "2", features = ["test"] }
+# The same Matrix SDK as above, plus its `testing` feature, which is only ever
+# compiled for `cargo test`.
+#
+# It brings `matrix_sdk::test_utils::mocks::MatrixMockServer`: a homeserver
+# stand-in that implements the *crypto* endpoints for real — `/keys/upload`,
+# `/keys/query`, `/keys/claim`, `/sendToDevice` — so two SDK clients perform a
+# genuine Olm/Megolm key exchange against it. That is what makes "encryption
+# actually works" provable in CI rather than only "plaintext is refused": a
+# hand-written protocol fixture can prove a refusal, but it cannot decrypt
+# anything, so it can never prove a success.
+#
+# The production `MatrixAdapter` is the client under test in every one of those
+# tests. Nothing here replaces it.
+matrix-sdk = { version = "0.18", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    "testing",
+] }
+# The sync-response builder those helpers take, for putting a room, a timeline
+# event or a to-device message into one `/sync` answer.
+matrix-sdk-test = "0.18"

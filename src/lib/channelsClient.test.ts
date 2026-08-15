@@ -114,6 +114,34 @@ describe("channels setup guidance", () => {
     expect(sasl?.required).toBeFalsy();
   });
 
+  it("describes each provider's transport the way the daemon implements it", () => {
+    // One truthful answer, not two. The daemon's `ProviderCapabilities`
+    // decides this — Matrix holds `/sync` open in a background task, which is
+    // `InboundTransport::Socket` there, so it is "socket" here. A guide that
+    // said "long_poll" would describe a client this app does not have.
+    const transport = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.transport;
+    expect(transport("matrix")).toBe("socket");
+    expect(transport("mattermost")).toBe("socket");
+    expect(transport("irc")).toBe("socket");
+    expect(transport("discord")).toBe("socket");
+    expect(transport("slack")).toBe("socket");
+    expect(transport("telegram")).toBe("long_poll");
+    expect(transport("signal")).toBe("helper");
+    expect(transport("imessage")).toBe("helper");
+  });
+
+  it("says what health actually checks, for the providers where a process is not an account", () => {
+    // Each of these had a false-positive Connected: a running helper, an
+    // installed binary, a saved token. The guide is where an operator reads
+    // what the health badge now means.
+    const text = (kind: string) => PROVIDER_GUIDES.find((guide) => guide.kind === kind)!.whereToGetIt;
+    expect(text("signal")).toMatch(/actually registered/i);
+    expect(text("imessage")).toMatch(/checked for real/i);
+    expect(text("mattermost")).toMatch(/websocket/i);
+    expect(text("irc")).toMatch(/never completed as an anonymous one/i);
+    expect(text("matrix")).toMatch(/refuses to send/i);
+  });
+
   it("collects each server's own address rather than a hosted provider's", () => {
     const keys = (kind: string) =>
       (PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields ?? []).map((field) => field.key);
