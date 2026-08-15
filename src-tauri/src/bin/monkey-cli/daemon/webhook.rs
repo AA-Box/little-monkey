@@ -307,10 +307,13 @@ fn ack_response(ack: super::channel_adapter::WebhookAck) -> Response<Full<Bytes>
 ///    received — nothing is parsed before that, and a failure returns
 ///    [`DeliveryOutcome::Rejected`] having written nothing;
 /// 2. the verified body is normalized into envelopes;
-/// 3. each envelope is committed to `channel_events`, whose
+/// 3. any reply address the delivery established is committed, because a
+///    message that is acknowledged and then cannot be answered is worse than
+///    one that is redelivered — see [`record_durable_addressing`];
+/// 4. each envelope is committed to `channel_events`, whose
 ///    `UNIQUE(source, account_id, direction, provider_event_id)` is what makes
 ///    the provider's own event id the durable dedupe identity;
-/// 4. only then may the caller answer with this provider's success.
+/// 5. only then may the caller answer with this provider's success.
 ///
 /// What is deliberately *not* here: no file is downloaded, no media endpoint is
 /// asked anything, no blob is written, no route is resolved, no execution
@@ -338,6 +341,12 @@ pub(crate) fn accept_webhook_delivery(
         // Deliberately opaque, and deliberately not recorded.
         Err(_) => return DeliveryOutcome::Rejected,
     };
+    // Where this conversation's answer goes, before anything says it arrived.
+    // A provider that saw success for a message whose only reply address was
+    // lost is owed an answer nothing can ever send, and it will not redeliver.
+    if !record_durable_addressing(store, adapter.take_durable_addressing(), delivery.now_ms) {
+        return DeliveryOutcome::NotAccepted;
+    }
     // What the provider says happened to messages we already sent. Recorded
     // before the inbound work because it is cheap and must survive even a
     // delivery that carries nothing else — a status-only body is the normal
@@ -367,6 +376,40 @@ pub(crate) fn accept_webhook_delivery(
         accepted,
         duplicates,
     }
+}
+
+/// Commit the reply addresses a verified delivery established, before the
+/// event that will need them.
+///
+/// Order is the whole of the crash-safety argument, and it is the reverse of
+/// the intuitive one. Address first, event second: a crash in between leaves an
+/// address for a conversation with no event, which costs nothing — the provider
+/// never saw success, so it redelivers, and the address is simply already
+/// correct when it does. The other order leaves the state that cannot be
+/// repaired: an accepted message, acknowledged, with nowhere to answer.
+///
+/// `false` means one of them did not commit, and the caller must withhold the
+/// acknowledgement so the provider sends the whole delivery again.
+fn record_durable_addressing(
+    store: &mut DaemonStore,
+    addressing: Vec<super::channel_adapter::DurableAddressing>,
+    now_ms: i64,
+) -> bool {
+    if !addressing.is_empty()
+        && super::fail_points::fire(super::fail_points::FailPoint::BeforeAddressingCommit).is_err()
+    {
+        return false;
+    }
+    addressing.into_iter().all(|entry| {
+        store
+            .set_channel_conversation_ref(
+                &entry.account_id,
+                &entry.conversation_id,
+                &entry.reference,
+                now_ms.max(1),
+            )
+            .is_ok()
+    })
 }
 
 /// Commit one authenticated envelope as accepted-and-unprocessed.

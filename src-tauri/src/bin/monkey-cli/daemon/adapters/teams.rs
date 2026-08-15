@@ -10,10 +10,10 @@
 //! 2. the RS256 signature, against a key from Microsoft's own OpenID metadata
 //!    document (fetched and cached as a JWKS);
 //! 3. issuer, audience, `exp` and `nbf`;
-//! 4. the signing key's **endorsements** — the Bot Framework publishes, per
-//!    key, which channels that key may sign for, and an activity claiming a
-//!    channel the key is not endorsed for is refused
-//!    ([`validate_channel_is_endorsed`]);
+//! 4. the activity's channel identity and the signing key's **endorsements** —
+//!    the activity must name the Teams channel, and the Bot Framework
+//!    publishes, per key, which channels that key may sign for, so the key must
+//!    be endorsed for Teams ([`validate_channel_is_endorsed`]);
 //! 5. the token's `serviceurl` claim against the activity's own `serviceUrl`
 //!    ([`validate_service_url_claim`]) — the JWT signs its claims, not the
 //!    body, and this is the claim that binds the two. Without it a valid token
@@ -50,10 +50,19 @@
 //! and per region, so without it there is no endpoint at all. That value is
 //! therefore *durable state*, not a cache: a turn accepted before a restart
 //! still owes an answer afterwards, and a process-local map cannot give it one.
-//! [`TeamsAdapter::record_conversation_reference`] writes it — only from an
+//! [`TeamsAdapter::conversation_reference_for`] produces it — only from an
 //! activity whose JWT has already verified, and only after
-//! [`validate_service_url`] — and `send` loads it back through
+//! [`validate_service_url`] — and it leaves this adapter as
+//! [`DurableAddressing`], which the webhook acceptance path commits *before*
+//! the provider is answered. `send` loads it back through
 //! [`ConversationReferences`]. Nothing derives, reconstructs or defaults it.
+//!
+//! That the address is committed by the acceptance path rather than written
+//! here is the correctness property, not a refactor: a message this build has
+//! acknowledged but cannot address is a message nobody will ever get an answer
+//! to, and no amount of retrying fixes it because the provider considers it
+//! delivered. So the two are one acceptance — event and address together, or
+//! neither and a redelivery.
 //!
 //! The bearer token is the opposite and stays that way: acquired from the
 //! operator's own app credentials, cached in memory with its expiry, never
@@ -75,7 +84,7 @@ use super::jwt::{
 };
 use crate::daemon::channel_adapter::{
     fetch_url, AdapterConfig, ChannelAdapter, ConversationReferences, DaemonConversationReferences,
-    InboundBatch, WebhookChannelAdapter,
+    DurableAddressing, InboundBatch, WebhookChannelAdapter,
 };
 
 /// Applies to `exp`/`nbf` alike, per the shared skew rule this file follows.
@@ -162,10 +171,13 @@ pub struct TeamsAdapter {
     token_cache: Mutex<Option<CachedToken>>,
     /// Where a reply to each conversation is addressed. Durable, because a
     /// turn accepted before a restart still owes an answer after one — see the
-    /// module doc. Only ever written by
-    /// [`TeamsAdapter::record_conversation_reference`], which validates before
-    /// storing; `send` refuses to guess or derive an endpoint.
+    /// module doc. Read here and written by the acceptance path; `send`
+    /// refuses to guess or derive an endpoint.
     references: std::sync::Arc<dyn ConversationReferences>,
+    /// What the last verified delivery established about where to answer,
+    /// waiting for the acceptance path to drain and commit it. Empty at every
+    /// other moment — see [`WebhookChannelAdapter::take_durable_addressing`].
+    pending_addressing: Mutex<Vec<DurableAddressing>>,
     /// Which Bot Framework cloud this account belongs to. Decides the issuer
     /// that is accepted, where signing keys come from, where the bot's own
     /// token is bought and what a reply may be addressed to — all five
@@ -203,6 +215,7 @@ impl TeamsAdapter {
             app_password: secrets.app_password,
             token_cache: Mutex::new(None),
             references: std::sync::Arc::new(DaemonConversationReferences::new()),
+            pending_addressing: Mutex::new(Vec::new()),
             environment,
             login_base: environment.oauth_authority.to_string(),
             jwks_cache: JwksCache::new(),
@@ -294,9 +307,8 @@ impl TeamsAdapter {
         None
     }
 
-    /// Durably record where replies to one conversation go, refusing any
-    /// `serviceUrl` that is not `https` on a Microsoft-owned Bot Framework
-    /// host.
+    /// Where replies to one conversation go, refusing any `serviceUrl` that is
+    /// not `https` on a Microsoft-owned Bot Framework host.
     ///
     /// This is the only way `send` learns where to POST — it never
     /// reconstructs a URL or trusts one handed to it another way — and it is
@@ -305,15 +317,15 @@ impl TeamsAdapter {
     /// property: an unauthenticated request cannot make this process POST an
     /// operator's bot token to a host of its choosing.
     ///
-    /// No token is stored. What is stored is addressing: the endpoint, the
+    /// No token is produced. What is produced is addressing: the endpoint, the
     /// tenant and conversation shape the Bot Framework needs to route a reply,
     /// and when it was last confirmed.
-    fn record_conversation_reference(
+    fn conversation_reference_for(
         &self,
         conversation_id: &str,
         activity: &JsonValue,
         now_ms: i64,
-    ) -> Result<(), String> {
+    ) -> Result<DurableAddressing, String> {
         let service_url = activity
             .get("serviceUrl")
             .and_then(JsonValue::as_str)
@@ -373,8 +385,11 @@ impl TeamsAdapter {
                 .and_then(|recipient| recipient.get("name"))
                 .and_then(JsonValue::as_str),
         );
-        self.references
-            .put(&self.account_id, conversation_id, &reference)
+        Ok(DurableAddressing {
+            account_id: self.account_id.clone(),
+            conversation_id: conversation_id.to_string(),
+            reference,
+        })
     }
 
     /// The stored reference for a conversation, or the reason there is none.
@@ -483,6 +498,13 @@ impl WebhookChannelAdapter for TeamsAdapter {
         crate::daemon::channel_adapter::WebhookAck::json_ok()
     }
 
+    fn take_durable_addressing(&self) -> Vec<DurableAddressing> {
+        self.pending_addressing
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
@@ -535,24 +557,32 @@ impl WebhookChannelAdapter for TeamsAdapter {
         validate_service_url_claim(&decoded.claims, &activity)?;
 
         // The `serviceUrl` this specific activity carries is the only way
-        // `send` learns where to POST for this conversation — record it now
+        // `send` learns where to POST for this conversation — produce it now
         // that the activity is verified *and* bound to the token, per
-        // `record_conversation_reference`'s own doc. Written durably rather
-        // than cached: the turn this delivery becomes may well outlive the
-        // process that received it.
+        // `conversation_reference_for`'s own doc, and hand it to the acceptance
+        // path, which commits it before this provider is told anything. It has
+        // to be durable rather than cached: the turn this delivery becomes may
+        // well outlive the process that received it.
         //
-        // Best-effort on failure: an activity whose `serviceUrl` is absent or
-        // on a host this cloud does not own still normalizes and runs, it just
-        // cannot be replied to until one that carries a usable address
-        // arrives. Refusing the whole delivery there would throw away a real
-        // message over a reply address, and the send says plainly what is
-        // missing.
+        // An activity whose `serviceUrl` is on a host this cloud does not own
+        // yields no address, and still normalizes and runs — it just cannot be
+        // replied to until one that carries a usable address arrives. Throwing
+        // away a real message over that would be worse, and the send says
+        // plainly what is missing. What must *not* happen is the other order:
+        // an address that exists and is lost. That case is the acceptance
+        // path's, and it withholds the acknowledgement.
         if let Some(conversation_id) = activity
             .get("conversation")
             .and_then(|conversation| conversation.get("id"))
             .and_then(JsonValue::as_str)
         {
-            let _ = self.record_conversation_reference(conversation_id, &activity, now_ms);
+            if let Ok(addressing) =
+                self.conversation_reference_for(conversation_id, &activity, now_ms)
+            {
+                if let Ok(mut pending) = self.pending_addressing.lock() {
+                    pending.push(addressing);
+                }
+            }
         }
 
         let bot_id = activity
@@ -602,27 +632,45 @@ fn validate_service_url_claim(claims: &JsonValue, activity: &JsonValue) -> Resul
     Ok(())
 }
 
-/// Refuse an activity from a channel the signing key is not endorsed for.
+/// The only channel identity this adapter accepts.
 ///
-/// The Bot Framework publishes, alongside each key in its OpenID key document,
-/// the list of channels that key may sign for. A key endorsed for one channel
-/// signing an activity claiming to come from another is the case this closes.
-/// A key that lists no endorsements makes no such claim and constrains
-/// nothing — that is the shape Microsoft publishes for keys that are not
-/// channel-scoped, and treating it as "endorses nothing" would refuse every
-/// delivery signed with one.
+/// This is the Teams adapter: the account it belongs to was configured against
+/// an Azure Bot resource's Teams channel, its reply endpoints are Teams', and
+/// the operator's policy was written about Teams. An activity naming any other
+/// Bot Framework channel — `directline`, `webchat`, `emulator`, anything a bot
+/// may also be connected to — is a different product arriving at this door, and
+/// is refused rather than normalized into a Teams conversation.
+const TEAMS_CHANNEL_ID: &str = "msteams";
+
+/// Refuse an activity that is not Teams', or whose signing key is not endorsed
+/// for Teams.
+///
+/// Two separate facts, both required. The `channelId` is the activity's own
+/// claim about where it came from, and it must be Teams. The **endorsements**
+/// are what the Bot Framework publishes alongside each key in its OpenID key
+/// document: the list of channels that key is permitted to sign for. A key not
+/// endorsed for Teams signing an activity that claims to be Teams is exactly
+/// the substitution this closes, so the endorsement must be *present* and must
+/// name Teams.
+///
+/// A key that publishes no endorsements at all therefore cannot sign a Teams
+/// activity here. That is deliberate: an empty list is an absent claim, and
+/// waving one through would let any Bot Framework key sign for this channel —
+/// which is the whole of what the check is for. Microsoft's Teams signing keys
+/// carry the endorsement; a fixture that omits it is a wrong fixture, not a
+/// reason to relax this.
 fn validate_channel_is_endorsed(activity: &JsonValue, key: &JwkRsaKey) -> Result<(), String> {
-    if key.endorsements.is_empty() {
-        return Ok(());
-    }
     let channel_id = activity
         .get("channelId")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| "Activity names no channelId to check its endorsement".to_string())?;
+        .ok_or_else(|| "Activity names no channelId".to_string())?;
+    if channel_id != TEAMS_CHANNEL_ID {
+        return Err("This activity is not from the Microsoft Teams channel".to_string());
+    }
     if !key
         .endorsements
         .iter()
-        .any(|endorsed| endorsed == channel_id)
+        .any(|endorsed| endorsed == TEAMS_CHANNEL_ID)
     {
         return Err("The signing key is not endorsed for this activity's channel".to_string());
     }
@@ -1204,7 +1252,7 @@ nJ6EyR9+bBW08LJfpDG+U7oWYA==
 
     /// A second, unrelated 2048-bit RSA test key: only ever used as the
     /// "wrong signer" in tests below.
-    const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+    pub(crate) const TEST_WRONG_PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
 MIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQDzgzLmiwnyEOF1
 FnDCygqdjmbhjbJjW2d5W5VC2cWTbqpJA+UitbAn9zalMm8HDxazOGn5VVMZU7Rj
 LFRqBsVStj8CKxzT/gSuODI8RQCgSSQV/RnymWmjk46E1/a3ArNMTuxK9oSqmPpG
@@ -1328,6 +1376,21 @@ Z4Cr3JR0FbjywTd4IHU6
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
     }
 
+    /// What the webhook acceptance path does with the addressing a verified
+    /// delivery established: drain it and commit it. Here the store is the
+    /// in-memory one, because what these tests are about is the *value* the
+    /// verifier produced — `channel_webhook_tests` proves the real path
+    /// commits it to the real database before the provider is answered.
+    fn commit_addressing(adapter: &TeamsAdapter, references: &dyn ConversationReferences) {
+        for entry in
+            crate::daemon::channel_adapter::WebhookChannelAdapter::take_durable_addressing(adapter)
+        {
+            references
+                .put(&entry.account_id, &entry.conversation_id, &entry.reference)
+                .expect("store the address");
+        }
+    }
+
     #[test]
     fn a_verified_activity_records_its_service_url_for_send() {
         let references = std::sync::Arc::new(MemoryConversationReferences::default());
@@ -1348,6 +1411,7 @@ Z4Cr3JR0FbjywTd4IHU6
                 now_ms,
             )
             .expect("verification should succeed");
+        commit_addressing(&adapter, references.as_ref());
         let stored = references
             .get("acct-teams", "19:conv1")
             .expect("the verified activity's address is durable");
@@ -1397,6 +1461,7 @@ Z4Cr3JR0FbjywTd4IHU6
                     now_ms,
                 )
                 .expect("verification should succeed");
+            commit_addressing(&receiver, references.as_ref());
         }
 
         let token_base = serve_forever("200 OK", r#"{"access_token":"tok","expires_in":3600}"#);
@@ -1446,6 +1511,7 @@ Z4Cr3JR0FbjywTd4IHU6
             result.unwrap_err().contains("serviceUrl"),
             "a token for one endpoint must not vouch for another"
         );
+        commit_addressing(&adapter, references.as_ref());
         assert!(
             references.get("acct-teams", "19:conv1").is_none(),
             "a mismatched token planted a reply address"
@@ -1521,11 +1587,11 @@ Z4Cr3JR0FbjywTd4IHU6
         );
     }
 
-    /// A key that publishes no endorsements makes no claim about channels, and
-    /// treating that as "endorses nothing" would refuse every delivery signed
-    /// with one.
+    /// An empty endorsement list is an absent claim, not a wildcard. Accepting
+    /// one would let any Bot Framework signing key sign for Teams, which is
+    /// exactly what the endorsement exists to stop.
     #[test]
-    fn a_key_publishing_no_endorsements_constrains_nothing() {
+    fn a_key_publishing_no_endorsements_cannot_sign_for_teams() {
         let adapter = adapter();
         adapter.seed_jwks_endorsing_for_test(&[]);
         let now_ms = 1_700_000_000_000i64;
@@ -1535,14 +1601,74 @@ Z4Cr3JR0FbjywTd4IHU6
             TEST_PRIVATE_KEY_PEM,
         );
 
-        adapter
-            .verify_and_normalize(
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&personal_activity()).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(
+            result.unwrap_err().contains("endorsed"),
+            "a key claiming no channel cannot claim this one"
+        );
+    }
+
+    /// This is the Teams adapter. An activity from another Bot Framework
+    /// channel the same bot is connected to — Direct Line, Web Chat, the
+    /// emulator — is a different product arriving at this door.
+    #[test]
+    fn an_activity_from_another_bot_framework_channel_is_refused() {
+        for channel_id in ["directline", "webchat", "emulator", "skype"] {
+            let adapter = adapter();
+            // Endorsed for both, so what refuses the activity is its own
+            // channel identity rather than the key's endorsements.
+            adapter.seed_jwks_endorsing_for_test(&["msteams", channel_id]);
+            let now_ms = 1_700_000_000_000i64;
+            let jwt = sign_test_jwt(
+                &valid_claims(now_ms / 1000),
+                "test-key-1",
+                TEST_PRIVATE_KEY_PEM,
+            );
+            let mut activity = personal_activity();
+            activity["channelId"] = JsonValue::from(channel_id);
+
+            let result = adapter.verify_and_normalize(
                 &[("authorization".to_string(), format!("Bearer {jwt}"))],
-                &serde_json::to_vec(&personal_activity()).unwrap(),
+                &serde_json::to_vec(&activity).unwrap(),
                 None,
                 now_ms,
-            )
-            .expect("an unendorsed key set is not a refusal");
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("not from the Microsoft Teams channel"),
+                "{channel_id} is not Teams"
+            );
+        }
+    }
+
+    /// An activity naming no channel at all cannot be checked, and is refused
+    /// rather than assumed to be Teams.
+    #[test]
+    fn an_activity_naming_no_channel_is_refused() {
+        let adapter = adapter();
+        adapter.seed_jwks_for_test();
+        let now_ms = 1_700_000_000_000i64;
+        let jwt = sign_test_jwt(
+            &valid_claims(now_ms / 1000),
+            "test-key-1",
+            TEST_PRIVATE_KEY_PEM,
+        );
+        let mut activity = personal_activity();
+        activity.as_object_mut().unwrap().remove("channelId");
+
+        let result = adapter.verify_and_normalize(
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &serde_json::to_vec(&activity).unwrap(),
+            None,
+            now_ms,
+        );
+        assert!(result.unwrap_err().contains("channelId"));
     }
 
     /// The endorsement list is what the JWKS document publishes, so it has to

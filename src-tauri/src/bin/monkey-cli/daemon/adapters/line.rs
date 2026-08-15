@@ -239,16 +239,8 @@ impl ChannelAdapter for LineAdapter {
         let parsed: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
 
         if status.is_success() {
-            // Newer Messaging API versions name what they sent; older ones
-            // answer `{}`, and there is nothing to invent when they do.
             return SendOutcome::Sent {
-                provider_message_id: parsed
-                    .get("sentMessages")
-                    .and_then(JsonValue::as_array)
-                    .and_then(|sent| sent.first())
-                    .and_then(|first| first.get("id"))
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_string),
+                provider_message_id: sent_message_id(&parsed),
             };
         }
 
@@ -261,10 +253,12 @@ impl ChannelAdapter for LineAdapter {
         // The retry key did its job: LINE has already accepted this exact
         // outbox row and refuses to deliver it a second time. That is a
         // delivered message, not a failure — treating it as one would either
-        // retry forever or park a row the recipient can already read.
+        // retry forever or park a row the recipient can already read. Some
+        // responses repeat what was originally sent, and where they do the
+        // real id is kept rather than thrown away for a `None`.
         if status.as_u16() == 409 {
             return SendOutcome::Sent {
-                provider_message_id: None,
+                provider_message_id: sent_message_id(&parsed),
             };
         }
         if status.as_u16() == 429 {
@@ -319,6 +313,22 @@ impl ChannelAdapter for LineAdapter {
 /// constant-time comparison (`ring::hmac::verify` is constant-time).
 /// LINE's own idempotency header for the push endpoints.
 const RETRY_KEY_HEADER: &str = "X-Line-Retry-Key";
+
+/// What LINE named as sent, if it named anything.
+///
+/// Newer Messaging API versions list what they delivered; older ones answer
+/// `{}`, and there is nothing to invent when they do. Read the same way on a
+/// success and on the `409` that says this exact retry key was already
+/// accepted, because both describe a message the recipient can read.
+fn sent_message_id(parsed: &JsonValue) -> Option<String> {
+    parsed
+        .get("sentMessages")
+        .and_then(JsonValue::as_array)
+        .and_then(|sent| sent.first())
+        .and_then(|first| first.get("id"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+}
 
 /// The outbox's idempotency key, in the UUID shape LINE requires.
 ///
@@ -563,15 +573,17 @@ fn normalize_event(
             ) {
                 return true;
             }
-            // LINE says outright whether a mention is the bot's own. Where it
-            // does, that answer is taken and nothing is inferred: a missing
-            // `userId` also happens for a member whose profile this bot may not
-            // read, and guessing there makes every such mention wake the agent
-            // in a group set to mention-only.
-            match mentionee.get("isSelf").and_then(JsonValue::as_bool) {
-                Some(is_self) => is_self,
-                None => mentionee.get("userId").is_none(),
-            }
+            // `isSelf` is the only thing LINE says about whether a mention is
+            // this bot's own, so it is the only thing read. Absent means LINE
+            // did not say — which is not the same as "yes", and inferring one
+            // from a missing `userId` was wrong twice over: a member whose
+            // profile this bot may not read also has no `userId`, and that
+            // guess woke the agent on every such mention in a group set to
+            // mention-only.
+            mentionee
+                .get("isSelf")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
         })
     });
     if let Some(count) = mentionees.map(Vec::len).filter(|count| *count > 0) {
@@ -1217,10 +1229,36 @@ pub(crate) mod tests {
             .with_base_url(&base)
             .send(&outbound_message())
             .await;
-        assert!(
-            matches!(outcome, SendOutcome::Sent { .. }),
-            "a retry-key conflict is an accepted delivery: {outcome:?}"
+        match outcome {
+            SendOutcome::Sent {
+                provider_message_id,
+            } => assert_eq!(
+                provider_message_id, None,
+                "there is no id to invent when the conflict names none"
+            ),
+            other => panic!("a retry-key conflict is an accepted delivery: {other:?}"),
+        }
+    }
+
+    /// Where LINE repeats what it originally accepted, that id is the message
+    /// the recipient can read — keeping it is what lets the operator's activity
+    /// list name the same message the first attempt created.
+    #[tokio::test]
+    async fn a_duplicate_retry_key_keeps_the_message_id_the_response_names() {
+        let base = serve_once(
+            "409 Conflict",
+            r#"{"message":"The retry key is already accepted","sentMessages":[{"id":"461230966842064897"}]}"#,
         );
+        let outcome = adapter("s", "t")
+            .with_base_url(&base)
+            .send(&outbound_message())
+            .await;
+        match outcome {
+            SendOutcome::Sent {
+                provider_message_id,
+            } => assert_eq!(provider_message_id.as_deref(), Some("461230966842064897")),
+            other => panic!("expected Sent, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1248,59 +1286,105 @@ pub(crate) mod tests {
 
     // --- Mentions ---------------------------------------------------------
 
-    #[test]
-    fn a_mention_of_the_bot_is_what_makes_a_group_message_addressed() {
-        // LINE marks a bot's own mention by leaving out the user id, and marks
-        // an @all with a type. Both address the bot; a mention of some other
-        // member does not.
-        let event = serde_json::json!({
+    /// One group message carrying `mentionees`, so each case below differs only
+    /// in what LINE said about who was named.
+    fn group_mention_event(event_id: &str, mentionees: JsonValue) -> JsonValue {
+        serde_json::json!({
             "type": "message",
-            "webhookEventId": "01GROUP",
+            "webhookEventId": event_id,
             "timestamp": 1_700_000_000_000i64,
             "source": {"type": "group", "groupId": "G1", "userId": "U2"},
             "message": {
                 "id": "m2", "type": "text", "text": "@monkey look",
-                "mention": {"mentionees": [{"index": 0, "length": 7}]}
+                "mention": {"mentionees": mentionees}
             }
-        });
-        let envelope = normalize_event(&event, "acct-line", 0).expect("normalizes");
-        assert!(envelope.mentions_self);
-        assert_eq!(envelope.metadata.get("line_mentions"), Some("1"));
+        })
+    }
 
-        let other_member = serde_json::json!({
-            "type": "message",
-            "webhookEventId": "01GROUP2",
-            "timestamp": 1_700_000_000_000i64,
-            "source": {"type": "group", "groupId": "G1", "userId": "U2"},
-            "message": {
-                "id": "m3", "type": "text", "text": "@ada look",
-                "mention": {"mentionees": [{"index": 0, "length": 4, "userId": "U9"}]}
-            }
-        });
-        let envelope = normalize_event(&other_member, "acct-line", 0).expect("normalizes");
+    fn mentions_self(event_id: &str, mentionees: JsonValue) -> bool {
+        normalize_event(&group_mention_event(event_id, mentionees), "acct-line", 0)
+            .expect("normalizes")
+            .mentions_self
+    }
+
+    /// `mentions_self` is what a group set to mention-only activates on, so it
+    /// may only ever come from something LINE actually said.
+    #[test]
+    fn only_line_saying_so_makes_a_group_message_addressed_to_the_bot() {
         assert!(
-            !envelope.mentions_self,
+            mentions_self(
+                "01SELF",
+                serde_json::json!([{"index": 0, "length": 7, "type": "user", "isSelf": true}])
+            ),
+            "LINE marks the bot's own mention with isSelf"
+        );
+        assert!(
+            !mentions_self(
+                "01OTHER",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user", "userId": "U9", "isSelf": false}])
+            ),
             "naming another member does not address the bot"
         );
-
         // A member whose profile this bot may not read is delivered without a
-        // user id too. LINE says who the mention is for, and that answer beats
-        // the shape of the payload — otherwise every such mention would wake
-        // the agent in a group set to mention-only.
-        let unreadable_member = serde_json::json!({
+        // user id. That is a fact about the profile, not about who was named,
+        // and inferring the bot from it woke the agent on every such mention.
+        assert!(
+            !mentions_self(
+                "01UNREADABLE",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user", "isSelf": false}])
+            ),
+            "a missing user id is not a mention of the bot"
+        );
+        assert!(
+            !mentions_self(
+                "01SILENT",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user"}])
+            ),
+            "LINE saying nothing about who was named is not a yes"
+        );
+        assert!(
+            mentions_self(
+                "01ALL",
+                serde_json::json!([{"index": 0, "length": 4, "type": "all"}])
+            ),
+            "an @all addresses the bot as much as anyone"
+        );
+    }
+
+    /// No mention metadata at all is the ordinary group message, and it is not
+    /// addressed to anybody.
+    #[test]
+    fn a_group_message_with_no_mention_metadata_is_not_addressed() {
+        let event = serde_json::json!({
             "type": "message",
-            "webhookEventId": "01GROUP3",
+            "webhookEventId": "01PLAIN",
             "timestamp": 1_700_000_000_000i64,
             "source": {"type": "group", "groupId": "G1", "userId": "U2"},
-            "message": {
-                "id": "m4", "type": "text", "text": "@ada look",
-                "mention": {"mentionees": [
-                    {"index": 0, "length": 4, "type": "user", "isSelf": false}
-                ]}
-            }
+            "message": {"id": "m2", "type": "text", "text": "look"}
         });
-        let envelope = normalize_event(&unreadable_member, "acct-line", 0).expect("normalizes");
+        let envelope = normalize_event(&event, "acct-line", 0).expect("normalizes");
         assert!(!envelope.mentions_self);
+        assert_eq!(envelope.metadata.get("line_mentions"), None);
+    }
+
+    /// The count is for the operator's activity list, and is independent of
+    /// whether the bot itself was one of them.
+    #[test]
+    fn the_number_of_mentions_is_recorded_whoever_they_named() {
+        let envelope = normalize_event(
+            &group_mention_event(
+                "01COUNT",
+                serde_json::json!([
+                    {"index": 0, "length": 4, "type": "user", "userId": "U9", "isSelf": false},
+                    {"index": 5, "length": 4, "type": "user", "isSelf": true}
+                ]),
+            ),
+            "acct-line",
+            0,
+        )
+        .expect("normalizes");
+        assert_eq!(envelope.metadata.get("line_mentions"), Some("2"));
+        assert!(envelope.mentions_self);
     }
 
     #[test]

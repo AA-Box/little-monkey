@@ -167,15 +167,18 @@ describe("provider settings", () => {
     expect(parts("google_chat")).toEqual([]);
   });
 
-  it("tells the operator the same Google Chat authentication audience the daemon verifies", () => {
-    // The daemon accepts exactly two values here and checks a different `aud`
-    // for each. Setup that described one and required the other is how an
-    // operator ends up with a callback Google calls and this app refuses.
+  it("names the one Google Chat authentication audience the daemon verifies", () => {
+    // Google Chat mints a different token for each of its two Authentication
+    // Audience values, and only the Project Number one is verified here.
+    // Setup that left the choice open is how an operator ends up with a
+    // callback Google calls and this app refuses.
     const guide = PROVIDER_GUIDES.find((entry) => entry.kind === "google_chat")!;
-    const audience = guide.configFields.find((field) => field.key === "auth_audience")!;
-    expect(audience.hint).toContain("project_number");
-    expect(audience.hint).toContain("app_url");
-    expect(guide.whereToGetIt).toContain("Authentication Audience");
+    expect(guide.configFields.map((field) => field.key)).toEqual(["project_number", "bot_user_name"]);
+    const projectNumber = guide.configFields.find((field) => field.key === "project_number")!;
+    expect(projectNumber.required).toBe(true);
+    expect(guide.whereToGetIt).toContain("Connection settings: HTTP endpoint URL");
+    expect(guide.whereToGetIt).toContain("Authentication Audience: Project Number");
+    expect(guide.whereToGetIt).toContain("App URL is the other Authentication Audience value and is not supported");
   });
 
   it("offers no Microsoft Teams cloud setting, because only one cloud works", () => {

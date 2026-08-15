@@ -645,6 +645,69 @@ fn line_body(webhook_event_id: &str, redelivery: bool) -> Vec<u8> {
     .into_bytes()
 }
 
+/// One LINE group message, with whatever LINE said about who it named.
+fn line_group_body(webhook_event_id: &str, mentionees: JsonValue) -> Vec<u8> {
+    serde_json::json!({
+        "destination": "Ubot",
+        "events": [{
+            "type": "message",
+            "webhookEventId": webhook_event_id,
+            "replyToken": "reply-token-1",
+            "deliveryContext": {"isRedelivery": false},
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "group", "groupId": "G-team", "userId": "U-ada"},
+            "message": {
+                "id": "m1", "type": "text", "text": "@monkey look",
+                "mention": {"mentionees": mentionees}
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// What the mention fix is actually for.
+///
+/// A group set to mention-only runs when — and only when — the bot was named,
+/// and `mentions_self` is the whole of that decision. A mentionee with no
+/// `userId` is a member whose profile this bot may not read, and inferring the
+/// bot from it woke the agent on every such message.
+#[tokio::test]
+async fn a_mention_only_line_group_runs_only_when_line_says_the_bot_was_named() {
+    let mut store = seeded_store("acct-line", ChannelKind::Line);
+    let queue = FakeQueue::default();
+    let adapter = line_adapter("acct-line");
+    let mut account = store
+        .channel_account("acct-line")
+        .expect("read")
+        .expect("the account");
+    account.access_policy.group_activation =
+        little_monkey_lib::channels::policy::GroupActivation::MentionOnly;
+    store.upsert_channel_account(&account).expect("policy");
+
+    // Somebody else was named, and LINE could not say who.
+    let unnamed = line_group_body(
+        "01UNNAMED",
+        serde_json::json!([{"index": 0, "length": 4, "type": "user"}]),
+    );
+    assert!(deliver(&mut store, &adapter, &line_signature(&unnamed), &unnamed).is_success());
+    process(&mut store, &queue).await;
+    assert_eq!(
+        distinct_runs(&queue),
+        0,
+        "a mention LINE did not attribute to the bot must not wake the agent"
+    );
+
+    // And the one LINE did attribute to the bot.
+    let named = line_group_body(
+        "01NAMED",
+        serde_json::json!([{"index": 0, "length": 7, "type": "user", "isSelf": true}]),
+    );
+    assert!(deliver(&mut store, &adapter, &line_signature(&named), &named).is_success());
+    process(&mut store, &queue).await;
+    assert_eq!(distinct_runs(&queue), 1, "an explicit mention runs");
+}
+
 #[tokio::test]
 async fn line_refuses_a_body_whose_signature_does_not_match_and_records_nothing() {
     let mut store = seeded_store("acct-line", ChannelKind::Line);
@@ -1021,8 +1084,11 @@ async fn teams_makes_a_new_activity_durable_before_it_answers() {
     assert!(outcome.is_success(), "{outcome:?}");
     assert_eq!(awaiting(&store), 1);
     assert_eq!(distinct_runs(&queue), 0);
-    let stored = references
-        .get("acct-teams", "19:conv1")
+    // Read out of the daemon's own state, not the adapter's: the acceptance
+    // path is what commits the address, and it commits it there.
+    let stored = store
+        .channel_conversation_ref("acct-teams", "19:conv1")
+        .expect("read")
         .expect("the verified activity's reply address is durable");
     assert_eq!(
         stored.get("service_url").and_then(|v| v.as_str()),
@@ -1127,6 +1193,250 @@ async fn a_teams_reply_address_survives_a_real_restart_through_the_production_st
     assert!(
         activity_request.starts_with("POST /v3/conversations/19:conv1/activities/activity-1"),
         "addressed from the row the first adapter wrote: {activity_request}"
+    );
+}
+
+/// The invariant the acknowledgement rests on: a Teams message is accepted
+/// with its reply address or not at all.
+///
+/// The address is the only thing that makes an answer possible, the Bot
+/// Framework will not redeliver a delivery it saw succeed, and there is no
+/// later moment that can repair it. So a failure to commit it costs the
+/// acknowledgement — and, critically, leaves no event either, because an
+/// unanswerable accepted message is the exact state this exists to prevent.
+#[tokio::test]
+async fn a_teams_activity_whose_reply_address_is_lost_is_never_acknowledged() {
+    let (paths, mut store) = restartable_store("acct-teams", ChannelKind::Teams);
+    let adapter = teams_adapter(
+        "acct-teams",
+        Arc::new(DaemonConversationReferences::at(paths.clone())),
+    );
+
+    super::fail_points::arm(super::fail_points::FailPoint::BeforeAddressingCommit);
+    let outcome = deliver(
+        &mut store,
+        &adapter,
+        &teams_authorization(),
+        &teams_body("activity-1"),
+    );
+
+    assert!(super::fail_points::fired());
+    assert_eq!(
+        outcome,
+        DeliveryOutcome::NotAccepted,
+        "the Bot Framework must be left to redeliver: {outcome:?}"
+    );
+    assert_eq!(
+        inbound_events(&store, "acct-teams"),
+        0,
+        "an event without its reply address is a message nobody can ever answer"
+    );
+    assert_eq!(awaiting(&store), 0);
+    assert!(
+        store
+            .channel_conversation_ref("acct-teams", "19:conv1")
+            .expect("read")
+            .is_none(),
+        "nothing landed"
+    );
+
+    // The redelivery the provider sends instead, which finds a clean daemon.
+    let outcome = deliver(
+        &mut store,
+        &adapter,
+        &teams_authorization(),
+        &teams_body("activity-1"),
+    );
+    assert!(outcome.is_success(), "{outcome:?}");
+    assert_eq!(inbound_events(&store, "acct-teams"), 1);
+    assert!(store
+        .channel_conversation_ref("acct-teams", "19:conv1")
+        .expect("read")
+        .is_some());
+}
+
+/// Every way a Teams delivery can fail authentication, and the same answer to
+/// all of them: no event, and no reply address.
+///
+/// The address matters as much as the event here. It is where this process
+/// would POST the operator's own bot token, so a delivery that did not
+/// authenticate must not be able to write one — not even as a leftover of a
+/// refusal that happened later in the same pass.
+#[tokio::test]
+async fn no_refused_teams_activity_records_an_event_or_a_reply_address() {
+    use super::adapters::teams::tests as fixtures;
+
+    let signed_with = |claims: &JsonValue, key: &str| {
+        publish_teams_key();
+        vec![(
+            "authorization".to_string(),
+            format!(
+                "Bearer {}",
+                fixtures::sign_test_jwt(claims, fixtures::ROUTE_KID, key)
+            ),
+        )]
+    };
+    let good = fixtures::long_lived_claims(fixtures::TEST_SERVICE_URL);
+    let with = |key: &str, value: JsonValue| {
+        let mut claims = good.clone();
+        claims[key] = value;
+        claims
+    };
+
+    let cases: Vec<(&str, Vec<(String, String)>, Vec<u8>)> = vec![
+        (
+            "no authorization at all",
+            Vec::new(),
+            teams_body("activity-1"),
+        ),
+        (
+            "a token signed by the wrong key",
+            signed_with(&good, fixtures::TEST_WRONG_PRIVATE_KEY_PEM),
+            teams_body("activity-1"),
+        ),
+        (
+            "another app's audience",
+            signed_with(
+                &with("aud", JsonValue::from("some-other-app")),
+                fixtures::TEST_PRIVATE_KEY_PEM,
+            ),
+            teams_body("activity-1"),
+        ),
+        (
+            "an issuer that is not the Bot Framework",
+            signed_with(
+                &with("iss", JsonValue::from("https://evil.example")),
+                fixtures::TEST_PRIVATE_KEY_PEM,
+            ),
+            teams_body("activity-1"),
+        ),
+        (
+            "a token that expired long ago",
+            signed_with(
+                &with("exp", JsonValue::from(1_500_000_100i64)),
+                fixtures::TEST_PRIVATE_KEY_PEM,
+            ),
+            teams_body("activity-1"),
+        ),
+        (
+            "a token that is not valid yet",
+            signed_with(
+                &with("nbf", JsonValue::from(4_000_000_000i64)),
+                fixtures::TEST_PRIVATE_KEY_PEM,
+            ),
+            teams_body("activity-1"),
+        ),
+        (
+            "a serviceUrl the token does not vouch for",
+            teams_authorization_for("https://smba.trafficmanager.net/emea/"),
+            teams_body("activity-1"),
+        ),
+        ("another Bot Framework channel", teams_authorization(), {
+            let mut activity: JsonValue =
+                serde_json::from_slice(&teams_body("activity-1")).expect("fixture");
+            activity["channelId"] = JsonValue::from("directline");
+            activity.to_string().into_bytes()
+        }),
+    ];
+
+    for (label, headers, body) in cases {
+        let (paths, mut store) = restartable_store("acct-teams", ChannelKind::Teams);
+        let adapter = teams_adapter(
+            "acct-teams",
+            Arc::new(DaemonConversationReferences::at(paths.clone())),
+        );
+
+        let outcome = deliver(&mut store, &adapter, &headers, &body);
+
+        assert_eq!(outcome, DeliveryOutcome::Rejected, "{label}");
+        assert_eq!(inbound_events(&store, "acct-teams"), 0, "{label}");
+        assert!(
+            store
+                .channel_conversation_ref("acct-teams", "19:conv1")
+                .expect("read")
+                .is_none(),
+            "{label}: an unauthenticated request planted a reply address"
+        );
+    }
+}
+
+/// A key the Bot Framework has not endorsed for Teams cannot sign a Teams
+/// activity, and the delivery leaves nothing behind.
+///
+/// Separate from the table above because it is the *key* that is wrong rather
+/// than the token, which takes a differently-published JWKS.
+#[tokio::test]
+async fn a_teams_activity_signed_by_a_key_not_endorsed_for_teams_records_nothing() {
+    use super::adapters::teams::tests as fixtures;
+
+    for endorsements in [&[][..], &["skype"][..]] {
+        let (paths, mut store) = restartable_store("acct-teams", ChannelKind::Teams);
+        let adapter = teams_adapter(
+            "acct-teams",
+            Arc::new(DaemonConversationReferences::at(paths.clone())),
+        );
+        adapter.seed_jwks_endorsing_for_test(endorsements);
+        let jwt = fixtures::sign_test_jwt(
+            &fixtures::long_lived_claims(fixtures::TEST_SERVICE_URL),
+            "test-key-1",
+            fixtures::TEST_PRIVATE_KEY_PEM,
+        );
+
+        let outcome = deliver(
+            &mut store,
+            &adapter,
+            &[("authorization".to_string(), format!("Bearer {jwt}"))],
+            &teams_body("activity-1"),
+        );
+
+        assert_eq!(outcome, DeliveryOutcome::Rejected, "{endorsements:?}");
+        assert_eq!(inbound_events(&store, "acct-teams"), 0, "{endorsements:?}");
+        assert!(
+            store
+                .channel_conversation_ref("acct-teams", "19:conv1")
+                .expect("read")
+                .is_none(),
+            "{endorsements:?}"
+        );
+    }
+}
+
+/// The acknowledged-then-restarted case, for the provider whose acceptance
+/// also has an address to commit.
+#[tokio::test]
+async fn teams_finishes_an_acknowledged_activity_after_a_restart() {
+    let (paths, mut store) = restartable_store("acct-teams", ChannelKind::Teams);
+    let queue = FakeQueue::default();
+    let adapter = teams_adapter(
+        "acct-teams",
+        Arc::new(DaemonConversationReferences::at(paths.clone())),
+    );
+
+    assert!(deliver(
+        &mut store,
+        &adapter,
+        &teams_authorization(),
+        &teams_body("activity-1")
+    )
+    .is_success());
+    // Everything the receiving process held is gone before any work was done.
+    drop(store);
+    drop(adapter);
+
+    let mut store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(
+        awaiting(&store),
+        1,
+        "the acknowledged activity is still owed"
+    );
+    process(&mut store, &queue).await;
+    assert_one_of_everything(&store, &queue, "acct-teams");
+    assert!(
+        store
+            .channel_conversation_ref("acct-teams", "19:conv1")
+            .expect("read")
+            .is_some(),
+        "and it can still be answered"
     );
 }
 
@@ -1503,6 +1813,404 @@ async fn google_chat_sends_the_same_request_id_on_every_attempt() {
 }
 
 // ---------------------------------------------------------------------------
+// Nothing that authorizes anything, anywhere an operator can read
+// ---------------------------------------------------------------------------
+
+/// Everything one account's delivery left behind that a person or the desktop
+/// app can go and look at.
+///
+/// Deliberately one string rather than a structured walk: the question is not
+/// "is field X clean", it is "did any of this end up somewhere it can be read
+/// back", and a new column added later is caught by this without anybody
+/// remembering to add it here.
+fn readable_durable_state(store: &DaemonStore, account_id: &str) -> String {
+    let mut seen = String::new();
+    for event in store
+        .recent_channel_events(account_id, 100)
+        .expect("the activity list")
+    {
+        seen.push_str(&format!("{event:?}"));
+    }
+    if let Ok(Some(account)) = store.channel_account(account_id) {
+        seen.push_str(&format!(
+            "{:?}{:?}{}",
+            account.health, account.access_policy, account.non_secret_config
+        ));
+    }
+    if let Ok(Some(reference)) = store.channel_conversation_ref(account_id, "19:conv1") {
+        seen.push_str(&reference.to_string());
+    }
+    for turn in store.recent_ingress_turns(50).expect("the accepted turns") {
+        seen.push_str(&format!("{turn:?}"));
+    }
+    seen
+}
+
+/// Nothing in `secrets` may be readable, and `marker` must be — otherwise the
+/// sweep found nothing at all and would pass on an empty database.
+fn assert_nothing_readable_leaks(
+    store: &DaemonStore,
+    account_id: &str,
+    marker: &str,
+    secrets: &[&str],
+) {
+    let seen = readable_durable_state(store, account_id);
+    assert!(
+        seen.contains(marker),
+        "{account_id}: the delivery left nothing to inspect, so this proves nothing"
+    );
+    for secret in secrets {
+        assert!(!seen.contains(secret), "{account_id} leaked '{secret}'");
+    }
+}
+
+/// The operator's own credentials, and the token that authenticated the
+/// delivery, must not survive anywhere that is read back.
+///
+/// Every one of these arrives on the inbound path and is needed there. What
+/// this asserts is that none of them is written into the durable event, the
+/// account's health, the activity list, the accepted turn or the
+/// reply-address row — the five places a support conversation, a screenshot or
+/// the desktop app would surface.
+#[tokio::test]
+async fn no_provider_credential_survives_into_anything_readable() {
+    // WhatsApp: app secret, user access token, operator-chosen verify token.
+    {
+        let (paths, store) = route_world(
+            "acct-wa",
+            ChannelKind::WhatsApp,
+            whatsapp_config(),
+            whatsapp_secret(),
+        );
+        drop(store);
+        let body = whatsapp_body("wamid.SECRETS");
+        let headers = whatsapp_signature(&body);
+        let signature = headers[0].1.clone();
+        assert_eq!(
+            test_route::post(&paths, "/v1/channels/acct-wa", &headers, &body)
+                .await
+                .status,
+            200
+        );
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        process(&mut store, &FakeQueue::default()).await;
+        assert_nothing_readable_leaks(
+            &store,
+            "acct-wa",
+            "wamid.SECRETS",
+            &[WA_APP_SECRET, WA_ACCESS_TOKEN, WA_VERIFY_TOKEN, &signature],
+        );
+    }
+
+    // LINE: channel secret, channel access token, and the reply token, which
+    // is a credential to answer as this bot and is never stored at all.
+    {
+        let (paths, store) = route_world(
+            "acct-line",
+            ChannelKind::Line,
+            serde_json::json!({}),
+            line_secret(),
+        );
+        drop(store);
+        let body = line_body("01SECRETS", false);
+        let headers = line_signature(&body);
+        let signature = headers[0].1.clone();
+        assert_eq!(
+            test_route::post(&paths, "/v1/channels/acct-line", &headers, &body)
+                .await
+                .status,
+            200
+        );
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        process(&mut store, &FakeQueue::default()).await;
+        assert_nothing_readable_leaks(
+            &store,
+            "acct-line",
+            "01SECRETS",
+            &[LINE_SECRET, LINE_TOKEN, "reply-token-1", &signature],
+        );
+    }
+
+    // Teams: the app password, and the inbound JWT itself.
+    {
+        let (paths, store) = route_world(
+            "acct-teams",
+            ChannelKind::Teams,
+            teams_config(),
+            teams_secret(),
+        );
+        drop(store);
+        let headers = teams_authorization();
+        let token = headers[0].1.clone();
+        assert_eq!(
+            test_route::post(
+                &paths,
+                "/v1/channels/acct-teams",
+                &headers,
+                &teams_body("activity-secrets"),
+            )
+            .await
+            .status,
+            200
+        );
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        process(&mut store, &FakeQueue::default()).await;
+        assert_nothing_readable_leaks(
+            &store,
+            "acct-teams",
+            "activity-secrets",
+            &["pw-value", "app_password", &token, "Bearer"],
+        );
+    }
+
+    // Google Chat: the service account's private key, and the inbound JWT.
+    {
+        let (paths, store) = route_world(
+            "acct-gchat",
+            ChannelKind::GoogleChat,
+            google_chat_config(),
+            google_chat_secret(),
+        );
+        drop(store);
+        let headers = google_chat_authorization();
+        let token = headers[0].1.clone();
+        assert_eq!(
+            test_route::post(
+                &paths,
+                "/v1/channels/acct-gchat",
+                &headers,
+                &google_chat_body("spaces/AAAA/messages/SECRETS"),
+            )
+            .await
+            .status,
+            200
+        );
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        process(&mut store, &FakeQueue::default()).await;
+        let key_body = super::adapters::google_chat::tests::TEST_PRIVATE_KEY_PEM
+            .lines()
+            .nth(1)
+            .expect("a line of the key")
+            .to_string();
+        assert_nothing_readable_leaks(
+            &store,
+            "acct-gchat",
+            "spaces/AAAA/messages/SECRETS",
+            &["BEGIN PRIVATE KEY", "private_key", &key_body, &token],
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What each provider is actually told, on the wire
+// ---------------------------------------------------------------------------
+//
+// `DeliveryOutcome::is_success` is this tree's own idea of "finished with".
+// What decides whether a provider redelivers is the status line and body it
+// reads, so these tests assert on those, through the production route, for
+// every provider and for all three answers it can give.
+
+/// One provider's whole answer set: valid, redelivered, and unauthenticated.
+struct RouteExpectation {
+    label: &'static str,
+    status: u16,
+    content_type: Option<&'static str>,
+    body: &'static str,
+}
+
+fn assert_route_answer(
+    response: &test_route::RouteResponse,
+    expected: &RouteExpectation,
+    case: &str,
+) {
+    assert_eq!(
+        response.status, expected.status,
+        "{}: {case} must answer {}: {response:?}",
+        expected.label, expected.status
+    );
+    if let Some(content_type) = expected.content_type {
+        assert_eq!(
+            response.content_type.as_deref(),
+            Some(content_type),
+            "{}: {case}",
+            expected.label
+        );
+    }
+    assert_eq!(response.body, expected.body, "{}: {case}", expected.label);
+}
+
+#[tokio::test]
+async fn whatsapp_answers_every_delivery_exactly_as_meta_requires() {
+    let expected = RouteExpectation {
+        label: "whatsapp",
+        status: 200,
+        // Meta reads the status and ignores the body, and treats anything
+        // else as a delivery to repeat.
+        content_type: Some("text/plain; charset=utf-8"),
+        body: "",
+    };
+    let (paths, store) = route_world(
+        "acct-wa",
+        ChannelKind::WhatsApp,
+        whatsapp_config(),
+        whatsapp_secret(),
+    );
+    drop(store);
+    let body = whatsapp_body("wamid.ROUTE1");
+    let headers = whatsapp_signature(&body);
+
+    let first = test_route::post(&paths, "/v1/channels/acct-wa", &headers, &body).await;
+    assert_route_answer(&first, &expected, "a new message");
+    let again = test_route::post(&paths, "/v1/channels/acct-wa", &headers, &body).await;
+    assert_route_answer(&again, &expected, "a redelivery");
+
+    let forged = vec![(
+        "x-hub-signature-256".to_string(),
+        "sha256=00000000".to_string(),
+    )];
+    let refused = test_route::post(&paths, "/v1/channels/acct-wa", &forged, &body).await;
+    assert!(
+        !(200..300).contains(&refused.status),
+        "a forged signature must not read as success: {refused:?}"
+    );
+
+    // One event, whichever answer came back — the duplicate collapsed.
+    let store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(inbound_events(&store, "acct-wa"), 1);
+}
+
+#[tokio::test]
+async fn line_answers_every_delivery_exactly_as_line_requires() {
+    let expected = RouteExpectation {
+        label: "line",
+        status: 200,
+        content_type: None,
+        body: "",
+    };
+    let (paths, store) = route_world(
+        "acct-line",
+        ChannelKind::Line,
+        serde_json::json!({}),
+        line_secret(),
+    );
+    drop(store);
+    let body = line_body("01ROUTE", false);
+    let headers = line_signature(&body);
+
+    let first = test_route::post(&paths, "/v1/channels/acct-line", &headers, &body).await;
+    assert_route_answer(&first, &expected, "a new message");
+    let again = test_route::post(&paths, "/v1/channels/acct-line", &headers, &body).await;
+    assert_route_answer(&again, &expected, "a redelivery");
+
+    // LINE's own webhook verification posts a signed body carrying no events
+    // at all, and will not enable the endpoint unless it answers 200.
+    let empty = serde_json::json!({ "destination": "Ubot", "events": [] })
+        .to_string()
+        .into_bytes();
+    let verification = test_route::post(
+        &paths,
+        "/v1/channels/acct-line",
+        &line_signature(&empty),
+        &empty,
+    )
+    .await;
+    assert_route_answer(&verification, &expected, "an events-less verification body");
+
+    let forged = vec![(
+        "x-line-signature".to_string(),
+        "bm90LWEtc2lnbmF0dXJl".to_string(),
+    )];
+    let refused = test_route::post(&paths, "/v1/channels/acct-line", &forged, &body).await;
+    assert!(
+        !(200..300).contains(&refused.status),
+        "a forged signature must not read as success: {refused:?}"
+    );
+
+    let store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(inbound_events(&store, "acct-line"), 1);
+}
+
+#[tokio::test]
+async fn teams_answers_every_delivery_exactly_as_the_bot_framework_requires() {
+    let expected = RouteExpectation {
+        label: "teams",
+        status: 200,
+        // The connector reads the body as an optional immediate response
+        // activity; an empty object is how a bot that will answer later says
+        // there is nothing to send back now.
+        content_type: Some("application/json"),
+        body: "{}",
+    };
+    let (paths, store) = route_world(
+        "acct-teams",
+        ChannelKind::Teams,
+        teams_config(),
+        teams_secret(),
+    );
+    drop(store);
+    let body = teams_body("activity-route-1");
+    let headers = teams_authorization();
+
+    let first = test_route::post(&paths, "/v1/channels/acct-teams", &headers, &body).await;
+    assert_route_answer(&first, &expected, "a new activity");
+    let again = test_route::post(&paths, "/v1/channels/acct-teams", &headers, &body).await;
+    assert_route_answer(&again, &expected, "a redelivery");
+
+    let forged = vec![("authorization".to_string(), "Bearer not-a-jwt".to_string())];
+    let refused = test_route::post(&paths, "/v1/channels/acct-teams", &forged, &body).await;
+    assert!(
+        !(200..300).contains(&refused.status),
+        "an unverifiable token must not read as success: {refused:?}"
+    );
+
+    let store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(inbound_events(&store, "acct-teams"), 1);
+    assert!(
+        store
+            .channel_conversation_ref("acct-teams", "19:conv1")
+            .expect("read")
+            .is_some(),
+        "the 200 promised an answer, so the address for one is on file"
+    );
+}
+
+#[tokio::test]
+async fn google_chat_answers_every_delivery_exactly_as_chat_requires() {
+    let expected = RouteExpectation {
+        label: "google_chat",
+        status: 200,
+        // Chat reads a 200's body as an optional immediate reply and treats
+        // any other status as a failed delivery.
+        content_type: Some("application/json"),
+        body: "{}",
+    };
+    let (paths, store) = route_world(
+        "acct-gchat",
+        ChannelKind::GoogleChat,
+        google_chat_config(),
+        google_chat_secret(),
+    );
+    drop(store);
+    let body = google_chat_body("spaces/AAAA/messages/ROUTE1");
+    let headers = google_chat_authorization();
+
+    let first = test_route::post(&paths, "/v1/channels/acct-gchat", &headers, &body).await;
+    assert_route_answer(&first, &expected, "a new message");
+    let again = test_route::post(&paths, "/v1/channels/acct-gchat", &headers, &body).await;
+    assert_route_answer(&again, &expected, "a redelivery");
+
+    let forged = vec![("authorization".to_string(), "Bearer not-a-jwt".to_string())];
+    let refused = test_route::post(&paths, "/v1/channels/acct-gchat", &forged, &body).await;
+    assert!(
+        !(200..300).contains(&refused.status),
+        "an unverifiable token must not read as success: {refused:?}"
+    );
+
+    let store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(inbound_events(&store, "acct-gchat"), 1);
+}
+
+// ---------------------------------------------------------------------------
 // The boundary itself, provider by provider
 // ---------------------------------------------------------------------------
 
@@ -1700,6 +2408,62 @@ async fn an_ambiguous_send_parks_the_outbox_row_instead_of_retrying_it() {
         .claim_outbox_batch(NOW + 60 * 60 * 1000, 10)
         .expect("claim")
         .is_empty());
+}
+
+/// A parked row stays parked across a restart.
+///
+/// "Needs reconciliation" is a decision about a message that may already be
+/// with the recipient, and a fresh process has no more information than the
+/// one that parked it. A restart that quietly re-armed the row would turn
+/// every ambiguous send into a duplicate answer on the next daemon start.
+#[tokio::test]
+async fn a_row_needing_reconciliation_is_not_rearmed_by_a_restart() {
+    let (paths, mut store) = restartable_store("acct-wa", ChannelKind::WhatsApp);
+    let queue = FakeQueue::default();
+    let adapter = whatsapp_adapter("acct-wa");
+    let body = whatsapp_body("wamid.NEW");
+
+    assert!(deliver(&mut store, &adapter, &whatsapp_signature(&body), &body).is_success());
+    process(&mut store, &queue).await;
+    let job_id = store.recent_ingress_turns(1).unwrap()[0]
+        .job_id
+        .clone()
+        .expect("queued");
+    queue_reply_for_job(&mut store, &job_id, "on it");
+
+    // The bytes left, and the far end went away before answering.
+    let hangup = super::channel_adapter::test_http::accept_then_hangup();
+    let outbound: Arc<dyn ChannelAdapter> =
+        Arc::new(whatsapp_adapter("acct-wa").with_base_url(&hangup));
+    let report = drain_outbox_once(&mut store, &adapters_map("acct-wa", outbound), NOW)
+        .await
+        .expect("drain");
+    assert_eq!(report.needs_reconciliation, 1, "{report:?}");
+
+    // The restart. Nothing about a new process makes the outcome any clearer.
+    drop(store);
+    let mut store = DaemonStore::open(&paths).expect("reopen");
+    assert!(
+        store
+            .claim_outbox_batch(NOW + 24 * 60 * 60 * 1000, 10)
+            .expect("claim")
+            .is_empty(),
+        "a parked row was re-armed by a restart"
+    );
+    let (unused, requests) = super::channel_adapter::test_http::serve(vec![(
+        200,
+        r#"{"messages":[{"id":"wamid.OUT-DUPLICATE"}]}"#.to_string(),
+    )]);
+    let outbound: Arc<dyn ChannelAdapter> =
+        Arc::new(whatsapp_adapter("acct-wa").with_base_url(&unused));
+    let report = drain_outbox_once(&mut store, &adapters_map("acct-wa", outbound), NOW + 1)
+        .await
+        .expect("drain");
+    assert_eq!(report.sent, 0, "{report:?}");
+    assert!(
+        requests.try_recv().is_err(),
+        "the message was sent a second time"
+    );
 }
 
 /// Every provider, both directions of the ambiguity question.

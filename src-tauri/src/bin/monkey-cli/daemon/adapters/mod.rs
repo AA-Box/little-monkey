@@ -151,12 +151,12 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         required("app_id", ConfigFieldKind::Text),
         required("tenant_id", ConfigFieldKind::Text),
     ];
-    // `project_number` is required by the default authentication audience and
-    // unused by the other, so which one is missing is the adapter's to say —
-    // it is the half that has to agree with Google's console.
+    // No audience key: Google Chat's Authentication Audience has two values,
+    // only the Project Number one issues the self-signed Chat service-account
+    // token this build verifies, and the other needs a genuinely separate OIDC
+    // verifier that does not exist here — see `google_chat`'s module doc.
     const GOOGLE_CHAT: &[ConfigField] = &[
-        optional("project_number", ConfigFieldKind::Text),
-        optional("auth_audience", ConfigFieldKind::Text),
+        required("project_number", ConfigFieldKind::Text),
         optional("bot_user_name", ConfigFieldKind::Text),
     ];
     const SMS: &[ConfigField] = &[

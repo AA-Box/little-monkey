@@ -419,6 +419,20 @@ impl WebhookAck {
     }
 }
 
+/// Where one conversation's replies go, as an authenticated delivery
+/// established it.
+///
+/// Addressing only — see `channel_conversation_refs`' own doc for what may and
+/// may not be in `reference`. It is produced by a verifier and consumed by the
+/// acceptance path, which is why it is a value rather than a write: a provider
+/// that cannot be answered must not be told its message was taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAddressing {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub reference: serde_json::Value,
+}
+
 /// Providers that are delivered to rather than polled.
 ///
 /// Signature verification happens here, over the exact bytes received, because
@@ -449,6 +463,22 @@ pub trait WebhookChannelAdapter: Send + Sync {
         public_base_url: Option<&str>,
         now_ms: i64,
     ) -> Result<Vec<ChannelEnvelope>, String>;
+
+    /// Addressing this delivery established that MUST be durable before the
+    /// provider is told "yes", drained by the acceptance path so it is
+    /// committed *with* the event rather than beside it.
+    ///
+    /// Filled by [`Self::verify_and_normalize`], which is the only thing that
+    /// can produce it: the values are only trustworthy once the delivery has
+    /// authenticated, and for Teams only once the token's own `serviceurl`
+    /// claim has been bound to the activity's. Draining is what keeps one
+    /// delivery's addressing from leaking into the next.
+    ///
+    /// An adapter whose replies are addressable from a conversation id alone
+    /// returns nothing, which is every provider but Teams.
+    fn take_durable_addressing(&self) -> Vec<DurableAddressing> {
+        Vec::new()
+    }
 
     /// Delivery progress this same body reports for messages already sent.
     ///

@@ -18,6 +18,12 @@
 /// point has happened, nothing after it has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailPoint {
+    /// Inside webhook acceptance, at the moment the reply address a verified
+    /// delivery established would be committed — the delivery authenticated,
+    /// the address exists, and it does not land. The point of naming it is
+    /// that nothing after it may happen either: an event committed here would
+    /// be a message this build acknowledged and can never answer.
+    BeforeAddressingCommit,
     /// Inside the acceptance transaction, after the provider event is inserted
     /// and before the accepted turn is. The window the old two-transaction
     /// design left open, and the one a rollback has to close.
@@ -41,6 +47,7 @@ impl FailPoint {
     #[cfg(test)]
     fn as_str(self) -> &'static str {
         match self {
+            FailPoint::BeforeAddressingCommit => "before the reply address was committed",
             FailPoint::AfterEventInsert => "after the provider event was recorded",
             FailPoint::BeforeAcceptCommit => "before the acceptance was committed",
             FailPoint::AfterAttachmentHydration => "after the attachments were stored",
