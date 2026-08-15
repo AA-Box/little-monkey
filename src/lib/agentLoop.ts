@@ -1657,6 +1657,12 @@ export async function runAgentTurn(
     chatTurnProcesses.delete(turnId);
     forgetPause(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    // Badge the sidebar row for a session the user has navigated away from.
+    // A cancelled turn records nothing: the user pressed Stop, so there is
+    // no outcome to go back and look at.
+    if (!controller.signal.aborted) {
+      useSessionStore.getState().noteTurnOutcome(sessionId, turnError ? 'error' : 'done');
+    }
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
     if (processId) {
