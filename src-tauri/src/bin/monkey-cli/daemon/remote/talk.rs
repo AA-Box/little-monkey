@@ -355,7 +355,8 @@ pub async fn run_talk_session(
         greeted: false,
         revoked: false,
         interrupting_utterance_complete: false,
-        pending_device_latency: DeviceLatency::default(),
+        utterance_first_audio_sequence: None,
+        pending_device_latency: None,
     };
     if session
         .emit(socket, TalkServerFrameKind::Ready)
@@ -374,11 +375,38 @@ pub async fn run_talk_session(
         )
         .await;
 
-    while let Some(raw) = socket.recv().await {
+    // A grant is withdrawn by an operator, and a listening device has no reason
+    // to send anything at all while it waits to be spoken to. Waiting on
+    // `recv()` alone would mean a revoked microphone stays open until the next
+    // frame — which for a silent room is until the idle deadline, a quarter of
+    // an hour later. So the wait is on whichever comes first.
+    let mut grant_tick =
+        tokio::time::interval(std::time::Duration::from_millis(GRANT_RECHECK_INTERVAL_MS));
+    grant_tick.tick().await;
+    loop {
+        let raw = tokio::select! {
+            // Frames first: a busy socket is checked on arrival anyway, and a
+            // fair select would let the timer displace a frame that is ready.
+            biased;
+            raw = socket.recv() => match raw {
+                Some(raw) => raw,
+                None => break,
+            },
+            _ = grant_tick.tick() => {
+                if turns.still_granted(&session.identity.device_id) {
+                    continue;
+                }
+                session.report.grant_revoked = true;
+                session.revoked = true;
+                let _ = session.report_revocation(socket).await;
+                break;
+            }
+        };
         // A grant withdrawn between utterances closes the microphone here
         // rather than at the next network failure.
         if !turns.still_granted(&session.identity.device_id) {
             session.report.grant_revoked = true;
+            session.revoked = true;
             let _ = session.report_revocation(socket).await;
             break;
         }
@@ -411,15 +439,22 @@ pub async fn run_talk_session(
             }
             TalkClientFrameKind::State { .. } => {}
             TalkClientFrameKind::Metrics {
+                audio_sequence,
                 speech_detection_ms,
                 capture_ms,
                 upload_ms,
-            } => session.observe_device_latency(speech_detection_ms, capture_ms, upload_ms),
+            } => session.observe_device_latency(
+                audio_sequence,
+                speech_detection_ms,
+                capture_ms,
+                upload_ms,
+            ),
             TalkClientFrameKind::Interrupt { .. } => {
                 // Nothing is playing between turns; an interrupt that arrives
                 // here only clears whatever was half-buffered.
                 session.report.interruptions += 1;
                 session.utterance.clear();
+                session.utterance_first_audio_sequence = None;
                 let _ = session
                     .emit(
                         socket,
@@ -430,10 +465,10 @@ pub async fn run_talk_session(
                     .await;
             }
             TalkClientFrameKind::Audio {
+                audio_sequence,
                 media_type,
                 audio_base64,
                 last,
-                ..
             } => {
                 let Ok(bytes) = STANDARD.decode(&audio_base64) else {
                     session.report.errors += 1;
@@ -451,6 +486,7 @@ pub async fn run_talk_session(
                 };
                 if session.utterance.len() + bytes.len() > MAX_TALK_UTTERANCE_BYTES {
                     session.utterance.clear();
+                    session.utterance_first_audio_sequence = None;
                     session.report.errors += 1;
                     let _ = session
                         .emit(
@@ -463,6 +499,9 @@ pub async fn run_talk_session(
                         )
                         .await;
                     continue;
+                }
+                if session.utterance.is_empty() {
+                    session.utterance_first_audio_sequence = Some(audio_sequence);
                 }
                 session.utterance.extend_from_slice(&bytes);
                 if session.utterance_media_type.is_none() {
@@ -554,7 +593,11 @@ struct Session {
     /// The audio that interrupted an answer arrived complete, so it is already a
     /// whole utterance and must be answered without waiting for another frame.
     interrupting_utterance_complete: bool,
-    pending_device_latency: DeviceLatency,
+    /// The `audio_sequence` the utterance now being assembled began at. It is
+    /// what a metrics frame names, so telemetry is filed against the utterance
+    /// it measured rather than against whichever one happens to be in flight.
+    utterance_first_audio_sequence: Option<u64>,
+    pending_device_latency: Option<(u64, DeviceLatency)>,
 }
 
 impl Session {
@@ -622,7 +665,15 @@ impl Session {
         }
         self.report.utterances += 1;
         self.utterance_index += 1;
-        let device_latency = std::mem::take(&mut self.pending_device_latency);
+        // Only the spans that name *this* utterance. A metrics frame that named
+        // another one is dropped rather than filed here: telemetry attributed to
+        // the wrong turn is worse than telemetry that is missing, because it
+        // still reads as a measurement.
+        let first_audio_sequence = self.utterance_first_audio_sequence.take();
+        let device_latency = match self.pending_device_latency.take() {
+            Some((named, latency)) if Some(named) == first_audio_sequence => latency,
+            _ => DeviceLatency::default(),
+        };
         // The clock the whole turn is measured against. It starts where the
         // device's own spans end, so `end_to_end` means what it says: the first
         // word spoken to the last thing said back.
@@ -756,8 +807,8 @@ impl Session {
             // everything after it can.
             if let Some(raw) = try_recv(socket).await {
                 match self.classify_during_playback(&raw) {
-                    Interjection::Metrics(latency) => {
-                        self.pending_device_latency = latency;
+                    Interjection::Metrics(audio_sequence, latency) => {
+                        self.pending_device_latency = Some((audio_sequence, latency));
                     }
                     Interjection::Interrupt => {
                         self.report.interruptions += 1;
@@ -988,23 +1039,32 @@ impl Session {
                 // and making them say it twice is the whole reason barge-in
                 // feels broken when it is done the other way.
                 TalkClientFrameKind::Audio {
+                    audio_sequence,
                     media_type,
                     audio_base64,
                     last,
-                    ..
                 } => {
-                    self.retain_interrupting_audio(&media_type, &audio_base64, last);
+                    self.retain_interrupting_audio(
+                        audio_sequence,
+                        &media_type,
+                        &audio_base64,
+                        last,
+                    );
                     Interjection::Interrupt
                 }
                 TalkClientFrameKind::Metrics {
+                    audio_sequence,
                     speech_detection_ms,
                     capture_ms,
                     upload_ms,
-                } => Interjection::Metrics(DeviceLatency {
-                    speech_detection_ms,
-                    capture_ms,
-                    upload_ms,
-                }),
+                } => Interjection::Metrics(
+                    audio_sequence,
+                    DeviceLatency {
+                        speech_detection_ms,
+                        capture_ms,
+                        upload_ms,
+                    },
+                ),
                 _ => Interjection::Ignored,
             },
             Err(error) => Interjection::Refused(error),
@@ -1014,12 +1074,21 @@ impl Session {
     /// Hold the audio that interrupted an answer so the next turn starts with
     /// it. A payload that will not decode, or that would push the buffer past
     /// the ceiling, is dropped — the interruption still stands.
-    fn retain_interrupting_audio(&mut self, media_type: &str, audio_base64: &str, last: bool) {
+    fn retain_interrupting_audio(
+        &mut self,
+        audio_sequence: u64,
+        media_type: &str,
+        audio_base64: &str,
+        last: bool,
+    ) {
         let Ok(bytes) = STANDARD.decode(audio_base64) else {
             return;
         };
         if self.utterance.len() + bytes.len() > MAX_TALK_UTTERANCE_BYTES {
             return;
+        }
+        if self.utterance.is_empty() {
+            self.utterance_first_audio_sequence = Some(audio_sequence);
         }
         self.utterance.extend_from_slice(&bytes);
         if self.utterance_media_type.is_none() {
@@ -1052,21 +1121,25 @@ impl Session {
 
     fn observe_device_latency(
         &mut self,
+        audio_sequence: u64,
         speech_detection_ms: Option<u64>,
         capture_ms: Option<u64>,
         upload_ms: Option<u64>,
     ) {
-        self.pending_device_latency = DeviceLatency {
-            speech_detection_ms,
-            capture_ms,
-            upload_ms,
-        };
+        self.pending_device_latency = Some((
+            audio_sequence,
+            DeviceLatency {
+                speech_detection_ms,
+                capture_ms,
+                upload_ms,
+            },
+        ));
     }
 }
 
 enum Interjection {
     Interrupt,
-    Metrics(DeviceLatency),
+    Metrics(u64, DeviceLatency),
     Refused(String),
     Ignored,
 }
@@ -1107,6 +1180,10 @@ mod tests {
     struct ScriptedSocket {
         inbound: VecDeque<String>,
         sent: Arc<Mutex<Vec<TalkServerFrame>>>,
+        /// A phone that has said everything it is going to say and is now simply
+        /// listening: the grant is withdrawn and `recv` never resolves again,
+        /// which is the shape a silent room actually has.
+        revoke_once_idle: Option<Arc<Mutex<bool>>>,
     }
 
     impl ScriptedSocket {
@@ -1114,6 +1191,14 @@ mod tests {
             Self {
                 inbound: inbound.into(),
                 sent: Arc::new(Mutex::new(Vec::new())),
+                revoke_once_idle: None,
+            }
+        }
+
+        fn idling(inbound: Vec<String>, granted: Arc<Mutex<bool>>) -> Self {
+            Self {
+                revoke_once_idle: Some(granted),
+                ..Self::new(inbound)
             }
         }
     }
@@ -1121,7 +1206,16 @@ mod tests {
     #[async_trait]
     impl TalkSocket for ScriptedSocket {
         async fn recv(&mut self) -> Option<String> {
-            self.inbound.pop_front()
+            if let Some(frame) = self.inbound.pop_front() {
+                return Some(frame);
+            }
+            let Some(granted) = self.revoke_once_idle.take() else {
+                return None;
+            };
+            *granted.lock().unwrap() = false;
+            // Not `None`: closing the socket here would end the session for a
+            // reason that has nothing to do with the grant, and prove nothing.
+            std::future::pending().await
         }
 
         async fn send(&mut self, frame: String) -> Result<(), String> {
@@ -1304,6 +1398,24 @@ mod tests {
                 media_type: "audio/webm;codecs=opus".into(),
                 audio_base64: STANDARD.encode(payload),
                 last,
+            },
+        )
+    }
+
+    fn metrics(
+        identity: &TalkIdentity,
+        sequence: u64,
+        audio_sequence: u64,
+        capture_ms: u64,
+    ) -> String {
+        client_frame(
+            identity,
+            sequence,
+            TalkClientFrameKind::Metrics {
+                audio_sequence,
+                speech_detection_ms: None,
+                capture_ms: Some(capture_ms),
+                upload_ms: None,
             },
         )
     }
@@ -1638,6 +1750,107 @@ mod tests {
         );
     }
 
+    /// A revoked microphone closes on its own clock.
+    ///
+    /// The device has nothing to send while it is listening, so a session that
+    /// only checked the grant when a frame arrived would hold an open microphone
+    /// on a withdrawn grant until the idle deadline — a quarter of an hour of
+    /// capture nobody authorised. The socket here never resolves another frame,
+    /// so nothing but the grant timer can end this test.
+    #[tokio::test]
+    async fn a_listening_socket_closes_when_the_grant_goes_away_without_a_frame() {
+        let identity = identity();
+        let turns = FakeTurns::answering(&[]);
+        let mut socket = ScriptedSocket::idling(vec![hello(&identity)], turns.granted.clone());
+        let sent = socket.sent.clone();
+        let speech = FakeSpeech::new("nothing was said");
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert!(
+            report.grant_revoked,
+            "the session ends because the grant went away, not because the socket did"
+        );
+        assert_eq!(report.utterances, 0);
+        let frames = sent.lock().unwrap().clone();
+        assert!(
+            frames.iter().any(|frame| matches!(
+                &frame.kind,
+                TalkServerFrameKind::Error { code, .. } if code == "capability_revoked"
+            )),
+            "the device is told why its microphone closed"
+        );
+        assert_eq!(states(&frames).last(), Some(&TalkState::Idle));
+    }
+
+    /// An utterance far past one frame's ceiling still becomes one turn.
+    ///
+    /// Ninety seconds is what the detector allows and what the client advertises;
+    /// at any ordinary bitrate that is more than a single audio frame may carry,
+    /// so the frames have to reassemble into exactly the bytes that were spoken.
+    #[tokio::test]
+    async fn an_utterance_larger_than_one_frame_is_reassembled_byte_for_byte() {
+        let identity = identity();
+        // Deliberately not a multiple of the chunk size: the last frame is a
+        // remainder in every real recording.
+        let spoken: Vec<u8> = (0..700_000u32).map(|at| (at % 251) as u8).collect();
+        let (head, tail) = spoken.split_at(MAX_TALK_AUDIO_BYTES);
+        assert!(tail.len() < MAX_TALK_AUDIO_BYTES);
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio(&identity, 2, 1, head, false),
+            audio(&identity, 3, 2, tail, true),
+        ]);
+        let speech = FakeSpeech::new("a very long question");
+        let turns = FakeTurns::answering(&["Answered."]);
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert_eq!(report.utterances, 1);
+        assert_eq!(report.turns_submitted, 1);
+        assert_eq!(
+            speech.transcribed.lock().unwrap().as_slice(),
+            [spoken],
+            "one transcription request, carrying every byte in the order it was spoken"
+        );
+        assert_eq!(report.errors, 0);
+    }
+
+    /// Telemetry belongs to the utterance that measured it.
+    ///
+    /// The device names that utterance, so spans cannot slide onto the next turn
+    /// — and spans naming an utterance this session never assembled are dropped
+    /// rather than filed, because a measurement of the wrong thing still reads
+    /// as a measurement.
+    #[tokio::test]
+    async fn device_metrics_are_filed_against_the_utterance_that_named_them() {
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            metrics(&identity, 2, 1, 1_111),
+            audio(&identity, 3, 1, b"first", true),
+            metrics(&identity, 4, 2, 2_222),
+            audio(&identity, 5, 2, b"second", true),
+            metrics(&identity, 6, 99, 3_333),
+            audio(&identity, 7, 3, b"third", true),
+        ]);
+        let speech = FakeSpeech::new("a question");
+        let turns = FakeTurns::answering(&["Answered."]);
+
+        let report = run_talk_session(&mut socket, &speech, &turns, identity).await;
+
+        assert_eq!(report.utterances, 3);
+        assert_eq!(
+            report.latency.capture.samples, 2,
+            "the third utterance's spans named an utterance that was never assembled"
+        );
+        assert_eq!(report.latency.capture.worst_ms, 2_222);
+        assert!(
+            report.latency.end_to_end.worst_ms >= 2_222,
+            "the device's own spans are still the head of the end-to-end measurement"
+        );
+    }
+
     /// Telemetry the device sends is folded into the session's counters, and
     /// there is nowhere in the shape for a word of it to hide.
     #[tokio::test]
@@ -1649,6 +1862,7 @@ mod tests {
                 &identity,
                 2,
                 TalkClientFrameKind::Metrics {
+                    audio_sequence: 1,
                     speech_detection_ms: Some(180),
                     capture_ms: Some(1_200),
                     upload_ms: Some(40),

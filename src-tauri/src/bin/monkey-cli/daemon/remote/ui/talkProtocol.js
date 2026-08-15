@@ -47,14 +47,28 @@ const TALK_NOISE_FLOOR_MAX = 0.08;
 const TALK_FLOOR_THRESHOLD = 0.012;
 const TALK_THRESHOLD_FACTOR = 2.8;
 
-// `MAX_TALK_AUDIO_BYTES` (512 KiB) expressed in base64 characters, plus the
-// runner's ceiling on a telemetry span. Both are checked here rather than after
-// the socket has already refused the frame, because that refusal is not
-// retryable and ends the conversation.
-export const MAX_TALK_AUDIO_BASE64_CHARS = 699_052;
+// `MAX_TALK_AUDIO_BYTES` in `protocol.rs`, and how much base64 may carry it.
+// One audio frame is checked here rather than after the socket has already
+// refused it, because that refusal is not retryable and ends the conversation.
+//
+// The chunk size is a multiple of 4, so every slice but the last is standard
+// base64 needing no padding and decoding to whole bytes — the runner decodes
+// each frame on its own and concatenates the results, so a slice at any other
+// offset would corrupt the utterance. It rounds *down* from 512 KiB rather than
+// up: 699_052 characters would decode to 524_289 bytes, one past the ceiling.
+export const MAX_TALK_AUDIO_BYTES = 524_288;
+export const TALK_AUDIO_CHUNK_BASE64_CHARS = Math.floor(MAX_TALK_AUDIO_BYTES / 3) * 4;
 export const MAX_TALK_LATENCY_MS = 600_000;
 
-/** Normalizes whatever a recorder reports into a container the runner accepts. */
+/**
+ * Normalizes whatever a recorder reports into a container the runner accepts,
+ * or `""` when it is none of them.
+ *
+ * Deliberately not a fallback: bytes in an unknown container relabelled as WebM
+ * are still not WebM, and the transcriber would be handed a file whose header
+ * contradicts its media type. Better to refuse the session with a sentence
+ * naming the container than to send mislabelled audio somewhere.
+ */
 export function normalizeTalkMediaType(recorded) {
   const value = String(recorded || "").replace(/\s+/gu, "");
   if (TALK_MEDIA_TYPES.includes(value)) return value;
@@ -63,7 +77,23 @@ export function normalizeTalkMediaType(recorded) {
   for (const family of ["audio/webm", "audio/ogg", "audio/mp4", "audio/wav", "audio/mpeg"]) {
     if (value.startsWith(family)) return family;
   }
-  return "audio/webm";
+  return "";
+}
+
+/**
+ * The audio frames one utterance is sent as.
+ *
+ * A 90-second recording is well past what a single frame may carry, so the
+ * payload is cut into frame-sized pieces the runner reassembles in order. The
+ * cut is on the base64, at a multiple of 4, so each piece decodes on its own.
+ */
+export function splitTalkAudioBase64(audioBase64) {
+  const payload = String(audioBase64 || "");
+  const chunks = [];
+  for (let at = 0; at < payload.length; at += TALK_AUDIO_CHUNK_BASE64_CHARS) {
+    chunks.push(payload.slice(at, at + TALK_AUDIO_CHUNK_BASE64_CHARS));
+  }
+  return chunks;
 }
 
 /**
@@ -116,6 +146,9 @@ function boundedSpan(value) {
  */
 export function createTalkFrames({ sessionId, sessionGeneration, mediaType, sampleRateHz, channels }) {
   const media = normalizeTalkMediaType(mediaType);
+  if (!media) {
+    throw new Error(`This browser records in ${String(mediaType || "an unknown container")}, which Talk cannot transcribe`);
+  }
   const rate = clampTalkSampleRateHz(sampleRateHz);
   const channelCount = clampTalkChannels(channels);
   let frameSequence = 0;
@@ -166,8 +199,8 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
       requireGreeted("audio");
       const payload = String(audioBase64 || "");
       if (payload.length === 0) throw new Error("A Talk audio frame carries no audio");
-      if (payload.length > MAX_TALK_AUDIO_BASE64_CHARS) {
-        throw new Error("That utterance is larger than one Talk audio frame may carry");
+      if (payload.length > TALK_AUDIO_CHUNK_BASE64_CHARS) {
+        throw new Error("That audio is larger than one Talk frame may carry — split it first");
       }
       audioSequence += 1;
       return envelope({
@@ -190,12 +223,20 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
     },
     /**
      * Durations, and nothing else. No transcript, no audio, no text of any kind
-     * can reach this frame — the shape is three optional integers and every
-     * other key is dropped before it is built.
+     * can reach this frame — the shape is an utterance number and three optional
+     * integers, and every other key is dropped before it is built.
+     *
+     * `audioSequence` names the utterance these spans measured, and the frame
+     * must go out *before* that utterance's audio: the runner answers the
+     * instant an utterance closes, so metrics sent afterwards arrive too late to
+     * be filed against it and are dropped rather than credited to the next one.
      */
-    metrics({ speechDetectionMs, captureMs, uploadMs } = {}) {
+    metrics({ audioSequence, speechDetectionMs, captureMs, uploadMs } = {}) {
       requireGreeted("metrics");
-      const frame = { type: "metrics" };
+      if (!Number.isInteger(audioSequence) || audioSequence < 1) {
+        throw new Error("Talk metrics must name the utterance they measure");
+      }
+      const frame = { type: "metrics", audio_sequence: audioSequence };
       const spans = {
         speech_detection_ms: boundedSpan(speechDetectionMs),
         capture_ms: boundedSpan(captureMs),

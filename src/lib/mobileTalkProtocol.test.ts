@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 // would be a second copy of the API free to drift from the first, which is the
 // defect class this whole file exists to catch.
 // @ts-expect-error — untyped ES module served verbatim to the mobile client.
-import { MAX_TALK_AUDIO_BASE64_CHARS, TALK_PROTOCOL_VERSION, chooseTalkMediaType, clampTalkChannels, clampTalkSampleRateHz, createTalkDetector, createTalkFrames, normalizeTalkMediaType } from "../../src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js";
+import { MAX_TALK_AUDIO_BYTES, TALK_AUDIO_CHUNK_BASE64_CHARS, TALK_PROTOCOL_VERSION, chooseTalkMediaType, clampTalkChannels, clampTalkSampleRateHz, createTalkDetector, createTalkFrames, normalizeTalkMediaType, splitTalkAudioBase64 } from "../../src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js";
 
 /**
  * The mobile Talk client's wire behaviour, driven rather than read.
@@ -80,24 +80,26 @@ describe("the Talk frame builder", () => {
       channels: 1,
     });
 
-    expect(frames.audio({ audioBase64: "AAECAwQ=", last: true })).toEqual({
+    // The three spans the runner cannot measure, naming the utterance they
+    // measured and sent *before* it: the runner answers the instant an
+    // utterance closes, so metrics behind it arrive too late to belong to it.
+    // Durations only — there is nowhere on this frame for a transcript to hide.
+    expect(frames.metrics({ audioSequence: 1, speechDetectionMs: 184, captureMs: 1_240, uploadMs: 96 })).toEqual({
       ...envelope(2),
+      type: "metrics",
+      audio_sequence: 1,
+      speech_detection_ms: 184,
+      capture_ms: 1_240,
+      upload_ms: 96,
+    });
+
+    expect(frames.audio({ audioBase64: "AAECAwQ=", last: true })).toEqual({
+      ...envelope(3),
       type: "audio",
       audio_sequence: 1,
       media_type: "audio/webm;codecs=opus",
       audio_base64: "AAECAwQ=",
       last: true,
-    });
-
-    // The three spans the runner cannot measure, immediately after the frame
-    // that closed the utterance. Durations only — there is nowhere on this
-    // frame for a transcript to hide.
-    expect(frames.metrics({ speechDetectionMs: 184, captureMs: 1_240, uploadMs: 96 })).toEqual({
-      ...envelope(3),
-      type: "metrics",
-      speech_detection_ms: 184,
-      capture_ms: 1_240,
-      upload_ms: 96,
     });
 
     // Barge-in during the answer.
@@ -124,7 +126,7 @@ describe("the Talk frame builder", () => {
     // answers with a non-retryable `invalid_frame`.
     expect(() => newFrames().audio({ audioBase64: "AAEC" })).toThrow(/before the hello/u);
     expect(() => newFrames().interrupt("barge_in")).toThrow(/before the hello/u);
-    expect(() => newFrames().metrics({ captureMs: 10 })).toThrow(/before the hello/u);
+    expect(() => newFrames().metrics({ audioSequence: 1, captureMs: 10 })).toThrow(/before the hello/u);
 
     const frames = newFrames();
     frames.hello();
@@ -150,8 +152,8 @@ describe("the Talk frame builder", () => {
     const frames = newFrames();
     const sent: number[] = [(frames.hello() as { frame_sequence: number }).frame_sequence];
     for (let utterance = 0; utterance < 25; utterance += 1) {
+      sent.push((frames.metrics({ audioSequence: utterance + 1, captureMs: 500 }) as { frame_sequence: number }).frame_sequence);
       sent.push((frames.audio({ audioBase64: "AAEC", last: true }) as { frame_sequence: number }).frame_sequence);
-      sent.push((frames.metrics({ captureMs: 500 }) as { frame_sequence: number }).frame_sequence);
     }
     expect(sent[0]).toBe(1);
     expect(sent.every((value, index) => index === 0 || value > sent[index - 1])).toBe(true);
@@ -164,21 +166,36 @@ describe("the Talk frame builder", () => {
     // Optional means absent, not null: `deny_unknown_fields` is fine with a
     // missing key and the runner's `Option` handles it, but a null would have
     // to be spelled by the sender and never is.
-    expect(frames.metrics({ captureMs: 1_000 })).toEqual({
+    expect(frames.metrics({ audioSequence: 1, captureMs: 1_000 })).toEqual({
       ...envelope(2),
       type: "metrics",
+      audio_sequence: 1,
       capture_ms: 1_000,
     });
-    expect(frames.metrics({})).toEqual({ ...envelope(3), type: "metrics" });
+    expect(frames.metrics({ audioSequence: 2 })).toEqual({
+      ...envelope(3),
+      type: "metrics",
+      audio_sequence: 2,
+    });
     // The runner caps a span at 600 000 ms; a clock jump must not turn into a
     // refused frame in the middle of a working conversation.
-    expect(frames.metrics({ speechDetectionMs: -5, captureMs: 9_999_999, uploadMs: 12.6 })).toEqual({
+    expect(frames.metrics({ audioSequence: 3, speechDetectionMs: -5, captureMs: 9_999_999, uploadMs: 12.6 })).toEqual({
       ...envelope(4),
       type: "metrics",
+      audio_sequence: 3,
       speech_detection_ms: 0,
       capture_ms: 600_000,
       upload_ms: 13,
     });
+  });
+
+  it("refuses telemetry that does not name the utterance it measured", () => {
+    // Unnamed spans are what let turn 1's capture time be filed against turn 2
+    // for the whole of a conversation, reading as a measurement the entire way.
+    const frames = newFrames();
+    frames.hello();
+    expect(() => frames.metrics({ captureMs: 500 })).toThrow(/name the utterance/u);
+    expect(() => frames.metrics({ audioSequence: 0, captureMs: 500 })).toThrow(/name the utterance/u);
   });
 
   it("omits an interrupt reason rather than sending a null", () => {
@@ -187,14 +204,54 @@ describe("the Talk frame builder", () => {
     expect(frames.interrupt()).toEqual({ ...envelope(2), type: "interrupt" });
   });
 
-  it("refuses an utterance larger than one audio frame may carry", () => {
+  it("refuses an audio payload larger than one frame may carry", () => {
     const frames = newFrames();
     frames.hello();
-    // 512 KiB decoded. The runner refuses this without retry, which ends the
+    // The runner refuses an oversized frame without retry, which ends the
     // conversation — so the client has to notice first.
-    const oversize = "A".repeat(MAX_TALK_AUDIO_BASE64_CHARS + 1);
+    const oversize = "A".repeat(TALK_AUDIO_CHUNK_BASE64_CHARS + 1);
     expect(() => frames.audio({ audioBase64: oversize, last: true })).toThrow(/larger than/u);
     expect(() => frames.audio({ audioBase64: "", last: true })).toThrow(/no audio/u);
+  });
+
+  it("sends a ninety-second utterance as frames instead of refusing it", () => {
+    // The detector allows 90 seconds and the client advertises it. At any
+    // ordinary Opus bitrate that is well past a single frame, so sending the
+    // recording whole meant the longest utterances silently never arrived.
+    const frames = newFrames();
+    frames.hello();
+    // 1.5 MiB of audio: three frames' worth, the last a remainder.
+    const spoken = "A".repeat(Math.ceil((MAX_TALK_AUDIO_BYTES * 3) / 3) * 4 - 300);
+    const chunks = splitTalkAudioBase64(spoken);
+
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join("")).toBe(spoken);
+    // Every cut lands on a 4-character boundary: the runner decodes each frame
+    // on its own before concatenating, and base64 sliced anywhere else decodes
+    // to different bytes than were recorded.
+    for (const chunk of chunks.slice(0, -1)) {
+      expect(chunk.length % 4).toBe(0);
+      expect(chunk.length).toBe(TALK_AUDIO_CHUNK_BASE64_CHARS);
+    }
+
+    const sent: { audio_sequence: number; last: boolean }[] = chunks.map(
+      (chunk: string, at: number) => frames.audio({ audioBase64: chunk, last: at === chunks.length - 1 }),
+    );
+    expect(sent.map((frame) => frame.audio_sequence)).toEqual([1, 2, 3]);
+    expect(sent.map((frame) => frame.last)).toEqual([false, false, true]);
+    // And every frame decodes to no more than the runner's ceiling.
+    for (const chunk of chunks) {
+      expect((chunk.length / 4) * 3).toBeLessThanOrEqual(MAX_TALK_AUDIO_BYTES);
+    }
+  });
+
+  it("refuses a container it cannot honestly label rather than calling it WebM", () => {
+    // Relabelling unknown bytes as WebM hands the transcriber a file whose
+    // header contradicts its media type — a failure that looks like a bad
+    // microphone rather than a bad label.
+    expect(normalizeTalkMediaType("audio/flac")).toBe("");
+    expect(normalizeTalkMediaType("")).toBe("");
+    expect(() => createTalkFrames({ sessionId: "s", sessionGeneration: "g", mediaType: "audio/flac", sampleRateHz: 48_000, channels: 1 })).toThrow(/cannot transcribe/u);
   });
 
   it("keeps the sample rate and channel count inside what the runner accepts", () => {
@@ -245,8 +302,6 @@ describe("choosing a container", () => {
     expect(normalizeTalkMediaType("audio/webm; codecs=opus")).toBe("audio/webm;codecs=opus");
     expect(normalizeTalkMediaType("audio/ogg;codecs=vorbis")).toBe("audio/ogg");
     expect(normalizeTalkMediaType("audio/mp4;codecs=mp4a.40.2")).toBe("audio/mp4");
-    expect(normalizeTalkMediaType("audio/flac")).toBe("audio/webm");
-    expect(normalizeTalkMediaType("")).toBe("audio/webm");
   });
 });
 

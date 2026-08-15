@@ -6725,6 +6725,19 @@ mod tests {
             })))
             .await
             .unwrap();
+        // The client's own order: telemetry naming the utterance, then the
+        // utterance. The runner answers the instant an utterance closes, so
+        // metrics sent after it would be too late to belong to it.
+        socket
+            .send(next(serde_json::json!({
+                "type": "metrics",
+                "audio_sequence": 1,
+                "speech_detection_ms": 180,
+                "capture_ms": 1_200,
+                "upload_ms": 40,
+            })))
+            .await
+            .unwrap();
         socket
             .send(next(serde_json::json!({
                 "type": "audio",
@@ -6732,15 +6745,6 @@ mod tests {
                 "media_type": "audio/webm;codecs=opus",
                 "audio_base64": STANDARD.encode(b"first utterance bytes"),
                 "last": true,
-            })))
-            .await
-            .unwrap();
-        socket
-            .send(next(serde_json::json!({
-                "type": "metrics",
-                "speech_detection_ms": 180,
-                "capture_ms": 1_200,
-                "upload_ms": 40,
             })))
             .await
             .unwrap();
@@ -6959,16 +6963,13 @@ mod tests {
 
         // Withdrawing the grant closes the socket, and the capture clears with
         // it rather than outliving the authority that allowed it.
+        //
+        // Nothing else is sent. A device that is listening has no reason to
+        // send anything, and a session that only noticed the withdrawal when
+        // the next frame arrived would hold this microphone open until the idle
+        // deadline — fifteen minutes of capture on a grant that is gone. So the
+        // close below is on the runner's own clock, or it does not happen.
         revoke(&api, &device_id, DeviceCapability::VoiceStream);
-        socket
-            .send(talk_frame(
-                &session_id,
-                &generation,
-                2,
-                serde_json::json!({ "type": "interrupt", "reason": "stop_button" }),
-            ))
-            .await
-            .unwrap();
         assert!(read_until_closed(&mut socket).await);
         for _ in 0..100 {
             if !capture_in_flight(&paths) {

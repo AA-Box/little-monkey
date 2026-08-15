@@ -29,6 +29,7 @@ import {
   createTalkDetector,
   createTalkFrames,
   normalizeTalkMediaType,
+  splitTalkAudioBase64,
 } from "./talkProtocol.js";
 
 const PROTOCOL_VERSION = 1;
@@ -3045,7 +3046,13 @@ async function startTalk() {
     // No preference supported: a recorder still records in *something*, so ask
     // a throwaway one what that is rather than naming a container this browser
     // will not produce.
-    const mediaType = normalizeTalkMediaType(preferred || new MediaRecorder(talk.stream).mimeType);
+    const recorded = preferred || new MediaRecorder(talk.stream).mimeType;
+    const mediaType = normalizeTalkMediaType(recorded);
+    if (!mediaType) {
+      // Sending the bytes anyway under a container name they do not have would
+      // hand the transcriber a file whose header contradicts its media type.
+      throw new RemoteError(`This browser records in ${recorded || "a container"} that Talk cannot transcribe`, 0);
+    }
     const context = new AudioContext();
     talk.context = context;
     // A context created inside a gesture handler can still open suspended on
@@ -3173,24 +3180,35 @@ function talkBeginUtterance(speechDetectionMs) {
     const blob = new Blob(chunks, { type: talk.frames?.mediaType || "audio/webm" });
     if (blob.size > 0 && talk.running && talk.frames) {
       const audioBase64 = await blobToBase64(blob);
+      // Ninety seconds of Opus is far more than one frame may carry, so the
+      // utterance goes out as however many frames it takes; the runner
+      // reassembles them and only the last one closes it.
+      const chunks = splitTalkAudioBase64(audioBase64);
       try {
-        talkSendFrame(talk.frames.audio({ audioBase64, last: true }));
+        // Before the audio, not after: the runner answers the moment the
+        // closing frame lands, so metrics sent afterwards would arrive too late
+        // to belong to this utterance. They name it explicitly as well, so a
+        // future reordering loses the telemetry instead of misfiling it.
+        //
+        // Three durations, measured on this device, that the runner cannot see.
+        // Never a word of what was said — the frame has no room for one.
+        talkSendFrame(
+          talk.frames.metrics({
+            audioSequence: talk.frames.audioSequence + 1,
+            speechDetectionMs: utterance.speechDetectionMs,
+            captureMs: stoppedAtMs - utterance.startedAtMs,
+            uploadMs: Date.now() - stoppedAtMs,
+          }),
+        );
+        chunks.forEach((chunk, at) => {
+          talkSendFrame(talk.frames.audio({ audioBase64: chunk, last: at === chunks.length - 1 }));
+        });
       } catch (error) {
-        // An oversized utterance is refused here rather than by the runner,
-        // whose refusal is not retryable and would end the conversation.
+        // Refused here rather than by the runner, whose refusal is not
+        // retryable and would end the conversation.
         showTalkError(String(error?.message || error));
         return;
       }
-      // Straight after the frame that closes the utterance: three durations,
-      // measured on this device, that the runner cannot see. Never a word of
-      // what was said — the frame has no room for one.
-      talkSendFrame(
-        talk.frames.metrics({
-          speechDetectionMs: utterance.speechDetectionMs,
-          captureMs: stoppedAtMs - utterance.startedAtMs,
-          uploadMs: Date.now() - stoppedAtMs,
-        }),
-      );
     }
     // Deliberately NOT re-armed: the next recorder starts at the next confirmed
     // speech-start, so the microphone is observed but nothing is captured while

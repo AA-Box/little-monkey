@@ -588,7 +588,13 @@ mod tests {
         assert!(protocol.contains("export function createTalkDetector("));
         assert!(protocol.contains("noiseFloor = noiseFloor * 0.96"));
         assert!(javascript.contains("talk.detector = createTalkDetector();"));
-        assert!(javascript.contains("last: true"));
+        // Ninety seconds of audio is past what one frame may carry, so the
+        // upload is cut into frames and only the last one closes the utterance.
+        assert!(
+            javascript.contains("splitTalkAudioBase64(audioBase64)")
+                && javascript.contains("last: at === chunks.length - 1"),
+            "a long utterance must be sent as frames rather than refused"
+        );
         assert!(
             javascript.contains("blob.size > 0 && talk.running"),
             "an empty recording must not be uploaded"
@@ -609,6 +615,10 @@ mod tests {
         // Telemetry is durations only. The frame has no field that could carry
         // a transcript, and the client fills exactly three.
         assert!(javascript.contains("talk.frames.metrics({"));
+        assert!(
+            javascript.contains("audioSequence: talk.frames.audioSequence + 1"),
+            "telemetry must name the utterance it measured, and precede it"
+        );
         assert!(protocol.contains("speech_detection_ms: boundedSpan(speechDetectionMs)"));
         assert!(protocol.contains("capture_ms: boundedSpan(captureMs)"));
         assert!(protocol.contains("upload_ms: boundedSpan(uploadMs)"));

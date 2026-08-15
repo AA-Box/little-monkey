@@ -1665,6 +1665,11 @@ pub enum TalkClientFrameKind {
     /// transcript or the audio on a telemetry frame is exactly the mistake this
     /// shape exists to make impossible.
     Metrics {
+        /// The `audio_sequence` of the first audio frame of the utterance these
+        /// spans describe. Required, and required *before* that frame is sent:
+        /// the runner answers the moment an utterance closes, so a metrics frame
+        /// that arrives after it would otherwise be filed against the next one.
+        audio_sequence: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speech_detection_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1713,10 +1718,14 @@ impl TalkClientFrame {
                 }
             }
             TalkClientFrameKind::Metrics {
+                audio_sequence,
                 speech_detection_ms,
                 capture_ms,
                 upload_ms,
             } => {
+                if *audio_sequence == 0 {
+                    return Err("Talk metrics must name the utterance they measure".to_string());
+                }
                 for span in [speech_detection_ms, capture_ms, upload_ms]
                     .into_iter()
                     .flatten()

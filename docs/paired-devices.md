@@ -237,6 +237,13 @@ device sends `audio` (with `last` marking the end of an utterance), `state`,
 `interrupt` and `metrics`. The runner sends `ready`, `state`, `transcript`,
 `assistant_delta`, `output_audio` and `error`.
 
+An utterance may run to ninety seconds, which is far more than one frame may
+carry, so it is uploaded as however many `audio` frames it takes and the runner
+reassembles them in order. `metrics` names the utterance it measured and is sent
+*before* that utterance's audio: the runner answers the instant an utterance
+closes, so spans arriving behind it are dropped rather than credited to whatever
+is said next.
+
 **Where the work happens.** Voice activity detection is on the device and stays
 there, so silence is never uploaded. The recorder is armed by confirmed speech
 rather than by the session, so what is uploaded is an utterance and not the gap
@@ -258,10 +265,11 @@ Talk says so instead of starting.
 
 **Revocation.** Withdrawing `voice_stream` closes the session in whichever phase
 it lands — listening, transcribing, thinking or speaking — because the grant is
-re-read on a timer while an answer streams and once more when each turn ends,
-not only when the device happens to send a frame. A device that is silent for a
-ten-minute answer is exactly the case where "at the next frame" would have meant
-"not at all".
+re-read on a timer, both while an answer streams and while the socket is simply
+waiting for someone to speak, and once more when each turn ends. Never only when
+the device happens to send a frame: a listening device has no reason to send
+anything at all, so "at the next frame" would have left a withdrawn microphone
+open until the socket's idle deadline a quarter of an hour later.
 
 What survives a session is the transcript, the answer and bounded counters: how
 many utterances, turns, interruptions and errors, and seven latency spans as
