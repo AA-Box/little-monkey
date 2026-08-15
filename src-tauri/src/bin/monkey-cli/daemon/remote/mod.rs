@@ -5,6 +5,7 @@ pub(crate) mod device;
 pub(crate) mod migrate;
 pub(crate) mod protocol;
 pub(crate) mod push;
+pub(crate) mod qr;
 mod server;
 pub(crate) mod store;
 pub(crate) mod voice;
@@ -344,6 +345,11 @@ pub struct RemotePairCreateArgs {
     /// writing the invitation file.
     #[arg(long)]
     qr: bool,
+    /// Print the result as JSON — the invitation path, the compact bootstrap
+    /// URI, and (with `--qr`) the code as an SVG. This is what the desktop's
+    /// pairing panel reads; a terminal wants the human form above it.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1365,6 +1371,39 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         capabilities: invitation.capabilities,
     };
     protected_json(&args.output, &value)?;
+    // The same one-time token, in the form a camera can read. It pins the
+    // certificate by fingerprint rather than carrying the PEM — see
+    // `PairingBootstrap`. Always computed, because the desktop's JSON reader
+    // shows the code beside the file and a terminal only prints it on `--qr`.
+    let bootstrap = PairingBootstrap {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        runner_id: value.runner_id.clone(),
+        runner_url: value.runner_url.clone(),
+        pairing_id: value.pairing_id.clone(),
+        pairing_token: value.pairing_token.clone(),
+        certificate_sha256: value.server_certificate_sha256.clone(),
+        expires_at_ms: value.expires_at_ms,
+    };
+    let uri = bootstrap.to_uri()?;
+    if args.json {
+        // The SVG rather than the matrix: the caller is a webview, and handing
+        // it a grid of booleans would put the rendering rules — quiet zone,
+        // crisp edges, contrast — in a second place.
+        let code = qr::encode(&uri)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "invitation_path": args.output.display().to_string(),
+                "controller_url": controller_url(&value.runner_url),
+                "expires_at_ms": value.expires_at_ms,
+                "bootstrap_uri": uri,
+                "bootstrap_bytes": uri.len(),
+                "qr_svg": code.to_svg(4),
+                "qr_modules": code.size,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "One-time pairing invitation written to {} (expires at {}). Transfer it securely, open {}, and choose the file.",
         args.output.display(),
@@ -1372,22 +1411,9 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         controller_url(&value.runner_url)
     );
     if args.qr {
-        // The same one-time token, in the form a camera can read. It pins the
-        // certificate by fingerprint rather than carrying the PEM — see
-        // `PairingBootstrap`.
-        let bootstrap = PairingBootstrap {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: value.runner_id.clone(),
-            runner_url: value.runner_url.clone(),
-            pairing_id: value.pairing_id.clone(),
-            pairing_token: value.pairing_token.clone(),
-            certificate_sha256: value.server_certificate_sha256.clone(),
-            expires_at_ms: value.expires_at_ms,
-        };
-        println!(
-            "\nScan or paste this pairing code on the device (it expires with the invitation):\n{}",
-            bootstrap.to_uri()?
-        );
+        println!("\nScan this with the device's camera (it expires with the invitation):\n");
+        println!("{}", qr::encode(&uri)?.to_terminal());
+        println!("Or paste this code into the controller's pairing field:\n{uri}");
     }
     Ok(())
 }
@@ -1862,6 +1888,16 @@ async fn migrate_run(
         departure.sequence, departure.event_hash
     );
     Ok(())
+}
+
+/// The advertised transport, for callers outside this module that need to
+/// describe it — the security audit asks whether a phone holding a camera grant
+/// is talking over a pinned connection, and there must be one answer to that
+/// rather than a second reader of the same file.
+pub(crate) fn host_config(
+    paths: &DaemonPaths,
+) -> Result<Option<protocol::RemoteHostConfig>, String> {
+    server::load_host_config(paths)
 }
 
 fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {
