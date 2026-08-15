@@ -2,18 +2,23 @@
 
 <img width="96" height="98" alt="Little Monkey" src="https://github.com/user-attachments/assets/84651d01-f18b-4c49-b203-8d1b7e8f16b6" />
 
-# Little Monkey
+# Little Monkey — open-source local Agent OS
 
-**A local-first agent runtime and control plane.**
+**Run autonomous AI agents on your own computer.**
 
-Chat, tools, workspace, models, images, video and speech — on your own machine,
-behind one permission boundary, with a process table you can actually inspect.
+Local or cloud models, real computer tools, kernel-sandboxed execution and jobs
+that survive a restart — with every process, network request and tool call
+behind one permission boundary you can inspect.
 
 [![CI](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/AA-Box/little-monkey/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AA-Box/little-monkey?color=6f4e37&label=release)](https://github.com/AA-Box/little-monkey/releases)
 [![License](https://img.shields.io/badge/license-MIT-6f4e37)](LICENSE)
 [![Platforms](https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-6f4e37)](docs/setup.md)
 [![Built with](https://img.shields.io/badge/Tauri%202%20%C2%B7%20Rust%20%C2%B7%20React-6f4e37)](docs/setup.md)
+
+### [⬇ Download for macOS, Windows or Linux](https://github.com/AA-Box/little-monkey/releases/latest)
+
+Local-first · llama.cpp · Ollama · MLX · any OpenAI-compatible provider · MCP · sandboxed shells · persistent agents · MIT
 
 [**Features**](docs/features.md) · [**CLI**](docs/cli.md) · [**Setup**](docs/setup.md) · [**Security**](docs/security.md) · [**Limitations**](docs/limitations.md) · [**Roadmap**](ROADMAP.md)
 
@@ -56,12 +61,15 @@ Nothing reaches a runtime without passing the middle row. That is the whole desi
 
 ## Install
 
-```sh
-pnpm install
-pnpm tauri dev       # stage llama.cpp + the CLI sidecar, then run the app
-```
+Take the installer for your platform from the [**latest release**](https://github.com/AA-Box/little-monkey/releases/latest):
 
-Desktop bundles ship a pinned, checksum-verified `llama.cpp` runtime and install the `monkey` command on first launch without elevation. Node.js, `pnpm`, Rust, Cargo and your platform's Tauri 2 prerequisites are required; optional runtimes are listed in **[Setup](docs/setup.md)**.
+| macOS | Windows | Linux |
+| :-- | :-- | :-- |
+| `.dmg` — Apple Silicon, Intel | `.exe`, `.msi` — x64, arm64 | `.AppImage`, `.deb`, `.rpm` — x86_64, aarch64 |
+
+Bundles ship a pinned, checksum-verified `llama.cpp` runtime and install the `monkey` command on first launch without elevation. Every release carries per-asset signatures, the signing public key and a CycloneDX SBOM. Optional runtimes are listed in **[Setup](docs/setup.md)**.
+
+Building from source instead: [Development](#development).
 
 ## Quick start
 
@@ -143,7 +151,11 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 
 ## Development
 
+Node.js, `pnpm`, Rust, Cargo and your platform's Tauri 2 prerequisites are required.
+
 ```sh
+pnpm install
+pnpm tauri dev       # stage llama.cpp + the CLI sidecar, then run the app
 pnpm dev             # Vite front end only
 pnpm build           # TypeScript check and production front-end build
 pnpm tauri build     # desktop bundle containing the managed runtime
