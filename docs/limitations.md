@@ -3,8 +3,7 @@
 Every capability claim in this repository describes the current `develop` tree.
 Where a feature is narrower than its name suggests, the boundary is stated here
 rather than left for a reader to discover. Work that is not built yet lives in
-[ROADMAP.md](../ROADMAP.md); the kernel-level plan is
-[docs/agent-os-roadmap.md](agent-os-roadmap.md).
+[ROADMAP.md](../ROADMAP.md).
 
 ## Runtimes and hardware
 

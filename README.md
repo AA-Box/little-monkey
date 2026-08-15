@@ -144,7 +144,6 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | Build, test, or find the code | [Setup and development](docs/setup.md) |
 | Understand the trust model | [Workspace and trust boundaries](docs/security.md) |
 | Know where a claim stops | [Limitations](docs/limitations.md) |
-| Follow the kernel-level plan | [Agent OS roadmap](docs/agent-os-roadmap.md) |
 | Connect remote MCP over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
 | Use a paired phone's camera, mic or location | [Paired devices](docs/paired-devices.md) |
 | Check the conformance suite | [Conformance suite](docs/conformance-suite.md) |

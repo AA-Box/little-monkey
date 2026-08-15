@@ -9,7 +9,7 @@ import {
 } from "../lib/modelRouting";
 
 /**
- * K9 (docs/agent-os-roadmap.md) — the user's authored dispatch policies, in
+ * The user's authored dispatch policies, in
  * the order they are evaluated.
  *
  * The list *is* the precedence: `matchPolicy` takes the first enabled policy

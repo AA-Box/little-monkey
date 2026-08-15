@@ -3,10 +3,10 @@
 **Suite revision: `little-monkey-conformance-2026-08-09`**
 
 This is the specification an implementation is graded against, and the
-document a "compatible" claim points at. It is the K21 half of
-`docs/agent-os-roadmap.md`: the M3 compatibility harness certifies *this*
-implementation from inside its own test binary, and this certifies *any* node
-from the outside, over a socket.
+document a "compatible" claim points at. It is one half of the compatibility
+story: the M3 compatibility harness certifies *this* implementation from inside
+its own test binary, and this certifies *any* node from the outside, over a
+socket.
 
 A claim of compatibility means exactly one thing:
 
