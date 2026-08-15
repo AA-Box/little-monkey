@@ -574,7 +574,21 @@ pub struct ResourceController {
     /// parent is killed cannot be attributed to this workload by any later
     /// snapshot. What can be attributed is what was recorded *before* the link
     /// was destroyed, which is what this is.
+    ///
+    /// **Ownership is sticky.** Nothing is ever removed. A member that leaves the
+    /// group, changes session or re-parents stays owned, because the question a
+    /// budget asks is "did this workload start it", and that does not become
+    /// false when the workload's descendant rearranges its own bookkeeping.
     owned: BTreeMap<u32, u64>,
+    /// The process group and session the workload started in, captured at attach.
+    ///
+    /// Captured rather than looked up on each sample, and that is the whole
+    /// point: both are read off the *root's* row in the process table, so the
+    /// moment the root exits they stop being discoverable — which is precisely
+    /// when a descendant that stayed in the group becomes unattributable. A
+    /// number recorded while the root was alive keeps working after it is not.
+    group: Option<u32>,
+    session: Option<u32>,
 }
 
 enum Backend {
@@ -622,6 +636,8 @@ impl ResourceController {
             peak_process_count: None,
             output_bytes: None,
             owned: BTreeMap::new(),
+            group: None,
+            session: None,
         }
     }
 
@@ -668,6 +684,11 @@ impl ResourceController {
     #[cfg(unix)]
     fn leading_process_group(&self) -> Option<ContainmentScope> {
         let root = self.root?;
+        // The group captured at attach, when it was certainly readable, rather
+        // than one queried now — a root that has since exited answers nothing.
+        if let Some(group) = self.group.filter(|group| *group == root.pid) {
+            return Some(ContainmentScope::ProcessGroup(group));
+        }
         let pid = libc::pid_t::try_from(root.pid).ok()?;
         // Safe: a pure query about one pid, with no side effect.
         let pgid = unsafe { libc::getpgid(pid) };
@@ -849,6 +870,25 @@ impl ResourceController {
         self.root = Some(identity);
         self.started_at = Instant::now();
         self.owned.insert(pid, identity.start_time);
+        // While the root is certainly alive, which is the only time either is
+        // readable — and only where the root *leads* the group or the session.
+        //
+        // The guard is not a nicety. A pgid or a sid the root merely belongs to
+        // is its **parent's**, which is this app: unioning it into the owned set
+        // would make a termination sweep every process in this app's own group or
+        // login session. Equality with the root's pid is what distinguishes "the
+        // primitive this workload was given" from "the primitive it inherited",
+        // and every supervised spawn is given one by `prepare_supervised`.
+        self.group = process_tree::snapshot()
+            .ok()
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .find(|node| node.pid == pid)
+                    .map(|node| node.process_group_id)
+            })
+            .filter(|group| *group == pid);
+        self.session = process_tree::session_of(pid).filter(|session| *session == pid);
 
         // Install the containment for the backends that cannot install it before
         // the first instruction, then read it back below.
@@ -966,7 +1006,12 @@ impl ResourceController {
                 })
                 .map(|(pid, _)| *pid),
         );
-        for pid in process_tree::tree_members_of_any(&nodes, &roots) {
+        for pid in process_tree::tree_members_of_any_in(
+            &nodes,
+            &roots,
+            &self.group.into_iter().collect::<Vec<_>>(),
+            self.session,
+        ) {
             if let Some(identity) = ProcessIdentity::of(pid) {
                 self.owned.entry(pid).or_insert(identity.start_time);
             }
@@ -1013,7 +1058,7 @@ impl ResourceController {
             #[cfg(windows)]
             Backend::Job(job) => job.sample()?,
             Backend::Supervisor => {
-                let usage = supervised_tree_usage(root, &self.owned)?;
+                let usage = supervised_tree_usage(root, &self.owned, self.group, self.session)?;
                 usage.map(|usage| (usage.rss_bytes, Some(usage.process_count)))
             }
         };
@@ -1194,7 +1239,9 @@ impl ResourceController {
             Backend::Cgroup(scope) => scope.terminate_tree(),
             #[cfg(windows)]
             Backend::Job(job) => job.terminate_tree(),
-            Backend::Supervisor => terminate_supervised_tree(self.root, &mut self.owned),
+            Backend::Supervisor => {
+                terminate_supervised_tree(self.root, &mut self.owned, self.group, self.session)
+            }
         }
     }
 }
@@ -1208,6 +1255,8 @@ impl ResourceController {
 fn supervised_tree_usage(
     root: ProcessIdentity,
     owned: &BTreeMap<u32, u64>,
+    group: Option<u32>,
+    session: Option<u32>,
 ) -> io::Result<Option<process_tree::TreeUsage>> {
     let mut roots: Vec<u32> = vec![root.pid];
     roots.extend(
@@ -1229,7 +1278,12 @@ fn supervised_tree_usage(
     }
     let nodes = process_tree::snapshot()?;
     Ok(process_tree::measure_members(
-        &process_tree::tree_members_of_any(&nodes, &roots),
+        &process_tree::tree_members_of_any_in(
+            &nodes,
+            &roots,
+            &group.into_iter().collect::<Vec<_>>(),
+            session,
+        ),
     ))
 }
 
@@ -1532,6 +1586,8 @@ const TERMINATION_SETTLE: std::time::Duration = std::time::Duration::from_millis
 fn terminate_supervised_tree(
     root: Option<ProcessIdentity>,
     owned: &mut BTreeMap<u32, u64>,
+    group: Option<u32>,
+    session: Option<u32>,
 ) -> io::Result<()> {
     if owned.is_empty() {
         return Ok(());
@@ -1542,7 +1598,7 @@ fn terminate_supervised_tree(
             // Re-derive from what is still running: a member that forked after
             // the previous pass is owned as well, and its ancestry is readable
             // right now because its parent is one of ours.
-            expand_owned(owned);
+            expand_owned(owned, group, session);
         }
 
         // The group: one signal for every member that stayed in it, which is the
@@ -1600,7 +1656,7 @@ fn terminate_supervised_tree(
 
 /// Add anything reachable from a still-running owned member.
 #[cfg(unix)]
-fn expand_owned(owned: &mut BTreeMap<u32, u64>) {
+fn expand_owned(owned: &mut BTreeMap<u32, u64>, group: Option<u32>, session: Option<u32>) {
     let roots = survivors(owned);
     if roots.is_empty() {
         return;
@@ -1608,7 +1664,12 @@ fn expand_owned(owned: &mut BTreeMap<u32, u64>) {
     let Ok(nodes) = process_tree::snapshot() else {
         return;
     };
-    for pid in process_tree::tree_members_of_any(&nodes, &roots) {
+    for pid in process_tree::tree_members_of_any_in(
+        &nodes,
+        &roots,
+        &group.into_iter().collect::<Vec<_>>(),
+        session,
+    ) {
         if let Some(identity) = ProcessIdentity::of(pid) {
             owned.entry(pid).or_insert(identity.start_time);
         }
@@ -1661,6 +1722,8 @@ fn kill_if_identity_matches(pid: u32, start_time: u64) {
 fn terminate_supervised_tree(
     root: Option<ProcessIdentity>,
     owned: &mut BTreeMap<u32, u64>,
+    _group: Option<u32>,
+    _session: Option<u32>,
 ) -> io::Result<()> {
     let mut last_error = None;
     for (pid, start_time) in owned.iter() {
@@ -2598,7 +2661,8 @@ mod tests {
         // And the signal path agrees: were it not identity-checked, this would
         // SIGKILL the test binary and the run would simply disappear.
         kill_if_identity_matches(me, u64::MAX);
-        terminate_supervised_tree(None, &mut owned).expect("nothing of ours is running");
+        terminate_supervised_tree(None, &mut owned, None, None)
+            .expect("nothing of ours is running");
     }
 
     /// Init is not a member of anything, and 0 means "our own process group".
@@ -2609,5 +2673,414 @@ mod tests {
         // either guard would terminate this test binary or the whole session.
         kill_if_identity_matches(0, 0);
         kill_if_identity_matches(1, 0);
+    }
+
+    /// Adversarial process trees: what a descendant can do to get out from under
+    /// its budget, and which of those this app actually stops.
+    ///
+    /// # Why these are real processes
+    ///
+    /// The escapes under test — `setsid`, re-parenting, both together — are
+    /// kernel state changes. A fake process table would assert that this module's
+    /// bookkeeping is self-consistent, which is not the question: the question is
+    /// whether the kernel's own view, after a descendant has rearranged itself,
+    /// still lets a supervisor find and kill what it started.
+    ///
+    /// # The property, stated once
+    ///
+    /// **Ownership is sticky from the moment of capture.** A member recorded
+    /// while it was still reachable stays owned however it later rearranges its
+    /// group, its session or its parent — because "did this workload start it" is
+    /// not a question a descendant's own bookkeeping can answer differently
+    /// later.
+    ///
+    /// The escapes are therefore ordered deliberately: each child waits for a
+    /// flag file before escaping, so "captured, then escaped" is the sequence
+    /// under test rather than a race. The one case where the order is reversed is
+    /// [`the_one_escape_no_unprivileged_supervisor_can_follow`], which exists to
+    /// draw the boundary rather than to pretend it is not there.
+    #[cfg(unix)]
+    mod escapes {
+        use super::*;
+
+        /// Perl, because it is the one interpreter present on every platform leg
+        /// this runs on that can call `setsid(2)` directly. A host without it
+        /// skips rather than passing vacuously.
+        fn perl_is_available() -> bool {
+            std::process::Command::new("perl")
+                .arg("-e")
+                .arg("exit 0")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+
+        fn scratch(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "little_monkey_escape_{}_{}_{name}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ))
+        }
+
+        /// A supervisor-backed controller with a real workload attached.
+        ///
+        /// The limits are deliberately generous: these tests are about ownership,
+        /// and a bound that fired during one would end the workload for a reason
+        /// the test is not about.
+        fn supervised(shell_command: &str) -> (ResourceController, std::process::Child) {
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(shell_command)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut controller =
+                ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+                    LimitSource::UserOverride,
+                    ProcessLimits {
+                        max_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+                        max_child_processes: Some(4_096),
+                        ..ProcessLimits::default()
+                    },
+                )]));
+            controller
+                .prepare_std(&mut command)
+                .expect("the containment is installable");
+            let child = command.spawn().expect("the workload starts");
+            controller
+                .attach(child.id())
+                .expect("the workload is inside its containment");
+            (controller, child)
+        }
+
+        /// Wait for a pid to appear in a file the workload writes.
+        fn wait_for_pid(path: &std::path::Path) -> u32 {
+            for _ in 0..200 {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    if let Ok(pid) = text.trim().parse::<u32>() {
+                        return pid;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!("the workload never reported its descendant's pid at {path:?}");
+        }
+
+        fn wait_until(mut ready: impl FnMut() -> bool, what: &str) {
+            for _ in 0..200 {
+                if ready() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            panic!("{what} never happened");
+        }
+
+        fn owns(controller: &ResourceController, pid: u32) -> bool {
+            controller
+                .live_owned()
+                .iter()
+                .any(|identity| identity.pid == pid)
+        }
+
+        /// A child that leaves the process group and session entirely.
+        ///
+        /// `setsid` is the strongest thing an unprivileged descendant can do to a
+        /// group-based supervisor: it is in a new session, a new group, and
+        /// nothing about either names this workload any more. It is still a
+        /// *child*, so the parent link holds — and the point of this test is that
+        /// the supervisor does not need the parent link either, because it wrote
+        /// the identity down before the escape.
+        #[test]
+        fn a_captured_child_that_calls_setsid_stays_owned() {
+            if !perl_is_available() {
+                return;
+            }
+            let pid_file = scratch("setsid.pid");
+            let flag = scratch("setsid.go");
+            let (mut controller, mut root) = supervised(&format!(
+                "perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$;                  close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }}                  setsid(); sleep 60' {} {} ; sleep 60",
+                pid_file.display(),
+                flag.display()
+            ));
+
+            let escapee = wait_for_pid(&pid_file);
+            // Captured while it is still reachable, which is the precondition the
+            // whole property depends on.
+            controller
+                .sample()
+                .expect("the tree samples")
+                .expect("it is running");
+            assert!(owns(&controller, escapee), "the child was never captured");
+
+            std::fs::write(&flag, "go").expect("the flag is written");
+            wait_until(
+                || crate::process_tree::session_of(escapee) == Some(escapee),
+                "the child never became its own session leader",
+            );
+
+            // The escape has happened. Ownership must not have moved with it.
+            controller.sample().expect("the tree samples");
+            assert!(
+                owns(&controller, escapee),
+                "a child that left the group and the session dropped out of the owned set"
+            );
+            controller.terminate_tree().expect("the tree is reclaimed");
+            wait_until(
+                || !crate::os_signal::process_is_alive(escapee),
+                "the escaped child survived the termination that owned it",
+            );
+
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_file(&pid_file);
+            let _ = std::fs::remove_file(&flag);
+        }
+
+        /// A child whose parent exits, so the kernel re-parents it to init.
+        ///
+        /// The ancestry a later snapshot could walk is destroyed by this, which is
+        /// exactly why ownership is recorded rather than re-derived: no snapshot
+        /// taken after the parent is gone can attribute this process to the
+        /// workload, and the one taken before can.
+        #[test]
+        fn a_captured_child_that_reparents_stays_owned() {
+            let pid_file = scratch("reparent.pid");
+            // The subshell exits immediately, so `sleep` is re-parented while the
+            // outer shell — the workload's root — keeps running.
+            let (mut controller, mut root) = supervised(&format!(
+                "( sleep 60 & echo $! > {} ) ; sleep 60",
+                pid_file.display()
+            ));
+
+            let escapee = wait_for_pid(&pid_file);
+            controller
+                .sample()
+                .expect("the tree samples")
+                .expect("it is running");
+            assert!(owns(&controller, escapee), "the child was never captured");
+
+            wait_until(
+                || {
+                    crate::process_tree::snapshot()
+                        .ok()
+                        .and_then(|nodes| {
+                            nodes
+                                .iter()
+                                .find(|node| node.pid == escapee)
+                                .map(|node| node.parent_pid)
+                        })
+                        .is_some_and(|parent| parent != root.id())
+                },
+                "the child never re-parented",
+            );
+
+            controller.sample().expect("the tree samples");
+            assert!(
+                owns(&controller, escapee),
+                "a re-parented child dropped out of the owned set"
+            );
+            controller.terminate_tree().expect("the tree is reclaimed");
+            wait_until(
+                || !crate::os_signal::process_is_alive(escapee),
+                "the re-parented child survived the termination that owned it",
+            );
+
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_file(&pid_file);
+        }
+
+        /// Both escapes at once, after capture: no group, no session, no parent.
+        ///
+        /// Nothing the kernel can be asked, after this, ties the process to the
+        /// workload. It stays owned anyway, and it is reclaimed, because the
+        /// supervisor wrote the identity down while the answer still existed.
+        #[test]
+        fn a_captured_child_that_reparents_and_calls_setsid_stays_owned() {
+            if !perl_is_available() {
+                return;
+            }
+            let pid_file = scratch("combined.pid");
+            let flag = scratch("combined.go");
+            let (mut controller, mut root) = supervised(&format!(
+                "( perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$;                  close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }}                  setsid(); sleep 60' {} {} & ) ; sleep 60",
+                pid_file.display(),
+                flag.display()
+            ));
+
+            let escapee = wait_for_pid(&pid_file);
+            controller
+                .sample()
+                .expect("the tree samples")
+                .expect("it is running");
+            assert!(owns(&controller, escapee), "the child was never captured");
+
+            std::fs::write(&flag, "go").expect("the flag is written");
+            wait_until(
+                || crate::process_tree::session_of(escapee) == Some(escapee),
+                "the child never became its own session leader",
+            );
+
+            controller.sample().expect("the tree samples");
+            assert!(
+                owns(&controller, escapee),
+                "a child that escaped every primitive at once dropped out of the owned set"
+            );
+            controller.terminate_tree().expect("the tree is reclaimed");
+            wait_until(
+                || !crate::os_signal::process_is_alive(escapee),
+                "the doubly-escaped child survived the termination that owned it",
+            );
+
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_file(&pid_file);
+            let _ = std::fs::remove_file(&flag);
+        }
+
+        /// The boundary, stated rather than papered over.
+        ///
+        /// A descendant that does **both** escapes *before* the supervisor has
+        /// ever recorded it is outside every primitive an unprivileged macOS
+        /// process has: it is not in the group, not in the session, and its parent
+        /// link is gone, so nothing the kernel can be asked names this workload.
+        /// This test asserts that residual honestly — a supervisor that claimed
+        /// otherwise would be claiming a guarantee the platform does not offer.
+        ///
+        /// Note what it is *not*: on Linux the same workload under a cgroup is
+        /// fully contained, because membership is inherited and neither `setsid`
+        /// nor re-parenting affects it. This is a supervisor limit, and it is why
+        /// the backend is reported rather than assumed.
+        #[test]
+        fn the_one_escape_no_unprivileged_supervisor_can_follow() {
+            if !perl_is_available() {
+                return;
+            }
+            let pid_file = scratch("boundary.pid");
+            let (mut controller, mut root) = supervised(&format!(
+                "( perl -e 'use POSIX qw(setsid); setsid(); open(my $f, \">\", $ARGV[0]);                  print $f $$; close($f); sleep 60' {} & ) ; sleep 60",
+                pid_file.display()
+            ));
+            // Deliberately not sampled before the escape: the pid file is written
+            // *after* `setsid`, so by the time this returns the process is already
+            // outside everything.
+            let escapee = wait_for_pid(&pid_file);
+            wait_until(
+                || crate::process_tree::session_of(escapee) == Some(escapee),
+                "the child never became its own session leader",
+            );
+
+            controller.sample().expect("the tree samples");
+            if matches!(
+                controller.capabilities().backend.as_str(),
+                "cgroup v2" | "windows job object"
+            ) {
+                // A kernel-held containment has no such boundary: membership is
+                // inherited and cannot be left. Nothing to assert about a
+                // supervisor here.
+                controller.terminate_tree().expect("the tree is reclaimed");
+                let _ = root.kill();
+                let _ = root.wait();
+                let _ = std::fs::remove_file(&pid_file);
+                return;
+            }
+            assert!(
+                !owns(&controller, escapee),
+                "this test documents a residual limit; if the supervisor now finds this                  process, the limit is closed and `docs/limitations.md` has to say so"
+            );
+
+            let _ = root.kill();
+            let _ = root.wait();
+            // Reclaimed by hand, because by construction the supervisor cannot.
+            let _ = crate::os_signal::terminate_process_group(escapee);
+            let _ = std::fs::remove_file(&pid_file);
+        }
+
+        /// An escaped-but-captured child still counts against the budget it
+        /// escaped.
+        ///
+        /// The failure this prevents: a workload could put its allocation behind a
+        /// `setsid` and read as a tree holding nothing, so a memory bound would
+        /// never fire while the machine filled up. Supervisor-only by nature — a
+        /// cgroup member cannot leave its scope, so there is nothing to escape.
+        #[test]
+        fn an_escaped_child_still_counts_against_the_budget_it_left() {
+            if !perl_is_available() {
+                return;
+            }
+            let pid_file = scratch("counts.pid");
+            let flag = scratch("counts.go");
+            // A quarter of a gigabyte held in one string, against a 64 MiB
+            // ceiling: far enough apart that no ordinary process on the host
+            // decides the outcome.
+            const CEILING: u64 = 64 * 1024 * 1024;
+            let mut command = std::process::Command::new("sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$;                      close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }}                      setsid(); my $x = \"a\" x (256*1024*1024); sleep 60' {} {} ; sleep 60",
+                    pid_file.display(),
+                    flag.display()
+                ))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut controller =
+                ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+                    LimitSource::UserOverride,
+                    ProcessLimits {
+                        max_memory_bytes: Some(CEILING),
+                        ..ProcessLimits::default()
+                    },
+                )]));
+            if controller.capabilities().backend != "supervisor" {
+                // The kernel backends hold this by construction and have their own
+                // tests; this one is about the supervisor's owned set.
+                return;
+            }
+            controller
+                .prepare_std(&mut command)
+                .expect("the containment is installable");
+            let mut root = command.spawn().expect("the workload starts");
+            controller.attach(root.id()).expect("it is contained");
+
+            let escapee = wait_for_pid(&pid_file);
+            controller
+                .sample()
+                .expect("the tree samples")
+                .expect("it is running");
+            assert!(owns(&controller, escapee), "the child was never captured");
+            std::fs::write(&flag, "go").expect("the flag is written");
+
+            let mut breach = None;
+            for _ in 0..200 {
+                match controller.check(now_ms()).expect("the controller checks") {
+                    ResourceCheck::Breached { breach: fired, .. } => {
+                        breach = Some(fired);
+                        break;
+                    }
+                    ResourceCheck::Running(_) | ResourceCheck::Gone => {}
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let breach = breach.expect(
+                "an escaped child's allocation never reached the budget it was supposed to count                  against",
+            );
+            assert_eq!(breach.limit, ProcessLimitKind::Memory.as_str());
+            assert!(breach.observed > CEILING, "{breach:?}");
+            wait_until(
+                || !crate::os_signal::process_is_alive(escapee),
+                "the breach did not reclaim the escaped child that caused it",
+            );
+
+            let _ = root.kill();
+            let _ = root.wait();
+            let _ = std::fs::remove_file(&pid_file);
+            let _ = std::fs::remove_file(&flag);
+        }
     }
 }

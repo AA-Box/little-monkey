@@ -159,6 +159,11 @@ pub fn tree_members_of_any_in(
 
     // Group union. A group id of zero is "no group", never "every ungrouped
     // process on the host".
+    // Only a group a root *leads*. A pgid a root merely belongs to is its
+    // parent's — this app's, for anything spawned without its own group — and
+    // unioning that in would make the owned set every process in this app's own
+    // group. Equality with the root's pid is what tells "the primitive this
+    // workload was given" from "the one it inherited".
     let mut group_ids: BTreeSet<u32> = roots
         .iter()
         .filter_map(|root_pid| {
@@ -166,6 +171,7 @@ pub fn tree_members_of_any_in(
                 .iter()
                 .find(|node| node.pid == *root_pid)
                 .map(|node| node.process_group_id)
+                .filter(|group| group == root_pid)
         })
         .filter(|group| *group != 0)
         .collect();
