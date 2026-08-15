@@ -121,6 +121,18 @@ pub struct PushPrivacySnapshot {
     pub registered_devices: usize,
 }
 
+/// The operator's voice configuration, reduced to the three questions the audit
+/// asks: is anything listening without being asked, is it opt-in, and could
+/// what it hears leave the machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoicePrivacySnapshot {
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    /// True when transcription runs on this machine. False means audio is
+    /// uploaded to a provider the operator configured.
+    pub local_only: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecurityRuntimeSnapshot {
     pub browser_grants: Vec<BrowserGrantSnapshot>,
@@ -145,6 +157,7 @@ pub struct SecurityRuntimeSnapshot {
     /// plain loopback is a reasonable thing to have and an unreasonable thing to
     /// hand a microphone.
     pub transport: Option<TransportSnapshot>,
+    pub voice: Option<VoicePrivacySnapshot>,
 }
 
 /// The advertised transport, reduced to what the device audit asks about.
@@ -219,6 +232,7 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
     audit_paired_devices(&request.runtime, &mut findings);
+    audit_voice_privacy(&request.runtime, &mut findings);
     audit_workspace_skill_root(request.workspace.as_deref(), &mut findings);
     audit_sandbox_enforcement(&mut findings);
 
@@ -1625,6 +1639,88 @@ fn summarize(findings: &[SecurityFinding]) -> SecuritySummary {
     summary
 }
 
+/// The voice surface: a microphone that opens itself, and where what it hears
+/// goes.
+///
+/// **Why this is its own audit rather than a line in the device one.** The
+/// device audit asks what a *phone* was granted. This asks what *this machine*
+/// does on its own — a wake phrase and always-listening are desktop settings,
+/// not grants, and nothing in the grant model would ever surface them. The
+/// combination that matters most is the one neither half sees alone:
+/// always-listening plus a hosted transcription provider is a room whose audio
+/// leaves the machine without anyone pressing anything.
+fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
+    let Some(voice) = &runtime.voice else {
+        return;
+    };
+    if voice.always_listening && !voice.local_only {
+        findings.push(finding(
+            "voice.passive_cloud_upload",
+            "voice",
+            "An always-on microphone is uploading to a provider",
+            "Always-listening is on and transcription is a hosted provider, so audio captured \
+             without anyone pressing anything can leave this machine.",
+            FindingStatus::Critical,
+            false,
+            None,
+            Some(
+                "Either turn always-listening off, or switch transcription to local Whisper in \
+                 Settings → Companion → Voice.",
+            ),
+        ));
+    } else if voice.always_listening {
+        findings.push(finding(
+            "voice.always_listening",
+            "voice",
+            "The microphone is always listening",
+            "This machine listens for a wake phrase continuously. Detection is local and no \
+             audio is uploaded until the phrase is heard, but the microphone is open.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some(
+                "Turn always-listening off in Settings → Companion → Voice when it is not in use.",
+            ),
+        ));
+    } else if voice.wake_phrase_enabled {
+        findings.push(finding(
+            "voice.wake_phrase_enabled",
+            "voice",
+            "A wake phrase is enabled",
+            "The wake phrase is armed but the microphone only opens when Talk is started.",
+            FindingStatus::Info,
+            false,
+            None,
+            None,
+        ));
+    } else {
+        findings.push(finding(
+            "voice.wake_disabled",
+            "voice",
+            "Nothing is listening on its own",
+            "The wake phrase and always-listening are both off; the microphone opens only when \
+             it is pressed.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+    if !voice.local_only {
+        findings.push(finding(
+            "voice.hosted_transcription",
+            "voice",
+            "Speech is transcribed by a hosted provider",
+            "What is said into Talk, the companion overlay and answered calls is uploaded to the \
+             transcription provider configured in Settings.",
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Local Whisper keeps every recording on this machine."),
+        ));
+    }
+}
+
 fn finding(
     id: &str,
     category: &str,
@@ -1720,6 +1816,97 @@ mod tests {
 
     fn has(findings: &[SecurityFinding], id: &str) -> bool {
         findings.iter().any(|finding| finding.id == id)
+    }
+
+    fn voice_findings(voice: Option<VoicePrivacySnapshot>) -> Vec<SecurityFinding> {
+        let mut findings = Vec::new();
+        audit_voice_privacy(
+            &SecurityRuntimeSnapshot {
+                voice,
+                ..SecurityRuntimeSnapshot::default()
+            },
+            &mut findings,
+        );
+        findings
+    }
+
+    /// The voice surface graded by what it can actually do, worst case first.
+    ///
+    /// The combination the operator most needs named is always-listening plus a
+    /// hosted transcription backend: neither is alarming alone, and together
+    /// they are a microphone that uploads a room nobody opened.
+    #[test]
+    fn the_doctor_grades_always_listening_by_where_the_audio_goes() {
+        let leaking = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: false,
+        }));
+        assert!(has(&leaking, "voice.passive_cloud_upload"));
+        assert_eq!(
+            leaking
+                .iter()
+                .find(|finding| finding.id == "voice.passive_cloud_upload")
+                .unwrap()
+                .status,
+            FindingStatus::Critical
+        );
+
+        // The same setting, kept on this machine, is a warning rather than a
+        // critical: the microphone is open, but nothing leaves.
+        let local = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: true,
+        }));
+        assert!(has(&local, "voice.always_listening"));
+        assert!(!has(&local, "voice.passive_cloud_upload"));
+        assert!(!has(&local, "voice.hosted_transcription"));
+
+        // Armed but not listening, and the default: neither is a problem, and
+        // both are stated rather than left silent.
+        let armed = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&armed, "voice.wake_phrase_enabled"));
+        let quiet = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: false,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&quiet, "voice.wake_disabled"));
+        assert_eq!(quiet[0].status, FindingStatus::Pass);
+
+        // Nothing observed says nothing, rather than claiming the microphone is
+        // quiet on evidence it does not have.
+        assert!(voice_findings(None).is_empty());
+    }
+
+    /// An open Talk socket is a running `voice_stream` command, so the device
+    /// audit already names it. This pins that, because the property is what
+    /// makes "an unexpected active stream" visible at all.
+    #[test]
+    fn a_live_voice_stream_is_reported_as_a_capture_in_flight() {
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![device("phone", &["voice_stream"], Some(now_ms()))],
+            device_commands: vec![DeviceCommandSnapshot {
+                command_id: "cmd-1".into(),
+                device_id: "device-phone".into(),
+                capability: "voice_stream".into(),
+                state: "running".into(),
+            }],
+            ..SecurityRuntimeSnapshot::default()
+        });
+        let in_flight = findings
+            .iter()
+            .find(|finding| finding.id == "devices.capture_in_flight")
+            .expect("a running stream is named");
+        assert_eq!(in_flight.status, FindingStatus::Critical);
+        assert!(in_flight.detail.contains("voice_stream"));
+        assert!(has(&findings, "devices.intimate_grant"));
     }
 
     /// The four things an operator most needs told about a phone they granted
