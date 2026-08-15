@@ -31,11 +31,11 @@ use crate::AppState;
 /// Hard wall-clock ceiling for one hook execution — a hook is glue, not a
 /// build step; anything slower is treated as hung (`timed_out: true`) and
 /// the frontend proceeds as if the hook had not answered.
-const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Per-stream capture ceiling (bytes). A hook's stdout is a decision payload
 /// or a short context block, never a log dump.
-const HOOK_OUTPUT_CAP: usize = 64 * 1024;
+pub(crate) const HOOK_OUTPUT_CAP: usize = 64 * 1024;
 
 /// What one hook execution produced. `exit_code: None` means the process
 /// was killed (timeout) or died to a signal — the frontend treats anything

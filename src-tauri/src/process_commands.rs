@@ -886,7 +886,7 @@ const WALL_NOT_FINAL: &str = "this process has not exited, so its wall time is n
 
 /// Whether this kind's OS process tree is owned by a [`ResourceController`].
 ///
-/// The three that own one. Everything else either runs inside the WebView or
+/// The six that own one. Everything else either runs inside the WebView or
 /// delegates to a child that carries its own record, and asking a controller
 /// about it would produce a host answer for a process no controller holds.
 ///
@@ -894,7 +894,12 @@ const WALL_NOT_FINAL: &str = "this process has not exited, so its wall time is n
 fn is_controller_owned(kind: ProcessKind) -> bool {
     matches!(
         kind,
-        ProcessKind::ForegroundShell | ProcessKind::BackgroundShell | ProcessKind::BrowserSession
+        ProcessKind::ForegroundShell
+            | ProcessKind::BackgroundShell
+            | ProcessKind::BrowserSession
+            | ProcessKind::VerifyCommand
+            | ProcessKind::HookCommand
+            | ProcessKind::SandboxRun
     )
 }
 
@@ -1508,6 +1513,9 @@ mod restart_semantics {
             native_pid,
             native_start_time,
             limits: ProcessKind::ForegroundShell.default_limits(),
+            containment: None,
+            usage: None,
+            usage_sampled_at_ms: None,
             signal_intent: SignalIntent::default(),
             signal_reason: None,
             signal_requested_at_ms: None,

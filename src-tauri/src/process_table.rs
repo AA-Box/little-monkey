@@ -93,6 +93,20 @@ pub enum ProcessKind {
     /// that the startup sweep could collect the profile directory of but never
     /// kill.
     BrowserSession,
+    /// One stored verification command (`verify.rs`) — a build or a test run,
+    /// started after an edit.
+    ///
+    /// The three kinds below are the same shape as [`Self::ForegroundShell`] and
+    /// were bounded by the same controller before they had a row: the limit was
+    /// installed, the tree was reclaimed, and none of it was visible. A limit
+    /// that fires on a verify command was reported in that command's own result
+    /// and nowhere a reader could find it afterwards, so "what did the agent run
+    /// on this machine, and what held it" had three blind spots.
+    VerifyCommand,
+    /// One user-authored lifecycle hook (`hooks.rs`).
+    HookCommand,
+    /// One disposable-copy Sandbox panel run (`sandbox.rs`).
+    SandboxRun,
 }
 
 /// The wall-clock budget the four WebView kinds carry by default.
@@ -207,6 +221,9 @@ impl ProcessKind {
             ProcessKind::ForegroundShell => "foreground_shell",
             ProcessKind::SideTask => "side_task",
             ProcessKind::BrowserSession => "browser_session",
+            ProcessKind::VerifyCommand => "verify_command",
+            ProcessKind::HookCommand => "hook_command",
+            ProcessKind::SandboxRun => "sandbox_run",
         }
     }
 
@@ -226,6 +243,9 @@ impl ProcessKind {
             ProcessKind::ForegroundShell => "fgsh",
             ProcessKind::SideTask => "side",
             ProcessKind::BrowserSession => "browser",
+            ProcessKind::VerifyCommand => "vfy",
+            ProcessKind::HookCommand => "hook",
+            ProcessKind::SandboxRun => "sbx",
         }
     }
 
@@ -242,6 +262,9 @@ impl ProcessKind {
             "foreground_shell" => ProcessKind::ForegroundShell,
             "side_task" => ProcessKind::SideTask,
             "browser_session" => ProcessKind::BrowserSession,
+            "verify_command" => ProcessKind::VerifyCommand,
+            "hook_command" => ProcessKind::HookCommand,
+            "sandbox_run" => ProcessKind::SandboxRun,
             other => {
                 return Err(ProcessTableError::UnknownKind {
                     kind: other.to_string(),
@@ -275,6 +298,13 @@ impl ProcessKind {
         // for this kind alone the reap has something to kill first: see
         // [`crate::browser_worker::reclaim_orphaned_browser_sessions`].
         ProcessKind::BrowserSession,
+        // The three bounded executions a turn blocks on. Each is started by this
+        // app and dies with it when teardown runs; the reap is what covers the
+        // crash, and like the shells they carry a durable containment identity
+        // the reclaim can still reach.
+        ProcessKind::VerifyCommand,
+        ProcessKind::HookCommand,
+        ProcessKind::SandboxRun,
     ];
 
     /// Kinds that record their host's pid, and are therefore swept by whether
@@ -338,7 +368,14 @@ impl ProcessKind {
             // and re-running it from out here would repeat a side effect the
             // model never asked for twice.
             | ProcessKind::ForegroundShell
-            | ProcessKind::SideTask => RestartPolicy::Never,
+            | ProcessKind::SideTask
+            // A verify command, a hook and a sandbox run are each one caller's
+            // tool call. Re-running one from out here would repeat a side effect
+            // — a formatter rewriting files, a build publishing artifacts — that
+            // nobody asked for twice.
+            | ProcessKind::VerifyCommand
+            | ProcessKind::HookCommand
+            | ProcessKind::SandboxRun => RestartPolicy::Never,
             // A browser session is a *tool call's* resource, not work in its own
             // right: relaunching Chromium would restore a blank profile with no
             // navigation history and no grant, which is not the session that was
@@ -441,7 +478,14 @@ impl ProcessKind {
             // `Enforced` means. A background shell is still spawned to outlive
             // its turn, so its class default states no wall bound; a caller that
             // sets one now gets it.
-            (K::BackgroundShell | K::ForegroundShell, L::Wall) => E::Enforced(
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::Wall,
+            ) => E::Enforced(
                 "the resource controller's sampling loop compares elapsed time against this \
                  row's `max_wall_ms` and terminates the whole owned tree",
             ),
@@ -465,7 +509,14 @@ impl ProcessKind {
             // supervised sum over the owned tree everywhere else. All three
             // measure the *tree*, so a shell whose grandchild holds the memory is
             // bounded by the number on this row.
-            (K::BackgroundShell | K::ForegroundShell, L::Memory) => E::Enforced(
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::Memory,
+            ) => E::Enforced(
                 "the resource controller bounds the owned process tree at this row's \
                  `max_memory_bytes`, kernel-held where the host offers a mechanism and \
                  supervised otherwise",
@@ -489,10 +540,12 @@ impl ProcessKind {
                 "the in-memory tail is front-truncated at this many bytes by \
                  `background_shell`",
             ),
-            (K::ForegroundShell, L::Output) => E::Enforced(
-                "both pipes are drained concurrently into a buffer front-truncated at this \
+            (K::ForegroundShell | K::VerifyCommand | K::HookCommand | K::SandboxRun, L::Output) => {
+                E::Enforced(
+                    "both pipes are drained concurrently into a buffer front-truncated at this \
                  many bytes, so the bound holds while the child is still producing",
-            ),
+                )
+            }
             (K::DaemonJob, L::Output) => E::OwnerSourced(
                 "the daemon watchdog enforces the recipe's own `max_log_bytes` against the \
                  job's log file",
@@ -518,7 +571,14 @@ impl ProcessKind {
             // supervised count of the owned tree's live members. None of them is
             // `RLIMIT_NPROC`, which counts per real uid and so fires whenever the
             // logged-in user's own session is busy.
-            (K::BackgroundShell | K::ForegroundShell, L::ChildProcesses) => E::Enforced(
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::ChildProcesses,
+            ) => E::Enforced(
                 "the resource controller counts the owned tree's live members against this \
                  row's `max_child_processes`, per tree rather than per uid",
             ),
@@ -547,7 +607,10 @@ impl ProcessKind {
                 | K::RemoteRun
                 | K::BackgroundShell
                 | K::ForegroundShell
-                | K::BrowserSession,
+                | K::BrowserSession
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
                 L::ContextTokens,
             ) => E::Unavailable(NO_MODEL_REQUEST),
         }
@@ -575,6 +638,20 @@ impl ProcessKind {
                 "a remote run records the request, not the work: it owns no process of its \
                  own and is closed as soon as the job is queued; signal the daemon job it \
                  spawned, which is its child in this table",
+            ),
+            // These three own a real tree and their controller can reclaim it —
+            // what is missing is a *deliverer*: nothing reads the durable latch
+            // between the spawn and the wait, because each is a single blocking
+            // call inside the turn that started it. Refused with the target that
+            // does work rather than downgraded to a `Stop` that lands nowhere,
+            // which is the same rule `workflow_node` is held to.
+            (
+                K::VerifyCommand | K::HookCommand | K::SandboxRun,
+                S::Kill | S::Suspend | S::Resume,
+            ) => SignalSupport::Refused(
+                "this execution is one blocking step of the turn that started it, and nothing \
+                 reads a signal latch while it runs; stop that turn instead, which cancels the \
+                 command and reclaims its whole tree",
             ),
             (_, S::Kill) => SignalSupport::Refused(
                 "this kind owns no OS process to terminate; stop it instead, which winds it \
@@ -635,6 +712,9 @@ impl ProcessKind {
         ProcessKind::ForegroundShell,
         ProcessKind::SideTask,
         ProcessKind::BrowserSession,
+        ProcessKind::VerifyCommand,
+        ProcessKind::HookCommand,
+        ProcessKind::SandboxRun,
     ];
 
     /// The bounds a process of this kind is *actually* subject to, seeded into
@@ -770,6 +850,44 @@ impl ProcessKind {
                 max_child_processes: Some(BROWSER_PROCESS_BUDGET),
                 ..ProcessLimits::default()
             },
+            // The three bounded executions. Each already ran under the shell's
+            // tree bounds plus a deadline and an output cap of its own; what was
+            // missing was a row to state them on, so the numbers are referenced
+            // from the modules that enforce them rather than copied — a
+            // declaration that can drift from its enforcement is the failure this
+            // whole matrix exists to prevent.
+            ProcessKind::VerifyCommand => ProcessLimits {
+                max_wall_ms: Some(crate::verify::DEFAULT_VERIFY_TIMEOUT_SECS * 1_000),
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::verify::VERIFY_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
+            ProcessKind::HookCommand => ProcessLimits {
+                max_wall_ms: Some(
+                    u64::try_from(crate::hooks::HOOK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                ),
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::hooks::HOOK_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
+            // No class wall bound: a sandbox run's deadline is chosen per run by
+            // the caller and always supplied, so a number here would be a second
+            // default that never applies.
+            ProcessKind::SandboxRun => ProcessLimits {
+                max_wall_ms: None,
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::sandbox::SANDBOX_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
         }
     }
 }
@@ -855,6 +973,20 @@ pub enum ExitStatus {
     Lost,
     /// Ended with external effects that could not be safely undone.
     NeedsReconciliation,
+    /// The row had to be closed and **nothing proved the work was gone**.
+    ///
+    /// Deliberately not [`Self::Lost`], which asserts a fact: a lost process is
+    /// one whose worker demonstrably went away. This one asserts the absence of a
+    /// fact — a restart found a row whose containment identity could not be
+    /// validated, or could be validated and would not empty, so the app stopped
+    /// tracking a workload that may still be executing.
+    ///
+    /// The distinction is the whole point. Overloading `Lost` to mean "we stopped
+    /// looking" is what turns a process table into a record of what the app
+    /// believes rather than of what happened, and a reader auditing a machine
+    /// after a crash needs to be able to tell "confirmed dead" from "ownership
+    /// could not be recovered".
+    ContainmentLost,
 }
 
 impl ExitStatus {
@@ -866,6 +998,7 @@ impl ExitStatus {
             ExitStatus::LimitExceeded => "limit_exceeded",
             ExitStatus::Lost => "lost",
             ExitStatus::NeedsReconciliation => "needs_reconciliation",
+            ExitStatus::ContainmentLost => "containment_lost",
         }
     }
 
@@ -877,6 +1010,7 @@ impl ExitStatus {
             "limit_exceeded" => ExitStatus::LimitExceeded,
             "lost" => ExitStatus::Lost,
             "needs_reconciliation" => ExitStatus::NeedsReconciliation,
+            "containment_lost" => ExitStatus::ContainmentLost,
             other => {
                 return Err(ProcessTableError::UnknownExitStatus {
                     status: other.to_string(),
@@ -1286,6 +1420,22 @@ pub struct ProcessRecord {
     #[serde(default)]
     pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
+    /// The mechanism that actually enforced this process, recorded when it was
+    /// attached rather than derived from the host reading the row.
+    ///
+    /// `None` for a kind that owns no OS process tree, and on a row written
+    /// before V23. Never re-derived: the whole point is that a row read on a
+    /// different machine, or on the same machine after its delegation changed,
+    /// still names what held *this* process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<crate::resource_control::Containment>,
+    /// The most recent measurement of the owned tree, with the peaks it has
+    /// reached. `None` where nothing sampled it — never a zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::resource_control::ResourceSample>,
+    /// When that measurement was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_sampled_at_ms: Option<i64>,
     /// Durable signal intent. Survives a restart, unlike the in-memory
     /// `AbortController`/`CancellationToken` each kind used before, and is
     /// readable by a worker in another process — which is what makes an
@@ -1630,6 +1780,20 @@ pub struct ProcessProjection {
     pub native_pid: Option<i64>,
     pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
+    /// What is holding this process, as its own controller reported it.
+    ///
+    /// Written once, when the workload is attached, and never recomputed: see
+    /// [`crate::resource_control::Containment`] for why a host answer derived at
+    /// read time is the wrong answer for a row that outlives its host.
+    pub containment: Option<crate::resource_control::Containment>,
+    /// The most recent measurement of the owned tree.
+    ///
+    /// Overwritten on every sample rather than appended, because this answers
+    /// "what is it holding *now*" — the history question is the resource
+    /// ledger's, and duplicating it here would be a second series to disagree
+    /// with. Peaks travel inside the sample, so a row that stops being sampled
+    /// keeps the highest value anything ever saw.
+    pub usage: Option<crate::resource_control::ResourceSample>,
 }
 
 impl ProcessProjection {
@@ -1645,6 +1809,8 @@ impl ProcessProjection {
             profile: None,
             native_pid: None,
             native_start_time: None,
+            containment: None,
+            usage: None,
             // Same seeding as `AdmitProcess::new`, and it has to be here too:
             // `reconcile` admits through a projection, so a kind whose only
             // adopter projects (every desktop kind) would otherwise never pick up
@@ -1702,6 +1868,21 @@ impl ProcessProjection {
 
     pub fn with_limits(mut self, limits: ProcessLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Record what actually holds this process, from its own controller.
+    pub fn with_containment(
+        mut self,
+        containment: Option<crate::resource_control::Containment>,
+    ) -> Self {
+        self.containment = containment;
+        self
+    }
+
+    /// Record the latest measurement of the owned tree.
+    pub fn with_usage(mut self, usage: Option<crate::resource_control::ResourceSample>) -> Self {
+        self.usage = usage;
         self
     }
 }
@@ -2843,6 +3024,100 @@ impl<'a> ProcessTable<'a> {
         Ok(())
     }
 
+    /// Record what is holding this process, once its controller has attached it.
+    ///
+    /// Write-once in practice and idempotent by construction: a controller's
+    /// answer does not change over a process's life, and a caller that projects
+    /// on a timer must not rewrite the row on every tick. It is a plain
+    /// overwrite rather than a `COALESCE` because the one case that *does*
+    /// rewrite it is real — a spawn that fell back to the supervisor after the
+    /// row was admitted — and the later answer is the true one.
+    pub fn set_containment(
+        &self,
+        process_id: &str,
+        containment: &crate::resource_control::Containment,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let enforcement = serde_json::to_string(&containment.enforcement).map_err(|error| {
+            ProcessTableError::InvalidField {
+                field: "resource_enforcement_json",
+                reason: error.to_string(),
+            }
+        })?;
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET resource_backend = ?2,
+                    resource_tree_primitive = ?3,
+                    resource_scope = ?4,
+                    resource_enforcement_json = ?5,
+                    updated_at_ms = ?6
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                containment.backend,
+                containment.tree_primitive,
+                containment.scope,
+                enforcement,
+                now_ms,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Record the latest measurement of the owned tree.
+    ///
+    /// Peaks are folded in SQL with `MAX` rather than trusted from the caller, so
+    /// a controller that is rebuilt mid-life — or a second writer that only knows
+    /// the current value — cannot lower a peak the row already reached. The
+    /// current values are plain overwrites, which is what "current" means.
+    ///
+    /// Wall time is deliberately not stored: it is `now - started_at_ms` for a
+    /// live row and `exited_at_ms - started_at_ms` for a finished one, both of
+    /// which the row already carries. A third copy would be a number to disagree
+    /// with the other two.
+    pub fn set_tree_usage(
+        &self,
+        process_id: &str,
+        sample: &crate::resource_control::ResourceSample,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET tree_rss_bytes = ?2,
+                    tree_peak_rss_bytes = MAX(COALESCE(tree_peak_rss_bytes, 0), COALESCE(?3, 0)),
+                    tree_process_count = ?4,
+                    tree_peak_process_count =
+                        MAX(COALESCE(tree_peak_process_count, 0), COALESCE(?5, 0)),
+                    tree_output_bytes = COALESCE(?6, tree_output_bytes),
+                    tree_sampled_at_ms = ?7,
+                    updated_at_ms = ?7
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                to_sql_u64(sample.rss_bytes),
+                to_sql_u64(sample.peak_rss_bytes.or(sample.rss_bytes)),
+                sample.process_count.map(i64::from),
+                sample
+                    .peak_process_count
+                    .or(sample.process_count)
+                    .map(i64::from),
+                to_sql_u64(sample.output_bytes),
+                now_ms,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Apply a [`ProcessProjection`] idempotently.
     ///
     /// This is the single find-or-admit-then-transition implementation. Every
@@ -2918,6 +3193,18 @@ impl<'a> ProcessTable<'a> {
                 projection.native_start_time,
                 now_ms,
             )?;
+        }
+        // Written before the transition below, so a projection that both attaches
+        // and exits — a command that finished inside one tick — still records what
+        // held it. The close-out reads the row back, and a row that gains its
+        // containment afterwards would have been closed without it.
+        if let Some(containment) = projection.containment.as_ref() {
+            if record.containment.as_ref() != Some(containment) {
+                self.set_containment(&record.process_id, containment, now_ms)?;
+            }
+        }
+        if let Some(sample) = projection.usage.as_ref() {
+            self.set_tree_usage(&record.process_id, sample, now_ms)?;
         }
 
         if record.state == projection.state {
@@ -3639,7 +3926,10 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
      signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens, \
      limit_kind, limit_configured, limit_observed, limit_backend, limit_level, \
-     limit_observed_at_ms, limit_evidence, native_start_time \
+     limit_observed_at_ms, limit_evidence, native_start_time, \
+     resource_backend, resource_tree_primitive, resource_scope, resource_enforcement_json, \
+     tree_rss_bytes, tree_peak_rss_bytes, tree_process_count, tree_peak_process_count, \
+     tree_output_bytes, tree_sampled_at_ms \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -3828,6 +4118,42 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
         None => None,
     };
 
+    // The mechanism that held *this* process, as its own controller reported it
+    // — read back rather than recomputed from the host doing the reading. A
+    // stored enforcement map that will not parse is dropped rather than guessed
+    // at: an invented capability would say a limit was kernel-held when nothing
+    // knows whether it was.
+    let containment = match row.get::<_, Option<String>>(35)? {
+        Some(backend) => Some(crate::resource_control::Containment {
+            backend,
+            tree_primitive: row.get::<_, Option<String>>(36)?.unwrap_or_default(),
+            scope: row.get(37)?,
+            enforcement: row
+                .get::<_, Option<String>>(38)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+        }),
+        None => None,
+    };
+
+    // Read as a group with `wall_ms`, because that is the one field of a sample
+    // that is always measurable: a row with a sample stamp has been measured, and
+    // a row without one has not. Every other field stays `Option`, so a backend
+    // that measures nothing reports nothing rather than zero.
+    let usage_sampled_at_ms: Option<i64> = row.get(44)?;
+    let usage = usage_sampled_at_ms
+        .map(|_| -> rusqlite::Result<_> {
+            Ok(crate::resource_control::ResourceSample {
+                wall_ms: 0,
+                rss_bytes: row.get::<_, Option<i64>>(39)?.map(|v| v as u64),
+                peak_rss_bytes: row.get::<_, Option<i64>>(40)?.map(|v| v as u64),
+                process_count: row.get::<_, Option<i64>>(41)?.map(|v| v as u32),
+                peak_process_count: row.get::<_, Option<i64>>(42)?.map(|v| v as u32),
+                output_bytes: row.get::<_, Option<i64>>(43)?.map(|v| v as u64),
+            })
+        })
+        .transpose()?;
+
     Ok(Ok(ProcessRecord {
         process_id: row.get(0)?,
         parent_process_id: row.get(1)?,
@@ -3848,6 +4174,9 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
             // index above stays where it was.
             max_context_tokens: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
         },
+        containment,
+        usage,
+        usage_sampled_at_ms,
         exit,
         signal_intent: SignalIntent {
             stop_requested: row.get::<_, i64>(21)? != 0,
@@ -4867,7 +5196,10 @@ mod tests {
                 ProcessKind::BackgroundShell,
                 ProcessKind::ForegroundShell,
                 ProcessKind::SideTask,
-                ProcessKind::BrowserSession
+                ProcessKind::BrowserSession,
+                ProcessKind::VerifyCommand,
+                ProcessKind::HookCommand,
+                ProcessKind::SandboxRun
             ],
             "a kind gained or lost a class-level bound; if that is intended, the \
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
@@ -6346,6 +6678,15 @@ mod tests {
             }
             ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
             ProcessKind::BrowserSession => "browser_worker.rs — OwnedBrowser::project",
+            ProcessKind::VerifyCommand => {
+                "verify.rs — run_command_impl, through bounded_execution::BoundedExecution"
+            }
+            ProcessKind::HookCommand => {
+                "hooks.rs — hook_exec, through bounded_execution::BoundedExecution"
+            }
+            ProcessKind::SandboxRun => {
+                "sandbox.rs — execute_in_sandbox, through bounded_execution::BoundedExecution"
+            }
         }
     }
 
@@ -6884,7 +7225,7 @@ mod tests {
         // the_same_kinds` is the half that says *which* kind is missing.
         assert_eq!(
             ProcessKind::ALL.len(),
-            11,
+            14,
             "ProcessKind::ALL is out of sync with the enum"
         );
     }
@@ -7021,6 +7362,9 @@ mod tests {
                 ProcessKind::BackgroundShell
                     | ProcessKind::ForegroundShell
                     | ProcessKind::BrowserSession
+                    | ProcessKind::VerifyCommand
+                    | ProcessKind::HookCommand
+                    | ProcessKind::SandboxRun
             );
             assert_eq!(
                 kind.limit_support(ProcessLimitKind::ChildProcesses)

@@ -212,9 +212,11 @@ const MIGRATION_V21: i64 = 21;
 const MIGRATION_V21_CHECKSUM: &str = "foreground-shell-and-limit-breach-v21-2026-08-14";
 const MIGRATION_V22: i64 = 22;
 const MIGRATION_V22_CHECKSUM: &str = "native-process-identity-v22-2026-08-14";
+const MIGRATION_V23: i64 = 23;
+const MIGRATION_V23_CHECKSUM: &str = "recorded-containment-and-tree-usage-v23-2026-08-15";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V22;
+const SCHEMA_VERSION: i64 = MIGRATION_V23;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -2264,6 +2266,18 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V22_CHECKSUM,
         Compatibility::Additive,
     ),
+    // Breaking for V18's and V21's reason a third time: it widens
+    // `agent_processes.kind` to admit `verify_command`, `hook_command` and
+    // `sandbox_run`, and `exit_status` to admit `containment_lost`. A V22 binary's
+    // `ProcessKind::parse` and `ExitStatus::parse` both reject a code they do not
+    // know, so a database carrying any of the four would fail that binary's every
+    // `list`/`get` rather than degrade. The ten containment and tree-usage columns
+    // beside them are additive on their own.
+    (
+        MIGRATION_V23,
+        MIGRATION_V23_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2956,6 +2970,43 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V22_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V22)
+            ],
+        )?;
+    }
+
+    let has_v23 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V23],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v23 {
+        // The same probe as V18's, V20's and V21's: this widens two `CHECK`s as
+        // well as adding columns, so the table's own DDL is the only thing that
+        // can say whether the rebuild already ran.
+        let already_wide = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%verify_command%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_wide {
+            transaction.execute_batch(MIGRATION_V23_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V23,
+                MIGRATION_V23_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V23)
             ],
         )?;
     }
@@ -3884,6 +3935,217 @@ ALTER TABLE agent_processes ADD COLUMN max_context_tokens INTEGER
 const MIGRATION_V22_SQL: &str = r#"
 ALTER TABLE agent_processes ADD COLUMN native_start_time INTEGER
     CHECK (native_start_time IS NULL OR native_start_time >= 0);
+"#;
+
+/// A process row records the mechanism that actually held it, and what that
+/// mechanism measured while it ran (roadmap K4).
+///
+/// Three changes that have to travel together because all three need the table
+/// rebuilt.
+///
+/// **Three kinds.** The verify runner, the hook runner and the disposable-copy
+/// sandbox run were bounded by the same `ResourceController` as an agent shell
+/// and had no row at all, so a limit that fired on one was reported in that
+/// command's own result and nowhere the processes ledger could show it. They are
+/// the last agent-controlled native executions with no lifecycle.
+///
+/// **`containment_lost`.** Startup reconciliation used to close every row it
+/// could not account for as `lost`, which asserts that the work went away. When
+/// the containment identity cannot be validated, or can be and will not empty,
+/// nothing has been established except that this app stopped tracking a workload.
+/// Those are different facts and a machine's operator needs to tell them apart,
+/// so the second one gets its own status rather than borrowing the first's.
+///
+/// **Ten columns.** The report a reader gets for a finished process used to be
+/// assembled from what the *current* host would do for a *new* process: a
+/// workload the Linux kernel had held read back as `supervisor` on a Mac, or on
+/// the same Linux box after its delegation changed. `resource_backend`,
+/// `resource_tree_primitive` and `resource_enforcement_json` are that answer
+/// recorded when the workload was attached, so the row says what enforced it
+/// rather than what would enforce something else today. `resource_scope` is the
+/// durable handle a later session can re-find the workload by — a cgroup path
+/// that is still enforcing after a crash, a process group, a Windows job — and is
+/// validated on the way back in rather than trusted. The five `tree_*` columns
+/// are the controller's own measurement, current and peak, so the panel can show
+/// what a live process is holding instead of only what it held at the end.
+const MIGRATION_V23_SQL: &str = r#"
+CREATE TABLE agent_processes_v23 (
+    process_id TEXT PRIMARY KEY,
+    parent_process_id TEXT REFERENCES agent_processes_v23(process_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'chat_turn', 'daemon_job', 'subagent', 'crew_member', 'workflow_run',
+        'workflow_node', 'remote_run', 'background_shell', 'side_task',
+        'browser_session', 'foreground_shell',
+        'verify_command', 'hook_command', 'sandbox_run'
+    )),
+    external_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'suspended', 'exited')),
+    run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    workspace TEXT,
+    profile TEXT,
+    native_pid INTEGER,
+    native_start_time INTEGER CHECK (native_start_time IS NULL OR native_start_time >= 0),
+    max_wall_ms INTEGER CHECK (max_wall_ms IS NULL OR max_wall_ms > 0),
+    max_memory_bytes INTEGER CHECK (max_memory_bytes IS NULL OR max_memory_bytes > 0),
+    max_output_bytes INTEGER CHECK (max_output_bytes IS NULL OR max_output_bytes > 0),
+    max_child_processes INTEGER CHECK (max_child_processes IS NULL OR max_child_processes > 0),
+    exit_status TEXT CHECK (exit_status IS NULL OR exit_status IN (
+        'succeeded', 'failed', 'cancelled', 'limit_exceeded', 'lost',
+        'needs_reconciliation', 'containment_lost'
+    )),
+    exit_code INTEGER,
+    exit_signal TEXT,
+    exit_reason TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    started_at_ms INTEGER CHECK (started_at_ms IS NULL OR started_at_ms > 0),
+    exited_at_ms INTEGER CHECK (exited_at_ms IS NULL OR exited_at_ms > 0),
+    stop_requested INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+    suspend_requested INTEGER NOT NULL DEFAULT 0 CHECK (suspend_requested IN (0, 1)),
+    signal_reason TEXT,
+    signal_requested_at_ms INTEGER
+        CHECK (signal_requested_at_ms IS NULL OR signal_requested_at_ms > 0),
+    kill_requested INTEGER NOT NULL DEFAULT 0 CHECK (kill_requested IN (0, 1)),
+    cpu_time_ms INTEGER CHECK (cpu_time_ms IS NULL OR cpu_time_ms >= 0),
+    peak_rss_bytes INTEGER CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0),
+    bytes_read INTEGER CHECK (bytes_read IS NULL OR bytes_read >= 0),
+    bytes_written INTEGER CHECK (bytes_written IS NULL OR bytes_written >= 0),
+    bytes_egressed INTEGER CHECK (bytes_egressed IS NULL OR bytes_egressed >= 0),
+    tokens_in INTEGER CHECK (tokens_in IS NULL OR tokens_in >= 0),
+    tokens_out INTEGER CHECK (tokens_out IS NULL OR tokens_out >= 0),
+    gpu_resident_bytes INTEGER CHECK (gpu_resident_bytes IS NULL OR gpu_resident_bytes >= 0),
+    gpu_device_ms INTEGER CHECK (gpu_device_ms IS NULL OR gpu_device_ms >= 0),
+    usage_unavailable_json TEXT,
+    egress_destinations_dropped INTEGER
+        CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0),
+    context_tokens_reused INTEGER
+        CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0),
+    max_context_tokens INTEGER CHECK (max_context_tokens IS NULL OR max_context_tokens > 0),
+    context_tokens_evaluated INTEGER
+        CHECK (context_tokens_evaluated IS NULL OR context_tokens_evaluated >= 0),
+    limit_kind TEXT CHECK (limit_kind IS NULL OR limit_kind IN (
+        'max_wall_ms', 'max_memory_bytes', 'max_output_bytes',
+        'max_child_processes', 'max_context_tokens'
+    )),
+    limit_configured INTEGER CHECK (limit_configured IS NULL OR limit_configured > 0),
+    limit_observed INTEGER CHECK (limit_observed IS NULL OR limit_observed >= 0),
+    limit_backend TEXT,
+    limit_level TEXT CHECK (limit_level IS NULL OR limit_level IN
+        ('kernel', 'supervised', 'owner-sourced')),
+    limit_observed_at_ms INTEGER
+        CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
+    limit_evidence TEXT,
+    -- What held *this* process. `resource_backend` is the queryable projection of
+    -- the same answer `resource_enforcement_json` carries per limit; the JSON is
+    -- where the named mechanism lives, and a name is what makes a claim checkable.
+    resource_backend TEXT,
+    resource_tree_primitive TEXT,
+    -- The durable handle, schemed so a reader can tell a cgroup path from a pid:
+    -- `cgroup2:<path>`, `pgroup:<pgid>`, `windows-job`. Never acted on without
+    -- being re-validated — see `ContainmentScope::parse`.
+    resource_scope TEXT,
+    resource_enforcement_json TEXT,
+    -- The controller's own measurement of the owned tree. Current and peak are
+    -- both kept because they answer different questions, and both are NULL rather
+    -- than 0 where a backend does not measure: a watchdog comparing a fabricated
+    -- zero against a budget is satisfied forever.
+    tree_rss_bytes INTEGER CHECK (tree_rss_bytes IS NULL OR tree_rss_bytes >= 0),
+    tree_peak_rss_bytes INTEGER CHECK (tree_peak_rss_bytes IS NULL OR tree_peak_rss_bytes >= 0),
+    tree_process_count INTEGER CHECK (tree_process_count IS NULL OR tree_process_count >= 0),
+    tree_peak_process_count INTEGER
+        CHECK (tree_peak_process_count IS NULL OR tree_peak_process_count >= 0),
+    tree_output_bytes INTEGER CHECK (tree_output_bytes IS NULL OR tree_output_bytes >= 0),
+    -- The stamp is what separates "measured, and it was nothing" from "never
+    -- measured": every other column here is meaningless without it.
+    tree_sampled_at_ms INTEGER CHECK (tree_sampled_at_ms IS NULL OR tree_sampled_at_ms > 0),
+    CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
+    CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
+    CHECK ((limit_kind IS NULL) = (limit_configured IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_observed IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_backend IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_level IS NULL)),
+    CHECK (limit_kind IS NULL OR exit_status = 'limit_exceeded'),
+    -- The containment travels as a unit for the breach columns' reason: a
+    -- tree primitive with no backend, or an enforcement map with neither, is a
+    -- partial write that a UI would print as a confident half-truth.
+    CHECK ((resource_backend IS NULL) = (resource_tree_primitive IS NULL)),
+    CHECK (resource_scope IS NULL OR resource_backend IS NOT NULL),
+    CHECK (resource_enforcement_json IS NULL OR resource_backend IS NOT NULL),
+    UNIQUE(kind, external_id)
+) STRICT;
+
+INSERT INTO agent_processes_v23 (
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, native_start_time, max_wall_ms, max_memory_bytes, max_output_bytes,
+    max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms,
+    updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested,
+    signal_reason, signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes,
+    bytes_read, bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes,
+    gpu_device_ms, usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated, limit_kind, limit_configured, limit_observed,
+    limit_backend, limit_level, limit_observed_at_ms, limit_evidence
+)
+SELECT
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, native_start_time, max_wall_ms, max_memory_bytes, max_output_bytes,
+    max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms,
+    updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested,
+    signal_reason, signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes,
+    bytes_read, bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes,
+    gpu_device_ms, usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated, limit_kind, limit_configured, limit_observed,
+    limit_backend, limit_level, limit_observed_at_ms, limit_evidence
+FROM agent_processes;
+
+DROP TABLE agent_processes;
+ALTER TABLE agent_processes_v23 RENAME TO agent_processes;
+
+CREATE INDEX agent_processes_live_idx ON agent_processes(created_at_ms DESC)
+    WHERE state <> 'exited';
+CREATE INDEX agent_processes_kind_idx ON agent_processes(kind, created_at_ms DESC);
+CREATE INDEX agent_processes_parent_idx ON agent_processes(parent_process_id)
+    WHERE parent_process_id IS NOT NULL;
+CREATE INDEX agent_processes_run_idx ON agent_processes(run_id)
+    WHERE run_id IS NOT NULL;
+CREATE INDEX agent_processes_workspace_idx ON agent_processes(workspace, created_at_ms DESC)
+    WHERE workspace IS NOT NULL;
+CREATE INDEX agent_processes_pending_signal_idx ON agent_processes(kind)
+    WHERE state <> 'exited' AND (stop_requested = 1 OR suspend_requested = 1);
+
+CREATE TRIGGER agent_processes_validate_transition
+BEFORE UPDATE OF state ON agent_processes
+WHEN OLD.state <> NEW.state AND NOT (
+       (OLD.state = 'admitted'  AND NEW.state IN ('running', 'exited'))
+    OR (OLD.state = 'running'   AND NEW.state IN ('suspended', 'exited'))
+    OR (OLD.state = 'suspended' AND NEW.state IN ('running', 'exited'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal agent process state transition');
+END;
+
+CREATE TRIGGER agent_processes_forbid_identity_update
+BEFORE UPDATE ON agent_processes
+WHEN OLD.process_id <> NEW.process_id
+  OR OLD.kind <> NEW.kind
+  OR OLD.external_id <> NEW.external_id
+  OR OLD.created_at_ms <> NEW.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent process identity is immutable');
+END;
+
+CREATE TRIGGER agent_processes_kill_implies_stop
+BEFORE UPDATE OF kill_requested ON agent_processes
+WHEN NEW.kill_requested = 1 AND NEW.stop_requested <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'kill_requested implies stop_requested');
+END;
+
+CREATE TRIGGER agent_processes_close_out_states_its_gaps
+BEFORE UPDATE OF state ON agent_processes
+WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
 "#;
 
 const MIGRATION_V21_SQL: &str = r#"
@@ -7280,10 +7542,12 @@ mod tests {
         let required = required_reader_version(&ledger.connection)
             .unwrap()
             .unwrap();
-        // V21 is the newest breaking migration: it widened
-        // `agent_processes.kind` to admit `foreground_shell`, which an older
-        // binary's `ProcessKind::parse` rejects outright rather than ignoring.
-        assert_eq!(required, MIGRATION_V21);
+        // V23 is the newest breaking migration: it widened
+        // `agent_processes.kind` to admit the three bounded-execution kinds and
+        // `exit_status` to admit `containment_lost`, and an older binary's
+        // `ProcessKind::parse`/`ExitStatus::parse` reject a code they do not know
+        // outright rather than ignoring it.
+        assert_eq!(required, MIGRATION_V23);
         assert!(required <= SCHEMA_VERSION);
 
         // No row may be left at the `DEFAULT 1` the ALTER used: that would claim

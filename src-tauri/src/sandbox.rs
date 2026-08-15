@@ -1386,7 +1386,7 @@ fn build_seatbelt_profile_inner(
 /// gigabyte of it. The child is never stopped for producing more — both pipes go
 /// on being drained past the cap — so a chatty run completes normally with the
 /// tail it produced.
-const SANDBOX_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
+pub(crate) const SANDBOX_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
 
 /// What bounds one sandboxed run's process tree, resolved once for every host.
 ///

@@ -182,6 +182,13 @@ impl CgroupScope {
         }))
     }
 
+    /// The scope directory, so a row can record the one handle that outlives
+    /// this app: the kernel keeps enforcing this cgroup after the process which
+    /// created it is gone, and a restart needs to be able to name it.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn capabilities(&self) -> ControllerCapabilities {
         let missing = || {
             self.missing_reason

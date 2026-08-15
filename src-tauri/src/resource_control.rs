@@ -50,7 +50,7 @@ use crate::process_tree::{self, ProcessIdentity};
 /// app promised needs to know whether the promise survives the app. Calling a
 /// supervised bound kernel-enforced is the specific dishonesty this type exists
 /// to make impossible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementLevel {
     /// The kernel holds it and will keep holding it if this app disappears.
@@ -73,7 +73,7 @@ impl EnforcementLevel {
 }
 
 /// What this backend can do about one resource.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum LimitCapability {
     Enforced {
@@ -131,7 +131,7 @@ impl LimitCapability {
 }
 
 /// Everything a caller can ask about what will hold this workload.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControllerCapabilities {
     /// The backend's own name, for the UI and `monkey processes show`.
@@ -301,7 +301,7 @@ impl EffectiveLimits {
 ///
 /// `None` on a field means this backend does not measure it — never zero. A
 /// watchdog comparing `Some(0)` against a budget would be satisfied forever.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceSample {
     pub wall_ms: u64,
@@ -384,6 +384,140 @@ impl LimitBreach {
             Some(evidence) => format!("{base}, reported by {evidence}"),
             None => base,
         }
+    }
+}
+
+/// The handle a **later session** can re-find a workload by.
+///
+/// # Why an identity and not a pid
+///
+/// A pid dies with the record's usefulness: after a restart, `native_pid` plus a
+/// start time proves which *root* process a row named, and nothing at all about
+/// the tree under it. On Linux that tree is held by a kernel object that outlives
+/// this app entirely — a cgroup scope keeps enforcing `memory.max` after the
+/// process that wrote it is gone — and the reclaim had no way to name it, so the
+/// only thing a restart could do was signal a process group and hope.
+///
+/// So the containment names itself, durably, in a form the next session can
+/// validate before acting on. Validation is the load-bearing half:
+/// [`Self::parse`] refuses anything this app could not have created, because the
+/// alternative is a stored string deciding which directory gets `cgroup.kill`
+/// written to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainmentScope {
+    /// A cgroup v2 scope directory, created by this app under a delegated
+    /// subtree. Still holding its bound after a crash, and still killable.
+    CgroupV2(std::path::PathBuf),
+    /// A POSIX process group this workload leads. Proven at attach time by
+    /// asking the kernel, never assumed from having requested one.
+    ProcessGroup(u32),
+    /// A Windows job object. Unnamed, so there is nothing to re-open — recorded
+    /// anyway because *which* mechanism held a workload is the fact a restart
+    /// needs: a job carries `KILL_ON_JOB_CLOSE`, so the tree died with the app
+    /// that held the handle, and that is a proof of absence rather than a gap.
+    WindowsJob,
+}
+
+/// The directory prefix every scope this app creates carries.
+///
+/// Duplicated from `resource_control_cgroup`'s `create` rather than shared,
+/// because the two uses are adversarial: one mints names and the other decides
+/// whether a *stored* name may be acted on. A validator that imported the minting
+/// side would follow it if it ever widened.
+const CGROUP_SCOPE_PREFIX: &str = "little-monkey-";
+
+/// Where cgroup2 is mounted. A stored path outside this is not ours.
+const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
+
+impl ContainmentScope {
+    /// The stored form. Schemed, so a reader can tell a cgroup path from a pid
+    /// without knowing which host wrote it.
+    #[must_use]
+    pub fn as_stored(&self) -> String {
+        match self {
+            ContainmentScope::CgroupV2(path) => format!("cgroup2:{}", path.display()),
+            ContainmentScope::ProcessGroup(pgid) => format!("pgroup:{pgid}"),
+            ContainmentScope::WindowsJob => "windows-job".to_string(),
+        }
+    }
+
+    /// Read a stored scope back, refusing anything this app could not have
+    /// written.
+    ///
+    /// A cgroup path is accepted only when it is absolute, lies under the cgroup2
+    /// mount, has no `..` component, and its final component carries the prefix
+    /// every scope this app mints is named with. Those four together are what
+    /// stands between "reclaim the workload a previous session left" and "write
+    /// `cgroup.kill` into a directory named by a string in a database".
+    #[must_use]
+    pub fn parse(stored: &str) -> Option<Self> {
+        if stored == "windows-job" {
+            return Some(ContainmentScope::WindowsJob);
+        }
+        if let Some(pgid) = stored.strip_prefix("pgroup:") {
+            // 0 is "this process's own group" and 1 is init's; neither is a
+            // workload, and both would be catastrophic to signal.
+            return pgid
+                .parse::<u32>()
+                .ok()
+                .filter(|pgid| *pgid > 1)
+                .map(ContainmentScope::ProcessGroup);
+        }
+        let path = std::path::PathBuf::from(stored.strip_prefix("cgroup2:")?);
+        if !path.is_absolute() || !path.starts_with(CGROUP_MOUNT) {
+            return None;
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        let named_by_us = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CGROUP_SCOPE_PREFIX));
+        named_by_us.then_some(ContainmentScope::CgroupV2(path))
+    }
+}
+
+/// What actually held one process, recorded on its row.
+///
+/// # Why this is stored and not recomputed
+///
+/// "What would this machine use for a new process" and "what enforced *that*
+/// process" are different questions, and the reporting surface answered the first
+/// while claiming the second. A row written on a Linux laptop with a delegated
+/// cgroup, read back on a Mac — or on the same machine after the delegation
+/// changed — reported `supervisor · macOS` for a workload the kernel had held.
+/// The class default and the effective number were durable; the mechanism that
+/// enforced them was not, and it is the part a reader auditing a limit kill most
+/// needs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Containment {
+    /// The controller's own name, as it was on the host that ran this process.
+    pub backend: String,
+    pub tree_primitive: String,
+    /// [`ContainmentScope::as_stored`], when the backend has a durable handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// The per-limit capability the controller reported at spawn, keyed by
+    /// [`ProcessLimitKind::as_str`]. Stored whole rather than as a level per
+    /// column: the *mechanism* string is the part a reader can go and look at.
+    pub enforcement: std::collections::BTreeMap<String, LimitCapability>,
+}
+
+impl Containment {
+    #[must_use]
+    pub fn for_limit(&self, limit: ProcessLimitKind) -> Option<&LimitCapability> {
+        self.enforcement.get(limit.as_str())
+    }
+
+    /// The typed scope, if the stored one still validates.
+    #[must_use]
+    pub fn parsed_scope(&self) -> Option<ContainmentScope> {
+        ContainmentScope::parse(self.scope.as_deref()?)
     }
 }
 
@@ -510,6 +644,62 @@ impl ResourceController {
             #[cfg(windows)]
             Backend::Job(job) => job.capabilities(),
             Backend::Supervisor => supervisor_capabilities(),
+        }
+    }
+
+    /// The durable handle a later session could reclaim this workload by.
+    ///
+    /// `None` until [`Self::attach`] has run for the process-group case, because
+    /// a group is only ours if the kernel says the root leads one — `process_group(0)`
+    /// is a *request*, and recording an unverified pgid would hand a restart a
+    /// number to signal that may belong to somebody else's group.
+    #[must_use]
+    pub fn scope(&self) -> Option<ContainmentScope> {
+        match &self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cgroup(scope) => Some(ContainmentScope::CgroupV2(scope.path().to_path_buf())),
+            #[cfg(windows)]
+            Backend::Job(_) => Some(ContainmentScope::WindowsJob),
+            Backend::Supervisor => self.leading_process_group(),
+        }
+    }
+
+    /// The root's process group, but only where the root actually leads it.
+    #[cfg(unix)]
+    fn leading_process_group(&self) -> Option<ContainmentScope> {
+        let root = self.root?;
+        let pid = libc::pid_t::try_from(root.pid).ok()?;
+        // Safe: a pure query about one pid, with no side effect.
+        let pgid = unsafe { libc::getpgid(pid) };
+        (pgid == pid).then(|| ContainmentScope::ProcessGroup(root.pid))
+    }
+
+    #[cfg(not(unix))]
+    fn leading_process_group(&self) -> Option<ContainmentScope> {
+        // Windows reaches the supervisor only when the job could not be created,
+        // and the parent-link closure it falls back to is not a durable handle:
+        // there is nothing a later session could re-open.
+        None
+    }
+
+    /// Everything a row needs to say what held this process, after the fact.
+    #[must_use]
+    pub fn containment(&self) -> Containment {
+        let capabilities = self.capabilities();
+        let enforcement = ProcessLimitKind::ALL
+            .iter()
+            .map(|limit| {
+                (
+                    limit.as_str().to_string(),
+                    capabilities.for_limit(*limit).clone(),
+                )
+            })
+            .collect();
+        Containment {
+            backend: capabilities.backend,
+            tree_primitive: capabilities.tree_primitive,
+            scope: self.scope().map(|scope| scope.as_stored()),
+            enforcement,
         }
     }
 

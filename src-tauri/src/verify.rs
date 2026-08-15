@@ -47,7 +47,7 @@ const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
 /// Default per-command timeout when `VerifyCommand::timeout_secs` is unset —
 /// generous relative to `tools.rs`'s 120s `SHELL_TIMEOUT`, since test suites
 /// routinely outlive that.
-const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
 
 /// Each of stdout/stderr is tail-capped before ever leaving this module — a
 /// runaway test suite's output must not flood the model's context window.
@@ -56,7 +56,7 @@ const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
 /// [`crate::output_cap`], shared with `tools.rs`'s shell tool, which had no cap at
 /// all. Previously documented as bounding "chars" while measuring `s.len()`, which
 /// is bytes.
-const VERIFY_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
+pub(crate) const VERIFY_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
 
 /// One user-configured verification command.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
