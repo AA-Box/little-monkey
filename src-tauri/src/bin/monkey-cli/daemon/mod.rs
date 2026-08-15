@@ -1759,6 +1759,7 @@ fn project_queue_origin(
                 code: None,
                 signal: None,
                 reason: Some("request accepted; the work continues as its daemon job".to_string()),
+                breach: None,
             },
         ),
         now_ms,

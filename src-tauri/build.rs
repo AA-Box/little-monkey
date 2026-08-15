@@ -29,6 +29,7 @@ fn main() {
         attributes = attributes
             .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
         embed_manifest_for_every_target();
+        reserve_a_unix_sized_main_stack_for_the_cli();
     }
 
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
@@ -68,6 +69,43 @@ fn emit_runtime_digest(staged_directory: &str, env_name: &str) {
             Sha256::digest(bytes)
         );
     }
+}
+
+/// Give `monkey-cli` on Windows the same main-thread stack every other platform
+/// already gives it.
+///
+/// A Windows process's main thread is sized by a field in the PE header, and the
+/// linker's default reserve is **1 MiB**. Unix gives 8 MiB. Nothing in this
+/// binary is recursive, but `Cli::parse()` builds this CLI's whole `clap` command
+/// tree — dozens of subcommands, each contributing inlined argument builders that
+/// an unoptimized build gives their own stack slots — and in a debug build that
+/// construction does not fit in 1 MiB. So *every* `monkey-cli` invocation died on
+/// Windows with `STATUS_STACK_OVERFLOW` (0xc00000fd) before reaching `main`'s
+/// first statement, which is why the crash looked like it belonged to whichever
+/// subcommand CI happened to run — `processes limits`, the only one it ran there
+/// — rather than to the binary.
+///
+/// Reproducible on any host: `(ulimit -s 1024; monkey-cli --version)` overflows
+/// identically, which is what identified the size rather than the subcommand as
+/// the cause.
+///
+/// Raising the reserve rather than restructuring the command tree, because 1 MiB
+/// is the outlier here: the number chosen matches the Unix default, so the three
+/// platforms now agree instead of one of them being a special case that anyone
+/// adding a subcommand has to keep in mind. Reserve is address space, not
+/// committed memory — Windows commits a page at a time as the stack grows — so
+/// this costs nothing at run time.
+#[cfg(windows)]
+fn reserve_a_unix_sized_main_stack_for_the_cli() {
+    const UNIX_DEFAULT_MAIN_STACK_BYTES: usize = 8 * 1024 * 1024;
+    // MSVC's linker takes `/STACK:reserve`; the GNU toolchain's takes
+    // `--stack`. Both mean the same PE header field.
+    let flag = if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        format!("-Wl,--stack,{UNIX_DEFAULT_MAIN_STACK_BYTES}")
+    } else {
+        format!("/STACK:{UNIX_DEFAULT_MAIN_STACK_BYTES}")
+    };
+    println!("cargo:rustc-link-arg-bin=monkey-cli={flag}");
 }
 
 #[cfg(windows)]

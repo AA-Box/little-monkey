@@ -38,7 +38,10 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
+
+use crate::process_table::{ProcessKind, ProcessLimits};
+use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 
 const PRIVATE_HOME: &str = "home";
 const PRIVATE_TMP: &str = "tmp";
@@ -265,10 +268,48 @@ pub(crate) struct ForegroundShell {
     reaped: bool,
     stdout: Option<AsyncShellReader>,
     stderr: Option<AsyncShellReader>,
+    /// What is holding this shell's tree. Owned here rather than by the caller so
+    /// the containment's lifetime is the shell's lifetime: on Windows the job
+    /// handle *is* the containment, and dropping it early would release the tree.
+    controller: ResourceController,
+    native_pid: u32,
     _runtime: ShellRuntime,
 }
 
 impl ForegroundShell {
+    /// What is enforcing each limit on this host, and what is not.
+    pub(crate) fn capabilities(&self) -> crate::resource_control::ControllerCapabilities {
+        self.controller.capabilities()
+    }
+
+    pub(crate) fn effective_limits(&self) -> EffectiveLimits {
+        *self.controller.limits()
+    }
+
+    pub(crate) fn native_pid(&self) -> u32 {
+        self.native_pid
+    }
+
+    /// The `(pid, start_time)` the controller attached to, for the row.
+    pub(crate) fn identity(&self) -> Option<crate::process_tree::ProcessIdentity> {
+        self.controller.root()
+    }
+
+    /// Make what this shell owns durable against the row the caller has just
+    /// written.
+    ///
+    /// Wired here rather than in [`spawn_foreground`] because the row does not
+    /// exist yet at spawn time: the caller mints the external id and projects it
+    /// afterwards, so this is the first moment the ownership has somewhere to go.
+    /// Everything the supervisor has already captured — the root, at minimum — is
+    /// flushed by this call.
+    pub(crate) fn persist_ownership_to(
+        &mut self,
+        journal: std::sync::Arc<dyn crate::resource_control::OwnershipJournal>,
+    ) -> Result<(), String> {
+        self.controller.persist_ownership_to(journal)
+    }
+
     pub(crate) fn id(&self) -> Option<u32> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -288,15 +329,88 @@ impl ForegroundShell {
         self.stderr.take()
     }
 
+    /// Wait for the shell while draining both pipes, under this shell's own
+    /// resource controller.
+    ///
+    /// Lives here rather than at the call site because of a borrow that is really
+    /// a design point: the wait needs `&mut self.child` and the sampler needs
+    /// `&mut self.controller`, and only inside this impl are those two disjoint
+    /// field borrows rather than two conflicting borrows of the shell. Pushing
+    /// the race out to the caller would mean handing the controller out and
+    /// hoping nobody drops it — and on Windows the controller *is* the
+    /// containment, so dropping it early releases the tree.
+    pub(crate) async fn wait_supervised(
+        &mut self,
+        stdout: AsyncShellReader,
+        stderr: AsyncShellReader,
+        output_cap: Option<usize>,
+        // Every measurement as it is taken, so a shell's row shows what the tree
+        // is holding *now* rather than only what it held once it was over.
+        observe: impl FnMut(&crate::resource_control::ResourceSample),
+    ) -> io::Result<crate::resource_control::Supervised<io::Result<CapturedShell>>> {
+        let child = &mut self.child;
+        #[cfg(not(target_os = "windows"))]
+        let (pgid, reaped) = (self.pgid, &mut self.reaped);
+        let wait = async move {
+            #[cfg(not(target_os = "windows"))]
+            {
+                while !child_exited_unreaped(pgid)? {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // Keep the exited leader as a zombie until after this signal. Its
+                // PID/PGID therefore cannot be reused for an unrelated process in
+                // the gap between observing exit and cleaning up descendants.
+                let _ = crate::os_signal::kill_process_group(pgid);
+                let status = child.wait().await?;
+                *reaped = true;
+                Ok::<_, io::Error>(status)
+            }
+            #[cfg(target_os = "windows")]
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    break Ok::<_, io::Error>(status);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        // Joined, never sequenced. Draining after the wait is the classic
+        // deadlock: a child that fills a 64 KiB pipe blocks until someone reads
+        // it, so a wait that runs first waits forever and the command reports a
+        // timeout instead of its output.
+        let work = async move {
+            let (status, stdout, stderr) = tokio::try_join!(
+                wait,
+                crate::output_cap::drain_capped(stdout, output_cap),
+                crate::output_cap::drain_capped(stderr, output_cap),
+            )?;
+            Ok(CapturedShell {
+                status,
+                stdout,
+                stderr,
+            })
+        };
+        crate::resource_control::run_under_observed(&mut self.controller, work, observe).await
+    }
+
+    /// What actually holds this shell, for the row.
+    pub(crate) fn containment(&self) -> crate::resource_control::Containment {
+        self.controller.containment()
+    }
+
+    /// Wait for the leader alone, with nothing supervising.
+    ///
+    /// Test-only, and deliberately so: every production path goes through
+    /// [`Self::wait_supervised`], because a wait that does not sample is a wait
+    /// under no limit at all. This exists for the confinement tests, which assert
+    /// what happens to the *tree* after the leader exits and would be muddied by a
+    /// second reason the tree could disappear.
+    #[cfg(test)]
     pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         #[cfg(not(target_os = "windows"))]
         {
             while !child_exited_unreaped(self.pgid)? {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // Keep the exited leader as a zombie until after this signal. Its
-            // PID/PGID therefore cannot be reused for an unrelated process in
-            // the gap between observing exit and cleaning up descendants.
             let _ = crate::os_signal::kill_process_group(self.pgid);
             let status = self.child.wait().await;
             if status.is_ok() {
@@ -305,23 +419,25 @@ impl ForegroundShell {
             status
         }
         #[cfg(target_os = "windows")]
-        {
-            loop {
-                if let Some(status) = self.child.try_wait()? {
-                    return Ok(status);
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
     pub(crate) fn terminate_tree(&mut self) {
+        // Through the controller, not the pgid: the controller knows the members
+        // that left the process group, because it recorded them while their
+        // ancestry was still readable. A bare `terminate_process_group` here is
+        // the escape this branch exists to close.
+        if let Err(error) = self.controller.terminate_tree() {
+            eprintln!("agent shell: could not reclaim the whole owned tree: {error}");
+        }
         #[cfg(not(target_os = "windows"))]
-        {
-            if !self.reaped {
-                let _ = crate::os_signal::terminate_process_group(self.pgid);
-                let _ = self.child.start_kill();
-            }
+        if !self.reaped {
+            let _ = self.child.start_kill();
         }
         #[cfg(target_os = "windows")]
         {
@@ -376,6 +492,7 @@ fn harden_macos_child_authority(fd_sweep: &mut MacFdSweep) -> io::Result<()> {
 fn configure_tokio(
     runtime: &ShellRuntime,
     shell_command: &str,
+    controller: &ResourceController,
 ) -> io::Result<tokio::process::Command> {
     #[cfg(target_os = "macos")]
     let (program, args) = (
@@ -404,6 +521,11 @@ fn configure_tokio(
         .kill_on_drop(true)
         .process_group(0);
     crate::os_limits::apply(crate::os_limits::ChildLimits::baseline(), &mut command);
+    // Before `exec`, so the target program has never run outside its containment
+    // — on Linux the child is already in its cgroup when it starts. This composes
+    // with the confinement below rather than replacing it: a resource bound is
+    // not a filesystem or network boundary and neither substitutes for the other.
+    controller.prepare_tokio(&mut command)?;
     #[cfg(target_os = "macos")]
     {
         let mut fd_sweep = MacFdSweep::create()?;
@@ -427,7 +549,11 @@ fn configure_tokio(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn configure_std(runtime: &ShellRuntime, shell_command: &str) -> io::Result<std::process::Command> {
+fn configure_std(
+    runtime: &ShellRuntime,
+    shell_command: &str,
+    controller: &ResourceController,
+) -> io::Result<std::process::Command> {
     use std::os::unix::process::CommandExt;
 
     #[cfg(target_os = "macos")]
@@ -456,6 +582,7 @@ fn configure_std(runtime: &ShellRuntime, shell_command: &str) -> io::Result<std:
         .stderr(Stdio::piped())
         .process_group(0);
     crate::os_limits::apply_std(crate::os_limits::ChildLimits::baseline(), &mut command);
+    controller.prepare_std(&mut command)?;
     #[cfg(target_os = "macos")]
     {
         let mut fd_sweep = MacFdSweep::create()?;
@@ -482,6 +609,7 @@ fn configure_std(runtime: &ShellRuntime, shell_command: &str) -> io::Result<std:
 fn spawn_windows(
     runtime: &ShellRuntime,
     shell_command: &str,
+    controller: &ResourceController,
 ) -> io::Result<crate::sandbox_windows::ConfinedChild> {
     let container = crate::sandbox_windows::open_workspace_app_container(
         &runtime.workspace_root,
@@ -492,9 +620,13 @@ fn spawn_windows(
         let _ = container.ensure_tree_read_access_if_permitted_persistent(root)?;
     }
     let grants = vec![container.grant_tree_access_scoped(&runtime.root)?];
+    // The job comes from the controller, so its memory and process ceilings are
+    // this process's effective limits rather than fixed constants. The spawn site
+    // still creates the process suspended and assigns it before resuming, which is
+    // what makes the bound hold from the first instruction.
     crate::sandbox_windows::spawn_confined_child(
         container,
-        crate::sandbox_windows::create_job()?,
+        controller.windows_job_for_spawn()?,
         grants,
         shell_command,
         &runtime.cwd,
@@ -503,15 +635,95 @@ fn spawn_windows(
     )
 }
 
+/// Resolve what this shell will actually run under.
+///
+/// One place, for every shell on either client. The class default states the
+/// tree bounds the controller holds; a caller may tighten any of them and may
+/// never widen one, which is what [`EffectiveLimits::resolve`] guarantees by
+/// intersecting rather than overriding.
+///
+/// The platform guardrail layer is deliberately empty here rather than absent:
+/// the shell's own fixed ceilings live inside the backends (the Windows job's
+/// independent limits, `os_limits`' core-dump refusal), where a caller cannot
+/// reach them at all. Expressing them as a layer would let this merge widen
+/// them, which is the one thing a guardrail must not permit.
+pub(crate) fn effective_shell_limits(kind: ProcessKind, caller: ProcessLimits) -> EffectiveLimits {
+    EffectiveLimits::resolve(&[
+        LimitLayer::new(LimitSource::ClassDefault, kind.default_limits()),
+        LimitLayer::new(LimitSource::UserOverride, caller),
+    ])
+}
+
+/// The process-table row a foreground shell should have while it runs.
+///
+/// One builder, used by both clients, for the reason [`run_to_output`] is shared:
+/// a row written differently per client is a row that can disagree with itself.
+/// It carries the *effective* limits rather than what the caller asked for, so
+/// what `monkey processes show` and the desktop panel display is the number that
+/// is actually installed on the tree.
+pub fn foreground_projection(
+    external_id: &str,
+    state: crate::process_table::ProcessState,
+    workspace: &Path,
+    identity: Option<crate::process_tree::ProcessIdentity>,
+    effective: EffectiveLimits,
+    // What actually held it, and what it was last measured holding. Both are
+    // `Option` because the row is written once before either is known: a shell
+    // that failed to spawn has no containment to state and nothing measured it.
+    containment: Option<crate::resource_control::Containment>,
+    usage: Option<crate::resource_control::ResourceSample>,
+) -> crate::process_table::ProcessProjection {
+    crate::process_table::ProcessProjection::new(ProcessKind::ForegroundShell, external_id, state)
+        .with_workspace(Some(workspace.to_string_lossy().into_owned()))
+        // The identity, not the bare pid: a row that names only a pid cannot be
+        // reconciled after a restart without risking an unrelated process.
+        .with_native_identity(identity)
+        .with_limits(effective.to_process_limits())
+        .with_containment(containment)
+        .with_usage(usage)
+}
+
+/// Bring a freshly spawned shell under its controller, or refuse to run it.
+///
+/// The two failures are not degrees of the same thing and this is the one place
+/// that says so. A command that exits before anyone can look at it — an `exec`
+/// the confinement denied, a one-line `echo` — leaves no tree to bound and its
+/// exit status is the answer the caller asked for. A command that is *running*
+/// outside its containment is the case a discarded `Result` used to wave
+/// through, and there is no version of continuing from it that is not a process
+/// record claiming a bound nothing holds.
+fn attach_or_refuse(controller: &mut ResourceController, native_pid: u32) -> io::Result<()> {
+    use crate::resource_control::AttachFailure;
+
+    match controller.attach(native_pid) {
+        Ok(()) => Ok(()),
+        Err(AttachFailure::AlreadyExited) => Ok(()),
+        Err(AttachFailure::Containment(error)) => {
+            // Whatever is running is reclaimed before the error propagates: an
+            // unbounded agent-controlled tree must not outlive the refusal to
+            // supervise it.
+            if let Err(cleanup) = controller.terminate_tree() {
+                return Err(io::Error::other(format!(
+                    "{error}; and the tree could not be reclaimed either: {cleanup}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn spawn_foreground(
     workspace_root: &Path,
     cwd: &Path,
     shell_command: &str,
+    limits: ProcessLimits,
 ) -> io::Result<ForegroundShell> {
     let runtime = ShellRuntime::create(workspace_root, cwd)?;
+    let mut controller =
+        ResourceController::new(effective_shell_limits(ProcessKind::ForegroundShell, limits));
     #[cfg(not(target_os = "windows"))]
     let (child, stdout, stderr) = {
-        let mut child = configure_tokio(&runtime, shell_command)?.spawn()?;
+        let mut child = configure_tokio(&runtime, shell_command, &controller)?.spawn()?;
         let stdout = child
             .stdout
             .take()
@@ -528,7 +740,7 @@ pub(crate) fn spawn_foreground(
         .ok_or_else(|| io::Error::other("confined shell exited before its pid was recorded"))?;
     #[cfg(target_os = "windows")]
     let (child, stdout, stderr) = {
-        let mut child = spawn_windows(&runtime, shell_command)?;
+        let mut child = spawn_windows(&runtime, shell_command, &controller)?;
         let stdout = child
             .stdout
             .take()
@@ -541,6 +753,13 @@ pub(crate) fn spawn_foreground(
             .map(|pipe| Box::new(pipe) as AsyncShellReader);
         (child, stdout, stderr)
     };
+    #[cfg(target_os = "windows")]
+    let native_pid = child.id();
+    #[cfg(not(target_os = "windows"))]
+    let native_pid = pgid;
+    // The tokio child carries `kill_on_drop`, so returning an error here reaps the
+    // leader; `attach_or_refuse` has already reclaimed the rest of the tree.
+    attach_or_refuse(&mut controller, native_pid)?;
     Ok(ForegroundShell {
         child,
         #[cfg(not(target_os = "windows"))]
@@ -549,6 +768,8 @@ pub(crate) fn spawn_foreground(
         reaped: false,
         stdout,
         stderr,
+        controller,
+        native_pid,
         _runtime: runtime,
     })
 }
@@ -649,6 +870,10 @@ impl Drop for BackgroundShellChild {
 
 pub(crate) struct BackgroundSpawn {
     pub child: BackgroundShellChild,
+    /// Held by the caller for as long as the shell may run, for the reason
+    /// [`ForegroundShell::controller`] gives: on Windows the job handle is the
+    /// containment, so dropping it releases the tree.
+    pub controller: ResourceController,
     pub stdout: Option<Box<dyn io::Read + Send>>,
     pub stderr: Option<Box<dyn io::Read + Send>>,
 }
@@ -657,11 +882,14 @@ pub(crate) fn spawn_background(
     workspace_root: &Path,
     cwd: &Path,
     shell_command: &str,
+    limits: ProcessLimits,
 ) -> io::Result<BackgroundSpawn> {
     let runtime = ShellRuntime::create(workspace_root, cwd)?;
+    let mut controller =
+        ResourceController::new(effective_shell_limits(ProcessKind::BackgroundShell, limits));
     #[cfg(not(target_os = "windows"))]
     let (child, stdout, stderr) = {
-        let mut child = configure_std(&runtime, shell_command)?.spawn()?;
+        let mut child = configure_std(&runtime, shell_command, &controller)?.spawn()?;
         let stdout = child
             .stdout
             .take()
@@ -674,7 +902,7 @@ pub(crate) fn spawn_background(
     };
     #[cfg(target_os = "windows")]
     let (child, stdout, stderr) = {
-        let mut child = spawn_windows(&runtime, shell_command)?;
+        let mut child = spawn_windows(&runtime, shell_command, &controller)?;
         let stdout = child
             .stdout
             .take()
@@ -685,58 +913,158 @@ pub(crate) fn spawn_background(
             .map(|pipe| Box::new(pipe) as Box<dyn io::Read + Send>);
         (child, stdout, stderr)
     };
+    let native_pid = child.id();
+    if let Err(error) = attach_or_refuse(&mut controller, native_pid) {
+        // A background shell is deliberately not built with `kill_on_drop`, so the
+        // leader is reaped by wrapping it in the type whose `Drop` already knows
+        // how to end one on either platform. The rest of the tree is gone by now.
+        drop(BackgroundShellChild {
+            #[cfg(not(target_os = "windows"))]
+            pgid: native_pid,
+            child,
+            reaped: false,
+            _runtime: Some(runtime),
+        });
+        return Err(error);
+    }
     Ok(BackgroundSpawn {
         child: BackgroundShellChild {
             #[cfg(not(target_os = "windows"))]
-            pgid: child.id(),
+            pgid: native_pid,
             child,
             reaped: false,
             _runtime: Some(runtime),
         },
+        controller,
         stdout,
         stderr,
     })
+}
+
+/// A finished foreground shell: its status and both bounded streams.
+pub struct CapturedShell {
+    pub status: ExitStatus,
+    pub stdout: crate::output_cap::CappedStream,
+    pub stderr: crate::output_cap::CappedStream,
 }
 
 pub struct ShellOutput {
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// What the child produced, as opposed to what was retained. Equal to the
+    /// buffer lengths when nothing was dropped.
+    pub stdout_total_bytes: u64,
+    pub stderr_total_bytes: u64,
+    pub truncated: bool,
+    /// The limit that ended this command, if one did. `None` means the command
+    /// ended on its own terms — which is different from "no limit was in force".
+    pub breach: Option<crate::resource_control::LimitBreach>,
+    /// What the tree actually held, for the process record and the UI.
+    pub usage: crate::resource_control::ResourceSample,
+    /// What was holding each limit on this host.
+    pub enforcement: crate::resource_control::ControllerCapabilities,
+    /// The same answer in the form a row stores, so what a reader sees later is
+    /// what held *this* shell rather than what this machine would build today.
+    pub containment: crate::resource_control::Containment,
+    pub limits: EffectiveLimits,
+    pub native_pid: u32,
+    /// The identity the controller attached to, so a record of this shell names
+    /// a process rather than a pid.
+    pub identity: Option<crate::process_tree::ProcessIdentity>,
 }
 
 /// AppHandle-free entry point used by `monkey-cli`; desktop foreground and
 /// background tools use the same `spawn_*` primitives above so the authority
 /// boundary cannot drift by client.
+///
+/// `output_cap` is the ceiling each stream is held to **as it arrives**. `None`
+/// keeps everything and is for the callers whose correctness needs the whole
+/// document; every other caller passes a number, because this used to
+/// `read_to_end` both pipes and a command printing a gigabyte took a gigabyte of
+/// this process's heap with it.
+///
+/// `limits` tightens the class defaults. It can never loosen them.
 pub async fn run_to_output(
     workspace_root: &Path,
     cwd: &Path,
     shell_command: &str,
     timeout: Duration,
+    output_cap: Option<usize>,
+    limits: ProcessLimits,
 ) -> io::Result<ShellOutput> {
-    let mut shell = spawn_foreground(workspace_root, cwd, shell_command)?;
-    let mut stdout = shell
+    let mut shell = spawn_foreground(workspace_root, cwd, shell_command, limits)?;
+    let enforcement = shell.capabilities();
+    let containment = shell.containment();
+    let effective = shell.effective_limits();
+    let native_pid = shell.native_pid();
+    let identity = shell.identity();
+    let stdout = shell
         .take_stdout()
         .ok_or_else(|| io::Error::other("confined shell had no stdout pipe"))?;
-    let mut stderr = shell
+    let stderr = shell
         .take_stderr()
         .ok_or_else(|| io::Error::other("confined shell had no stderr pipe"))?;
-    let result = tokio::time::timeout(timeout, async {
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        let (status, _, _) = tokio::try_join!(
-            shell.wait(),
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
-        )?;
-        Ok::<_, io::Error>((status, out, err))
-    })
+
+    // Two bounds, and they are different facts. The controller's limits belong to
+    // the *process* — exceed one and the workload is torn down and recorded as
+    // `limit_exceeded`. The caller's timeout belongs to the *call* — a tool that
+    // gives up after 120 s has not observed a resource breach, so it wraps the
+    // supervision rather than being expressed as a wall limit inside it.
+    let supervised = tokio::time::timeout(
+        timeout,
+        // No per-tick observer here: this entry point has no live row to update —
+        // `monkey-cli` writes one record for the whole command — and the final
+        // sample it returns carries the peaks anything reached.
+        shell.wait_supervised(stdout, stderr, output_cap, |_| {}),
+    )
     .await;
-    match result {
-        Ok(Ok((status, stdout, stderr))) => Ok(ShellOutput {
-            exit_code: status.code(),
-            stdout,
-            stderr,
-        }),
+
+    let finish = |breach,
+                  stdout: crate::output_cap::CappedStream,
+                  stderr: crate::output_cap::CappedStream,
+                  exit_code,
+                  usage| {
+        Ok(ShellOutput {
+            exit_code,
+            stdout_total_bytes: stdout.total_bytes(),
+            stderr_total_bytes: stderr.total_bytes(),
+            truncated: stdout.was_truncated() || stderr.was_truncated(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            breach,
+            usage,
+            enforcement,
+            containment: containment.clone(),
+            limits: effective,
+            native_pid,
+            identity,
+        })
+    };
+
+    match supervised {
+        Ok(Ok(crate::resource_control::Supervised::Completed(Ok(captured), usage))) => finish(
+            None,
+            captured.stdout,
+            captured.stderr,
+            captured.status.code(),
+            usage,
+        ),
+        // A limit fired. `run_under` has already terminated the tree, so what is
+        // left is to report *which* limit with both numbers — the output produced
+        // up to that point is lost with the dropped drain futures, which is the
+        // honest outcome: the command did not finish.
+        Ok(Ok(crate::resource_control::Supervised::Breached(breach, usage))) => finish(
+            Some(breach),
+            crate::output_cap::CappedStream::default(),
+            crate::output_cap::CappedStream::default(),
+            None,
+            usage,
+        ),
+        Ok(Ok(crate::resource_control::Supervised::Completed(Err(error), _))) => {
+            shell.terminate_tree();
+            Err(error)
+        }
         Ok(Err(error)) => {
             shell.terminate_tree();
             Err(error)
@@ -803,6 +1131,25 @@ pub(crate) fn posix_spawn_inheriting_fd_probe_for_test(fd: libc::c_int) -> io::R
 mod tests {
     use super::*;
 
+    /// The two spawn entry points with no caller override, which is what every
+    /// boundary test wants: these assert the *confinement*, and a limit set here
+    /// would only add a second reason a command could end.
+    fn spawn_foreground_for_test(
+        workspace_root: &Path,
+        cwd: &Path,
+        shell_command: &str,
+    ) -> io::Result<ForegroundShell> {
+        spawn_foreground(workspace_root, cwd, shell_command, ProcessLimits::default())
+    }
+
+    fn spawn_background_for_test(
+        workspace_root: &Path,
+        cwd: &Path,
+        shell_command: &str,
+    ) -> io::Result<BackgroundSpawn> {
+        spawn_background(workspace_root, cwd, shell_command, ProcessLimits::default())
+    }
+
     struct TestTree(PathBuf);
 
     impl TestTree {
@@ -863,8 +1210,9 @@ mod tests {
         fs::create_dir(&workspace).expect("create workspace");
         let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
 
-        let mut shell = spawn_foreground(&workspace, &workspace, "sleep 30 > detached.log 2>&1 &")
-            .expect("spawn foreground shell");
+        let mut shell =
+            spawn_foreground_for_test(&workspace, &workspace, "sleep 30 > detached.log 2>&1 &")
+                .expect("spawn foreground shell");
         let pgid = shell.id().expect("shell pid");
         let status = tokio::time::timeout(Duration::from_secs(10), shell.wait())
             .await
@@ -886,7 +1234,7 @@ mod tests {
         let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
 
         let mut spawned =
-            spawn_background(&workspace, &workspace, "sleep 30 > detached.log 2>&1 &")
+            spawn_background_for_test(&workspace, &workspace, "sleep 30 > detached.log 2>&1 &")
                 .expect("spawn background shell");
         let pgid = spawned.child.id();
         let runtime_root = spawned
@@ -937,6 +1285,8 @@ mod tests {
             &workspace,
             "/usr/bin/python3 -c 'print(\"PY_OK\")' && (/usr/bin/python3 -c 'import socket; socket.socket(socket.AF_UNIX)' >\"$TMPDIR/socket-out\" 2>&1 && printf ESCAPE_UNIX || printf DENIED_UNIX)",
             Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
         )
         .await
         .expect("run confined socket probe");
@@ -967,6 +1317,8 @@ mod tests {
             &workspace,
             "kill -0 $PPID 2>/dev/null && printf ESCAPE_SIGNAL || printf DENIED_SIGNAL",
             Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
         )
         .await
         .expect("run confined signal probe");
@@ -996,6 +1348,8 @@ mod tests {
             &workspace,
             "/bin/launchctl print system >\"$TMPDIR/launchctl-out\" 2>&1 && printf ESCAPE_MACH || printf DENIED_MACH",
             Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
         )
         .await
         .expect("run confined launchd probe");
@@ -1032,9 +1386,16 @@ mod tests {
             quote(&log_file),
             quote(&pid_file),
         );
-        run_to_output(&workspace, &workspace, &command, Duration::from_secs(20))
-            .await
-            .expect("run group-escape probe");
+        run_to_output(
+            &workspace,
+            &workspace,
+            &command,
+            Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
+        )
+        .await
+        .expect("run group-escape probe");
         let pid: libc::pid_t = fs::read_to_string(pid_file)
             .expect("escaped child pid")
             .parse()
@@ -1096,6 +1457,7 @@ mod tests {
                 quote(&probe_executable),
                 quote(&probe_executable),
             ),
+            &ResourceController::new(EffectiveLimits::default()),
         )
         .expect("configure confined inherited-descriptor probe");
         let outside = tree.0.join("outside-secret.txt");
@@ -1123,6 +1485,483 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             "PROBE_OK:DENIED_FD"
         );
+    }
+
+    // --- K4: the limits actually fire, on a real process tree ------------
+    //
+    // Every test below runs its workload as a *grandchild* of the shell — `sh -c
+    // "<binary>"` — because the direct child is always a shell holding a few
+    // hundred kilobytes and forking nothing. A bound that only measures the pid
+    // this app spawned is evaded by the normal case, not by a trick, which is
+    // exactly the gap these exist to close.
+
+    /// Allocates and touches `LITTLE_MONKEY_MEMORY_HOG_MIB` mebibytes, then
+    /// sleeps holding them.
+    ///
+    /// Written rather than allocated: an untouched allocation is not resident, so
+    /// a hog that only called `Vec::with_capacity` would be invisible to every
+    /// memory limit and this whole test would pass against a broken bound.
+    #[test]
+    #[cfg(unix)]
+    fn memory_hog_child() {
+        let Some(mib) = std::env::var("LITTLE_MONKEY_MEMORY_HOG_MIB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let mut held: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..mib {
+            let mut block = vec![0_u8; 1024 * 1024];
+            // Touch every page so the kernel has to back it.
+            for page in block.chunks_mut(4096) {
+                page[0] = 1;
+            }
+            held.push(block);
+        }
+        std::thread::sleep(Duration::from_secs(30));
+        // Keeps the allocation live across the sleep.
+        assert_eq!(held.len(), mib);
+    }
+
+    /// Places a copy of the test binary *inside* the workspace and returns it.
+    ///
+    /// The confinement is why this is not just `current_exe()`: the shell may
+    /// only execute what is inside its grant, and the target directory is not.
+    /// A test that ran the binary from its build path would be denied by
+    /// Seatbelt/Landlock and then pass for the wrong reason — the workload would
+    /// exit instantly, no limit would fire, and the assertion would read as "the
+    /// bound did not work".
+    /// Requires that a real mechanism held this limit, and names it on failure.
+    ///
+    /// This is the half of the cross-platform requirement a test can enforce: a
+    /// green build must mean the primary mechanism worked or the production
+    /// fallback worked, never that neither did. An empty backend or an
+    /// owner-sourced level would mean the breach came from something other than
+    /// this process's own record.
+    ///
+    /// It deliberately does not pin a *specific* backend — which one is correct
+    /// depends on the host, and requiring a cgroup would fail a perfectly good
+    /// machine that has no delegated hierarchy. Answering "which one did this
+    /// runner actually use" is left to the `processes limits` step in CI, because
+    /// libtest captures a passing test's output and no print from here can reach
+    /// the log.
+    #[cfg(unix)]
+    fn assert_enforced_by_a_real_backend(breach: &crate::resource_control::LimitBreach) {
+        assert!(
+            !breach.backend.is_empty(),
+            "a breach must name the mechanism that made it: {breach:?}"
+        );
+        // …unless the host has been provisioned for a particular one, in which
+        // case "some real backend" is not the question being asked. See
+        // `resource_control::required_backend`.
+        if let Some(required) = crate::resource_control::required_backend() {
+            assert_eq!(
+                breach.backend, required,
+                "this host was provisioned to exercise {required}; a fallback here means the \
+                 kernel path was not tested: {breach:?}"
+            );
+        }
+        assert!(
+            ["kernel", "supervised"].contains(&breach.level.as_str()),
+            "a limit fired on this process must be held by the kernel or by the supervisor, \
+             not sourced from an owner: {breach:?}"
+        );
+
+        // The two levels report the measurement differently, and that difference
+        // is the whole distinction between them.
+        //
+        // A *supervised* bound is found by comparison: the workload passes the
+        // number and the sampler notices afterwards, so the observation that
+        // tripped it is strictly above the budget.
+        //
+        // A *kernel* bound exists so the workload never passes the number. cgroup
+        // v2 refuses the fork at `pids.max` and leaves `pids.current` at the cap;
+        // `memory.max` OOM-kills a member inside the scope rather than letting
+        // `memory.current` exceed it. `observed > configured` is false when a
+        // kernel limit fires and stays false — which is why the backends carry
+        // `evidence` from the kernel's own refusal counters, and why a kernel
+        // breach has to be judged on that rather than on an inequality it can
+        // never satisfy.
+        //
+        // These tests asserted the supervised shape on every platform and passed
+        // for as long as nobody ran the cgroup path. The first CI run inside a
+        // delegated hierarchy failed them with `configured: 12, observed: 12`,
+        // which is the correct kernel answer.
+        match breach.level.as_str() {
+            "kernel" => {
+                assert!(
+                    breach.observed <= breach.configured,
+                    "a kernel bound holds the measurement at the cap; an observation above it \
+                     would mean the kernel let the workload past: {breach:?}"
+                );
+                assert!(
+                    breach.evidence.is_some(),
+                    "a kernel breach cannot be found by comparison, so it must carry the \
+                     refusal counter that found it: {breach:?}"
+                );
+            }
+            _ => assert!(
+                breach.observed > breach.configured,
+                "a supervised bound is found by comparison, so the observation that tripped \
+                 it must be above the budget: {breach:?}"
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    fn place_test_binary_in(workspace: &Path, name: &str) -> PathBuf {
+        let placed = workspace.join(name);
+        let current = std::env::current_exe().expect("the test binary knows its own path");
+        fs::hard_link(&current, &placed)
+            .or_else(|_| fs::copy(&current, &placed).map(|_| ()))
+            .expect("place the workload binary inside the selected workspace");
+        placed
+    }
+
+    /// The headline case: a grandchild outgrows the budget and the *whole* tree
+    /// is stopped, with the record naming the limit and both numbers.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_grandchild_that_outgrows_the_memory_budget_takes_the_whole_tree_down() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        // The variable is set *inside* the command line because the shell's
+        // environment is scrubbed at spawn: nothing this process exports reaches
+        // the child, which is the confinement working and was the first thing
+        // this test got wrong.
+        let hog = format!(
+            "LITTLE_MONKEY_MEMORY_HOG_MIB=512 {} --exact \
+             workspace_shell::tests::memory_hog_child --test-threads=1 >/dev/null 2>&1",
+            quote(&place_test_binary_in(&workspace, "memory-hog"))
+        );
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            &hog,
+            // Comfortably longer than the budget needs to fire, so a timeout can
+            // never be mistaken for the limit working.
+            Duration::from_secs(60),
+            None,
+            ProcessLimits {
+                // 192 MiB against a 512 MiB hog: high enough that the test binary's
+                // own baseline is not the thing that trips it, low enough to fire
+                // within a sample or two.
+                max_memory_bytes: Some(192 * 1024 * 1024),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a limit breach is an outcome, not an error");
+
+        let breach = output
+            .breach
+            .expect("512 MiB of touched pages must exceed a 192 MiB tree budget");
+        assert_eq!(breach.limit, "max_memory_bytes");
+        assert_enforced_by_a_real_backend(&breach);
+        assert_eq!(breach.configured, 192 * 1024 * 1024);
+        // The tree, not the shell: the hog is a grandchild, so this is the
+        // assertion that would still pass against a bound measuring only the pid
+        // we spawned — and would fail against one that killed only it.
+        assert!(
+            crate::process_tree::measure_tree(output.native_pid)
+                .expect("snapshot")
+                .is_none(),
+            "the owned tree must be gone once its budget fired"
+        );
+    }
+
+    /// A fork-heavy workload hits its own ceiling without the logged-in user's
+    /// processes counting against it.
+    ///
+    /// That second half is the reason `RLIMIT_NPROC` was rejected for this: it
+    /// counts per real uid, so on a busy desktop the bound fires because the user
+    /// opened a browser.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_fork_heavy_tree_hits_its_own_process_ceiling_and_not_the_users() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        // The host already has far more than 12 processes belonging to this user,
+        // so a per-uid bound would fire before the first `sleep` started.
+        let host_processes = crate::process_tree::snapshot().expect("snapshot").len();
+        assert!(
+            host_processes > 12,
+            "this assertion is only meaningful on a host with real process load: {host_processes}"
+        );
+
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            "i=0; while [ $i -lt 40 ]; do sleep 20 & i=$((i+1)); done; wait",
+            Duration::from_secs(60),
+            None,
+            ProcessLimits {
+                max_child_processes: Some(12),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a limit breach is an outcome, not an error");
+
+        let breach = output
+            .breach
+            .expect("forty concurrent children must exceed a twelve-process tree budget");
+        assert_eq!(breach.limit, "max_child_processes");
+        assert_enforced_by_a_real_backend(&breach);
+        assert_eq!(breach.configured, 12);
+        assert!(
+            breach.observed < u64::try_from(host_processes).unwrap(),
+            "the count must be of the owned tree, not of everything this uid owns: {breach:?}"
+        );
+        assert!(crate::process_tree::measure_tree(output.native_pid)
+            .expect("snapshot")
+            .is_none());
+    }
+
+    /// A wall limit must end the descendants too, which is the half `kill_on_drop`
+    /// never did: it SIGKILLs one pid, so `sh -c "sleep 30"` reaped the shell and
+    /// left the sleep running.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_wall_limit_ends_the_grandchild_and_not_only_the_shell() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            "sleep 30 & sleep 30",
+            Duration::from_secs(60),
+            None,
+            ProcessLimits {
+                max_wall_ms: Some(1_000),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a limit breach is an outcome, not an error");
+
+        let breach = output.breach.expect("a 30s command past a 1s wall budget");
+        assert_eq!(breach.limit, "max_wall_ms");
+        assert_enforced_by_a_real_backend(&breach);
+        assert_eq!(breach.configured, 1_000);
+        // Wall is the one bound no kernel here holds — neither cgroup v2 nor a
+        // job object expresses wall clock — so it is always supervised and always
+        // found by comparison.
+        assert_eq!(breach.level, "supervised");
+        assert!(breach.observed >= 1_000, "{breach:?}");
+        assert!(
+            crate::process_tree::measure_tree(output.native_pid)
+                .expect("snapshot")
+                .is_none(),
+            "neither the shell nor either sleep may survive its deadline"
+        );
+    }
+
+    /// A command that finishes inside every bound is not a breach, and its output
+    /// survives.
+    ///
+    /// The counter-test. Without it "everything is a limit kill" passes all three
+    /// tests above.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_command_inside_its_bounds_completes_normally_with_its_output() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            "printf INSIDE_THE_BOUNDS",
+            Duration::from_secs(30),
+            None,
+            ProcessLimits {
+                max_wall_ms: Some(30_000),
+                max_memory_bytes: Some(1024 * 1024 * 1024),
+                max_child_processes: Some(64),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("an ordinary command");
+
+        assert!(output.breach.is_none(), "{:?}", output.breach);
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "INSIDE_THE_BOUNDS");
+    }
+
+    /// Flooding both pipes at once must not deadlock, and must not grow the app's
+    /// heap past the cap — while the command still exits normally.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_flood_on_both_pipes_stays_capped_without_deadlocking_the_command() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        const CAP: usize = 4 * 1024;
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            // Both streams, well past the cap and past any pipe buffer, so a
+            // reader that drained them in sequence would block forever.
+            "i=0; while [ $i -lt 400 ]; do \
+                 printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; \
+                 printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' >&2; \
+                 i=$((i+1)); \
+             done",
+            Duration::from_secs(60),
+            Some(CAP),
+            ProcessLimits::default(),
+        )
+        .await
+        .expect("a noisy command is still a command");
+
+        assert_eq!(
+            output.exit_code,
+            Some(0),
+            "a command that merely printed too much must still report its own exit"
+        );
+        assert!(output.stdout.len() <= CAP, "{}", output.stdout.len());
+        assert!(output.stderr.len() <= CAP, "{}", output.stderr.len());
+        assert!(output.truncated);
+        assert_eq!(
+            output.stdout_total_bytes,
+            400 * 40,
+            "the cap bounds what is kept; the total is what the command produced"
+        );
+        assert_eq!(output.stderr_total_bytes, 400 * 40);
+    }
+
+    /// `max_output_bytes` is a *retention* bound, and a command that exceeds it
+    /// finishes.
+    ///
+    /// The two concepts §K4 keeps apart, asserted rather than described. A
+    /// retained-tail cap holds this app's heap while the child runs; a process
+    /// resource limit ends the workload. `max_output_bytes` is the first, on
+    /// purpose: a verbose build printing past a model's context cap has done
+    /// nothing wrong, and killing it would make the bound something people turn
+    /// off. What the record carries instead is both numbers — what was produced,
+    /// and that what is kept was truncated.
+    ///
+    /// The counter-assertion matters as much as the first: no breach. If the
+    /// controller ever started terminating on output, this fails and whoever made
+    /// that change has to decide it deliberately.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_command_past_its_output_bound_is_truncated_and_still_completes() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        const BOUND: u64 = 2 * 1024;
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            "i=0; while [ $i -lt 200 ]; do \
+                 printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; i=$((i+1)); \
+             done",
+            Duration::from_secs(60),
+            Some(BOUND as usize),
+            ProcessLimits {
+                max_output_bytes: Some(BOUND),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a noisy command is still a command");
+
+        assert_eq!(
+            output.limits.output_bytes.map(|resolved| resolved.value),
+            Some(BOUND)
+        );
+        assert!(
+            output.breach.is_none(),
+            "producing more output than is retained is not a resource kill: {:?}",
+            output.breach
+        );
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.truncated);
+        assert!(output.stdout.len() <= BOUND as usize);
+        assert_eq!(output.stdout_total_bytes, 200 * 40);
+    }
+
+    /// A descendant that leaves the process group is still terminated.
+    ///
+    /// The one escape a POSIX process group cannot close on its own, and the
+    /// reason the supervisor measures and signals by parent link *as well as* by
+    /// group. `setsid` here is the deliberate version of what a daemonising build
+    /// tool does by accident.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_descendant_that_leaves_the_process_group_is_still_terminated() {
+        if !confinement_available_for_test() {
+            return;
+        }
+        let tree = TestTree::create();
+        let workspace = tree.0.join("workspace");
+        fs::create_dir(&workspace).expect("create workspace");
+        let workspace = crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+
+        let marker = tree.0.join("escapee.pid");
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            &format!("(sleep 25 & echo $! > {}) ; sleep 25", quote(&marker)),
+            Duration::from_secs(60),
+            None,
+            ProcessLimits {
+                max_wall_ms: Some(1_000),
+                ..ProcessLimits::default()
+            },
+        )
+        .await
+        .expect("a limit breach is an outcome, not an error");
+
+        assert!(output.breach.is_some());
+        // Give the terminate a beat to be observed, then assert on the recorded
+        // pid rather than on the tree: the whole point is that this process was
+        // not reachable through the group alone.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(pid) = fs::read_to_string(&marker) {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                assert!(
+                    crate::process_tree::ProcessIdentity::of(pid).is_none(),
+                    "a descendant of the owned tree survived its budget kill"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1185,9 +2024,16 @@ mod tests {
             outside.display(),
         );
 
-        let output = run_to_output(&workspace, &workspace, &command, Duration::from_secs(20))
-            .await
-            .expect("run confined shell");
+        let output = run_to_output(
+            &workspace,
+            &workspace,
+            &command,
+            Duration::from_secs(20),
+            None,
+            ProcessLimits::default(),
+        )
+        .await
+        .expect("run confined shell");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             output.exit_code,

@@ -34,7 +34,7 @@ export interface UpdateStore {
   status: UpdateStatus;
   /** Version of the pending update (no leading "v"), or null when none. */
   version: string | null;
-  /** Release notes from `latest.json`, shown as the card's tooltip. */
+  /** Release notes from `latest.json`, shown in the Updates settings panel. */
   notes: string | null;
   downloadedBytes: number;
   contentLength: number | null;

@@ -19,7 +19,6 @@ export function UpdateCard() {
   const { t } = useT();
   const status = useUpdateStore((s) => s.status);
   const version = useUpdateStore((s) => s.version);
-  const notes = useUpdateStore((s) => s.notes);
   const applyUpdate = useUpdateStore((s) => s.applyUpdate);
 
   if (status !== "ready" && status !== "applying") return null;
@@ -34,7 +33,6 @@ export function UpdateCard() {
       type="button"
       onClick={() => void applyUpdate()}
       disabled={applying}
-      title={notes ?? undefined}
       className="group absolute inset-x-2 bottom-2 z-20 flex cursor-pointer items-center gap-3 rounded-2xl border border-border bg-background px-3 py-2.5 text-left shadow-lg disabled:cursor-default disabled:opacity-70"
     >
       <img src={monkeyAvatar} alt="" className="h-9 w-9 shrink-0 rounded-lg" />

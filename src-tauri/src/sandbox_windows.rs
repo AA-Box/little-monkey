@@ -246,7 +246,74 @@ impl Drop for JobConfinement {
 /// is the same choice `os_limits::install` and `sandbox_linux::confine` make: a
 /// tool that will not start is visible, and a tool that quietly lost its
 /// boundary is not.
+/// The numbers a job will actually be configured with.
+///
+/// The point of this type is that the two ceilings stop being constants. A job
+/// used to bound every tree at 4 GiB and 512 processes whatever the process's
+/// `ProcessLimits` said, so a caller that asked for 512 MiB got 4 GiB and a row
+/// that claimed 512 MiB — the exact shape of "a caller believes a safety bound is
+/// active when it is not" that K4 exists to close.
+///
+/// The fixed values survive as a **ceiling**, never as the policy. A caller may
+/// tighten below them and can never widen past them, which is what makes them
+/// defence in depth rather than something masquerading as the user's limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobLimits {
+    pub memory_bytes: usize,
+    pub active_processes: u32,
+}
+
+impl JobLimits {
+    /// The fixed containment ceiling, with no caller policy applied.
+    #[must_use]
+    pub const fn guardrail() -> Self {
+        JobLimits {
+            memory_bytes: MAX_JOB_MEMORY_BYTES,
+            active_processes: MAX_ACTIVE_PROCESSES,
+        }
+    }
+
+    /// Intersect the guardrail with what this process is actually allowed.
+    ///
+    /// `min` in both directions, so an absent effective limit leaves the
+    /// guardrail in place and a present one can only lower it.
+    #[must_use]
+    pub fn from_effective(limits: &crate::resource_control::EffectiveLimits) -> Self {
+        let guardrail = JobLimits::guardrail();
+        JobLimits {
+            memory_bytes: limits
+                .memory_bytes
+                .and_then(|resolved| usize::try_from(resolved.value).ok())
+                .map_or(guardrail.memory_bytes, |bytes| {
+                    bytes.min(guardrail.memory_bytes)
+                }),
+            active_processes: limits
+                .child_processes
+                .and_then(|resolved| u32::try_from(resolved.value).ok())
+                .map_or(guardrail.active_processes, |count| {
+                    count.min(guardrail.active_processes)
+                }),
+        }
+    }
+}
+
+/// What a job is currently holding, as the kernel accounts for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobAccounting {
+    pub active_processes: u32,
+    /// Peak committed memory across the tree. The peak rather than the current
+    /// total because `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` reports no current
+    /// figure — and for a limit the peak is the honest number anyway: a tree that
+    /// touched the ceiling and freed is a tree that exceeded it.
+    pub job_memory_bytes: u64,
+}
+
 pub fn create_job() -> io::Result<JobConfinement> {
+    create_job_with(JobLimits::guardrail())
+}
+
+/// [`create_job`] with the numbers this process is entitled to.
+pub fn create_job_with(limits: JobLimits) -> io::Result<JobConfinement> {
     // An anonymous job (null name): nothing else needs to find it, and a named
     // one could be opened by any process in the session.
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -256,12 +323,12 @@ pub fn create_job() -> io::Result<JobConfinement> {
     // Owned from here on, so every early return below closes it.
     let job = JobConfinement { handle };
 
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        JobMemoryLimit: MAX_JOB_MEMORY_BYTES,
+    let mut configured = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        JobMemoryLimit: limits.memory_bytes,
         ..unsafe { std::mem::zeroed() }
     };
-    limits.BasicLimitInformation.ActiveProcessLimit = MAX_ACTIVE_PROCESSES;
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configured.BasicLimitInformation.ActiveProcessLimit = limits.active_processes;
+    configured.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_JOB_MEMORY
         | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
@@ -271,7 +338,7 @@ pub fn create_job() -> io::Result<JobConfinement> {
         SetInformationJobObject(
             job.handle,
             JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
+            (&raw const configured).cast(),
             u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
                 .expect("a Win32 struct size fits in u32"),
         )
@@ -307,6 +374,135 @@ pub fn create_job() -> io::Result<JobConfinement> {
 }
 
 impl JobConfinement {
+    /// The raw job handle, for a caller that must configure the job itself.
+    ///
+    /// Borrowed, never transferred: this type still owns the handle and its
+    /// `Drop` still closes it exactly once. The one caller is
+    /// [`crate::resource_control_job`], which associates a completion port so the
+    /// kernel can say *which* limit it refused — a job may hold exactly one such
+    /// port for its lifetime, so it has to be attached to this handle rather than
+    /// to a duplicate that will be closed.
+    #[must_use]
+    pub fn raw_handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    /// A second handle to the same job.
+    ///
+    /// A job lives while *any* handle is open and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` fires when the last one closes, so
+    /// duplicating extends the containment's lifetime rather than weakening it.
+    /// The resource controller keeps one so it can still sample and terminate
+    /// after handing the other to the spawn site, which consumes it into the
+    /// child.
+    pub fn duplicate(&self) -> io::Result<JobConfinement> {
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut duplicated: HANDLE = std::ptr::null_mut();
+        // Safe: duplicates a handle this value owns into this same process. The
+        // result is owned by the returned `JobConfinement`, whose `Drop` closes
+        // it exactly once.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle,
+                GetCurrentProcess(),
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("DuplicateHandle"));
+        }
+        Ok(JobConfinement { handle: duplicated })
+    }
+
+    /// Whether `pid` is actually inside this job.
+    ///
+    /// The check that turns "we created a job and spawned a process" into "the
+    /// process is bounded": a spawn path that skipped the assignment would
+    /// otherwise leave a record claiming a kernel-held limit over a process no
+    /// job contains.
+    pub fn contains(&self, pid: u32) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // Safe: opens a query-only handle to one pid, or null on refusal.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(os_error("OpenProcess"));
+        }
+        let mut inside = 0;
+        // Safe: both handles are valid for the call, and `inside` is a BOOL this
+        // stack owns.
+        let ok = unsafe { IsProcessInJob(process, self.handle, &mut inside) };
+        // Safe: closes the handle this function opened, exactly once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        if ok == 0 {
+            return Err(os_error("IsProcessInJob"));
+        }
+        Ok(inside != 0)
+    }
+
+    /// What the kernel says this job is holding.
+    ///
+    /// Two queries because the two figures live in different information
+    /// classes, and both are the kernel's own accounting over the whole tree —
+    /// strictly better than the parent-link walk the supervisor has to do
+    /// elsewhere, because a job has no membership question to get wrong.
+    pub fn accounting(&self) -> io::Result<JobAccounting> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut basic: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // Safe: writes the named information class's struct into a buffer of
+        // exactly that type and size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                (&raw mut basic).cast(),
+                u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .expect("a Win32 struct size fits in u32"),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("QueryInformationJobObject(basic accounting)"));
+        }
+
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // Safe: as above, for the extended class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                (&raw mut extended).cast(),
+                u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("a Win32 struct size fits in u32"),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("QueryInformationJobObject(extended limits)"));
+        }
+
+        Ok(JobAccounting {
+            active_processes: basic.ActiveProcesses,
+            job_memory_bytes: extended.PeakJobMemoryUsed as u64,
+        })
+    }
+
     /// Put an already-spawned child, and everything it goes on to spawn, in the
     /// job. [`spawn_confined`] uses the raw form while its child is suspended;
     /// this `tokio` form remains for callers and tests that own their spawn.
@@ -344,6 +540,34 @@ impl JobConfinement {
         }
     }
 
+    /// [`JobConfinement::assign`] for a process this crate did not spawn itself.
+    ///
+    /// Opens the pid with exactly the two rights the assignment needs —
+    /// `PROCESS_SET_QUOTA` to place it under the job's limits and
+    /// `PROCESS_TERMINATE` because the job's `KILL_ON_JOB_CLOSE` will eventually
+    /// use it — and nothing else. Used by an owner whose spawn site cannot be
+    /// given the job before creation; see
+    /// [`crate::resource_control::ResourceController::adopt`] for the window that
+    /// leaves and why it is stated rather than glossed.
+    pub fn assign_pid(&self, pid: u32) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // Safe: opens a handle to one pid with two rights, or null on refusal.
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Err(os_error("OpenProcess"));
+        }
+        let assigned = self.assign_raw(process);
+        // Safe: closes the handle this function opened, exactly once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        assigned
+    }
+
     /// Kill everything in the job now, without giving up the handle.
     ///
     /// The timeout path needs this rather than a `drop`: the job has to stay
@@ -354,7 +578,14 @@ impl JobConfinement {
         let _ = self.terminate_result();
     }
 
-    fn terminate_result(&self) -> io::Result<()> {
+    /// Kill every process in the job, now, reporting whether it worked.
+    ///
+    /// Atomic in the way a walk-and-signal loop cannot be: a process created
+    /// while the terminate is in flight is created *into* the job and dies with
+    /// it, so there is no window for a fork to outrun the kill. Public because
+    /// the resource controller needs the failure — a limit kill that silently
+    /// did nothing is the worst outcome available.
+    pub fn terminate_result(&self) -> io::Result<()> {
         // 1 rather than 0: the exit code is what a killed tree reports, and a
         // zero there would read as a clean exit.
         match unsafe { TerminateJobObject(self.handle, 1) } {
@@ -1033,6 +1264,11 @@ fn capability_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
 
 /// What a confined run produced.
 pub struct ConfinedOutput {
+    /// The limit that ended this run, when a mechanism made the kill.
+    ///
+    /// `None` from [`run_confined`], which has no controller to ask — the two
+    /// entry points differ in what they can *know*, not in what they enforce.
+    pub breach: Option<crate::resource_control::LimitBreach>,
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -1585,6 +1821,148 @@ pub fn spawn_confined_child(
     })
 }
 
+/// [`run_confined`] under a resource controller that watches the run.
+///
+/// # What the extra parameter buys
+///
+/// `run_confined` spawns, waits and returns, so a caller holding a controller
+/// had nowhere to put it: the run's identity was never recorded and nothing
+/// sampled the job while it was executing, which for the sandbox run meant a row
+/// that could state a memory ceiling and never what was held against it.
+///
+/// The containment itself is unchanged and is established by [`spawn_confined`]
+/// before the child's first instruction. What this adds is the attach — which
+/// reads the job membership back and refuses a run that is not inside it — and a
+/// sampling tick that hands the controller to `observe` so a caller can project
+/// what the job is holding.
+///
+/// ponytail: the wait-and-read block below is a near-copy of `run_confined`'s
+/// rather than a shared helper, because sharing it means threading three
+/// `Option`s through the one function whose ordering must stay readable. If a
+/// third variant appears, extract then.
+pub async fn run_confined_supervised(
+    container: Option<&AppContainer>,
+    job: &JobConfinement,
+    shell_command: &str,
+    workspace_dir: &Path,
+    env: &[(String, String)],
+    allow_network: bool,
+    timeout: Duration,
+    controller: &mut crate::resource_control::ResourceController,
+    mut observe: impl FnMut(
+        &crate::resource_control::ResourceController,
+        Option<crate::resource_control::ResourceSample>,
+    ),
+) -> io::Result<ConfinedOutput> {
+    let spawned = spawn_confined(
+        container,
+        job,
+        shell_command,
+        workspace_dir,
+        env,
+        allow_network,
+    )?;
+    // Fail closed, on the same terms as every other controlled spawn: a run that
+    // is executing and cannot be shown to be inside its containment is reclaimed
+    // rather than reported as bounded. One that finished first is not a
+    // containment failure.
+    match controller.attach(spawned.pid) {
+        Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+        Err(crate::resource_control::AttachFailure::Containment(error)) => {
+            job.terminate();
+            return Err(error);
+        }
+    }
+    observe(controller, None);
+
+    let child = spawned.process;
+    let mut stdout_file = spawned.stdout;
+    let mut stderr_file = spawned.stderr;
+
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Err(error) = stdout_file.read_to_end(&mut out) {
+            eprintln!("sandbox: reading the confined child's stdout failed: {error}");
+        }
+        if let Err(error) = stderr_file.read_to_end(&mut err) {
+            eprintln!("sandbox: reading the confined child's stderr failed: {error}");
+        }
+        (out, err)
+    });
+
+    let waiter_handle = child.as_raw_handle() as usize;
+    let waited = tokio::task::spawn_blocking(move || {
+        let handle = waiter_handle as HANDLE;
+        unsafe { WaitForSingleObject(handle, INFINITE) };
+        let mut code: u32 = 0;
+        let read = unsafe { GetExitCodeProcess(handle, &mut code) };
+        (read, code)
+    });
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    tokio::pin!(waited);
+    let mut ticker = tokio::time::interval(crate::resource_control::SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // Biased so a run that finishes on its tick is reported as finished
+            // rather than as timed out.
+            biased;
+            joined = &mut waited => {
+                let (read, code) = joined.map_err(io::Error::other)?;
+                let (stdout, stderr) = reader.await.map_err(io::Error::other)?;
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: (read != 0).then_some(code as i32),
+                    stdout,
+                    stderr,
+                    timed_out: false,
+                    breach: None,
+                });
+            }
+            _ = &mut deadline => {
+                job.terminate();
+                let (stdout, stderr) = reader.await.unwrap_or_default();
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                    timed_out: true,
+                    breach: None,
+                });
+            }
+            _ = ticker.tick() => {
+                // The job's own accounting *and* its refusals, in the order every
+                // other owner asks: a kernel that refused a fork announces itself
+                // through the mechanism, never through a measurement passing a cap.
+                match controller.check(crate::resource_control::now_ms_for_breach()) {
+                    Ok(crate::resource_control::ResourceCheck::Breached { breach, sample }) => {
+                        observe(controller, sample);
+                        let (stdout, stderr) = reader.await.unwrap_or_default();
+                        drop(child);
+                        return Ok(ConfinedOutput {
+                            exit_code: None,
+                            stdout,
+                            stderr,
+                            timed_out: breach.limit
+                                == crate::process_table::ProcessLimitKind::Wall.as_str(),
+                            breach: Some(breach),
+                        });
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Running(sample)) => {
+                        observe(controller, Some(sample));
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Gone) | Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// See [`spawn_confined`] for why the raw work is not inlined here.
 pub async fn run_confined(
     container: Option<&AppContainer>,
@@ -1651,6 +2029,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: false,
+                breach: None,
             })
         }
         Err(_) => {
@@ -1664,6 +2043,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: true,
+                breach: None,
             })
         }
     }

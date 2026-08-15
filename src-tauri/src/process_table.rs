@@ -68,6 +68,21 @@ pub enum ProcessKind {
     RemoteRun,
     /// A backgrounded `run_shell` command.
     BackgroundShell,
+    /// A foreground `run_shell`/verify command — the agent shell a turn blocks
+    /// on.
+    ///
+    /// The most common native process this app creates, and until now the only
+    /// one with no row at all. A turn's shell is where the compiler, the test
+    /// runner and the model server actually live, so "what is this machine
+    /// doing on behalf of the agent" was answerable for a backgrounded shell and
+    /// not for the foreground one beside it. It also meant the process holding
+    /// the memory had no record to carry a limit, which is why K4's memory and
+    /// child-process legs had nowhere to land.
+    ///
+    /// Short-lived by construction — bounded by the caller's timeout — so its
+    /// rows are numerous and brief. That is a property of the work, not a reason
+    /// to keep it invisible: the same is true of a subagent.
+    ForegroundShell,
     /// A side task running beside the main conversation.
     SideTask,
     /// An isolated Chromium the browser tool owns (`browser_worker.rs`).
@@ -78,6 +93,20 @@ pub enum ProcessKind {
     /// that the startup sweep could collect the profile directory of but never
     /// kill.
     BrowserSession,
+    /// One stored verification command (`verify.rs`) — a build or a test run,
+    /// started after an edit.
+    ///
+    /// The three kinds below are the same shape as [`Self::ForegroundShell`] and
+    /// were bounded by the same controller before they had a row: the limit was
+    /// installed, the tree was reclaimed, and none of it was visible. A limit
+    /// that fires on a verify command was reported in that command's own result
+    /// and nowhere a reader could find it afterwards, so "what did the agent run
+    /// on this machine, and what held it" had three blind spots.
+    VerifyCommand,
+    /// One user-authored lifecycle hook (`hooks.rs`).
+    HookCommand,
+    /// One disposable-copy Sandbox panel run (`sandbox.rs`).
+    SandboxRun,
 }
 
 /// The wall-clock budget the four WebView kinds carry by default.
@@ -119,6 +148,65 @@ pub enum ProcessKind {
 /// which is exactly what these kinds do not have.
 pub const WEBVIEW_WALL_BUDGET_MS: u64 = 6 * 60 * 60 * 1_000;
 
+/// The resident-memory ceiling an agent shell's whole process tree carries by
+/// default.
+///
+/// # Why 8 GiB, and why one number for both shell kinds
+///
+/// A class default is not a tuning knob; it is the answer to "what is so far
+/// outside normal that it is certainly a runaway". The legitimate heavy cases
+/// here are a Rust or LLVM build and a local model server, and both fit inside
+/// 8 GiB on the machines this app targets — a 16 GiB laptop is the floor, and a
+/// tree past half of it is not a build, it is a leak or a fork bomb's memory
+/// twin.
+///
+/// A *tight* number is the failure mode to avoid. A limit that kills working
+/// commands gets turned off, and a limit that is off bounds nothing; a limit that
+/// only ever fires on genuine runaways stays on. Callers who know their command's
+/// real appetite tighten it per call, which the resolution in
+/// [`crate::resource_control::EffectiveLimits`] always allows.
+///
+/// It bounds the **tree**, not the shell process: the shell itself holds a few
+/// hundred kilobytes and the compiler underneath it holds everything.
+pub const SHELL_MEMORY_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Live processes an agent shell's tree may hold at once.
+///
+/// Sized against the widest legitimate case rather than the common one: a
+/// parallel build on a high-core machine is the shape that spawns most, and
+/// `make -j64` with a compiler and a linker per job is comfortably inside 512.
+/// A fork bomb is not near 512, it is unbounded, so the two are not close enough
+/// for the exact number to be load-bearing.
+///
+/// This is the same figure the Windows shell job has always used as a fixed
+/// guardrail. It becomes a *class default* here — a number a caller can tighten
+/// and the row records — while the fixed job ceiling stays as an independent
+/// defence in depth that a caller cannot widen.
+pub const SHELL_PROCESS_BUDGET: u32 = 512;
+
+/// The resident-memory ceiling one browser session's Chromium tree carries.
+///
+/// Lower than a shell's, and for a different reason rather than a stricter mood:
+/// a shell legitimately hosts a compiler and a model server, while a browser
+/// session hosts one page. 4 GiB is several times what a heavy real page costs
+/// across its dozen renderer, GPU and utility processes, and well under what a
+/// runaway page — a leaking script, an infinite canvas — reaches within seconds.
+///
+/// Held by [`crate::resource_control::ResourceController`], not by
+/// `browser_worker`: the session's own quotas bound *browser* things (actions,
+/// session clock, profile disk) and none of them is an answer to a renderer
+/// taking the machine's memory.
+pub const BROWSER_MEMORY_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Live processes one browser session's tree may hold at once.
+///
+/// Chromium's own process model is the sizing input: one browser process, one
+/// GPU, one network service, one storage service, a utility or two, and a
+/// renderer per site instance. A page with many cross-origin frames is the widest
+/// legitimate case and stays well inside this; a tab spawning without bound is
+/// nowhere near it.
+pub const BROWSER_PROCESS_BUDGET: u32 = 128;
+
 impl ProcessKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -130,8 +218,12 @@ impl ProcessKind {
             ProcessKind::WorkflowNode => "workflow_node",
             ProcessKind::RemoteRun => "remote_run",
             ProcessKind::BackgroundShell => "background_shell",
+            ProcessKind::ForegroundShell => "foreground_shell",
             ProcessKind::SideTask => "side_task",
             ProcessKind::BrowserSession => "browser_session",
+            ProcessKind::VerifyCommand => "verify_command",
+            ProcessKind::HookCommand => "hook_command",
+            ProcessKind::SandboxRun => "sandbox_run",
         }
     }
 
@@ -148,8 +240,12 @@ impl ProcessKind {
             ProcessKind::WorkflowNode => "wfn",
             ProcessKind::RemoteRun => "remote",
             ProcessKind::BackgroundShell => "sh",
+            ProcessKind::ForegroundShell => "fgsh",
             ProcessKind::SideTask => "side",
             ProcessKind::BrowserSession => "browser",
+            ProcessKind::VerifyCommand => "vfy",
+            ProcessKind::HookCommand => "hook",
+            ProcessKind::SandboxRun => "sbx",
         }
     }
 
@@ -163,8 +259,12 @@ impl ProcessKind {
             "workflow_node" => ProcessKind::WorkflowNode,
             "remote_run" => ProcessKind::RemoteRun,
             "background_shell" => ProcessKind::BackgroundShell,
+            "foreground_shell" => ProcessKind::ForegroundShell,
             "side_task" => ProcessKind::SideTask,
             "browser_session" => ProcessKind::BrowserSession,
+            "verify_command" => ProcessKind::VerifyCommand,
+            "hook_command" => ProcessKind::HookCommand,
+            "sandbox_run" => ProcessKind::SandboxRun,
             other => {
                 return Err(ProcessTableError::UnknownKind {
                     kind: other.to_string(),
@@ -191,12 +291,20 @@ impl ProcessKind {
         ProcessKind::Subagent,
         ProcessKind::CrewMember,
         ProcessKind::BackgroundShell,
+        ProcessKind::ForegroundShell,
         ProcessKind::SideTask,
         // Its Chromium is spawned by this app and dies with it — but only if the
         // app got to run its teardown. The reap is what covers the crash, and
         // for this kind alone the reap has something to kill first: see
         // [`crate::browser_worker::reclaim_orphaned_browser_sessions`].
         ProcessKind::BrowserSession,
+        // The three bounded executions a turn blocks on. Each is started by this
+        // app and dies with it when teardown runs; the reap is what covers the
+        // crash, and like the shells they carry a durable containment identity
+        // the reclaim can still reach.
+        ProcessKind::VerifyCommand,
+        ProcessKind::HookCommand,
+        ProcessKind::SandboxRun,
     ];
 
     /// Kinds that record their host's pid, and are therefore swept by whether
@@ -255,7 +363,19 @@ impl ProcessKind {
             | ProcessKind::Subagent
             | ProcessKind::CrewMember
             | ProcessKind::BackgroundShell
-            | ProcessKind::SideTask => RestartPolicy::Never,
+            // A foreground shell is a *tool call's* process: the turn that
+            // blocked on it is what decides whether to run the command again,
+            // and re-running it from out here would repeat a side effect the
+            // model never asked for twice.
+            | ProcessKind::ForegroundShell
+            | ProcessKind::SideTask
+            // A verify command, a hook and a sandbox run are each one caller's
+            // tool call. Re-running one from out here would repeat a side effect
+            // — a formatter rewriting files, a build publishing artifacts — that
+            // nobody asked for twice.
+            | ProcessKind::VerifyCommand
+            | ProcessKind::HookCommand
+            | ProcessKind::SandboxRun => RestartPolicy::Never,
             // A browser session is a *tool call's* resource, not work in its own
             // right: relaunching Chromium would restore a blank profile with no
             // navigation history and no grant, which is not the session that was
@@ -319,12 +439,17 @@ impl ProcessKind {
         use ProcessKind as K;
         use ProcessLimitKind as L;
 
+        // Both name what is missing *for this kind*, which changed when the
+        // resource controller landed: it is no longer that no mechanism exists —
+        // the two shell kinds are bounded by one — but that these kinds own no OS
+        // process for a controller to attach to. Leaving the old "no mechanism on
+        // any host" would read as a platform gap rather than as what it is.
         const NO_MEMORY_MECHANISM: &str =
-            "no per-class memory mechanism on any host: needs delegated cgroups v2 or a \
-             class-derived Windows job object";
+            "this kind owns no OS process tree to measure: its work runs inside the WebView, \
+             or is delegated to a child process that carries its own record";
         const NO_PIDS_MECHANISM: &str =
-            "no per-tree process-count mechanism: needs the cgroup `pids` controller or a \
-             class-derived Windows job object";
+            "this kind owns no OS process tree to count: bound the native process it spawns, \
+             which is its child in this table";
         const NO_MODEL_REQUEST: &str = "this kind issues no model request of its own";
         const NO_CAPTURED_OUTPUT: &str = "this kind captures no output stream of its own";
 
@@ -347,9 +472,22 @@ impl ProcessKind {
             (K::BrowserSession, L::Wall) => {
                 E::OwnerSourced("the browser watchdog enforces its session's own `max_session_ms`")
             }
-            (K::BackgroundShell, L::Wall) => E::Unavailable(
-                "a background shell is spawned to outlive its turn, with neither a timeout \
-                 nor `kill_on_drop`",
+            // The two native shell kinds. Both now run under a
+            // `ResourceController`, whose sampling loop reads this row's field —
+            // so a value set here is the value that fires, which is what
+            // `Enforced` means. A background shell is still spawned to outlive
+            // its turn, so its class default states no wall bound; a caller that
+            // sets one now gets it.
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::Wall,
+            ) => E::Enforced(
+                "the resource controller's sampling loop compares elapsed time against this \
+                 row's `max_wall_ms` and terminates the whole owned tree",
             ),
             (K::WorkflowNode, L::Wall) => E::OwnerSourced(
                 "a node is bounded by its own `timeout_ms`, which the definition validates \
@@ -365,6 +503,35 @@ impl ProcessKind {
                 "the daemon's sampling watchdog measures the job's whole process group \
                  against the recipe's own `max_memory_bytes`",
             ),
+            // The kinds that own a native process tree read this field through
+            // the resource controller: a cgroup v2 `memory.max` where the host
+            // delegates one, a job object's `JobMemoryLimit` on Windows, and a
+            // supervised sum over the owned tree everywhere else. All three
+            // measure the *tree*, so a shell whose grandchild holds the memory is
+            // bounded by the number on this row.
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::Memory,
+            ) => E::Enforced(
+                "the resource controller bounds the owned process tree at this row's \
+                 `max_memory_bytes`, kernel-held where the host offers a mechanism and \
+                 supervised otherwise",
+            ),
+            // The third kind that owns a real process tree, and now routed through
+            // the same controller. The reconciliation the old note said was
+            // needed is done by *splitting by resource*: the controller holds
+            // memory and child-process count over Chromium's whole tree, while
+            // `browser_worker` keeps the browser-domain quotas — session clock,
+            // action budget, profile disk — which no controller can express.
+            (K::BrowserSession, L::Memory) => E::Enforced(
+                "the resource controller bounds the whole Chromium tree at this row's \
+                 `max_memory_bytes`, kernel-held where the host offers a mechanism and \
+                 supervised otherwise",
+            ),
             (_, L::Memory) => E::Unavailable(NO_MEMORY_MECHANISM),
 
             // --- Output ----------------------------------------------------
@@ -373,6 +540,12 @@ impl ProcessKind {
                 "the in-memory tail is front-truncated at this many bytes by \
                  `background_shell`",
             ),
+            (K::ForegroundShell | K::VerifyCommand | K::HookCommand | K::SandboxRun, L::Output) => {
+                E::Enforced(
+                    "both pipes are drained concurrently into a buffer front-truncated at this \
+                 many bytes, so the bound holds while the child is still producing",
+                )
+            }
             (K::DaemonJob, L::Output) => E::OwnerSourced(
                 "the daemon watchdog enforces the recipe's own `max_log_bytes` against the \
                  job's log file",
@@ -393,6 +566,26 @@ impl ProcessKind {
             // Nothing, anywhere. The Windows shell job's fixed 512-process
             // ceiling is a containment guardrail on one spawn site, not a
             // per-class policy this field could express.
+            // Per *tree*, which is what makes this expressible at all: cgroup
+            // v2's `pids` controller, a job object's `ActiveProcessLimit`, or a
+            // supervised count of the owned tree's live members. None of them is
+            // `RLIMIT_NPROC`, which counts per real uid and so fires whenever the
+            // logged-in user's own session is busy.
+            (
+                K::BackgroundShell
+                | K::ForegroundShell
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
+                L::ChildProcesses,
+            ) => E::Enforced(
+                "the resource controller counts the owned tree's live members against this \
+                 row's `max_child_processes`, per tree rather than per uid",
+            ),
+            (K::BrowserSession, L::ChildProcesses) => E::Enforced(
+                "the resource controller counts Chromium's renderer, GPU and utility children \
+                 against this row's `max_child_processes`, per tree rather than per uid",
+            ),
             (_, L::ChildProcesses) => E::Unavailable(NO_PIDS_MECHANISM),
 
             // --- Context tokens --------------------------------------------
@@ -413,7 +606,11 @@ impl ProcessKind {
                 | K::WorkflowNode
                 | K::RemoteRun
                 | K::BackgroundShell
-                | K::BrowserSession,
+                | K::ForegroundShell
+                | K::BrowserSession
+                | K::VerifyCommand
+                | K::HookCommand
+                | K::SandboxRun,
                 L::ContextTokens,
             ) => E::Unavailable(NO_MODEL_REQUEST),
         }
@@ -433,13 +630,28 @@ impl ProcessKind {
             // do, and it is the reason this kind exists at all: its `native_pid`
             // leads a real process group, so a terminate reaches Chromium's
             // renderer and GPU children rather than orphaning them.
-            (K::DaemonJob | K::BackgroundShell | K::BrowserSession, S::Kill) => {
-                SignalSupport::Honoured
-            }
+            (
+                K::DaemonJob | K::BackgroundShell | K::ForegroundShell | K::BrowserSession,
+                S::Kill,
+            ) => SignalSupport::Honoured,
             (K::RemoteRun, S::Kill | S::Suspend | S::Resume) => SignalSupport::Refused(
                 "a remote run records the request, not the work: it owns no process of its \
                  own and is closed as soon as the job is queued; signal the daemon job it \
                  spawned, which is its child in this table",
+            ),
+            // These three own a real tree and their controller can reclaim it —
+            // what is missing is a *deliverer*: nothing reads the durable latch
+            // between the spawn and the wait, because each is a single blocking
+            // call inside the turn that started it. Refused with the target that
+            // does work rather than downgraded to a `Stop` that lands nowhere,
+            // which is the same rule `workflow_node` is held to.
+            (
+                K::VerifyCommand | K::HookCommand | K::SandboxRun,
+                S::Kill | S::Suspend | S::Resume,
+            ) => SignalSupport::Refused(
+                "this execution is one blocking step of the turn that started it, and nothing \
+                 reads a signal latch while it runs; stop that turn instead, which cancels the \
+                 command and reclaims its whole tree",
             ),
             (_, S::Kill) => SignalSupport::Refused(
                 "this kind owns no OS process to terminate; stop it instead, which winds it \
@@ -450,7 +662,9 @@ impl ProcessKind {
             // where the loop now checks a durable latch at a safe point, or a
             // blocking wait at a coarse boundary for a workflow run.
             (K::DaemonJob, S::Suspend | S::Resume) => SignalSupport::Honoured,
-            (K::BackgroundShell, S::Suspend | S::Resume) => SignalSupport::Honoured,
+            (K::BackgroundShell | K::ForegroundShell, S::Suspend | S::Resume) => {
+                SignalSupport::Honoured
+            }
             (K::SideTask, S::Suspend | S::Resume) => SignalSupport::Honoured,
             (K::ChatTurn | K::Subagent | K::CrewMember, S::Suspend | S::Resume) => {
                 SignalSupport::Honoured
@@ -495,8 +709,12 @@ impl ProcessKind {
         ProcessKind::WorkflowNode,
         ProcessKind::RemoteRun,
         ProcessKind::BackgroundShell,
+        ProcessKind::ForegroundShell,
         ProcessKind::SideTask,
         ProcessKind::BrowserSession,
+        ProcessKind::VerifyCommand,
+        ProcessKind::HookCommand,
+        ProcessKind::SandboxRun,
     ];
 
     /// The bounds a process of this kind is *actually* subject to, seeded into
@@ -536,10 +754,37 @@ impl ProcessKind {
             // the lesser evil: a second copy of the number could drift from the
             // code that enforces it, and a declaration that disagrees with the
             // enforcement is worse than a slightly untidy dependency.
+            // The agent shell a turn blocks on, and the first kind whose class
+            // default states a memory and a process-count bound — because it is
+            // the first kind with a mechanism that holds them.
+            //
+            // Both numbers are deliberately generous rather than tuned. The
+            // question a class default answers is "what is so far outside normal
+            // that it is certainly a runaway", not "what should a build need":
+            // this is the site that legitimately compiles a Rust workspace and
+            // downloads a 40 GB model, so a number chosen to be *tight* would
+            // break working commands, which is the failure mode that makes people
+            // turn a limit off. A per-command override tightens it where a caller
+            // knows better.
+            ProcessKind::ForegroundShell => ProcessLimits {
+                max_wall_ms: None,
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::output_cap::MODEL_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
             ProcessKind::BackgroundShell => ProcessLimits {
                 max_output_bytes: Some(
                     u64::try_from(crate::background_shell::MAX_OUTPUT_BYTES).unwrap_or(u64::MAX),
                 ),
+                // The same two class bounds as the foreground shell, for the same
+                // reason and through the same controller. A backgrounded command
+                // is if anything the one more worth bounding: nothing is blocked
+                // on it, so a runaway is noticed later.
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
                 // No wall bound on purpose: a background shell is meant to
                 // outlive the turn that started it, so it is spawned with
                 // neither a timeout nor `kill_on_drop`.
@@ -586,9 +831,62 @@ impl ProcessKind {
             // default, and a caller that starts a session with a tighter budget
             // writes its own `max_wall_ms` onto the row through the projection,
             // exactly as the daemon does with its per-job recipe.
+            //
+            // The two process bounds beneath it belong to the *other* owner. A
+            // browser session owns a real process tree — Chromium's renderer, GPU
+            // and utility children — and it is now routed through the same
+            // `ResourceController` the shells use, which holds memory and
+            // child-process count while the sweep keeps the session clock. One
+            // resource, one owner, both stated on this row.
+            //
+            // Generous rather than tuned, for the shell's reason and more so: a
+            // page with video across a dozen renderers is legitimately hundreds of
+            // megabytes, and a number tight enough to argue about would break real
+            // browsing. These answer "is this tab now the largest thing on the
+            // machine".
             ProcessKind::BrowserSession => ProcessLimits {
                 max_wall_ms: Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS),
+                max_memory_bytes: Some(BROWSER_MEMORY_BUDGET_BYTES),
+                max_child_processes: Some(BROWSER_PROCESS_BUDGET),
                 ..ProcessLimits::default()
+            },
+            // The three bounded executions. Each already ran under the shell's
+            // tree bounds plus a deadline and an output cap of its own; what was
+            // missing was a row to state them on, so the numbers are referenced
+            // from the modules that enforce them rather than copied — a
+            // declaration that can drift from its enforcement is the failure this
+            // whole matrix exists to prevent.
+            ProcessKind::VerifyCommand => ProcessLimits {
+                max_wall_ms: Some(crate::verify::DEFAULT_VERIFY_TIMEOUT_SECS * 1_000),
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::verify::VERIFY_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
+            ProcessKind::HookCommand => ProcessLimits {
+                max_wall_ms: Some(
+                    u64::try_from(crate::hooks::HOOK_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                ),
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::hooks::HOOK_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
+            },
+            // No class wall bound: a sandbox run's deadline is chosen per run by
+            // the caller and always supplied, so a number here would be a second
+            // default that never applies.
+            ProcessKind::SandboxRun => ProcessLimits {
+                max_wall_ms: None,
+                max_memory_bytes: Some(SHELL_MEMORY_BUDGET_BYTES),
+                max_output_bytes: Some(
+                    u64::try_from(crate::sandbox::SANDBOX_OUTPUT_CAP).unwrap_or(u64::MAX),
+                ),
+                max_child_processes: Some(SHELL_PROCESS_BUDGET),
+                max_context_tokens: None,
             },
         }
     }
@@ -675,6 +973,20 @@ pub enum ExitStatus {
     Lost,
     /// Ended with external effects that could not be safely undone.
     NeedsReconciliation,
+    /// The row had to be closed and **nothing proved the work was gone**.
+    ///
+    /// Deliberately not [`Self::Lost`], which asserts a fact: a lost process is
+    /// one whose worker demonstrably went away. This one asserts the absence of a
+    /// fact — a restart found a row whose containment identity could not be
+    /// validated, or could be validated and would not empty, so the app stopped
+    /// tracking a workload that may still be executing.
+    ///
+    /// The distinction is the whole point. Overloading `Lost` to mean "we stopped
+    /// looking" is what turns a process table into a record of what the app
+    /// believes rather than of what happened, and a reader auditing a machine
+    /// after a crash needs to be able to tell "confirmed dead" from "ownership
+    /// could not be recovered".
+    ContainmentLost,
 }
 
 impl ExitStatus {
@@ -686,6 +998,7 @@ impl ExitStatus {
             ExitStatus::LimitExceeded => "limit_exceeded",
             ExitStatus::Lost => "lost",
             ExitStatus::NeedsReconciliation => "needs_reconciliation",
+            ExitStatus::ContainmentLost => "containment_lost",
         }
     }
 
@@ -697,6 +1010,7 @@ impl ExitStatus {
             "limit_exceeded" => ExitStatus::LimitExceeded,
             "lost" => ExitStatus::Lost,
             "needs_reconciliation" => ExitStatus::NeedsReconciliation,
+            "containment_lost" => ExitStatus::ContainmentLost,
             other => {
                 return Err(ProcessTableError::UnknownExitStatus {
                     status: other.to_string(),
@@ -745,6 +1059,49 @@ fn upgrade_a_budget_kill(
         reason: signal_reason.map(str::to_string),
         ..exit
     })
+}
+
+/// Whether the pid on this row still belongs to the process the row is about.
+///
+/// # The rule every reconciler has to obey
+///
+/// A row outlives the app session that wrote it, which is the entire point of a
+/// durable process table — and it is why "is something alive at that pid" is not
+/// a safe question to act on. Pids are reused; across a restart, hours later, on
+/// a busy machine, the number a previous session recorded is as likely to name
+/// the user's editor as the shell this app abandoned.
+///
+/// So a startup reclaim signals only what it can *prove*: the pid is still the
+/// process whose start time this row recorded. Three things answer `false`,
+/// deliberately:
+///
+/// - no pid — the row says nothing about anything running;
+/// - no start time — a pre-V22 row, or a host that would not report one, so the
+///   pid cannot be tied to a process;
+/// - a start time that does not match — the pid was reused, and the process
+///   behind it is somebody else's;
+/// - the process is no longer *executing* — it exited and is waiting to be
+///   collected, so there is no tree left to reclaim and the next thing to occupy
+///   that pid will be somebody else's.
+///
+/// The asymmetry is the safety property: failing to reclaim one stale process is
+/// recoverable, and killing an unrelated one is not.
+#[must_use]
+pub fn still_the_recorded_process(record: &ProcessRecord) -> bool {
+    let Some(pid) = record.native_pid.and_then(|pid| u32::try_from(pid).ok()) else {
+        return false;
+    };
+    let Some(recorded) = record
+        .native_start_time
+        .and_then(|start| u64::try_from(start).ok())
+    else {
+        return false;
+    };
+    crate::process_tree::ProcessIdentity {
+        pid,
+        start_time: recorded,
+    }
+    .is_running()
 }
 
 /// The limit set attached to a process.
@@ -966,6 +1323,17 @@ pub struct ProcessExit {
     /// Human-readable reason. For [`ExitStatus::LimitExceeded`] this must name
     /// the limit that fired.
     pub reason: Option<String>,
+    /// The structured form of that reason, when a resource controller made the
+    /// kill: which limit, what was configured, what was measured, which backend
+    /// noticed, and whether it was kernel-held or supervised.
+    ///
+    /// Beside `reason` rather than instead of it. The prose is what a person
+    /// reads and what older surfaces already show; this is what a query filters
+    /// on and what a UI formats. Before V21 only the prose existed, so "how much
+    /// memory did it actually hold" could be answered only by parsing a sentence
+    /// — which the daemon genuinely did, with a marker string.
+    #[serde(default)]
+    pub breach: Option<crate::resource_control::LimitBreach>,
 }
 
 impl ProcessExit {
@@ -975,6 +1343,19 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: None,
+            breach: None,
+        }
+    }
+
+    /// The exit a resource controller produces. The prose reason is derived from
+    /// the breach rather than written separately, so the two can never disagree.
+    pub fn limit_exceeded(breach: crate::resource_control::LimitBreach) -> Self {
+        ProcessExit {
+            status: ExitStatus::LimitExceeded,
+            code: None,
+            signal: None,
+            reason: Some(breach.describe()),
+            breach: Some(breach),
         }
     }
 
@@ -984,6 +1365,7 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: Some(reason.into()),
+            breach: None,
         }
     }
 
@@ -993,6 +1375,7 @@ impl ProcessExit {
             code: None,
             signal: None,
             reason: Some(reason.into()),
+            breach: None,
         }
     }
 }
@@ -1025,7 +1408,51 @@ pub struct ProcessRecord {
     pub profile: Option<String>,
     /// OS process id, where the process owns one.
     pub native_pid: Option<i64>,
+    /// The platform's own start-time stamp for that pid, which together with it
+    /// names a *process* rather than a slot in the pid space.
+    ///
+    /// Opaque and host-local by design — `/proc` jiffies, a BSD start timeval, a
+    /// Windows creation FILETIME — and only ever compared against
+    /// [`crate::process_tree::ProcessIdentity::of`] on the machine that wrote it.
+    /// `None` on a row written before V22, and on a host that will not report
+    /// one; a reconciler that finds `None` must not signal, because it cannot
+    /// prove the pid is still the process this row is about.
+    #[serde(default)]
+    pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
+    /// The mechanism that actually enforced this process, recorded when it was
+    /// attached rather than derived from the host reading the row.
+    ///
+    /// `None` for a kind that owns no OS process tree, and on a row written
+    /// before V23. Never re-derived: the whole point is that a row read on a
+    /// different machine, or on the same machine after its delegation changed,
+    /// still names what held *this* process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment: Option<crate::resource_control::Containment>,
+    /// The session this process's root *led*, where it led one.
+    ///
+    /// Captured while the root was alive, for the reason the process group on
+    /// `containment.scope` is: both are read off the root's own row, so neither
+    /// is discoverable once the root exits — which is precisely when a descendant
+    /// that stayed in the session becomes unattributable to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervised_session_id: Option<u32>,
+    /// The host boot this row's native identities belong to, on a platform whose
+    /// start-time clock restarts with the machine.
+    ///
+    /// `None` on macOS and Windows, whose start times are absolute and need no
+    /// disambiguation — see [`crate::process_tree::boot_marker`]. A reclaim that
+    /// finds a *different* marker treats every recorded identity as gone rather
+    /// than signalling a pid the new boot may have reissued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_boot_marker: Option<String>,
+    /// The most recent measurement of the owned tree, with the peaks it has
+    /// reached. `None` where nothing sampled it — never a zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::resource_control::RecordedUsage>,
+    /// When that measurement was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_sampled_at_ms: Option<i64>,
     /// Durable signal intent. Survives a restart, unlike the in-memory
     /// `AbortController`/`CancellationToken` each kind used before, and is
     /// readable by a worker in another process — which is what makes an
@@ -1368,7 +1795,22 @@ pub struct ProcessProjection {
     pub workspace: Option<String>,
     pub profile: Option<String>,
     pub native_pid: Option<i64>,
+    pub native_start_time: Option<i64>,
     pub limits: ProcessLimits,
+    /// What is holding this process, as its own controller reported it.
+    ///
+    /// Written once, when the workload is attached, and never recomputed: see
+    /// [`crate::resource_control::Containment`] for why a host answer derived at
+    /// read time is the wrong answer for a row that outlives its host.
+    pub containment: Option<crate::resource_control::Containment>,
+    /// The most recent measurement of the owned tree.
+    ///
+    /// Overwritten on every sample rather than appended, because this answers
+    /// "what is it holding *now*" — the history question is the resource
+    /// ledger's, and duplicating it here would be a second series to disagree
+    /// with. Peaks travel inside the sample, so a row that stops being sampled
+    /// keeps the highest value anything ever saw.
+    pub usage: Option<crate::resource_control::ResourceSample>,
 }
 
 impl ProcessProjection {
@@ -1383,6 +1825,9 @@ impl ProcessProjection {
             workspace: None,
             profile: None,
             native_pid: None,
+            native_start_time: None,
+            containment: None,
+            usage: None,
             // Same seeding as `AdmitProcess::new`, and it has to be here too:
             // `reconcile` admits through a projection, so a kind whose only
             // adopter projects (every desktop kind) would otherwise never pick up
@@ -1422,8 +1867,39 @@ impl ProcessProjection {
         self
     }
 
+    /// The pid *and* the start time that says which process it is.
+    ///
+    /// Preferred over [`Self::with_native_pid`] wherever the caller holds a
+    /// [`crate::process_tree::ProcessIdentity`], which every resource-controlled
+    /// spawn does: a row with a bare pid cannot be safely reconciled after a
+    /// restart, because nothing can prove the pid was not reused.
+    pub fn with_native_identity(
+        mut self,
+        identity: Option<crate::process_tree::ProcessIdentity>,
+    ) -> Self {
+        self.native_pid = identity.and_then(|identity| i64::try_from(identity.pid).ok());
+        self.native_start_time =
+            identity.and_then(|identity| i64::try_from(identity.start_time).ok());
+        self
+    }
+
     pub fn with_limits(mut self, limits: ProcessLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Record what actually holds this process, from its own controller.
+    pub fn with_containment(
+        mut self,
+        containment: Option<crate::resource_control::Containment>,
+    ) -> Self {
+        self.containment = containment;
+        self
+    }
+
+    /// Record the latest measurement of the owned tree.
+    pub fn with_usage(mut self, usage: Option<crate::resource_control::ResourceSample>) -> Self {
+        self.usage = usage;
         self
     }
 }
@@ -1444,7 +1920,34 @@ pub enum ReconcileOutcome {
     AlreadyExited,
 }
 
-/// A sink for [`ProcessProjection`]s.
+/// One native process a supervised workload owns, as it was durably recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedMember {
+    pub identity: crate::process_tree::ProcessIdentity,
+    pub first_seen_at_ms: i64,
+    pub last_seen_at_ms: i64,
+}
+
+/// Everything a restart needs in order to find what one workload still owns.
+///
+/// Sent whole rather than one member at a time, because the three parts are one
+/// fact: a set of identities is only reclaimable alongside the supervision
+/// metadata that says which host boot they belong to and which session they may
+/// still be discoverable through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedProcesses {
+    pub kind: ProcessKind,
+    pub external_id: String,
+    /// Every `(pid, start_time)` this workload has been observed to own.
+    pub members: Vec<crate::process_tree::ProcessIdentity>,
+    /// The session the root led, where it led one.
+    pub session: Option<u32>,
+    /// The host boot these identities belong to, where the platform needs one.
+    pub boot_marker: Option<String>,
+}
+
+/// A sink for [`ProcessProjection`]s, and for the ownership facts a restart
+/// depends on.
 ///
 /// A port, not a ledger handle. Services that must not depend on storage —
 /// `WorkflowService` keeps its history in a JSON file store and is deliberately
@@ -1452,11 +1955,28 @@ pub enum ReconcileOutcome {
 /// recording fake rather than standing up SQLite, and every caller of theirs
 /// (desktop, CLI, daemon-triggered) gets the projection from one place.
 ///
-/// Implementations must be fail-soft at their own boundary if the caller cannot
-/// tolerate an error; `project` returns one so a caller that *can* report it
-/// has the option.
+/// # The two methods keep opposite contracts, deliberately
+///
+/// [`Self::project`] is bookkeeping: implementations must be fail-soft at their
+/// own boundary if the caller cannot tolerate an error, and a missed periodic
+/// sample costs a stale number on a panel. [`Self::record_owned`] is
+/// **recovery-critical state** — it is the only record that a descendant which
+/// has since escaped every discovery primitive was ever this workload's — so a
+/// caller that cannot persist it must not go on claiming the workload is
+/// restart-recoverable. `ResourceController` reclaims the tree instead.
 pub trait ProcessProjector: Send + Sync {
     fn project(&self, projection: &ProcessProjection) -> Result<(), String>;
+
+    /// Durably record the native processes a supervised workload owns.
+    ///
+    /// Must be an upsert keyed by `(process_id, pid, start_time)`: this is
+    /// called on the supervision tick, and a row per sample would grow the table
+    /// with the clock rather than with the processes actually observed.
+    ///
+    /// No default implementation, and that is the point: a projector that cannot
+    /// persist ownership has to say so at compile time rather than silently
+    /// accept the write and drop it.
+    fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String>;
 }
 
 /// A read port mirroring [`ProcessProjector`]'s shape in the opposite
@@ -1572,6 +2092,18 @@ pub enum ProcessTableError {
     TerminalMismatch {
         process_id: String,
     },
+    /// A stored breach names a limit and is missing one of the values that make
+    /// it mean anything.
+    ///
+    /// The schema constrains the five columns to arrive as a group, so this can
+    /// only be reached by a row some other writer produced. It is an error rather
+    /// than a default because the alternative — reading a missing `configured` as
+    /// zero — manufactures "a budget of 0 bytes was exceeded", which is a
+    /// confident sentence about a number nobody ever set.
+    PartialBreach {
+        limit: String,
+        missing: &'static str,
+    },
     /// A parent id that names no row. Refused so the tree can never be broken.
     UnknownParent {
         parent_process_id: String,
@@ -1606,6 +2138,11 @@ impl fmt::Display for ProcessTableError {
             ProcessTableError::UnknownSignal { signal } => {
                 write!(f, "unknown process signal \"{signal}\"")
             }
+            ProcessTableError::PartialBreach { limit, missing } => write!(
+                f,
+                "the stored breach names {limit} but has no {missing}, so what it was measured \
+                 against is unknown rather than zero"
+            ),
             ProcessTableError::SignalRefused {
                 process_id,
                 kind,
@@ -1852,6 +2389,7 @@ impl<'a> ProcessTable<'a> {
             .map(ProcessUsage::measured)
             .unwrap_or_default();
 
+        let breach = exit.as_ref().and_then(|exit| exit.breach.clone());
         self.connection.execute(
             "UPDATE agent_processes
                 SET state = ?2,
@@ -1871,7 +2409,14 @@ impl<'a> ProcessTable<'a> {
                     tokens_out = COALESCE(?16, tokens_out),
                     gpu_resident_bytes = COALESCE(?17, gpu_resident_bytes),
                     gpu_device_ms = COALESCE(?18, gpu_device_ms),
-                    usage_unavailable_json = COALESCE(?19, usage_unavailable_json)
+                    usage_unavailable_json = COALESCE(?19, usage_unavailable_json),
+                    limit_kind = ?20,
+                    limit_configured = ?21,
+                    limit_observed = ?22,
+                    limit_backend = ?23,
+                    limit_level = ?24,
+                    limit_observed_at_ms = ?25,
+                    limit_evidence = ?26
               WHERE process_id = ?1",
             params![
                 process_id,
@@ -1893,6 +2438,20 @@ impl<'a> ProcessTable<'a> {
                 to_sql_u64(measured.gpu_resident_bytes),
                 to_sql_u64(measured.gpu_device_ms),
                 unavailable_json,
+                // The typed breach, which is why V21 exists: a limit kill used to
+                // survive only as prose in `exit_reason` and, for the daemon, as a
+                // marker encoded into `last_error` and parsed back out.
+                breach.as_ref().map(|breach| breach.limit.clone()),
+                breach
+                    .as_ref()
+                    .map(|breach| to_sql_u64(Some(breach.configured))),
+                breach
+                    .as_ref()
+                    .map(|breach| to_sql_u64(Some(breach.observed))),
+                breach.as_ref().map(|breach| breach.backend.clone()),
+                breach.as_ref().map(|breach| breach.level.clone()),
+                breach.as_ref().map(|breach| breach.observed_at_ms),
+                breach.as_ref().and_then(|breach| breach.evidence.clone()),
             ],
         )?;
 
@@ -2478,9 +3037,29 @@ impl<'a> ProcessTable<'a> {
         native_pid: Option<i64>,
         now_ms: i64,
     ) -> ProcessTableResult<()> {
+        self.set_native_identity(process_id, native_pid, None, now_ms)
+    }
+
+    /// [`Self::set_native_pid`] with the start time that makes the pid an
+    /// identity.
+    ///
+    /// The start time is written only when supplied, so a caller that has a pid
+    /// and nothing else does not erase one a better-informed caller recorded —
+    /// the same rule `reconcile` already applies to the pid itself.
+    pub fn set_native_identity(
+        &self,
+        process_id: &str,
+        native_pid: Option<i64>,
+        native_start_time: Option<i64>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
         let updated = self.connection.execute(
-            "UPDATE agent_processes SET native_pid = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
-            params![process_id, native_pid, now_ms],
+            "UPDATE agent_processes
+                SET native_pid = ?2,
+                    native_start_time = COALESCE(?3, native_start_time),
+                    updated_at_ms = ?4
+              WHERE process_id = ?1",
+            params![process_id, native_pid, native_start_time, now_ms],
         )?;
         if updated == 0 {
             return Err(ProcessTableError::NotFound {
@@ -2497,6 +3076,241 @@ impl<'a> ProcessTable<'a> {
         let updated = self.connection.execute(
             "UPDATE agent_processes SET run_id = ?2, updated_at_ms = ?3 WHERE process_id = ?1",
             params![process_id, run_id, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Record what is holding this process, once its controller has attached it.
+    ///
+    /// Write-once in practice and idempotent by construction: a controller's
+    /// answer does not change over a process's life, and a caller that projects
+    /// on a timer must not rewrite the row on every tick. It is a plain
+    /// overwrite rather than a `COALESCE` because the one case that *does*
+    /// rewrite it is real — a spawn that fell back to the supervisor after the
+    /// row was admitted — and the later answer is the true one.
+    pub fn set_containment(
+        &self,
+        process_id: &str,
+        containment: &crate::resource_control::Containment,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let enforcement = serde_json::to_string(&containment.enforcement).map_err(|error| {
+            ProcessTableError::InvalidField {
+                field: "resource_enforcement_json",
+                reason: error.to_string(),
+            }
+        })?;
+        let updated = self.connection.execute(
+            "UPDATE agent_processes
+                SET resource_backend = ?2,
+                    resource_tree_primitive = ?3,
+                    resource_scope = ?4,
+                    resource_enforcement_json = ?5,
+                    updated_at_ms = ?6
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                containment.backend,
+                containment.tree_primitive,
+                containment.scope,
+                enforcement,
+                now_ms,
+            ],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Durably record what one supervised workload owns, and how to find it after
+    /// a restart.
+    ///
+    /// # Why this is one transaction
+    ///
+    /// The members and the supervision metadata are read back together by the
+    /// startup reclaim, and a half-written pair is worse than neither: a member
+    /// set recorded without its boot marker cannot be safely validated on Linux,
+    /// and a boot marker recorded without its members claims a recovery the
+    /// database cannot perform.
+    ///
+    /// # Never a row per sample
+    ///
+    /// `ON CONFLICT` updates `last_seen_at_ms` rather than inserting, so the
+    /// table grows with the processes actually observed and not with the sampling
+    /// interval. `first_seen_at_ms` is left alone, because when a member was
+    /// first attributed to this workload is the audit fact worth keeping.
+    ///
+    /// A missing row is an error rather than a no-op: ownership with no lifecycle
+    /// to hang it on is exactly the state the fail-closed admission exists to
+    /// prevent, and swallowing it here would put it back.
+    pub fn record_owned(
+        &self,
+        kind: ProcessKind,
+        external_id: &str,
+        members: &[crate::process_tree::ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let Some(record) = self.find_by_external_id(kind, external_id)? else {
+            return Err(ProcessTableError::NotFound {
+                process_id: format!("{}:{external_id}", kind.as_str()),
+            });
+        };
+        self.record_owned_members(&record.process_id, members, session, boot_marker, now_ms)
+    }
+
+    /// [`Self::record_owned`] against a process id the caller already resolved.
+    pub fn record_owned_members(
+        &self,
+        process_id: &str,
+        members: &[crate::process_tree::ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        // The session guard mirrors the SQL `CHECK`: 0 is "this process's own"
+        // and 1 is init's, and neither names a workload. Recording one would hand
+        // the startup reclaim a set containing this app's own processes.
+        let session = session.filter(|session| *session > 1);
+        let updated = transaction.execute(
+            "UPDATE agent_processes
+                SET supervised_session_id = COALESCE(?2, supervised_session_id),
+                    native_boot_marker = COALESCE(?3, native_boot_marker),
+                    updated_at_ms = ?4
+              WHERE process_id = ?1",
+            params![process_id, session.map(i64::from), boot_marker, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        for member in members {
+            transaction.execute(
+                "INSERT INTO agent_process_owned_members (
+                     process_id, native_pid, native_start_time, first_seen_at_ms, last_seen_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT (process_id, native_pid, native_start_time)
+                 DO UPDATE SET last_seen_at_ms = ?4",
+                params![
+                    process_id,
+                    i64::from(member.pid),
+                    // Saturating rather than refusing: a start time this app
+                    // cannot store is still an identity it must not forget, and
+                    // the reclaim compares the stored value against a freshly
+                    // read one that would saturate identically.
+                    i64::try_from(member.start_time).unwrap_or(i64::MAX),
+                    now_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every native identity this row has been recorded as owning.
+    ///
+    /// An out-of-range stored value is an **error**, not a skipped row: the
+    /// startup reclaim's only safe answer to ownership metadata it cannot
+    /// validate is [`ExitStatus::ContainmentLost`], and quietly dropping the
+    /// member would turn that into a confident `lost`.
+    pub fn owned_members(&self, process_id: &str) -> ProcessTableResult<Vec<OwnedMember>> {
+        let mut statement = self.connection.prepare(
+            "SELECT native_pid, native_start_time, first_seen_at_ms, last_seen_at_ms
+               FROM agent_process_owned_members
+              WHERE process_id = ?1
+              ORDER BY first_seen_at_ms, native_pid",
+        )?;
+        let rows = statement.query_map(params![process_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (pid, start_time, first_seen_at_ms, last_seen_at_ms) = row?;
+            let pid = u32::try_from(pid).map_err(|_| ProcessTableError::InvalidField {
+                field: "native_pid",
+                reason: format!("{pid} is outside the pid space"),
+            })?;
+            let start_time =
+                u64::try_from(start_time).map_err(|_| ProcessTableError::InvalidField {
+                    field: "native_start_time",
+                    reason: format!("{start_time} is not a start time this host could have read"),
+                })?;
+            members.push(OwnedMember {
+                identity: crate::process_tree::ProcessIdentity { pid, start_time },
+                first_seen_at_ms,
+                last_seen_at_ms,
+            });
+        }
+        Ok(members)
+    }
+
+    /// Record the latest measurement of the owned tree.
+    ///
+    /// Peaks are folded in SQL with `MAX` rather than trusted from the caller, so
+    /// a controller that is rebuilt mid-life — or a second writer that only knows
+    /// the current value — cannot lower a peak the row already reached. The
+    /// current values are plain overwrites, which is what "current" means.
+    ///
+    /// Wall time is deliberately not stored: it is `now - started_at_ms` for a
+    /// live row and `exited_at_ms - started_at_ms` for a finished one, both of
+    /// which the row already carries. A third copy would be a number to disagree
+    /// with the other two.
+    pub fn set_tree_usage(
+        &self,
+        process_id: &str,
+        sample: &crate::resource_control::ResourceSample,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let updated = self.connection.execute(
+            // Each peak is folded only when the new sample *has* one. A bare
+            // `MAX(COALESCE(peak, 0), COALESCE(?, 0))` turns an unmeasured
+            // reading into a recorded zero — a backend that measures nothing
+            // would write `peak = 0`, which reads as "this tree held nothing"
+            // rather than "nobody looked", and those are the two things this
+            // whole surface exists to keep apart.
+            "UPDATE agent_processes
+                SET tree_rss_bytes = ?2,
+                    tree_peak_rss_bytes = CASE
+                        WHEN ?3 IS NULL THEN tree_peak_rss_bytes
+                        ELSE MAX(COALESCE(tree_peak_rss_bytes, 0), ?3)
+                    END,
+                    tree_process_count = ?4,
+                    tree_peak_process_count = CASE
+                        WHEN ?5 IS NULL THEN tree_peak_process_count
+                        ELSE MAX(COALESCE(tree_peak_process_count, 0), ?5)
+                    END,
+                    tree_output_bytes = COALESCE(?6, tree_output_bytes),
+                    tree_sampled_at_ms = ?7,
+                    updated_at_ms = ?7
+              WHERE process_id = ?1",
+            params![
+                process_id,
+                to_sql_u64(sample.rss_bytes),
+                to_sql_u64(sample.peak_rss_bytes.or(sample.rss_bytes)),
+                sample.process_count.map(i64::from),
+                sample
+                    .peak_process_count
+                    .or(sample.process_count)
+                    .map(i64::from),
+                to_sql_u64(sample.output_bytes),
+                now_ms,
+            ],
         )?;
         if updated == 0 {
             return Err(ProcessTableError::NotFound {
@@ -2570,8 +3384,29 @@ impl<'a> ProcessTable<'a> {
                 self.link_run(&record.process_id, run_id, now_ms)?;
             }
         }
-        if projection.native_pid.is_some() && record.native_pid != projection.native_pid {
-            self.set_native_pid(&record.process_id, projection.native_pid, now_ms)?;
+        if projection.native_pid.is_some()
+            && (record.native_pid != projection.native_pid
+                || (projection.native_start_time.is_some()
+                    && record.native_start_time != projection.native_start_time))
+        {
+            self.set_native_identity(
+                &record.process_id,
+                projection.native_pid,
+                projection.native_start_time,
+                now_ms,
+            )?;
+        }
+        // Written before the transition below, so a projection that both attaches
+        // and exits — a command that finished inside one tick — still records what
+        // held it. The close-out reads the row back, and a row that gains its
+        // containment afterwards would have been closed without it.
+        if let Some(containment) = projection.containment.as_ref() {
+            if record.containment.as_ref() != Some(containment) {
+                self.set_containment(&record.process_id, containment, now_ms)?;
+            }
+        }
+        if let Some(sample) = projection.usage.as_ref() {
+            self.set_tree_usage(&record.process_id, sample, now_ms)?;
         }
 
         if record.state == projection.state {
@@ -2772,6 +3607,7 @@ impl<'a> ProcessTable<'a> {
                     code: None,
                     signal: None,
                     reason: Some(reason.to_string()),
+                    breach: None,
                 }),
                 now_ms,
             )?);
@@ -2832,6 +3668,7 @@ impl<'a> ProcessTable<'a> {
                     code: None,
                     signal: None,
                     reason: Some(reason.to_string()),
+                    breach: None,
                 }),
                 now_ms,
             )?);
@@ -3258,8 +4095,15 @@ impl LedgerProcessProjector {
     }
 }
 
-impl ProcessProjector for LedgerProcessProjector {
-    fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+impl LedgerProcessProjector {
+    /// The ledger, opened on first use, and the clock read once.
+    ///
+    /// Shared by both port methods so neither can drift into opening a second
+    /// connection or reading a second clock.
+    fn with_table<T>(
+        &self,
+        work: impl FnOnce(&ProcessTable<'_>, i64) -> Result<T, String>,
+    ) -> Result<T, String> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| "system clock is before the unix epoch".to_string())?
@@ -3277,11 +4121,33 @@ impl ProcessProjector for LedgerProcessProjector {
             );
         }
         let ledger = slot.as_ref().expect("ledger initialized above");
-        ledger
-            .process_table()
-            .reconcile(projection, now_ms)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        work(&ledger.process_table(), now_ms)
+    }
+}
+
+impl ProcessProjector for LedgerProcessProjector {
+    fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+        self.with_table(|table, now_ms| {
+            table
+                .reconcile(projection, now_ms)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String> {
+        self.with_table(|table, now_ms| {
+            table
+                .record_owned(
+                    owned.kind,
+                    &owned.external_id,
+                    &owned.members,
+                    owned.session,
+                    owned.boot_marker.as_deref(),
+                    now_ms,
+                )
+                .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -3289,7 +4155,12 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, \
      max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms, \
      updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested, \
-     signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens \
+     signal_reason, signal_requested_at_ms, kill_requested, max_context_tokens, \
+     limit_kind, limit_configured, limit_observed, limit_backend, limit_level, \
+     limit_observed_at_ms, limit_evidence, native_start_time, \
+     resource_backend, resource_tree_primitive, resource_scope, resource_enforcement_json, \
+     tree_rss_bytes, tree_peak_rss_bytes, tree_process_count, tree_peak_process_count, \
+     tree_output_bytes, tree_sampled_at_ms, supervised_session_id, native_boot_marker \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -3418,11 +4289,100 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
                 code: row.get(14)?,
                 signal: row.get(15)?,
                 reason: row.get(16)?,
+                // Present only for a row a resource controller closed. Read as a
+                // group, and a group that does not arrive whole is reported as
+                // such: the SQL constrains these five columns to be all-or-none,
+                // so a partial row means some other writer bypassed the schema,
+                // and defaulting the gaps would turn that into "a budget of 0 was
+                // exceeded" — a confident sentence about a number nobody set.
+                breach: match row.get::<_, Option<String>>(27)? {
+                    Some(limit) => {
+                        let require_u64 = |value: Option<i64>, missing| match value {
+                            Some(value) => Ok(value as u64),
+                            None => Err(ProcessTableError::PartialBreach {
+                                limit: limit.clone(),
+                                missing,
+                            }),
+                        };
+                        let require_text = |value: Option<String>, missing| match value {
+                            Some(value) => Ok(value),
+                            None => Err(ProcessTableError::PartialBreach {
+                                limit: limit.clone(),
+                                missing,
+                            }),
+                        };
+                        let configured = require_u64(row.get(28)?, "limit_configured");
+                        let observed = require_u64(row.get(29)?, "limit_observed");
+                        let backend = require_text(row.get(30)?, "limit_backend");
+                        let level = require_text(row.get(31)?, "limit_level");
+                        match (configured, observed, backend, level) {
+                            (Ok(configured), Ok(observed), Ok(backend), Ok(level)) => {
+                                Some(crate::resource_control::LimitBreach {
+                                    limit,
+                                    configured,
+                                    observed,
+                                    backend,
+                                    level,
+                                    // A stamp is the one field a breach can
+                                    // honestly lack — see `now_ms`'s own note on
+                                    // a clock that will not read.
+                                    observed_at_ms: row
+                                        .get::<_, Option<i64>>(32)?
+                                        .unwrap_or_default(),
+                                    // Absent for every supervised bound, by
+                                    // design: the supervisor's evidence is the
+                                    // two numbers beside it.
+                                    evidence: row.get::<_, Option<String>>(33)?,
+                                })
+                            }
+                            (Err(error), ..)
+                            | (_, Err(error), ..)
+                            | (_, _, Err(error), _)
+                            | (_, _, _, Err(error)) => return Ok(Err(error)),
+                        }
+                    }
+                    None => None,
+                },
             }),
             Err(error) => return Ok(Err(error)),
         },
         None => None,
     };
+
+    // The mechanism that held *this* process, as its own controller reported it
+    // — read back rather than recomputed from the host doing the reading. A
+    // stored enforcement map that will not parse is dropped rather than guessed
+    // at: an invented capability would say a limit was kernel-held when nothing
+    // knows whether it was.
+    let containment = match row.get::<_, Option<String>>(35)? {
+        Some(backend) => Some(crate::resource_control::Containment {
+            backend,
+            tree_primitive: row.get::<_, Option<String>>(36)?.unwrap_or_default(),
+            scope: row.get(37)?,
+            enforcement: row
+                .get::<_, Option<String>>(38)?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+        }),
+        None => None,
+    };
+
+    // Read as a group with `wall_ms`, because that is the one field of a sample
+    // that is always measurable: a row with a sample stamp has been measured, and
+    // a row without one has not. Every other field stays `Option`, so a backend
+    // that measures nothing reports nothing rather than zero.
+    let usage_sampled_at_ms: Option<i64> = row.get(44)?;
+    let usage = usage_sampled_at_ms
+        .map(|_| -> rusqlite::Result<_> {
+            Ok(crate::resource_control::RecordedUsage {
+                rss_bytes: row.get::<_, Option<i64>>(39)?.map(|v| v as u64),
+                peak_rss_bytes: row.get::<_, Option<i64>>(40)?.map(|v| v as u64),
+                process_count: row.get::<_, Option<i64>>(41)?.map(|v| v as u32),
+                peak_process_count: row.get::<_, Option<i64>>(42)?.map(|v| v as u32),
+                output_bytes: row.get::<_, Option<i64>>(43)?.map(|v| v as u64),
+            })
+        })
+        .transpose()?;
 
     Ok(Ok(ProcessRecord {
         process_id: row.get(0)?,
@@ -3434,6 +4394,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
         workspace: row.get(6)?,
         profile: row.get(7)?,
         native_pid: row.get(8)?,
+        native_start_time: row.get(34)?,
         limits: ProcessLimits {
             max_wall_ms: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
             max_memory_bytes: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
@@ -3443,6 +4404,13 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
             // index above stays where it was.
             max_context_tokens: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
         },
+        containment,
+        supervised_session_id: row
+            .get::<_, Option<i64>>(45)?
+            .and_then(|v| u32::try_from(v).ok()),
+        native_boot_marker: row.get(46)?,
+        usage,
+        usage_sampled_at_ms,
         exit,
         signal_intent: SignalIntent {
             stop_requested: row.get::<_, i64>(21)? != 0,
@@ -4139,6 +5107,171 @@ mod tests {
         );
     }
 
+    /// A kernel-reported breach survives the round trip whole, including the
+    /// counter that proved it.
+    ///
+    /// The evidence matters most in exactly the case the two numbers cannot
+    /// carry: a `pids.max` refusal leaves configured and observed **equal**,
+    /// which read alone says the limit did not fire.
+    #[test]
+    fn a_kernel_breach_round_trips_with_the_counter_that_proved_it() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-kernel-breach");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the shell starts");
+
+        let breach = crate::resource_control::LimitBreach {
+            limit: "max_child_processes".to_string(),
+            configured: 12,
+            observed: 12,
+            backend: "cgroup v2".to_string(),
+            level: "kernel".to_string(),
+            observed_at_ms: T0 + 2,
+            evidence: Some("cgroup v2 `pids.events` max".to_string()),
+        };
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(breach.clone())),
+                T0 + 3,
+            )
+            .expect("a limit kill is a terminal transition");
+
+        let stored = table
+            .get(&record.process_id)
+            .expect("read back")
+            .expect("the row exists")
+            .exit
+            .expect("an exited row carries its exit")
+            .breach
+            .expect("a limit kill carries its breach");
+        assert_eq!(stored, breach);
+        assert!(
+            stored.describe().contains("pids.events"),
+            "with both numbers equal, the evidence is the only thing that says the limit fired: {}",
+            stored.describe()
+        );
+    }
+
+    /// A supervised breach has no kernel counter, and is not made to invent one.
+    #[test]
+    fn a_supervised_breach_round_trips_with_no_evidence_rather_than_an_empty_one() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-supervised");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("the shell starts");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(
+                    crate::resource_control::LimitBreach {
+                        limit: "max_memory_bytes".to_string(),
+                        configured: 1_024,
+                        observed: 4_096,
+                        backend: "supervisor".to_string(),
+                        level: "supervised".to_string(),
+                        observed_at_ms: T0 + 2,
+                        evidence: None,
+                    },
+                )),
+                T0 + 3,
+            )
+            .expect("terminal");
+        let stored = table
+            .get(&record.process_id)
+            .expect("read back")
+            .expect("row")
+            .exit
+            .expect("exit")
+            .breach
+            .expect("breach");
+        assert_eq!(stored.evidence, None);
+    }
+
+    /// A breach row missing one of its grouped values is reported, never
+    /// completed with zeros.
+    ///
+    /// The schema constrains the five to arrive together, so this writes past it
+    /// deliberately — which is the only way the case can exist, and exactly why
+    /// the reader must not paper over it: `configured: 0` reads as "a budget of
+    /// zero was exceeded", a confident sentence about a number nobody set.
+    #[test]
+    fn a_partial_stored_breach_is_an_error_rather_than_a_manufactured_zero() {
+        let ledger = ledger();
+        let table = ProcessTable::new(ledger.connection());
+        let record = admit(&table, ProcessKind::ForegroundShell, "fgsh-partial");
+        table
+            .transition(&record.process_id, ProcessState::Running, None, T0 + 1)
+            .expect("running");
+        table
+            .transition(
+                &record.process_id,
+                ProcessState::Exited,
+                Some(ProcessExit::limit_exceeded(
+                    crate::resource_control::LimitBreach {
+                        limit: "max_memory_bytes".to_string(),
+                        configured: 1_024,
+                        observed: 4_096,
+                        backend: "supervisor".to_string(),
+                        level: "supervised".to_string(),
+                        observed_at_ms: T0 + 2,
+                        evidence: None,
+                    },
+                )),
+                T0 + 3,
+            )
+            .expect("terminal");
+        // The schema refuses this write, which is the first line of defence and is
+        // asserted below. Suspending the check is how a row written by some other
+        // tool — an older build, a repair script, a hand-edited database — is
+        // reproduced, because that is the only way this state can arise.
+        assert!(
+            ledger
+                .connection()
+                .execute(
+                    "UPDATE agent_processes SET limit_configured = NULL WHERE process_id = ?1",
+                    rusqlite::params![record.process_id],
+                )
+                .is_err(),
+            "the schema must refuse a half-written breach in the first place"
+        );
+        ledger
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("suspend the guard for this one write");
+        ledger
+            .connection()
+            .execute(
+                "UPDATE agent_processes SET limit_configured = NULL WHERE process_id = ?1",
+                rusqlite::params![record.process_id],
+            )
+            .expect("a writer that bypassed the schema");
+        ledger
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", false)
+            .expect("restore the guard");
+
+        let error = table
+            .get(&record.process_id)
+            .expect_err("a half-written breach is a data error");
+        assert!(
+            matches!(
+                error,
+                ProcessTableError::PartialBreach {
+                    missing: "limit_configured",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
     /// Without this, a turn killed for exceeding its budget is indistinguishable
     /// from one a user stopped — and its recorded reason says "stopped by the
     /// user", which is not imprecise but false.
@@ -4246,8 +5379,40 @@ mod tests {
         }
     }
 
+    /// `ProcessKind::ALL` is hand-maintained, and nothing made adding a variant
+    /// fail without it.
+    ///
+    /// That is not a tidiness point. `ALL` is what `monkey processes limits`
+    /// enumerates and what every "for each kind" invariant in this file iterates,
+    /// so a variant missing from it is a kind whose limit matrix, signal matrix
+    /// and class defaults are simply never checked — and the check that would
+    /// have caught it passes, because it never looked. `ForegroundShell` was
+    /// added and every one of those invariants still passed until this existed.
+    ///
+    /// Checked against the SQL vocabulary rather than against a second Rust list,
+    /// because two copies of the same list agree by construction. The `CHECK`
+    /// constraint is written by a different author for a different reason, so its
+    /// agreement is evidence.
+    #[test]
+    fn the_kind_list_and_the_stored_vocabulary_name_the_same_kinds() {
+        let database = crate::run_ledger::RunLedger::open(temp_ledger_path("kind-vocab"))
+            .expect("ledger opens");
+        let stored = database
+            .stored_process_kinds()
+            .expect("the CHECK is readable");
+        let declared: std::collections::BTreeSet<String> = ProcessKind::ALL
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect();
+        assert_eq!(
+            stored, declared,
+            "ProcessKind::ALL and the agent_processes.kind CHECK disagree; a kind in one and \
+             not the other is either unstorable or silently exempt from every per-kind invariant"
+        );
+    }
+
     /// The declaration must match what the app really enforces, so this asserts
-    /// the *shape of the honesty*: exactly one kind carries a bound, and its
+    /// the *shape of the honesty*: which kinds carry a bound, and that each
     /// number is the constant the enforcing code uses.
     #[test]
     fn every_kind_declares_the_bounds_it_is_actually_subject_to() {
@@ -4263,23 +5428,31 @@ mod tests {
                 ProcessKind::Subagent,
                 ProcessKind::CrewMember,
                 ProcessKind::BackgroundShell,
+                ProcessKind::ForegroundShell,
                 ProcessKind::SideTask,
-                ProcessKind::BrowserSession
+                ProcessKind::BrowserSession,
+                ProcessKind::VerifyCommand,
+                ProcessKind::HookCommand,
+                ProcessKind::SandboxRun
             ],
             "a kind gained or lost a class-level bound; if that is intended, the \
              field docs on ProcessLimits and the K4 roadmap entry have to move with it"
         );
 
-        // The only desktop kind with an *enforced* wall bound, and the number is
-        // the one `browser_worker`'s watchdog actually sweeps on — not a second
-        // ceiling declared beside it.
+        // Two owners on one row, and the assertions are per field because that is
+        // exactly the split. The wall number is the one `browser_worker`'s
+        // watchdog actually sweeps on — not a second ceiling declared beside it —
+        // while the two process bounds belong to the resource controller, which
+        // now holds Chromium's whole tree. Output stays absent: this kind
+        // captures no stream of its own.
         let browser = ProcessKind::BrowserSession.default_limits();
         assert_eq!(
             browser.max_wall_ms,
             Some(crate::browser_worker::DEFAULT_MAX_SESSION_MS)
         );
         assert_eq!(browser.max_output_bytes, None);
-        assert_eq!(browser.max_memory_bytes, None);
+        assert_eq!(browser.max_memory_bytes, Some(BROWSER_MEMORY_BUDGET_BYTES));
+        assert_eq!(browser.max_child_processes, Some(BROWSER_PROCESS_BUDGET));
 
         let shell = ProcessKind::BackgroundShell.default_limits();
         assert_eq!(
@@ -4290,7 +5463,41 @@ mod tests {
         // A background shell is meant to outlive its turn, so it is spawned with
         // no timeout at all. Declaring a wall bound here would be a lie.
         assert_eq!(shell.max_wall_ms, None);
-        assert_eq!(shell.max_memory_bytes, None);
+
+        // The two native shell kinds carry the same tree bounds, because they are
+        // the same process under the same controller — the only difference is who
+        // is waiting for it. Asserted per field rather than as a whole record so
+        // the two output ceilings, which genuinely differ, stay visible: a
+        // background shell's tail is read by a human and a foreground shell's by
+        // a model.
+        let foreground = ProcessKind::ForegroundShell.default_limits();
+        for (kind, limits) in [
+            (ProcessKind::BackgroundShell, shell),
+            (ProcessKind::ForegroundShell, foreground),
+        ] {
+            assert_eq!(
+                limits.max_memory_bytes,
+                Some(SHELL_MEMORY_BUDGET_BYTES),
+                "{} must declare the tree memory bound its controller holds",
+                kind.as_str()
+            );
+            assert_eq!(
+                limits.max_child_processes,
+                Some(SHELL_PROCESS_BUDGET),
+                "{} must declare the per-tree process bound its controller holds",
+                kind.as_str()
+            );
+            assert_eq!(limits.max_context_tokens, None);
+        }
+        assert_eq!(
+            foreground.max_output_bytes,
+            Some(u64::try_from(crate::output_cap::MODEL_OUTPUT_CAP).unwrap()),
+            "a foreground shell's output reaches a model, so it takes the model ceiling"
+        );
+        // Bounded by the caller's own tool timeout rather than by a class number:
+        // `SHELL_TIMEOUT` and `DEFAULT_VERIFY_TIMEOUT_SECS` differ by more than
+        // twice, so one class default would be wrong for one of them.
+        assert_eq!(foreground.max_wall_ms, None);
 
         // The four WebView kinds all carry the same wall budget, and only that:
         // one number for four kinds because they are the same shape of process,
@@ -4470,6 +5677,7 @@ mod tests {
                         code: Some(3),
                         signal: Some("SIGTERM".to_string()),
                         reason: Some("because".to_string()),
+                        breach: None,
                     }),
                     T0 + 1,
                 )
@@ -4922,6 +6130,7 @@ mod tests {
                 code: None,
                 signal: None,
                 reason: None,
+                breach: None,
             });
         }
         table.reconcile(&projection, T0).unwrap().0
@@ -5040,6 +6249,7 @@ mod tests {
                     code: None,
                     signal: None,
                     reason: None,
+                    breach: None,
                 }),
                 T0 + 1,
             )
@@ -5696,8 +6906,21 @@ mod tests {
             ProcessKind::WorkflowNode => "m4_services.rs — WorkflowService::append_history",
             ProcessKind::RemoteRun => "bin/monkey-cli/daemon/mod.rs — project_queue_origin",
             ProcessKind::BackgroundShell => "background_shell.rs — emit_status",
+            ProcessKind::ForegroundShell => {
+                "workspace_shell.rs — GuardedShell::spawn, for every foreground shell and \
+                 verify command on either client"
+            }
             ProcessKind::SideTask => "src/lib/sideTaskRunner.ts — runSideTask",
             ProcessKind::BrowserSession => "browser_worker.rs — OwnedBrowser::project",
+            ProcessKind::VerifyCommand => {
+                "verify.rs — run_command_impl, through bounded_execution::BoundedExecution"
+            }
+            ProcessKind::HookCommand => {
+                "hooks.rs — hook_exec, through bounded_execution::BoundedExecution"
+            }
+            ProcessKind::SandboxRun => {
+                "sandbox.rs — execute_in_sandbox, through bounded_execution::BoundedExecution"
+            }
         }
     }
 
@@ -6231,10 +7454,12 @@ mod tests {
                 kind.as_str()
             );
         }
-        // `ALL` must itself be exhaustive, or the loop above proves nothing.
+        // `ALL` must itself be exhaustive, or the loop above proves nothing. The
+        // count is the cheap half; `the_kind_list_and_the_stored_vocabulary_name_
+        // the_same_kinds` is the half that says *which* kind is missing.
         assert_eq!(
             ProcessKind::ALL.len(),
-            10,
+            14,
             "ProcessKind::ALL is out of sync with the enum"
         );
     }
@@ -6355,14 +7580,38 @@ mod tests {
         assert!(!ProcessKind::DaemonJob
             .limit_support(ProcessLimitKind::Memory)
             .honours_caller_value());
-        // Nothing, anywhere, holds a per-tree process count.
+        // A per-tree process count is held exactly where a resource controller
+        // owns a native tree, and nowhere else. Both halves are asserted: the
+        // first is the capability this item added, and the second is what stops
+        // it from being claimed for a kind that owns no OS process at all.
+        // The kinds routed through a resource controller. That set is now exactly
+        // "owns a native process tree": the browser session was the one member of
+        // the second group and not the first, bounded by `browser_worker`'s own
+        // session quotas, and it is routed. What the quotas kept is what no
+        // controller can express — the session clock, the action budget, the disk
+        // budget — so the two authorities still hold disjoint resources.
         for kind in ProcessKind::ALL {
-            assert!(
-                matches!(
-                    kind.limit_support(ProcessLimitKind::ChildProcesses),
-                    LimitEnforcement::Unavailable(_)
-                ),
-                "{} claims a child-process ceiling",
+            let owns_a_tree = matches!(
+                kind,
+                ProcessKind::BackgroundShell
+                    | ProcessKind::ForegroundShell
+                    | ProcessKind::BrowserSession
+                    | ProcessKind::VerifyCommand
+                    | ProcessKind::HookCommand
+                    | ProcessKind::SandboxRun
+            );
+            assert_eq!(
+                kind.limit_support(ProcessLimitKind::ChildProcesses)
+                    .honours_caller_value(),
+                owns_a_tree,
+                "{} disagrees with whether it owns a process tree a count can bound",
+                kind.as_str()
+            );
+            assert_eq!(
+                kind.limit_support(ProcessLimitKind::Memory)
+                    .honours_caller_value(),
+                owns_a_tree,
+                "{} disagrees with whether it owns a process tree memory can be summed over",
                 kind.as_str()
             );
         }
