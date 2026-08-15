@@ -1537,6 +1537,17 @@ pub async fn tool_device_action(
     if let Some(wait_ms) = wait_ms {
         args.extend(["--wait-ms".into(), wait_ms.to_string()]);
     }
+    // The turn and the call inside it: the desktop's durable identity for this
+    // invocation, and the only thing that stops a replayed turn from taking a
+    // second photograph. Both come from the runtime, never from the model.
+    if let (Some(turn_id), Some(tool_call_id)) = (&turn_id, &tool_call_id) {
+        validate_id("turn id", turn_id)?;
+        validate_id("tool call id", tool_call_id)?;
+        args.extend([
+            "--invocation-id".into(),
+            format!("{turn_id}:{tool_call_id}"),
+        ]);
+    }
     parse_json(&command(args).await?)
 }
 

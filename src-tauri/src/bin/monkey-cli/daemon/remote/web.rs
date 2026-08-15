@@ -3,6 +3,10 @@ use super::api::ApiResponse;
 const INDEX_HTML: &str = include_str!("ui/index.html");
 const APP_CSS: &str = include_str!("ui/app.css");
 const APP_JS: &str = include_str!("ui/app.js");
+/// The client's decision logic, split out of `app.js` so it can be tested
+/// without a browser. `app.js` imports it as a module; the CSP already allows
+/// `script-src 'self'`, so no policy change is needed.
+const DEVICE_CORE_JS: &str = include_str!("ui/device-core.js");
 const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
 const SERVICE_WORKER: &str = include_str!("ui/sw.js");
 const ICON: &str = include_str!("ui/icon.svg");
@@ -20,6 +24,9 @@ pub fn asset(method: &str, path_and_query: &str) -> Option<ApiResponse> {
         "/" | "/remote" | "/remote/" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         "/v1/remote/ui/app.css" => ("text/css; charset=utf-8", APP_CSS.as_bytes()),
         "/v1/remote/ui/app.js" => ("text/javascript; charset=utf-8", APP_JS.as_bytes()),
+        "/v1/remote/ui/device-core.js" => {
+            ("text/javascript; charset=utf-8", DEVICE_CORE_JS.as_bytes())
+        }
         // At the root, not under `/v1/remote/ui/`: a worker's default scope is
         // its own directory, and the controller it must serve lives at `/`.
         "/sw.js" => ("text/javascript; charset=utf-8", SERVICE_WORKER.as_bytes()),
@@ -412,13 +419,27 @@ mod tests {
              makes the grant a dead letter"
         );
 
-        // One armed screen share, reused, and honestly reported.
+        // One armed screen share, reused, and honestly reported. The mapping
+        // itself — armed means ready, unarmed means it needs arming — lives in
+        // `device-core.js` and is exercised directly by the client tests; what
+        // matters here is that the stream is still held and still re-advertised
+        // when the browser's own sharing bar ends it.
         assert!(javascript.contains("function screenShareIsLive()"));
         assert!(javascript.contains("async function armScreenShare()"));
         assert!(javascript.contains("track.addEventListener(\"ended\""));
+        let core = String::from_utf8(
+            asset("GET", "/v1/remote/ui/device-core.js")
+                .expect("device core asset")
+                .body,
+        )
+        .unwrap();
         assert!(
-            javascript.contains("return screenShareIsLive() ? \"granted\" : \"undetermined\""),
-            "the OS permission reported for screen capture must follow the armed stream"
+            core.contains("probe.screenShareLive ? READINESS.ready : READINESS.armedRequired"),
+            "screen capture readiness must follow the armed stream"
+        );
+        assert!(
+            core.contains("permission: PERMISSION.notRequired"),
+            "screen sharing and audio playback have no OS permission to report"
         );
 
         // Real audio, through the artifact route that already exists rather
@@ -448,6 +469,89 @@ mod tests {
         // `start` before the physical action, and a `started: false` reply
         // performs nothing — the exactly-once contract, on the client side.
         assert!(javascript.contains("if (started.started !== true)"));
+    }
+
+    /// The client's decision logic is a module the runner serves and the tests
+    /// import, not a paragraph of `app.js` nobody can execute.
+    ///
+    /// This assertion exists because the alternative was the whole problem:
+    /// every rule about performing a physical effect at most once used to be
+    /// checkable only by reading the source. `src/lib/pairedDeviceCore.test.ts`
+    /// exercises the module itself; this makes sure the phone is actually
+    /// served the same file.
+    #[test]
+    fn the_client_decision_logic_is_a_module_the_runner_serves() {
+        let response = asset("GET", "/v1/remote/ui/device-core.js").expect("device core asset");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/javascript; charset=utf-8");
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        assert!(
+            javascript.contains("from \"./device-core.js\""),
+            "the client must use the module the tests exercise, not a second copy"
+        );
+        let html = String::from_utf8(asset("GET", "/").unwrap().body).unwrap();
+        assert!(
+            html.contains("<script type=\"module\""),
+            "a classic script cannot import the module"
+        );
+    }
+
+    /// The orderings that make a physical effect happen at most once and its
+    /// result arrive at least once.
+    ///
+    /// Each of these is a step whose *position* is the safety property, so each
+    /// is pinned where a refactor would otherwise quietly reorder it. The
+    /// behaviour behind them is exercised in `device_e2e.rs` (runner side) and
+    /// `src/lib/pairedDeviceCore.test.ts` (device side).
+    #[test]
+    fn the_client_stages_results_durably_and_forgets_them_only_after_the_runner_acknowledges() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        // A dedicated object store: artifact bytes must not ride in the profile
+        // record, which is rewritten on every sequence allocation.
+        assert!(javascript.contains("const JOURNAL_STORE = \"device_command_journal\""));
+        assert!(javascript.contains("const DB_VERSION = 2"));
+        // One executor per profile, holding the lock across the whole loop —
+        // not merely around each signed request.
+        assert!(javascript.contains("const EXECUTOR_LOCK = \"little-monkey-device-executor-v1\""));
+        assert!(javascript.contains("acquireExecutor(navigator.locks, EXECUTOR_LOCK"));
+        // Flush, then reconcile, then lease. A fresh command must never race
+        // ahead of a result the runner is still waiting for.
+        let body = javascript
+            .split_once("async function commandLoopBody()")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
+            .map(|(body, _)| body.to_string())
+            .expect("app.js still declares commandLoopBody");
+        let flush = body.find("flushOutbox").expect("the outbox is flushed");
+        let reconcile = body
+            .find("reconcileRunningCommands")
+            .expect("running work is reconciled");
+        let lease = body.find("/commands/next").expect("new work is leased");
+        assert!(
+            flush < reconcile && reconcile < lease,
+            "the loop must flush staged results and reconcile running commands before leasing"
+        );
+        // The start transition is durable before anything physical happens, and
+        // carries the execution identity that tells a reconnect from a second
+        // device.
+        assert!(javascript.contains("execution_id: executionId"));
+        assert!(javascript.contains("phase: PHASE.startAuthorized"));
+        // A running command is watched, so a cancellation reaches it.
+        assert!(javascript.contains("/control?wait_ms="));
+        assert!(javascript.contains("new AbortController()"));
+        // Room for the result is checked before the effect, never after.
+        assert!(javascript.contains("capacityRefusal(await journalEntries()"));
+        // The recovery route is a reconciliation, never a second lease.
+        assert!(javascript.contains("\"GET\", \"/v1/remote/device/commands/recover\""));
     }
 
     #[test]

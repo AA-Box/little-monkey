@@ -22,13 +22,15 @@ use little_monkey_lib::run_protocol::OutputChannel;
 use super::desktop::DesktopControlRuntime;
 use super::migrate::land_migration;
 use super::protocol::{
-    canonical_request, effective_capabilities, legacy_capabilities, sha256_hex,
-    ApprovalRequestBody, CancelRequestBody, DesktopControlActionRequest,
+    canonical_request, capability_block, effective_capabilities, legacy_capabilities, sha256_hex,
+    terminal_digest, ApprovalRequestBody, CancelRequestBody, DesktopControlActionRequest,
     DesktopControlStartRequest, DesktopControlStopRequest, DeviceCapability, DeviceCommand,
-    DeviceCommandResult, DeviceCommandState, DeviceSurface, MigrationAcceptRequest,
-    MigrationPreflightRequest, MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig,
-    RemoteScopes, RunSummary, SignedRequestHeaders, VoiceChunkRequest, VoiceCloseRequest,
-    DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES, REMOTE_PROTOCOL_VERSION,
+    DeviceCommandControl, DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest,
+    DeviceCommandState, DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest,
+    MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
+    SignedRequestHeaders, VoiceChunkRequest, VoiceCloseRequest, DEVICE_LEASE_MS,
+    MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES,
+    REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
     CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
@@ -284,6 +286,13 @@ impl RemoteApi {
         })
     }
 
+    /// The store this API answers from, for tests that need to queue work or
+    /// read the authoritative record beside the protocol.
+    #[cfg(test)]
+    pub fn store_for_tests(&self) -> Arc<Mutex<RemoteStore>> {
+        Arc::clone(&self.store)
+    }
+
     #[cfg(test)]
     pub fn injected(
         paths: DaemonPaths,
@@ -386,8 +395,8 @@ impl RemoteApi {
     /// `wait_ms` (capped at the lease length) so no connection is held open
     /// indefinitely. Every other route is the unchanged synchronous path.
     pub async fn handle_waiting(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
-        let deadline_ms = match long_poll_wait_ms(&request) {
-            Some(wait_ms) => wait_ms,
+        let (target, deadline_ms) = match long_poll_target(&request) {
+            Some(value) => value,
             None => return self.handle(request, now_ms),
         };
         // The wait happens BEFORE dispatch, and the signed request is answered
@@ -407,7 +416,15 @@ impl RemoteApi {
             // An unverified device id is enough to decide *whether to wait*: it
             // grants nothing, and the answer below still goes through the full
             // signature, revocation and replay checks.
-            if self.has_pending_device_command(&device_id, now_ms.saturating_add(elapsed)) {
+            let ready = match &target {
+                LongPollTarget::Lease => {
+                    self.has_pending_device_command(&device_id, now_ms.saturating_add(elapsed))
+                }
+                LongPollTarget::Control(command_id) => {
+                    self.command_control_changed(&device_id, command_id)
+                }
+            };
+            if ready {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(
@@ -425,6 +442,17 @@ impl RemoteApi {
             .ok()
             .and_then(|store| store.pending_device_command_count(device_id, now_ms).ok())
             .is_some_and(|count| count > 0)
+    }
+
+    /// Whether a control watcher has anything to hear yet: a cancellation
+    /// asked for, or the command having left `running` under it.
+    fn command_control_changed(&self, device_id: &str, command_id: &str) -> bool {
+        self.store
+            .lock()
+            .ok()
+            .and_then(|store| store.device_command(command_id).ok().flatten())
+            .filter(|record| record.device_id == device_id)
+            .is_none_or(|record| record.cancel_requested || record.state.terminal())
     }
 
     fn handle_request(&self, request: ApiRequest, now_ms: u64) -> ApiResponse {
@@ -712,8 +740,17 @@ impl RemoteApi {
             ("GET", ["v1", "remote", "device", "commands", "next"]) => {
                 self.device_command_lease(device, now_ms)
             }
+            // Reconciliation, never a second lease: the commands this device
+            // started and never finished, so a reconnect can deliver a staged
+            // result or say honestly that the outcome is unknown.
+            ("GET", ["v1", "remote", "device", "commands", "recover"]) => {
+                self.device_commands_recover(device, now_ms)
+            }
+            ("GET", ["v1", "remote", "device", "commands", command_id, "control"]) => {
+                self.device_command_control(device, command_id, now_ms)
+            }
             ("POST", ["v1", "remote", "device", "commands", command_id, "start"]) => {
-                self.device_command_start(device_id, command_id, now_ms)
+                self.device_command_start(&request.body, device, command_id, now_ms)
             }
             ("POST", ["v1", "remote", "device", "commands", command_id, "result"]) => {
                 self.device_command_result(&request.body, device, command_id, now_ms)
@@ -2010,7 +2047,7 @@ impl RemoteApi {
         // not the one asking for work, so this is where someone else notices.
         super::voice::expire(&mut store, now_ms).map_err(internal)?;
         let surface = store.device_surface(&device.device_id).map_err(internal)?;
-        let effective = effective_capabilities(&device.capabilities, surface.as_ref());
+        let granted = granted_capabilities(device);
         // Bounded: each iteration retires exactly one now-unauthorized command,
         // so this cannot spin.
         for _ in 0..64 {
@@ -2020,7 +2057,10 @@ impl RemoteApi {
             else {
                 return Ok((204, serde_json::json!({}), None));
             };
-            if !effective.contains(&record.capability) {
+            if let Some(block) = capability_block(&granted, surface.as_ref(), record.capability) {
+                // Failed with the reason, not with a shrug: a run is waiting on
+                // this answer and the operator needs to know which of the four
+                // axes said no.
                 store
                     .complete_device_command(
                         &device.device_id,
@@ -2028,11 +2068,19 @@ impl RemoteApi {
                         DeviceCommandState::Failed,
                         None,
                         None,
-                        Some(
-                            "The capability this command needs is no longer granted, advertised \
-                             or permitted by the device's operating system",
-                        ),
+                        Some(&block.explain(record.capability)),
+                        None,
                         now_ms,
+                    )
+                    .map_err(internal)?;
+                store
+                    .audit(
+                        now_ms,
+                        Some(&device.device_id),
+                        "device_command_blocked",
+                        Some(&record.command_id),
+                        block.as_str(),
+                        None,
                     )
                     .map_err(internal)?;
                 continue;
@@ -2057,24 +2105,165 @@ impl RemoteApi {
     /// The device declaring it is about to touch hardware. `started: false`
     /// means this command was already running — the device must not repeat the
     /// action, and this is the reply a reconnect gets.
+    ///
+    /// Authority is re-checked here and not only at lease time. A lease and the
+    /// moment hardware is touched are different moments, and a grant withdrawn
+    /// or a permission revoked in between has to stop the action — the whole
+    /// point of the split is that nothing physical has happened yet.
     fn device_command_start(
         &self,
-        device_id: &str,
+        body: &[u8],
+        device: &DeviceRecord,
         command_id: &str,
         now_ms: u64,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
-        let started = self
-            .locked_store()?
-            .start_device_command(device_id, command_id, now_ms)
+        let request: DeviceCommandStartRequest = if body.is_empty() {
+            DeviceCommandStartRequest::default()
+        } else {
+            serde_json::from_slice(body)
+                .map_err(|error| (400, format!("Invalid device command start: {error}")))?
+        };
+        request.validate().map_err(|error| (400, error))?;
+        let mut store = self.locked_store()?;
+        let record = store
+            .device_command(command_id)
+            .map_err(internal)?
+            .filter(|record| record.device_id == device.device_id)
+            .ok_or((404, "Unknown device command".to_string()))?;
+        // A command already past its own deadline never begins, however long
+        // the device took to ask.
+        if record.expires_at_ms <= now_ms && !record.state.terminal() {
+            store.expire_device_commands(now_ms).map_err(internal)?;
+            return Err((409, "This command expired before it started".to_string()));
+        }
+        if !record.state.terminal() {
+            let surface = store.device_surface(&device.device_id).map_err(internal)?;
+            let granted = granted_capabilities(device);
+            if let Some(block) = capability_block(&granted, surface.as_ref(), record.capability) {
+                store
+                    .complete_device_command(
+                        &device.device_id,
+                        command_id,
+                        DeviceCommandState::Failed,
+                        None,
+                        None,
+                        Some(&block.explain(record.capability)),
+                        request.execution_id.as_deref(),
+                        now_ms,
+                    )
+                    .map_err(internal)?;
+                store
+                    .audit(
+                        now_ms,
+                        Some(&device.device_id),
+                        "device_command_blocked",
+                        Some(command_id),
+                        block.as_str(),
+                        None,
+                    )
+                    .map_err(internal)?;
+                return Err((403, block.explain(record.capability)));
+            }
+        }
+        let outcome = store
+            .start_device_command(
+                &device.device_id,
+                command_id,
+                request.execution_id.as_deref(),
+                now_ms,
+            )
             .map_err(|error| (409, error))?;
         Ok((
             200,
             serde_json::json!({
                 "protocol_version": REMOTE_PROTOCOL_VERSION,
                 "command_id": command_id,
-                "started": started,
+                "started": outcome.started,
+                // True when this is the same execution reconnecting: it may
+                // deliver a result it already staged, and must not re-execute.
+                "recoverable": outcome.recoverable,
+                "execution_id": outcome.execution_id,
             }),
             Some(command_id.to_string()),
+        ))
+    }
+
+    /// Every nonterminal command the runner still believes this device owns.
+    ///
+    /// Deliberately not a lease: handing a `running` command back through the
+    /// queue is precisely the second execution this design refuses. The device
+    /// answers each of these from its own journal — deliver the staged result,
+    /// or report the outcome unknown.
+    fn device_commands_recover(
+        &self,
+        device: &DeviceRecord,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let mut store = self.locked_store()?;
+        store.expire_device_commands(now_ms).map_err(internal)?;
+        let commands = store
+            .recoverable_device_commands(&device.device_id)
+            .map_err(internal)?
+            .into_iter()
+            .map(|record| DeviceCommandRecovery {
+                command_id: record.command_id,
+                capability: record.capability,
+                arguments_sha256: record.arguments_sha256,
+                state: record.state,
+                execution_id: record.execution_id,
+                started_at_ms: record.started_at_ms,
+                expires_at_ms: record.expires_at_ms,
+                cancel_requested: record.cancel_requested,
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            200,
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "commands": commands,
+            }),
+            None,
+        ))
+    }
+
+    /// A running command's control signals.
+    ///
+    /// One request the device makes while it is working, held open by the
+    /// long-poll until something changes, rather than a poll it repeats. That is
+    /// what lets a cancellation reach a recording already in progress without
+    /// spending a signed request every second.
+    fn device_command_control(
+        &self,
+        device: &DeviceRecord,
+        command_id: &str,
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let store = self.locked_store()?;
+        let record = store
+            .device_command(command_id)
+            .map_err(internal)?
+            .filter(|record| record.device_id == device.device_id)
+            .ok_or((404, "Unknown device command".to_string()))?;
+        // Authority, deliberately not readiness. A page that goes to the
+        // background loses readiness for a moment; telling a recording already
+        // in progress that it was revoked would cut it short over a glance at
+        // another app. What ends a running command here is the operator taking
+        // the grant away, or the pairing itself going.
+        let revoked =
+            !device.active() || !granted_capabilities(device).contains(&record.capability);
+        let control = DeviceCommandControl {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            command_id: record.command_id.clone(),
+            state: record.state,
+            cancel_requested: record.cancel_requested,
+            revoked,
+            deadline_ms: record.expires_at_ms,
+        };
+        let _ = now_ms;
+        Ok((
+            200,
+            serde_json::to_value(&control).map_err(internal)?,
+            Some(record.command_id),
         ))
     }
 
@@ -2093,7 +2282,11 @@ impl RemoteApi {
         result
             .validate(device.scopes.max_artifact_bytes)
             .map_err(|error| (400, error))?;
-        let artifact = match (&result.artifact_base64, &result.artifact_media_type) {
+        // Decoded and digested before anything is written, because the digest is
+        // what decides whether this delivery is a retry of the stored result or
+        // a contradiction of it — and a contradiction must not reach the
+        // artifact file at all.
+        let decoded = match (&result.artifact_base64, &result.artifact_media_type) {
             (Some(encoded), Some(media_type)) => {
                 let bytes = STANDARD
                     .decode(encoded)
@@ -2104,25 +2297,66 @@ impl RemoteApi {
                         "Device artifact exceeds this pairing's artifact budget".to_string(),
                     ));
                 }
-                let directory = self.paths.root.join("device-artifacts");
-                std::fs::create_dir_all(&directory).map_err(|error| {
-                    internal(format!(
-                        "Could not create device artifact directory: {error}"
-                    ))
-                })?;
-                // The command id names the file, so a retried report overwrites
-                // its own bytes and can never create a second artifact.
-                std::fs::write(directory.join(command_id), &bytes).map_err(|error| {
-                    internal(format!("Could not persist device artifact: {error}"))
-                })?;
-                Some(DeviceArtifact {
-                    sha256: sha256_hex(&bytes),
-                    bytes: bytes.len() as u64,
-                    media_type: media_type.clone(),
-                })
+                let sha256 = sha256_hex(&bytes);
+                if let Some(declared) = &result.artifact_sha256 {
+                    if declared != &sha256 {
+                        return Err((
+                            400,
+                            "The artifact's bytes do not match the digest the device declared"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some((
+                    bytes,
+                    DeviceArtifact {
+                        sha256,
+                        bytes: 0,
+                        media_type: media_type.clone(),
+                    },
+                ))
             }
             _ => None,
         };
+        let artifact = decoded.as_ref().map(|(bytes, artifact)| DeviceArtifact {
+            bytes: bytes.len() as u64,
+            ..artifact.clone()
+        });
+        let digest = terminal_digest(
+            result.outcome,
+            result.result.as_ref(),
+            artifact.as_ref().map(|artifact| artifact.sha256.as_str()),
+            result
+                .error
+                .as_deref()
+                .map(|error| super::store::bounded(error, 4_096))
+                .as_deref(),
+        );
+        {
+            let store = self.locked_store()?;
+            let existing = store
+                .device_command(command_id)
+                .map_err(internal)?
+                .filter(|record| record.device_id == device.device_id)
+                .ok_or((404, "Unknown device command".to_string()))?;
+            if existing.state.terminal() {
+                if let Some(stored) = &existing.terminal_sha256 {
+                    if stored != &digest {
+                        return Err((
+                            409,
+                            format!(
+                                "This command already reported {} and that result is \
+                                 authoritative; a different result cannot replace it",
+                                existing.state.as_str()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some((bytes, _)) = &decoded {
+            self.persist_device_artifact(command_id, bytes)?;
+        }
         let record = self
             .locked_store()?
             .complete_device_command(
@@ -2132,6 +2366,7 @@ impl RemoteApi {
                 result.result.as_ref(),
                 artifact.as_ref(),
                 result.error.as_deref(),
+                result.execution_id.as_deref(),
                 now_ms,
             )
             .map_err(|error| (409, error))?;
@@ -2141,9 +2376,69 @@ impl RemoteApi {
                 "protocol_version": REMOTE_PROTOCOL_VERSION,
                 "command_id": record.command_id,
                 "state": record.state.as_str(),
+                // The authoritative record, so a retrying device can see that
+                // what the runner holds is what it delivered — and stop.
+                "acknowledged": true,
+                "artifact_sha256": record.artifact.as_ref().map(|artifact| artifact.sha256.clone()),
             }),
             Some(record.command_id),
         ))
+    }
+
+    /// Writes one artifact so a crash can never leave a stored record pointing
+    /// at bytes that are not there.
+    ///
+    /// Staged under a deterministic temporary name, flushed, then renamed onto
+    /// the final path — the rename is atomic, so the file at the destination is
+    /// either the previous complete artifact or this complete one, never a
+    /// half-written mixture. The DB row is written afterwards: an orphaned
+    /// staging file or an artifact with no row is recoverable, a row naming
+    /// bytes that do not exist is not.
+    fn persist_device_artifact(&self, command_id: &str, bytes: &[u8]) -> Result<(), (u16, String)> {
+        use std::io::Write;
+        let directory = self.paths.root.join("device-artifacts");
+        let staging = directory.join("staging");
+        std::fs::create_dir_all(&staging).map_err(|error| {
+            internal(format!(
+                "Could not create device artifact directory: {error}"
+            ))
+        })?;
+        Self::sweep_stale_staging(&staging);
+        let temporary = staging.join(format!("{command_id}.part"));
+        {
+            let mut file = std::fs::File::create(&temporary)
+                .map_err(|error| internal(format!("Could not stage device artifact: {error}")))?;
+            file.write_all(bytes)
+                .map_err(|error| internal(format!("Could not stage device artifact: {error}")))?;
+            file.sync_all()
+                .map_err(|error| internal(format!("Could not flush device artifact: {error}")))?;
+        }
+        // The command id names the final file, so a retried report replaces its
+        // own bytes with identical ones and can never create a second artifact.
+        std::fs::rename(&temporary, directory.join(command_id))
+            .map_err(|error| internal(format!("Could not persist device artifact: {error}")))?;
+        Ok(())
+    }
+
+    /// Removes staged files a crashed upload left behind. Best-effort and
+    /// silent: an orphan costs disk, never correctness, and failing a live
+    /// delivery because an old temporary file could not be removed would be the
+    /// worse trade.
+    fn sweep_stale_staging(staging: &std::path::Path) {
+        const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+        let Ok(entries) = std::fs::read_dir(staging) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| modified.elapsed().unwrap_or_default() > STALE_AFTER)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// One chunk of a live microphone stream.
@@ -2868,9 +3163,20 @@ impl RemoteApi {
 /// nothing measurable.
 const LONG_POLL_TICK_MS: u64 = 500;
 
-/// The `wait_ms` a lease request asked for, capped at the lease length, or
-/// `None` when this request is not a lease at all.
-fn long_poll_wait_ms(request: &ApiRequest) -> Option<u64> {
+/// The two requests that may wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LongPollTarget {
+    /// `GET /v1/remote/device/commands/next` — wait for work to exist.
+    Lease,
+    /// `GET /v1/remote/device/commands/{id}/control` — wait for a running
+    /// command's control state to change. A watcher held open like this is why
+    /// cancelling a recording does not need the device to poll every second.
+    Control(String),
+}
+
+/// What a request wants to wait for and for how long, capped at the lease
+/// length, or `None` when this request is not one that waits.
+fn long_poll_target(request: &ApiRequest) -> Option<(LongPollTarget, u64)> {
     if request.method != "GET" {
         return None;
     }
@@ -2878,16 +3184,25 @@ fn long_poll_wait_ms(request: &ApiRequest) -> Option<u64> {
         .path_and_query
         .split_once('?')
         .map_or((request.path_and_query.as_str(), ""), |value| value);
-    if path.trim_end_matches('/') != "/v1/remote/device/commands/next" {
-        return None;
-    }
+    let segments = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let target = match segments.as_slice() {
+        ["v1", "remote", "device", "commands", "next"] => LongPollTarget::Lease,
+        ["v1", "remote", "device", "commands", command_id, "control"] => {
+            LongPollTarget::Control((*command_id).to_string())
+        }
+        _ => return None,
+    };
     let wait_ms = query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find(|(key, _)| *key == "wait_ms")
         .and_then(|(_, value)| value.parse::<u64>().ok())
         .unwrap_or(0);
-    (wait_ms > 0).then(|| wait_ms.min(DEVICE_LEASE_MS))
+    (wait_ms > 0).then(|| (target, wait_ms.min(DEVICE_LEASE_MS)))
 }
 
 /// The three sets an operator (and the phone) must be able to tell apart:
@@ -2900,6 +3215,25 @@ fn device_state_json(device: &DeviceRecord, surface: Option<&DeviceSurface>) -> 
     } else {
         device.capabilities.clone()
     };
+    // One row per physical capability, with the four axes kept apart and the
+    // single reason it is not effective named. A caller that only gets the
+    // intersection cannot tell an operator what to do about it.
+    let physical = PHYSICAL_DEVICE_CAPABILITIES
+        .iter()
+        .map(|capability| {
+            let block = capability_block(&granted, surface, *capability);
+            serde_json::json!({
+                "capability": capability,
+                "granted": granted.contains(capability),
+                "supported": surface.is_some_and(|surface| surface.capabilities.contains(capability)),
+                "permission": surface.map(|surface| surface.permission(*capability)),
+                "readiness": surface.map(|surface| surface.readiness(*capability)),
+                "effective": block.is_none(),
+                "blocked_by": block.map(|block| block.as_str()),
+                "reason": block.map(|block| block.explain(*capability)),
+            })
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "protocol_version": REMOTE_PROTOCOL_VERSION,
         "device_id": device.device_id,
@@ -2907,7 +3241,9 @@ fn device_state_json(device: &DeviceRecord, surface: Option<&DeviceSurface>) -> 
         "granted": granted,
         "advertised": surface.map(|surface| surface.capabilities.clone()),
         "os_permissions": surface.map(|surface| surface.permissions.clone()),
+        "readiness": surface.map(|surface| surface.readiness.clone()),
         "effective": effective_capabilities(&granted, surface),
+        "physical": physical,
         "surface": surface,
         "max_artifact_bytes": device.scopes.max_artifact_bytes,
     })
@@ -3135,6 +3471,8 @@ fn internal(error: impl std::fmt::Display) -> (u16, String) {
 mod tests {
     use std::collections::{BTreeSet, HashMap};
     use std::path::PathBuf;
+
+    use super::super::protocol::DeviceReadiness;
 
     use little_monkey_lib::run_ledger::RunLedger;
     use little_monkey_lib::run_protocol::{
@@ -5246,6 +5584,13 @@ mod tests {
             device_model: "Pixel 9".into(),
             capabilities: capabilities.iter().copied().collect(),
             permissions: permissions.iter().copied().collect(),
+            // Everything this helper advertises is ready; a test that needs an
+            // unready capability states its permission instead, which is the
+            // axis those tests are about.
+            readiness: capabilities
+                .iter()
+                .map(|capability| (*capability, DeviceReadiness::Ready))
+                .collect(),
             constraints: DeviceConstraints::default(),
             reported_at_ms: 0,
         };
@@ -5319,6 +5664,7 @@ mod tests {
                         source_run_id: None,
                         source_session_id: None,
                         source_tool_call_id: None,
+                        invocation_id: None,
                         expires_at_ms: 300_000,
                     },
                     2_000,
@@ -5524,6 +5870,7 @@ mod tests {
                     source_run_id: Some("run-one".into()),
                     source_session_id: None,
                     source_tool_call_id: Some("call-1".into()),
+                    invocation_id: None,
                     expires_at_ms: 300_000,
                 },
                 2_000,
@@ -5607,7 +5954,9 @@ mod tests {
             result: Some(serde_json::json!({ "width": 4, "height": 3 })),
             artifact_base64: Some(STANDARD.encode(b"jpeg-bytes")),
             artifact_media_type: Some("image/jpeg".into()),
+            artifact_sha256: None,
             error: None,
+            execution_id: None,
         };
         let result_path = format!("/v1/remote/device/commands/{}/result", command.command_id);
         let reported = api.handle(
@@ -5668,6 +6017,7 @@ mod tests {
                     source_run_id: None,
                     source_session_id: None,
                     source_tool_call_id: None,
+                    invocation_id: None,
                     expires_at_ms: 300_000,
                 },
                 2_000,
@@ -5703,7 +6053,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, DeviceCommandState::Failed);
-        assert!(stored.error.unwrap().contains("no longer granted"));
+        // Not a shrug: the reason names the axis that refused and what the
+        // operator would do about it.
+        let reason = stored.error.unwrap();
+        assert!(
+            reason.contains("denies") && reason.contains("system settings"),
+            "the failure must say the OS denied it and where to fix it: {reason}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5793,6 +6149,7 @@ mod tests {
                     source_run_id: None,
                     source_session_id: None,
                     source_tool_call_id: None,
+                    invocation_id: None,
                     expires_at_ms: 300_000,
                 },
                 2_000,

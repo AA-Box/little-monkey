@@ -285,8 +285,34 @@ export interface RemoteDeviceCommandRow {
   updated_at_ms: number;
   expires_at_ms: number;
   source_run_id: string | null;
+  /** Which attempt owns a running command. A reconnect resuming the same
+   * execution keeps this id; a second one is never authorized. */
+  execution_id: string | null;
   artifact: { sha256: string; bytes: number; media_type: string } | null;
   error: string | null;
+}
+
+/** One physical capability, with the four axes kept apart.
+ *
+ * `blocked_by` is the single reason it is not effective — `not_granted`,
+ * `unsupported`, `permission_required`, `permission_denied`,
+ * `foreground_required`, `interaction_required`, `screen_capture_not_armed`,
+ * `unavailable` or `no_surface` — and `reason` is that reason in words the
+ * operator can act on. */
+export interface RemoteDevicePhysicalRow {
+  capability: string;
+  granted: boolean;
+  supported: boolean;
+  /** `granted` | `denied` | `promptable` | `not_required` | `unsupported` |
+   * `undetermined`, or `null` before the device has advertised anything. */
+  permission: string | null;
+  /** `ready` | `foreground_required` | `interaction_required` |
+   * `armed_required` | `unavailable`, or `null` before the device has
+   * advertised anything. */
+  readiness: string | null;
+  effective: boolean;
+  blocked_by: string | null;
+  reason: string | null;
 }
 
 /** One paired physical device.
@@ -304,7 +330,11 @@ export interface RemoteDeviceRow {
   /** `null` until the device has reported its surface at least once. */
   advertised: string[] | null;
   os_permissions: Record<string, string> | null;
+  readiness: Record<string, string> | null;
   effective: string[];
+  /** Every physical capability, whether granted or not, with the one thing
+   * standing in its way named. */
+  physical: RemoteDevicePhysicalRow[];
   platform: string | null;
   platform_version: string | null;
   app_version: string | null;

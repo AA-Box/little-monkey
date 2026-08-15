@@ -2,6 +2,10 @@ pub(crate) mod api;
 mod client;
 mod desktop;
 pub(crate) mod device;
+/// The device plane end to end, against the real store and the real signed
+/// API. Tests only — see the module's own documentation.
+#[cfg(test)]
+mod device_e2e;
 pub(crate) mod migrate;
 pub(crate) mod protocol;
 pub(crate) mod push;
@@ -76,6 +80,27 @@ pub enum RemoteCmd {
     },
     /// Ask a paired device to do something once, and wait for the answer.
     DeviceAction(RemoteDeviceActionArgs),
+    /// Check a real paired device end to end and exit non-zero if it is not
+    /// working.
+    ///
+    /// Safe by default: it reads the device's own advertised surface and asks
+    /// it to describe itself, which touches no sensor. `--dangerous` adds the
+    /// physical actions — a photograph, a short recording, a location fix, a
+    /// notification — and is opt-in precisely because each of those happens in
+    /// a room somebody is in. Needs no credentials of any kind: it uses the
+    /// pairing the operator already made.
+    DeviceCheck {
+        /// Which paired device. Omit when exactly one is paired.
+        #[arg(long = "device-id")]
+        device_id: Option<String>,
+        /// Also perform the physical actions this device is granted.
+        #[arg(long)]
+        dangerous: bool,
+        #[arg(long, default_value_t = 60_000)]
+        wait_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Recent commands queued for one device.
     DeviceCommands {
         device_id: String,
@@ -381,6 +406,13 @@ pub struct RemoteDeviceActionArgs {
     pub artifact_id: Option<String>,
     #[arg(long = "wait-ms", default_value_t = 60_000)]
     pub wait_ms: u64,
+    /// The durable invocation asking for this, when a caller has one.
+    ///
+    /// Two deliveries of the same invocation produce one command and therefore
+    /// one physical effect. Omitted — an operator running this by hand — every
+    /// invocation is its own command, because two deliberate asks are two asks.
+    #[arg(long = "invocation-id")]
+    pub invocation_id: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -538,6 +570,12 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             capabilities,
         } => device_grant(&paths, device_id, capabilities)?,
         RemoteCmd::DeviceAction(args) => device_action(&paths, args).await?,
+        RemoteCmd::DeviceCheck {
+            device_id,
+            dangerous,
+            wait_ms,
+            json,
+        } => device_check(&paths, device_id.as_deref(), *dangerous, *wait_ms, *json).await?,
         RemoteCmd::DeviceCommands {
             device_id,
             limit,
@@ -1441,7 +1479,37 @@ fn device_rows(paths: &DaemonPaths) -> Result<Vec<serde_json::Value>, String> {
                 "granted": device.capabilities,
                 "advertised": surface.as_ref().map(|surface| surface.capabilities.clone()),
                 "os_permissions": surface.as_ref().map(|surface| surface.permissions.clone()),
+                "readiness": surface.as_ref().map(|surface| surface.readiness.clone()),
                 "effective": effective,
+                // One row per physical capability with the four axes kept
+                // apart and the single reason it is not effective named. The
+                // intersection alone tells an operator nothing they can act on.
+                "physical": protocol::PHYSICAL_DEVICE_CAPABILITIES
+                    .iter()
+                    .map(|capability| {
+                        let block = protocol::capability_block(
+                            &device.capabilities,
+                            surface.as_ref(),
+                            *capability,
+                        );
+                        serde_json::json!({
+                            "capability": capability,
+                            "granted": device.capabilities.contains(capability),
+                            "supported": surface
+                                .as_ref()
+                                .is_some_and(|surface| surface.capabilities.contains(capability)),
+                            "permission": surface
+                                .as_ref()
+                                .map(|surface| surface.permission(*capability)),
+                            "readiness": surface
+                                .as_ref()
+                                .map(|surface| surface.readiness(*capability)),
+                            "effective": block.is_none(),
+                            "blocked_by": block.map(|block| block.as_str()),
+                            "reason": block.map(|block| block.explain(*capability)),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
                 "platform": surface.as_ref().map(|surface| surface.platform.clone()),
                 "platform_version": surface.as_ref().map(|surface| surface.platform_version.clone()),
                 "app_version": surface.as_ref().map(|surface| surface.app_version.clone()),
@@ -1467,6 +1535,9 @@ fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value 
         "updated_at_ms": record.updated_at_ms,
         "expires_at_ms": record.expires_at_ms,
         "source_run_id": record.source_run_id,
+        // Which attempt owns a running command, so an operator can see that a
+        // reconnect resumed the same one rather than starting a second.
+        "execution_id": record.execution_id,
         "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
             "sha256": artifact.sha256,
             "bytes": artifact.bytes,
@@ -1595,7 +1666,11 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
             wait_ms: args.wait_ms,
             source_run_id: None,
             source_session_id: None,
-            source_tool_call_id: None,
+            source_tool_call_id: args.invocation_id.clone(),
+            // Supplied only by a caller that has a durable invocation to name —
+            // the desktop passes its turn and tool-call ids. An operator typing
+            // this command twice means it twice.
+            invocation_id: args.invocation_id.clone(),
         },
         now_ms()?,
     )
@@ -1615,6 +1690,186 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
             "  artifact: {} bytes of {} (sha256 {})",
             artifact.bytes, artifact.media_type, artifact.sha256
         );
+    }
+    Ok(())
+}
+
+/// Exercises a genuinely paired device and says whether it works.
+///
+/// The one thing the automated suite cannot cover: real hardware, over the real
+/// signed transport, on somebody's actual phone. It needs no credentials, no
+/// account and no project — the pairing the operator already made is the whole
+/// setup — and it is never part of a normal test run, because a photograph is
+/// not something CI should take.
+///
+/// Safe checks run by default and touch no sensor. `--dangerous` adds the
+/// physical ones, each of which is skipped unless the device says it is
+/// effective, so the check reports "not ready" rather than hanging on a
+/// capability the phone cannot serve.
+async fn device_check(
+    paths: &DaemonPaths,
+    device_id: Option<&str>,
+    dangerous: bool,
+    wait_ms: u64,
+    json: bool,
+) -> Result<(), String> {
+    let rows = device_rows(paths)?;
+    let row = match device_id {
+        Some(device_id) => rows
+            .iter()
+            .find(|row| row["device_id"].as_str() == Some(device_id))
+            .ok_or_else(|| format!("No paired device '{device_id}'"))?,
+        None => match rows.len() {
+            0 => return Err("No device is paired with this runner.".to_string()),
+            1 => &rows[0],
+            _ => {
+                return Err(format!(
+                    "{} devices are paired — name one with --device-id",
+                    rows.len()
+                ))
+            }
+        },
+    };
+    let device_id = row["device_id"].as_str().unwrap_or_default().to_string();
+    let physical = row["physical"].as_array().cloned().unwrap_or_default();
+    let effective = |capability: &str| {
+        physical.iter().any(|entry| {
+            entry["capability"].as_str() == Some(capability)
+                && entry["effective"] == serde_json::json!(true)
+        })
+    };
+
+    if !json {
+        println!(
+            "Checking {} ({})",
+            row["device_name"].as_str().unwrap_or_default(),
+            device_id
+        );
+        for entry in &physical {
+            println!(
+                "  {:<20} granted={} supported={} permission={} readiness={} effective={}{}",
+                entry["capability"].as_str().unwrap_or_default(),
+                entry["granted"],
+                entry["supported"],
+                entry["permission"].as_str().unwrap_or("not reported"),
+                entry["readiness"].as_str().unwrap_or("not reported"),
+                entry["effective"],
+                match entry["reason"].as_str() {
+                    Some(reason) => format!("\n      {reason}"),
+                    None => String::new(),
+                },
+            );
+        }
+    }
+
+    // Safe first, then the physical ones only when asked for. `device_info`
+    // reads the device's own name and nothing else, which is why it is the
+    // default check: it proves the whole path — queue, wake, lease, start,
+    // result — without touching a sensor.
+    let mut plan: Vec<(&str, serde_json::Value)> = vec![("device_info", serde_json::json!({}))];
+    if dangerous {
+        plan.extend([
+            ("camera_capture", serde_json::json!({ "position": "back" })),
+            (
+                "microphone_capture",
+                serde_json::json!({ "duration_ms": 2_000 }),
+            ),
+            ("screen_capture", serde_json::json!({})),
+            ("location_read", serde_json::json!({ "accuracy": "coarse" })),
+            (
+                "notification_post",
+                serde_json::json!({ "title": "Little Monkey", "body": "Device check" }),
+            ),
+            (
+                "audio_playback",
+                serde_json::json!({ "text": "Device check" }),
+            ),
+        ]);
+    }
+
+    let mut results = Vec::new();
+    let mut failures = 0usize;
+    for (action, arguments) in plan {
+        if !effective(action) {
+            results.push(serde_json::json!({
+                "action": action,
+                "status": "skipped",
+                "detail": "not effective on this device",
+            }));
+            if !json {
+                println!("  {action}: skipped (not effective)");
+            }
+            continue;
+        }
+        let capability = device::capability_for_action(action)?;
+        let record = device::dispatch(
+            paths,
+            &device::DeviceActionRequest {
+                device_id: Some(device_id.clone()),
+                capability,
+                arguments,
+                wait_ms,
+                source_run_id: None,
+                source_session_id: None,
+                source_tool_call_id: None,
+                // Each check is its own ask, so none of them dedupes against
+                // another.
+                invocation_id: None,
+            },
+            now_ms()?,
+        )
+        .await?;
+        // The shape, not merely the state: a success carrying neither a result
+        // nor an artifact has not proven anything.
+        let succeeded = record.state == protocol::DeviceCommandState::Succeeded;
+        let has_payload = record.result.is_some() || record.artifact.is_some();
+        let artifact_ok = record.artifact.as_ref().is_none_or(|artifact| {
+            artifact.bytes > 0
+                && artifact.sha256.len() == 64
+                && !artifact.media_type.trim().is_empty()
+        });
+        if !(succeeded && has_payload && artifact_ok) {
+            failures += 1;
+        }
+        results.push(serde_json::json!({
+            "action": action,
+            "status": if succeeded && has_payload && artifact_ok { "ok" } else { "failed" },
+            "state": record.state.as_str(),
+            "command_id": record.command_id,
+            "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
+                "sha256": artifact.sha256,
+                "bytes": artifact.bytes,
+                "media_type": artifact.media_type,
+            })),
+            "error": record.error,
+        }));
+        if !json {
+            println!(
+                "  {action}: {} ({}){}",
+                if succeeded && has_payload && artifact_ok {
+                    "ok"
+                } else {
+                    "FAILED"
+                },
+                record.state.as_str(),
+                match &record.error {
+                    Some(error) => format!(" — {error}"),
+                    None => String::new(),
+                }
+            );
+        }
+    }
+
+    if json {
+        print_json(serde_json::json!({
+            "device_id": device_id,
+            "physical": physical,
+            "checks": results,
+            "failures": failures,
+        }))?;
+    }
+    if failures > 0 {
+        return Err(format!("{failures} device check(s) failed"));
     }
     Ok(())
 }

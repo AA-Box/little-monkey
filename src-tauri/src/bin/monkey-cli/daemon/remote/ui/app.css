@@ -1161,6 +1161,32 @@ dialog p:not(.eyebrow) {
   }
 }
 
+/* One row per granted hardware capability: the four axes, and the control that
+   fixes whichever one is in the way. Same card vocabulary as the panels above
+   rather than a second design. */
+.readiness-list {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.readiness-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.65rem 0.75rem;
+}
+
+.readiness-row .button {
+  justify-self: start;
+}
+
+.readiness-name {
+  font-weight: 600;
+  margin: 0;
+}
+
 /* The paired conversation, the workflow list and the capture form.
    Deliberately the same grid vocabulary as the approvals and events lists
    above: these are three more panels in one column, not a second design. */

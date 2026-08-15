@@ -9,26 +9,102 @@ Nothing here is a new pairing system. It extends the existing remote trust:
 the same one-time invitation, the same non-exportable device key, the same
 signed, replay-guarded HTTPS identity, the same revocation.
 
-## The three sets, and why they are separate
+## The four axes, and why they are separate
 
-An action happens only where all three agree:
+An action happens only where all four agree:
 
 ```
-operator grant  ∩  advertised support  ∩  current OS permission
+effective =
+    granted by the operator
+  AND supported by the device build
+  AND permission ∈ { granted, not_required }
+  AND readiness == ready
 ```
 
 * **Granted** — what you gave this device at pairing time or afterwards.
 * **Supported** — what the device's build can actually do. It reports this
   itself, and a claim here grants nothing: advertising a camera can only ever
   *narrow* what is effective.
-* **OS permitted** — what the device's operating system currently allows.
+* **Permission** — the operating system's answer, and only where an operating
+  system has one. Four of the eight capabilities have no OS permission at all,
+  and saying otherwise was a real defect: a runner that demanded `granted` for
+  `device_info` refused it forever, because no browser or phone has a "may this
+  app read its own name" permission to grant.
+* **Readiness** — whether the device could act *right now*. Separate from
+  permission because the fixes are separate: a permission is granted once in a
+  settings screen; readiness is about this moment, and the operator's next step
+  is different in each case.
+
+Permission is one of:
+
+| State | Means |
+| --- | --- |
+| `granted` | the OS permits it |
+| `denied` | the OS refuses it — fix in the device's own system settings |
+| `promptable` | not asked yet, and askable from the device |
+| `not_required` | no such permission exists on this platform |
+| `unsupported` | this build has no such facility |
+
+`undetermined` is the older spelling of `promptable` and is treated identically:
+**not asked is never permission.** A device build that predates this model, or
+one whose browser cannot answer for a permission, therefore grants nothing by
+omission.
+
+Readiness is one of:
+
+| State | Means | Fix |
+| --- | --- | --- |
+| `ready` | it would work now | — |
+| `foreground_required` | the controller must be open and in front | bring it forward |
+| `interaction_required` | the platform needs a user gesture first | tap the control on the device |
+| `armed_required` | a one-time consent must be armed | share the screen once |
+| `unavailable` | nothing can be done from here | — |
+
+A surface that says nothing about readiness reads as `unavailable`. That is
+deliberate: a device that has upgraded but not yet re-advertised has its
+sensitive capabilities refused until it says, in its own words, what it can do
+now. **A missing security field is never read as consent.**
+
+Per capability:
+
+| Capability | Permission | Readiness |
+| --- | --- | --- |
+| `device_info` | `not_required` | `ready` |
+| `camera_capture` | the camera permission | `foreground_required` while the page is hidden |
+| `microphone_capture` | the microphone permission | as camera |
+| `voice_stream` | the microphone permission | as camera |
+| `location_read` | the location permission | as camera |
+| `notification_post` | the browser's notification permission | `ready` — a notification does not need the page in front |
+| `screen_capture` | `not_required` — sharing is a per-session consent, not a stored permission | `armed_required` until the user shares, `ready` while the share is live |
+| `audio_playback` | `not_required` — no platform has a "may this page make a sound" permission | `interaction_required` until playback is enabled by a gesture |
 
 They are shown separately everywhere — the desktop card, the phone's own
-screen, `device-list` — because "why can this phone not take a photo" has four
-different answers, and merging them into one list hides which one applies.
+screen, `device-list --json` — because "why can this phone not take a photo" has
+several different answers, and merging them into one list hides which applies.
+Each refusal carries the one reason that applies (`not_granted`, `unsupported`,
+`permission_required`, `permission_denied`, `foreground_required`,
+`interaction_required`, `screen_capture_not_armed`, `unavailable`,
+`no_surface`) and a sentence naming the action that fixes it.
 
 A device paired before this existed advertises nothing, so it keeps every
 run-facing grant and gains no hardware access from an app update.
+
+## Preparing a capability on the device
+
+The paired-device controller has a **Device readiness** list: one row per
+granted hardware capability, showing Granted, Supported, Permission, Readiness
+and Effective separately, with the control that fixes whichever one is in the
+way — *Allow camera*, *Allow microphone*, *Allow location*, *Allow
+notifications*, *Allow screen capture*, *Enable audio playback*.
+
+**A permission prompt only ever comes from a gesture on the device.** An agent
+asking for a camera never causes a prompt to appear in somebody's face; the
+command is refused with a reason instead, and the person holding the phone
+decides. After any answer — granted or refused — the device re-reads the
+permission, recalculates readiness, posts a fresh surface and updates its own
+screen. It also re-advertises on focus, on visibility change, on a permission
+changing in the browser's own settings, when a screen share ends, and on
+reconnect.
 
 ## Capabilities
 
@@ -125,24 +201,158 @@ tunnel leaves a closed session behind, not an open one.
 
 There is no transcription here. The audio is stored as audio.
 
-## Exactly once
+## At most once, and delivered at least once
 
-A command's life is `queued → leased → running → succeeded | failed |
-cancelled | expired`, and the split between *leased* and *running* is the whole
-safety property:
+The physical world has no transactions. A photograph cannot be un-taken, and no
+protocol can make "the shutter fired" and "the runner knows it fired" happen
+together. So the guarantee is stated in two halves, and both halves are real:
+
+* **The physical effect happens at most once.** No disconnect, reload,
+  reconnect, daemon restart, duplicate delivery or lost response can cause a
+  second one.
+* **Its result is delivered at least once.** A result that exists is retried
+  until the runner acknowledges it, and the runner recognises a retry as a retry
+  rather than as a second answer.
+
+### The lifecycle
+
+```
+agent or operator invocation
+  → arguments validated on the runner
+  → one explicitly eligible device resolved
+  → durable, idempotent command row            (queued)
+  → the device is woken by push if it is away
+  → the device reconciles its own journal first
+  → grant / support / permission / readiness re-checked
+  → lease                                       (leased)
+  → durable start authorization, naming an execution
+                                                (running)
+  → the physical effect, at most once
+  → the result and its bytes staged durably on the device
+  → delivery retried until acknowledged
+  → the runner persists the artifact, then the terminal row
+                                                (succeeded | failed | cancelled | expired)
+  → the result reaches the waiting run
+```
+
+The `leased` / `running` split is what makes the first half true:
 
 * a lease that lapses **before** the device says it started is requeued, because
   nothing physical has happened;
-* a *running* command is **never** requeued. When its deadline passes with no
-  report it terminates as failed, with the effect explicitly recorded as
-  unproven — a retry could take a second photograph.
+* a `running` command is **never** requeued, and never handed to another device.
+  When its deadline passes with no report it terminates as failed, with the
+  effect explicitly recorded as unproven.
 
-A device that reconnects and re-posts `start` is told `started: false` and does
-nothing. It also keeps a small local record of what it already did, so a browser
-restart reports the old outcome rather than repeating it.
+### The execution identity
 
-Cancellation is truthful. A queued or leased command is cancelled outright; on a
-running one it raises a flag, and anything already captured stays captured.
+`POST /v1/remote/device/commands/{id}/start` carries an `execution_id` the
+device minted and journalled *before* asking. The runner answers:
+
+| Situation | Answer |
+| --- | --- |
+| `leased` | `started: true` — and only this answer authorizes hardware |
+| `running`, same execution | `started: false, recoverable: true` — the same attempt is reconnecting; it may deliver a staged result, and must not act |
+| `running`, different execution | `409` — refused. Two executions of one physical command is exactly the failure being prevented |
+
+### Recovering after a reconnect or a restart
+
+`GET /v1/remote/device/commands/recover` returns only the nonterminal commands
+this device already started. It is deliberately **not** a lease: handing a
+running command back as work would be the second execution. The device answers
+each from its own journal:
+
+| Local journal | What happens |
+| --- | --- |
+| result staged | the exact saved result and bytes are delivered; nothing is re-executed |
+| start authorized, no result | terminal failure, `execution_outcome_unknown_after_restart` — the effect **may** have happened, was **not** repeated, and cannot be proven either way |
+| no record at all | same: reported unknown, never executed |
+| only leased, never started | nothing to recover; the lease expires and the command is safely requeued |
+
+On startup the device takes an exclusive executor lock, flushes its outbox,
+reconciles, and only then leases new work. Exactly one browser tab per paired
+profile is the executor; the others say so and do nothing.
+
+### Crash and reconnect, step by step
+
+| Crash point | What happens |
+| --- | --- |
+| before `start` | nothing was authorized; the lease lapses and the command is executed once, later |
+| after `start`, before the effect | never re-executed. The outcome is reported unknown |
+| after the effect, before the result is staged | the same: unknown, not repeated. This is the unavoidable window |
+| after the result is staged | the staged result and its bytes are delivered on reconnect; the effect stays at one |
+| after the runner persisted it, before the device saw the acknowledgement | the device retries; the runner recognises the identical report and returns the authoritative record |
+
+### Where the bytes live
+
+An artifact is held in the device's own `device_command_journal` object store —
+its own store, not the profile record, because a profile row is rewritten on
+every signed request and a multi-megabyte still has no business there. The bytes
+are deleted **only** after the runner acknowledges them.
+
+The journal is bounded by entry count, by total artifact bytes, and by a TTL on
+acknowledged entries. An unacknowledged result is **never** evicted to satisfy a
+bound. Instead, if there is no room to stage the result an artifact-producing
+command might produce, the device refuses to start it and reports
+`device_storage_full` — the alternative is taking a photograph and then choosing
+between losing it and discarding somebody else's undelivered one.
+
+On the runner, the bytes are written to a staging file, flushed, and renamed
+atomically onto the command's artifact path *before* the terminal database row
+is written. A crash between the two leaves an artifact with no row — recoverable
+— rather than a row naming bytes that are not there. Stale staging files are
+swept.
+
+### Idempotency, in both directions
+
+**Invocation → command.** A durable tool invocation names itself: the daemon's
+job id and the agent loop's tool-call id, both supplied by the runtime and
+neither visible to the model. The same invocation delivered twice returns the
+command it already created; the same invocation asking for something *different*
+is a conflict, not a replacement; a unique index enforces it across processes. A
+manual CLI or desktop invocation carries no such identity and is never
+deduplicated — two deliberate asks are two asks.
+
+**Result → terminal row.** A terminal report is digested over its outcome,
+result, artifact digest and error. The identical digest arriving again is a
+retry: accepted, and answered with the authoritative record. A different digest
+is refused with `409`, and neither the stored result nor its artifact file is
+touched.
+
+### Cancellation
+
+A running command is watched over `GET /v1/remote/device/commands/{id}/control`,
+a long poll that returns the moment a cancellation is asked for. What each
+action does when it arrives:
+
+| Action | On cancellation |
+| --- | --- |
+| microphone recording | stops recording promptly, stops the tracks, and reports what it *did* record — the microphone did open |
+| voice stream | stops on the answer to its next chunk, closes the microphone and the session |
+| audio playback | stops. This is one of the few cancellations that genuinely undoes something |
+| location | the pending fix is abandoned; nothing observable happened |
+| screen capture | aborted if the frame has not been taken; a taken screenshot is reported, not disowned |
+| camera | aborted if the shutter has not fired; a photograph that exists is reported with its bytes |
+| notification | a notification already shown cannot be unshown, and is not claimed to be |
+
+The result says which of three things happened, and they are never collapsed:
+
+* `cancelled_before_effect` — nothing happened;
+* `cancelled_during_effect` — it started, was cut short, and what happened was
+  not undone;
+* the effect completed before the cancellation was observed — reported as the
+  success it was.
+
+A queued or leased command is cancelled outright on the runner, because nothing
+physical has happened yet.
+
+### Authority is re-checked at every boundary
+
+Grant, support, permission, readiness, revocation and expiry are checked when
+the command is queued, again when it is leased, and again at `start` — the last
+boundary before hardware. A grant withdrawn or a permission revoked in between
+stops the command with the reason attached, and no effect occurs. Authority lost
+*after* the effect began cannot un-happen it, and is never reported as though it
+had.
 
 ## What the paired device can do
 
@@ -180,6 +390,21 @@ refresh would act on a run it can no longer see.
 A **draft** is the exception, and it is not an action: text typed into the
 composer is kept on the device and restored on the next load, because nothing
 has happened until it is sent.
+
+The device-command result outbox is a different thing again, and the distinction
+is worth stating plainly because it looks superficially like the queue that is
+forbidden:
+
+* a queued **action** would be a request somebody made against a view the device
+  could not refresh, replayed later against a runner whose state has moved. That
+  is why approvals, cancellations, workflow launches, chat sends, physical
+  commands and permission changes are never buffered.
+* a staged **result** is not a request at all. The effect already happened. The
+  runner is waiting for it and will otherwise record it as unproven. Not
+  retrying it would lose the only account of something that really occurred.
+
+So the outbox retries on reconnect, on the network coming back and on focus,
+with bounded exponential backoff — and nothing else does.
 
 ## Push
 
@@ -222,8 +447,18 @@ A notification says what kind of thing happened and which id it happened to —
 never what it said — unless you pass `--include-detail`. A security alert is the
 one exception, because an alert you cannot identify is not actionable.
 
-A push grants nothing: the woken device still makes an ordinary signed request
-to learn or do anything.
+A push grants nothing. It is a wake-up hint and nothing else:
+
+```
+push notification  ≠  authenticated command
+                   ≠  capability grant
+                   ≠  permission grant
+```
+
+A woken device reconnects, authenticates normally, reconciles whatever it was
+already holding, and only then takes work. Nothing in a notification is trusted,
+and default notification text carries no command arguments, message contents,
+captured media, tool parameters or run output onto a lock screen.
 
 What raises one:
 
@@ -248,15 +483,65 @@ revoked device can still be woken, whether the transport those grants are
 exercised over is pinned HTTPS, and whether push would put run specifics on a
 lock screen.
 
+## Checking a real device
+
+The automated suite covers the protocol end to end against a simulated
+executor. It cannot cover real hardware, so there is a command for that:
+
+```bash
+monkey daemon remote device-check                      # safe: no sensor is touched
+monkey daemon remote device-check --dangerous          # camera, microphone, location, screen, notification, audio
+monkey daemon remote device-check --device-id <id> --json
+```
+
+It reads the device's advertised surface, prints Granted / Supported /
+Permission / Readiness / Effective per capability, runs `device_info` by
+default, validates the shape of every answer — including an artifact's digest,
+size and media type — and exits non-zero if anything fails. Capabilities that
+are not effective are skipped and reported as skipped rather than hung on.
+
+It needs no credentials, no account and no project: the pairing you already made
+is the whole setup. It is deliberately not part of a normal test run, because a
+photograph is not something CI should take.
+
+## Troubleshooting
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| `not_granted` | the operator never granted it | grant it on the device's card, or at pairing time |
+| `no_surface` | the device has never said what it can do | open the paired-device controller on the device once |
+| `unsupported` | that build cannot do it at all | nothing here; a different client is needed |
+| `permission_required` | the OS has not been asked | open the controller, use the control under Device readiness |
+| `permission_denied` | the OS refuses | fix in the device's own system settings, then reopen the controller |
+| `foreground_required` | the controller is not in front | bring it forward; it re-advertises on focus |
+| `interaction_required` | autoplay policy, usually | tap *Enable audio playback* on the device |
+| `screen_capture_not_armed` | nobody has shared a screen | tap *Allow screen capture*; it stays armed until stopped |
+| `device_storage_full` | undelivered results are filling the journal | reconnect the device so it can deliver them |
+| `outcome unknown — the action was not repeated` | the device was interrupted mid-action | the effect may have happened; check the device, then retry deliberately if needed |
+
 ## Limits
+
+These are real platform limits, not things left undone:
 
 * The bundled mobile client is the browser controller the runner serves. It uses
   public web platform APIs, so what it can do is what the browser exposes.
-  `screen_capture` needs the device to arm screen sharing once — the browser
-  asks then, and the runner treats the OS permission as granted only while that
-  share is live, so a capture never interrupts anyone with a fresh prompt and
-  an unarmed device is simply not asked.
+* `screen_capture` cannot be a durable permission: browsers grant screen sharing
+  per session and forget it. The armed-stream model is the honest version of
+  that — while a share is live, capture is ready; when the user stops it, it is
+  not, and the surface says so at once.
+* Camera, microphone, voice and location need the controller in the foreground.
+  A backgrounded page on a phone is suspended, so a command queued against a
+  hidden tab is refused with `foreground_required` rather than silently
+  producing a black frame.
+* Autoplay policy means remote audio cannot play until someone has interacted
+  with the page. There is no way around this from a page, and pretending
+  otherwise would make `audio_playback` fail in silence.
+* There is one unavoidable uncertainty window: after the runner authorizes a
+  start and before the device durably stages a result, a crash leaves an outcome
+  nobody can determine. It is reported as unknown and never retried. No protocol
+  can close this window for a non-transactional physical effect; what can be
+  guaranteed — and is — is that the effect is not repeated.
 * Location is a single fix. There is no continuous background tracking, by
   construction — the client never registers a watch.
-* An artifact is bounded by the pairing's artifact budget and by the device's own
-  advertised bound, whichever is smaller.
+* An artifact is bounded by the pairing's artifact budget and by the device's
+  own advertised bound, whichever is smaller.

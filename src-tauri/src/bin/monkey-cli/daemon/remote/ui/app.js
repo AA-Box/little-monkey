@@ -1,7 +1,32 @@
+import {
+  JOURNAL_LIMITS,
+  PERMISSION,
+  PERMISSION_NAMES,
+  PHASE,
+  READINESS,
+  acquireExecutor,
+  capacityRefusal,
+  createJournal,
+  deliverStaged as deliverStagedResult,
+  describeCapability,
+  isEffective,
+  isUnacknowledged,
+  journalUpgrade,
+  leaseDecision,
+  recoveryAction,
+  unknownOutcomeReport,
+} from "./device-core.js";
+
 const PROTOCOL_VERSION = 1;
 const DB_NAME = "little-monkey-remote-v1";
-const DB_VERSION = 1;
+// v2 adds the durable command journal. Additive: the controller store keeps its
+// name, its key path and every record in it, so an upgrade never re-pairs.
+const DB_VERSION = 2;
 const STORE_NAME = "controllers";
+// Artifact bytes live here, not in the controller record. A profile row that
+// carried multi-megabyte stills would be rewritten in full on every sequence
+// allocation, which is the hottest write this client makes.
+const JOURNAL_STORE = "device_command_journal";
 const ACTIVE_RECORD = "active";
 const MAX_INVITATION_BYTES = 256 * 1024;
 // Every `RemoteAction` the runner can grant. `pause` and `control_desktop`
@@ -56,31 +81,6 @@ const CONTROLLER_CAPABILITIES = {
   admin: null,
 };
 
-// Physical capabilities this build can actually perform, mapped to the
-// browser feature that performs them. Advertised to the runner as "supported";
-// the runner intersects that with the operator's grant and the OS permission.
-const DEVICE_CAPABILITIES = {
-  device_info: () => true,
-  camera_capture: () => Boolean(navigator.mediaDevices?.getUserMedia),
-  microphone_capture: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
-  location_read: () => Boolean(navigator.geolocation),
-  notification_post: () => "Notification" in window,
-  screen_capture: () => Boolean(navigator.mediaDevices?.getDisplayMedia),
-  // Either half is enough to be useful: an artifact is played back through the
-  // audio element, and `text` is spoken by the synthesizer.
-  audio_playback: () => Boolean(window.speechSynthesis) || typeof Audio === "function",
-  voice_stream: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
-};
-
-// Which Permissions API name answers for each capability, where one does.
-const PERMISSION_NAMES = {
-  camera_capture: "camera",
-  microphone_capture: "microphone",
-  // A stream is the microphone, so it is the microphone's permission.
-  voice_stream: "microphone",
-  location_read: "geolocation",
-};
-
 const PAIRING_URI_SCHEME = "littlemonkey://pair/";
 // How long one lease long-poll waits. Just inside the runner's 30 s lease so
 // a reply is never cut off mid-flight by the server's own deadline.
@@ -106,9 +106,18 @@ const state = {
   // Last surface reported to the runner, and what it answered with — the
   // grant/advertised/OS/effective breakdown the device screen shows.
   deviceState: null,
+  // The last surface this device posted — what it supports, what its OS
+  // permits, and whether each capability is ready right now.
+  surface: null,
   // The command currently being performed, so a cancel can reach it.
   activeCommand: null,
   commandLoopRunning: false,
+  // True while this tab holds the executor lock. Exactly one tab of a paired
+  // profile performs physical commands; the others say so and do nothing.
+  executor: false,
+  // Autoplay policy cleared by an explicit gesture. Never assumed: a browser
+  // that refuses to play a sound would otherwise be advertised as ready.
+  audioEnabled: false,
   pushSubscribed: false,
   // The armed display stream. Held so a screen capture needs no second consent
   // prompt; while it is null, screen capture is reported as not permitted and
@@ -192,6 +201,8 @@ const ui = Object.fromEntries(
     "deviceSupported",
     "deviceEffective",
     "devicePermissions",
+    "deviceReadiness",
+    "journalStatus",
     "staleBanner",
     "pushButton",
     "pushStatus",
@@ -248,12 +259,10 @@ function requiredFeaturesAvailable() {
 function openDatabase() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(STORE_NAME)) {
-        database.createObjectStore(STORE_NAME, { keyPath: "id" });
-      }
-    };
+    // The upgrade lives in `device-core.js` so it can be exercised without a
+    // browser: it adds the journal store and leaves an existing pairing's key,
+    // sequence and cache exactly where they were.
+    request.onupgradeneeded = () => journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Browser storage could not be opened"));
     request.onblocked = () => reject(new Error("Browser storage upgrade is blocked by another tab"));
@@ -1896,50 +1905,88 @@ function parsePairingCode(value) {
 }
 
 // --- What this device is --------------------------------------------------
+//
+// Four separate questions, kept separate: what this build supports, what the OS
+// permits, whether it could act right now, and — the runner's answer, never
+// this client's — whether all of that adds up to something effective.
 
-async function readOsPermission(capability) {
-  // Screen capture has no Permissions API name: a browser asks at the moment of
-  // capture and forgets afterwards, which would mean a prompt on every single
-  // command. Holding one armed display stream is what replaces that — while it
-  // is live the permission genuinely is granted, and the moment the user stops
-  // sharing (from this page or from the browser's own bar) it genuinely is not.
-  // Reporting it this way is what makes "effective" tell the truth: an unarmed
-  // device is not asked to capture a screen it would have to interrupt someone
-  // for.
-  if (capability === "screen_capture") {
-    return screenShareIsLive() ? "granted" : "undetermined";
+// Physical capabilities this build can actually perform, mapped to the browser
+// feature that performs them. Advertised to the runner as "supported"; the
+// runner intersects that with the operator's grant, the OS permission and the
+// readiness reported beside it.
+const DEVICE_CAPABILITIES = {
+  device_info: () => true,
+  camera_capture: () => Boolean(navigator.mediaDevices?.getUserMedia),
+  microphone_capture: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
+  location_read: () => Boolean(navigator.geolocation),
+  notification_post: () => "Notification" in window,
+  screen_capture: () => Boolean(navigator.mediaDevices?.getDisplayMedia),
+  // Either half is enough to be useful: an artifact is played back through the
+  // audio element, and `text` is spoken by the synthesizer.
+  audio_playback: () => Boolean(window.speechSynthesis) || typeof Audio === "function",
+  voice_stream: () => Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder),
+};
+
+// What each capability's preparation control says and does. Only a direct user
+// gesture ever reaches these — an agent asking for a camera must never cause a
+// permission prompt to appear in somebody's face.
+const PREPARATION = {
+  camera_capture: { label: "Allow camera", prepare: () => promptForMedia({ video: true }) },
+  microphone_capture: { label: "Allow microphone", prepare: () => promptForMedia({ audio: true }) },
+  voice_stream: { label: "Allow microphone", prepare: () => promptForMedia({ audio: true }) },
+  location_read: { label: "Allow location", prepare: promptForLocation },
+  notification_post: { label: "Allow notifications", prepare: promptForNotifications },
+  screen_capture: { label: "Allow screen capture", prepare: armScreenShare },
+  audio_playback: { label: "Enable audio playback", prepare: enableAudioPlayback },
+};
+
+function capabilitySupported(capability) {
+  try {
+    return Boolean(DEVICE_CAPABILITIES[capability]?.());
+  } catch {
+    return false;
   }
-  const name = PERMISSION_NAMES[capability];
-  if (!name) return "undetermined";
-  if (!navigator.permissions?.query) return "undetermined";
+}
+
+// Everything the browser will tell us right now, collected in one place so the
+// decision itself stays a pure function of it.
+async function collectProbe() {
+  const permissions = {};
+  for (const [capability, name] of Object.entries(PERMISSION_NAMES)) {
+    permissions[capability] = await queryPermission(name);
+  }
+  return {
+    permissions,
+    notificationPermission: "Notification" in window ? Notification.permission : null,
+    screenShareLive: screenShareIsLive(),
+    audioEnabled: state.audioEnabled === true,
+    foreground: document.visibilityState === "visible",
+  };
+}
+
+async function queryPermission(name) {
+  if (!navigator.permissions?.query) return null;
   try {
     const status = await navigator.permissions.query({ name });
-    if (status.state === "granted") return "granted";
-    if (status.state === "denied") return "denied";
-    return "undetermined";
+    return status.state;
   } catch {
-    // A browser that does not know this permission name cannot answer for it.
-    return "undetermined";
+    // A browser that does not know this permission name cannot answer for it,
+    // and "cannot answer" is not "granted".
+    return null;
   }
 }
 
 async function describeDevice() {
-  const capabilities = Object.entries(DEVICE_CAPABILITIES)
-    .filter(([, supported]) => {
-      try {
-        return supported();
-      } catch {
-        return false;
-      }
-    })
-    .map(([capability]) => capability);
+  const probe = await collectProbe();
+  const capabilities = [];
   const permissions = {};
-  for (const capability of capabilities) {
-    const permission = await readOsPermission(capability);
-    // A capability the OS cannot be asked about is reported honestly as
-    // undetermined rather than optimistically as granted; the runner then
-    // treats it as not effective until the device proves otherwise.
-    permissions[capability] = DEVICE_CAPABILITIES[capability]() ? permission : "unsupported";
+  const readiness = {};
+  for (const capability of Object.keys(DEVICE_CAPABILITIES)) {
+    const supported = capabilitySupported(capability);
+    const answer = describeCapability(capability, { ...probe, supported });
+    if (supported) capabilities.push(capability);
+    permissions[capability] = answer.permission;
+    readiness[capability] = answer.readiness;
   }
   return {
     protocol_version: PROTOCOL_VERSION,
@@ -1949,35 +1996,93 @@ async function describeDevice() {
     device_model: navigator.userAgentData?.mobile ? "mobile browser" : "browser",
     capabilities,
     permissions,
+    readiness,
     constraints: {
       max_artifact_bytes: MAX_ARTIFACT_BYTES,
       max_recording_ms: MAX_RECORDING_MS,
       max_notification_chars: 512,
-      camera_positions: DEVICE_CAPABILITIES.camera_capture() ? ["front", "back"] : [],
+      camera_positions: capabilitySupported("camera_capture") ? ["front", "back"] : [],
     },
     reported_at_ms: Date.now(),
   };
 }
 
 // Reports the surface and renders what the runner says is effective.
+//
+// Called after every event that can change any of the four axes — a permission
+// prompt answered, the page coming back to the front, a screen share ending —
+// because a runner acting on a stale surface either refuses something possible
+// or queues something that will fail in the user's face.
 async function advertiseDevice() {
   const surface = await describeDevice();
+  state.surface = surface;
   state.deviceState = await signedRequest("POST", "/v1/remote/device/surface", surface);
   renderDeviceState();
   return state.deviceState;
+}
+
+let advertisePending = null;
+// Coalesced: focus, visibility and permission-change events arrive together and
+// three surfaces posted in a row would differ only in their timestamps.
+function scheduleAdvertise() {
+  if (!state.profile || state.stale) return;
+  if (advertisePending) return;
+  advertisePending = setTimeout(() => {
+    advertisePending = null;
+    advertiseDevice().catch(() => {});
+  }, 250);
+}
+
+// Every input to the four axes that can change without this client acting.
+function watchDeviceReadiness() {
+  document.addEventListener("visibilitychange", scheduleAdvertise);
+  window.addEventListener("focus", scheduleAdvertise);
+  window.addEventListener("online", () => {
+    scheduleAdvertise();
+    // A result staged before the network went is delivered now. This is not a
+    // queued user action — the effect already happened and the runner is
+    // waiting for it.
+    runCommandLoop();
+  });
+  if (!navigator.permissions?.query) return;
+  for (const name of new Set(Object.values(PERMISSION_NAMES))) {
+    navigator.permissions
+      .query({ name })
+      .then((status) => {
+        status.addEventListener?.("change", scheduleAdvertise);
+      })
+      .catch(() => {});
+  }
 }
 
 function capabilityList(values) {
   return Array.isArray(values) && values.length > 0 ? values.map(humanize).join(", ") : "none";
 }
 
+const READINESS_WORDS = {
+  [READINESS.ready]: "Ready",
+  [READINESS.foregroundRequired]: "Needs this page in front",
+  [READINESS.interactionRequired]: "Needs user interaction",
+  [READINESS.armedRequired]: "Needs screen sharing armed",
+  [READINESS.unavailable]: "Unavailable",
+};
+
+const PERMISSION_WORDS = {
+  [PERMISSION.granted]: "Granted",
+  [PERMISSION.denied]: "Denied",
+  [PERMISSION.promptable]: "Needs permission",
+  [PERMISSION.notRequired]: "Not required",
+  [PERMISSION.unsupported]: "Unsupported",
+  undetermined: "Needs permission",
+};
+
 function renderDeviceState() {
   if (!ui.devicePanel) return;
   const value = state.deviceState;
   ui.devicePanel.hidden = !value;
   if (!value) return;
-  // Four separate lines, never one merged list: "why can it not take a photo"
-  // has four different answers and the operator has to be able to see which.
+  // Never one merged list: "why can it not take a photo" has four different
+  // answers and the operator has to be able to see which.
   ui.deviceGranted.textContent = capabilityList(value.granted);
   ui.deviceSupported.textContent = capabilityList(value.advertised);
   ui.deviceEffective.textContent = capabilityList(value.effective);
@@ -1986,12 +2091,147 @@ function renderDeviceState() {
   ui.devicePermissions.textContent = entries.length
     ? entries.map(([capability, permission]) => `${humanize(capability)}: ${permission}`).join(" · ")
     : "not reported";
+  renderReadiness();
   // The runner has just restated what this pairing holds, which is where an
   // operator's grant edit becomes visible: a withdrawn `chat` has to take the
   // composer with it rather than leaving a control that answers 403.
   renderSessions();
   renderWorkflows();
   if (ui.capturePanel) ui.capturePanel.hidden = !hasCapability("capture");
+}
+
+// One row per granted physical capability: the four axes, and the control that
+// fixes whichever one is in the way.
+function renderReadiness() {
+  const host = ui.deviceReadiness;
+  if (!host) return;
+  const granted = new Set(state.deviceState?.granted || []);
+  const surface = state.surface;
+  host.replaceChildren();
+  const rows = Object.keys(DEVICE_CAPABILITIES).filter((capability) => granted.has(capability));
+  if (rows.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "field-help";
+    empty.textContent = "No hardware capability is granted to this device.";
+    host.append(empty);
+    return;
+  }
+  for (const capability of rows) {
+    const supported = capabilitySupported(capability);
+    const permission = surface?.permissions?.[capability] || PERMISSION.unsupported;
+    const readiness = surface?.readiness?.[capability] || READINESS.unavailable;
+    const effective = isEffective({ granted: true, supported, permission, readiness });
+
+    const row = document.createElement("div");
+    row.className = "readiness-row";
+    const title = document.createElement("p");
+    title.className = "readiness-name";
+    title.textContent = humanize(capability);
+    const facts = document.createElement("p");
+    facts.className = "field-help";
+    facts.textContent = [
+      "Granted: yes",
+      `Supported: ${supported ? "yes" : "no"}`,
+      `Permission: ${PERMISSION_WORDS[permission] || permission}`,
+      `Readiness: ${READINESS_WORDS[readiness] || readiness}`,
+      `Effective: ${effective ? "yes" : "no"}`,
+    ].join(" · ");
+    row.append(title, facts);
+
+    const preparation = PREPARATION[capability];
+    // A control only where one would actually help. A denied OS permission is
+    // fixed in the system's own settings, not here, and offering a button that
+    // silently does nothing is worse than offering none.
+    if (!effective && supported && preparation && permission !== PERMISSION.denied) {
+      const button = document.createElement("button");
+      button.className = "button secondary";
+      button.type = "button";
+      button.textContent = preparation.label;
+      button.disabled = state.stale;
+      button.addEventListener("click", async () => {
+        setButtonBusy(button, true, "Asking…");
+        try {
+          await preparation.prepare();
+        } catch (error) {
+          handleError(error, `${preparation.label} was refused`);
+        } finally {
+          setButtonBusy(button, false);
+          // Whatever the answer was, the surface is re-read and re-posted: the
+          // runner's view of this device must never be older than the device's.
+          await advertiseDevice().catch(() => {});
+        }
+      });
+      row.append(button);
+    }
+    host.append(row);
+  }
+}
+
+// What this device is still holding that the runner has not acknowledged.
+// Visible locally on purpose: an operator looking at a phone that is holding an
+// undelivered photograph should be able to see that, not wonder.
+function renderJournalState() {
+  const host = ui.journalStatus;
+  if (!host) return;
+  journalEntries()
+    .then((entries) => {
+      const pending = entries.filter((entry) => isUnacknowledged(entry));
+      const bytes = pending.reduce((total, entry) => total + (Number(entry.artifactBytes) || 0), 0);
+      if (pending.length === 0) {
+        host.textContent = state.executor
+          ? "This tab performs the runner's device commands."
+          : "Another tab of this profile is performing device commands.";
+        return;
+      }
+      host.textContent =
+        `${pending.length} result${pending.length === 1 ? "" : "s"} not yet acknowledged by the runner` +
+        (bytes > 0 ? ` (${Math.round(bytes / 1024)} KiB held here).` : ".");
+    })
+    .catch(() => {});
+}
+
+// --- Preparing a capability, always from a user gesture --------------------
+
+// Opens the stream only to make the browser ask, then closes it immediately.
+// The permission is what is wanted here, not the media.
+async function promptForMedia(constraints) {
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  stopTracks(stream);
+  return true;
+}
+
+function promptForLocation() {
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition(
+      () => resolve(true),
+      (error) => reject(new Error(error.message || "Location permission was refused")),
+      { timeout: 20_000, maximumAge: 0 },
+    );
+  });
+}
+
+async function promptForNotifications() {
+  const decision = await Notification.requestPermission();
+  if (decision !== "granted") throw new Error("Notification permission was refused");
+  return true;
+}
+
+// Autoplay policy, cleared the only way it can be: by playing something
+// silently inside the gesture that asked for it.
+async function enableAudioPlayback() {
+  if (window.speechSynthesis) {
+    // A zero-length utterance counts as the page having spoken.
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(" "));
+  }
+  if (typeof Audio === "function") {
+    const silence = new Audio(
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=",
+    );
+    silence.volume = 0;
+    await silence.play().catch(() => {});
+  }
+  state.audioEnabled = true;
+  return true;
 }
 
 // --- Performing one command ------------------------------------------------
@@ -2014,12 +2254,33 @@ function stopTracks(stream) {
   for (const track of stream?.getTracks?.() || []) track.stop();
 }
 
-async function captureStill(position) {
+function aborted(signal) {
+  return Boolean(signal?.aborted);
+}
+
+/** Resolves when the delay elapses or the signal aborts, whichever is first. */
+function delayUntilAborted(milliseconds, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, milliseconds);
+    function finish() {
+      clearTimeout(timer);
+      signal?.removeEventListener?.("abort", finish);
+      resolve();
+    }
+    signal?.addEventListener?.("abort", finish, { once: true });
+  });
+}
+
+async function captureStill(position, signal) {
+  // Cancellation observed before the camera opens prevents the effect outright;
+  // that is the only point at which it can.
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   const stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: position === "front" ? "user" : "environment" },
     audio: false,
   });
   try {
+    if (aborted(signal)) return { cancelledBeforeEffect: true };
     return await frameFromStream(stream, "image/jpeg", 0.85);
   } finally {
     // Always, on every path: a camera left running after a refused or failed
@@ -2038,8 +2299,7 @@ async function captureStill(position) {
 // It is not a way around consent: the browser still asks once, the page still
 // shows what is shared, and the browser's own "stop sharing" control ends it
 // from outside this page. That is why the `ended` listener below re-advertises
-// rather than trying to reacquire — the honest report is that the permission is
-// gone.
+// rather than trying to reacquire — the honest report is that readiness is gone.
 
 function screenShareIsLive() {
   return Boolean(state.screenStream?.getVideoTracks?.().some((track) => track.readyState === "live"));
@@ -2052,11 +2312,11 @@ async function armScreenShare() {
   for (const track of stream.getVideoTracks()) {
     track.addEventListener("ended", () => {
       // Stopped from the browser's own sharing bar. Drop it and tell the runner
-      // immediately, so a queued capture fails with "not permitted" instead of
+      // immediately, so a queued capture fails with "not armed" instead of
       // interrupting someone with a fresh prompt.
       if (state.screenStream === stream) state.screenStream = null;
       renderScreenShare();
-      advertiseDevice().catch(() => {});
+      scheduleAdvertise();
     });
   }
   renderScreenShare();
@@ -2067,12 +2327,13 @@ function disarmScreenShare() {
   stopTracks(state.screenStream);
   state.screenStream = null;
   renderScreenShare();
+  scheduleAdvertise();
 }
 
 function renderScreenShare() {
   if (!ui.screenShareButton) return;
   const live = screenShareIsLive();
-  const supported = DEVICE_CAPABILITIES.screen_capture();
+  const supported = capabilitySupported("screen_capture");
   ui.screenShareButton.hidden = !supported;
   ui.screenShareButton.textContent = live ? "Stop screen capture" : "Allow screen capture";
   if (ui.screenShareStatus) {
@@ -2084,12 +2345,13 @@ function renderScreenShare() {
   }
 }
 
-async function captureScreen() {
+async function captureScreen(signal) {
   if (!screenShareIsLive()) {
-    // Never a silent prompt: the runner was told this was not permitted, and
-    // this path exists only if that report raced with the user stopping.
+    // Never a silent prompt: the runner was told this was not armed, and this
+    // path exists only if that report raced with the user stopping.
     throw new Error("Screen sharing is not armed on this device");
   }
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   // The armed stream is deliberately NOT stopped afterwards — it is the whole
   // reason a second capture needs no second prompt.
   return await frameFromStream(state.screenStream, "image/png", undefined);
@@ -2119,8 +2381,9 @@ async function frameFromStream(stream, mediaType, quality) {
   return { blob, mediaType, result: { width: canvas.width, height: canvas.height } };
 }
 
-async function recordMicrophone(durationMs) {
+async function recordMicrophone(durationMs, signal) {
   const bounded = Math.min(Math.max(Number(durationMs) || 10_000, 1), MAX_RECORDING_MS);
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   try {
     const recorder = new MediaRecorder(stream);
@@ -2133,28 +2396,41 @@ async function recordMicrophone(durationMs) {
     });
     recorder.start();
     const started = Date.now();
-    // Polled rather than a single timer so an operator's cancel reaches a
-    // recording already in progress instead of waiting out its full duration.
-    while (Date.now() - started < bounded && !state.activeCommand?.cancelled) {
-      await delay(200);
+    // Woken by the cancellation signal rather than polled: a stop asked for
+    // now reaches the recorder now, not up to 200 ms later.
+    while (Date.now() - started < bounded && !aborted(signal)) {
+      await delayUntilAborted(Math.min(200, bounded - (Date.now() - started)), signal);
     }
     recorder.stop();
     await finished;
     const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+    const cancelled = aborted(signal);
     return {
       blob,
       mediaType: blob.type || "audio/webm",
-      result: { duration_ms: Date.now() - started, cancelled: Boolean(state.activeCommand?.cancelled) },
+      // A cancelled recording still recorded: the honest answer keeps the audio
+      // it captured and says the recording was cut short, rather than claiming
+      // the microphone never opened.
+      cancelledDuringEffect: cancelled,
+      result: { duration_ms: Date.now() - started, cancelled },
     };
   } finally {
+    // Always, on every path: success, failure and cancellation.
     stopTracks(stream);
   }
 }
 
-function readLocation(accuracy) {
+function readLocation(accuracy, signal) {
   return new Promise((resolve, reject) => {
-    navigator.geolocation.getCurrentPosition(
-      (position) =>
+    if (aborted(signal)) {
+      resolve({ cancelledBeforeEffect: true });
+      return;
+    }
+    let settled = false;
+    const watch = navigator.geolocation.getCurrentPosition(
+      (position) => {
+        if (settled) return;
+        settled = true;
         resolve({
           result: {
             latitude: position.coords.latitude,
@@ -2164,28 +2440,51 @@ function readLocation(accuracy) {
             // no continuous background tracking to turn on.
             taken_at_ms: position.timestamp,
           },
-        }),
-      (error) => reject(new Error(error.message || "Location is unavailable")),
+        });
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(error.message || "Location is unavailable"));
+      },
       { enableHighAccuracy: accuracy === "precise", timeout: 20_000, maximumAge: 0 },
+    );
+    // A fix in flight cannot be recalled, but it can be abandoned: nothing
+    // observable happened, so this is honestly a cancellation before effect.
+    signal?.addEventListener?.(
+      "abort",
+      () => {
+        if (settled) return;
+        settled = true;
+        navigator.geolocation.clearWatch?.(watch);
+        resolve({ cancelledBeforeEffect: true });
+      },
+      { once: true },
     );
   });
 }
 
-async function postNotification(argumentsValue) {
+async function postNotification(argumentsValue, signal) {
   if (Notification.permission !== "granted") {
-    const decision = await Notification.requestPermission();
-    if (decision !== "granted") {
-      throw new Error("The device's notification permission is denied");
-    }
+    // Never prompts here. A prompt raised by a remote command would appear
+    // without anyone having touched this device — permission is asked for from
+    // the readiness control instead, which is a gesture the user made.
+    throw new Error(
+      "This device has not granted notification permission. Open the paired-device controller and " +
+        "allow notifications under Device readiness, then retry.",
+    );
   }
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
   const notification = new Notification(String(argumentsValue.title || ""), {
     body: String(argumentsValue.body || ""),
     silent: false,
   });
+  // Shown. A cancellation arriving now cannot unshow it, and saying otherwise
+  // would be a lie the operator acts on.
   return { result: { shown: true, at_ms: Date.now() }, notification };
 }
 
-function speak(text) {
+function speak(text, signal) {
   return new Promise((resolve, reject) => {
     const utterance = new SpeechSynthesisUtterance(String(text || ""));
     utterance.onend = () => resolve({ result: { spoken: true } });
@@ -2193,6 +2492,7 @@ function speak(text) {
       // A cancelled utterance ends with an error event; the caller decides
       // whether that was a cancellation or a failure.
       reject(new Error(event.error === "canceled" ? "Playback was cancelled" : "Playback failed"));
+    signal?.addEventListener?.("abort", () => window.speechSynthesis.cancel(), { once: true });
     window.speechSynthesis.speak(utterance);
   });
 }
@@ -2209,7 +2509,7 @@ function base64ToBytes(encoded) {
 // The bytes are fetched over the ordinary signed artifact route, under the run
 // scope this device was already paired with — there is no second way in, and a
 // device without `read_artifacts` cannot reach one at all.
-async function playArtifact(runId, artifactId) {
+async function playArtifact(runId, artifactId, signal) {
   const artifact = await signedRequest(
     "GET",
     `/v1/remote/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
@@ -2222,20 +2522,22 @@ async function playArtifact(runId, artifactId) {
   const url = URL.createObjectURL(blob);
   const audio = new Audio(url);
   try {
+    if (aborted(signal)) return { cancelledBeforeEffect: true };
     await audio.play();
-    // Polled rather than awaiting `ended` alone, so a cancellation reaches a
-    // long recording instead of waiting it out.
-    while (!audio.ended && !state.activeCommand?.cancelled) {
-      await delay(200);
+    while (!audio.ended && !aborted(signal)) {
+      await delayUntilAborted(200, signal);
     }
+    // Stopping playback is one of the few cancellations that genuinely works:
+    // the sound stops when asked.
     if (!audio.ended) audio.pause();
     return {
+      cancelledDuringEffect: !audio.ended,
       result: {
         played: audio.ended,
         artifact_id: artifactId,
         media_type: mediaType,
         bytes: artifact.size_bytes ?? null,
-        cancelled: Boolean(state.activeCommand?.cancelled),
+        cancelled: !audio.ended,
       },
     };
   } finally {
@@ -2243,23 +2545,23 @@ async function playArtifact(runId, artifactId) {
   }
 }
 
-async function playAudio(argumentsValue) {
+async function playAudio(argumentsValue, signal) {
   if (argumentsValue.artifact_id && argumentsValue.run_id) {
-    return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id);
+    return await playArtifact(argumentsValue.run_id, argumentsValue.artifact_id, signal);
   }
   if (!window.speechSynthesis) {
     throw new Error("This device cannot speak text");
   }
-  return await speak(argumentsValue.text);
+  return await speak(argumentsValue.text, signal);
 }
 
 // --- A live microphone stream ----------------------------------------------
 //
 // The control command stays `running` for as long as the microphone is open;
 // the audio does not travel in its result but in chunks, to the session the
-// command named. Two things end it: the duration it was given, and the runner
+// command named. Three things end it: the duration it was given, the runner
 // answering `stop: true` — which arrives on the reply to a chunk this device is
-// posting anyway, so a cancellation needs no second poll to be noticed.
+// posting anyway — and the cancellation watcher aborting.
 
 // Containers the runner accepts. A recorder that reports anything else has its
 // type normalized to the family it belongs to rather than being refused, since
@@ -2282,7 +2584,7 @@ function voiceMediaType(recorded) {
   return "audio/webm";
 }
 
-async function streamVoice(argumentsValue) {
+async function streamVoice(argumentsValue, signal) {
   const sessionId = String(argumentsValue.session_id || "");
   if (!validId(sessionId)) throw new Error("The runner did not name a voice session");
   const durationMs = Math.min(Math.max(Number(argumentsValue.duration_ms) || 60_000, 1_000), MAX_STREAM_MS);
@@ -2325,11 +2627,11 @@ async function streamVoice(argumentsValue) {
   const started = Date.now();
   try {
     recorder.start(chunkMs);
-    while (Date.now() - started < durationMs && !stopped && !state.activeCommand?.cancelled) {
-      await delay(Math.min(chunkMs, 500));
+    while (Date.now() - started < durationMs && !stopped && !aborted(signal)) {
+      await delayUntilAborted(Math.min(chunkMs, 500), signal);
       await drain();
     }
-    if (state.activeCommand?.cancelled) stopped = "Cancelled on the device";
+    if (aborted(signal)) stopped = "Cancelled on the device";
     recorder.stop();
     // One last slice is emitted by `stop()`; give it a moment to arrive.
     await delay(250);
@@ -2353,6 +2655,7 @@ async function streamVoice(argumentsValue) {
     }
   }
   return {
+    cancelledDuringEffect: aborted(signal),
     result: {
       session_id: sessionId,
       chunks: sequence,
@@ -2365,31 +2668,29 @@ async function streamVoice(argumentsValue) {
 }
 
 // Runs one leased command and returns the terminal report to send back.
-async function performCommand(command) {
+//
+// The three cancellation outcomes are kept apart rather than collapsed into
+// "cancelled": an operator reading a result has to be able to tell a photograph
+// that never happened from one that did.
+async function performCommand(command, signal) {
   const argumentsValue = command.arguments || {};
   switch (command.capability) {
     case "device_info":
       return { outcome: "succeeded", result: await describeDevice() };
-    case "camera_capture": {
-      const { blob, mediaType, result } = await captureStill(argumentsValue.position);
-      return await withArtifact(blob, mediaType, result);
-    }
-    case "screen_capture": {
-      const { blob, mediaType, result } = await captureScreen();
-      return await withArtifact(blob, mediaType, result);
-    }
-    case "microphone_capture": {
-      const { blob, mediaType, result } = await recordMicrophone(argumentsValue.duration_ms);
-      return await withArtifact(blob, mediaType, result);
-    }
+    case "camera_capture":
+      return await artifactOutcome(await captureStill(argumentsValue.position, signal));
+    case "screen_capture":
+      return await artifactOutcome(await captureScreen(signal));
+    case "microphone_capture":
+      return await artifactOutcome(await recordMicrophone(argumentsValue.duration_ms, signal));
     case "location_read":
-      return { outcome: "succeeded", result: (await readLocation(argumentsValue.accuracy)).result };
+      return plainOutcome(await readLocation(argumentsValue.accuracy, signal));
     case "notification_post":
-      return { outcome: "succeeded", result: (await postNotification(argumentsValue)).result };
+      return plainOutcome(await postNotification(argumentsValue, signal));
     case "audio_playback":
-      return { outcome: "succeeded", result: (await playAudio(argumentsValue)).result };
+      return plainOutcome(await playAudio(argumentsValue, signal));
     case "voice_stream":
-      return { outcome: "succeeded", result: (await streamVoice(argumentsValue)).result };
+      return plainOutcome(await streamVoice(argumentsValue, signal));
     default:
       // Honest refusal rather than a silent success: the runner records the
       // reason and the waiting run reads it.
@@ -2400,148 +2701,492 @@ async function performCommand(command) {
   }
 }
 
-async function withArtifact(blob, mediaType, result) {
+// A cancellation that arrived before anything happened is a real cancellation.
+// One that arrived after is not, and neither is a completed effect the operator
+// happened to ask to stop a moment too late.
+function cancelledBeforeEffect(error) {
+  return {
+    outcome: "cancelled",
+    result: { cancellation: "cancelled_before_effect" },
+    error: error || "Cancelled before this device performed the action",
+  };
+}
+
+function plainOutcome(outcome) {
+  if (outcome?.cancelledBeforeEffect) return cancelledBeforeEffect();
+  if (outcome?.cancelledDuringEffect) {
+    return {
+      outcome: "cancelled",
+      result: { ...(outcome.result || {}), cancellation: "cancelled_during_effect" },
+      error: "Stopped part-way through; what had already happened was not undone",
+    };
+  }
+  return { outcome: "succeeded", result: outcome?.result ?? null };
+}
+
+async function artifactOutcome(outcome) {
+  if (outcome?.cancelledBeforeEffect) return cancelledBeforeEffect();
+  const { blob, mediaType, result } = outcome;
+  if (!blob) return { outcome: "failed", error: "The device produced no artifact" };
   if (blob.size > MAX_ARTIFACT_BYTES) {
     return { outcome: "failed", error: "The captured artifact is larger than this device allows" };
   }
+  // Digested here, once, and carried through staging: the same digest is
+  // declared to the runner after a reload, so a truncated redelivery is caught
+  // rather than accepted as authoritative bytes.
+  const artifactSha256 = await sha256Hex(await blob.arrayBuffer());
   return {
-    outcome: "succeeded",
-    result,
-    artifact_base64: await blobToBase64(blob),
-    artifact_media_type: mediaType,
+    // The effect happened. If a cancellation arrived mid-way the artifact is
+    // still reported — losing it would be pretending the action did not occur.
+    outcome: outcome.cancelledDuringEffect ? "cancelled" : "succeeded",
+    result: outcome.cancelledDuringEffect
+      ? { ...(result || {}), cancellation: "cancelled_during_effect" }
+      : result,
+    error: outcome.cancelledDuringEffect
+      ? "Stopped part-way through; what had already been captured is attached"
+      : null,
+    artifactBlob: blob,
+    artifactMediaType: mediaType,
+    artifactSha256,
+  };
+}
+
+// --- The durable command journal -------------------------------------------
+//
+// One record per command this device has been handed, holding the phase it
+// reached and — once it has one — the staged result including its bytes. It is
+// the reason a reload cannot cause a second photograph and cannot lose the
+// first one: the phase is written *before* the runner is asked to authorize a
+// start, and the bytes are dropped only after the runner acknowledges them.
+
+async function withJournal(mode, operation) {
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(JOURNAL_STORE, mode);
+      const store = transaction.objectStore(JOURNAL_STORE);
+      let result;
+      let failure;
+      try {
+        result = operation(store);
+      } catch (error) {
+        failure = error;
+        transaction.abort();
+      }
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(failure || transaction.error || new Error("The command journal failed"));
+      transaction.onabort = () => reject(failure || transaction.error || new Error("The command journal was aborted"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function requestValue(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("The command journal could not be read"));
+  });
+}
+
+// The IndexedDB adapter the journal runs on. Mechanical: open, one request,
+// close. Every decision it serves — what may be dropped, what may be forgotten,
+// what must be retried — lives in `device-core.js` and is tested there.
+const journalAdapter = {
+  async get(commandId) {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(JOURNAL_STORE, "readonly");
+      return (await requestValue(transaction.objectStore(JOURNAL_STORE).get(commandId))) || null;
+    } finally {
+      database.close();
+    }
+  },
+  async all() {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(JOURNAL_STORE, "readonly");
+      return (await requestValue(transaction.objectStore(JOURNAL_STORE).getAll())) || [];
+    } finally {
+      database.close();
+    }
+  },
+  put(record) {
+    return withJournal("readwrite", (store) => store.put(record));
+  },
+  remove(commandIds) {
+    return withJournal("readwrite", (store) => {
+      for (const commandId of commandIds) store.delete(commandId);
+    });
+  },
+};
+
+const journal = createJournal(journalAdapter, { limits: JOURNAL_LIMITS });
+
+const journalEntry = (commandId) => journal.get(commandId);
+const journalEntries = () => journal.all();
+
+async function journalWrite(entry) {
+  const record = await journal.write(entry);
+  renderJournalState();
+  return record;
+}
+
+const journalDelete = (commandIds) => journal.remove(commandIds);
+
+// Drops what the bounds allow, and never an unacknowledged result: a cache
+// limit must not become data loss about an effect that really happened.
+const pruneJournal = () => journal.prune();
+
+function stagedReport(entry) {
+  return {
+    outcome: entry.outcome,
+    result: entry.result ?? null,
+    error: entry.error ?? null,
+    artifactBlob: entry.artifactBlob ?? null,
+    artifactMediaType: entry.artifactMediaType ?? null,
+    artifactSha256: entry.artifactSha256 ?? null,
   };
 }
 
 // --- The command loop ------------------------------------------------------
 
-// Long-polls for work, performs it, and reports back.
+// One executor per paired profile, whatever a browser does with tabs.
 //
-// The order is the exactly-once contract: `start` is posted BEFORE anything
-// physical happens, and a `started: false` reply means another connection
-// already began this command — so this one performs nothing and stops. A
-// command is never retried by this client; the runner decides whether a lapsed
-// lease may be requeued, and it only does so before `start`.
+// The lock is held for the whole loop rather than around each signed request:
+// two loops that merely serialized their HTTP calls would still lease, start
+// and execute the same command in two tabs. Everything physical happens inside
+// this lock.
+const EXECUTOR_LOCK = "little-monkey-device-executor-v1";
+
 async function runCommandLoop() {
   if (state.commandLoopRunning) return;
   state.commandLoopRunning = true;
   try {
-    while (state.profile && !state.stale) {
-      let command;
-      try {
-        command = await signedRequest("GET", `/v1/remote/device/commands/next?wait_ms=${LEASE_WAIT_MS}`);
-      } catch (error) {
-        if (error instanceof RemoteError && error.status === 401) throw error;
-        // Any other failure is a network hiccup: wait and poll again rather
-        // than tearing the session down.
-        await delay(5_000);
-        continue;
-      }
-      if (!command || !validId(command.command_id)) continue;
-      await executeLeasedCommand(command);
+    const held = await acquireExecutor(navigator.locks, EXECUTOR_LOCK, async () => {
+      state.executor = true;
+      renderJournalState();
+      await commandLoopBody();
+    });
+    if (!held.executor) {
+      state.executor = false;
+      renderJournalState();
     }
   } catch (error) {
     handleError(error, "Device command loop stopped");
   } finally {
+    state.executor = false;
     state.commandLoopRunning = false;
   }
 }
 
+// The order is the whole recovery contract, and it is not negotiable:
+//
+//   1. deliver everything already staged — those effects have happened, and the
+//      runner is waiting for results it may re-hand out otherwise;
+//   2. reconcile what the runner still calls running — deliver or report
+//      unknown, never re-execute;
+//   3. only then take new work.
+//
+// Leasing first would let a fresh command race ahead of a result the runner is
+// still waiting for, and a command whose result never arrives is one the runner
+// eventually fails as unproven.
+async function commandLoopBody() {
+  while (state.profile && !state.stale) {
+    try {
+      await flushOutbox();
+      await reconcileRunningCommands();
+    } catch (error) {
+      if (error instanceof RemoteError && error.status === 401) throw error;
+      await delay(5_000);
+      continue;
+    }
+    let command;
+    try {
+      command = await signedRequest("GET", `/v1/remote/device/commands/next?wait_ms=${LEASE_WAIT_MS}`);
+    } catch (error) {
+      if (error instanceof RemoteError && error.status === 401) throw error;
+      // Any other failure is a network hiccup: wait and poll again rather
+      // than tearing the session down.
+      await delay(5_000);
+      continue;
+    }
+    if (!command || !validId(command.command_id)) continue;
+    await executeLeasedCommand(command);
+    await pruneJournal();
+  }
+}
+
+/**
+ * Everything this device performed and the runner has not acknowledged.
+ *
+ * This is not an action queue. Nothing here is a request somebody made offline
+ * and this client decided to replay — every entry is the *result of an effect
+ * that already happened*, which the runner is waiting for and will otherwise
+ * record as unproven. That is why it retries while approvals, cancellations and
+ * chat sends never do.
+ */
+async function flushOutbox() {
+  const staged = (await journalEntries()).filter((entry) => entry.phase === PHASE.resultStaged);
+  for (const entry of staged) {
+    await deliverStaged(entry);
+  }
+}
+
+async function deliverStaged(entry) {
+  const answer = await deliverStagedResult(entry, {
+    journal,
+    send: (staged) => reportCommand(staged.commandId, stagedReport(staged), staged.executionId),
+  });
+  renderJournalState();
+  if (answer.outcome === "conflict") {
+    showToast("The runner already holds a different result for one command; ours was dropped.");
+    return false;
+  }
+  if (answer.outcome === "retry") {
+    // Bounded backoff, then out — the loop's next pass, a reconnect or the
+    // online handler wakes it again. Never a tight retry.
+    await delay(answer.backoffMs);
+    throw new RemoteError("The device result has not been acknowledged yet");
+  }
+  return true;
+}
+
+/**
+ * The commands the runner still believes are running on this device.
+ *
+ * Deliberately a separate route from the lease: a `running` command handed back
+ * as work would be a second execution. Each one is answered from the journal,
+ * and the answer is never "do it again".
+ */
+async function reconcileRunningCommands() {
+  const answer = await signedRequest("GET", "/v1/remote/device/commands/recover");
+  const commands = Array.isArray(answer?.commands) ? answer.commands : [];
+  for (const command of commands) {
+    if (!validId(command.command_id)) continue;
+    const entry = await journalEntry(command.command_id);
+    const decision = recoveryAction(entry);
+    if (decision.action === "none") continue;
+    if (decision.action === "deliver_staged") {
+      await deliverStaged(entry);
+      continue;
+    }
+    // The uncertainty window. The runner authorized a start, so the effect may
+    // have happened; nothing survives to prove it either way. Reported as
+    // exactly that, and never performed again.
+    const report = unknownOutcomeReport(decision.reason);
+    await journalWrite({
+      commandId: command.command_id,
+      capability: command.capability,
+      executionId: entry?.executionId ?? command.execution_id ?? null,
+      phase: PHASE.uncertain,
+      outcome: report.outcome,
+      result: null,
+      error: report.error,
+      artifactBlob: null,
+      artifactBytes: 0,
+    });
+    try {
+      await reportCommand(command.command_id, report, entry?.executionId ?? null);
+      await journalWrite({
+        commandId: command.command_id,
+        capability: command.capability,
+        executionId: entry?.executionId ?? null,
+        phase: PHASE.resultAcked,
+        outcome: report.outcome,
+        error: report.error,
+        artifactBlob: null,
+        artifactBytes: 0,
+      });
+      showToast("A command interrupted mid-action was reported as unknown, not repeated.");
+    } catch (error) {
+      if (!(error instanceof RemoteError && error.status === 409)) throw error;
+    }
+  }
+}
+
+/**
+ * One leased command, from journal entry to terminal report.
+ *
+ * Every ordering here is load-bearing:
+ *
+ *   journal the command → mint and journal an execution id → ask the runner to
+ *   authorize a start → only then touch hardware → stage the result durably →
+ *   deliver it.
+ *
+ * A crash between any two of those is recoverable without repeating the effect,
+ * which is the property the whole design exists for.
+ */
 async function executeLeasedCommand(command) {
-  const recent = await rememberCommand(command.command_id);
-  if (recent) {
-    // This device already performed this command in an earlier session. Report
-    // the remembered outcome instead of doing it again.
-    await reportCommand(command.command_id, recent);
+  const existing = await journalEntry(command.command_id);
+  const decision = leaseDecision(existing);
+  if (decision.action === "none") return;
+  if (decision.action === "deliver_staged") {
+    await deliverStaged(existing);
+    return;
+  }
+  if (decision.action === "report_unknown") {
+    const report = unknownOutcomeReport(decision.reason);
+    await reportCommand(command.command_id, report, existing?.executionId ?? null);
+    await journalWrite({ ...existing, phase: PHASE.resultAcked, ...report, artifactBlob: null, artifactBytes: 0 });
     return;
   }
   if (command.cancel_requested) {
-    await reportCommand(command.command_id, { outcome: "cancelled", error: "Cancelled before it started" });
+    await reportCommand(command.command_id, {
+      outcome: "cancelled",
+      result: { cancellation: "cancelled_before_effect" },
+      error: "Cancelled before this device started it",
+    });
     return;
   }
+  // Room for the result BEFORE the effect. Discovering there is nowhere to put
+  // a photograph after taking it leaves a choice between losing it and evicting
+  // somebody else's undelivered result; refusing up front keeps both.
+  const ceiling = Math.min(MAX_ARTIFACT_BYTES, Number(state.deviceState?.max_artifact_bytes) || MAX_ARTIFACT_BYTES);
+  const refusal = capacityRefusal(await journalEntries(), command.capability, ceiling);
+  if (refusal) {
+    await reportCommand(command.command_id, { outcome: "failed", error: refusal });
+    return;
+  }
+
+  const executionId = `exec-${randomToken(18)}`;
+  await journalWrite({
+    commandId: command.command_id,
+    capability: command.capability,
+    argumentsSha256: command.arguments_sha256 || null,
+    executionId,
+    phase: PHASE.received,
+    expiresAtMs: Number(command.expires_at_ms) || 0,
+    receivedAtMs: Date.now(),
+    artifactBlob: null,
+    artifactBytes: 0,
+  });
+
   let started;
   try {
-    started = await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(command.command_id)}/start`, {});
+    started = await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(command.command_id)}/start`, {
+      execution_id: executionId,
+    });
   } catch (error) {
+    // Nothing was authorized, so nothing physical happened. The runner may
+    // safely hand this out again once the lease lapses.
+    await journalDelete([command.command_id]);
     handleError(error, "The device command could not be started");
     return;
   }
   if (started.started !== true) {
-    // Already running elsewhere (or on this device before a reconnect). Doing
-    // it again would take a second photograph.
+    // Already running (this device before a reconnect, and the runner said so).
+    // Doing it again would take a second photograph.
+    await journalWrite({
+      commandId: command.command_id,
+      capability: command.capability,
+      executionId,
+      phase: PHASE.startAuthorized,
+      startedAtMs: Date.now(),
+      artifactBlob: null,
+      artifactBytes: 0,
+    });
     return;
   }
-  state.activeCommand = { commandId: command.command_id, capability: command.capability, cancelled: false };
+  // Durable before the effect. If the browser dies on the next line, recovery
+  // finds this phase and reports the outcome unknown rather than repeating it.
+  await journalWrite({
+    commandId: command.command_id,
+    capability: command.capability,
+    argumentsSha256: command.arguments_sha256 || null,
+    executionId,
+    phase: PHASE.startAuthorized,
+    startedAtMs: Date.now(),
+    expiresAtMs: Number(command.expires_at_ms) || 0,
+    artifactBlob: null,
+    artifactBytes: 0,
+  });
+
+  const controller = new AbortController();
+  state.activeCommand = {
+    commandId: command.command_id,
+    capability: command.capability,
+    cancelled: false,
+    controller,
+  };
+  const watcher = watchForCancellation(command.command_id, controller);
   showToast(`Running ${humanize(command.capability)} for the runner…`);
   let report;
   try {
-    report = await performCommand(command);
+    report = await performCommand(command, controller.signal);
   } catch (error) {
     report = { outcome: "failed", error: String(error?.message || error) };
   } finally {
     state.activeCommand = null;
+    controller.abort();
+    await watcher.catch(() => {});
   }
-  await rememberCommand(command.command_id, report);
-  await reportCommand(command.command_id, report);
+  await journalWrite({
+    commandId: command.command_id,
+    capability: command.capability,
+    executionId,
+    phase: PHASE.resultStaged,
+    outcome: report.outcome,
+    result: report.result ?? null,
+    error: report.error ?? null,
+    // The bytes, durably. This is the difference between a reload losing a
+    // photograph and a reload delivering it.
+    artifactBlob: report.artifactBlob ?? null,
+    artifactMediaType: report.artifactMediaType ?? null,
+    artifactSha256: report.artifactSha256 ?? null,
+    artifactBytes: report.artifactBlob ? report.artifactBlob.size : 0,
+    deliveryAttempts: 0,
+  });
+  await deliverStaged(await journalEntry(command.command_id)).catch(() => {});
 }
 
-async function reportCommand(commandId, report) {
-  try {
-    await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(commandId)}/result`, {
-      protocol_version: PROTOCOL_VERSION,
-      outcome: report.outcome,
-      result: report.result ?? null,
-      artifact_base64: report.artifact_base64 ?? null,
-      artifact_media_type: report.artifact_media_type ?? null,
-      error: report.error ?? null,
-    });
-  } catch (error) {
-    handleError(error, "The device result could not be delivered");
+/**
+ * Holds one long-poll open for as long as the command runs, and aborts the work
+ * when the runner says cancellation was asked for.
+ *
+ * A watcher rather than a poll: the request costs one signed round trip and
+ * returns the moment something changes, so a recording stops promptly without
+ * the device spending a request a second on the chance that it might.
+ */
+async function watchForCancellation(commandId, controller) {
+  while (!controller.signal.aborted) {
+    let control;
+    try {
+      control = await signedRequest(
+        "GET",
+        `/v1/remote/device/commands/${encodeURIComponent(commandId)}/control?wait_ms=${LEASE_WAIT_MS}`,
+      );
+    } catch {
+      // A watcher that cannot reach the runner must not abort the work: the
+      // effect may be half done and the runner has said nothing.
+      await delay(2_000);
+      continue;
+    }
+    if (control?.cancel_requested === true || control?.revoked === true) {
+      if (state.activeCommand?.commandId === commandId) state.activeCommand.cancelled = true;
+      controller.abort();
+      return;
+    }
+    if (control?.state && TERMINAL_COMMAND_STATES.has(control.state)) return;
   }
 }
 
-// --- Bounded local caches --------------------------------------------------
+const TERMINAL_COMMAND_STATES = new Set(["succeeded", "failed", "cancelled", "expired"]);
 
-// Remembers what this device already did, so a command that survives a browser
-// restart is reported rather than performed twice. Bounded to the most recent
-// 50 commands; older ones cannot recur, because the runner expires them long
-// before that.
-async function rememberCommand(commandId, report) {
-  const database = await openDatabase();
-  try {
-    return await new Promise((resolve, reject) => {
-      const transaction = database.transaction(STORE_NAME, report ? "readwrite" : "readonly");
-      const store = transaction.objectStore(STORE_NAME);
-      const request = store.get(ACTIVE_RECORD);
-      let found = null;
-      request.onsuccess = () => {
-        const record = request.result;
-        if (!record) return;
-        record.commandResults ||= {};
-        if (report) {
-          // The artifact bytes are deliberately not remembered — only the
-          // outcome. Re-reporting a cached success without its artifact is
-          // honest and bounded; caching megabytes of stills is not.
-          record.commandResults[commandId] = {
-            outcome: report.outcome,
-            result: report.result ?? null,
-            error: report.error ?? null,
-            atMs: Date.now(),
-          };
-          const entries = Object.entries(record.commandResults).sort((a, b) => b[1].atMs - a[1].atMs);
-          record.commandResults = Object.fromEntries(entries.slice(0, 50));
-          store.put(record);
-        } else {
-          found = record.commandResults[commandId] || null;
-        }
-      };
-      request.onerror = () => reject(request.error || new Error("The command cache could not be read"));
-      transaction.oncomplete = () => resolve(found);
-      transaction.onerror = () => reject(transaction.error || new Error("The command cache failed"));
-      transaction.onabort = () => reject(transaction.error || new Error("The command cache was aborted"));
-    });
-  } finally {
-    database.close();
-  }
+async function reportCommand(commandId, report, executionId) {
+  const encoded = report.artifactBlob ? await blobToBase64(report.artifactBlob) : null;
+  await signedRequest("POST", `/v1/remote/device/commands/${encodeURIComponent(commandId)}/result`, {
+    protocol_version: PROTOCOL_VERSION,
+    outcome: report.outcome,
+    result: report.result ?? null,
+    artifact_base64: encoded,
+    artifact_media_type: report.artifactMediaType ?? null,
+    // Declared so a truncated upload is refused rather than stored as
+    // authoritative bytes that do not match what this device holds.
+    artifact_sha256: encoded ? report.artifactSha256 ?? null : null,
+    error: report.error ?? null,
+    execution_id: executionId ?? null,
+  });
 }
 
 // Keeps the last view of the runner so the app opens to something on a train.
@@ -2897,6 +3542,11 @@ async function initialize() {
   await refreshCapabilitySurfaces();
   void refreshPushState();
   renderScreenShare();
+  // Focus, visibility, a permission changed in the browser's own settings, a
+  // screen share ended from its bar: every one of those changes an axis, and a
+  // runner acting on a stale surface refuses what is possible or queues what
+  // will fail.
+  watchDeviceReadiness();
   // Deliberately not awaited: the loop runs for the life of the page.
   void runCommandLoop();
 }
