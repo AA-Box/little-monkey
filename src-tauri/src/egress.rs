@@ -3800,9 +3800,7 @@ mod tests {
     ///
     /// This scan used to look for `Client::new()` alone, and pinned **5** bare
     /// production sites in four files while **30** `Client::builder()` chains
-    /// stood next to them unseen. (`docs/agent-os-roadmap.md` said "8", which
-    /// matched neither the table below it nor the tree — a third wrong count in
-    /// an entry whose subject is wrong counts.) Both are the same defect class —
+    /// stood next to them unseen. Both are the same defect class —
     /// a client built somewhere
     /// other than [`hardened`], with whatever budget and redirect policy its
     /// author happened to think of — so the count that matters is the sum, and a
@@ -3915,8 +3913,7 @@ mod tests {
             // by construction. Its integrity guarantee is a SHA-256 check rather
             // than an origin pin, and reqwest strips `Authorization` cross-host
             // anyway. It sets a connect timeout, `egress::READ_TIMEOUT`, a hop cap
-            // and its own per-hop SSRF check. `docs/agent-os-roadmap.md` carries
-            // the long form.
+            // and its own per-hop SSRF check.
             ("model_sources.rs", 0, 1),
             // `download_to_file`, the same shape and the same reason, likewise on
             // `egress::READ_TIMEOUT`.
@@ -4059,7 +4056,6 @@ mod tests {
         /// B and C are recorded rather than fixed: both need a product decision
         /// about what the ceiling should be, not a mechanical conversion, and a
         /// `read_timeout` alone would let a wedged local model hang forever.
-        /// `docs/agent-os-roadmap.md` carries the detail.
         const TOTAL_TIMEOUT_ALLOWED: &[(&str, usize)] = &[
             // 8s for two favicon candidates. `MAX_FAVICON_BYTES` (256 KiB) is
             // checked *after* `bytes()` has already buffered the body, so the
