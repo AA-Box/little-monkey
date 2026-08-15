@@ -92,17 +92,26 @@ describe("channels setup guidance", () => {
     expect(PROVIDER_GUIDES.find((entry) => entry.kind === "imessage")?.requiresPlatform).toBe("macos");
   });
 
-  it("does not make an iMessage helper mandatory", () => {
-    // iMessage talks to Messages on this Mac by default. Requiring a helper
-    // path would block setup on installing something that most people have
-    // no reason to run.
+  it("makes both helper paths mandatory, because both are the only way in", () => {
+    // Full Disk Access and Automation for Messages belong to the iMessage
+    // helper, and the daemon holds neither — so an account with no helper path
+    // has nothing to talk to and setup should say so up front.
     const fields = PROVIDER_GUIDES.find((guide) => guide.kind === "imessage")!.configFields;
-    expect(fields.find((field) => field.key === "helper_path")?.required).toBeFalsy();
+    expect(fields.find((field) => field.key === "helper_path")?.required).toBe(true);
     expect(fields.find((field) => field.key === "handle")?.required).toBe(true);
-    // Signal is the opposite: signal-cli is the only way in, so its path is
-    // required.
+    // Neither helper provider asks for a credential of ours: the helper holds
+    // the account.
     const signal = PROVIDER_GUIDES.find((guide) => guide.kind === "signal")!.configFields;
     expect(signal.find((field) => field.key === "helper_path")?.required).toBe(true);
+  });
+
+  it("keeps the IRC SASL account separate from the nickname", () => {
+    // A taken nickname changes the nickname, and must not change who the
+    // connection authenticates as.
+    const fields = PROVIDER_GUIDES.find((guide) => guide.kind === "irc")!.configFields;
+    const sasl = fields.find((field) => field.key === "sasl_username");
+    expect(sasl).toBeDefined();
+    expect(sasl?.required).toBeFalsy();
   });
 
   it("collects each server's own address rather than a hosted provider's", () => {
@@ -110,7 +119,14 @@ describe("channels setup guidance", () => {
       (PROVIDER_GUIDES.find((guide) => guide.kind === kind)?.configFields ?? []).map((field) => field.key);
     expect(keys("matrix")).toEqual(["homeserver_url", "user_id"]);
     expect(keys("mattermost")).toEqual(["base_url"]);
-    expect(keys("irc")).toEqual(["server", "port", "nick", "channels", "use_sasl"]);
+    expect(keys("irc")).toEqual([
+      "server",
+      "port",
+      "nick",
+      "channels",
+      "use_sasl",
+      "sasl_username",
+    ]);
   });
 });
 
@@ -190,6 +206,7 @@ describe("editing an existing account's settings", () => {
       nick: "",
       channels: "#one, #two",
       use_sasl: "true",
+      sasl_username: "",
     });
   });
 

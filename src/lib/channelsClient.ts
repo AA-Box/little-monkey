@@ -221,7 +221,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "irc", label: "IRC", transport: "socket", credentialLabel: "SASL password", credentialOptional: true,
-    whereToGetIt: "The account password registered with the network's services (NickServ). Only needed if you turn SASL on.",
+    whereToGetIt: "The account password registered with the network's services (NickServ). Only needed if you turn SASL on. If the nickname you ask for is already in use, the connection takes the next free one (littlemonkey_, littlemonkey_2, \u2026) and health shows which one it ended up with.",
     docsUrl: "https://ircv3.net/specs/extensions/sasl-3.1",
     configFields: [
       { key: "server", label: "Server", type: "text", required: true, placeholder: "irc.libera.chat" },
@@ -229,11 +229,12 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "nick", label: "Nickname", type: "text", required: true, placeholder: "littlemonkey" },
       { key: "channels", label: "Channels to join", type: "list", placeholder: "#room-one, #room-two" },
       { key: "use_sasl", label: "Log in with SASL", type: "boolean" },
+      { key: "sasl_username", label: "SASL account (optional)", type: "text", placeholder: "littlemonkey", hint: "The account name registered with the network's services, when it differs from the nickname. Leave empty to authenticate as the nickname. If the nickname is taken, the connection takes the next free one \u2014 but always authenticates as this account." },
     ],
   },
   {
     kind: "matrix", label: "Matrix", transport: "long_poll", credentialLabel: "Access token",
-    whereToGetIt: "Your own homeserver account's access token — in Element: Settings → Help & About → Advanced → Access Token. Treat it like a password. Encrypted rooms work: this app appears as the device that token belongs to, and messages sent before it joined stay unreadable until you verify it from another of your clients.",
+    whereToGetIt: "Your own homeserver account's access token \u2014 in Element: Settings \u2192 Help & About \u2192 Advanced \u2192 Access Token. Treat it like a password. Encrypted rooms, encrypted files and threads all work: this app appears as the device that token already belongs to rather than adding a new one, and it keeps that device across restarts. Messages sent before it joined stay unreadable until you verify it from another of your clients. If it ever cannot tell whether a room is encrypted, it refuses to send rather than risk sending in the clear.",
     docsUrl: "https://spec.matrix.org/latest/client-server-api/",
     configFields: [
       { key: "homeserver_url", label: "Homeserver", type: "text", required: true, placeholder: "https://matrix.example.org" },
@@ -242,7 +243,7 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "signal", label: "Signal", transport: "helper", credentialLabel: "None — signal-cli holds the account", credentialOptional: true,
-    whereToGetIt: "Install signal-cli yourself and register or link your own number with it. Little Monkey never bundles, downloads or installs it, and never reads its account store.",
+    whereToGetIt: "Install signal-cli yourself and register or link your own number with it. Little Monkey never bundles, downloads or installs it, and never reads its account store. Health checks that this number is actually registered with the helper, not just that the helper starts.",
     docsUrl: "https://github.com/AsamK/signal-cli#installation",
     configFields: [
       { key: "helper_path", label: "signal-cli path", type: "text", required: true, placeholder: "/usr/local/bin/signal-cli" },
@@ -251,13 +252,11 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
   },
   {
     kind: "imessage", label: "iMessage", transport: "helper", credentialLabel: "None — macOS holds the account", credentialOptional: true, requiresPlatform: "macos",
-    whereToGetIt: "macOS only, using the Mac you are already signed in to Messages on. Two normal macOS permissions are needed: Full Disk Access, so the Messages database can be read, and Automation for Messages, so replies can be sent. Nothing disables SIP, injects into Messages, or asks for your Apple ID password.",
+    whereToGetIt: "macOS only, using the Mac you are already signed in to Messages on. Install little-monkey-imessage-helper and grant it two normal macOS permissions: Full Disk Access, so the Messages database can be read, and Automation for Messages, so replies can be sent. The helper holds both \u2014 Little Monkey itself never opens the Messages database and never sends an Apple event. Nothing disables SIP, injects into Messages, or asks for your Apple ID password.",
     docsUrl: "https://support.apple.com/guide/messages/welcome/mac",
     configFields: [
       { key: "handle", label: "Your iMessage handle", type: "text", required: true, placeholder: "you@example.com" },
-      { key: "helper_path", label: "Helper path (optional)", type: "text", placeholder: "/usr/local/bin/imessage-helper", hint: "Leave empty to use Messages on this Mac directly. Set it only if you run your own helper process." },
-      { key: "db_path", label: "Messages database path (optional)", type: "text", placeholder: "~/Library/Messages/chat.db", hint: "Leave empty to read the signed-in user's own Messages database." },
-      { key: "osascript_path", label: "osascript path (optional)", type: "text", placeholder: "/usr/bin/osascript", hint: "Leave empty to use the system osascript." },
+      { key: "helper_path", label: "Helper path", type: "text", required: true, placeholder: "/usr/local/bin/little-monkey-imessage-helper", hint: "Where you installed the helper. Health reports which permission is still missing if either grant has not been made yet." },
     ],
   },
   { kind: "whatsapp", label: "WhatsApp", transport: "webhook", credentialLabel: "WhatsApp credentials", whereToGetIt: "Meta for Developers → your app → WhatsApp → API Setup for the access token and phone number ID; App settings → Basic for the app secret. The verify token is yours to invent — type the same value here and into Meta's webhook form.", docsUrl: "https://developers.facebook.com/docs/whatsapp/cloud-api", configFields: [{ key: "phone_number_id", label: "Phone number ID", type: "text", required: true }], secretFields: [{ key: "access_token", label: "Access token" }, { key: "app_secret", label: "App secret" }, { key: "verify_token", label: "Verify token (you choose it)" }] },
