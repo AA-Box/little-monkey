@@ -80,7 +80,13 @@ beforeEach(() => {
       completionTokens: 5,
     },
   });
-  runSandboxVerification.mockResolvedValue({ passed: true, detail: "1 command passed" });
+  // The ordinary case: the rebuilt starting state does NOT satisfy the
+  // verification (it is the task), and an arm that does the work does.
+  runSandboxVerification.mockImplementation(async (_path: string, turnId: string) =>
+    turnId.endsWith("-starting-state")
+      ? { passed: false, detail: "1 command failed" }
+      : { passed: true, detail: "1 command passed" },
+  );
 });
 
 describe("runCandidateEvaluation", () => {
@@ -116,6 +122,9 @@ describe("runCandidateEvaluation", () => {
       "candidate-positive",
       "baseline-regression",
       "candidate-regression",
+      // Its own copy, so checking the starting state cannot leave anything
+      // behind in an arm's.
+      "starting-state",
     ]);
     // One call, before the first arm ran: the baseline never hands its
     // mutated files to the candidate.
@@ -154,6 +163,39 @@ describe("runCandidateEvaluation", () => {
     // The baseline has no skill, so it has the profile's own tools — exactly
     // what an ordinary turn has, which is what it is standing in for.
     expect(byArm.get("eval-abc-baseline-positive")).toBeUndefined();
+  });
+
+  it("is unevaluated when the rebuilt starting state already passes verification", async () => {
+    // No checkpoint captures what a shell command did, so a rewind can leave
+    // the procedure's own result behind. Whatever the cause, a starting state
+    // that already verifies is a solved problem, and an arm passing it there
+    // proves nothing.
+    const api = client();
+    runSandboxVerification.mockResolvedValue({ passed: true, detail: "1 command passed" });
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    expect(api.markUnevaluated).toHaveBeenCalledWith(
+      "eval-abc",
+      expect.stringContaining("already passes"),
+    );
+    expect(api.reportEvaluation).not.toHaveBeenCalled();
+    // Checked before any arm burned a model call, and cleaned up after.
+    expect(runHeadlessAgent).not.toHaveBeenCalled();
+    expect(api.destroySandboxes).toHaveBeenCalledWith("eval-abc");
+  });
+
+  it("checks the starting state in its own copy, with the source workspace's config", async () => {
+    const api = client();
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    const [path, turnId, , workspacePath] = runSandboxVerification.mock.calls[0] as [
+      string,
+      string,
+      unknown,
+      string,
+    ];
+    expect(path).toBe("/sandboxes/starting-state");
+    expect(turnId).toBe("eval-abc-starting-state");
+    // Not "whatever workspace is open" — the one the candidate was learned in.
+    expect(workspacePath).toBe("/tmp/workspace");
   });
 
   it("is unevaluated, never a pass, when no reproducible environment exists", async () => {
@@ -213,6 +255,8 @@ describe("runCandidateEvaluation", () => {
     ];
     const regression = reports.find((entry) => entry.case_id === "regression");
     expect(regression?.verification_passed).toBeNull();
-    expect(runSandboxVerification).toHaveBeenCalledTimes(2);
+    // Both positive arms, plus the starting-state check. The regression case
+    // runs none.
+    expect(runSandboxVerification).toHaveBeenCalledTimes(3);
   });
 });

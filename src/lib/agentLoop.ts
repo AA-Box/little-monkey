@@ -926,10 +926,16 @@ export async function runSandboxVerification(
   sandboxPath: string,
   turnId: string,
   signal?: AbortSignal,
+  workspacePath?: string,
 ): Promise<{ passed: boolean; detail: string } | null> {
   let config: VerifyConfig;
   try {
-    config = await invoke<VerifyConfig>('verify_get_config', {});
+    // The commands of the workspace this sandbox is a copy of, which is not
+    // necessarily the one open right now — a candidate learned in A can be
+    // evaluated from B, or with nothing open. `verify_run` independently
+    // derives the same workspace from the sandbox's own marker, so a wrong
+    // value here cannot make it execute another workspace's commands.
+    config = await invoke<VerifyConfig>('verify_get_config', { workspacePath });
   } catch {
     return null;
   }

@@ -1165,6 +1165,15 @@ fn external_effects_of(manifest: &CheckpointManifest) -> Vec<ExternalEffectKind>
     effects
 }
 
+/// Checkpoint `id`'s turn as it stood before it ran — see [`pre_turn_state`].
+pub struct PreTurnState {
+    pub files: Vec<PreTurnFile>,
+    /// The turn ran a shell command. No checkpoint snapshots what a shell did,
+    /// so rewinding to `files` is a partial rewind: anything the shell created
+    /// or changed outside this app's own write/edit tools stays.
+    pub shell_ran: bool,
+}
+
 /// One file as it stood *before* checkpoint `id`'s turn ran.
 pub struct PreTurnFile {
     /// Absolute path of the workspace file the turn mutated.
@@ -1192,11 +1201,11 @@ pub struct PreTurnFile {
 /// Covers the files this app's own write/edit tools mutated. Side effects a
 /// shell command had are not snapshotted by any checkpoint (see
 /// `CheckpointManifest::shell_ran`) and so are not rewound here either.
-pub fn pre_turn_state(base_dir: &Path, id: &str) -> Result<Vec<PreTurnFile>, String> {
+pub fn pre_turn_state(base_dir: &Path, id: &str) -> Result<PreTurnState, String> {
     validate_id(id)?;
     let dir = base_dir.join(id);
     let manifest = read_manifest(base_dir, id)?;
-    manifest
+    let files = manifest
         .entries
         .iter()
         .map(|entry| {
@@ -1214,7 +1223,11 @@ pub fn pre_turn_state(base_dir: &Path, id: &str) -> Result<Vec<PreTurnFile>, Str
                 contents,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PreTurnState {
+        files,
+        shell_ran: manifest.shell_ran,
+    })
 }
 
 /// Parses a raw `manifest.json`, falling back from the versioned v2 struct
@@ -3195,9 +3208,14 @@ mod tests {
         std::fs::write(&created, "brand new").unwrap();
         end_impl(&state, &id).unwrap();
 
-        let files = pre_turn_state(&base.path, &id).unwrap();
+        let state_before = pre_turn_state(&base.path, &id).unwrap();
+        assert!(
+            !state_before.shell_ran,
+            "no shell ran, so this rewind is complete"
+        );
         let before = |path: &Path| {
-            files
+            state_before
+                .files
                 .iter()
                 .find(|file| file.path == path)
                 .map(|file| file.contents.clone())

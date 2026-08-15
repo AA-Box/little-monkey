@@ -68,6 +68,11 @@ function sandboxArm(arm: Arm, testCase: EvaluationCase): string {
   return `${arm}-${testCase.case_id}`;
 }
 
+/** A copy nothing runs in, used only to check that the rebuilt starting state
+ * is actually the task. Its own sandbox so the check cannot leave anything
+ * behind in an arm's. */
+const STARTING_STATE_ARM = "starting-state";
+
 function unevaluatedReport(testCase: EvaluationCase, arm: Arm, error: string): EvaluationCaseReport {
   return {
     case_id: testCase.case_id,
@@ -131,7 +136,9 @@ async function runArm(
   // is reported as absent rather than invented.
   const verification =
     testCase.kind === "positive" && result.outcome === "completed"
-      ? await runSandboxVerification(sandboxPath, runId, signal).catch(() => null)
+      ? await runSandboxVerification(sandboxPath, runId, signal, plan.workspace_path ?? undefined).catch(
+          () => null,
+        )
       : null;
   return {
     case_id: testCase.case_id,
@@ -173,7 +180,13 @@ export async function runCandidateEvaluation(
   }
   // Every arm of every case is copied from the same starting state, before any
   // of them runs — the baseline never hands its mutated files to the candidate.
-  const arms = plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase)));
+  const selfChecking = plan.cases.find(
+    (testCase) => testCase.kind === "positive" && testCase.verification_required,
+  );
+  const arms = [
+    ...plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase))),
+    ...(selfChecking ? [STARTING_STATE_ARM] : []),
+  ];
   let sandboxes: Awaited<ReturnType<typeof client.createSandboxes>>;
   try {
     sandboxes = await client.createSandboxes(plan.evaluation_id, arms);
@@ -184,6 +197,28 @@ export async function runCandidateEvaluation(
 
   const reports: EvaluationCaseReport[] = [];
   try {
+    // The rewind puts back every file this app's write and edit tools changed,
+    // but no checkpoint captures what a shell command did. If the rebuilt
+    // starting state already satisfies the verification, the positive case is
+    // a solved problem and an arm "passing" it proves nothing — whatever the
+    // reason the state survived.
+    if (selfChecking) {
+      const startingState = pathFor.get(STARTING_STATE_ARM);
+      const already = startingState
+        ? await runSandboxVerification(
+            startingState,
+            `${plan.evaluation_id}-starting-state`,
+            signal,
+            plan.workspace_path ?? undefined,
+          ).catch(() => null)
+        : null;
+      if (already?.passed) {
+        return await client.markUnevaluated(
+          plan.evaluation_id,
+          "the rebuilt starting state already passes this workspace's verification, so reproducing the observed task there would prove nothing",
+        );
+      }
+    }
     for (const testCase of plan.cases) {
       for (const arm of ARMS) {
         const sandboxPath = pathFor.get(sandboxArm(arm, testCase));

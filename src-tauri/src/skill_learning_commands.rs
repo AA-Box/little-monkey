@@ -270,11 +270,28 @@ pub async fn skill_learning_create_sandboxes(
             )
         })?;
         let pre_task = match &environment.checkpoint_id {
-            Some(checkpoint_id) => crate::checkpoints::pre_turn_state(&checkpoints_dir, checkpoint_id)
-                .map_err(invalid)?
-                .into_iter()
-                .map(|file| PreTaskFile { path: file.path, contents: file.contents })
-                .collect::<Vec<_>>(),
+            Some(checkpoint_id) => {
+                let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, checkpoint_id)
+                    .map_err(invalid)?;
+                // A shell command's side effects are snapshotted by no
+                // checkpoint, so the rewind is partial and the copy may still
+                // hold what the procedure produced. When the observed run ended
+                // verified, the evaluator catches that by verifying the rewound
+                // sandbox before any arm runs. When it did not, nothing can
+                // tell a reproduced task from a leftover one, and a promotion
+                // -grade pass cannot honestly come out of it.
+                if state.shell_ran && !environment.self_checking {
+                    return Err(invalid(
+                        "the observed run used the shell, whose effects no checkpoint captures, and ended with no verification to check the rebuilt starting state against — so a reproducible evaluation environment cannot be confirmed"
+                            .to_string(),
+                    ));
+                }
+                state
+                    .files
+                    .into_iter()
+                    .map(|file| PreTaskFile { path: file.path, contents: file.contents })
+                    .collect::<Vec<_>>()
+            }
             None if environment.requires_pre_task_state => {
                 return Err(invalid(
                     "the observed run changed files but its checkpoint is no longer available, so the task it solved cannot be put back for evaluation"

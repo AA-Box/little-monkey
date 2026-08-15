@@ -503,6 +503,11 @@ pub struct EvaluationEnvironment {
     /// reproducing an already-solved task. A caller that cannot rewind must
     /// refuse to build the environment rather than evaluate against the answer.
     pub requires_pre_task_state: bool,
+    /// The observed run ended on a passing verification, so the evaluation can
+    /// check its own starting state: if the rewound sandbox already satisfies
+    /// that verification, nothing an arm does there proves anything. Without
+    /// it there is no such check, and a partial rewind cannot be caught.
+    pub self_checking: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1411,6 +1416,7 @@ impl SkillLearningStore {
             // from the answer.
             requires_pre_task_state: evidence
                 .is_some_and(|evidence| !evidence.changed_files.is_empty()),
+            self_checking: evidence.and_then(RunEvidence::final_verification) == Some(true),
         })
     }
 
@@ -2733,6 +2739,15 @@ impl SkillLearningStore {
         remove_tree(&self.root.join(EVAL_DIR).join(evaluation_id))
     }
 
+    /// Which folder a workspace-scoped candidate belongs to.
+    ///
+    /// The workspace recorded on the candidate wins over whatever happens to
+    /// be open. A candidate learned in A and acted on days later from B would
+    /// otherwise deduplicate against B's skills and install itself into B —
+    /// the currently-open folder must never redirect an existing candidate.
+    /// A mismatch is refused rather than silently redirected, so the user is
+    /// told which folder to open instead of watching a skill appear in one
+    /// they did not learn it in.
     fn workspace_for(
         &self,
         candidate: &LearningCandidate,
@@ -2740,18 +2755,24 @@ impl SkillLearningStore {
     ) -> Result<Option<PathBuf>, SkillError> {
         match candidate.scope {
             SkillScope::Global => Ok(None),
-            SkillScope::Workspace => {
-                let path = supplied
-                    .map(Path::to_path_buf)
-                    .or_else(|| candidate.workspace_path.clone().map(PathBuf::from))
-                    .ok_or_else(|| {
-                        SkillError::Invalid(
-                            "a workspace-scoped candidate needs an open workspace folder"
-                                .to_string(),
-                        )
-                    })?;
-                Ok(Some(path))
-            }
+            SkillScope::Workspace => match (&candidate.workspace_path, supplied) {
+                (Some(recorded), supplied) => {
+                    let recorded = PathBuf::from(recorded);
+                    if let Some(supplied) = supplied {
+                        if !same_folder(&recorded, supplied) {
+                            return Err(SkillError::Conflict(format!(
+                                "this candidate was learned in {} and can only be acted on there; that folder is not the one currently open",
+                                recorded.display()
+                            )));
+                        }
+                    }
+                    Ok(Some(recorded))
+                }
+                (None, Some(supplied)) => Ok(Some(supplied.to_path_buf())),
+                (None, None) => Err(SkillError::Invalid(
+                    "a workspace-scoped candidate needs an open workspace folder".to_string(),
+                )),
+            },
         }
     }
 
@@ -3764,6 +3785,18 @@ struct CopyBudget {
     bytes: u64,
 }
 
+/// Whether two paths name the same folder. Canonicalized when both exist, so
+/// a symlink, a trailing slash or a relative spelling of the same directory
+/// still matches; a path that cannot be canonicalized (deleted, unmounted)
+/// falls back to comparing what was recorded, which is the honest answer
+/// available.
+fn same_folder(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// One file as it stood before the observed procedure ran — the learning
 /// module's own view of `checkpoints::PreTurnFile`, so this module keeps
 /// depending on nothing but paths and bytes.
@@ -3902,6 +3935,20 @@ pub fn require_eval_sandbox(data_root: &Path, path: &str) -> Result<PathBuf, Str
         return Err(format!("'{path}' is not a managed evaluation sandbox."));
     }
     Ok(canon)
+}
+
+/// The workspace a verified evaluation sandbox is a copy of, read from the
+/// marker this module wrote when it created the sandbox.
+///
+/// The configuration an arm is verified with has to come from the workspace
+/// the candidate was learned in — not from whichever folder happens to be
+/// open in the window. Pass a path [`require_eval_sandbox`] already accepted;
+/// this only reads the marker inside it.
+pub fn eval_sandbox_source(sandbox: &Path) -> Option<PathBuf> {
+    let raw = fs::read(sandbox.join(SANDBOX_MARKER)).ok()?;
+    let marker: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let source = marker.get("source")?.as_str()?;
+    (!source.is_empty()).then(|| PathBuf::from(source))
 }
 
 /// The digest an approval binds to: everything the user is shown before they
@@ -6243,6 +6290,111 @@ mod tests {
         // The observed run changed files, so an arm that is not rewound would
         // start from the answer — the caller must refuse instead.
         assert!(environment.requires_pre_task_state);
+        // It ended verified, so the evaluator can check its own starting state
+        // and catch a rewind that a shell command left incomplete.
+        assert!(environment.self_checking);
+    }
+
+    /// A candidate belongs to the folder it was learned in. Acting on it from
+    /// a different one must not deduplicate against that folder's skills or
+    /// install into it.
+    #[test]
+    fn the_open_workspace_never_redirects_a_candidate_to_another_folder() {
+        let directory = TestDirectory::new("workspace-authority");
+        let learned_in = TestDirectory::new("workspace-a");
+        let opened_now = TestDirectory::new("workspace-b");
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let detected = store
+            .detect(
+                &evidence_from_events("run-1", "add retries", &verified_procedure_events()),
+                SkillScope::Workspace,
+                Some(learned_in.path()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut scoped = proposal("retry-wrapper", "Wrap the call.");
+        scoped.scope = SkillScope::Workspace;
+
+        // Workspace B is open. The candidate is A's, and staging it against B
+        // is refused rather than quietly retargeted.
+        let wrong = store.propose(
+            &detected.candidate_id,
+            None,
+            &scoped,
+            &manager,
+            Some(opened_now.path()),
+            &[],
+        );
+        assert!(
+            matches!(&wrong, Err(SkillError::Conflict(message)) if message.contains(&learned_in.path().display().to_string())),
+            "{wrong:?}"
+        );
+
+        // A's own folder works, and so does asking with nothing open — the
+        // candidate already knows where it belongs.
+        store
+            .propose(&detected.candidate_id, None, &scoped, &manager, None, &[])
+            .unwrap();
+        pass_evaluation(&store, &detected.candidate_id);
+        let refused = store.promote(
+            &detected.candidate_id,
+            Some(&approve(&store, &detected.candidate_id)),
+            false,
+            &manager,
+            Some(opened_now.path()),
+        );
+        assert!(
+            matches!(refused, Err(SkillError::Conflict(_))),
+            "{refused:?}"
+        );
+        let outcome = store
+            .promote(
+                &detected.candidate_id,
+                Some(&approve(&store, &detected.candidate_id)),
+                false,
+                &manager,
+                Some(learned_in.path()),
+            )
+            .unwrap();
+        assert!(matches!(outcome, PromotionOutcome::Promoted { .. }));
+        // Installed into A, and B never gained a skill it did not learn.
+        assert!(manager
+            .discover(Some(learned_in.path()), &[])
+            .unwrap()
+            .iter()
+            .any(|entry| entry.command == "retry-wrapper"));
+        assert!(!manager
+            .discover(Some(opened_now.path()), &[])
+            .unwrap()
+            .iter()
+            .any(|entry| entry.command == "retry-wrapper"));
+    }
+
+    /// Every sandbox records which workspace it is a copy of, so the
+    /// verification an arm runs is configured by the workspace the candidate
+    /// was learned in — not by whichever folder is open, or none at all.
+    #[test]
+    fn a_sandbox_names_the_workspace_its_verification_must_come_from() {
+        let directory = TestDirectory::new("sandbox-source");
+        let work = TestDirectory::new("sandbox-source-workspace");
+        let store = store(&directory);
+        seed_workspace(work.path());
+        let sandboxes = store
+            .create_eval_sandboxes(
+                "eval-source",
+                work.path(),
+                &["candidate-positive".to_string()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            eval_sandbox_source(&sandboxes[0].1),
+            Some(work.path().to_path_buf())
+        );
+        // A directory that is not a sandbox has no source to speak for it.
+        assert_eq!(eval_sandbox_source(work.path()), None);
+        store.destroy_eval_sandboxes("eval-source").unwrap();
     }
 
     #[test]
@@ -6750,6 +6902,7 @@ mod tests {
     fn pre_task_of(checkpoints_dir: &Path, checkpoint_id: &str) -> Vec<PreTaskFile> {
         crate::checkpoints::pre_turn_state(checkpoints_dir, checkpoint_id)
             .unwrap()
+            .files
             .into_iter()
             .map(|file| PreTaskFile {
                 path: file.path,
