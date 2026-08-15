@@ -2950,11 +2950,24 @@ mod tests {
         #[test]
         fn a_captured_child_that_reparents_stays_owned() {
             let pid_file = scratch("reparent.pid");
-            // The subshell exits immediately, so `sleep` is re-parented while the
-            // outer shell — the workload's root — keeps running.
+            let flag = scratch("reparent.go");
+            // The subshell reports the pid and then *waits* before exiting, so
+            // "captured, then re-parented" is the sequence under test rather than
+            // a race with the supervisor's first sample.
+            //
+            // Ordering matters more here than anywhere else in this module, and
+            // the backend is why. On a supervised host the root leads a process
+            // group, so the group union catches the grandchild whenever it is
+            // sampled; under a cgroup no group is installed at all — the cgroup
+            // *is* the containment — so the only thing that captures the
+            // grandchild is the parent link, and that is readable only while the
+            // subshell is alive. Without this wait the test passed on macOS and
+            // failed on the Linux cgroup leg, for the opposite reason to the one
+            // it exists to check.
             let (mut controller, mut root) = supervised(&format!(
-                "( sleep 60 & echo $! > {} ) ; sleep 60",
-                pid_file.display()
+                "( sleep 60 & echo $! > {}; while [ ! -e {} ]; do sleep 0.05; done ) ; sleep 60",
+                pid_file.display(),
+                flag.display()
             ));
 
             let escapee = wait_for_pid(&pid_file);
@@ -2964,6 +2977,10 @@ mod tests {
                 .expect("it is running");
             assert!(owns(&controller, escapee), "the child was never captured");
 
+            // Only now is the subshell allowed to exit, which is what re-parents
+            // the grandchild and destroys the ancestry a later snapshot could
+            // have walked.
+            std::fs::write(&flag, "go").expect("the flag is written");
             wait_until(
                 || {
                     crate::process_tree::snapshot()
@@ -2993,6 +3010,7 @@ mod tests {
             let _ = root.kill();
             let _ = root.wait();
             let _ = std::fs::remove_file(&pid_file);
+            let _ = std::fs::remove_file(&flag);
         }
 
         /// Both escapes at once, after capture: no group, no session, no parent.
