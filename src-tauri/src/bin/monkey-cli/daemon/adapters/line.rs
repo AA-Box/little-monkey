@@ -7,8 +7,28 @@
 //! `provider_event_id` dedupe (`webhookEventId`, or the message id as a
 //! fallback for older payloads that predate it).
 //!
-//! Outbound is the Messaging API's push endpoint with a long-lived channel
-//! access token.
+//! # Outbound, and why the reply token is not used at all
+//!
+//! LINE offers two send paths. The reply endpoint answers a specific inbound
+//! event using the `replyToken` that event carried; it is free of the push
+//! quota, but the token is **single use, short lived, and scoped to one
+//! event**. The push endpoint addresses the conversation itself and always
+//! works.
+//!
+//! Nothing here uses the reply token. Every answer this adapter sends is a run
+//! that was queued after the delivery was acknowledged, ran for however long it
+//! ran, and may well have outlived the process that received the message — so
+//! the token would be dead by the time there is anything to say, and a token
+//! stored per conversation would be overwritten anyway by the next of several
+//! events arriving in the same delivery. Keying it per event to fix that would
+//! buy a saved push at the cost of durable state that is only ever valid for
+//! seconds and is a credential to answer as this bot.
+//!
+//! So the token is never stored, never durable, and never consulted:
+//! [`ChannelAdapter::send`] always POSTs `/v2/bot/message/push` to the
+//! normalized destination, with `X-Line-Retry-Key` derived from the outbox
+//! row's own idempotency key so a retried row can never become two messages.
+//! Restart recovery therefore depends on nothing that expires.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -22,7 +42,8 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
 use crate::daemon::channel_adapter::{
-    AdapterConfig, ChannelAdapter, InboundBatch, WebhookChannelAdapter,
+    AdapterConfig, ChannelAdapter, InboundBatch, VerifiedWebhookDelivery, WebhookAck,
+    WebhookChannelAdapter,
 };
 
 const LINE_API_BASE: &str = "https://api.line.me";
@@ -75,7 +96,7 @@ impl LineAdapter {
     }
 
     #[cfg(test)]
-    fn with_base_url(mut self, base: &str) -> Self {
+    pub(crate) fn with_base_url(mut self, base: &str) -> Self {
         self.api_base = base.to_string();
         self
     }
@@ -86,13 +107,20 @@ impl WebhookChannelAdapter for LineAdapter {
         ChannelKind::Line
     }
 
+    /// LINE's own requirement, and the one its console's Verify button checks:
+    /// status 200. It reads nothing else, including on a redelivery of an event
+    /// this daemon already has.
+    fn ack(&self) -> WebhookAck {
+        WebhookAck::empty_ok()
+    }
+
     fn verify_and_normalize(
         &self,
         headers: &[(String, String)],
         body: &[u8],
         _public_base_url: Option<&str>,
         now_ms: i64,
-    ) -> Result<Vec<ChannelEnvelope>, String> {
+    ) -> Result<VerifiedWebhookDelivery, String> {
         // LINE's signature covers only the body, same as WhatsApp's — see the
         // module doc for why there is no timestamp skew check here, and why
         // `public_base_url` is unused (it is only for providers whose
@@ -107,7 +135,16 @@ impl WebhookChannelAdapter for LineAdapter {
 
         let payload: JsonValue = serde_json::from_slice(body)
             .map_err(|error| format!("LINE webhook body is not valid JSON: {error}"))?;
-        Ok(normalize_payload(&payload, &self.account_id, now_ms))
+        // Nothing is written here. A LINE delivery carries one reply token per
+        // event and this adapter answers with push, so there is no per-event
+        // state to keep and nothing a second event in the same delivery could
+        // overwrite — see the module doc, and nothing durable to address a
+        // push with beyond the destination the envelope already carries.
+        Ok(VerifiedWebhookDelivery::messages_only(normalize_payload(
+            &payload,
+            &self.account_id,
+            now_ms,
+        )))
     }
 }
 
@@ -122,8 +159,13 @@ impl ChannelAdapter for LineAdapter {
             max_text_chars: MAX_TEXT_CHARS,
             supports_threads: false,
             supports_attachments: false,
-            supports_mention_metadata: false,
-            supports_idempotency_key: false,
+            // LINE puts mentions on the message rather than in the text, and
+            // `normalize_event` reads them — so mention-only group activation
+            // means something here.
+            supports_mention_metadata: true,
+            // `X-Line-Retry-Key` on the push endpoint, which is the path any
+            // retried send takes.
+            supports_idempotency_key: true,
             supports_delivery_receipts: false,
             ..ProviderCapabilities::minimal(ChannelKind::Line, InboundTransport::Webhook)
         }
@@ -170,14 +212,19 @@ impl ChannelAdapter for LineAdapter {
             .iter()
             .map(|chunk| serde_json::json!({ "type": "text", "text": chunk }))
             .collect();
-        let url = format!("{}/v2/bot/message/push", self.api_base);
+        // Always push, to the normalized destination — see the module doc for
+        // why no reply token is consulted, stored or hoped for.
         let body = serde_json::json!({
             "to": message.conversation_id,
             "messages": messages,
         });
+        // LINE's own idempotency: a push carrying a retry key it has already
+        // accepted is refused as a duplicate rather than delivered twice, which
+        // is what makes the outbox safe to retry.
         let request = client
-            .post(url)
+            .post(format!("{}/v2/bot/message/push", self.api_base))
             .bearer_auth(&self.channel_access_token)
+            .header(RETRY_KEY_HEADER, retry_key(&message.idempotency_key))
             .json(&body);
         let response = match little_monkey_lib::egress::send(request).await {
             Ok(response) => response,
@@ -195,20 +242,31 @@ impl ChannelAdapter for LineAdapter {
             Err(error) => return map_transport_error(&error),
         };
 
+        let parsed: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+
         if status.is_success() {
-            // The push API returns no message id in its 200 response body.
             return SendOutcome::Sent {
-                provider_message_id: None,
+                provider_message_id: sent_message_id(&parsed),
             };
         }
 
-        let parsed: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
         let error_message = parsed
             .get("message")
             .and_then(JsonValue::as_str)
             .unwrap_or("LINE send failed")
             .to_string();
 
+        // The retry key did its job: LINE has already accepted this exact
+        // outbox row and refuses to deliver it a second time. That is a
+        // delivered message, not a failure — treating it as one would either
+        // retry forever or park a row the recipient can already read. Some
+        // responses repeat what was originally sent, and where they do the
+        // real id is kept rather than thrown away for a `None`.
+        if status.as_u16() == 409 {
+            return SendOutcome::Sent {
+                provider_message_id: sent_message_id(&parsed),
+            };
+        }
         if status.as_u16() == 429 {
             return SendOutcome::RetryableFailure {
                 error: error_message,
@@ -259,6 +317,50 @@ impl ChannelAdapter for LineAdapter {
 
 /// Verifies the base64 HMAC-SHA256 in `X-Line-Signature` with a
 /// constant-time comparison (`ring::hmac::verify` is constant-time).
+/// LINE's own idempotency header for the push endpoints.
+const RETRY_KEY_HEADER: &str = "X-Line-Retry-Key";
+
+/// What LINE named as sent, if it named anything.
+///
+/// Newer Messaging API versions list what they delivered; older ones answer
+/// `{}`, and there is nothing to invent when they do. Read the same way on a
+/// success and on the `409` that says this exact retry key was already
+/// accepted, because both describe a message the recipient can read.
+fn sent_message_id(parsed: &JsonValue) -> Option<String> {
+    parsed
+        .get("sentMessages")
+        .and_then(JsonValue::as_array)
+        .and_then(|sent| sent.first())
+        .and_then(|first| first.get("id"))
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+}
+
+/// The outbox's idempotency key, in the UUID shape LINE requires.
+///
+/// The key itself is an internal id of no fixed format, and LINE rejects a
+/// retry key that is not a UUID. Derived by digest rather than randomly so the
+/// same queued row produces the same key on every attempt — a fresh one each
+/// time would be an idempotency key that idempotates nothing.
+fn retry_key(idempotency_key: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, idempotency_key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_ref()[..16]);
+    // Version 4 and the RFC 4122 variant, so the value parses as a UUID
+    // wherever LINE checks it.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 fn verify_line_signature(secret: &str, body: &[u8], header_value: &str) -> Result<(), ()> {
     if header_value.is_empty() {
         return Err(());
@@ -440,13 +542,58 @@ fn normalize_event(
         .unwrap_or(fallback_received_at_ms);
 
     let mut metadata = BoundedMetadata::new();
-    // The reply token expires and is never part of the model's text — only
-    // the outbound path may read it back out of metadata.
-    if let Some(reply_token) = event.get("replyToken").and_then(JsonValue::as_str) {
-        metadata.insert("line_reply_token", reply_token);
-    }
+    // `replyToken` is deliberately dropped rather than carried: nothing sends
+    // with it, and a short-lived credential to answer as this bot has no
+    // business in an envelope that is written to disk and shown to an operator.
     if !message_type.is_empty() {
         metadata.insert("line_message_type", message_type);
+    }
+    // LINE marks a redelivered event rather than hiding it. Dedupe on
+    // `webhookEventId` is what actually stops a second run; recording the flag
+    // is so an operator reading the activity list can tell a provider retry
+    // from a person sending the same thing twice.
+    if event
+        .get("deliveryContext")
+        .and_then(|context| context.get("isRedelivery"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false)
+    {
+        metadata.insert("line_redelivery", "true");
+    }
+
+    // Whether the bot itself was named. Group activation can be set to
+    // mention-only, and without this every LINE group message would look
+    // unaddressed and be ignored — LINE puts mentions on the message rather
+    // than marking the text.
+    let mentionees = message
+        .get("mention")
+        .and_then(|mention| mention.get("mentionees"))
+        .and_then(JsonValue::as_array);
+    let mentions_self = mentionees.is_some_and(|mentionees| {
+        mentionees.iter().any(|mentionee| {
+            // `type: "all"` is an @all, which addresses the bot as much as
+            // anyone.
+            if matches!(
+                mentionee.get("type").and_then(JsonValue::as_str),
+                Some("all")
+            ) {
+                return true;
+            }
+            // `isSelf` is the only thing LINE says about whether a mention is
+            // this bot's own, so it is the only thing read. Absent means LINE
+            // did not say — which is not the same as "yes", and inferring one
+            // from a missing `userId` was wrong twice over: a member whose
+            // profile this bot may not read also has no `userId`, and that
+            // guess woke the agent on every such mention in a group set to
+            // mention-only.
+            mentionee
+                .get("isSelf")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false)
+        })
+    });
+    if let Some(count) = mentionees.map(Vec::len).filter(|count| *count > 0) {
+        metadata.insert("line_mentions", count.to_string());
     }
 
     Some(ChannelEnvelope {
@@ -457,15 +604,22 @@ fn normalize_event(
         sender: ChannelSender::new(sender_id),
         text,
         attachments,
-        reply_to_provider_id: None,
-        mentions_self: false,
+        // LINE marks a quoted message with the id of the message being quoted,
+        // which is the same fact every other provider calls a reply. Without
+        // this a LINE reply looked unrelated to what it answered, and the
+        // reply-depth chain that bounds automated loops saw nothing at all.
+        reply_to_provider_id: message
+            .get("quotedMessageId")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string),
+        mentions_self,
         received_at_ms,
         metadata,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     #[test]
     fn a_photo_message_becomes_an_attachment_rather_than_an_empty_turn() {
@@ -492,7 +646,7 @@ mod tests {
     use little_monkey_lib::channels::types::{ConversationKind, HealthState};
     use std::io::{Read, Write};
 
-    fn test_account() -> ChannelAccountRecord {
+    pub(crate) fn test_account() -> ChannelAccountRecord {
         ChannelAccountRecord {
             account_id: "acct-line".to_string(),
             kind: ChannelKind::Line,
@@ -576,14 +730,16 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].provider_event_id, "evt-1");
         assert_eq!(envelopes[0].text, "hello");
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Direct);
         assert_eq!(
             envelopes[0].metadata.get("line_reply_token"),
-            Some("reply-token-1")
+            None,
+            "a reply token is not carried anywhere: nothing sends with one"
         );
     }
 
@@ -641,6 +797,47 @@ mod tests {
 
     // --- Normalization -------------------------------------------------------
 
+    /// Every media type LINE delivers by message id, and the two grouped
+    /// sources. A type that normalized to empty text with no attachment used
+    /// to be dropped by the access gate as a message with no content at all.
+    #[test]
+    fn every_media_type_and_grouped_source_normalizes() {
+        for (message_type, expected) in [
+            ("image", AttachmentKind::Image),
+            ("video", AttachmentKind::Video),
+            ("audio", AttachmentKind::Audio),
+            ("file", AttachmentKind::Document),
+        ] {
+            let event = serde_json::json!({
+                "type": "message",
+                "message": {"id": "466273", "type": message_type, "fileName": "notes.pdf"},
+                "timestamp": 1_700_000_000_000i64,
+                "source": {"type": "user", "userId": "U1"},
+            });
+            let envelope = normalize_event(&event, "acct-1", 0)
+                .unwrap_or_else(|| panic!("{message_type} normalizes"));
+            assert_eq!(envelope.attachments.len(), 1, "{message_type}");
+            assert_eq!(envelope.attachments[0].kind, expected, "{message_type}");
+            assert_eq!(
+                envelope.metadata.get("line_message_type"),
+                Some(message_type)
+            );
+        }
+
+        // A room is LINE's other multi-person source, and it addresses the
+        // room rather than whoever spoke.
+        let room = serde_json::json!({
+            "type": "message",
+            "message": {"id": "m9", "type": "text", "text": "hi room"},
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "room", "roomId": "R1", "userId": "U9"},
+        });
+        let envelope = normalize_event(&room, "acct-1", 0).expect("a room normalizes");
+        assert_eq!(envelope.conversation.kind, ConversationKind::Group);
+        assert_eq!(envelope.conversation.conversation_id, "R1");
+        assert_eq!(envelope.sender.sender_id, "U9");
+    }
+
     #[test]
     fn a_group_source_normalizes_to_a_group_conversation() {
         let adapter = adapter("channel-secret-value", "token-value");
@@ -661,7 +858,8 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes[0].conversation.kind, ConversationKind::Group);
         assert_eq!(envelopes[0].conversation.conversation_id, "G1");
         assert_eq!(envelopes[0].sender.sender_id, "U9");
@@ -679,7 +877,8 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert!(envelopes.is_empty());
     }
 
@@ -703,12 +902,13 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
+            .expect("verifies")
+            .envelopes;
         assert_eq!(envelopes[0].provider_event_id, "msg-only-3");
     }
 
     #[test]
-    fn the_reply_token_never_reaches_the_normalized_text() {
+    fn the_reply_token_reaches_nothing_at_all() {
         let adapter = adapter("channel-secret-value", "token-value");
         let body = user_message_body();
         let signature = sign("channel-secret-value", &body);
@@ -719,8 +919,14 @@ mod tests {
                 None,
                 0,
             )
-            .expect("verifies");
-        assert!(!envelopes[0].text.contains("reply-token-1"));
+            .expect("verifies")
+            .envelopes;
+        // Not the text, not the metadata, not the durable envelope: the
+        // token is dropped at normalization and nothing downstream can find
+        // one to use, refresh or leak.
+        assert!(!serde_json::to_string(&envelopes[0])
+            .unwrap()
+            .contains("reply-token-1"));
     }
 
     // --- No secret leakage ----------------------------------------------------
@@ -828,5 +1034,386 @@ mod tests {
             .send(&outbound_message())
             .await;
         assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_provider_named_message_id_is_carried_back() {
+        let base = serve_once(
+            "200 OK",
+            r#"{"sentMessages":[{"id":"461230966842064897"}]}"#,
+        );
+        let outcome = adapter("s", "t")
+            .with_base_url(&base)
+            .send(&outbound_message())
+            .await;
+        match outcome {
+            SendOutcome::Sent {
+                provider_message_id,
+            } => assert_eq!(provider_message_id.as_deref(), Some("461230966842064897")),
+            other => panic!("expected Sent, got {other:?}"),
+        }
+    }
+
+    // --- Reply token lifetime ---------------------------------------------
+
+    /// The body of the one request the fixture received.
+    fn sent_body(request: &[u8]) -> JsonValue {
+        let text = String::from_utf8_lossy(request);
+        let (_, body) = text.split_once("\r\n\r\n").expect("a request with a body");
+        serde_json::from_str(body).expect("the request body is JSON")
+    }
+
+    fn text_event(reply_token: &str) -> String {
+        serde_json::json!({
+            "destination": "Ubot",
+            "events": [{
+                "type": "message",
+                "webhookEventId": "01HELLO",
+                "replyToken": reply_token,
+                "timestamp": 1_700_000_000_000i64,
+                "source": {"type": "user", "userId": "U1"},
+                "message": {"id": "m1", "type": "text", "text": "hello"}
+            }]
+        })
+        .to_string()
+    }
+
+    /// Verify one signed delivery through the production path, so the reply
+    /// token is recorded exactly as a real webhook would record it.
+    fn deliver(adapter: &LineAdapter, body: &str, now_ms: i64) {
+        let signature = sign("s", body.as_bytes());
+        adapter
+            .verify_and_normalize(
+                &[("x-line-signature".to_string(), signature)],
+                body.as_bytes(),
+                None,
+                now_ms,
+            )
+            .expect("a correctly signed delivery verifies");
+    }
+
+    #[tokio::test]
+    async fn every_send_is_a_push_carrying_a_retry_key() {
+        let (base, requests) =
+            crate::daemon::channel_adapter::test_http::serve(vec![(200, "{}".to_string())]);
+        let adapter = adapter("s", "t").with_base_url(&base);
+        // A delivery carrying a perfectly fresh reply token, moments ago.
+        deliver(&adapter, &text_event("reply-token-1"), now_ms());
+
+        let outcome = adapter.send(&outbound_message()).await;
+        assert!(matches!(outcome, SendOutcome::Sent { .. }), "{outcome:?}");
+
+        let request = requests.recv().expect("the fixture saw a request");
+        let text = String::from_utf8_lossy(&request);
+        assert!(
+            text.starts_with("POST /v2/bot/message/push"),
+            "an answer must not depend on a token that expires: {text}"
+        );
+        assert!(
+            !text.contains("reply-token-1"),
+            "a reply token must never leave this process: {text}"
+        );
+        assert!(
+            text.to_ascii_lowercase().contains("x-line-retry-key:"),
+            "a push must carry the retry key that makes it idempotent: {text}"
+        );
+        assert_eq!(
+            sent_body(&request).get("to").and_then(JsonValue::as_str),
+            Some("U1"),
+            "the normalized destination, not an event-scoped token"
+        );
+    }
+
+    #[test]
+    fn a_retry_key_is_a_uuid_and_is_the_same_one_on_every_attempt() {
+        let key = retry_key("outbox-row-7");
+        assert_eq!(
+            key,
+            retry_key("outbox-row-7"),
+            "a key that changed per attempt would deduplicate nothing"
+        );
+        assert_ne!(key, retry_key("outbox-row-8"));
+        // LINE refuses a retry key that is not a UUID.
+        let groups: Vec<usize> = key.split('-').map(str::len).collect();
+        assert_eq!(groups, vec![8, 4, 4, 4, 12], "{key}");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert_eq!(key.as_bytes()[14], b'4', "version 4: {key}");
+        assert!(
+            matches!(key.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+            "{key}"
+        );
+    }
+
+    /// A redelivery is where a per-conversation reply token used to be
+    /// refreshed by the local clock and look usable long after LINE retired
+    /// it. Nothing stores one now, so there is nothing to refresh — and the
+    /// send is the same push either way.
+    #[tokio::test]
+    async fn a_redelivered_event_leaves_nothing_that_could_look_fresh() {
+        let (base, requests) = crate::daemon::channel_adapter::test_http::serve(vec![
+            (200, "{}".to_string()),
+            (200, "{}".to_string()),
+        ]);
+        let adapter = adapter("s", "t").with_base_url(&base);
+        // The same event delivered twice, ten minutes apart, exactly as LINE
+        // redelivers one it never got a 200 for.
+        deliver(&adapter, &text_event("reply-token-1"), now_ms());
+        deliver(&adapter, &text_event("reply-token-1"), now_ms() + 600_000);
+
+        adapter.send(&outbound_message()).await;
+        adapter.send(&outbound_message()).await;
+
+        for _ in 0..2 {
+            let request = requests.recv().expect("a request");
+            let text = String::from_utf8_lossy(&request);
+            assert!(
+                text.starts_with("POST /v2/bot/message/push"),
+                "a redelivery must not resurrect a reply path: {text}"
+            );
+            assert!(!text.contains("reply-token-1"), "{text}");
+        }
+    }
+
+    /// Several events in one delivery, from the same conversation. The old
+    /// per-conversation token would have had the second overwrite the first;
+    /// there is no per-event state left to lose, and both normalize whole.
+    #[test]
+    fn two_events_from_one_conversation_in_one_delivery_both_survive() {
+        let body = serde_json::json!({
+            "destination": "Ubot",
+            "events": [
+                {
+                    "type": "message",
+                    "webhookEventId": "01FIRST",
+                    "replyToken": "token-first",
+                    "timestamp": 1_700_000_000_000i64,
+                    "source": {"type": "user", "userId": "U1"},
+                    "message": {"id": "m1", "type": "text", "text": "first"}
+                },
+                {
+                    "type": "message",
+                    "webhookEventId": "01SECOND",
+                    "replyToken": "token-second",
+                    "timestamp": 1_700_000_000_500i64,
+                    "source": {"type": "user", "userId": "U1"},
+                    "message": {"id": "m2", "type": "text", "text": "second"}
+                }
+            ]
+        })
+        .to_string();
+        let adapter = adapter("s", "t");
+        let envelopes = adapter
+            .verify_and_normalize(
+                &[("x-line-signature".to_string(), sign("s", body.as_bytes()))],
+                body.as_bytes(),
+                None,
+                now_ms(),
+            )
+            .expect("verifies")
+            .envelopes;
+
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(envelopes[0].provider_event_id, "01FIRST");
+        assert_eq!(envelopes[1].provider_event_id, "01SECOND");
+        assert_eq!(envelopes[0].text, "first");
+        assert_eq!(envelopes[1].text, "second");
+        for envelope in &envelopes {
+            assert!(
+                serde_json::to_string(envelope)
+                    .unwrap()
+                    .find("token-")
+                    .is_none(),
+                "a reply token reached the durable envelope: {envelope:?}"
+            );
+        }
+    }
+
+    /// LINE's own answer to a push whose retry key it has already accepted.
+    /// The message is with the recipient; treating the refusal as a failure
+    /// would either retry forever or park a row that was delivered.
+    #[tokio::test]
+    async fn a_duplicate_retry_key_response_counts_as_delivered() {
+        let base = serve_once(
+            "409 Conflict",
+            r#"{"message":"The retry key is already accepted"}"#,
+        );
+        let outcome = adapter("s", "t")
+            .with_base_url(&base)
+            .send(&outbound_message())
+            .await;
+        match outcome {
+            SendOutcome::Sent {
+                provider_message_id,
+            } => assert_eq!(
+                provider_message_id, None,
+                "there is no id to invent when the conflict names none"
+            ),
+            other => panic!("a retry-key conflict is an accepted delivery: {other:?}"),
+        }
+    }
+
+    /// Where LINE repeats what it originally accepted, that id is the message
+    /// the recipient can read — keeping it is what lets the operator's activity
+    /// list name the same message the first attempt created.
+    #[tokio::test]
+    async fn a_duplicate_retry_key_keeps_the_message_id_the_response_names() {
+        let base = serve_once(
+            "409 Conflict",
+            r#"{"message":"The retry key is already accepted","sentMessages":[{"id":"461230966842064897"}]}"#,
+        );
+        let outcome = adapter("s", "t")
+            .with_base_url(&base)
+            .send(&outbound_message())
+            .await;
+        match outcome {
+            SendOutcome::Sent {
+                provider_message_id,
+            } => assert_eq!(provider_message_id.as_deref(), Some("461230966842064897")),
+            other => panic!("expected Sent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_retryable_and_a_hangup_needs_reconciliation() {
+        let refused = crate::daemon::channel_adapter::test_http::refused();
+        let outcome = adapter("s", "t")
+            .with_base_url(&refused)
+            .send(&outbound_message())
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::RetryableFailure { .. }),
+            "a connection that was never established proves the push never left: {outcome:?}"
+        );
+
+        let hangup = crate::daemon::channel_adapter::test_http::accept_then_hangup();
+        let outcome = adapter("s", "t")
+            .with_base_url(&hangup)
+            .send(&outbound_message())
+            .await;
+        assert!(
+            matches!(outcome, SendOutcome::NeedsReconciliation { .. }),
+            "a push that may have landed must never be repeated blindly: {outcome:?}"
+        );
+    }
+
+    // --- Mentions ---------------------------------------------------------
+
+    /// One group message carrying `mentionees`, so each case below differs only
+    /// in what LINE said about who was named.
+    fn group_mention_event(event_id: &str, mentionees: JsonValue) -> JsonValue {
+        serde_json::json!({
+            "type": "message",
+            "webhookEventId": event_id,
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "group", "groupId": "G1", "userId": "U2"},
+            "message": {
+                "id": "m2", "type": "text", "text": "@monkey look",
+                "mention": {"mentionees": mentionees}
+            }
+        })
+    }
+
+    fn mentions_self(event_id: &str, mentionees: JsonValue) -> bool {
+        normalize_event(&group_mention_event(event_id, mentionees), "acct-line", 0)
+            .expect("normalizes")
+            .mentions_self
+    }
+
+    /// `mentions_self` is what a group set to mention-only activates on, so it
+    /// may only ever come from something LINE actually said.
+    #[test]
+    fn only_line_saying_so_makes_a_group_message_addressed_to_the_bot() {
+        assert!(
+            mentions_self(
+                "01SELF",
+                serde_json::json!([{"index": 0, "length": 7, "type": "user", "isSelf": true}])
+            ),
+            "LINE marks the bot's own mention with isSelf"
+        );
+        assert!(
+            !mentions_self(
+                "01OTHER",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user", "userId": "U9", "isSelf": false}])
+            ),
+            "naming another member does not address the bot"
+        );
+        // A member whose profile this bot may not read is delivered without a
+        // user id. That is a fact about the profile, not about who was named,
+        // and inferring the bot from it woke the agent on every such mention.
+        assert!(
+            !mentions_self(
+                "01UNREADABLE",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user", "isSelf": false}])
+            ),
+            "a missing user id is not a mention of the bot"
+        );
+        assert!(
+            !mentions_self(
+                "01SILENT",
+                serde_json::json!([{"index": 0, "length": 4, "type": "user"}])
+            ),
+            "LINE saying nothing about who was named is not a yes"
+        );
+        assert!(
+            mentions_self(
+                "01ALL",
+                serde_json::json!([{"index": 0, "length": 4, "type": "all"}])
+            ),
+            "an @all addresses the bot as much as anyone"
+        );
+    }
+
+    /// No mention metadata at all is the ordinary group message, and it is not
+    /// addressed to anybody.
+    #[test]
+    fn a_group_message_with_no_mention_metadata_is_not_addressed() {
+        let event = serde_json::json!({
+            "type": "message",
+            "webhookEventId": "01PLAIN",
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "group", "groupId": "G1", "userId": "U2"},
+            "message": {"id": "m2", "type": "text", "text": "look"}
+        });
+        let envelope = normalize_event(&event, "acct-line", 0).expect("normalizes");
+        assert!(!envelope.mentions_self);
+        assert_eq!(envelope.metadata.get("line_mentions"), None);
+    }
+
+    /// The count is for the operator's activity list, and is independent of
+    /// whether the bot itself was one of them.
+    #[test]
+    fn the_number_of_mentions_is_recorded_whoever_they_named() {
+        let envelope = normalize_event(
+            &group_mention_event(
+                "01COUNT",
+                serde_json::json!([
+                    {"index": 0, "length": 4, "type": "user", "userId": "U9", "isSelf": false},
+                    {"index": 5, "length": 4, "type": "user", "isSelf": true}
+                ]),
+            ),
+            "acct-line",
+            0,
+        )
+        .expect("normalizes");
+        assert_eq!(envelope.metadata.get("line_mentions"), Some("2"));
+        assert!(envelope.mentions_self);
+    }
+
+    #[test]
+    fn a_redelivered_event_is_marked_and_keeps_its_dedupe_identity() {
+        let event = serde_json::json!({
+            "type": "message",
+            "webhookEventId": "01SAME",
+            "deliveryContext": {"isRedelivery": true},
+            "timestamp": 1_700_000_000_000i64,
+            "source": {"type": "user", "userId": "U1"},
+            "message": {"id": "m1", "type": "text", "text": "hello"}
+        });
+        let envelope = normalize_event(&event, "acct-line", 0).expect("normalizes");
+        assert_eq!(envelope.metadata.get("line_redelivery"), Some("true"));
+        // The flag is only for the operator's activity list. What actually
+        // stops a second run is that the id is unchanged, so the durable event
+        // log collapses it onto the row already there.
+        assert_eq!(envelope.provider_event_id, "01SAME");
     }
 }

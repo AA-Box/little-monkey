@@ -2111,9 +2111,10 @@ const DAEMON_V14_CHECKSUM: &str = "daemon-jobs-v14-channel-event-ingress-link";
 /// The backfill links every inbound accepted event that already has a turn, by
 /// the dedupe key that turn was stored under — `source:account:event_id`, the
 /// same three columns the event carries. What it deliberately cannot do is
-/// invent a turn for an event that never got one: those rows stay NULL and are
-/// picked up by the orphan sweep at daemon start, which re-decides them from
-/// the envelope they still carry rather than pretending they completed.
+/// invent a turn for an event that never got one: those rows stay NULL, which
+/// is the same shape a message a webhook provider has been acknowledged for
+/// rests in, and the channel worker decides them again from the envelope they
+/// still carry rather than pretending they completed.
 const DAEMON_V14_SQL: &str = r#"
 ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
 
@@ -2130,6 +2131,51 @@ CREATE INDEX IF NOT EXISTS channel_events_ingress_idx
     ON channel_events(ingress_id);
 CREATE INDEX IF NOT EXISTS channel_events_orphan_idx
     ON channel_events(direction, disposition, ingress_id, received_at_ms);
+"#;
+
+const DAEMON_V15: i64 = 15;
+const DAEMON_V15_CHECKSUM: &str = "daemon-jobs-v15-channel-conversation-refs";
+
+/// Where a provider wants a reply sent, kept durably per conversation.
+///
+/// Some providers do not accept a conversation id alone. The Bot Framework
+/// addresses a Teams reply by the `serviceUrl` its inbound activity carried,
+/// and that value is per conversation and per region — without it there is no
+/// endpoint to POST to at all. Holding it in memory made a reply survive only
+/// as long as the process that received the activity, so a durable turn that
+/// outlived a restart had a queued answer and nowhere to send it.
+///
+/// # What may live here
+///
+/// Addressing, never authorization. `reference_json` is written only from an
+/// input the provider's own adapter has already authenticated and validated —
+/// for Teams that means an activity whose Bot Framework JWT verified and a
+/// `serviceUrl` on a Microsoft-owned host — so an unauthenticated request can
+/// never plant an outbound destination.
+///
+/// A **credential** may never live here, and nothing that expires does either.
+/// The bot access tokens both Teams and Google Chat acquire stay in memory with
+/// their expiry, and the operator's own long-lived tokens stay in the keychain.
+/// LINE's `replyToken` is deliberately not here: it authorizes answering as the
+/// bot, is valid for seconds, and belongs to one event rather than to the
+/// conversation this table is keyed by — so that adapter pushes instead, and
+/// stores nothing. Teams is currently the only writer. Nothing reads this table
+/// but the adapters; no status API projects it.
+///
+/// The size check keeps a provider from turning a reply address into unbounded
+/// storage.
+///
+/// A row is per `(account_id, conversation_id)` and is overwritten as newer
+/// activities arrive, because the newest authenticated address is the one a
+/// provider wants used.
+const DAEMON_V15_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_conversation_refs (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL CHECK (length(conversation_id) > 0),
+    reference_json TEXT NOT NULL CHECK (length(reference_json) <= 8192),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    PRIMARY KEY(account_id, conversation_id)
+) STRICT;
 "#;
 
 /// Every migration in order, so applying them is a loop rather than a stanza per
@@ -2157,12 +2203,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
     (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
     (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
+    (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V14;
+const DAEMON_LATEST: i64 = DAEMON_V15;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2515,7 +2562,7 @@ mod tests {
             .find(|event| event.event_id == "evt-orphan")
             .expect("the orphaned event");
         assert_eq!(orphan.ingress_id, None);
-        let unfinished = store.orphaned_accepted_events(10).unwrap();
+        let unfinished = store.accepted_events_awaiting_processing(10).unwrap();
         assert_eq!(unfinished.len(), 1);
         assert_eq!(unfinished[0].event_id, "evt-orphan");
     }

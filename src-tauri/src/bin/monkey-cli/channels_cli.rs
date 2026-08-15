@@ -559,10 +559,13 @@ pub async fn probe(account_id: &str, json: bool) -> Result<(), String> {
         Some(reference) => KeyringChannelSecrets.get(reference)?,
         None => String::new(),
     };
-    let adapter = crate::daemon::adapters::build_adapter(&AdapterConfig {
-        account: &account,
-        secret,
-    })?;
+    let adapter = crate::daemon::adapters::build_adapter(
+        &AdapterConfig {
+            account: &account,
+            secret,
+        },
+        None,
+    )?;
     let health = adapter.probe().await;
     store.set_channel_account_health(account_id, &health, now_ms())?;
     if json {
@@ -736,9 +739,8 @@ fn route_scope(options: &RouteOptions) -> Result<RouteScope, String> {
         (None, None) => RouteScope::default(),
     };
     if let Some(kind) = options.kind.as_deref() {
-        scope.kind = Some(
-            ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?,
-        );
+        scope.kind =
+            Some(ChannelKind::parse(kind).ok_or_else(|| format!("Unknown provider '{kind}'"))?);
     }
     if let Some(thread) = &options.thread {
         scope = scope.with_thread(thread);
@@ -1104,10 +1106,13 @@ mod tests {
         };
         store.upsert_channel_account(&account).expect("account");
         let built = |account: &ChannelAccountRecord| {
-            crate::daemon::adapters::build_adapter(&AdapterConfig {
-                account,
-                secret: "token".to_string(),
-            })
+            crate::daemon::adapters::build_adapter(
+                &AdapterConfig {
+                    account,
+                    secret: "token".to_string(),
+                },
+                None,
+            )
         };
         built(&account).expect("the configured server builds");
 
@@ -1300,7 +1305,10 @@ mod tests {
             scoped(None, None, Some("slack")).expect("kind").kind,
             Some(ChannelKind::Slack)
         );
-        assert_eq!(scoped(None, None, None).expect("global"), RouteScope::default());
+        assert_eq!(
+            scoped(None, None, None).expect("global"),
+            RouteScope::default()
+        );
         assert!(scoped(None, None, Some("nonesuch")).is_err());
     }
 
