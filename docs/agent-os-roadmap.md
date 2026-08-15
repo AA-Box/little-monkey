@@ -1460,11 +1460,13 @@ shared Rust verdict. The launch policies stay separate; the observable
 filesystem assertions no longer do.
 
 One process-lifetime correction stays explicit. Windows owns a real tree through its job and Linux
-denies `setsid`/`setpgid`; macOS owns a process group, not a kernel process tree. A child which moves
-itself into another group can outlive foreground cleanup, still carrying the same Seatbelt policy.
-It gains no new filesystem or network reach, but authority can last past the call. That is the
-macOS process-tree leg K4's deferred-platform section must continue to name, not evidence this entry
-has a cross-platform resource/lifetime mechanism it does not have.
+owns one through a cgroup, whose membership is inherited and cannot be left; macOS owns a process
+group and a recorded ownership set, not a kernel process tree. A child captured once stays owned
+however it later rearranges its group, session or parent — but one that leaves *before* it is ever
+observed can outlive foreground cleanup, still carrying the same Seatbelt policy. It gains no new
+filesystem or network reach, but authority can last past the call. That is the macOS process-tree leg
+K4's remaining-limit section must continue to name, not evidence this entry has a cross-platform
+resource/lifetime mechanism it does not have.
 
 **Blocks:** no K3 isolation or parity gap remains. K4 records the macOS
 process-tree lifetime gap as an explicitly deferred platform capability; K21's
