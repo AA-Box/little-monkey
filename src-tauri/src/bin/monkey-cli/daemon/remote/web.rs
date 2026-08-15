@@ -552,6 +552,31 @@ mod tests {
         assert!(javascript.contains("capacityRefusal(await journalEntries()"));
         // The recovery route is a reconciliation, never a second lease.
         assert!(javascript.contains("\"GET\", \"/v1/remote/device/commands/recover\""));
+        // Coming back online wakes the outbox. This is the one thing that
+        // *does* retry after a disconnection, and the reason it may is that a
+        // staged result is not a user action somebody took offline — the effect
+        // already happened and the runner is waiting for it.
+        let online = javascript
+            .split_once("window.addEventListener(\"online\"")
+            .and_then(|(_, tail)| tail.split_once("});"))
+            .map(|(body, _)| body.to_string())
+            .expect("app.js still handles coming back online");
+        assert!(
+            online.contains("runCommandLoop()"),
+            "reconnecting must wake the result outbox"
+        );
+        assert!(online.contains("scheduleAdvertise()"));
+        // …and every other axis that can change without this client acting.
+        for listener in [
+            "document.addEventListener(\"visibilitychange\", scheduleAdvertise)",
+            "window.addEventListener(\"focus\", scheduleAdvertise)",
+            "status.addEventListener?.(\"change\", scheduleAdvertise)",
+        ] {
+            assert!(
+                javascript.contains(listener),
+                "the surface must be re-advertised on {listener}"
+            );
+        }
     }
 
     #[test]
