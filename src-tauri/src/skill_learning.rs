@@ -6499,10 +6499,11 @@ mod tests {
             .unwrap();
         let sandbox = sandboxes[0].1.to_string_lossy().to_string();
         let identity = |path: &str| eval_sandbox_identity(directory.path(), path);
-        assert_eq!(
-            identity(&sandbox).unwrap().1,
-            work.path().canonicalize().unwrap()
-        );
+        // Compared through the same normalization the registry stores: on
+        // Windows a bare `canonicalize()` yields a `\\?\` verbatim path,
+        // which is not the form anything else in this app uses.
+        let learned_in = PathBuf::from(canonical_key(work.path()));
+        assert_eq!(identity(&sandbox).unwrap().1, learned_in);
 
         // The arm rewrites the marker to name a workspace whose verification
         // commands it would rather be judged by. The answer does not move.
@@ -6511,18 +6512,12 @@ mod tests {
             serde_json::json!({ "source": elsewhere.path().to_string_lossy() }).to_string(),
         )
         .unwrap();
-        assert_eq!(
-            identity(&sandbox).unwrap().1,
-            work.path().canonicalize().unwrap()
-        );
+        assert_eq!(identity(&sandbox).unwrap().1, learned_in);
 
         // Deleting the marker outright does not help either: membership is the
         // registry's answer, and the registry is outside every sandbox.
         fs::remove_file(sandboxes[0].1.join(SANDBOX_MARKER)).unwrap();
-        assert_eq!(
-            identity(&sandbox).unwrap().1,
-            work.path().canonicalize().unwrap()
-        );
+        assert_eq!(identity(&sandbox).unwrap().1, learned_in);
 
         // A directory this app did not create for the purpose is refused, and
         // a destroyed sandbox stops being one the moment it is destroyed.
