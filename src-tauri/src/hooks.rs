@@ -205,9 +205,11 @@ pub(crate) async fn hook_exec_impl(
     let bound = controller
         .prepare_tokio(&mut builder)
         .map_err(|error| format!("Failed to bound hook: {error}"));
+    // Through the controller, so on Windows the job holds this hook before its
+    // first instruction. On Unix this is the ordinary spawn.
     let mut child = match bound.and_then(|()| {
-        builder
-            .spawn()
+        controller
+            .spawn_contained_tokio(&mut builder)
             .map_err(|error| format!("Failed to spawn hook: {}", error))
     }) {
         Ok(child) => child,

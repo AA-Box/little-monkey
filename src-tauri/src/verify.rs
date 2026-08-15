@@ -312,9 +312,22 @@ pub async fn run_command_impl(
         return failed_to_start(format!("Failed to bound command: {error}"));
     }
 
-    let mut child = match command_builder.spawn() {
+    // Through the controller, so on Windows the job holds this command before its
+    // first instruction rather than microseconds after it. On Unix this is the
+    // ordinary spawn: `prepare_tokio` above already installed the containment the
+    // child joins between `fork` and `exec`.
+    let mut child = match controller.spawn_contained_tokio(&mut command_builder) {
         Ok(child) => child,
-        Err(e) => return failed_to_start(format!("Failed to spawn command: {}", e)),
+        Err(e) => {
+            let message = format!("Failed to spawn command: {}", e);
+            if let Some(execution) = execution.take() {
+                execution.exited(
+                    crate::process_table::ProcessExit::failed(message.clone()),
+                    None,
+                );
+            }
+            return failed_to_start(message);
+        }
     };
 
     // Fail closed: a command that is *running* and cannot be shown to be inside

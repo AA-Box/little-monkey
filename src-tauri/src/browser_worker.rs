@@ -975,8 +975,14 @@ impl OwnedBrowser {
         controller
             .prepare_std(&mut command)
             .map_err(|error| format!("Failed to prepare Chromium's resource bound: {error}"))?;
-        let mut child = command
-            .spawn()
+        // Through the controller, which on Windows creates Chromium suspended,
+        // assigns it to the job, reads the membership back and only then resumes
+        // it. Chromium is the spawn site where a late assignment mattered most:
+        // it forks renderer, GPU, network and utility children within
+        // milliseconds of starting, and any of them created inside the old
+        // assignment window belonged to no job at all.
+        let mut child = controller
+            .spawn_contained_std(&mut command)
             .map_err(|error| format!("Failed to launch owned Chromium: {error}"))?;
         // Captured here because `stop` takes the child out of its `Mutex` and
         // consumes it; after that there is nothing left to ask for a pid. With

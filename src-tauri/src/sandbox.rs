@@ -1555,15 +1555,7 @@ pub async fn execute_in_sandbox(
         // `EffectiveLimits` holds for every other host. The controller is kept
         // alive for the block because it owns the original job handle; the one
         // handed to the spawn is a duplicate.
-        let controller = ResourceController::new(sandbox_run_limits(timeout));
-        // The job exists before `CreateProcessW`, so the row can state what will
-        // hold this run before the run's first instruction. The native identity
-        // lands with it on every other platform; here `run_confined` owns the
-        // whole spawn-and-wait and does not surface a pid, so the row carries the
-        // mechanism without one rather than inventing one.
-        if let Some(execution) = execution.as_mut() {
-            execution.running(&controller);
-        }
+        let mut controller = ResourceController::new(sandbox_run_limits(timeout));
         let job = controller.windows_job_for_spawn()?;
         // The container is the filesystem boundary; the job is the process-tree
         // one. A machine that cannot give us the container still gets the job,
@@ -1597,16 +1589,34 @@ pub async fn execute_in_sandbox(
             true => Isolation::OsSandboxed,
             false => Isolation::ProcessContained,
         };
-        let output = crate::sandbox_windows::run_confined(
-            container.as_ref(),
-            &job,
-            shell_command,
-            &workspace_dir,
-            &env,
-            allow_network,
-            timeout,
-        )
-        .await;
+        // Supervised, so the run gets what every other platform already had: the
+        // identity the attach verified, the containment on the row, and a sample
+        // on every tick rather than one final number.
+        let output = {
+            let mut observer = execution.as_mut();
+            crate::sandbox_windows::run_confined_supervised(
+                container.as_ref(),
+                &job,
+                shell_command,
+                &workspace_dir,
+                &env,
+                allow_network,
+                timeout,
+                &mut controller,
+                |controller, sample| {
+                    let Some(execution) = observer.as_mut() else {
+                        return;
+                    };
+                    match sample {
+                        Some(sample) => execution.sampled(&sample),
+                        // The attach: identity and containment, recorded before
+                        // the run's first measurement exists.
+                        None => execution.running(controller),
+                    }
+                },
+            )
+            .await
+        };
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let output = match output {
             Ok(output) => output,
@@ -1621,11 +1631,15 @@ pub async fn execute_in_sandbox(
             }
         };
         if let Some(execution) = execution.take() {
-            let exit = match (output.timed_out, output.exit_code) {
-                // The job's own deadline, which for this path is the wall bound
-                // the controller was built with. Reported as the limit it is
-                // rather than as an unexplained missing exit code.
-                (true, _) => crate::process_table::ProcessExit::limit_exceeded(
+            let exit = match (output.breach.clone(), output.timed_out, output.exit_code) {
+                // The mechanism's own answer, where it had one: a job that refused
+                // a fork or a memory commit says which limit and with what
+                // evidence, and that must reach the row as typed fields.
+                (Some(breach), ..) => crate::process_table::ProcessExit::limit_exceeded(breach),
+                // The run's deadline, held by the supervising loop rather than by
+                // the job. Reported as the limit it is rather than as an
+                // unexplained missing exit code.
+                (None, true, _) => crate::process_table::ProcessExit::limit_exceeded(
                     crate::resource_control::LimitBreach {
                         limit: ProcessLimitKind::Wall.as_str().to_string(),
                         configured: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
@@ -1634,12 +1648,12 @@ pub async fn execute_in_sandbox(
                         level: crate::resource_control::EnforcementLevel::Supervised
                             .as_str()
                             .to_string(),
-                        observed_at_ms: unix_time_ms(),
+                        observed_at_ms: crate::resource_control::now_ms_for_breach(),
                         evidence: None,
                     },
                 ),
-                (false, Some(0)) => crate::process_table::ProcessExit::succeeded(),
-                (false, code) => crate::process_table::ProcessExit {
+                (None, false, Some(0)) => crate::process_table::ProcessExit::succeeded(),
+                (None, false, code) => crate::process_table::ProcessExit {
                     status: crate::process_table::ExitStatus::Failed,
                     code,
                     signal: None,

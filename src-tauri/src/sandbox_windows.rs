@@ -1264,6 +1264,11 @@ fn capability_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
 
 /// What a confined run produced.
 pub struct ConfinedOutput {
+    /// The limit that ended this run, when a mechanism made the kill.
+    ///
+    /// `None` from [`run_confined`], which has no controller to ask — the two
+    /// entry points differ in what they can *know*, not in what they enforce.
+    pub breach: Option<crate::resource_control::LimitBreach>,
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -1816,6 +1821,148 @@ pub fn spawn_confined_child(
     })
 }
 
+/// [`run_confined`] under a resource controller that watches the run.
+///
+/// # What the extra parameter buys
+///
+/// `run_confined` spawns, waits and returns, so a caller holding a controller
+/// had nowhere to put it: the run's identity was never recorded and nothing
+/// sampled the job while it was executing, which for the sandbox run meant a row
+/// that could state a memory ceiling and never what was held against it.
+///
+/// The containment itself is unchanged and is established by [`spawn_confined`]
+/// before the child's first instruction. What this adds is the attach — which
+/// reads the job membership back and refuses a run that is not inside it — and a
+/// sampling tick that hands the controller to `observe` so a caller can project
+/// what the job is holding.
+///
+/// ponytail: the wait-and-read block below is a near-copy of `run_confined`'s
+/// rather than a shared helper, because sharing it means threading three
+/// `Option`s through the one function whose ordering must stay readable. If a
+/// third variant appears, extract then.
+pub async fn run_confined_supervised(
+    container: Option<&AppContainer>,
+    job: &JobConfinement,
+    shell_command: &str,
+    workspace_dir: &Path,
+    env: &[(String, String)],
+    allow_network: bool,
+    timeout: Duration,
+    controller: &mut crate::resource_control::ResourceController,
+    mut observe: impl FnMut(
+        &crate::resource_control::ResourceController,
+        Option<crate::resource_control::ResourceSample>,
+    ),
+) -> io::Result<ConfinedOutput> {
+    let spawned = spawn_confined(
+        container,
+        job,
+        shell_command,
+        workspace_dir,
+        env,
+        allow_network,
+    )?;
+    // Fail closed, on the same terms as every other controlled spawn: a run that
+    // is executing and cannot be shown to be inside its containment is reclaimed
+    // rather than reported as bounded. One that finished first is not a
+    // containment failure.
+    match controller.attach(spawned.pid) {
+        Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+        Err(crate::resource_control::AttachFailure::Containment(error)) => {
+            job.terminate();
+            return Err(error);
+        }
+    }
+    observe(controller, None);
+
+    let child = spawned.process;
+    let mut stdout_file = spawned.stdout;
+    let mut stderr_file = spawned.stderr;
+
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Err(error) = stdout_file.read_to_end(&mut out) {
+            eprintln!("sandbox: reading the confined child's stdout failed: {error}");
+        }
+        if let Err(error) = stderr_file.read_to_end(&mut err) {
+            eprintln!("sandbox: reading the confined child's stderr failed: {error}");
+        }
+        (out, err)
+    });
+
+    let waiter_handle = child.as_raw_handle() as usize;
+    let waited = tokio::task::spawn_blocking(move || {
+        let handle = waiter_handle as HANDLE;
+        unsafe { WaitForSingleObject(handle, INFINITE) };
+        let mut code: u32 = 0;
+        let read = unsafe { GetExitCodeProcess(handle, &mut code) };
+        (read, code)
+    });
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    tokio::pin!(waited);
+    let mut ticker = tokio::time::interval(crate::resource_control::SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // Biased so a run that finishes on its tick is reported as finished
+            // rather than as timed out.
+            biased;
+            joined = &mut waited => {
+                let (read, code) = joined.map_err(io::Error::other)?;
+                let (stdout, stderr) = reader.await.map_err(io::Error::other)?;
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: (read != 0).then_some(code as i32),
+                    stdout,
+                    stderr,
+                    timed_out: false,
+                    breach: None,
+                });
+            }
+            _ = &mut deadline => {
+                job.terminate();
+                let (stdout, stderr) = reader.await.unwrap_or_default();
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                    timed_out: true,
+                    breach: None,
+                });
+            }
+            _ = ticker.tick() => {
+                // The job's own accounting *and* its refusals, in the order every
+                // other owner asks: a kernel that refused a fork announces itself
+                // through the mechanism, never through a measurement passing a cap.
+                match controller.check(crate::resource_control::now_ms_for_breach()) {
+                    Ok(crate::resource_control::ResourceCheck::Breached { breach, sample }) => {
+                        observe(controller, sample);
+                        let (stdout, stderr) = reader.await.unwrap_or_default();
+                        drop(child);
+                        return Ok(ConfinedOutput {
+                            exit_code: None,
+                            stdout,
+                            stderr,
+                            timed_out: breach.limit
+                                == crate::process_table::ProcessLimitKind::Wall.as_str(),
+                            breach: Some(breach),
+                        });
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Running(sample)) => {
+                        observe(controller, Some(sample));
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Gone) | Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
 /// See [`spawn_confined`] for why the raw work is not inlined here.
 pub async fn run_confined(
     container: Option<&AppContainer>,
@@ -1882,6 +2029,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: false,
+                breach: None,
             })
         }
         Err(_) => {
@@ -1895,6 +2043,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: true,
+                breach: None,
             })
         }
     }

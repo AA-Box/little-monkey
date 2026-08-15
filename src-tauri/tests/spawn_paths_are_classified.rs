@@ -135,6 +135,20 @@ const CLASSIFIED: &[(&str, Class, &str)] = &[
          termination against a real child",
     ),
     (
+        "managed_spawn_windows.rs",
+        Class::ResourceInfrastructure,
+        "the one Windows spawn ordering — created suspended, assigned to its job, membership \
+         read back, and only then resumed. Every agent-controlled Windows spawn goes through \
+         it, so the window in which a workload could create a descendant outside its job does \
+         not exist; it spawns on its own only in its own tests",
+    ),
+    (
+        "orphan_reclaim.rs",
+        Class::ResourceInfrastructure,
+        "what a restart may conclude about work a previous session left; spawns only in its \
+         own tests, to reclaim a real tree a simulated crash left behind",
+    ),
+    (
         "process_tree.rs",
         Class::ResourceInfrastructure,
         "the tree enumeration and liveness the supervisor measures and signals through; \
@@ -518,6 +532,54 @@ fn every_agent_controlled_spawn_path_reaches_the_resource_infrastructure() {
         unrouted.is_empty(),
         "these agent-controlled spawn paths do not reach the resource infrastructure: \
          {unrouted:?}"
+    );
+}
+
+/// On Windows, an agent-controlled workload's first instruction must not run
+/// before its job holds it.
+///
+/// # Why this is a source test and not a behaviour test
+///
+/// The window it guards is microseconds wide, so a behaviour test would be
+/// asserting that a race did not happen to be lost this time. The ordering
+/// itself is the property, and the ordering lives in exactly one place —
+/// `managed_spawn_windows`, reached through
+/// `ResourceController::spawn_contained_*`. Every owner that builds its own
+/// `Command` must go through it, and this fails a new one that does not.
+///
+/// The two exceptions are not weaker, they are the *stronger* form: the agent
+/// shells and the disposable-copy sandbox call `CreateProcessW` themselves,
+/// because an AppContainer's capabilities can only be handed to a process
+/// through a `STARTUPINFOEX` attribute list that no `Command` can build. Those
+/// sites create suspended and assign before resuming too, in
+/// `sandbox_windows::spawn_confined`.
+#[test]
+fn every_agent_controlled_windows_spawn_is_contained_before_its_first_instruction() {
+    let root = source_root();
+    let mut unordered = Vec::new();
+    for (path, class, _) in CLASSIFIED.iter().chain(CLASSIFIED_CLI.iter()) {
+        if *class != Class::AgentShell {
+            continue;
+        }
+        let full = if root.join(path).exists() {
+            root.join(path)
+        } else {
+            root.join("bin/monkey-cli").join(path)
+        };
+        let text = std::fs::read_to_string(&full).unwrap_or_default();
+        let ordered = text.contains("spawn_contained_")
+            // The `CreateProcessW` sites, and the owners that delegate to them.
+            || text.contains("sandbox_windows::spawn_confined")
+            || text.contains("sandbox_windows::run_confined")
+            || text.contains("workspace_shell::spawn_")
+            || text.contains("workspace_shell::run_to_output");
+        if !ordered {
+            unordered.push(*path);
+        }
+    }
+    assert!(
+        unordered.is_empty(),
+        "these agent-controlled spawn paths do not establish their Windows job before the          workload's first instruction: {unordered:?}"
     );
 }
 

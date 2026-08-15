@@ -250,6 +250,9 @@ pub mod bounded_execution;
 // What a new app session may conclude about native work an old one left behind —
 // and, crucially, what it may not.
 pub mod orphan_reclaim;
+// The one Windows spawn ordering: suspended, assigned, verified, resumed — so no
+// agent-controlled workload runs an instruction before its job holds it.
+pub mod managed_spawn_windows;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;

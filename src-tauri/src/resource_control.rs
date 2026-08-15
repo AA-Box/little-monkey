@@ -589,6 +589,15 @@ pub struct ResourceController {
     /// number recorded while the root was alive keeps working after it is not.
     group: Option<u32>,
     session: Option<u32>,
+    /// The job handle a managed Windows spawn created the workload into.
+    ///
+    /// Held for the controller's life because a job dies with its last handle
+    /// and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` takes the tree with it: dropping
+    /// this at the end of the spawn would kill the workload the instant it was
+    /// contained. Every owner already keeps its controller for as long as the
+    /// workload may run, which is what makes this the right place for it.
+    #[cfg(windows)]
+    spawn_job: Option<crate::sandbox_windows::JobConfinement>,
 }
 
 enum Backend {
@@ -638,6 +647,8 @@ impl ResourceController {
             owned: BTreeMap::new(),
             group: None,
             session: None,
+            #[cfg(windows)]
+            spawn_job: None,
         }
     }
 
@@ -784,6 +795,62 @@ impl ResourceController {
             // weaker than the caller asked for, which is exactly what
             // `capabilities()` will report.
             Backend::Supervisor => crate::sandbox_windows::create_job(),
+        }
+    }
+
+    /// Spawn `command` so that nothing it does happens outside its bound.
+    ///
+    /// # The one entry point every managed native workload uses
+    ///
+    /// The two platforms need opposite things and this is where that stops being
+    /// each owner's problem. On Unix the containment is installed by the child
+    /// between `fork` and `exec`, so this is [`Self::prepare_tokio`] followed by
+    /// an ordinary spawn. On Windows a job is applied *to* a process and nothing
+    /// a `Command` carries can put it there, so the child is created suspended,
+    /// assigned, read back, and only then resumed — see
+    /// [`crate::managed_spawn_windows`].
+    ///
+    /// An owner that spawns through here cannot get the ordering wrong, which is
+    /// the point: the owners that did it themselves each left a window in which
+    /// the workload's first instructions ran under no job at all.
+    ///
+    /// [`Self::prepare_tokio`] must still have been called first — it is what
+    /// installs the Unix half — and [`Self::attach`] must still be called after,
+    /// because recording the identity and refusing an uncontained workload are
+    /// separate obligations from establishing the containment.
+    pub fn spawn_contained_tokio(
+        &mut self,
+        command: &mut tokio::process::Command,
+    ) -> io::Result<tokio::process::Child> {
+        #[cfg(windows)]
+        {
+            let job = self.windows_job_for_spawn()?;
+            let child = crate::managed_spawn_windows::spawn_suspended_tokio(&job, command, 0)?;
+            self.spawn_job = Some(job);
+            Ok(child)
+        }
+        #[cfg(not(windows))]
+        {
+            command.spawn()
+        }
+    }
+
+    /// [`Self::spawn_contained_tokio`] for an owner that must build a `std`
+    /// command.
+    pub fn spawn_contained_std(
+        &mut self,
+        command: &mut std::process::Command,
+    ) -> io::Result<std::process::Child> {
+        #[cfg(windows)]
+        {
+            let job = self.windows_job_for_spawn()?;
+            let child = crate::managed_spawn_windows::spawn_suspended_std(&job, command, 0)?;
+            self.spawn_job = Some(job);
+            Ok(child)
+        }
+        #[cfg(not(windows))]
+        {
+            command.spawn()
         }
     }
 
@@ -1293,6 +1360,11 @@ fn supervised_tree_usage(
 /// so this degrades to zero rather than erroring: an unstamped breach still names
 /// the limit, the configured value and the measurement, which is what the record
 /// is for.
+#[must_use]
+pub fn now_ms_for_breach() -> i64 {
+    now_ms()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
