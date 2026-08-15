@@ -89,7 +89,7 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 - Invoke up to five installed skills at the start of a turn, for example `/review /testing check this patch`. The selected instructions, version, source, and digest are frozen into that turn and never expand tool permissions.
 - Create a quarantined skill proposal with `/learn command | instructions`. It activates only after its risk flags are reviewed and its exact digest approved, and it can be rejected or rolled back.
 - Learn a reusable skill from the agent's own verified work. After a run finishes, the backend classifies that run's durable events against fixed rules; only five things open a candidate: you explicitly asking for a procedure to be reusable, a correction of yours that then verified, a verification failure repaired inside the same run, a normalized failure that recurred and was finally resolved, or a multi-step procedure that changed files and ended with a passing verification. A turn without real execution evidence never opens one, whatever it says.
-- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated with the Eval Harness against the same cases run with no candidate at all. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. Learning Mode is **Suggest only** by default; even **Auto-promote safe improvements** stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
+- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated by really running it — and a baseline without it — in disposable copies of the workspace, with real tool execution and the workspace's own verification. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. Learning Mode is **Suggest only** by default; even **Auto-promote safe improvements** stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
 - Manage signed declarative packages in **Settings → Ecosystem** with install and update permission previews, pins, enable and disable, rollback, revocation state, uninstall, offline cache, and portable export and import. Local unsigned development packages stay data-only behind an explicit warning; unsigned Git packages and executable payloads are rejected.
 - Start from a signed first-party catalog of six skills (review, testing, documentation, browser QA, release preparation, knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages.
 - Inspect plugin health and component setup, use package assistants, activate package workflow templates, and apply verified package rules to normal, Compare, and Crew turns with provenance.
@@ -156,12 +156,23 @@ permission gates, and a command that collides with a skill this loop did not
 install, are refused outright rather than prompted for.
 
 **Evaluation.** Each candidate gets a positive case reproducing the observed
-task and a regression case an unrelated turn must not be hijacked by, run with
-the candidate's staged instructions and again with no candidate. The backend
-scores completion, required and forbidden tool usage, verification result
-where one exists, latency, tokens and cost. If no model target is reachable
-the result is recorded as **unevaluated** — never as a pass — and an
-unevaluated candidate can still be installed by you, but never unattended.
+task and a regression case an unrelated turn must not be hijacked by. Every arm
+of every case runs in its own disposable copy of the workspace the candidate
+was learned in, and all of those copies are made from the same starting state
+*before* any arm runs — the baseline never hands its mutated files to the
+candidate. Each arm is an ordinary agent run whose filesystem and shell calls
+are pointed at that copy, so tool calls really execute, permission policy
+really applies, and the workspace's own configured verification commands really
+run against what the arm produced. Your live files are never touched.
+
+Evaluations are recorded with the mode that produced them. A **preflight**
+record only captured which tools a model asked for and executed none of them:
+useful as a diagnostic, and never a pass — the backend downgrades even a clean
+preflight to `unevaluated`. Only a **real isolated** evaluation, with actual
+tool execution, can back an unattended promotion. If a reproducible environment
+cannot be built (no workspace on record, a workspace too large to copy) or no
+model target is reachable, the result is **unevaluated**, and an unevaluated
+candidate can still be installed by you, but never unattended.
 
 **Provenance.** Every promotion records origin, candidate id, source run ids,
 parent hash, installed hash, evaluation ids, promotion policy, approval id and
@@ -169,13 +180,70 @@ timestamp, keyed by the installed content hash. Nothing later rewrites it: an
 update writes a new record, and a rollback surfaces the restored version's own
 provenance, so a historical run's evidence stays true.
 
-**Effectiveness and regression.** Each use of a learned skill records the exact
-hash used, the run id, success, verification result, tool failures and whether
-you corrected it afterwards. One failure changes nothing. Two comparable
-failures at the same hash, or one correction, open an *update candidate* with
-the current hash as its parent — the installed version is never mutated in
-place, and the previous version stays available through the ordinary rollback
-path.
+**How approval works.** There is no "approved" flag a window can set. When you
+install a candidate, the app raises its ordinary permission prompt describing
+exactly what would be installed — the package digest, the tools it may use,
+what it requires, why it needs approval, and which evaluation backs it — and on
+an allow decision the backend receives a durable approval identity bound to a
+digest computed from all of that. The digest is recomputed at install time: a
+candidate edited or re-staged after you saw it no longer matches, and the
+approval stops authorizing anything until you approve what is actually staged.
+The approval id is stored in the skill's provenance. An explicit `--yes` on the
+CLI is the same thing by another route, and it records its own auditable
+decision.
+
+**Which version a run used.** A run writes a durable `skill_invoked` event
+naming the command, scope and exact content hash at the moment it freezes a
+skill into its prompt. Effectiveness, correction attribution, regression
+counting and provenance all key off that event, so a run that used a version
+which has since been updated — or rolled back — still reports against the
+version it actually ran. It is never inferred from whatever happens to be
+installed when the question is asked, and never from parsing tool output.
+
+**Effectiveness and regression.** Every run that invoked a learned skill is
+recorded once it reaches a terminal state — completed, failed *or* cancelled.
+The record carries the exact hash, the run id, the outcome, the run's final
+verification result (`passed`, `failed`, or genuinely absent — never assumed),
+the tool calls that failed, and whether you corrected it afterwards. A
+cancellation is its own outcome and never counts as a failure of the skill; a
+real execution or verification failure does.
+
+Failures are counted by *comparable* failure: the failure text is normalized
+into a stable signature (digits, paths, hex blobs and quoted values collapsed)
+and counted per `hash + signature`. One failure changes nothing, and two
+*unrelated* failures are two unrelated facts. Two comparable failures at the
+same hash open an *update candidate* with that hash as its parent. So does a
+correction — but only once the corrected procedure has itself run and verified:
+telling the agent it was wrong, on its own, is recorded against the version it
+was about and opens nothing. The correction is attributed to the previous
+learned-skill use in the same session, read from the durable effectiveness
+rows, so it survives a reload and a restart. The installed version is never
+mutated in place; the previous version stays available through the ordinary
+rollback path, and learning state reconciles a rollback at the next start —
+the restored version becomes the active one again, with its own provenance.
+
+**What the model may ask for.** The bounded `manage_skill_learning` tool can
+propose a draft, inspect a candidate, request an evaluation, request a
+promotion, and deprecate a learned skill. `request_evaluation` really does
+reach the isolated executor — after the turn ends, and the verdict is still the
+backend's; the model cannot report one. `request_promotion` parks the
+candidate and nothing more. No model action can approve itself, forge an
+approval id, write into a skills directory, change the learning mode, change
+scope to global, or weaken permission policy.
+
+**Enforcement, not persuasion.** A skill's `allowed-tools` list narrows what a
+turn may call; it can never widen it. The effective capability of a run is its
+own permissions ∩ the invoked skills' allowed tools ∩ the normal tool policy,
+and it is enforced structurally: a tool that is not in that intersection is not
+offered to the model *and* is refused if called anyway. The deny list on
+proposed skill text is defense in depth against a skill that tries to talk a
+future turn out of its gates — it is not the boundary.
+
+**Settings.** Learning Mode and whether this loop may work in global scope at
+all live in the backend store, so the UI and the CLI read the same values.
+Turning global scope off confines every candidate to the workspace it was
+observed in. Nothing is ever re-scoped on its own in either direction; moving a
+workspace skill to global is a separate, explicitly approved change.
 
 **Limits.** See [Limitations](limitations.md#scope-narrower-than-the-name).
 

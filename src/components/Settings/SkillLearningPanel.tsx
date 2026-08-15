@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
-import { Brain, CheckCircle2, FlaskConical, Loader2, RefreshCw, ShieldAlert, Trash2, XCircle } from "lucide-react";
+import {
+  Brain,
+  CheckCircle2,
+  FlaskConical,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  ShieldAlert,
+  Trash2,
+  Wand2,
+  XCircle,
+} from "lucide-react";
 
 import {
   skillLearningClient,
@@ -7,10 +18,14 @@ import {
   type LearnedSkillSummary,
   type LearningCandidate,
   type LearningMode,
+  type LearningSettings,
   type LearningSourceKind,
 } from "../../lib/skillLearningClient";
+import { nativeSkillsClient } from "../../lib/nativeSkillsClient";
 import { runCandidateEvaluation } from "../../lib/skillLearningEval";
+import { draftCandidate } from "../../lib/skillLearningReflection";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
+import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore";
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
@@ -19,7 +34,8 @@ const MODE_LABELS: Array<{ value: LearningMode; label: string; detail: string }>
   {
     value: "suggest_only",
     label: "Suggest only",
-    detail: "Signals are recorded; a draft is written only when you explicitly ask for one. Nothing installs without your approval.",
+    detail:
+      "Signals are recorded and listed below. A draft is written when you ask for one — or straight away when you explicitly asked the agent to learn a procedure. Nothing installs without your approval.",
   },
   {
     value: "auto_stage",
@@ -30,7 +46,7 @@ const MODE_LABELS: Array<{ value: LearningMode; label: string; detail: string }>
     value: "auto_promote_safe",
     label: "Auto-promote safe improvements",
     detail:
-      "Additionally installs a workspace-scoped candidate that passed evaluation, adds no tool access, and declares no new executables or environment variables. Anything else still waits for you.",
+      "Additionally installs a candidate that passed a real isolated evaluation, adds no tool access, and declares no new executables or environment variables. Anything else still waits for you.",
   },
 ];
 
@@ -68,7 +84,7 @@ function PolicyNotes({ candidate }: { candidate: LearningCandidate }) {
 }
 
 export function SkillLearningPanel() {
-  const [mode, setMode] = useState<LearningMode>("suggest_only");
+  const [settings, setSettings] = useState<LearningSettings>({ mode: "suggest_only", allow_global_scope: true });
   const [candidates, setCandidates] = useState<LearningCandidate[]>([]);
   const [learned, setLearned] = useState<LearnedSkillSummary[]>([]);
   const [evaluations, setEvaluations] = useState<Record<string, EvaluationRecord[]>>({});
@@ -82,20 +98,28 @@ export function SkillLearningPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
+  const focusedCandidateId = useSkillLearningFocusStore((state) => state.candidateId);
+  const clearFocus = useSkillLearningFocusStore((state) => state.clear);
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [nextMode, nextCandidates, nextLearned, descriptors] = await Promise.all([
-        skillLearningClient.mode(),
+      const [nextSettings, nextCandidates, nextLearned, descriptors] = await Promise.all([
+        skillLearningClient.settings(),
         skillLearningClient.listCandidates(),
         skillLearningClient.learnedSkills(),
         skillLearningClient.discover(),
       ]);
-      setMode(nextMode);
+      setSettings(nextSettings);
       setCandidates(nextCandidates);
       setLearned(nextLearned);
       setInstalledBody(Object.fromEntries(descriptors.map((entry) => [entry.command, entry.instructions])));
+      const withEvaluations = await Promise.all(
+        nextCandidates
+          .filter((candidate) => candidate.evaluation_ids.length > 0)
+          .map(async (candidate) => [candidate.candidate_id, await skillLearningClient.evaluations(candidate.candidate_id)] as const),
+      );
+      setEvaluations(Object.fromEntries(withEvaluations));
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -104,6 +128,14 @@ export function SkillLearningPanel() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  /** A run notice's "Review it" button names an exact candidate — open it,
+   * then release the focus so a later normal visit is not hijacked. */
+  useEffect(() => {
+    if (!focusedCandidateId) return;
+    setExpanded(focusedCandidateId);
+    clearFocus();
+  }, [focusedCandidateId, clearFocus]);
 
   const run = async (key: string, operation: () => Promise<unknown>) => {
     setBusy(key);
@@ -122,38 +154,8 @@ export function SkillLearningPanel() {
   const evaluate = (candidate: LearningCandidate) =>
     run(`evaluate:${candidate.candidate_id}`, async () => {
       const controller = new AbortController();
-      const record = await runCandidateEvaluation(candidate.candidate_id, controller.signal);
-      setEvaluations((current) => ({
-        ...current,
-        [candidate.candidate_id]: [...(current[candidate.candidate_id] ?? []), record],
-      }));
+      await runCandidateEvaluation(candidate.candidate_id, controller.signal);
     });
-
-  const promote = (candidate: LearningCandidate) => {
-    const policy = candidate.policy;
-    const lines = [
-      `Install /${candidate.proposed_command} (${candidate.scope} scope) as a learned skill?`,
-      "",
-      `Digest: ${candidate.candidate_sha256}`,
-      candidate.allowed_tools.length > 0
-        ? `Tools while active: ${candidate.allowed_tools.join(", ")}`
-        : "Tools while active: unrestricted",
-      candidate.requirements.bins.length > 0 ? `Requires executables: ${candidate.requirements.bins.join(", ")}` : "",
-      candidate.requirements.env.length > 0 ? `Requires environment: ${candidate.requirements.env.join(", ")}` : "",
-      candidate.parent_skill_sha256 ? `Replaces version ${shortHash(candidate.parent_skill_sha256)} (kept for rollback)` : "",
-      policy && policy.approval_reasons.length > 0 ? `\nApproval needed because ${policy.approval_reasons.join("; ")}.` : "",
-      candidate.evaluation_verdict === "unevaluated" || candidate.evaluation_verdict === null
-        ? "\nThis candidate has not passed an evaluation."
-        : "",
-    ].filter(Boolean);
-    if (!window.confirm(lines.join("\n"))) return;
-    void run(`promote:${candidate.candidate_id}`, async () => {
-      const outcome = await skillLearningClient.promote(candidate.candidate_id, true);
-      if (outcome.kind !== "promoted") {
-        throw new Error(`${outcome.kind === "refused" ? "Refused" : "Awaiting approval"}: ${outcome.reasons.join("; ")}`);
-      }
-    });
-  };
 
   const open = candidates.filter(
     (candidate) => !["promoted", "rejected", "superseded"].includes(candidate.status),
@@ -168,8 +170,8 @@ export function SkillLearningPanel() {
           </h3>
           <p className="text-xs text-faint">
             Reusable procedures derived from this agent's own verified work. A candidate is only ever opened from a real
-            run's durable evidence, is staged and evaluated before it can be installed, and becomes an ordinary versioned
-            native skill with full rollback when you approve it.
+            run's durable evidence, is staged and evaluated in a disposable copy of the workspace before it can be
+            installed, and becomes an ordinary versioned native skill with full rollback when you approve it.
           </p>
         </div>
         <Button variant="ghost" size="sm" onClick={() => void refresh()} disabled={busy !== null}>
@@ -182,10 +184,12 @@ export function SkillLearningPanel() {
       <label className="flex flex-col gap-1 text-xs">
         <span className="text-muted">Learning mode</span>
         <select
-          value={mode}
+          value={settings.mode}
           disabled={busy !== null}
           onChange={(event) =>
-            void run("mode", () => skillLearningClient.setMode(event.target.value as LearningMode))
+            void run("mode", () =>
+              skillLearningClient.setSettings({ ...settings, mode: event.target.value as LearningMode }),
+            )
           }
           className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground"
         >
@@ -195,7 +199,28 @@ export function SkillLearningPanel() {
             </option>
           ))}
         </select>
-        <span className="text-faint">{MODE_LABELS.find((entry) => entry.value === mode)?.detail}</span>
+        <span className="text-faint">{MODE_LABELS.find((entry) => entry.value === settings.mode)?.detail}</span>
+      </label>
+
+      <label className="flex items-start gap-2 text-xs">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={settings.allow_global_scope}
+          disabled={busy !== null}
+          onChange={(event) =>
+            void run("scope", () =>
+              skillLearningClient.setSettings({ ...settings, allow_global_scope: event.target.checked }),
+            )
+          }
+        />
+        <span className="flex flex-col">
+          <span className="text-muted">Allow learning in global scope</span>
+          <span className="text-faint">
+            Off confines every candidate this loop opens to the workspace it was observed in. A workspace candidate is
+            never quietly moved into global scope in either case — that is a separate, explicitly approved change.
+          </span>
+        </span>
       </label>
 
       <div className="flex flex-col gap-1.5">
@@ -206,6 +231,7 @@ export function SkillLearningPanel() {
           open.map((candidate) => {
             const isOpen = expanded === candidate.candidate_id;
             const editing = draft?.id === candidate.candidate_id;
+            const drafted = candidate.proposed_skill_content.length > 0;
             return (
               <div key={candidate.candidate_id} className="rounded-md border border-border bg-background px-2.5 py-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
@@ -226,6 +252,14 @@ export function SkillLearningPanel() {
                   </Button>
                 </div>
                 <p className="mt-1 text-muted">{candidate.signal_summary}</p>
+                {candidate.correction && (
+                  <p className="mt-1 text-faint">
+                    Updates version {shortHash(candidate.correction.previous_skill_sha256)} used in run{" "}
+                    {candidate.correction.previous_run_id}
+                    {candidate.correction.failure_signature && ` · repeated failure "${candidate.correction.failure_signature}"`}
+                    {candidate.correction.corrected_execution_succeeded && " · the corrected procedure ran and verified"}
+                  </p>
+                )}
                 {candidate.dedup_detail && <p className="mt-1 text-faint">{candidate.dedup_detail}</p>}
                 {candidate.evaluation_summary && (
                   <p className="mt-1 flex items-start gap-1">
@@ -248,6 +282,13 @@ export function SkillLearningPanel() {
                       events · digest {shortHash(candidate.candidate_sha256)}
                       {candidate.parent_skill_sha256 && ` · replaces ${shortHash(candidate.parent_skill_sha256)}`}
                     </p>
+                    {candidate.evidence && (
+                      <p className="text-faint">
+                        Observed: {candidate.evidence.tool_calls.length} tool call(s),{" "}
+                        {candidate.evidence.verifications.length} verification round(s),{" "}
+                        {candidate.evidence.changed_files.length} file(s) changed
+                      </p>
+                    )}
                     <p className="text-faint">
                       Tools while active:{" "}
                       {candidate.allowed_tools.length > 0 ? candidate.allowed_tools.join(", ") : "unrestricted"}
@@ -270,22 +311,44 @@ export function SkillLearningPanel() {
                       />
                     ) : (
                       <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border bg-surface p-2 font-mono text-[11px] text-foreground">
-                        {candidate.proposed_skill_content || "(no draft yet — the reflection pass has not run)"}
+                        {candidate.proposed_skill_content || "(no draft yet — generate one to see the proposed procedure)"}
                       </pre>
                     )}
                     {(evaluations[candidate.candidate_id] ?? []).map((record) => (
                       <p key={record.evaluation_id} className="text-faint">
-                        {record.evaluation_id}: {record.verdict} — {record.summary}
+                        {record.evaluation_id} [{record.mode}]: {record.verdict} — {record.summary}
                       </p>
                     ))}
                   </div>
                 )}
 
                 <div className="mt-2 flex flex-wrap justify-end gap-1">
+                  {!drafted && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={busy !== null}
+                      onClick={() =>
+                        void run(`draft:${candidate.candidate_id}`, async () => {
+                          const outcome = await draftCandidate(candidate.candidate_id);
+                          if (outcome.error) throw new Error(outcome.error);
+                          if (outcome.declined) {
+                            throw new Error(
+                              "The reflection pass found nothing reusable in this run and declined to draft a skill.",
+                            );
+                          }
+                          setExpanded(candidate.candidate_id);
+                        })
+                      }
+                    >
+                      {busy === `draft:${candidate.candidate_id}` && <Loader2 size={12} className="animate-spin" />}
+                      <Wand2 size={12} /> Generate draft
+                    </Button>
+                  )}
                   <Button
                     variant="ghost"
                     size="sm"
-                    disabled={busy !== null || !candidate.proposed_command}
+                    disabled={busy !== null || !drafted}
                     onClick={() => void evaluate(candidate)}
                   >
                     {busy === `evaluate:${candidate.candidate_id}` && <Loader2 size={12} className="animate-spin" />}
@@ -318,7 +381,7 @@ export function SkillLearningPanel() {
                     <Button
                       variant="ghost"
                       size="sm"
-                      disabled={busy !== null || !candidate.proposed_skill_content}
+                      disabled={busy !== null || !drafted}
                       onClick={() => {
                         setExpanded(candidate.candidate_id);
                         setDraft({ id: candidate.candidate_id, content: candidate.proposed_skill_content });
@@ -327,11 +390,24 @@ export function SkillLearningPanel() {
                       Edit before install
                     </Button>
                   )}
+                  {/* No confirmation dialog here: the approval is the app's own
+                      permission prompt, raised in Rust and bound to this exact
+                      candidate's digest. A boolean from this component would
+                      not authorize anything. */}
                   <Button
                     variant="secondary"
                     size="sm"
-                    disabled={busy !== null || candidate.status === "detected" || !candidate.candidate_sha256}
-                    onClick={() => promote(candidate)}
+                    disabled={busy !== null || !candidate.candidate_sha256}
+                    onClick={() =>
+                      void run(`promote:${candidate.candidate_id}`, async () => {
+                        const outcome = await skillLearningClient.promote(candidate.candidate_id);
+                        if (outcome.kind !== "promoted") {
+                          throw new Error(
+                            `${outcome.kind === "refused" ? "Refused" : "Awaiting approval"}: ${outcome.reasons.join("; ")}`,
+                          );
+                        }
+                      })
+                    }
                   >
                     {busy === `promote:${candidate.candidate_id}` && <Loader2 size={12} className="animate-spin" />}
                     Approve &amp; install
@@ -370,6 +446,9 @@ export function SkillLearningPanel() {
                 <span className="text-muted">{summary.version}</span>
                 <span className="rounded border border-border px-1 py-0.5 text-[10px] text-faint">{summary.scope}</span>
                 <span className="rounded bg-success-soft px-1 py-0.5 text-[10px] text-success">learned</span>
+                {!summary.enabled && (
+                  <span className="rounded bg-warning-soft px-1 py-0.5 text-[10px] text-warning">disabled</span>
+                )}
                 {summary.deprecated && (
                   <span
                     className="rounded bg-warning-soft px-1 py-0.5 text-[10px] text-warning"
@@ -383,6 +462,7 @@ export function SkillLearningPanel() {
               <p className="mt-1 text-faint">
                 From {summary.provenance.source_kind} · runs {summary.provenance.source_run_ids.join(", ") || "—"} ·{" "}
                 {summary.provenance.promotion_policy}
+                {summary.provenance.approval_id && ` · approval ${summary.provenance.approval_id}`}
                 {summary.provenance.evaluation_ids.length > 0 &&
                   ` · evaluations ${summary.provenance.evaluation_ids.join(", ")}`}
               </p>
@@ -390,10 +470,45 @@ export function SkillLearningPanel() {
                 {summary.uses} use{summary.uses === 1 ? "" : "s"} · {summary.failures} failure
                 {summary.failures === 1 ? "" : "s"} · {summary.corrections} correction
                 {summary.corrections === 1 ? "" : "s"}
+                {summary.last_used_at_unix_ms !== null &&
+                  ` · last used ${new Date(summary.last_used_at_unix_ms).toLocaleString()}`}
                 {summary.previous_sha256.length > 0 &&
                   ` · previous versions ${summary.previous_sha256.map(shortHash).join(", ")}`}
               </p>
-              <div className="mt-1.5 flex justify-end">
+              {/* All four actions go straight to the native skill backend — a
+                  learned skill is an ordinary versioned skill once installed,
+                  and this panel must not grow a second copy of that logic. */}
+              <div className="mt-1.5 flex flex-wrap justify-end gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy !== null || summary.previous_sha256.length === 0}
+                  title={
+                    summary.previous_sha256.length === 0
+                      ? "This is the first installed version — there is nothing to roll back to."
+                      : `Roll back to ${shortHash(summary.previous_sha256[0])}`
+                  }
+                  onClick={() =>
+                    void run(`rollback:${summary.command}`, () =>
+                      nativeSkillsClient.rollback(summary.scope, summary.command),
+                    )
+                  }
+                >
+                  {busy === `rollback:${summary.command}` && <Loader2 size={12} className="animate-spin" />}
+                  <RotateCcw size={12} /> Roll back
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy !== null}
+                  onClick={() =>
+                    void run(`enabled:${summary.command}`, () =>
+                      nativeSkillsClient.setEnabled(summary.scope, summary.command, !summary.enabled),
+                    )
+                  }
+                >
+                  {summary.enabled ? "Disable" : "Enable"}
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -406,14 +521,22 @@ export function SkillLearningPanel() {
                 >
                   Deprecate
                 </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={busy !== null}
+                  onClick={() =>
+                    void run(`uninstall:${summary.command}`, () =>
+                      nativeSkillsClient.uninstall(summary.scope, summary.command),
+                    )
+                  }
+                >
+                  <Trash2 size={12} /> Uninstall
+                </Button>
               </div>
             </div>
           ))
         )}
-        <p className="text-[11px] text-faint">
-          Rollback, disable, and uninstall for an installed learned skill live in the native skill list above — a learned
-          skill is an ordinary versioned skill once it is installed.
-        </p>
       </div>
     </section>
   );

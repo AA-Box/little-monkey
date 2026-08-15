@@ -217,6 +217,11 @@ export type RunEventWire =
       }
     >
   | Event<"tool_started", { tool_call_id: string }>
+  /** Mirrors `RunEvent::SkillInvoked` — the exact native skill version this
+   * run froze into its prompt. Written by the invocation path itself, so a
+   * historical run identifies the content it ran rather than whatever is
+   * installed when the question is asked. */
+  | Event<"skill_invoked", { command: string; scope: "global" | "workspace"; sha256: string }>
   | Event<"tool_finished", {
       tool_call_id: string;
       outcome: ToolOutcome;

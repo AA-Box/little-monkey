@@ -11,6 +11,7 @@ import { usePermissionStore } from '../store/permissionStore';
 import { useWorkspaceStore } from '../store/workspaceStore';
 import { resolveTarget, snapshotForResolvedTarget } from './agentLoop';
 import { beginDurableRun, type DurableRunRecorder } from './durableRun';
+import { toolResultOutcome } from './toolOutcome';
 import type { ChatMessage, ToolCall } from './llamaClient';
 import type { McpToolRegistry } from './mcpTools';
 import { toolsForProfile } from './tools';
@@ -31,10 +32,26 @@ function emptyMcpRegistry(): McpToolRegistry {
   return new Map();
 }
 
+/** What a run actually did, as opposed to what the model asked for.
+ *
+ * `executedTools` names only calls that were dispatched to the tool executor
+ * and returned — a call the offered-tool check rejected never appears. This is
+ * the difference between "the model requested write_file" and "a file was
+ * written", and it is why the learning loop's evaluation reads this rather
+ * than the model's own tool-call list. */
+export interface HeadlessAgentEvidence {
+  executedTools: string[];
+  toolFailures: string[];
+  permissionRequests: string[];
+  promptTokens: number;
+  completionTokens: number;
+}
+
 export interface HeadlessAgentResult {
   outcome: 'completed' | 'cancelled' | 'error';
   summary: string;
   durableRunId: string | null;
+  evidence: HeadlessAgentEvidence;
 }
 
 export interface HeadlessAgentDurableRunSpec {
@@ -66,6 +83,12 @@ export interface RunHeadlessAgentParams {
    * attached-root label. This keeps owned-worktree agents from accidentally
    * reading or mutating the primary root when a model omits its path/cwd. */
   requiredWorkspaceRoot?: string;
+  /** Points this run's filesystem and shell tools at one app-created
+   * directory instead of the primary workspace — the same reserved argument a
+   * worktree-isolated subagent's calls carry, and refused by Rust for any
+   * directory this app did not create for the purpose. The learning loop's
+   * evaluation uses it to run an arm inside its disposable sandbox. */
+  workspaceRootOverride?: string;
   durableRun: HeadlessAgentDurableRunSpec;
   onToolActivity?: (label: string) => void;
   /** Optional feature-level validation of the final reply. Throwing converts
@@ -108,6 +131,13 @@ function workspaceRootViolation(toolCall: ToolCall, requiredRoot: string | undef
 export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<HeadlessAgentResult> {
   const { runId, signal } = params;
   let recorder: DurableRunRecorder | null = null;
+  const evidence: HeadlessAgentEvidence = {
+    executedTools: [],
+    toolFailures: [],
+    permissionRequests: [],
+    promptTokens: 0,
+    completionTokens: 0,
+  };
 
   const finish = async (
     outcome: HeadlessAgentResult['outcome'],
@@ -118,7 +148,7 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
       else if (outcome === 'cancelled') await recorder.cancel(summary).catch(() => {});
       else await recorder.fail(summary).catch(() => {});
     }
-    return { outcome, summary, durableRunId: recorder?.runId ?? null };
+    return { outcome, summary, durableRunId: recorder?.runId ?? null, evidence };
   };
 
   try {
@@ -165,6 +195,8 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
 
       if (attempt.usage) {
         recorder?.recordUsage(attempt.usage.promptTokens, attempt.usage.completionTokens);
+        evidence.promptTokens += attempt.usage.promptTokens;
+        evidence.completionTokens += attempt.usage.completionTokens;
       }
       if (attempt.streamError !== null) return finish('error', attempt.streamError);
 
@@ -213,8 +245,21 @@ export async function runHeadlessAgent(params: RunHeadlessAgentParams): Promise<
                 undefined,
                 undefined,
                 params.executionSource,
+                undefined,
+                undefined,
+                params.workspaceRootOverride,
               );
 
+        if (!aborted && allowed) {
+          // Recorded only for a call that actually reached the executor, so
+          // "which tools ran" never counts one the offered-tool check refused.
+          evidence.executedTools.push(toolCall.function.name);
+          const outcome = toolResultOutcome(resultContent, false);
+          if (outcome === 'denied') evidence.permissionRequests.push(toolCall.function.name);
+          if (outcome === 'failed' || outcome === 'denied') {
+            evidence.toolFailures.push(`${toolCall.function.name}: ${resultContent.slice(0, 240)}`);
+          }
+        }
         if (!aborted) {
           await recorder?.recordToolFinished(toolCall.id, resultContent, Date.now() - started).catch(() => {});
         }

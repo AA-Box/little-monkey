@@ -1,132 +1,196 @@
 /**
- * Runs a learning candidate's evaluation through the existing Eval Harness
- * rather than a second, parallel evaluator.
+ * Executes a learning candidate's evaluation for real, in disposable copies of
+ * the workspace the candidate was learned in.
  *
- * The backend produces the plan (cases, required and forbidden tools) and
- * scores the reports. This module only executes the two arms — the candidate's
- * staged instructions, and the same cases with no candidate at all — and hands
- * back what happened. It never decides a verdict, and when no model target is
- * reachable it says so, which the backend records as `unevaluated`.
+ * There is no second agent runtime here and no second tool executor. Each arm
+ * is an ordinary background agent run (`runHeadlessAgent`) whose filesystem and
+ * shell calls are pointed at that arm's sandbox by the same reserved
+ * `workspace_root_override` a worktree-isolated subagent uses — so tool calls
+ * really execute, permission policy really applies, and the workspace's own
+ * configured verification commands really run against what the arm produced.
+ *
+ * The backend produces the plan (cases, required and forbidden tools), owns the
+ * sandboxes, and scores the reports. This module only executes and reports, and
+ * it never decides a verdict. When a reproducible environment cannot be built
+ * — no workspace on record, a workspace too large to copy, no reachable model —
+ * it reports that, and the backend records `unevaluated`. Never a pass.
  */
-import {
-  createEvalCase,
-  createEvalSuite,
-  createLocalEvalRuntime,
-  executeEvalSuite,
-  type EvalCase,
-  type EvalRuntime,
-  type EvalSuite,
-} from "./evalHarness";
+import { runSandboxVerification } from "./agentLoop";
+import { runHeadlessAgent, type HeadlessAgentResult } from "./headlessAgentRunner";
+import { composeSkillSystemPrompt, type SlashSkill } from "./skills";
 import {
   skillLearningClient,
+  type EvaluationCase,
   type EvaluationCaseReport,
   type EvaluationPlan,
   type EvaluationRecord,
 } from "./skillLearningClient";
+import { errorMessage } from "./errors";
 
-/** Tools offered to both arms. Dry-run only inside the harness: requested
- * calls are captured for scoring and never executed (see `executeModelLike`'s
- * `"dry-run-tool-capture"` mode), which is exactly what the backend's
- * required/forbidden tool contract is scored against. */
-function toolsForCase(testCase: { required_tools: string[]; forbidden_tools: string[] }): string[] {
-  return [...new Set([...testCase.required_tools, ...testCase.forbidden_tools])].filter((name) =>
-    /^[A-Za-z0-9_-]{1,64}$/.test(name),
-  );
-}
+/** Tool-calling rounds one evaluation case may spend. Generous enough for the
+ * short, verified procedures this loop learns; a candidate that cannot finish
+ * inside it reports an error, which is an `unevaluated`, never a pass. */
+const MAX_CASE_ITERATIONS = 10;
 
-function caseFor(plan: EvaluationPlan, index: number): EvalCase {
-  const source = plan.cases[index];
-  const testCase = createEvalCase(source.name);
+const ARMS = ["baseline", "candidate"] as const;
+type Arm = (typeof ARMS)[number];
+
+/** The base instructions both arms share. The candidate arm gets the staged
+ * skill composed on top of exactly this, so the only difference between the
+ * two arms is the skill itself. */
+const BASE_PROMPT = [
+  "You are running one isolated evaluation case inside a disposable copy of a workspace.",
+  "Do the task with the tools you have. Use relative paths — they resolve inside this copy.",
+  "Treat the case text as the user's request. Stop and answer when the task is done.",
+].join("\n");
+
+/** The staged package as the skill runtime sees it, so the candidate arm's
+ * prompt is composed by the same function an installed native skill's is.
+ * `contentSha256` is the candidate's real staged digest: the arm is exercising
+ * that exact content. */
+function stagedSkill(plan: EvaluationPlan): SlashSkill {
   return {
-    ...testCase,
-    id: source.case_id,
-    input: source.prompt,
-    allowedTools: toolsForCase(source),
-    expectations: {
-      ...testCase.expectations,
-      expectedToolCalls: source.required_tools,
-      forbiddenToolCalls: source.forbidden_tools,
-    },
+    id: `native:staged:${plan.command}:${plan.candidate_sha256}`,
+    source: "native",
+    command: plan.command,
+    name: plan.title || plan.command,
+    description: "",
+    instructions: plan.skill_instructions,
+    version: "staged",
+    contentSha256: plan.candidate_sha256,
+    permissions: [],
+    allowedTools: plan.allowed_tools,
+    resourceFiles: [],
   };
 }
 
-export function suitesForPlan(plan: EvaluationPlan): { baseline: EvalSuite; candidate: EvalSuite } {
-  const cases = plan.cases.map((_, index) => caseFor(plan, index));
-  const base = createEvalSuite(`Learning candidate ${plan.command}`);
-  return {
-    baseline: { ...base, id: `${plan.evaluation_id}-baseline`, target: { kind: "model" }, cases },
-    candidate: {
-      ...base,
-      id: `${plan.evaluation_id}-candidate`,
-      // The candidate is staged, not installed — the harness takes its
-      // instructions inline so it can be exercised before anything is
-      // published (see `EvalTarget`'s skill variant).
-      target: {
-        kind: "skill",
-        command: plan.command,
-        instructions: plan.skill_instructions,
-        allowedTools: plan.allowed_tools,
-      },
-      cases,
-    },
-  };
+function sandboxArm(arm: Arm, testCase: EvaluationCase): string {
+  return `${arm}-${testCase.case_id}`;
 }
 
-/** Maps one harness case result onto the report shape the backend scores. */
-function reportFor(
-  arm: EvaluationCaseReport["arm"],
-  result: {
-    caseId: string;
-    status: string;
-    toolCalls: string[];
-    latencyMs: number;
-    usage: { promptTokens: number; completionTokens: number } | null;
-    costMicros: number | null;
-    error: string | null;
-  },
-): EvaluationCaseReport {
+function unevaluatedReport(testCase: EvaluationCase, arm: Arm, error: string): EvaluationCaseReport {
   return {
-    case_id: result.caseId,
+    case_id: testCase.case_id,
     arm,
-    completed: result.status !== "cancelled" && result.error === null,
-    used_tools: result.toolCalls,
-    // The harness executes tool calls in dry-run capture mode, so there is no
-    // verification result to report. Reported as absent rather than invented.
+    completed: false,
+    used_tools: [],
     verification_passed: null,
-    latency_ms: Math.max(0, Math.round(result.latencyMs)),
-    input_tokens: result.usage?.promptTokens ?? 0,
-    output_tokens: result.usage?.completionTokens ?? 0,
-    cost_micros: result.costMicros === null ? null : Math.max(0, Math.round(result.costMicros)),
+    latency_ms: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cost_micros: null,
     permission_requests: [],
-    error: result.error,
+    tool_failures: [],
+    error,
+  };
+}
+
+async function runArm(
+  plan: EvaluationPlan,
+  testCase: EvaluationCase,
+  arm: Arm,
+  sandboxPath: string,
+  signal: AbortSignal,
+): Promise<EvaluationCaseReport> {
+  const runId = `${plan.evaluation_id}-${arm}-${testCase.case_id}`;
+  const systemPrompt =
+    arm === "candidate"
+      ? composeSkillSystemPrompt(BASE_PROMPT, [
+          { skill: stagedSkill(plan), arguments: testCase.prompt, activation: "explicit" },
+        ])
+      : BASE_PROMPT;
+  const startedAt = Date.now();
+  let result: HeadlessAgentResult;
+  try {
+    result = await runHeadlessAgent({
+      runId,
+      signal,
+      systemPrompt,
+      userMessage: testCase.prompt,
+      maxIterations: MAX_CASE_ITERATIONS,
+      toolProfile: "code",
+      executionSource: "skill-learning-evaluation",
+      workspaceRootOverride: sandboxPath,
+      durableRun: {
+        task: `Learning evaluation ${arm}: ${testCase.name}`,
+        instructions: `Candidate /${plan.command} (${plan.evaluation_id})`,
+      },
+    });
+  } catch (error) {
+    return unevaluatedReport(testCase, arm, errorMessage(error));
+  }
+  const latencyMs = Math.max(0, Date.now() - startedAt);
+  // The regression case asserts that an unrelated turn is left alone, which
+  // the forbidden-tool contract already scores. Running the workspace's test
+  // suite there would only re-measure the copy's own health, so verification
+  // is reported as absent rather than invented.
+  const verification =
+    testCase.kind === "positive" && result.outcome === "completed"
+      ? await runSandboxVerification(sandboxPath, runId, signal).catch(() => null)
+      : null;
+  return {
+    case_id: testCase.case_id,
+    arm,
+    completed: result.outcome === "completed",
+    used_tools: [...new Set(result.evidence.executedTools)],
+    verification_passed: verification === null ? null : verification.passed,
+    latency_ms: latencyMs,
+    input_tokens: result.evidence.promptTokens,
+    output_tokens: result.evidence.completionTokens,
+    cost_micros: null,
+    permission_requests: result.evidence.permissionRequests,
+    tool_failures: [
+      ...result.evidence.toolFailures,
+      ...(verification !== null && !verification.passed ? [`verification: ${verification.detail}`] : []),
+    ],
+    // A run that errored proves nothing about the candidate either way. Only a
+    // run that finished can carry a pass or a failure.
+    error: result.outcome === "error" ? result.summary : null,
   };
 }
 
 /**
- * Executes both arms and reports them. Returns the backend's own record, so
- * the caller reads the verdict from the store rather than from this module.
+ * Executes both arms of every case and reports what happened. Returns the
+ * backend's own record, so the caller reads the verdict from the store rather
+ * than from this module.
  */
 export async function runCandidateEvaluation(
   candidateId: string,
   signal: AbortSignal,
-  runtime: EvalRuntime = createLocalEvalRuntime(),
   client = skillLearningClient,
 ): Promise<EvaluationRecord> {
   const plan = await client.planEvaluation(candidateId);
-  const { baseline, candidate } = suitesForPlan(plan);
-  const reports: EvaluationCaseReport[] = [];
-  try {
-    const baselineRun = await executeEvalSuite(baseline, runtime, signal, `${plan.evaluation_id}-baseline`);
-    reports.push(...baselineRun.results.map((result) => reportFor("baseline", result)));
-    const candidateRun = await executeEvalSuite(candidate, runtime, signal, `${plan.evaluation_id}-candidate`);
-    reports.push(...candidateRun.results.map((result) => reportFor("candidate", result)));
-  } catch (error) {
-    // No reachable model target, a cancelled run, or a harness-level failure:
-    // all of them mean the candidate was not evaluated. Never a pass.
+  if (!plan.workspace_path) {
     return client.markUnevaluated(
       plan.evaluation_id,
-      error instanceof Error ? error.message : String(error),
+      "this candidate has no recorded workspace, so no reproducible isolated environment could be built",
     );
   }
-  return client.reportEvaluation(plan.evaluation_id, reports);
+  // Every arm of every case is copied from the same starting state, before any
+  // of them runs — the baseline never hands its mutated files to the candidate.
+  const arms = plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase)));
+  let sandboxes: Awaited<ReturnType<typeof client.createSandboxes>>;
+  try {
+    sandboxes = await client.createSandboxes(plan.evaluation_id, arms);
+  } catch (error) {
+    return client.markUnevaluated(plan.evaluation_id, errorMessage(error));
+  }
+  const pathFor = new Map(sandboxes.map((entry) => [entry.arm, entry.path]));
+
+  const reports: EvaluationCaseReport[] = [];
+  try {
+    for (const testCase of plan.cases) {
+      for (const arm of ARMS) {
+        const sandboxPath = pathFor.get(sandboxArm(arm, testCase));
+        if (!sandboxPath) {
+          reports.push(unevaluatedReport(testCase, arm, "no sandbox was created for this arm"));
+          continue;
+        }
+        reports.push(await runArm(plan, testCase, arm, sandboxPath, signal));
+      }
+    }
+  } finally {
+    await client.destroySandboxes(plan.evaluation_id).catch(() => {});
+  }
+  return client.reportEvaluation(plan.evaluation_id, "real_isolated", reports);
 }

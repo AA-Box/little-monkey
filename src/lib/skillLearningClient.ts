@@ -34,6 +34,13 @@ export type DedupOutcome = "new_skill" | "update_existing" | "possible_duplicate
 
 export type EvaluationVerdict = "passed" | "failed" | "unevaluated";
 
+/** How an evaluation was carried out. A `preflight` record only captured the
+ * tools a model asked for and executed none of them, so it can never carry a
+ * promotion-grade pass — see `EvaluationMode` in `skill_learning.rs`. */
+export type EvaluationMode = "preflight" | "real_isolated";
+
+export type RunOutcome = "success" | "failure" | "cancelled";
+
 export interface CandidateResourceFile {
   path: string;
   content: string;
@@ -94,6 +101,74 @@ export interface LearningCandidate {
   workspace_path: string | null;
   observed_prompt: string;
   observed_tools: string[];
+  /** The bounded backend-owned snapshot of the run this candidate was opened
+   * against. Read-only evidence — nothing in it authorizes an install, and the
+   * reflection brief the model reads is rendered from it in Rust. */
+  evidence: RunEvidence | null;
+  correction: CorrectionEvidence | null;
+  approval_id: string | null;
+}
+
+export interface ToolEvidence {
+  event_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  succeeded: boolean;
+  mutation: boolean;
+  arguments: string | null;
+  output_excerpt: string | null;
+  outcome: string;
+  failure_excerpt: string | null;
+  path: string | null;
+}
+
+export interface VerificationEvidence {
+  event_id: string;
+  name: string;
+  passed: boolean;
+  summary: string;
+  sequence: number;
+}
+
+export interface InvokedSkillEvidence {
+  command: string;
+  scope: string;
+  sha256: string;
+}
+
+export interface RunEvidence {
+  run_id: string;
+  completed: boolean;
+  failed: boolean;
+  cancelled: boolean;
+  user_text: string;
+  tool_calls: ToolEvidence[];
+  verifications: VerificationEvidence[];
+  changed_files: string[];
+  invoked_skills: InvokedSkillEvidence[];
+  summary: string;
+  failure_signatures: string[];
+}
+
+export interface CorrectionEvidence {
+  previous_skill_sha256: string;
+  previous_run_id: string;
+  correction_run_id: string;
+  correction_event_ids: string[];
+  failure_signature: string | null;
+  corrected_execution_succeeded: boolean;
+}
+
+/** Backend-owned learning settings. The UI and the CLI read the same values;
+ * neither holds an authoritative copy. */
+export interface LearningSettings {
+  mode: LearningMode;
+  allow_global_scope: boolean;
+}
+
+export interface EvaluationSandbox {
+  arm: string;
+  path: string;
 }
 
 export interface EvaluationCase {
@@ -110,9 +185,14 @@ export interface EvaluationPlan {
   candidate_id: string;
   command: string;
   title: string;
+  candidate_sha256: string;
   skill_instructions: string;
   allowed_tools: string[];
   cases: EvaluationCase[];
+  /** The workspace the observed run happened in. `null` means no reproducible
+   * isolated environment can be built, which is an `unevaluated`, never a run
+   * against the user's live files. */
+  workspace_path: string | null;
 }
 
 export interface EvaluationCaseReport {
@@ -126,6 +206,9 @@ export interface EvaluationCaseReport {
   output_tokens: number;
   cost_micros: number | null;
   permission_requests: string[];
+  /** Tool calls that actually ran and failed. Empty for a preflight report,
+   * which executes nothing. */
+  tool_failures: string[];
   error: string | null;
 }
 
@@ -135,6 +218,7 @@ export interface EvaluationRecord {
   cases: EvaluationCase[];
   reports: EvaluationCaseReport[];
   verdict: EvaluationVerdict;
+  mode: EvaluationMode;
   summary: string;
   created_at_unix_ms: number;
   finished_at_unix_ms: number | null;
@@ -169,15 +253,18 @@ export interface LearnedSkillSummary {
   last_used_at_unix_ms: number | null;
 }
 
-export interface SkillUsageReport {
+export interface EffectivenessRecord {
   command: string;
   scope: NativeSkillScope;
   skill_sha256: string;
   run_id: string;
-  succeeded: boolean;
+  session_id: string | null;
+  outcome: RunOutcome;
   verification_passed: boolean | null;
   tool_failures: string[];
+  failure_signature: string | null;
   user_corrected: boolean;
+  recorded_at_unix_ms: number;
 }
 
 export type PromotionOutcome =
@@ -207,6 +294,20 @@ export const skillLearningClient = {
     cachedMode = await invoke<LearningMode>("skill_learning_set_mode", { mode });
     return cachedMode;
   },
+  settings: async () => {
+    const settings = await invoke<LearningSettings>("skill_learning_settings");
+    cachedMode = settings.mode;
+    return settings;
+  },
+  setSettings: async (settings: LearningSettings) => {
+    const next = await invoke<LearningSettings>("skill_learning_set_settings", { settings });
+    cachedMode = next.mode;
+    return next;
+  },
+  /** The bounded evidence brief the reflection pass reads, rendered in Rust
+   * from the snapshot the backend persisted with the candidate. */
+  reflectionBrief: (candidateId: string) =>
+    invoke<string>("skill_learning_reflection_brief", { candidateId }),
   /** Classifies a finished durable run. The backend reads that run's own
    * events from the ledger; `userText` is the user's turn text, the one input
    * the ledger does not carry. */
@@ -219,20 +320,40 @@ export const skillLearningClient = {
   stage: (candidateId: string, proposal: CandidateProposal, runId?: string) =>
     invoke<LearningCandidate>("skill_learning_stage", { candidateId, proposal, runId: runId ?? null }),
   planEvaluation: (candidateId: string) => invoke<EvaluationPlan>("skill_learning_plan_evaluation", { candidateId }),
-  reportEvaluation: (evaluationId: string, reports: EvaluationCaseReport[]) =>
-    invoke<EvaluationRecord>("skill_learning_report_evaluation", { evaluationId, reports }),
+  /** `mode` says how the reports were produced. Only `real_isolated` — arms
+   * that actually executed their tool calls — can score a promotion-grade
+   * pass; the backend downgrades a clean `preflight` to `unevaluated`. */
+  reportEvaluation: (evaluationId: string, mode: EvaluationMode, reports: EvaluationCaseReport[]) =>
+    invoke<EvaluationRecord>("skill_learning_report_evaluation", { evaluationId, mode, reports }),
   markUnevaluated: (evaluationId: string, reason: string) =>
     invoke<EvaluationRecord>("skill_learning_mark_unevaluated", { evaluationId, reason }),
   evaluations: (candidateId: string) => invoke<EvaluationRecord[]>("skill_learning_evaluations", { candidateId }),
-  /** `unattended` is the auto-promote path: strictly narrower than an
+  /** One disposable copy of the candidate's own workspace per arm, all made
+   * before any arm runs. The backend resolves what they are copies of. */
+  createSandboxes: (evaluationId: string, arms: string[]) =>
+    invoke<EvaluationSandbox[]>("skill_learning_create_sandboxes", { evaluationId, arms }),
+  destroySandboxes: (evaluationId: string) =>
+    invoke<void>("skill_learning_destroy_sandboxes", { evaluationId }),
+  /** Asks the user, through the app's own permission system, and installs on
+   * an allow decision. There is no `approved` boolean: the approval is a
+   * durable decision bound to this exact candidate's digest, issued in Rust.
+   * `unattended` is the auto-promote path instead — strictly narrower than an
    * approval (it also needs the configured mode, a clean policy, and a passing
-   * evaluation), never wider. */
-  promote: (candidateId: string, approved: boolean, unattended = false) =>
-    invoke<PromotionOutcome>("skill_learning_promote", { candidateId, approved, unattended }),
+   * real isolated evaluation), never wider. */
+  promote: (candidateId: string, unattended = false) =>
+    invoke<PromotionOutcome>("skill_learning_promote", { candidateId, unattended }),
   reject: (candidateId: string, reason: string) =>
     invoke<LearningCandidate>("skill_learning_reject", { candidateId, reason }),
-  recordUse: (report: SkillUsageReport) =>
-    invoke<LearningCandidate | null>("skill_learning_record_use", { report }),
+  /** Finalizes effectiveness for a run that reached a terminal state. The
+   * backend reads which learned versions the run actually invoked from that
+   * run's own durable events — a caller cannot name a hash. */
+  finalizeRun: (runId: string, sessionId: string | null) =>
+    invoke<LearningCandidate[]>("skill_learning_finalize_run", { runId, sessionId }),
+  /** Attributes a correction to the learned version the session's previous
+   * turn used, durably — the attribution survives a reload and a restart. */
+  recordCorrection: (sessionId: string, runId: string, userText: string) =>
+    invoke<LearningCandidate | null>("skill_learning_record_correction", { sessionId, runId, userText }),
+  effectiveness: () => invoke<EffectivenessRecord[]>("skill_learning_effectiveness"),
   learnedSkills: () => invoke<LearnedSkillSummary[]>("skill_learning_learned_skills"),
   deprecate: (scope: NativeSkillScope, command: string, reason: string) =>
     invoke<NativeSkillMutationResult>("skill_learning_deprecate", { scope, command, reason }),

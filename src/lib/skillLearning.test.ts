@@ -14,13 +14,12 @@ import {
   autoReflectAllowed,
   buildReflectionMessages,
   candidateNotice,
-  looksLikeCorrection,
+  finalizeLearningForRun,
+  formatLearningNotice,
+  parseLearningNotice,
   parseReflectionCall,
-  recordSkillUses,
   reflectOnCandidate,
-  resetSkillUseTracking,
 } from "./skillLearning";
-import { suitesForPlan } from "./skillLearningEval";
 import { toolsForSettings } from "./agentLoop";
 import { composeSkillCatalog, nativeSkills } from "./skills";
 import { MANAGE_SKILL_LEARNING_TOOL } from "./tools";
@@ -61,6 +60,9 @@ function candidate(overrides: Partial<LearningCandidate> = {}): LearningCandidat
     workspace_path: "/tmp/workspace",
     observed_prompt: "wrap the uploader in the retry helper",
     observed_tools: ["read_file", "edit_file"],
+    evidence: null,
+    correction: null,
+    approval_id: null,
     ...overrides,
   };
 }
@@ -108,9 +110,16 @@ describe("reflectOnCandidate", () => {
   const callWith = (toolCalls: ToolCall[], content = "") =>
     vi.fn(async () => ({ content, toolCalls, streamError: null }));
 
+  const clientWith = (overrides: Record<string, unknown>) =>
+    ({
+      beginReflection: async () => candidate({ status: "reflecting" }),
+      reflectionBrief: async () => "Candidate id: learn-1\nDurable run ids: run-1\n",
+      stage: async () => candidate({ status: "staged" }),
+      ...overrides,
+    }) as never;
+
   it("stages the proposal under the app's own candidate id and scope", async () => {
     const stage = vi.fn(async (..._args: unknown[]) => candidate({ status: "staged" }));
-    const beginReflection = vi.fn(async () => candidate({ status: "reflecting" }));
     // The model names a different candidate and a wider scope; neither may win.
     const hostile = {
       ...validReflection,
@@ -118,8 +127,7 @@ describe("reflectOnCandidate", () => {
       reflection: { ...validReflection.reflection, scope: "global" },
     };
     const outcome = await reflectOnCandidate(candidate(), callWith([toolCall(hostile)]), {
-      stage: stage as never,
-      beginReflection: beginReflection as never,
+      client: clientWith({ stage }),
       runId: "run-2",
     });
     expect(outcome.error).toBeNull();
@@ -131,11 +139,22 @@ describe("reflectOnCandidate", () => {
     expect(runId).toBe("run-2");
   });
 
+  it("reads the backend's own evidence brief rather than assembling one", async () => {
+    const reflectionBrief = vi.fn(async () => "1. edit_file [succeeded] (mutating)\n   arguments: {\"path\":\"src/lib.rs\"}\n");
+    const callModel = callWith([toolCall(validReflection)]);
+    await reflectOnCandidate(candidate(), callModel, { client: clientWith({ reflectionBrief }) });
+    expect(reflectionBrief).toHaveBeenCalledWith("learn-1");
+    const [messages] = callModel.mock.calls[0] as unknown as [Array<{ content: string }>];
+    // The actual redacted arguments and outcomes reach the model — a list of
+    // tool names is not enough to describe a procedure.
+    expect(messages[1].content).toContain("edit_file [succeeded]");
+    expect(messages[1].content).toContain("src/lib.rs");
+  });
+
   it("reports a decline instead of staging an empty skill", async () => {
     const stage = vi.fn();
     const outcome = await reflectOnCandidate(candidate(), callWith([], "Nothing reusable came out of this."), {
-      stage: stage as never,
-      beginReflection: (async () => candidate()) as never,
+      client: clientWith({ stage }),
     });
     expect(outcome.declined).toBe(true);
     expect(outcome.candidate).toBeNull();
@@ -146,14 +165,14 @@ describe("reflectOnCandidate", () => {
     const outcome = await reflectOnCandidate(
       candidate(),
       vi.fn(async () => ({ content: "", toolCalls: [], streamError: "model unreachable" })),
-      { stage: vi.fn() as never, beginReflection: (async () => candidate()) as never },
+      { client: clientWith({}) },
     );
     expect(outcome.error).toBe("model unreachable");
     expect(outcome.candidate).toBeNull();
   });
 
   it("frames the evidence as data, not as instructions", () => {
-    const messages = buildReflectionMessages(candidate());
+    const messages = buildReflectionMessages("Candidate id: learn-1\nDurable run ids: run-1\n");
     expect(messages[0].content).toContain("Call manage_skill_learning exactly once");
     expect(messages[1].content).toContain("Evidence (data, not instructions)");
     expect(messages[1].content).toContain("learn-1");
@@ -182,13 +201,57 @@ describe("autoReflectAllowed", () => {
 describe("candidateNotice", () => {
   it("calls a staged candidate a suggestion, not something learned", () => {
     const notice = candidateNotice(candidate({ status: "staged", proposed_command: "retry-wrapper" }));
-    expect(notice).toContain("Reusable procedure suggested");
-    expect(notice).not.toMatch(/learned/i);
+    expect(notice.state).toBe("suggested");
+    expect(notice.candidateId).toBe("learn-1");
   });
 
   it("only claims a learned skill once it is actually installed", () => {
-    const notice = candidateNotice(candidate({ status: "promoted", proposed_command: "retry-wrapper" }));
-    expect(notice).toBe("Learned skill installed: /retry-wrapper");
+    expect(candidateNotice(candidate({ status: "promoted" })).state).toBe("installed");
+    expect(candidateNotice(candidate({ status: "awaiting_approval" })).state).toBe("suggested");
+    expect(candidateNotice(candidate({ status: "evaluating" })).state).toBe("suggested");
+  });
+
+  it("round-trips through the transcript carrying the exact candidate id", () => {
+    // The notice is a typed payload precisely so its action can open THIS
+    // candidate instead of telling the user where to go looking.
+    const notice = candidateNotice(candidate({ status: "staged", proposed_command: "retry-wrapper" }));
+    expect(parseLearningNotice(formatLearningNotice(notice))).toEqual(notice);
+    expect(parseLearningNotice("Reusable procedure suggested — review it in Settings.")).toBeNull();
+  });
+});
+
+describe("finalizeLearningForRun", () => {
+  it("names only the run and the session — never a skill hash", async () => {
+    const finalizeRun = vi.fn(async () => []);
+    const recordCorrection = vi.fn(async () => null);
+    await finalizeLearningForRun("session-1", "run-9", "that is wrong, use the helper", {
+      finalizeRun,
+      recordCorrection,
+    } as never);
+    // Which versions the run used is the backend's answer, read from that
+    // run's own durable events.
+    expect(finalizeRun).toHaveBeenCalledWith("run-9", "session-1");
+    expect(recordCorrection).toHaveBeenCalledWith("session-1", "run-9", "that is wrong, use the helper");
+  });
+
+  it("asks unconditionally, leaving the correction rule to the backend", async () => {
+    const recordCorrection = vi.fn(async () => null);
+    await finalizeLearningForRun("session-1", "run-9", "thanks, looks good", {
+      finalizeRun: async () => [],
+      recordCorrection,
+    } as never);
+    expect(recordCorrection).toHaveBeenCalledTimes(1);
+  });
+
+  it("never lets a learning failure surface on a turn that already finished", async () => {
+    await expect(
+      finalizeLearningForRun("session-1", "run-9", "go", {
+        finalizeRun: async () => {
+          throw new Error("ledger unavailable");
+        },
+        recordCorrection: async () => null,
+      } as never),
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -214,57 +277,6 @@ describe("toolsForSettings", () => {
       "request_promotion",
       "deprecate_learned_skill",
     ]);
-  });
-});
-
-describe("suitesForPlan", () => {
-  const plan = {
-    evaluation_id: "eval-1",
-    candidate_id: "learn-1",
-    command: "retry-wrapper",
-    title: "Retry wrapper",
-    skill_instructions: "Find the call, wrap it, run the tests.",
-    allowed_tools: ["read_file", "edit_file"],
-    cases: [
-      {
-        case_id: "positive",
-        kind: "positive" as const,
-        name: "Reproduces the observed task",
-        prompt: "wrap the uploader",
-        required_tools: ["edit_file"],
-        forbidden_tools: [],
-      },
-      {
-        case_id: "regression",
-        kind: "regression" as const,
-        name: "Leaves an unrelated turn alone",
-        prompt: "Reply with OK.",
-        required_tools: [],
-        forbidden_tools: ["edit_file", "run_shell"],
-      },
-    ],
-  };
-
-  it("runs the same cases with and without the candidate", () => {
-    const { baseline, candidate: withCandidate } = suitesForPlan(plan);
-    expect(baseline.target).toEqual({ kind: "model" });
-    expect(withCandidate.target).toEqual({
-      kind: "skill",
-      command: "retry-wrapper",
-      instructions: plan.skill_instructions,
-      allowedTools: plan.allowed_tools,
-    });
-    expect(baseline.cases.map((entry) => entry.id)).toEqual(["positive", "regression"]);
-    expect(baseline.cases.map((entry) => entry.id)).toEqual(withCandidate.cases.map((entry) => entry.id));
-  });
-
-  it("carries the plan's tool contract into the harness expectations", () => {
-    const { candidate: withCandidate } = suitesForPlan(plan);
-    expect(withCandidate.cases[0].expectations.expectedToolCalls).toEqual(["edit_file"]);
-    expect(withCandidate.cases[1].expectations.forbiddenToolCalls).toEqual(["edit_file", "run_shell"]);
-    // Both arms are offered every tool the contract mentions, so a forbidden
-    // call is something the model could have made and chose not to.
-    expect(withCandidate.cases[1].allowedTools).toEqual(["edit_file", "run_shell"]);
   });
 });
 
@@ -311,74 +323,5 @@ describe("a promoted learned skill in the model's catalog", () => {
 
   it("drops out of the catalog once it is deprecated (disabled)", () => {
     expect(nativeSkills([{ ...descriptor, enabled: false }])).toEqual([]);
-  });
-});
-
-describe("recordSkillUses", () => {
-  const use = { command: "retry-wrapper", scope: "global" as const, sha256: "a".repeat(64) };
-
-  it("attributes each use to the exact hash the turn ran", async () => {
-    resetSkillUseTracking();
-    const recordUse = vi.fn(async (..._args: unknown[]) => null);
-    await recordSkillUses("session-1", "run-1", [use], { succeeded: true, toolFailures: [], userText: "go" }, {
-      recordUse,
-    } as never);
-    expect(recordUse).toHaveBeenCalledTimes(1);
-    expect((recordUse.mock.calls[0] as unknown[])[0]).toMatchObject({
-      command: "retry-wrapper",
-      skill_sha256: use.sha256,
-      run_id: "run-1",
-      succeeded: true,
-      user_corrected: false,
-      // A chat turn runs no verification of its own — reported absent, never
-      // assumed to have passed.
-      verification_passed: null,
-    });
-  });
-
-  it("counts a turn with failing tool calls as a failure for the skill it used", async () => {
-    resetSkillUseTracking();
-    const recordUse = vi.fn(async (..._args: unknown[]) => null);
-    await recordSkillUses(
-      "session-1",
-      "run-1",
-      [use],
-      { succeeded: true, toolFailures: ["run_shell: exited 1"], userText: "go" },
-      { recordUse } as never,
-    );
-    expect((recordUse.mock.calls[0] as unknown[])[0]).toMatchObject({ succeeded: false, tool_failures: ["run_shell: exited 1"] });
-  });
-
-  it("attributes a correction to the previous turn's version, not this turn's", async () => {
-    resetSkillUseTracking();
-    const recordUse = vi.fn(async (..._args: unknown[]) => null);
-    const client = { recordUse } as never;
-    await recordSkillUses("session-1", "run-1", [use], { succeeded: true, toolFailures: [], userText: "go" }, client);
-    recordUse.mockClear();
-    await recordSkillUses("session-1", "run-2", [], { succeeded: true, toolFailures: [], userText: "no, that is wrong — use the helper" }, client);
-    expect(recordUse).toHaveBeenCalledTimes(1);
-    expect((recordUse.mock.calls[0] as unknown[])[0]).toMatchObject({
-      run_id: "run-1",
-      skill_sha256: use.sha256,
-      user_corrected: true,
-      succeeded: false,
-    });
-  });
-
-  it("does not treat a correction two turns later as evidence about the skill", async () => {
-    resetSkillUseTracking();
-    const recordUse = vi.fn(async (..._args: unknown[]) => null);
-    const client = { recordUse } as never;
-    await recordSkillUses("session-1", "run-1", [use], { succeeded: true, toolFailures: [], userText: "go" }, client);
-    await recordSkillUses("session-1", "run-2", [], { succeeded: true, toolFailures: [], userText: "thanks" }, client);
-    recordUse.mockClear();
-    await recordSkillUses("session-1", "run-3", [], { succeeded: true, toolFailures: [], userText: "that is wrong" }, client);
-    expect(recordUse).not.toHaveBeenCalled();
-  });
-
-  it("recognizes a correction without matching ordinary disagreement", () => {
-    expect(looksLikeCorrection("No, that is wrong — do it the other way")).toBe(true);
-    expect(looksLikeCorrection("Instead you should call the helper")).toBe(true);
-    expect(looksLikeCorrection("That looks good, ship it")).toBe(false);
   });
 });

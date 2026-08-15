@@ -17,9 +17,10 @@ use crate::native_skills::{ExternalSignedSkill, SkillDescriptor, SkillMutationRe
 use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
-    evidence_from_events, CandidateProposal, EffectivenessRecord, EvaluationCaseReport,
-    EvaluationPlan, EvaluationRecord, LearnedSkillSummary, LearningCandidate, LearningMode,
-    PromotionOutcome, SkillLearningStore, SkillUsageReport,
+    approval_operation_digest, evidence_from_events, reflection_brief, ApprovalGrant,
+    CandidateProposal, CorrectedExecution, EffectivenessRecord, EvaluationCaseReport,
+    EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary, LearningCandidate,
+    LearningMode, LearningSettings, PromotionOutcome, RunEvidence, SkillLearningStore,
 };
 use crate::AppState;
 
@@ -79,6 +80,42 @@ pub async fn skill_learning_mode(
 ) -> Result<LearningMode, String> {
     let store = learning.store.clone();
     run_blocking(move || store.mode()).await
+}
+
+#[tauri::command]
+pub async fn skill_learning_settings(
+    learning: tauri::State<'_, SkillLearningCommandState>,
+) -> Result<LearningSettings, String> {
+    let store = learning.store.clone();
+    run_blocking(move || store.settings()).await
+}
+
+#[tauri::command]
+pub async fn skill_learning_set_settings(
+    window: tauri::Window,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    settings: LearningSettings,
+) -> Result<LearningSettings, String> {
+    require_main_window(&window)?;
+    let store = learning.store.clone();
+    run_blocking(move || store.set_settings(settings)).await
+}
+
+/// The bounded evidence brief the reflection pass reads. Generated here, from
+/// the snapshot the backend persisted with the candidate — never assembled in
+/// the frontend out of whatever fields happen to be on hand.
+#[tauri::command]
+pub async fn skill_learning_reflection_brief(
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    candidate_id: String,
+) -> Result<String, String> {
+    let store = learning.store.clone();
+    run_blocking(move || {
+        store
+            .candidate(&candidate_id)
+            .map(|candidate| reflection_brief(&candidate))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -181,10 +218,11 @@ pub async fn skill_learning_plan_evaluation(
 pub async fn skill_learning_report_evaluation(
     learning: tauri::State<'_, SkillLearningCommandState>,
     evaluation_id: String,
+    mode: EvaluationMode,
     reports: Vec<EvaluationCaseReport>,
 ) -> Result<EvaluationRecord, String> {
     let store = learning.store.clone();
-    run_blocking(move || store.report_evaluation(&evaluation_id, &reports)).await
+    run_blocking(move || store.report_evaluation(&evaluation_id, mode, &reports)).await
 }
 
 #[tauri::command]
@@ -197,6 +235,56 @@ pub async fn skill_learning_mark_unevaluated(
     run_blocking(move || store.mark_unevaluated(&evaluation_id, &reason)).await
 }
 
+/// One disposable workspace per evaluation arm, all copied from the same
+/// starting state before any arm runs.
+///
+/// The source is resolved in the backend from the candidate's own recorded
+/// workspace — a runtime asks for sandboxes, it does not get to say what they
+/// are copies of. A workspace that is too large to copy within the store's
+/// bounds returns an error, which the caller records as `unevaluated`: an
+/// evaluation that cannot be reproduced is never a pass, and never runs
+/// against the user's live files.
+#[tauri::command]
+pub async fn skill_learning_create_sandboxes(
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    evaluation_id: String,
+    arms: Vec<String>,
+) -> Result<Vec<EvaluationSandbox>, String> {
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let source = store.evaluation_source_workspace(&evaluation_id)?.ok_or_else(|| {
+            crate::native_skills::SkillError::Invalid(
+                "this candidate has no recorded workspace, so no reproducible evaluation environment can be built"
+                    .to_string(),
+            )
+        })?;
+        let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms)?;
+        Ok(created
+            .into_iter()
+            .map(|(arm, path)| EvaluationSandbox {
+                arm,
+                path: path.to_string_lossy().to_string(),
+            })
+            .collect::<Vec<_>>())
+    })
+    .await
+}
+
+#[derive(serde::Serialize)]
+pub struct EvaluationSandbox {
+    pub arm: String,
+    pub path: String,
+}
+
+#[tauri::command]
+pub async fn skill_learning_destroy_sandboxes(
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    evaluation_id: String,
+) -> Result<(), String> {
+    let store = learning.store.clone();
+    run_blocking(move || store.destroy_eval_sandboxes(&evaluation_id)).await
+}
+
 #[tauri::command]
 pub async fn skill_learning_evaluations(
     learning: tauri::State<'_, SkillLearningCommandState>,
@@ -206,24 +294,31 @@ pub async fn skill_learning_evaluations(
     run_blocking(move || store.evaluations_for(&candidate_id)).await
 }
 
-/// The approve-and-install action. `approved` reaching this command is a
-/// decision made in the desktop UI's approval dialog; the store still
-/// re-derives the digest from the staged bytes and refuses anything the policy
-/// blocks.
+/// The approve-and-install action.
+///
+/// The approval itself is the app's own permission system — the same prompt,
+/// the same durable `permission_decisions` row, the same request id every
+/// other gated operation produces. This command never takes an "approved"
+/// boolean from the UI: it describes exactly what would be installed, asks,
+/// and only on an allow decision hands the store an [`ApprovalGrant`] bound to
+/// the digest of the candidate the user was shown. A candidate that is edited
+/// or re-staged in between recomputes to a different digest, and the grant
+/// stops authorizing it.
 ///
 /// `unattended` marks the auto-promote path instead, which is strictly
 /// *narrower* than an approval, never wider: it additionally requires the
 /// user's configured mode to allow unattended promotion, the policy to have
-/// found nothing needing approval, and the evaluation to have passed. It can
-/// therefore never install something an explicit approval could not.
+/// found nothing needing approval, and a real isolated evaluation to have
+/// passed. It can therefore never install something an explicit approval
+/// could not.
 #[tauri::command]
 pub async fn skill_learning_promote(
+    app: tauri::AppHandle,
     window: tauri::Window,
     state: tauri::State<'_, AppState>,
     native: tauri::State<'_, NativeSkillsCommandState>,
     learning: tauri::State<'_, SkillLearningCommandState>,
     candidate_id: String,
-    approved: bool,
     unattended: Option<bool>,
 ) -> Result<PromotionOutcome, String> {
     require_main_window(&window)?;
@@ -231,17 +326,115 @@ pub async fn skill_learning_promote(
     let manager = native.manager.clone();
     let store = learning.store.clone();
     let unattended = unattended.unwrap_or(false);
+    if unattended {
+        return run_blocking(move || {
+            store.promote(&candidate_id, None, true, &manager, workspace.as_deref())
+        })
+        .await;
+    }
+
+    let candidate = {
+        let store = learning.store.clone();
+        let candidate_id = candidate_id.clone();
+        run_blocking(move || store.candidate(&candidate_id)).await?
+    };
+    let operation_sha256 = approval_operation_digest(&candidate);
+    let approval_id = crate::permissions::request_permission(
+        &app,
+        state.inner(),
+        "install_learned_skill",
+        promotion_detail(&candidate, &operation_sha256),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let grant = ApprovalGrant {
+        approval_id,
+        operation_sha256,
+    };
     run_blocking(move || {
         store.promote(
             &candidate_id,
-            approved && !unattended,
-            unattended,
+            Some(&grant),
+            false,
             &manager,
             workspace.as_deref(),
-            None,
         )
     })
     .await
+}
+
+/// Everything the approval covers, in the words the user decides on. The
+/// digest is part of the text as well as of the grant, so the record of what
+/// was approved and the thing that authorizes the install cannot drift apart.
+fn promotion_detail(candidate: &LearningCandidate, operation_sha256: &str) -> String {
+    let mut lines = vec![
+        format!(
+            "Install /{} as a {:?}-scope learned skill",
+            candidate.proposed_command, candidate.scope
+        ),
+        format!("Package digest: {}", candidate.candidate_sha256),
+        format!(
+            "Tools while active: {}",
+            if candidate.allowed_tools.is_empty() {
+                "unrestricted (the run's own permissions still apply)".to_string()
+            } else {
+                candidate.allowed_tools.join(", ")
+            }
+        ),
+    ];
+    if !candidate.requirements.bins.is_empty() {
+        lines.push(format!(
+            "Requires executables: {}",
+            candidate
+                .requirements
+                .bins
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !candidate.requirements.env.is_empty() {
+        lines.push(format!(
+            "Requires environment: {}",
+            candidate
+                .requirements
+                .env
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(parent) = &candidate.parent_skill_sha256 {
+        lines.push(format!(
+            "Replaces version {} (kept for rollback)",
+            &parent[..parent.len().min(12)]
+        ));
+    }
+    if let Some(policy) = &candidate.policy {
+        if !policy.approval_reasons.is_empty() {
+            lines.push(format!(
+                "Needs approval because {}",
+                policy.approval_reasons.join("; ")
+            ));
+        }
+    }
+    lines.push(match candidate.evaluation_verdict {
+        Some(crate::skill_learning::EvaluationVerdict::Passed) => {
+            format!(
+                "Evaluation: passed ({})",
+                candidate.evaluation_ids.join(", ")
+            )
+        }
+        Some(crate::skill_learning::EvaluationVerdict::Failed) => "Evaluation: FAILED".to_string(),
+        _ => "Evaluation: not evaluated".to_string(),
+    });
+    lines.push(format!("Approval digest: {operation_sha256}"));
+    lines.join("\n")
 }
 
 #[tauri::command]
@@ -254,13 +447,88 @@ pub async fn skill_learning_reject(
     run_blocking(move || store.reject(&candidate_id, &reason)).await
 }
 
+/// Finalizes effectiveness for one run that has reached a terminal state —
+/// completed, failed or cancelled alike.
+///
+/// Everything is read from the run's own durable events: which learned
+/// versions it invoked (its `skill_invoked` events), how it ended, what its
+/// last verification said, and which tool calls failed. The caller supplies
+/// only the identity of the run and the session it belonged to, so no
+/// frontend can attribute an outcome to a version that run never used.
 #[tauri::command]
-pub async fn skill_learning_record_use(
+pub async fn skill_learning_finalize_run(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     learning: tauri::State<'_, SkillLearningCommandState>,
-    report: SkillUsageReport,
-) -> Result<Option<LearningCandidate>, String> {
+    run_id: String,
+    session_id: Option<String>,
+) -> Result<Vec<LearningCandidate>, String> {
+    let Some(evidence) = run_evidence(&app, &state, &run_id, "") else {
+        return Ok(Vec::new());
+    };
     let store = learning.store.clone();
-    run_blocking(move || store.record_use(&report)).await
+    run_blocking(move || store.record_run(&evidence, session_id.as_deref())).await
+}
+
+/// Attributes a correction to the learned version the session's previous turn
+/// actually used. The corrected run's own outcome is read from the durable
+/// ledger — a correction only becomes an update candidate when the corrected
+/// procedure really executed and verified.
+#[tauri::command]
+pub async fn skill_learning_record_correction(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    session_id: String,
+    run_id: String,
+    user_text: String,
+) -> Result<Option<LearningCandidate>, String> {
+    let evidence = run_evidence(&app, &state, &run_id, &user_text);
+    let corrected = CorrectedExecution {
+        user_text,
+        succeeded: evidence.as_ref().is_some_and(|entry| {
+            entry.completed && !entry.failed && !entry.successful_tools().is_empty()
+        }),
+        verification_passed: evidence.as_ref().and_then(|entry| {
+            entry
+                .verifications
+                .iter()
+                .max_by_key(|verification| verification.sequence)
+                .map(|verification| verification.passed)
+        }),
+        event_ids: evidence
+            .as_ref()
+            .map(|entry| {
+                entry
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.event_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        evidence,
+    };
+    let store = learning.store.clone();
+    run_blocking(move || store.record_correction(&session_id, &run_id, &corrected)).await
+}
+
+/// The bounded projection of one run's durable events. `None` when the run has
+/// no events this process can read — an honest absence, never a fabricated
+/// snapshot.
+fn run_evidence(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    run_id: &str,
+    user_text: &str,
+) -> Option<RunEvidence> {
+    let events: Vec<RunEventEnvelope> = with_ledger(app, state, |ledger| {
+        ledger.load_events(run_id, 0, crate::skill_learning::MAX_SOURCE_EVENTS * 8)
+    })
+    .ok()?;
+    if events.is_empty() {
+        return None;
+    }
+    Some(evidence_from_events(run_id, user_text, &events))
 }
 
 #[tauri::command]

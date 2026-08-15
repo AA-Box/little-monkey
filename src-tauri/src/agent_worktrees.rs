@@ -367,8 +367,17 @@ pub fn resolve_with_override(
         Some(root) => {
             let data_root = crate::app_paths::data_dir()
                 .ok_or_else(|| "Could not resolve the application data directory".to_string())?;
-            let record = require_registered(&data_root, root)?;
-            let canon = PathBuf::from(&record.path);
+            // Two kinds of directory this app creates for tools to be pointed
+            // at: a managed agent worktree, and a disposable learning
+            // evaluation sandbox. Both are marker-verified inside app-owned
+            // roots, so an override can still only ever name one of them.
+            let canon = match require_registered(&data_root, root) {
+                Ok(record) => PathBuf::from(&record.path),
+                Err(worktree_error) => {
+                    crate::skill_learning::require_eval_sandbox(&data_root, root)
+                        .map_err(|_| worktree_error)?
+                }
+            };
             let resolved = workspace::resolve_in_root(&canon, raw)?;
             Ok((resolved, canon))
         }

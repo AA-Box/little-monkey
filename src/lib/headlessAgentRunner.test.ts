@@ -136,6 +136,15 @@ describe('runHeadlessAgent', () => {
       outcome: 'completed',
       summary: 'Implemented and verified.',
       durableRunId: 'durable-run-1',
+      // What the run actually did, as opposed to what the model asked for.
+      // No tool ran here, so nothing is claimed to have.
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 12,
+        completionTokens: 4,
+      },
     });
     expect(mocks.beginDurableRun).toHaveBeenCalledWith(expect.objectContaining({
       runId: 'run-1',
@@ -236,6 +245,9 @@ describe('runHeadlessAgent', () => {
     const result = await runHeadlessAgent(params);
 
     expect(result.outcome).toBe('completed');
+    // Only a call that reached the executor is reported as having run.
+    expect(result.evidence.executedTools).toEqual([call.function.name]);
+    expect(result.evidence.toolFailures).toEqual([]);
     expect(mocks.executeToolCall).toHaveBeenCalledWith(
       call,
       null,
@@ -246,6 +258,11 @@ describe('runHeadlessAgent', () => {
       undefined,
       undefined,
       'test-source',
+      undefined,
+      undefined,
+      // No workspace override configured for this run, so the call resolves
+      // against the primary workspace exactly as before.
+      undefined,
     );
     expect(onToolActivity).toHaveBeenCalledWith('run_shell');
     expect(recorder.recordToolProposed).toHaveBeenCalledWith(
@@ -305,6 +322,13 @@ describe('runHeadlessAgent', () => {
       outcome: 'cancelled',
       summary: 'Cancelled by the user.',
       durableRunId: 'durable-run-1',
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 0,
+        completionTokens: 0,
+      },
     });
     expect(mocks.attemptStream).not.toHaveBeenCalled();
     expect(recorder.cancel).toHaveBeenCalledWith('Cancelled by the user.');
@@ -324,6 +348,13 @@ describe('runHeadlessAgent', () => {
       outcome: 'error',
       summary: 'provider unavailable',
       durableRunId: 'durable-run-1',
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 0,
+        completionTokens: 0,
+      },
     });
     expect(recorder.fail).toHaveBeenCalledWith('provider unavailable');
   });
@@ -345,6 +376,7 @@ describe('runHeadlessAgent', () => {
     );
     expect(mocks.attemptStream).toHaveBeenCalledTimes(2);
     expect(mocks.executeToolCall).toHaveBeenCalledTimes(2);
+    expect(result.evidence.executedTools).toEqual(['read_file', 'read_file']);
     expect(recorder.fail).toHaveBeenCalledWith(result.summary);
   });
 });

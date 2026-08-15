@@ -753,8 +753,16 @@ fn run_learned(
                 .map_err(|error| format!("read {}: {error}", report.display()))?;
             let reports: Vec<EvaluationCaseReport> =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            // A CLI-supplied report file describes what some runtime did; it
+            // is recorded as a preflight result, which can never carry a
+            // promotion-grade pass. Only the app's own isolated executor,
+            // which really runs the arms, reports `real_isolated`.
             let record = store
-                .report_evaluation(&plan.evaluation_id, &reports)
+                .report_evaluation(
+                    &plan.evaluation_id,
+                    little_monkey_lib::skill_learning::EvaluationMode::Preflight,
+                    &reports,
+                )
                 .map_err(|error| error.to_string())?;
             println!("{:?}: {}", record.verdict, record.summary);
             Ok(())
@@ -782,8 +790,22 @@ fn run_learned(
                 }
                 return Err("Promotion requires --yes".to_string());
             }
+            // `--yes` is a real, explicit user decision, and it produces a
+            // real approval record: an id that is auditable afterwards and a
+            // digest bound to exactly this version of the candidate. If the
+            // candidate is re-staged between the two calls, the digest no
+            // longer matches and the promotion parks instead of installing.
+            let candidate = store
+                .candidate(candidate_id)
+                .map_err(|error| error.to_string())?;
+            let grant = little_monkey_lib::skill_learning::ApprovalGrant {
+                approval_id: format!("cli:{}", uuid::Uuid::new_v4().simple()),
+                operation_sha256: little_monkey_lib::skill_learning::approval_operation_digest(
+                    &candidate,
+                ),
+            };
             let outcome = store
-                .promote(candidate_id, true, false, &manager, workspace, None)
+                .promote(candidate_id, Some(&grant), false, &manager, workspace)
                 .map_err(|error| error.to_string())?;
             match outcome {
                 PromotionOutcome::Promoted {

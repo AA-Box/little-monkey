@@ -98,6 +98,11 @@ monkey skills learned reject <candidate-id> [--reason <text>]
 monkey skills learned deprecate <command> [--scope global|workspace]
 monkey skills learned mode [off|suggest-only|auto-stage|auto-promote-safe]
 
+# `learned evaluate --report` records a preflight result: it describes what some
+# runtime did, and can never back an unattended promotion. Only the app's own
+# isolated executor, which really runs the arms in disposable workspace copies,
+# produces a promotion-grade pass.
+
 monkey plugins list [--json]
 monkey plugins health [--json]
 monkey security audit [--deep] [--fix] [--json]

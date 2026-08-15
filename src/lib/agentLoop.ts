@@ -27,7 +27,14 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
 import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
-import { candidateNotice, learnFromFinishedRun, recordSkillUses, type InvokedSkillUse, type ReflectionCall } from './skillLearning';
+import {
+  candidateNotice,
+  finalizeLearningForRun,
+  formatLearningNotice,
+  learnFromFinishedRun,
+  type InvokedSkillUse,
+  type ReflectionCall,
+} from './skillLearning';
 import { cachedLearningMode } from './skillLearningClient';
 import type { NativeSkillScope } from './nativeSkillsClient';
 import { mcpToolDefs } from './mcpTools';
@@ -922,6 +929,47 @@ function buildVerifyOutput(result: VerifyRunResult): string {
   return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
 }
 
+/**
+ * Runs the workspace's own configured verification commands inside one
+ * learning-evaluation sandbox, and reports whether they passed.
+ *
+ * Same config and same Rust runner the ordinary post-turn phase uses — only
+ * the working directory differs, and Rust accepts that directory only for a
+ * marker-verified sandbox this app created. `null` means the workspace has no
+ * verification configured, which is reported as "no result", never as a pass:
+ * an evaluation may not claim a verification that never ran.
+ */
+export async function runSandboxVerification(
+  sandboxPath: string,
+  turnId: string,
+  signal?: AbortSignal,
+): Promise<{ passed: boolean; detail: string } | null> {
+  let config: VerifyConfig;
+  try {
+    config = await invoke<VerifyConfig>('verify_get_config', {});
+  } catch {
+    return null;
+  }
+  const enabled = config.commands.filter((command) => command.enabled);
+  if (enabled.length === 0) return null;
+  for (const command of enabled) {
+    if (signal?.aborted) return null;
+    try {
+      const result = await invoke<VerifyRunResult>('verify_run', {
+        commandId: command.id,
+        turnId,
+        sandboxPath,
+      });
+      if (result.timedOut || result.code !== 0) {
+        return { passed: false, detail: `${result.label}: ${buildVerifyOutput(result).slice(0, 400)}` };
+      }
+    } catch (err) {
+      return { passed: false, detail: `${command.label}: ${errorMessage(err)}` };
+    }
+  }
+  return { passed: true, detail: `${enabled.length} verification command(s) passed` };
+}
+
 /** The first failed command from a `runVerificationPhase` pass — enough
  * detail to build the feed-back-to-the-model fix instruction in
  * `runAgentTurnBody`. `null` when every command passed (or none ran). */
@@ -1504,24 +1552,30 @@ interface DurableTurnContext {
 const MAX_RECORDED_TOOL_FAILURES = 8;
 
 /**
- * The native skills a finished turn actually invoked, paired with the exact
- * content hash each one was frozen at. Local prompt skills and signed
- * packages are excluded: neither can be a learned skill, and neither carries a
- * content hash the learning store could attribute an outcome to.
+ * One invoked native skill, paired with the exact content hash it was frozen
+ * at. Local prompt skills and signed packages are excluded: neither can be a
+ * learned skill, and neither carries a content hash an outcome could be
+ * attributed to.
  *
  * Scope comes from the descriptor id `nativeSkills` built (`native:<scope>:…`)
  * rather than from a second lookup, so it always agrees with the root the
  * skill was actually discovered in.
  */
-function invokedSkillUses(context: SkillToolContext | null): InvokedSkillUse[] {
-  if (!context) return [];
-  return context.availableSkills
-    .filter((skill) => skill.source === 'native' && context.invokedCommands.has(skill.command))
-    .flatMap((skill) => {
-      const scope = skill.id.split(':')[1];
-      if (scope !== 'global' && scope !== 'workspace') return [];
-      return [{ command: skill.command, scope, sha256: skill.contentSha256 }];
-    });
+export function skillUse(skill: SlashSkill): InvokedSkillUse | null {
+  if (skill.source !== 'native') return null;
+  const scope = skill.id.split(':')[1];
+  if (scope !== 'global' && scope !== 'workspace') return null;
+  return { command: skill.command, scope, sha256: skill.contentSha256 };
+}
+
+/** Writes the durable `skill_invoked` event for one invocation. The run's own
+ * record of WHICH version it ran — the only thing a later effectiveness,
+ * correction or regression judgement can honestly be keyed to, since the
+ * installed version can have moved on (or been rolled back) by then. */
+function recordSkillInvocation(durable: DurableTurnContext, skill: SlashSkill): void {
+  const use = skillUse(skill);
+  if (!use) return;
+  durable.recorder?.recordSkillInvoked(use.command, use.scope, use.sha256);
 }
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
@@ -2289,19 +2343,16 @@ async function runTurnGuarded(
             : durable.recorder.complete('Desktop turn completed');
       await terminal.catch((error) => console.error('Failed to finalize durable run', error));
 
-      // Learning runs strictly AFTER the run is durably complete, and only
-      // for a run that actually completed: the backend classifies the signal
-      // from that run's own terminal events, so a cancelled or failed turn is
-      // simply not a candidate. Everything here is best-effort — a turn that
-      // already succeeded must never surface a learning failure as its own.
-      if (cleanlyCompleted) {
-        await recordSkillUses(
-          sessionId,
-          durable.recorder.runId,
-          invokedSkillUses(durable.skills),
-          { succeeded: true, toolFailures: durable.toolFailures, userText },
-        );
-      }
+      // Learning runs strictly AFTER the run is durably complete.
+      //
+      // Effectiveness is finalized for EVERY terminal state — a failed or
+      // cancelled turn that used a learned skill is exactly the turn its
+      // history most needs — and the backend reads which versions the run
+      // used from the run's own durable events, so nothing here names a hash.
+      // Detection is the narrower half: only a run that actually completed
+      // can be a candidate. Everything is best-effort — a turn that already
+      // succeeded must never surface a learning failure as its own.
+      await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
       if (cleanlyCompleted && durable.reflect !== null) {
         const scope: NativeSkillScope =
           primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
@@ -2315,7 +2366,7 @@ async function runTurnGuarded(
         if (candidate) {
           useSessionStore.getState().addMessage(sessionId, {
             role: 'system',
-            content: candidateNotice(candidate),
+            content: formatLearningNotice(candidateNotice(candidate)),
           });
         }
       }
@@ -2800,8 +2851,14 @@ async function runAgentTurnBody(
     invokedCommands: invokedSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
     runId: durable.recorder?.runId,
+    onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
   durable.skills = skillToolContext;
+  // Explicit `/command` invocations are already frozen into the system prompt
+  // by the time the loop starts, so they are recorded here rather than through
+  // `onInvoked` — the event has to name every version this run used, not only
+  // the ones the model picked itself.
+  for (const invocation of skillInvocations) recordSkillInvocation(durable, invocation.skill);
   const skillToolEnabled =
     settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);

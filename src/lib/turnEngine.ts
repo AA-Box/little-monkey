@@ -502,6 +502,12 @@ export interface SkillToolContext {
    * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
    * already enforces for stacked explicit invocations. */
   maxSkillsPerTurn: number;
+  /** Called with each skill this turn actually invokes, at the moment the
+   * invocation is recorded — the seam the durable `skill_invoked` event is
+   * written from (see `agentLoop.ts`'s `recordSkillInvocation`). A callback
+   * rather than a recorder handle for the same reason `onRoutingDecision` is:
+   * this module never learns what a durable run is. */
+  onInvoked?: (skill: SlashSkill) => void;
   /** This turn's durable run id, injected as `manage_skill_learning`'s
    * `run_id` (see `RESERVED_ARGS`). Lives here rather than as a thirteenth
    * positional parameter because it is skill-adjacent bookkeeping and every
@@ -892,6 +898,7 @@ async function executeToolCallInner(
       // synchronous bookkeeping (no `await` happens between the checks above
       // and this line).
       skill.invokedCommands.add(command);
+      skill.onInvoked?.(matched);
       const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
       return formatSkillToolResult(matched, argumentsText);
     } catch (err) {
