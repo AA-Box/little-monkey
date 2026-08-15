@@ -279,6 +279,24 @@ describe("running one leased command", () => {
     expect(answer.action).toBe("refused");
     expect(device.effects).toEqual([]);
     expect(device.transport.state.resultBodies[0].outcome).toBe("failed");
+    // Reported from the far side of the authorization boundary, because that is
+    // the only side a terminal report is accepted from — the runner refuses one
+    // for a command it never authorized, and it is right to.
+    expect(device.transport.calls[0]).toContain("/start");
+  });
+
+  it("lets the runner resolve a command cancelled before it was started", async () => {
+    const device = deviceFixture();
+    const answer = await runLeasedCommand({ ...COMMAND, cancel_requested: true }, device.deps);
+    expect(answer.action).toBe("cancelled_before_start");
+    expect(device.effects).toEqual([]);
+    // Asked to start, which the runner refuses and records as the cancellation
+    // it is. A device that could post a terminal result for a command it never
+    // started could post one for any command it was ever handed.
+    expect(device.transport.calls).toEqual([
+      "POST /v1/remote/device/commands/dcmd-camera-1/start",
+    ]);
+    expect(device.transport.state.resultBodies).toEqual([]);
   });
 
   it("cancels the work when the control channel says cancellation was asked for", async () => {

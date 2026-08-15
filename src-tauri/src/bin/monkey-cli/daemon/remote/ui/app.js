@@ -565,18 +565,41 @@ function endRequest(success) {
 // first. Nothing is lost: the poll is a question about state, the watcher asks
 // it again straight afterwards, and cancelling a request that has already been
 // counted by the runner costs one sequence number.
+//
+// Registered *before* the lock is asked for, and the same signal cancels the
+// lock request itself: a long poll that is still queued for the lock is exactly
+// as much in the way as one that holds it, and registering only once it was
+// granted left a window where an ordinary request found nothing to cancel and
+// then waited out the poll it had just missed.
 let pendingLongPoll = null;
 
 async function signedRequest(method, pathAndQuery, bodyValue, options = {}) {
   if (!options.longPoll) pendingLongPoll?.abort();
-  return navigator.locks.request(
-    "little-monkey-remote-command-v1",
-    { mode: "exclusive" },
-    () => signedRequestExclusive(method, pathAndQuery, bodyValue, options),
-  );
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  if (options.signal?.aborted) cancel();
+  options.signal?.addEventListener?.("abort", cancel, { once: true });
+  if (options.longPoll) pendingLongPoll = controller;
+  try {
+    return await navigator.locks.request(
+      "little-monkey-remote-command-v1",
+      { mode: "exclusive", signal: controller.signal },
+      () => signedRequestExclusive(method, pathAndQuery, bodyValue, controller),
+    );
+  } catch (error) {
+    // The lock request itself was cancelled while queued. Same answer as a
+    // cancelled fetch: nothing was sent, nothing is inferred.
+    if (controller.signal.aborted && !(error instanceof RemoteError)) {
+      throw new RemoteError("This request was cancelled on the device", 0, { cancelled: true });
+    }
+    throw error;
+  } finally {
+    options.signal?.removeEventListener?.("abort", cancel);
+    if (pendingLongPoll === controller) pendingLongPoll = null;
+  }
 }
 
-async function signedRequestExclusive(method, pathAndQuery, bodyValue, options = {}) {
+async function signedRequestExclusive(method, pathAndQuery, bodyValue, controller) {
   if (!/^\/v1\/remote\//u.test(pathAndQuery) || /[\r\n]/u.test(pathAndQuery)) {
     throw new Error("Controller request path is outside the remote API");
   }
@@ -612,14 +635,6 @@ async function signedRequestExclusive(method, pathAndQuery, bodyValue, options =
   if (bodyValue !== undefined) headers.set("content-type", "application/json");
 
   beginRequest();
-  // One controller for the underlying fetch, fed by the caller's signal where
-  // there is one. Without this a cancelled long poll would keep the lock — and
-  // the request — until the runner or the network decided otherwise.
-  const controller = new AbortController();
-  const cancel = () => controller.abort();
-  if (options.signal?.aborted) cancel();
-  options.signal?.addEventListener?.("abort", cancel, { once: true });
-  if (options.longPoll) pendingLongPoll = controller;
   let lastNetworkError = null;
   let succeeded = false;
   try {
@@ -671,8 +686,6 @@ async function signedRequestExclusive(method, pathAndQuery, bodyValue, options =
       `Runner is unreachable after replay-safe retries. No cancellation was inferred. ${lastNetworkError?.message || ""}`.trim(),
     );
   } finally {
-    options.signal?.removeEventListener?.("abort", cancel);
-    if (pendingLongPoll === controller) pendingLongPoll = null;
     endRequest(succeeded);
   }
 }
@@ -2983,7 +2996,14 @@ async function reconcileRunningCommands() {
       artifactBytes: 0,
     });
     try {
-      await reportCommand(command.command_id, report, entry?.executionId ?? null);
+      // The runner's own execution id when this device has lost its journal:
+      // a terminal report has to name the execution that holds the command, and
+      // `/recover` is where the holder is stated.
+      await reportCommand(
+        command.command_id,
+        report,
+        entry?.executionId ?? command.execution_id ?? null,
+      );
       await journalWrite({
         commandId: command.command_id,
         capability: command.capability,

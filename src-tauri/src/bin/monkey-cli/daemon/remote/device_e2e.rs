@@ -362,9 +362,23 @@ mod tests {
                     // Started, and nothing survived to say what happened. The
                     // effect is NOT repeated; the outcome is reported unknown.
                     other => {
-                        let execution_id = other
-                            .map(|entry| entry.execution_id)
-                            .unwrap_or_else(|| "exec-unknown-0000".to_string());
+                        // The journal's execution id, or — when this device has
+                        // lost its journal entirely — the one the runner just
+                        // named on `/recover`. A terminal report has to name the
+                        // execution that holds the command, and inventing an id
+                        // is refused exactly as a second execution's would be.
+                        let execution_id =
+                            other.map(|entry| entry.execution_id).unwrap_or_else(|| {
+                                command["execution_id"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string()
+                            });
+                        let execution_id = if execution_id.is_empty() {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::Value::String(execution_id)
+                        };
                         self.json(
                             "POST",
                             &format!("/v1/remote/device/commands/{command_id}/result"),

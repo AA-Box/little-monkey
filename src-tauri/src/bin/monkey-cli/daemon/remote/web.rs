@@ -584,8 +584,28 @@ mod tests {
         assert!(core.contains("const physical = new AbortController()"));
         assert!(core.contains("const watcher = new AbortController()"));
         // …and the request layer has to honour that signal, or nothing above is
-        // true: a long poll that cannot be cancelled is waited out.
+        // true: a long poll that cannot be cancelled is waited out. Both halves
+        // are needed — the fetch, and the queue for the request lock, since a
+        // poll still waiting for the lock is as much in the way as one holding
+        // it, and it must be registered before it asks rather than after it is
+        // granted.
         assert!(javascript.contains("signal: controller.signal"));
+        assert!(javascript.contains("{ mode: \"exclusive\", signal: controller.signal }"));
+        let request_layer = javascript
+            .split_once("async function signedRequest(")
+            .and_then(|(_, tail)| tail.split_once("async function signedRequestExclusive"))
+            .map(|(body, _)| body.to_string())
+            .expect("app.js still declares the signed request layer");
+        let registered = request_layer
+            .find("pendingLongPoll = controller")
+            .expect("a long poll registers itself");
+        let asks = request_layer
+            .find("navigator.locks.request")
+            .expect("a signed request takes the request lock");
+        assert!(
+            registered < asks,
+            "a long poll must be cancellable while it is still queued for the lock"
+        );
         // The recovery route is a reconciliation, never a second lease.
         assert!(javascript.contains("\"GET\", \"/v1/remote/device/commands/recover\""));
         // Coming back online wakes the outbox. This is the one thing that

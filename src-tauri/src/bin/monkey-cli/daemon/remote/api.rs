@@ -2399,16 +2399,47 @@ impl RemoteApi {
                 }
                 true
             } else {
+                // `/start` is the authorization boundary for a physical effect,
+                // so a terminal report is only meaningful from the far side of
+                // it. Accepting one for a `queued` or `leased` command would let
+                // an authenticated device answer for an action the runner never
+                // authorized — and skip the readiness, grant and cancellation
+                // checks that boundary exists to make.
+                if existing.state != DeviceCommandState::Running {
+                    return Err((
+                        409,
+                        format!(
+                            "This command is {} and has not been started; a result can only be \
+                             reported for a running command",
+                            existing.state.as_str()
+                        ),
+                    ));
+                }
                 // Ownership is settled before the artifact is published, not
                 // after: an execution that does not hold this command must not
                 // be able to write over the artifact path of the one that does.
-                if let (Some(held), Some(offered)) =
-                    (&existing.execution_id, result.execution_id.as_deref())
-                {
-                    if held != offered {
+                //
+                // A missing identity is refused as firmly as a wrong one. The
+                // pair-of-`Some`s test it replaces let an omitted `execution_id`
+                // through — the one form a second execution can always produce.
+                match (&existing.execution_id, result.execution_id.as_deref()) {
+                    (Some(held), Some(offered)) if held == offered => {}
+                    (Some(_), _) => {
                         return Err((
                             409,
-                            "This result belongs to a different execution of the command"
+                            "This result does not name the execution that holds the command"
+                                .to_string(),
+                        ));
+                    }
+                    // Started by a build that had no execution identity to give.
+                    // Both ends must be silent about it: an id offered against a
+                    // command that never recorded one proves nothing.
+                    (None, None) => {}
+                    (None, Some(_)) => {
+                        return Err((
+                            409,
+                            "This command was started without an execution identity and cannot be \
+                             completed under one"
                                 .to_string(),
                         ));
                     }
@@ -6091,6 +6122,27 @@ mod tests {
         crate::daemon::remote::store::DeviceRecord,
         String,
     ) {
+        command_fixture(Stage::Running(Some("exec-race-0001")))
+    }
+
+    /// How far along its lifecycle a fixture's command has travelled.
+    #[derive(Clone, Copy)]
+    enum Stage {
+        Queued,
+        Leased,
+        /// Started, naming an execution — or, with `None`, started by a build
+        /// that had no execution identity to give.
+        Running(Option<&'static str>),
+    }
+
+    fn command_fixture(
+        stage: Stage,
+    ) -> (
+        PathBuf,
+        RemoteApi,
+        crate::daemon::remote::store::DeviceRecord,
+        String,
+    ) {
         let (root, api, _secrets, device_id, secret) = fixture();
         grant(&api, &device_id, &[DeviceCapability::CameraCapture]);
         advertise(
@@ -6119,33 +6171,41 @@ mod tests {
                 2_000,
             )
             .unwrap();
-        let leased = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                2,
-                "cmd-race-lease",
-                "GET",
-                "/v1/remote/device/commands/next",
-                b"",
-            ),
-            2_000,
-        );
-        assert_eq!(leased.status, 200);
-        let start_path = format!("/v1/remote/device/commands/{}/start", queued.command_id);
-        let started = api.handle(
-            signed(
-                &device_id,
-                &secret,
-                3,
-                "cmd-race-start",
-                "POST",
-                &start_path,
-                br#"{"execution_id":"exec-race-0001"}"#,
-            ),
-            2_000,
-        );
-        assert_eq!(started.status, 200);
+        if !matches!(stage, Stage::Queued) {
+            let leased = api.handle(
+                signed(
+                    &device_id,
+                    &secret,
+                    2,
+                    "cmd-race-lease",
+                    "GET",
+                    "/v1/remote/device/commands/next",
+                    b"",
+                ),
+                2_000,
+            );
+            assert_eq!(leased.status, 200);
+        }
+        if let Stage::Running(execution_id) = stage {
+            let body = match execution_id {
+                Some(value) => format!(r#"{{"execution_id":"{value}"}}"#).into_bytes(),
+                None => b"{}".to_vec(),
+            };
+            let start_path = format!("/v1/remote/device/commands/{}/start", queued.command_id);
+            let started = api.handle(
+                signed(
+                    &device_id,
+                    &secret,
+                    3,
+                    "cmd-race-start",
+                    "POST",
+                    &start_path,
+                    &body,
+                ),
+                2_000,
+            );
+            assert_eq!(started.status, 200);
+        }
         let device = api
             .store
             .lock()
@@ -6157,6 +6217,10 @@ mod tests {
     }
 
     fn camera_report(bytes: &[u8], execution_id: &str) -> Vec<u8> {
+        report_body(bytes, Some(execution_id))
+    }
+
+    fn report_body(bytes: &[u8], execution_id: Option<&str>) -> Vec<u8> {
         serde_json::to_vec(&DeviceCommandResult {
             protocol_version: REMOTE_PROTOCOL_VERSION,
             outcome: DeviceCommandState::Succeeded,
@@ -6165,9 +6229,136 @@ mod tests {
             artifact_media_type: Some("image/jpeg".into()),
             artifact_sha256: Some(sha256_hex(bytes)),
             error: None,
-            execution_id: Some(execution_id.to_string()),
+            execution_id: execution_id.map(str::to_string),
         })
         .unwrap()
+    }
+
+    fn artifact_path(root: &std::path::Path, command_id: &str) -> PathBuf {
+        root.join("daemon/device-artifacts").join(command_id)
+    }
+
+    /// `/start` is the authorization boundary, so a terminal report is only
+    /// meaningful from the far side of it.
+    ///
+    /// Before this, an authenticated device could take a command straight from
+    /// `queued` — or from `leased`, without ever asking — to `succeeded`, which
+    /// skips every check that boundary exists to make: the grant, the readiness,
+    /// the cancellation, and the record of *which* execution is answering.
+    #[test]
+    fn a_result_for_a_command_that_was_never_started_is_refused() {
+        for (stage, expected) in [
+            (Stage::Queued, DeviceCommandState::Queued),
+            (Stage::Leased, DeviceCommandState::Leased),
+        ] {
+            let (root, api, device, command_id) = command_fixture(stage);
+            let body = camera_report(b"never-authorized", "exec-invented-1");
+            let (status, message) = api
+                .device_command_result(&body, &device, &command_id, 2_100)
+                .expect_err("a command that was never started has no result to report");
+            assert_eq!(status, 409, "{message}");
+            assert_eq!(
+                api.store
+                    .lock()
+                    .unwrap()
+                    .device_command(&command_id)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                expected,
+                "a refused report must not move the command"
+            );
+            assert!(
+                !artifact_path(&root, &command_id).exists(),
+                "a refused report must not publish an artifact"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A running command answers only to the execution that holds it.
+    ///
+    /// Including the silent case: an omitted `execution_id` is the one form any
+    /// second execution can always produce, so it is refused exactly as firmly
+    /// as a wrong one.
+    #[test]
+    fn a_running_command_accepts_only_its_own_executions_result() {
+        for (offered, accepted) in [
+            (None, false),
+            (Some("exec-somebody-el"), false),
+            (Some("exec-race-0001"), true),
+        ] {
+            let (root, api, device, command_id) = running_command_fixture();
+            let body = report_body(b"jpeg-bytes", offered);
+            let answer = api.device_command_result(&body, &device, &command_id, 2_100);
+            let state = api
+                .store
+                .lock()
+                .unwrap()
+                .device_command(&command_id)
+                .unwrap()
+                .unwrap()
+                .state;
+            if accepted {
+                assert_eq!(answer.expect("the holder's result is accepted").0, 200);
+                assert_eq!(state, DeviceCommandState::Succeeded);
+                assert!(artifact_path(&root, &command_id).exists());
+            } else {
+                let (status, message) = answer.expect_err("only the holder may report");
+                assert_eq!(status, 409, "{message}");
+                assert_eq!(
+                    state,
+                    DeviceCommandState::Running,
+                    "a refused report must leave the command running"
+                );
+                assert!(
+                    !artifact_path(&root, &command_id).exists(),
+                    "a refused report must not publish an artifact"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A command started before execution identities existed stays completable.
+    ///
+    /// Both ends have to be silent about it. An id offered against a command
+    /// that never recorded one proves nothing, and accepting it would let a
+    /// second execution answer for the first.
+    #[test]
+    fn a_command_started_without_an_execution_identity_completes_without_one() {
+        let (root, api, device, command_id) = command_fixture(Stage::Running(None));
+        let (status, message) = api
+            .device_command_result(
+                &report_body(b"jpeg-bytes", Some("exec-invented-1")),
+                &device,
+                &command_id,
+                2_100,
+            )
+            .expect_err("an invented identity proves nothing about a command that recorded none");
+        assert_eq!(status, 409, "{message}");
+        assert!(!artifact_path(&root, &command_id).exists());
+
+        let (status, _, _) = api
+            .device_command_result(
+                &report_body(b"jpeg-bytes", None),
+                &device,
+                &command_id,
+                2_100,
+            )
+            .expect("a legacy start must stay completable");
+        assert_eq!(status, 200);
+        assert_eq!(
+            api.store
+                .lock()
+                .unwrap()
+                .device_command(&command_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeviceCommandState::Succeeded
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// What the runner holds, as two facts that must agree: the digest in the

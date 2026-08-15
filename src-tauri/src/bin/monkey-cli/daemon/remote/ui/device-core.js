@@ -746,17 +746,18 @@ export async function runLeasedCommand(command, deps) {
     return { action: "report_unknown", reason: decision.reason };
   }
   if (command.cancel_requested) {
-    await report(commandId, cancelledBeforeEffectReport("Cancelled before this device started it"));
+    // Answered by asking to start rather than by reporting a result. A command
+    // that has not been started is the runner's to resolve — it refuses the
+    // start and records the cancellation itself — and a device that could post
+    // a terminal report for a `leased` command could report one for any command
+    // it was ever handed, start or no start.
+    await request("POST", startPath, { execution_id: newExecutionId() }).catch(() => {});
     return { action: "cancelled_before_start" };
   }
   // Room for the result BEFORE the effect. Discovering there is nowhere to put
   // a photograph after taking it leaves a choice between losing it and evicting
   // somebody else's undelivered result; refusing up front keeps both.
   const refusal = capacityRefusal(await journal.all(), command.capability, artifactCeiling);
-  if (refusal) {
-    await report(commandId, { outcome: "failed", error: refusal });
-    return { action: "refused", reason: refusal };
-  }
 
   const executionId = newExecutionId();
   await journal.write({
@@ -811,22 +812,33 @@ export async function runLeasedCommand(command, deps) {
 
   const physical = new AbortController();
   const watcher = new AbortController();
-  const watching = watchCommandControl(commandId, {
-    request,
-    waitMs: controlWaitMs,
-    signal: watcher.signal,
-    onCancel: () => {
-      onCancelRequested(commandId);
-      physical.abort();
-    },
-  });
-  notify(command.capability);
+  // Nothing to watch when nothing will be performed.
+  const watching = refusal
+    ? null
+    : watchCommandControl(commandId, {
+        request,
+        waitMs: controlWaitMs,
+        signal: watcher.signal,
+        onCancel: () => {
+          onCancelRequested(commandId);
+          physical.abort();
+        },
+      });
 
   let outcome;
-  try {
-    outcome = await perform(command, physical.signal);
-  } catch (error) {
-    outcome = { outcome: "failed", error: String(error?.message || error) };
+  if (refusal) {
+    // The room check happened before the start, so no effect began — but the
+    // report still travels the ordinary way, because a `leased` command is the
+    // runner's to resolve and a terminal report is only meaningful from the far
+    // side of the authorization boundary.
+    outcome = { outcome: "failed", error: refusal };
+  } else {
+    notify(command.capability);
+    try {
+      outcome = await perform(command, physical.signal);
+    } catch (error) {
+      outcome = { outcome: "failed", error: String(error?.message || error) };
+    }
   }
   try {
     // Nothing between the effect's result and this write. Not the watcher, not
@@ -851,8 +863,8 @@ export async function runLeasedCommand(command, deps) {
     // Only now, and whatever happened above: the watcher's pending request is
     // cancelled rather than waited out.
     watcher.abort();
-    await watching.catch(() => {});
+    await watching?.catch(() => {});
   }
   await deliver(await journal.get(commandId));
-  return { action: "performed", executionId };
+  return { action: refusal ? "refused" : "performed", executionId, reason: refusal };
 }
