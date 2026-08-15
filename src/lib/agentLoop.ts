@@ -26,7 +26,10 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import { candidateNotice, learnFromFinishedRun, recordSkillUses, type InvokedSkillUse, type ReflectionCall } from './skillLearning';
+import { cachedLearningMode } from './skillLearningClient';
+import type { NativeSkillScope } from './nativeSkillsClient';
 import { mcpToolDefs } from './mcpTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
@@ -596,6 +599,7 @@ export function toolsForSettings(
   subagentsEnabled = false,
   skillToolEnabled = false,
   readSkillResourceToolEnabled = false,
+  skillLearningToolEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -607,6 +611,7 @@ export function toolsForSettings(
     ...(subagentsEnabled ? [TASK_TOOL, WORKFLOW_TOOL] : []),
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
+    ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
   ];
 }
 
@@ -1475,6 +1480,48 @@ function registerDurableController(
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  /** One-shot model call for the bounded learning reflection pass, built by
+   * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
+   * and consumed by `runAgentTurn`'s `finally` — the learning step can only
+   * run once the durable run is COMPLETE, because the backend classifies the
+   * signal from that run's own terminal events. `null` when the turn never
+   * got as far as resolving a target. */
+  reflect: ReflectionCall | null;
+  /** This turn's live skill context. Held by reference (not a copy) because
+   * `invokedCommands` is mutated in place as the turn runs, so
+   * `runAgentTurn`'s `finally` sees every skill the turn ended up using no
+   * matter which of this loop's early returns it took. */
+  skills: SkillToolContext | null;
+  /** Failing tool results this turn produced, classified exactly as the
+   * durable recorder classifies them. Part of a learned skill's effectiveness
+   * record, and the reason a turn that "completed" with three failed tool
+   * calls is not counted as a success for the skill it used. */
+  toolFailures: string[];
+}
+
+/** Cap on the failing tool results carried into a learned skill's
+ * effectiveness record — the record is a signal, not a log. */
+const MAX_RECORDED_TOOL_FAILURES = 8;
+
+/**
+ * The native skills a finished turn actually invoked, paired with the exact
+ * content hash each one was frozen at. Local prompt skills and signed
+ * packages are excluded: neither can be a learned skill, and neither carries a
+ * content hash the learning store could attribute an outcome to.
+ *
+ * Scope comes from the descriptor id `nativeSkills` built (`native:<scope>:…`)
+ * rather than from a second lookup, so it always agrees with the root the
+ * skill was actually discovered in.
+ */
+function invokedSkillUses(context: SkillToolContext | null): InvokedSkillUse[] {
+  if (!context) return [];
+  return context.availableSkills
+    .filter((skill) => skill.source === 'native' && context.invokedCommands.has(skill.command))
+    .flatMap((skill) => {
+      const scope = skill.id.split(':')[1];
+      if (scope !== 'global' && scope !== 'workspace') return [];
+      return [{ command: skill.command, scope, sha256: skill.contentSha256 }];
+    });
 }
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
@@ -2179,7 +2226,7 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null };
+  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2232,6 +2279,7 @@ async function runTurnGuarded(
           console.error('Failed to record cancellation request', error),
         );
       }
+      const cleanlyCompleted = !signal.aborted && thrown === null && durable.failure === null;
       const terminal = signal.aborted
         ? durable.recorder.cancel('Stopped by the user')
         : thrown !== null
@@ -2240,6 +2288,37 @@ async function runTurnGuarded(
             ? durable.recorder.fail(new Error(durable.failure), true)
             : durable.recorder.complete('Desktop turn completed');
       await terminal.catch((error) => console.error('Failed to finalize durable run', error));
+
+      // Learning runs strictly AFTER the run is durably complete, and only
+      // for a run that actually completed: the backend classifies the signal
+      // from that run's own terminal events, so a cancelled or failed turn is
+      // simply not a candidate. Everything here is best-effort — a turn that
+      // already succeeded must never surface a learning failure as its own.
+      if (cleanlyCompleted) {
+        await recordSkillUses(
+          sessionId,
+          durable.recorder.runId,
+          invokedSkillUses(durable.skills),
+          { succeeded: true, toolFailures: durable.toolFailures, userText },
+        );
+      }
+      if (cleanlyCompleted && durable.reflect !== null) {
+        const scope: NativeSkillScope =
+          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
+        const candidate = await learnFromFinishedRun(
+          durable.recorder.runId,
+          userText,
+          scope,
+          durable.reflect,
+          signal,
+        );
+        if (candidate) {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: candidateNotice(candidate),
+          });
+        }
+      }
     }
   }
 }
@@ -2720,7 +2799,9 @@ async function runAgentTurnBody(
     availableSkills,
     invokedCommands: invokedSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    runId: durable.recorder?.runId,
   };
+  durable.skills = skillToolContext;
   const skillToolEnabled =
     settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
@@ -2739,6 +2820,10 @@ async function runAgentTurnBody(
     settings.subagentsEnabled || ultracode,
     skillToolEnabled,
     readSkillResourceToolEnabled,
+    // The learning tool is a capability, so an unknown backend mode means
+    // "not offered" — see `cachedLearningMode`. It also needs a durable run:
+    // without one there is no evidence chain for a proposal to append to.
+    cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -2818,6 +2903,34 @@ async function runAgentTurnBody(
         },
         signal
       ),
+  };
+
+  // The bounded learning reflection pass shares `sendForSummary`/`classify`'s
+  // exact transport — one non-streaming, privacy-gated call against this
+  // turn's own target — and is stashed on the durable context because it can
+  // only run once `runAgentTurn`'s `finally` has completed the run.
+  durable.reflect = async (reflectionMessages, reflectionTools, reflectionSignal) => {
+    const prepared = await privacyGateWireForTarget(target, reflectionMessages);
+    if (!prepared) {
+      throw new Error('Privacy Firewall cancelled the learning reflection.');
+    }
+    const result = await attemptStream(
+      prepared.target,
+      prepared.messages,
+      reflectionTools,
+      reflectionSignal,
+      effort,
+      sessionId,
+      undefined,
+      true,
+      undefined,
+      durable.recorder?.runId,
+      // Side-channel work, like the risk judge — kept out of the turn's own
+      // token status line.
+      false,
+      { preGated: true },
+    );
+    return { content: result.content, toolCalls: result.toolCalls, streamError: result.streamError };
   };
 
   // Absolute paths this turn's `write_file`/`edit_file` calls have
@@ -3250,6 +3363,20 @@ async function runAgentTurnBody(
           Date.now() - toolStartedAt,
           result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
         );
+        // Failing results are also this turn's evidence about any learned
+        // skill it invoked (see `recordSkillUses`). Classified the same way
+        // `durableRun.ts`'s `resultOutcome` classifies it, and bounded so a
+        // pathological round cannot grow the record without limit.
+        if (result !== CANCELLED_TOOL_RESULT && durable.toolFailures.length < MAX_RECORDED_TOOL_FAILURES) {
+          try {
+            const parsed = JSON.parse(result) as { error?: unknown };
+            if (parsed && typeof parsed === 'object' && parsed.error) {
+              durable.toolFailures.push(`${toolCall.function.name}: ${String(parsed.error).slice(0, 200)}`);
+            }
+          } catch {
+            // A plain-text tool result is a success — nothing to record.
+          }
+        }
         return result;
       };
       // Reject (without executing) any call whose name wasn't actually

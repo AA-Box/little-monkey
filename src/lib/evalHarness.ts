@@ -19,7 +19,12 @@ import { errorMessage } from "./errors";
 export type EvalTarget =
   | { kind: "model" }
   | { kind: "agent" }
-  | { kind: "skill"; command: string }
+  /** An installed skill by command, or — when `instructions` is supplied — a
+   * skill package that is only staged and not installed yet. The staged form
+   * is what `skillLearningEval.ts` evaluates a learning candidate with: the
+   * candidate must be exercised BEFORE it is installed, so looking it up in
+   * the installed catalogue is not an option. */
+  | { kind: "skill"; command: string; instructions?: string; allowedTools?: string[] }
   | { kind: "connector"; serverId: string; toolName: string }
   | { kind: "workflow"; workflowId: string };
 
@@ -600,6 +605,9 @@ async function executeModelLike(
   testCase: EvalCase,
   runId: string,
   signal: AbortSignal,
+  /** A staged, not-yet-installed skill package to evaluate instead of looking
+   * `skillCommand` up in the installed catalogue. */
+  stagedSkill: { command: string; instructions: string; allowedTools: string[] } | null = null,
 ): Promise<EvalExecutionEvidence> {
   const target = await resolveTarget();
   if (signal.aborted) throw cancelledError();
@@ -611,9 +619,26 @@ async function executeModelLike(
     targetKind === "agent" ? "Behave as the agent under test and follow the tool allowlist exactly." : "Answer the case directly.",
   ].join("\n");
   if (skillCommand) {
-    const descriptors = await nativeSkillsClient.discover();
-    if (signal.aborted) throw cancelledError();
-    const skill = nativeSkills(descriptors).find((candidate) => candidate.command === skillCommand);
+    let skill: ReturnType<typeof nativeSkills>[number] | undefined;
+    if (stagedSkill) {
+      skill = {
+        id: `staged:${stagedSkill.command}`,
+        source: "native" as const,
+        command: stagedSkill.command,
+        name: stagedSkill.command,
+        description: "",
+        instructions: stagedSkill.instructions,
+        version: "staged",
+        contentSha256: "staged",
+        permissions: [],
+        allowedTools: stagedSkill.allowedTools,
+        resourceFiles: [],
+      };
+    } else {
+      const descriptors = await nativeSkillsClient.discover();
+      if (signal.aborted) throw cancelledError();
+      skill = nativeSkills(descriptors).find((candidate) => candidate.command === skillCommand);
+    }
     if (!skill) throw new Error(`Enabled installed skill /${skillCommand} was not found or is ineligible.`);
     selectedSkill = skill;
     system = composeSkillSystemPrompt(system, [{ skill, arguments: testCase.input, activation: "explicit" }]);
@@ -705,7 +730,16 @@ export function createLocalEvalRuntime(): EvalRuntime {
         return executeModelLike(target.kind, null, testCase, runId, signal);
       }
       if (target.kind === "skill") {
-        return executeModelLike("skill", target.command, testCase, runId, signal);
+        return executeModelLike(
+          "skill",
+          target.command,
+          testCase,
+          runId,
+          signal,
+          target.instructions === undefined
+            ? null
+            : { command: target.command, instructions: target.instructions, allowedTools: target.allowedTools ?? [] },
+        );
       }
       if (target.kind === "connector") {
         const args = parseObjectInput(testCase.input, "Connector");

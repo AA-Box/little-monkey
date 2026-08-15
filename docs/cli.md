@@ -89,6 +89,14 @@ monkey skills install-local <folder> --approval-digest <sha256> --yes
 monkey skills preview-git <repository-url> <40-char-commit> [--subdirectory <path>]
 monkey skills install-git <repository-url> <40-char-commit> --approval-digest <sha256> --yes
 monkey skills enable|disable|rollback|uninstall <command>
+monkey skills learned list [--json]
+monkey skills learned candidates [--json]
+monkey skills learned inspect <candidate-id>
+monkey skills learned evaluate <candidate-id> [--report <case-reports.json>]
+monkey skills learned promote <candidate-id> --yes
+monkey skills learned reject <candidate-id> [--reason <text>]
+monkey skills learned deprecate <command> [--scope global|workspace]
+monkey skills learned mode [off|suggest-only|auto-stage|auto-promote-safe]
 
 monkey plugins list [--json]
 monkey plugins health [--json]

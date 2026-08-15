@@ -11,6 +11,9 @@ use little_monkey_lib::native_skills::{
     SkillDescriptor, SkillScope,
 };
 use little_monkey_lib::prompts::PromptEntry;
+use little_monkey_lib::skill_learning::{
+    EvaluationCaseReport, LearningMode, PromotionOutcome, SkillLearningStore,
+};
 
 const MAX_SKILLS_PER_TURN: usize = 5;
 const RESERVED: &[&str] = &[
@@ -120,6 +123,81 @@ pub enum SkillsCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Skills this agent derived from its own verified work, and the
+    /// candidates still waiting on evaluation or approval.
+    #[command(subcommand)]
+    Learned(LearnedCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LearnedCmd {
+    /// Installed learned skills with their provenance and effectiveness.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Candidates derived from run evidence but not yet installed.
+    Candidates {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Full detail for one candidate, including the staged SKILL.md body.
+    Inspect { candidate_id: String },
+    /// Run the candidate's evaluation cases.
+    ///
+    /// The CLI has no agent runtime of its own for this, so without
+    /// `--report` it records the evaluation as unevaluated rather than
+    /// inventing a verdict. `--report` takes the JSON array of case reports a
+    /// runtime produced (`[{"case_id":…,"arm":"candidate",…}]`).
+    Evaluate {
+        candidate_id: String,
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// Approve and install a staged candidate as a versioned native skill.
+    Promote {
+        candidate_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Discard a candidate and delete its staged package.
+    Reject {
+        candidate_id: String,
+        #[arg(long, default_value = "rejected from the CLI")]
+        reason: String,
+    },
+    /// Disable an installed learned skill, keeping its provenance and history.
+    Deprecate {
+        command: String,
+        #[arg(long, value_enum, default_value_t = CliSkillScope::Global)]
+        scope: CliSkillScope,
+        #[arg(long, default_value = "deprecated from the CLI")]
+        reason: String,
+    },
+    /// Read or change the learning mode shared with the desktop app.
+    Mode {
+        #[arg(value_enum)]
+        mode: Option<CliLearningMode>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliLearningMode {
+    Off,
+    SuggestOnly,
+    AutoStage,
+    AutoPromoteSafe,
+}
+
+impl From<CliLearningMode> for LearningMode {
+    fn from(value: CliLearningMode) -> Self {
+        match value {
+            CliLearningMode::Off => Self::Off,
+            CliLearningMode::SuggestOnly => Self::SuggestOnly,
+            CliLearningMode::AutoStage => Self::AutoStage,
+            CliLearningMode::AutoPromoteSafe => Self::AutoPromoteSafe,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +612,226 @@ pub fn run(action: &SkillsCmd, data_dir: &Path, workspace: Option<&Path>) -> Res
                 "Uninstalled /{}; rollback history retained",
                 command.trim_start_matches('/')
             );
+            Ok(())
+        }
+        SkillsCmd::Learned(action) => run_learned(action, data_dir, workspace),
+    }
+}
+
+/// The CLI half of the learning loop. Same durable store the desktop drives —
+/// this module only renders it, so a candidate staged in the app is promotable
+/// here and vice versa.
+fn run_learned(
+    action: &LearnedCmd,
+    data_dir: &Path,
+    workspace: Option<&Path>,
+) -> Result<(), String> {
+    let store = SkillLearningStore::new(data_dir).map_err(|error| error.to_string())?;
+    let manager = manager(data_dir)?;
+    let packages = external_package_skills(data_dir)?;
+    match action {
+        LearnedCmd::Mode { mode } => {
+            let current = match mode {
+                Some(mode) => store
+                    .set_mode(LearningMode::from(*mode))
+                    .map_err(|error| error.to_string())?,
+                None => store.mode().map_err(|error| error.to_string())?,
+            };
+            println!("Learning mode: {current:?}");
+            Ok(())
+        }
+        LearnedCmd::List { json } => {
+            let summaries = store
+                .learned_skills(&manager, workspace, &packages)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summaries).map_err(|error| error.to_string())?
+                );
+                return Ok(());
+            }
+            if summaries.is_empty() {
+                println!("No learned skills are installed.");
+                return Ok(());
+            }
+            for summary in summaries {
+                println!(
+                    "/{:<24} {:<8} {} uses, {} failures, {} corrections{}",
+                    summary.command,
+                    summary.version,
+                    summary.uses,
+                    summary.failures,
+                    summary.corrections,
+                    if summary.deprecated {
+                        " [deprecated]"
+                    } else if !summary.enabled {
+                        " [disabled]"
+                    } else {
+                        ""
+                    }
+                );
+                println!(
+                    "  hash {} from {} (runs {})",
+                    summary.active_sha256,
+                    summary.provenance.source_kind,
+                    summary.provenance.source_run_ids.join(", ")
+                );
+                if !summary.previous_sha256.is_empty() {
+                    println!(
+                        "  previous versions: {}",
+                        summary.previous_sha256.join(", ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        LearnedCmd::Candidates { json } => {
+            let candidates = store.list_candidates().map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&candidates).map_err(|error| error.to_string())?
+                );
+                return Ok(());
+            }
+            if candidates.is_empty() {
+                println!("No learning candidates.");
+                return Ok(());
+            }
+            for candidate in candidates {
+                println!(
+                    "{}  {:?}  /{}  {}",
+                    candidate.candidate_id,
+                    candidate.status,
+                    if candidate.proposed_command.is_empty() {
+                        "(not drafted)".to_string()
+                    } else {
+                        candidate.proposed_command.clone()
+                    },
+                    candidate.title
+                );
+                println!("  why: {}", candidate.signal_summary);
+            }
+            Ok(())
+        }
+        LearnedCmd::Inspect { candidate_id } => {
+            let candidate = store
+                .candidate(candidate_id)
+                .map_err(|error| error.to_string())?;
+            let evaluations = store
+                .evaluations_for(candidate_id)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "candidate": candidate,
+                    "evaluations": evaluations,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        LearnedCmd::Evaluate {
+            candidate_id,
+            report,
+        } => {
+            let plan = store
+                .plan_evaluation(candidate_id)
+                .map_err(|error| error.to_string())?;
+            let Some(report) = report else {
+                let record = store
+                    .mark_unevaluated(
+                        &plan.evaluation_id,
+                        "no agent runtime was supplied to the CLI; pass --report with a runtime's case reports",
+                    )
+                    .map_err(|error| error.to_string())?;
+                println!("{} {}", record.evaluation_id, record.summary);
+                return Ok(());
+            };
+            let bytes = std::fs::read(report)
+                .map_err(|error| format!("read {}: {error}", report.display()))?;
+            let reports: Vec<EvaluationCaseReport> =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            let record = store
+                .report_evaluation(&plan.evaluation_id, &reports)
+                .map_err(|error| error.to_string())?;
+            println!("{:?}: {}", record.verdict, record.summary);
+            Ok(())
+        }
+        LearnedCmd::Promote { candidate_id, yes } => {
+            if !yes {
+                let candidate = store
+                    .candidate(candidate_id)
+                    .map_err(|error| error.to_string())?;
+                let policy = candidate.policy.unwrap_or_else(|| {
+                    little_monkey_lib::skill_learning::PromotionPolicy {
+                        auto_promote_allowed: false,
+                        requires_approval: true,
+                        blocking: Vec::new(),
+                        approval_reasons: vec!["the candidate has not been staged".to_string()],
+                    }
+                });
+                println!("/{} — {}", candidate.proposed_command, candidate.title);
+                println!("  digest: {}", candidate.candidate_sha256);
+                if !policy.blocking.is_empty() {
+                    println!("  refused: {}", policy.blocking.join("; "));
+                }
+                if !policy.approval_reasons.is_empty() {
+                    println!("  needs approval: {}", policy.approval_reasons.join("; "));
+                }
+                return Err("Promotion requires --yes".to_string());
+            }
+            let outcome = store
+                .promote(candidate_id, true, false, &manager, workspace, None)
+                .map_err(|error| error.to_string())?;
+            match outcome {
+                PromotionOutcome::Promoted {
+                    candidate,
+                    mutation,
+                } => {
+                    println!(
+                        "Installed /{} at {}",
+                        mutation.command,
+                        candidate.installed_sha256.unwrap_or_default()
+                    );
+                    Ok(())
+                }
+                PromotionOutcome::AwaitingApproval { reasons, .. } => {
+                    Err(format!("Awaiting approval: {}", reasons.join("; ")))
+                }
+                PromotionOutcome::Refused { reasons, .. } => {
+                    Err(format!("Refused: {}", reasons.join("; ")))
+                }
+            }
+        }
+        LearnedCmd::Reject {
+            candidate_id,
+            reason,
+        } => {
+            let candidate = store
+                .reject(candidate_id, reason)
+                .map_err(|error| error.to_string())?;
+            println!("Rejected {}", candidate.candidate_id);
+            Ok(())
+        }
+        LearnedCmd::Deprecate {
+            command,
+            scope,
+            reason,
+        } => {
+            let scope = SkillScope::from(*scope);
+            let mutation = store
+                .deprecate(
+                    command.trim_start_matches('/'),
+                    scope,
+                    reason,
+                    &manager,
+                    workspace_for_scope(scope, workspace)?,
+                    &packages,
+                )
+                .map_err(|error| error.to_string())?;
+            println!("Deprecated /{}; history retained", mutation.command);
             Ok(())
         }
     }
