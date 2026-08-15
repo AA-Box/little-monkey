@@ -1129,6 +1129,29 @@ pub(crate) fn project_process_record<R: tauri::Runtime>(
     })
 }
 
+/// Records what a supervised workload owns, through the same pooled ledger.
+///
+/// The ownership half of [`project_process_record`], and deliberately not folded
+/// into it: a projection is written on every tick and may be missed, while this
+/// is the evidence a restart reclaims by and its failure reaches the controller.
+pub(crate) fn record_owned_processes<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    owned: &crate::process_table::OwnedProcesses,
+) -> Result<(), String> {
+    let now = crate::run_commands::unix_time_ms()? as i64;
+    with_process_table(app, state, |table| {
+        table.record_owned(
+            owned.kind,
+            &owned.external_id,
+            &owned.members,
+            owned.session,
+            owned.boot_marker.as_deref(),
+            now,
+        )
+    })
+}
+
 /// Reaps desktop-owned processes at app startup.
 ///
 /// Called from `lib.rs`'s `setup` rather than from the frontend so it runs once
@@ -1492,6 +1515,8 @@ mod resource_report {
             native_start_time: Some(99),
             limits: kind.default_limits(),
             containment: None,
+            supervised_session_id: None,
+            native_boot_marker: None,
             usage: None,
             usage_sampled_at_ms: None,
             signal_intent: SignalIntent::default(),
@@ -1744,6 +1769,8 @@ mod restart_semantics {
             native_start_time,
             limits: ProcessKind::ForegroundShell.default_limits(),
             containment: None,
+            supervised_session_id: None,
+            native_boot_marker: None,
             usage: None,
             usage_sampled_at_ms: None,
             signal_intent: SignalIntent::default(),

@@ -1429,6 +1429,23 @@ pub struct ProcessRecord {
     /// still names what held *this* process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<crate::resource_control::Containment>,
+    /// The session this process's root *led*, where it led one.
+    ///
+    /// Captured while the root was alive, for the reason the process group on
+    /// `containment.scope` is: both are read off the root's own row, so neither
+    /// is discoverable once the root exits — which is precisely when a descendant
+    /// that stayed in the session becomes unattributable to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervised_session_id: Option<u32>,
+    /// The host boot this row's native identities belong to, on a platform whose
+    /// start-time clock restarts with the machine.
+    ///
+    /// `None` on macOS and Windows, whose start times are absolute and need no
+    /// disambiguation — see [`crate::process_tree::boot_marker`]. A reclaim that
+    /// finds a *different* marker treats every recorded identity as gone rather
+    /// than signalling a pid the new boot may have reissued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_boot_marker: Option<String>,
     /// The most recent measurement of the owned tree, with the peaks it has
     /// reached. `None` where nothing sampled it — never a zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1903,7 +1920,34 @@ pub enum ReconcileOutcome {
     AlreadyExited,
 }
 
-/// A sink for [`ProcessProjection`]s.
+/// One native process a supervised workload owns, as it was durably recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnedMember {
+    pub identity: crate::process_tree::ProcessIdentity,
+    pub first_seen_at_ms: i64,
+    pub last_seen_at_ms: i64,
+}
+
+/// Everything a restart needs in order to find what one workload still owns.
+///
+/// Sent whole rather than one member at a time, because the three parts are one
+/// fact: a set of identities is only reclaimable alongside the supervision
+/// metadata that says which host boot they belong to and which session they may
+/// still be discoverable through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedProcesses {
+    pub kind: ProcessKind,
+    pub external_id: String,
+    /// Every `(pid, start_time)` this workload has been observed to own.
+    pub members: Vec<crate::process_tree::ProcessIdentity>,
+    /// The session the root led, where it led one.
+    pub session: Option<u32>,
+    /// The host boot these identities belong to, where the platform needs one.
+    pub boot_marker: Option<String>,
+}
+
+/// A sink for [`ProcessProjection`]s, and for the ownership facts a restart
+/// depends on.
 ///
 /// A port, not a ledger handle. Services that must not depend on storage —
 /// `WorkflowService` keeps its history in a JSON file store and is deliberately
@@ -1911,11 +1955,28 @@ pub enum ReconcileOutcome {
 /// recording fake rather than standing up SQLite, and every caller of theirs
 /// (desktop, CLI, daemon-triggered) gets the projection from one place.
 ///
-/// Implementations must be fail-soft at their own boundary if the caller cannot
-/// tolerate an error; `project` returns one so a caller that *can* report it
-/// has the option.
+/// # The two methods keep opposite contracts, deliberately
+///
+/// [`Self::project`] is bookkeeping: implementations must be fail-soft at their
+/// own boundary if the caller cannot tolerate an error, and a missed periodic
+/// sample costs a stale number on a panel. [`Self::record_owned`] is
+/// **recovery-critical state** — it is the only record that a descendant which
+/// has since escaped every discovery primitive was ever this workload's — so a
+/// caller that cannot persist it must not go on claiming the workload is
+/// restart-recoverable. `ResourceController` reclaims the tree instead.
 pub trait ProcessProjector: Send + Sync {
     fn project(&self, projection: &ProcessProjection) -> Result<(), String>;
+
+    /// Durably record the native processes a supervised workload owns.
+    ///
+    /// Must be an upsert keyed by `(process_id, pid, start_time)`: this is
+    /// called on the supervision tick, and a row per sample would grow the table
+    /// with the clock rather than with the processes actually observed.
+    ///
+    /// No default implementation, and that is the point: a projector that cannot
+    /// persist ownership has to say so at compile time rather than silently
+    /// accept the write and drop it.
+    fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String>;
 }
 
 /// A read port mirroring [`ProcessProjector`]'s shape in the opposite
@@ -3069,6 +3130,136 @@ impl<'a> ProcessTable<'a> {
         Ok(())
     }
 
+    /// Durably record what one supervised workload owns, and how to find it after
+    /// a restart.
+    ///
+    /// # Why this is one transaction
+    ///
+    /// The members and the supervision metadata are read back together by the
+    /// startup reclaim, and a half-written pair is worse than neither: a member
+    /// set recorded without its boot marker cannot be safely validated on Linux,
+    /// and a boot marker recorded without its members claims a recovery the
+    /// database cannot perform.
+    ///
+    /// # Never a row per sample
+    ///
+    /// `ON CONFLICT` updates `last_seen_at_ms` rather than inserting, so the
+    /// table grows with the processes actually observed and not with the sampling
+    /// interval. `first_seen_at_ms` is left alone, because when a member was
+    /// first attributed to this workload is the audit fact worth keeping.
+    ///
+    /// A missing row is an error rather than a no-op: ownership with no lifecycle
+    /// to hang it on is exactly the state the fail-closed admission exists to
+    /// prevent, and swallowing it here would put it back.
+    pub fn record_owned(
+        &self,
+        kind: ProcessKind,
+        external_id: &str,
+        members: &[crate::process_tree::ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let Some(record) = self.find_by_external_id(kind, external_id)? else {
+            return Err(ProcessTableError::NotFound {
+                process_id: format!("{}:{external_id}", kind.as_str()),
+            });
+        };
+        self.record_owned_members(&record.process_id, members, session, boot_marker, now_ms)
+    }
+
+    /// [`Self::record_owned`] against a process id the caller already resolved.
+    pub fn record_owned_members(
+        &self,
+        process_id: &str,
+        members: &[crate::process_tree::ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+        now_ms: i64,
+    ) -> ProcessTableResult<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        // The session guard mirrors the SQL `CHECK`: 0 is "this process's own"
+        // and 1 is init's, and neither names a workload. Recording one would hand
+        // the startup reclaim a set containing this app's own processes.
+        let session = session.filter(|session| *session > 1);
+        let updated = transaction.execute(
+            "UPDATE agent_processes
+                SET supervised_session_id = COALESCE(?2, supervised_session_id),
+                    native_boot_marker = COALESCE(?3, native_boot_marker),
+                    updated_at_ms = ?4
+              WHERE process_id = ?1",
+            params![process_id, session.map(i64::from), boot_marker, now_ms],
+        )?;
+        if updated == 0 {
+            return Err(ProcessTableError::NotFound {
+                process_id: process_id.to_string(),
+            });
+        }
+        for member in members {
+            transaction.execute(
+                "INSERT INTO agent_process_owned_members (
+                     process_id, native_pid, native_start_time, first_seen_at_ms, last_seen_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?4)
+                 ON CONFLICT (process_id, native_pid, native_start_time)
+                 DO UPDATE SET last_seen_at_ms = ?4",
+                params![
+                    process_id,
+                    i64::from(member.pid),
+                    // Saturating rather than refusing: a start time this app
+                    // cannot store is still an identity it must not forget, and
+                    // the reclaim compares the stored value against a freshly
+                    // read one that would saturate identically.
+                    i64::try_from(member.start_time).unwrap_or(i64::MAX),
+                    now_ms,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Every native identity this row has been recorded as owning.
+    ///
+    /// An out-of-range stored value is an **error**, not a skipped row: the
+    /// startup reclaim's only safe answer to ownership metadata it cannot
+    /// validate is [`ExitStatus::ContainmentLost`], and quietly dropping the
+    /// member would turn that into a confident `lost`.
+    pub fn owned_members(&self, process_id: &str) -> ProcessTableResult<Vec<OwnedMember>> {
+        let mut statement = self.connection.prepare(
+            "SELECT native_pid, native_start_time, first_seen_at_ms, last_seen_at_ms
+               FROM agent_process_owned_members
+              WHERE process_id = ?1
+              ORDER BY first_seen_at_ms, native_pid",
+        )?;
+        let rows = statement.query_map(params![process_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (pid, start_time, first_seen_at_ms, last_seen_at_ms) = row?;
+            let pid = u32::try_from(pid).map_err(|_| ProcessTableError::InvalidField {
+                field: "native_pid",
+                reason: format!("{pid} is outside the pid space"),
+            })?;
+            let start_time =
+                u64::try_from(start_time).map_err(|_| ProcessTableError::InvalidField {
+                    field: "native_start_time",
+                    reason: format!("{start_time} is not a start time this host could have read"),
+                })?;
+            members.push(OwnedMember {
+                identity: crate::process_tree::ProcessIdentity { pid, start_time },
+                first_seen_at_ms,
+                last_seen_at_ms,
+            });
+        }
+        Ok(members)
+    }
+
     /// Record the latest measurement of the owned tree.
     ///
     /// Peaks are folded in SQL with `MAX` rather than trusted from the caller, so
@@ -3904,8 +4095,15 @@ impl LedgerProcessProjector {
     }
 }
 
-impl ProcessProjector for LedgerProcessProjector {
-    fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+impl LedgerProcessProjector {
+    /// The ledger, opened on first use, and the clock read once.
+    ///
+    /// Shared by both port methods so neither can drift into opening a second
+    /// connection or reading a second clock.
+    fn with_table<T>(
+        &self,
+        work: impl FnOnce(&ProcessTable<'_>, i64) -> Result<T, String>,
+    ) -> Result<T, String> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| "system clock is before the unix epoch".to_string())?
@@ -3923,11 +4121,33 @@ impl ProcessProjector for LedgerProcessProjector {
             );
         }
         let ledger = slot.as_ref().expect("ledger initialized above");
-        ledger
-            .process_table()
-            .reconcile(projection, now_ms)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        work(&ledger.process_table(), now_ms)
+    }
+}
+
+impl ProcessProjector for LedgerProcessProjector {
+    fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+        self.with_table(|table, now_ms| {
+            table
+                .reconcile(projection, now_ms)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String> {
+        self.with_table(|table, now_ms| {
+            table
+                .record_owned(
+                    owned.kind,
+                    &owned.external_id,
+                    &owned.members,
+                    owned.session,
+                    owned.boot_marker.as_deref(),
+                    now_ms,
+                )
+                .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -3940,7 +4160,7 @@ const SELECT_COLUMNS: &str = "SELECT process_id, parent_process_id, kind, extern
      limit_observed_at_ms, limit_evidence, native_start_time, \
      resource_backend, resource_tree_primitive, resource_scope, resource_enforcement_json, \
      tree_rss_bytes, tree_peak_rss_bytes, tree_process_count, tree_peak_process_count, \
-     tree_output_bytes, tree_sampled_at_ms \
+     tree_output_bytes, tree_sampled_at_ms, supervised_session_id, native_boot_marker \
      FROM agent_processes";
 
 /// The nine V8 measurement columns, in [`MeasuredUsage::fields`]' order so the
@@ -4185,6 +4405,10 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
             max_context_tokens: row.get::<_, Option<i64>>(26)?.map(|v| v as u64),
         },
         containment,
+        supervised_session_id: row
+            .get::<_, Option<i64>>(45)?
+            .and_then(|v| u32::try_from(v).ok()),
+        native_boot_marker: row.get(46)?,
         usage,
         usage_sampled_at_ms,
         exit,

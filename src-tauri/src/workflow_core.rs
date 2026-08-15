@@ -3524,6 +3524,14 @@ mod tests {
             self.seen.lock().unwrap().push(projection.clone());
             Ok(())
         }
+
+        // A workflow node owns no native tree, so nothing here records ownership.
+        fn record_owned(
+            &self,
+            _owned: &crate::process_table::OwnedProcesses,
+        ) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[test]

@@ -224,6 +224,50 @@ pub fn session_of(_pid: u32) -> Option<u32> {
     None
 }
 
+/// What makes a stored [`ProcessIdentity`] comparable across an app restart, on
+/// a host whose start-time clock restarts with the machine.
+///
+/// # Why only Linux answers
+///
+/// The identity a controller records is `(pid, start_time)`, and how safe that
+/// pair is *after a reboot* depends entirely on what the platform's start time
+/// counts from. macOS reports a wall-clock timeval and Windows a creation
+/// FILETIME: both are absolute, so a pair recorded before a reboot cannot
+/// accidentally match a process created after one, and there is nothing left to
+/// disambiguate. Linux's `/proc/<pid>/stat` field 22 counts clock ticks *since
+/// boot*, so `(pid 4242, 91 ticks)` is a pair the next boot can genuinely
+/// reissue to somebody else's process — which is the one input a startup reclaim
+/// must never get wrong, because what it does with a match is send `SIGKILL`.
+///
+/// So this returns the host's boot identity where the clock needs one and `None`
+/// where it does not, and a reclaim treats *a different marker* as proof that the
+/// recorded processes cannot still exist. `None` is not a downgrade: it means the
+/// pair is already unambiguous on its own.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn boot_marker() -> Option<String> {
+    // `btime` is the wall-clock second the kernel booted, and it is stable for
+    // the life of that boot — unlike `/proc/sys/kernel/random/boot_id`, which is
+    // unreadable in some containers.
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    parse_proc_stat_btime(&stat).map(|btime| format!("linux-btime:{btime}"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_btime(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// `None` where the platform's start time is already absolute — see the Linux
+/// arm for why that is the whole question this answers.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn boot_marker() -> Option<String> {
+    None
+}
+
 /// Every process currently in `pgid`, read from the host process table.
 ///
 /// Used by the startup reclaim, which cannot ask a live controller anything: the
@@ -241,6 +285,34 @@ pub fn process_group_members(pgid: u32) -> Vec<u32> {
         .iter()
         .filter(|node| node.process_group_id == pgid)
         .map(|node| node.pid)
+        .collect()
+}
+
+/// Every process currently in session `sid`.
+///
+/// The startup reclaim's third discovery arm, and the reason it is worth a
+/// syscall per host process: a descendant that called `setpgid` left the group
+/// the row records but stayed in the session, so the group arm alone reports it
+/// absent. One that called `setsid` left both, which is what the durable
+/// ownership journal is for.
+///
+/// Deliberately not folded into [`snapshot`], for [`session_of`]'s reason: this
+/// runs once per orphaned row at startup, while a snapshot runs on every
+/// supervision tick.
+#[must_use]
+pub fn session_members(sid: u32) -> Vec<u32> {
+    if sid <= 1 {
+        // 0 is "this process's own session" and 1 is init's; neither names a
+        // workload, and both would collect processes this app must never signal.
+        return Vec::new();
+    }
+    let Ok(nodes) = snapshot() else {
+        return Vec::new();
+    };
+    nodes
+        .iter()
+        .map(|node| node.pid)
+        .filter(|pid| session_of(*pid) == Some(sid))
         .collect()
 }
 

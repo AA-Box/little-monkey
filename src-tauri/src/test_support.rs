@@ -125,6 +125,63 @@ impl crate::process_table::ProcessProjector for RecordingProjector {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    fn record_owned(&self, owned: &crate::process_table::OwnedProcesses) -> Result<(), String> {
+        let ledger = self.ledger.lock().map_err(|_| "poisoned".to_string())?;
+        crate::process_table::ProcessTable::new(ledger.connection())
+            .record_owned(
+                owned.kind,
+                &owned.external_id,
+                &owned.members,
+                owned.session,
+                owned.boot_marker.as_deref(),
+                1_800_000_000_000,
+            )
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// A projector whose every write fails, for the tests that prove a bounded
+/// execution refuses to start rather than running outside the ledger.
+///
+/// Deliberately not "a projector that drops writes": the failure is the input
+/// those tests are about, and a fake that silently succeeded would let the
+/// fail-closed rule regress without a red test.
+pub(crate) struct FailingProjector {
+    /// Whether the ownership half fails too. A projector that admits rows and
+    /// then refuses to record ownership is the shape of a database that goes
+    /// away *after* a workload has started, which is a different failure from one
+    /// that was never writable.
+    ownership_only: bool,
+}
+
+impl FailingProjector {
+    /// Fails every write, including the admitting one.
+    pub(crate) fn shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FailingProjector {
+            ownership_only: false,
+        })
+    }
+
+    /// Admits rows, then refuses to record ownership.
+    pub(crate) fn shared_for_ownership_only() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(FailingProjector {
+            ownership_only: true,
+        })
+    }
+}
+
+impl crate::process_table::ProcessProjector for FailingProjector {
+    fn project(&self, _projection: &crate::process_table::ProcessProjection) -> Result<(), String> {
+        match self.ownership_only {
+            true => Ok(()),
+            false => Err("the process table is unavailable".to_string()),
+        }
+    }
+
+    fn record_owned(&self, _owned: &crate::process_table::OwnedProcesses) -> Result<(), String> {
+        Err("the process table is unavailable".to_string())
+    }
 }
 
 /// The app-data directories this thread asked for, deleted when it exits.

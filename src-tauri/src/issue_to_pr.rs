@@ -574,9 +574,7 @@ pub async fn issue_to_pr_run_checks(
                 &root,
                 &verify_command,
                 Some(&run_id),
-                Some(crate::bounded_execution::AppProcessProjector::shared(
-                    app.clone(),
-                )),
+                crate::bounded_execution::AppProcessProjector::shared(app.clone()),
             )
             .await;
             let passed = result.code == Some(0) && !result.timed_out;

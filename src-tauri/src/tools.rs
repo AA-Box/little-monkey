@@ -933,6 +933,36 @@ pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
         None => running,
     };
     project_foreground_shell(app, state, &running);
+    // Every native process this shell's supervisor observes is recorded against
+    // that row from here on — which is what lets the next session reclaim a
+    // descendant that has since left the process group, and is why the wiring
+    // happens the moment the row exists rather than at the spawn.
+    //
+    // Fail-closed, unlike the projection above: a missing row costs visibility,
+    // while an unrecordable owned set costs the ability to find this tree again
+    // after a crash. The shell is reclaimed rather than run without it.
+    if let Err(error) =
+        child.persist_ownership_to(crate::bounded_execution::ProjectedOwnership::shared(
+            crate::bounded_execution::AppProcessProjector::shared(app.clone()),
+            crate::process_table::ProcessKind::ForegroundShell,
+            shell_process_id.clone(),
+        ))
+    {
+        let message = format!("Failed to record what this shell owns, so it was not run: {error}");
+        child.terminate_tree();
+        let mut exited = crate::workspace_shell::foreground_projection(
+            &shell_process_id,
+            crate::process_table::ProcessState::Exited,
+            &shell_workspace,
+            shell_identity,
+            shell_limits,
+            Some(shell_containment.clone()),
+            None,
+        );
+        exited.exit = Some(crate::process_table::ProcessExit::failed(message.clone()));
+        project_foreground_shell(app, state, &exited);
+        return Err(message);
+    }
     // Taken out of the child *before* the wait, so the two pipes can be drained
     // concurrently with it. `Stdio::piped()` above guarantees both are `Some`;
     // the `ok_or` is a refusal rather than an `expect` because a panic inside a

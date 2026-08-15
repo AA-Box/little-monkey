@@ -902,8 +902,49 @@ pub(crate) fn start_background_command<R: tauri::Runtime>(
     if let Some(stderr) = stderr {
         spawn_reader(app.clone(), process.clone(), stderr);
     }
-    spawn_exit_watcher(app.clone(), process);
+    // Ahead of the exit watcher rather than behind it, which is where this used to
+    // be: the row has to exist before the ownership below can be attributed to it,
+    // and a watcher that samples before the row is written was already recording
+    // usage against nothing.
     emit_status(app, view.clone(), identity);
+    // Every native process this command's supervisor observes is recorded against
+    // that row from here on, so a descendant that leaves the process group after
+    // being seen is still reclaimable after a restart — which for a background
+    // command is the whole point: it is the kind most likely to outlive the turn
+    // that started it.
+    //
+    // Fail-closed: a command whose ownership cannot be made durable is reclaimed
+    // rather than left running as a tree this app could not find again.
+    let journal = crate::bounded_execution::ProjectedOwnership::shared(
+        crate::bounded_execution::AppProcessProjector::shared(app.clone()),
+        crate::process_table::ProcessKind::BackgroundShell,
+        view.id.clone(),
+    );
+    if let Err(error) = lock(&process.controller)
+        .and_then(|mut controller| controller.persist_ownership_to(journal))
+    {
+        if let Ok(mut controller) = lock(&process.controller) {
+            let _ = controller.terminate_tree();
+        }
+        if let Ok(mut child) = lock(&process.child) {
+            let _ = child.kill();
+        }
+        // The registered entry is moved to `Error` rather than a clone of it: the
+        // manager already holds this process, and a view that stays `Running`
+        // would be a panel row for a command that was reclaimed before it began —
+        // the same phantom the process table's `Drop` backstop exists to prevent.
+        let ended = {
+            let mut registered = lock(&process.view)?;
+            registered.status = BackgroundShellStatus::Error;
+            registered.finished_at_ms = Some(now_ms()?);
+            registered.clone()
+        };
+        emit_status(app, ended, identity);
+        return Err(format!(
+            "Failed to record what this background command owns, so it was not run: {error}"
+        ));
+    }
+    spawn_exit_watcher(app.clone(), process);
     Ok(view)
 }
 

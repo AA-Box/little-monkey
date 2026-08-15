@@ -1102,6 +1102,20 @@ impl OwnedBrowser {
         // untracked Chromium. `running` and not `admitted`: the browser is up,
         // the CDP handshake above has already completed against it.
         browser.project(crate::process_table::ProcessState::Running, None);
+        // And every process Chromium has forked is recorded against that row from
+        // here on. This is the tree where it matters most: Chromium is a fan-out
+        // of renderer, GPU, network and utility processes, several of which
+        // deliberately leave the parent's group — so the durable owned set is what
+        // a later session reclaims them by once this app is gone.
+        //
+        // Fail-closed on the same terms as the containment check above: a Chromium
+        // this app could not find again after a crash is not one it is holding.
+        if let Err(error) = browser.persist_ownership() {
+            let _ = browser.stop();
+            return Err(format!(
+                "Refusing to run Chromium whose owned processes could not be recorded: {error}"
+            ));
+        }
         browser.navigate(&request.url)?;
         browser.capture_evidence()?;
         Ok(browser)
@@ -1113,6 +1127,30 @@ impl OwnedBrowser {
     /// Fail-soft by construction — the result is logged and dropped. A browser
     /// action must not fail because a bookkeeping row could not be written, which
     /// is the rule every other adopter of this table follows.
+    /// Make this session's owned Chromium processes durable against its row.
+    ///
+    /// Unlike [`Self::project`], the error is returned rather than logged: this
+    /// is the record a later session reclaims a surviving renderer by, and a
+    /// session that cannot write it is one whose tree could outlive the app with
+    /// nothing able to name it.
+    ///
+    /// `Ok(())` where there is no projector — a test browser with no ledger owns
+    /// no row anybody could be asked to recover.
+    fn persist_ownership(&self) -> Result<(), String> {
+        let Some(projector) = self.projector.clone() else {
+            return Ok(());
+        };
+        let journal = crate::bounded_execution::ProjectedOwnership::shared(
+            projector,
+            crate::process_table::ProcessKind::BrowserSession,
+            self.session_id.clone(),
+        );
+        self.controller
+            .lock()
+            .map_err(|_| "the browser's resource controller lock was poisoned".to_string())?
+            .persist_ownership_to(journal)
+    }
+
     fn project(&self, state: crate::process_table::ProcessState, exit: Option<BrowserProcessExit>) {
         let Some(projector) = self.projector.as_ref() else {
             return;

@@ -1556,6 +1556,19 @@ pub async fn execute_in_sandbox(
         // alive for the block because it owns the original job handle; the one
         // handed to the spawn is a duplicate.
         let mut controller = ResourceController::new(sandbox_run_limits(timeout));
+        // Wired before the spawn rather than after it, because this arm's attach
+        // happens inside `run_confined_supervised`: the controller flushes the
+        // root's identity there, which is the earliest moment it exists. Nothing
+        // is owned yet, so this call itself writes nothing and cannot fail on the
+        // journal's behalf.
+        if let Some(journal) = execution
+            .as_ref()
+            .map(crate::bounded_execution::BoundedExecution::ownership_journal)
+        {
+            controller
+                .persist_ownership_to(journal)
+                .map_err(io::Error::other)?;
+        }
         let job = controller.windows_job_for_spawn()?;
         // The container is the filesystem boundary; the job is the process-tree
         // one. A machine that cannot give us the container still gets the job,
@@ -1774,6 +1787,28 @@ pub async fn execute_in_sandbox(
                     }
                     return Err(io::Error::other(message));
                 }
+            }
+        }
+        // Every native process this run's supervisor observes is recorded against
+        // its row from here on, so a descendant that leaves the process group
+        // after being seen stays reclaimable after a restart. A run whose
+        // ownership cannot be made durable is reclaimed rather than continued, on
+        // the same terms as one that could not be contained.
+        if let Some(journal) = execution
+            .as_ref()
+            .map(crate::bounded_execution::BoundedExecution::ownership_journal)
+        {
+            if let Err(error) = controller.persist_ownership_to(journal) {
+                let _ = controller.terminate_tree();
+                let message =
+                    format!("sandboxed command's ownership could not be recorded: {error}");
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::failed(message.clone()),
+                        None,
+                    );
+                }
+                return Err(io::Error::other(message));
             }
         }
         // After the attach, so the row records the containment the attach has
@@ -2340,12 +2375,17 @@ async fn run_sandboxed_body(
     // The row exists before the copy is executed against, and names the run that
     // asked for it, so `monkey processes list --parent` answers "what did this
     // sandbox run start".
+    // Fail-closed: a sandbox run whose durable lifecycle cannot be created does
+    // not launch its child. Security confinement and a process-table row are both
+    // halves of the contract, and a run with only the first is not a successful
+    // run — it is a native tree nothing in this app can find.
     let mut execution = crate::bounded_execution::BoundedExecution::admit(
         crate::bounded_execution::AppProcessProjector::shared(app.clone()),
         crate::process_table::ProcessKind::SandboxRun,
         Some(workspace_dir.to_string_lossy().into_owned()),
         sandbox_run_limits(request.timeout()).to_process_limits(),
-    );
+    )
+    .map_err(|error| error.to_string())?;
     execution.set_parent(crate::process_table::ProcessKind::WorkflowRun, run_id);
 
     let outcome = execute_in_sandbox(
@@ -3313,12 +3353,15 @@ mod tests {
             timeout,
             false,
             &[],
-            Some(crate::bounded_execution::BoundedExecution::admit(
-                projector.clone(),
-                ProcessKind::SandboxRun,
-                Some(workspace_dir.to_string_lossy().into_owned()),
-                sandbox_run_limits(timeout).to_process_limits(),
-            )),
+            Some(
+                crate::bounded_execution::BoundedExecution::admit(
+                    projector.clone(),
+                    ProcessKind::SandboxRun,
+                    Some(workspace_dir.to_string_lossy().into_owned()),
+                    sandbox_run_limits(timeout).to_process_limits(),
+                )
+                .expect("the in-memory ledger admits the row"),
+            ),
         )
         .await
         .expect("the sandbox launches");
@@ -3347,6 +3390,61 @@ mod tests {
         let _ = fs::remove_dir_all(&real_workspace);
     }
 
+    /// A sandbox run whose durable lifecycle cannot be created never launches its
+    /// child.
+    ///
+    /// Both halves of a sandboxed run are the contract — the security confinement
+    /// *and* the process-table row — and a run with only the first is not a
+    /// successful run. Proved by the absence of a file the sandboxed command
+    /// would have created inside its own copy of the workspace: the child must
+    /// never reach its first instruction.
+    #[tokio::test]
+    async fn a_sandbox_run_whose_row_cannot_be_written_never_launches() {
+        let sandbox_root = temp_dir("sandbox-admission");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("sandbox-admission-real");
+        let profile_path = sandbox_root.join("run.sb");
+        let timeout = Duration::from_secs(30);
+        let marker = workspace_dir.join("the-command-ran");
+
+        let admission = crate::bounded_execution::BoundedExecution::admit(
+            crate::test_support::FailingProjector::shared(),
+            ProcessKind::SandboxRun,
+            Some(workspace_dir.to_string_lossy().into_owned()),
+            sandbox_run_limits(timeout).to_process_limits(),
+        );
+        assert!(
+            admission.is_err(),
+            "a sandbox run must not be admitted when its row cannot be written"
+        );
+        // The production caller (`run_sandboxed_body`) returns at exactly this
+        // point. What follows is the launch it would have reached had the
+        // admission succeeded — so the assertion below is about the real spawn
+        // path, and with no execution to hand it, that path is never entered.
+        if let Ok(execution) = admission {
+            let _ = execute_in_sandbox(
+                &sandbox_root,
+                &workspace_dir,
+                &real_workspace,
+                &profile_path,
+                &crate::verify::tests::marker_command(&marker),
+                timeout,
+                false,
+                &[],
+                Some(execution),
+            )
+            .await;
+        }
+        assert!(
+            !marker.exists(),
+            "the sandboxed command executed even though its process row could not be created"
+        );
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
     /// A sandbox run reclaimed for exceeding its deadline persists the limit as
     /// typed fields, not as an unexplained missing exit code.
     #[cfg(not(target_os = "windows"))]
@@ -3369,12 +3467,15 @@ mod tests {
             timeout,
             false,
             &[],
-            Some(crate::bounded_execution::BoundedExecution::admit(
-                projector.clone(),
-                ProcessKind::SandboxRun,
-                Some(workspace_dir.to_string_lossy().into_owned()),
-                sandbox_run_limits(timeout).to_process_limits(),
-            )),
+            Some(
+                crate::bounded_execution::BoundedExecution::admit(
+                    projector.clone(),
+                    ProcessKind::SandboxRun,
+                    Some(workspace_dir.to_string_lossy().into_owned()),
+                    sandbox_run_limits(timeout).to_process_limits(),
+                )
+                .expect("the in-memory ledger admits the row"),
+            ),
         )
         .await
         .expect("the sandbox launches");

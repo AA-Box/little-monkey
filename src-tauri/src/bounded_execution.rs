@@ -25,19 +25,36 @@
 //! `running` forever, and a process table with permanent phantoms is worse than
 //! one with gaps.
 //!
-//! # Fail-soft, at every write
+//! # Fail-closed at admission, fail-soft afterwards
 //!
-//! A command must never fail because a bookkeeping row could not be written —
-//! the same contract every other adopter of [`ProcessProjector`] keeps. Errors
-//! are reported to stderr and swallowed here, which is the one place the decision
-//! is made rather than three.
+//! The two are not a compromise, they are the difference between establishing a
+//! lifecycle and reporting on one.
+//!
+//! **Admission is fail-closed.** [`BoundedExecution::admit`] returns a `Result`,
+//! and a caller that cannot get one must not spawn. The alternative — which this
+//! module used to do — is a warning on stderr and a native process running
+//! outside the ledger that claims to cover every bounded execution. "Admit →
+//! durable row → contain → spawn" is either the order or it is a sentence in a
+//! document.
+//!
+//! **Everything after it is fail-soft.** A periodic sample, a usage refresh, the
+//! close-out: a command must never die because a bookkeeping row could not be
+//! updated, and [`Drop`] is the backstop that keeps a missed close-out from
+//! becoming a permanent phantom. Errors are reported to stderr and swallowed
+//! here, which is the one place that decision is made rather than three.
+//!
+//! **Ownership is the exception on the other side.** A newly observed native
+//! member is not telemetry — it is the only evidence a restart will have — so
+//! [`ProjectedOwnership`] hands it to the same projector without swallowing
+//! anything, and the controller reclaims the workload if it will not land.
 
 use std::sync::Arc;
 
 use crate::process_table::{
-    ProcessExit, ProcessKind, ProcessLimits, ProcessProjection, ProcessProjector, ProcessState,
+    OwnedProcesses, ProcessExit, ProcessKind, ProcessLimits, ProcessProjection, ProcessProjector,
+    ProcessState,
 };
-use crate::resource_control::{Containment, ResourceController, ResourceSample};
+use crate::resource_control::{Containment, OwnershipJournal, ResourceController, ResourceSample};
 
 /// A [`ProcessProjector`] over the app's own pooled ledger connection.
 ///
@@ -68,6 +85,69 @@ impl<R: tauri::Runtime> ProcessProjector for AppProcessProjector<R> {
         let state = self.app.state::<crate::AppState>();
         crate::process_commands::project_process_record(&self.app, state.inner(), projection)
     }
+
+    fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String> {
+        use tauri::Manager;
+        let state = self.app.state::<crate::AppState>();
+        crate::process_commands::record_owned_processes(&self.app, state.inner(), owned)
+    }
+}
+
+/// The one path from "the supervisor observed a native process" to "a row says
+/// so".
+///
+/// # Why this is a wrapper rather than six loops
+///
+/// Every supervised owner — both shells, the verify runner, the hook runner, the
+/// sandbox, the browser — holds a [`ResourceController`] and a
+/// [`ProcessProjector`], and each could have walked the controller's owned set
+/// onto its own row. Six copies of that is six chances to forget the identity
+/// check, to swallow the error, or to write on the wrong tick. This is the
+/// adapter between the two, so there is one.
+///
+/// The kind and external id are the row's, captured once: the controller never
+/// learns them, which is what keeps the lowest layer here free of the process
+/// table.
+pub struct ProjectedOwnership {
+    projector: Arc<dyn ProcessProjector>,
+    kind: ProcessKind,
+    external_id: String,
+}
+
+impl ProjectedOwnership {
+    /// The journal for one row, as the handle a controller takes.
+    #[must_use]
+    pub fn shared(
+        projector: Arc<dyn ProcessProjector>,
+        kind: ProcessKind,
+        external_id: impl Into<String>,
+    ) -> Arc<dyn OwnershipJournal> {
+        Arc::new(ProjectedOwnership {
+            projector,
+            kind,
+            external_id: external_id.into(),
+        })
+    }
+}
+
+impl OwnershipJournal for ProjectedOwnership {
+    fn record_owned(
+        &self,
+        members: &[crate::process_tree::ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+    ) -> Result<(), String> {
+        // Not swallowed, unlike `BoundedExecution::project`: the caller is the
+        // controller, and the error is what tells it the workload has stopped
+        // being recoverable.
+        self.projector.record_owned(&OwnedProcesses {
+            kind: self.kind,
+            external_id: self.external_id.clone(),
+            members: members.to_vec(),
+            session,
+            boot_marker: boot_marker.map(str::to_string),
+        })
+    }
 }
 
 /// The projector for a host with no `AppHandle` — `monkey-cli`, which runs the
@@ -77,15 +157,51 @@ impl<R: tauri::Runtime> ProcessProjector for AppProcessProjector<R> {
 /// root, because that is the profile chokepoint: a store that skips it writes
 /// rows into whichever profile happened to be active when the path was cached.
 ///
-/// `None` where the active profile cannot be resolved at all, which is the one
-/// case with nowhere to write; a run is never refused over it.
-#[must_use]
-pub fn cli_projector() -> Option<Arc<dyn ProcessProjector>> {
-    let path = crate::app_paths::data_dir()?.join(crate::run_commands::DATABASE_FILE);
-    Some(Arc::new(crate::process_table::LedgerProcessProjector::new(
+/// # Why this became fallible
+///
+/// It used to answer `Option`, and `None` meant "run the command with no row" —
+/// which is a bounded native execution outside the ledger that claims to cover
+/// every one of them. An unresolvable profile directory is not a reason to run
+/// agent-controlled code untracked; it is a reason to say so and stop.
+pub fn cli_projector() -> Result<Arc<dyn ProcessProjector>, String> {
+    let path = crate::app_paths::data_dir()
+        .ok_or_else(|| {
+            "the active profile's data directory could not be resolved, so this command's \
+             process record could not be created"
+                .to_string()
+        })?
+        .join(crate::run_commands::DATABASE_FILE);
+    Ok(Arc::new(crate::process_table::LedgerProcessProjector::new(
         path,
     )))
 }
+
+/// Why a bounded execution could not begin.
+///
+/// One variant today, and a named type rather than a bare `String` because the
+/// distinction it carries is the whole point of the change: the workload did not
+/// fail, it never started, and a caller has to be able to say which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionFailure {
+    /// The process table would not take the row this execution's lifecycle
+    /// begins with.
+    NoProcessRecord { kind: ProcessKind, reason: String },
+}
+
+impl std::fmt::Display for AdmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdmissionFailure::NoProcessRecord { kind, reason } => write!(
+                formatter,
+                "this {} was not started because its durable process lifecycle could not be \
+                 created: {reason}",
+                kind.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionFailure {}
 
 /// One bounded execution's row, from admission to close-out.
 pub struct BoundedExecution {
@@ -116,14 +232,25 @@ impl BoundedExecution {
     /// `command_id` names the *configured* command and repeats on every run, so
     /// using it would collide on the table's `UNIQUE(kind, external_id)` the
     /// second time anyone pressed the button.
-    #[must_use]
+    ///
+    /// # Fallible, and nothing may spawn without it
+    ///
+    /// The admitting write used to be fail-soft like every other write here, so a
+    /// process table that refused the row printed a warning and the command ran
+    /// anyway — a contained, limit-enforced, agent-controlled native tree with no
+    /// entry in the ledger that claims to hold every one of them. There is no
+    /// version of that which is merely a missing row: a workload nothing recorded
+    /// is a workload nothing reclaims, signals or reports.
+    ///
+    /// So the row is the admission ticket. An `Err` here means the caller must
+    /// return a start failure and never reach its spawn.
     pub fn admit(
         projector: Arc<dyn ProcessProjector>,
         kind: ProcessKind,
         workspace: Option<String>,
         limits: ProcessLimits,
-    ) -> Self {
-        let execution = BoundedExecution {
+    ) -> Result<Self, AdmissionFailure> {
+        let mut execution = BoundedExecution {
             projector,
             kind,
             external_id: format!("{}-{}", kind.tag(), uuid::Uuid::new_v4()),
@@ -132,10 +259,33 @@ impl BoundedExecution {
             limits,
             identity: None,
             containment: None,
-            closed: false,
+            // Closed until the row exists, which is what keeps [`Drop`] silent on
+            // the failure path below: an execution whose admission was refused is
+            // never returned and never ran, so a close-out from it would be a
+            // terminal write about a row nothing admitted.
+            closed: true,
         };
-        execution.project(execution.projection(ProcessState::Admitted, None, None));
+        // Not through `project`, which swallows by design: this is the one write
+        // whose failure the caller has to see.
         execution
+            .projector
+            .project(&execution.projection(ProcessState::Admitted, None, None))
+            .map_err(|reason| AdmissionFailure::NoProcessRecord { kind, reason })?;
+        execution.closed = false;
+        Ok(execution)
+    }
+
+    /// The journal this execution's controller records its owned processes to.
+    ///
+    /// Handed to [`ResourceController::persist_ownership_to`] once the workload is
+    /// attached, so every native process the supervisor observes lands on *this*
+    /// row.
+    ///
+    /// [`ResourceController::persist_ownership_to`]:
+    /// crate::resource_control::ResourceController::persist_ownership_to
+    #[must_use]
+    pub fn ownership_journal(&self) -> Arc<dyn OwnershipJournal> {
+        ProjectedOwnership::shared(self.projector.clone(), self.kind, self.external_id.clone())
     }
 
     /// Name the turn or run that asked for this work, so
@@ -271,6 +421,20 @@ mod tests {
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         }
+
+        fn record_owned(&self, owned: &OwnedProcesses) -> Result<(), String> {
+            let ledger = self.ledger.lock().map_err(|_| "poisoned".to_string())?;
+            ProcessTable::new(ledger.connection())
+                .record_owned(
+                    owned.kind,
+                    &owned.external_id,
+                    &owned.members,
+                    owned.session,
+                    owned.boot_marker.as_deref(),
+                    1_800_000_000_000,
+                )
+                .map_err(|error| error.to_string())
+        }
     }
 
     fn fake() -> Arc<LedgerFake> {
@@ -298,7 +462,8 @@ mod tests {
             ProcessKind::VerifyCommand,
             Some("/tmp/workspace".to_string()),
             limits,
-        );
+        )
+        .expect("the in-memory ledger admits the row");
         let external_id = execution.external_id().to_string();
 
         let admitted = row(&projector, &external_id);
@@ -315,6 +480,175 @@ mod tests {
         );
     }
 
+    /// The fail-closed rule, at the type level: a process table that refuses the
+    /// row hands back an error and no usable execution, so a caller cannot reach
+    /// its spawn.
+    ///
+    /// The `Result` is what makes this checkable at all — the previous version
+    /// returned `Self` unconditionally, and the only evidence of the refusal was
+    /// a line on stderr that nothing could assert against.
+    #[test]
+    fn an_execution_whose_row_cannot_be_written_is_never_admitted() {
+        let outcome = BoundedExecution::admit(
+            crate::test_support::FailingProjector::shared(),
+            ProcessKind::VerifyCommand,
+            None,
+            ProcessKind::VerifyCommand.default_limits(),
+        );
+
+        let failure = match outcome {
+            Err(failure) => failure,
+            // Named rather than `expect_err`, which would need `BoundedExecution`
+            // to be `Debug` — and it holds a `dyn ProcessProjector`, which is the
+            // reason it is not.
+            Ok(_) => panic!("a refused row must not yield a usable execution"),
+        };
+        assert!(
+            matches!(
+                &failure,
+                AdmissionFailure::NoProcessRecord { kind, .. }
+                    if *kind == ProcessKind::VerifyCommand
+            ),
+            "{failure:?}"
+        );
+        // The message has to separate "never started" from "ran and failed",
+        // because that is the distinction every caller is about to report.
+        let message = failure.to_string();
+        assert!(
+            message.contains("was not started") && message.contains("process lifecycle"),
+            "{message}"
+        );
+    }
+
+    /// And it writes no close-out either.
+    ///
+    /// `Drop` is the backstop for an execution whose owner went away, and a
+    /// failed admission must not reach it: a terminal projection for a row that
+    /// was never admitted would create the phantom `Drop` exists to prevent, one
+    /// state earlier.
+    #[test]
+    fn a_refused_admission_writes_no_terminal_row_either() {
+        struct CountingProjector {
+            writes: Mutex<Vec<ProcessState>>,
+        }
+
+        impl ProcessProjector for CountingProjector {
+            fn project(&self, projection: &ProcessProjection) -> Result<(), String> {
+                self.writes
+                    .lock()
+                    .expect("not poisoned")
+                    .push(projection.state);
+                Err("the process table is unavailable".to_string())
+            }
+
+            fn record_owned(&self, _owned: &OwnedProcesses) -> Result<(), String> {
+                Err("the process table is unavailable".to_string())
+            }
+        }
+
+        let projector = Arc::new(CountingProjector {
+            writes: Mutex::new(Vec::new()),
+        });
+        let outcome = BoundedExecution::admit(
+            projector.clone(),
+            ProcessKind::HookCommand,
+            None,
+            ProcessKind::HookCommand.default_limits(),
+        );
+        assert!(outcome.is_err());
+        drop(outcome);
+
+        assert_eq!(
+            *projector.writes.lock().expect("not poisoned"),
+            vec![ProcessState::Admitted],
+            "the only write may be the admission that failed; a `Drop` close-out here would \
+             be a terminal row for a process that never existed"
+        );
+    }
+
+    /// Production source, minus each file's test module.
+    ///
+    /// Split on the module rather than on the bare attribute: several of these
+    /// files carry a `#[cfg(test)]` item well above their tests, and cutting at
+    /// the first one would hide most of the production code from the assertions
+    /// below — which is how a structural test passes by looking at nothing.
+    fn production(source: &str, file: &str) -> String {
+        source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .or_else(|| source.split_once("\n#[cfg(test)]\npub(crate) mod tests {"))
+            .map(|(before, _)| before.to_string())
+            .unwrap_or_else(|| panic!("{file} has no `mod tests` to split on"))
+    }
+
+    /// Structural: no production caller may take the admission's `Result` and
+    /// carry on.
+    ///
+    /// The type makes ignoring it awkward; this makes it visible. `let _ =`,
+    /// `.ok()` and `unwrap_or` on an admission are each a way to reintroduce
+    /// exactly the gap the `Result` closed — a spawn that happens whether or not
+    /// the row exists — and none of them is a compiler error.
+    #[test]
+    fn no_owner_discards_the_result_of_an_admission() {
+        for (file, source) in [
+            ("verify.rs", include_str!("verify.rs")),
+            ("hooks.rs", include_str!("hooks.rs")),
+            ("sandbox.rs", include_str!("sandbox.rs")),
+        ] {
+            let source = production(source, file);
+            for (start, _) in source.match_indices("BoundedExecution::admit(") {
+                // The 40 characters before the call carry the binding, which is
+                // where a discarded result would be visible.
+                let before = &source[start.saturating_sub(40)..start];
+                assert!(
+                    !before.contains("let _ =") && !before.contains("if let Ok"),
+                    "{file} discards an admission result, which puts the spawn back in front \
+                     of the row"
+                );
+            }
+            for discard in [
+                "admit(\n            projector,\n        )\n        .ok()",
+                ".unwrap_or_default()",
+            ] {
+                assert!(
+                    !source.contains(&format!("BoundedExecution::admit{discard}")),
+                    "{file} swallows an admission failure"
+                );
+            }
+        }
+    }
+
+    /// Structural: every supervised owner records ownership through the one
+    /// journal, and none of them walks the controller's owned set itself.
+    ///
+    /// The failure this prevents is not a bug in any single file — it is six
+    /// files each growing their own copy of "for each owned pid, write a row",
+    /// which is six places to forget the identity check or swallow the error.
+    /// [`ResourceController::live_owned`] stays available for measurement, so the
+    /// assertion is about the *durable* path specifically.
+    #[test]
+    fn every_supervised_owner_persists_ownership_through_the_one_journal() {
+        // Each owner, and the file where its controller is wired to a row.
+        for (file, source) in [
+            ("verify.rs", include_str!("verify.rs")),
+            ("hooks.rs", include_str!("hooks.rs")),
+            ("sandbox.rs", include_str!("sandbox.rs")),
+            ("tools.rs", include_str!("tools.rs")),
+            ("background_shell.rs", include_str!("background_shell.rs")),
+            ("browser_worker.rs", include_str!("browser_worker.rs")),
+        ] {
+            let source = production(source, file);
+            assert!(
+                source.contains("persist_ownership_to") || source.contains("persist_ownership()"),
+                "{file} owns a supervised workload and never makes its ownership durable"
+            );
+            assert!(
+                !source.contains(".owned()"),
+                "{file} reads the controller's owned set directly; the durable path is \
+                 `ProjectedOwnership`"
+            );
+        }
+    }
+
     /// The failure `Drop` exists for: an owner that returns early must not leave
     /// a row that says `running` for the rest of the machine's life.
     #[test]
@@ -326,7 +660,8 @@ mod tests {
                 ProcessKind::VerifyCommand,
                 None,
                 ProcessKind::VerifyCommand.default_limits(),
-            );
+            )
+            .expect("the in-memory ledger admits the row");
             execution.external_id().to_string()
         };
 
@@ -355,7 +690,8 @@ mod tests {
             ProcessKind::VerifyCommand,
             None,
             ProcessKind::VerifyCommand.default_limits(),
-        );
+        )
+        .expect("the in-memory ledger admits the row");
         let external_id = execution.external_id().to_string();
         let breach = crate::resource_control::LimitBreach {
             limit: crate::process_table::ProcessLimitKind::Memory
@@ -386,7 +722,8 @@ mod tests {
             ProcessKind::VerifyCommand,
             None,
             ProcessKind::VerifyCommand.default_limits(),
-        );
+        )
+        .expect("the in-memory ledger admits the row");
         let external_id = execution.external_id().to_string();
         // Attaching is what moves the row to `running`, and a sample before that
         // would have nowhere to land.
@@ -441,7 +778,8 @@ mod tests {
             ProcessKind::VerifyCommand,
             None,
             ProcessKind::VerifyCommand.default_limits(),
-        );
+        )
+        .expect("the in-memory ledger admits the row");
         let external_id = execution.external_id().to_string();
         execution.identity = crate::process_tree::ProcessIdentity::of(std::process::id());
         let projection = execution.projection(ProcessState::Running, None, None);
@@ -486,7 +824,8 @@ mod tests {
             ProcessKind::VerifyCommand,
             None,
             ProcessKind::VerifyCommand.default_limits(),
-        );
+        )
+        .expect("the in-memory ledger admits the row");
         let external_id = execution.external_id().to_string();
         execution.identity = crate::process_tree::ProcessIdentity::of(std::process::id());
         let projection = execution.projection(ProcessState::Running, None, None);

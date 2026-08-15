@@ -37,8 +37,9 @@
 //! distinction is load-bearing: a kernel-held bound survives this app dying, and
 //! a supervised one does not.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::process_table::{ProcessLimitKind, ProcessLimits};
@@ -585,6 +586,36 @@ impl std::fmt::Display for AttachFailure {
 
 impl std::error::Error for AttachFailure {}
 
+/// Where a supervised controller writes the ownership facts a restart depends on.
+///
+/// # Why the controller does not just hold a `ProcessProjector`
+///
+/// This is the narrow half of that port, named separately so the controller —
+/// which is the lowest layer here, and is used by probes and by tests that have
+/// no ledger at all — depends on "somewhere to record an identity" rather than on
+/// the process table. The one production implementation lives beside the
+/// projector it wraps, in [`crate::bounded_execution`], so there is a single path
+/// from "the supervisor observed a process" to "a row says so", rather than one
+/// per owner.
+///
+/// # This write is not bookkeeping
+///
+/// A periodic sample may be missed; a newly observed member may not. It is the
+/// only record that a descendant which afterwards calls `setsid`, changes group
+/// and re-parents was ever this workload's — which is exactly the process a
+/// restart cannot otherwise find. An implementation that returns `Err` is telling
+/// the controller it can no longer promise the workload is recoverable, and the
+/// controller reclaims the tree rather than carrying on with a guarantee that has
+/// stopped being true.
+pub trait OwnershipJournal: Send + Sync {
+    fn record_owned(
+        &self,
+        members: &[ProcessIdentity],
+        session: Option<u32>,
+        boot_marker: Option<&str>,
+    ) -> Result<(), String>;
+}
+
 /// The controller: one workload's whole resource story.
 pub struct ResourceController {
     limits: EffectiveLimits,
@@ -618,6 +649,15 @@ pub struct ResourceController {
     /// number recorded while the root was alive keeps working after it is not.
     group: Option<u32>,
     session: Option<u32>,
+    /// Where the owned set is made durable, once an owner has a row to hang it
+    /// on. `None` for a capability probe and for a test with no ledger, which own
+    /// no workload anybody could be asked to recover.
+    journal: Option<Arc<dyn OwnershipJournal>>,
+    /// Which members the journal has already accepted.
+    ///
+    /// Kept so a tick that discovers nothing new writes nothing at all: the
+    /// journal is consulted when the owned set *grows*, not on the clock.
+    journalled: BTreeSet<(u32, u64)>,
     /// The job handle a managed Windows spawn created the workload into.
     ///
     /// Held for the controller's life because a job dies with its last handle
@@ -676,9 +716,64 @@ impl ResourceController {
             owned: BTreeMap::new(),
             group: None,
             session: None,
+            journal: None,
+            journalled: BTreeSet::new(),
             #[cfg(windows)]
             spawn_job: None,
         }
+    }
+
+    /// Make this workload's ownership durable from here on, starting with what is
+    /// already owned.
+    ///
+    /// Called by an owner once its process row exists — which is *after*
+    /// [`Self::attach`], because attach is what records the root identity and
+    /// captures the group and session that go with it.
+    ///
+    /// Fallible on purpose, and the failure is the caller's to act on: a workload
+    /// whose first ownership write does not land is one this app could not find
+    /// again after a crash, so the owner refuses to run it rather than starting a
+    /// tree it has already lost the ability to recover.
+    pub fn persist_ownership_to(
+        &mut self,
+        journal: Arc<dyn OwnershipJournal>,
+    ) -> Result<(), String> {
+        self.journal = Some(journal);
+        self.flush_ownership()
+    }
+
+    /// Hand every member the journal has not yet accepted to it, with the
+    /// supervision metadata that makes them reclaimable.
+    ///
+    /// The metadata travels on every write rather than once, because it is not
+    /// knowable at a fixed moment: the session is captured at attach, and the boot
+    /// marker is read here — the journal's `COALESCE` keeps the first non-null
+    /// answer either way.
+    fn flush_ownership(&mut self) -> Result<(), String> {
+        let Some(journal) = self.journal.clone() else {
+            return Ok(());
+        };
+        let fresh: Vec<ProcessIdentity> = self
+            .owned
+            .iter()
+            .map(|(pid, start_time)| ProcessIdentity {
+                pid: *pid,
+                start_time: *start_time,
+            })
+            .filter(|identity| {
+                !self
+                    .journalled
+                    .contains(&(identity.pid, identity.start_time))
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        journal.record_owned(&fresh, self.session, process_tree::boot_marker().as_deref())?;
+        for identity in fresh {
+            self.journalled.insert((identity.pid, identity.start_time));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1031,6 +1126,22 @@ impl ResourceController {
             }
             return Err(AttachFailure::Containment(error));
         }
+
+        // The root's identity, durable before the workload is reported as
+        // contained — for an owner that wired its journal before the spawn. An
+        // owner that wires it afterwards flushes the same set through
+        // [`Self::persist_ownership_to`], and both orders end with "nothing is
+        // supervised that is not also recoverable".
+        //
+        // A containment failure rather than a category of its own: a workload this
+        // app cannot find again after a crash is one it is not really holding, and
+        // every caller already reclaims the tree on this arm.
+        if let Err(error) = self.flush_ownership() {
+            return Err(AttachFailure::Containment(io::Error::other(format!(
+                "process {pid} could not be recorded as this workload's, so a later session \
+                 would have no way to reclaim it: {error}"
+            ))));
+        }
         Ok(())
     }
 
@@ -1079,7 +1190,7 @@ impl ResourceController {
     /// no later snapshot can then prove it was ever ours, and it survives. The
     /// order this function's callers keep — record, then terminate — is the fix
     /// for that race.
-    fn record_ownership(&mut self) {
+    fn capture_ownership(&mut self) {
         let Some(root) = self.root else {
             return;
         };
@@ -1114,6 +1225,41 @@ impl ResourceController {
         }
     }
 
+    /// Capture what this workload owns and make the new part of it durable.
+    ///
+    /// # The ordering that closes the crash hole
+    ///
+    /// A member discovered and held only in memory is a member the next session
+    /// cannot find: the app crashes, the descendant `setsid`s and re-parents, and
+    /// nothing on disk ever said it was ours. So discovery and persistence are one
+    /// step, and "observed" and "recoverable" become the same moment.
+    ///
+    /// # Why a failed write reclaims the tree
+    ///
+    /// The alternative is to keep running a workload while quietly no longer
+    /// being able to recover it — a guarantee the rest of this system, and the
+    /// startup reclaim in particular, goes on acting as though it has. Reclaiming
+    /// is the honest response to losing it: a stopped workload is recoverable by
+    /// definition. The reclaim runs *before* the error propagates so that no
+    /// caller's error handling can be the thing that decides it.
+    fn record_ownership(&mut self) -> io::Result<()> {
+        self.capture_ownership();
+        let Err(error) = self.flush_ownership() else {
+            return Ok(());
+        };
+        let reclaim = self.terminate_tree();
+        Err(io::Error::other(match reclaim {
+            Ok(()) => format!(
+                "this workload's ownership could not be recorded, so it could no longer be \
+                 recovered after a restart, and it was reclaimed: {error}"
+            ),
+            Err(cleanup) => format!(
+                "this workload's ownership could not be recorded ({error}), and reclaiming it \
+                 failed too: {cleanup}"
+            ),
+        }))
+    }
+
     /// Every process still running that this workload owns.
     #[must_use]
     pub fn live_owned(&self) -> Vec<ProcessIdentity> {
@@ -1145,8 +1291,9 @@ impl ResourceController {
 
         // Whatever the backend measures, ownership is recorded on every tick:
         // the set has to be complete *before* a termination destroys the links
-        // that prove membership.
-        self.record_ownership();
+        // that prove membership, and durable before a crash destroys the only
+        // copy of it. The `?` is the fail-closed half — see `record_ownership`.
+        self.record_ownership()?;
 
         let measured = match &self.backend {
             #[cfg(target_os = "linux")]
@@ -1329,7 +1476,12 @@ impl ResourceController {
         // Before anything is signalled, and unconditionally — including when the
         // root is already gone, which is precisely the case where an escaped
         // descendant is all that is left.
-        self.record_ownership();
+        self.capture_ownership();
+        // Best-effort here, and only here: this is the one caller that must not
+        // be turned back by a journal that will not write, because it is already
+        // doing the thing a failed write would ask for. A crash mid-termination
+        // still leaves the members on disk if the write does land.
+        let _ = self.flush_ownership();
         match &self.backend {
             #[cfg(target_os = "linux")]
             Backend::Cgroup(scope) => scope.terminate_tree(),
@@ -2743,6 +2895,234 @@ mod tests {
         controller.terminate_tree().expect("nothing to terminate");
     }
 
+    // --- Durable ownership ----------------------------------------------------
+
+    /// A journal that records what it was handed, or refuses to.
+    struct TestJournal {
+        recorded: std::sync::Mutex<Vec<ProcessIdentity>>,
+        sessions: std::sync::Mutex<Vec<Option<u32>>>,
+        fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl TestJournal {
+        fn new() -> Arc<Self> {
+            Arc::new(TestJournal {
+                recorded: std::sync::Mutex::new(Vec::new()),
+                sessions: std::sync::Mutex::new(Vec::new()),
+                fails: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn start_failing(&self) {
+            self.fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn members(&self) -> Vec<ProcessIdentity> {
+            self.recorded.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl OwnershipJournal for TestJournal {
+        fn record_owned(
+            &self,
+            members: &[ProcessIdentity],
+            session: Option<u32>,
+            _boot_marker: Option<&str>,
+        ) -> Result<(), String> {
+            if self.fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("the process table is unavailable".to_string());
+            }
+            self.recorded
+                .lock()
+                .expect("not poisoned")
+                .extend_from_slice(members);
+            self.sessions.lock().expect("not poisoned").push(session);
+            Ok(())
+        }
+    }
+
+    /// Ownership is durable from the attach onwards, and each identity is handed
+    /// over exactly once however many times the workload is sampled.
+    ///
+    /// The second half is not a performance nicety: a write per sample would grow
+    /// the members table with the clock rather than with the processes actually
+    /// observed, on a 500 ms tick, for the life of every supervised workload.
+    #[cfg(unix)]
+    #[test]
+    fn every_observed_process_is_journalled_once_rather_than_once_per_sample() {
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::ClassDefault,
+            crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+        )]));
+        controller
+            .prepare_std(&mut command)
+            .expect("the containment is installable");
+        let mut child = command.spawn().expect("the shell starts");
+        controller.attach(child.id()).expect("the shell attaches");
+
+        let journal = TestJournal::new();
+        controller
+            .persist_ownership_to(journal.clone())
+            .expect("the first ownership write lands");
+        // The root, durable before anything else happens — this is what makes an
+        // attach that is followed by a crash recoverable at all.
+        assert!(
+            journal
+                .members()
+                .iter()
+                .any(|identity| identity.pid == child.id()),
+            "the root was not recorded when the journal was wired"
+        );
+
+        for _ in 0..3 {
+            controller.sample().expect("the sample runs");
+        }
+        let members = journal.members();
+        let mut unique = members.clone();
+        unique.sort_by_key(|identity| identity.pid);
+        unique.dedup_by_key(|identity| identity.pid);
+        assert_eq!(
+            members.len(),
+            unique.len(),
+            "an identity was handed to the journal more than once: {members:?}"
+        );
+
+        controller.terminate_tree().expect("the tree is reclaimed");
+        let _ = child.wait();
+    }
+
+    /// The fail-closed half: a newly observed member that cannot be made durable
+    /// stops the workload rather than leaving it running with a recovery
+    /// guarantee that has quietly stopped being true.
+    ///
+    /// Not a stylistic preference — the alternative is precisely the untracked
+    /// escaped workload the journal exists to prevent, reached from the other
+    /// direction.
+    #[cfg(unix)]
+    #[test]
+    fn a_workload_whose_ownership_cannot_be_recorded_is_reclaimed_rather_than_continued() {
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            // A child of its own, so the next sample has something *new* to
+            // discover and therefore something new to journal.
+            .arg("sleep 5 & sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::ClassDefault,
+            crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+        )]));
+        controller
+            .prepare_std(&mut command)
+            .expect("the containment is installable");
+        let mut child = command.spawn().expect("the shell starts");
+        let root = ProcessIdentity::of(child.id()).expect("the shell has an identity");
+        controller.attach(child.id()).expect("the shell attaches");
+        let journal = TestJournal::new();
+        controller
+            .persist_ownership_to(journal.clone())
+            .expect("the first ownership write lands");
+
+        // The database goes away underneath a running workload.
+        journal.start_failing();
+        // Give the shell time to fork the child that the next sample discovers.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let error = controller
+            .sample()
+            .expect_err("a sample that cannot record new ownership must not report success");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be recorded") && message.contains("reclaimed"),
+            "the error has to say the workload was reclaimed, not merely that a write failed: \
+             {message}"
+        );
+        for _ in 0..100 {
+            if !root.is_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !root.is_running(),
+            "the workload kept running after this app lost the ability to recover it"
+        );
+        let _ = child.wait();
+    }
+
+    /// And the other side of the line: a failed *measurement* projection is not
+    /// a reason to kill anything.
+    ///
+    /// This is the regression the fail-closed rule above could easily cause —
+    /// turning an optional UI refresh into a process-fatal dependency. A journal
+    /// that has already accepted every member it is going to see writes nothing
+    /// further, so a workload that discovers no new process keeps running however
+    /// unavailable the ledger becomes.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_ledger_does_not_end_a_workload_that_owns_nothing_new() {
+        use std::process::{Command, Stdio};
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let mut controller = ResourceController::new(EffectiveLimits::resolve(&[LimitLayer::new(
+            LimitSource::ClassDefault,
+            crate::process_table::ProcessKind::ForegroundShell.default_limits(),
+        )]));
+        controller
+            .prepare_std(&mut command)
+            .expect("the containment is installable");
+        let mut child = command.spawn().expect("the shell starts");
+        let root = ProcessIdentity::of(child.id()).expect("the shell has an identity");
+        controller.attach(child.id()).expect("the shell attaches");
+        let journal = TestJournal::new();
+        controller
+            .persist_ownership_to(journal.clone())
+            .expect("the first ownership write lands");
+        // Settle the owned set first, so what follows is a workload with nothing
+        // new to record rather than one that simply had not looked yet.
+        controller.sample().expect("the first sample runs");
+
+        journal.start_failing();
+        for _ in 0..3 {
+            // Deliberately no assertion on the measurement itself: what this test
+            // is about is that the sample *happens*, and a wall-clock comparison
+            // here would only add a way for a fast machine to fail it.
+            controller
+                .sample()
+                .expect("a workload that owns nothing new keeps running")
+                .expect("the tree is still there to measure");
+        }
+        assert!(
+            root.is_running(),
+            "an unavailable ledger ended a workload that was still correctly contained"
+        );
+
+        controller.terminate_tree().expect("the tree is reclaimed");
+        let _ = child.wait();
+    }
+
     /// A pid that has been reused is the one thing a supervisor must never
     /// signal. Deterministic because it never involves a second process: an
     /// identity whose start time does not match what the pid reports now is by
@@ -3125,6 +3505,94 @@ mod tests {
             // Reclaimed by hand, because by construction the supervisor cannot.
             let _ = crate::os_signal::terminate_process_group(escapee);
             let _ = std::fs::remove_file(&pid_file);
+        }
+
+        /// The distinction this whole change turns on, in one test.
+        ///
+        /// Two descendants of the same workload, differing only in *when* they
+        /// escape:
+        ///
+        /// - one reports itself, waits to be sampled, and only then calls
+        ///   `setsid` — so the supervisor saw it, and its identity is on disk
+        ///   before the escape;
+        /// - one calls `setsid` first and reports itself afterwards — so nothing
+        ///   ever saw it, which is the platform boundary
+        ///   [`the_one_escape_no_unprivileged_supervisor_can_follow`] states.
+        ///
+        /// Afterwards the journal holds exactly the first. That is the line: not
+        /// "macOS containment now works", but "an observed process stays ours
+        /// across a restart, and a never-observed one was never findable by
+        /// anything".
+        #[test]
+        fn a_child_observed_before_its_escape_is_journalled_and_one_never_observed_is_not() {
+            if !perl_is_available() {
+                return;
+            }
+            let seen_pid = scratch("distinction-seen.pid");
+            let seen_flag = scratch("distinction-seen.go");
+            let unseen_pid = scratch("distinction-unseen.pid");
+            let (mut controller, mut root) = supervised(&format!(
+                "perl -e 'use POSIX qw(setsid); open(my $f, \">\", $ARGV[0]); print $f $$; \
+                 close($f); while (! -e $ARGV[1]) {{ select(undef,undef,undef,0.02) }} \
+                 setsid(); sleep 60' {} {} & \
+                 ( perl -e 'use POSIX qw(setsid); setsid(); open(my $f, \">\", $ARGV[0]); \
+                 print $f $$; close($f); sleep 60' {} & ) ; sleep 60",
+                seen_pid.display(),
+                seen_flag.display(),
+                unseen_pid.display()
+            ));
+
+            let journal = TestJournal::new();
+            controller
+                .persist_ownership_to(journal.clone())
+                .expect("the first ownership write lands");
+
+            let seen = wait_for_pid(&seen_pid);
+            let unseen = wait_for_pid(&unseen_pid);
+            // One sample, while the first child is still attributable and the
+            // second is already outside everything.
+            wait_until(
+                || crate::process_tree::session_of(unseen) == Some(unseen),
+                "the never-observed child never became its own session leader",
+            );
+            controller.sample().expect("the tree samples");
+
+            let backend = controller.capabilities().backend.clone();
+            let kernel_held = matches!(backend.as_str(), "cgroup v2" | "windows job object");
+
+            // Now let the observed child escape, and prove the record predates it.
+            std::fs::write(&seen_flag, "go").expect("the flag is written");
+            wait_until(
+                || crate::process_tree::session_of(seen) == Some(seen),
+                "the observed child never left its session",
+            );
+
+            let recorded: Vec<u32> = journal
+                .members()
+                .iter()
+                .map(|identity| identity.pid)
+                .collect();
+            assert!(
+                recorded.contains(&seen),
+                "a child observed before its escape must already be on disk: {recorded:?}"
+            );
+            if !kernel_held {
+                assert!(
+                    !recorded.contains(&unseen),
+                    "a child that escaped before it was ever observed cannot be recorded — if it \
+                     is, this platform boundary has moved and `docs/limitations.md` has to say so"
+                );
+            }
+
+            controller.terminate_tree().expect("the tree is reclaimed");
+            let _ = root.kill();
+            let _ = root.wait();
+            // The never-observed one is reclaimed by hand, because by construction
+            // nothing here can.
+            let _ = crate::os_signal::terminate_process_group(unseen);
+            for path in [&seen_pid, &seen_flag, &unseen_pid] {
+                let _ = std::fs::remove_file(path);
+            }
         }
 
         /// An escaped-but-captured child still counts against the budget it

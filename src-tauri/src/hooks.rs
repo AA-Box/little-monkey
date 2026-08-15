@@ -40,7 +40,7 @@ pub(crate) const HOOK_OUTPUT_CAP: usize = 64 * 1024;
 /// What one hook execution produced. `exit_code: None` means the process
 /// was killed (timeout) or died to a signal — the frontend treats anything
 /// with `timed_out` as "hook did not answer" and proceeds.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct HookExecOutcome {
     pub exit_code: Option<i32>,
     pub stdout: String,
@@ -128,7 +128,7 @@ pub async fn hook_exec(
         &cwd,
         &command,
         &payload,
-        Some(crate::bounded_execution::AppProcessProjector::shared(app)),
+        crate::bounded_execution::AppProcessProjector::shared(app),
     )
     .await
 }
@@ -141,11 +141,16 @@ pub async fn hook_exec(
 /// A `tauri::command`'s `AppHandle` cannot be conjured in a unit test, and a test
 /// that reassembled the spawn, the controller and the two projections would be a
 /// test of its own assembly rather than of the one that ships.
+///
+/// The projector is required rather than optional: a hook is a bounded native
+/// execution, and one that runs without a process-table row is the case the
+/// ledger claims cannot happen. A hook whose row cannot be written is reported as
+/// **not started**, which is a different fact from a hook that ran and failed.
 pub(crate) async fn hook_exec_impl(
     cwd: &Path,
     command: &str,
     payload: &str,
-    projector: Option<std::sync::Arc<dyn crate::process_table::ProcessProjector>>,
+    projector: std::sync::Arc<dyn crate::process_table::ProcessProjector>,
 ) -> Result<HookExecOutcome, String> {
     #[cfg(target_os = "windows")]
     let (shell, shell_flag) = ("cmd", "/C");
@@ -190,16 +195,20 @@ pub(crate) async fn hook_exec_impl(
             },
         ),
     ]));
-    // The row, before the spawn. A hook that fails to `exec` is exactly the case
-    // a reader wants a record of, and one written after the wait would miss it.
-    let mut execution = projector.map(|projector| {
+    // The row, before the spawn, and the hook does not run without it. A hook that
+    // fails to `exec` is exactly the case a reader wants a record of, and one
+    // written after the wait would miss it — while one that could never be
+    // written would leave an arbitrary user-authored command running with nothing
+    // in the ledger to reclaim or report it.
+    let mut execution = Some(
         crate::bounded_execution::BoundedExecution::admit(
             projector,
             ProcessKind::HookCommand,
             Some(cwd.to_string_lossy().into_owned()),
             controller.limits().to_process_limits(),
         )
-    });
+        .map_err(|error| error.to_string())?,
+    );
     // Before the spawn: the containment has to exist before the hook's first
     // instruction, not be applied to a process already running.
     let bound = controller
@@ -235,6 +244,25 @@ pub(crate) async fn hook_exec_impl(
                 }
                 return Err(message);
             }
+        }
+    }
+    // Every native process this hook's supervisor observes is recorded against
+    // this row from here on, so a descendant that leaves its process group after
+    // being seen stays reclaimable across a restart. A hook whose ownership
+    // cannot be made durable is reclaimed rather than run, on the same terms as
+    // one that could not be contained.
+    if let Some(journal) = execution
+        .as_ref()
+        .map(crate::bounded_execution::BoundedExecution::ownership_journal)
+    {
+        if let Err(error) = controller.persist_ownership_to(journal) {
+            let _ = controller.terminate_tree();
+            let message =
+                format!("Failed to record what this hook owns, so it was not run: {error}");
+            if let Some(execution) = execution.take() {
+                execution.exited(ProcessExit::failed(message.clone()), None);
+            }
+            return Err(message);
         }
     }
     // After the attach, so the row records the containment the attach verified.
@@ -357,7 +385,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let projector = crate::test_support::RecordingProjector::shared();
 
-        let outcome = hook_exec_impl(&cwd, "cat", "hello", Some(projector.clone()))
+        let outcome = hook_exec_impl(&cwd, "cat", "hello", projector.clone())
             .await
             .expect("the hook runs");
         assert_eq!(outcome.exit_code, Some(0));
@@ -388,6 +416,43 @@ mod tests {
             .is_some_and(|capability| capability.is_enforced()));
     }
 
+    /// A hook whose durable lifecycle cannot be created does not run — and the
+    /// error says so, rather than reporting a command failure for a command that
+    /// never executed.
+    ///
+    /// Proved by the absence of a file the hook would have created. A hook is
+    /// user-authored rather than model-authored, which makes it the least
+    /// suspicious of the three bounded executions and the easiest place for an
+    /// untracked spawn to go unnoticed.
+    #[tokio::test]
+    async fn a_hook_whose_row_cannot_be_written_never_runs() {
+        let cwd = std::env::temp_dir();
+        let marker = cwd.join(format!(
+            "little_monkey_hook_admission_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let error = hook_exec_impl(
+            &cwd,
+            &crate::verify::tests::marker_command(&marker),
+            "",
+            crate::test_support::FailingProjector::shared(),
+        )
+        .await
+        .expect_err("a hook with no process row must not run");
+
+        assert!(
+            !marker.exists(),
+            "the hook executed even though its process row could not be created"
+        );
+        assert!(
+            error.contains("was not started"),
+            "a hook that never started must not be reported as one that failed: {error}"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
     /// A hook that fails on its own is a failure, not a limit kill — the two
     /// have to stay distinguishable on the row.
     #[tokio::test]
@@ -395,7 +460,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let projector = crate::test_support::RecordingProjector::shared();
 
-        let outcome = hook_exec_impl(&cwd, "exit 7", "", Some(projector.clone()))
+        let outcome = hook_exec_impl(&cwd, "exit 7", "", projector.clone())
             .await
             .expect("the hook runs");
         assert_eq!(outcome.exit_code, Some(7));

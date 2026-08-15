@@ -694,6 +694,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             }),
+            supervised_session_id: None,
+            native_boot_marker: None,
             usage: Some(RecordedUsage {
                 rss_bytes: Some(2_000),
                 peak_rss_bytes: Some(6_000),
@@ -752,6 +754,8 @@ mod tests {
             native_start_time: None,
             limits: ProcessKind::ChatTurn.default_limits(),
             containment: None,
+            supervised_session_id: None,
+            native_boot_marker: None,
             usage: None,
             usage_sampled_at_ms: None,
             signal_intent: SignalIntent::default(),

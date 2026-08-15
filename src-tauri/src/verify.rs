@@ -205,12 +205,18 @@ struct CapturedVerifyOutput {
 /// the turn's `tool_cancel` `Notify` firing (the existing Stop button kills a
 /// running verify command with zero new wiring), and a per-command timeout
 /// (default [`DEFAULT_VERIFY_TIMEOUT_SECS`]).
+///
+/// The projector is not optional, and that is the fail-closed rule rather than a
+/// tidier signature: a verify command is a bounded native execution, and one
+/// running without a process-table row is exactly the case the ledger claims
+/// cannot exist. A host that cannot resolve one — `monkey-cli` with no readable
+/// profile directory — reports that instead of running the command untracked.
 pub async fn run_command_impl(
     state: &AppState,
     root: &Path,
     cmd: &VerifyCommand,
     turn_id: Option<&str>,
-    projector: Option<std::sync::Arc<dyn crate::process_table::ProcessProjector>>,
+    projector: std::sync::Arc<dyn crate::process_table::ProcessProjector>,
 ) -> VerifyResult {
     let started = Instant::now();
 
@@ -276,26 +282,6 @@ pub async fn run_command_impl(
             },
         ),
     ]));
-    // The row, before the spawn rather than after the wait. A verify command
-    // that fails to `exec` is exactly the case a reader wants a record of, and
-    // one written afterwards would miss every command that never started.
-    //
-    // `None` only where there is nothing to project onto — `monkey-cli` and this
-    // module's own tests, which have no ledger. A missing projector is a missing
-    // row, never a refused command.
-    let mut execution = projector.map(|projector| {
-        crate::bounded_execution::BoundedExecution::admit(
-            projector,
-            ProcessKind::VerifyCommand,
-            Some(root.to_string_lossy().into_owned()),
-            controller.limits().to_process_limits(),
-        )
-    });
-    if let (Some(execution), Some(turn)) = (execution.as_mut(), turn_id) {
-        // The turn is what makes `monkey processes list --parent` answer "what
-        // did this turn verify".
-        execution.set_parent(ProcessKind::ChatTurn, turn);
-    }
     let failed_to_start = |message: String| VerifyResult {
         command_id: cmd.id.clone(),
         label: cmd.label.clone(),
@@ -305,6 +291,30 @@ pub async fn run_command_impl(
         stderr: message,
         duration_ms: started.elapsed().as_millis() as u64,
         timed_out: false,
+    };
+    // The row, before the spawn rather than after the wait — and the command does
+    // not run without it. A verify command that fails to `exec` is exactly the
+    // case a reader wants a record of, and one written afterwards would miss
+    // every command that never started; one that could not be written at all
+    // would leave a bounded native tree the ledger never knew about.
+    //
+    // Held in an `Option` from here on because every close-out below consumes it,
+    // and each of them is on a path the others must not repeat.
+    let mut execution = match crate::bounded_execution::BoundedExecution::admit(
+        projector,
+        ProcessKind::VerifyCommand,
+        Some(root.to_string_lossy().into_owned()),
+        controller.limits().to_process_limits(),
+    ) {
+        Ok(mut execution) => {
+            if let Some(turn) = turn_id {
+                // The turn is what makes `monkey processes list --parent` answer
+                // "what did this turn verify".
+                execution.set_parent(ProcessKind::ChatTurn, turn);
+            }
+            Some(execution)
+        }
+        Err(error) => return failed_to_start(error.to_string()),
     };
     // Before the spawn, so the containment exists before the command's first
     // instruction rather than being applied to a process already running.
@@ -347,6 +357,28 @@ pub async fn run_command_impl(
                 }
                 return failed_to_start(message);
             }
+        }
+    }
+    // Every native process this command's supervisor observes is recorded against
+    // this row from here on, so a descendant that escapes its process group after
+    // being seen is still reclaimable by the next session. Refusing the command
+    // when that cannot be established is the same rule as the containment check
+    // above: a workload this app could not find again must not be started.
+    if let Some(journal) = execution
+        .as_ref()
+        .map(crate::bounded_execution::BoundedExecution::ownership_journal)
+    {
+        if let Err(error) = controller.persist_ownership_to(journal) {
+            let _ = controller.terminate_tree();
+            let message =
+                format!("Failed to record what this command owns, so it was not run: {error}");
+            if let Some(execution) = execution.take() {
+                execution.exited(
+                    crate::process_table::ProcessExit::failed(message.clone()),
+                    None,
+                );
+            }
+            return failed_to_start(message);
         }
     }
     // After the attach, not after the spawn: the row records the identity and the
@@ -598,13 +630,13 @@ pub async fn verify_run(
         &root,
         &cmd,
         turn_id.as_deref(),
-        Some(crate::bounded_execution::AppProcessProjector::shared(app)),
+        crate::bounded_execution::AppProcessProjector::shared(app),
     )
     .await)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -736,6 +768,136 @@ mod tests {
         assert!(find_command(&config, "real-id").is_some());
     }
 
+    /// Fail-closed admission, proved against the filesystem rather than against a
+    /// mock.
+    ///
+    /// The command is one whose only job is to leave evidence it ran. If the
+    /// marker exists afterwards, a bounded native execution happened with no row
+    /// in the table that claims to hold every one of them — which is exactly the
+    /// state the old fail-soft projection allowed, and which no amount of asserting
+    /// on a returned struct would have caught.
+    #[tokio::test]
+    async fn a_verify_command_whose_row_cannot_be_written_never_runs() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_admission");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = cwd.join("the-command-ran");
+        let cmd = command("c1", &marker_command(&marker));
+
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::FailingProjector::shared(),
+        )
+        .await;
+
+        assert!(
+            !marker.exists(),
+            "the verify command executed even though its process row could not be created"
+        );
+        assert_eq!(result.code, None, "a command that never ran has no code");
+        assert!(
+            result.stderr.contains("was not started"),
+            "the failure has to say the command never started, not that it failed: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The CLI's shape of the same rule, against the projector it actually uses.
+    ///
+    /// `cli_projector` hands back a [`LedgerProcessProjector`] over the active
+    /// profile's database. When that database cannot be opened — which is what an
+    /// unresolvable profile directory amounts to — the command must not run. The
+    /// path here is a directory, which SQLite refuses to open as a file, so this
+    /// is the real failure rather than a fake standing in for it.
+    ///
+    /// [`LedgerProcessProjector`]: crate::process_table::LedgerProcessProjector
+    #[tokio::test]
+    async fn a_verify_command_whose_ledger_cannot_be_opened_never_runs() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_no_ledger");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = cwd.join("the-command-ran");
+        let cmd = command("c1", &marker_command(&marker));
+        // A directory where a database file should be: `RunLedger::open` fails,
+        // exactly as it would for a profile directory this host cannot use.
+        let unopenable = std::sync::Arc::new(crate::process_table::LedgerProcessProjector::new(
+            cwd.clone(),
+        ));
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, unopenable).await;
+
+        assert!(
+            !marker.exists(),
+            "the verify command ran with no process-table row behind it"
+        );
+        assert!(
+            result.stderr.contains("was not started"),
+            "the CLI has to say the command never started: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Ownership that cannot be made durable stops the command too — after
+    /// admission, where the failure means "this app can no longer recover what it
+    /// is about to run" rather than "there is nowhere to record it".
+    ///
+    /// The row exists in this case, so the assertion is about the command's own
+    /// result: a workload whose recovery guarantee has already lapsed must not be
+    /// left running.
+    #[tokio::test]
+    async fn a_verify_command_whose_ownership_cannot_be_recorded_is_not_left_running() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_ownership");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cmd = command("c1", "sleep 30");
+
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::FailingProjector::shared_for_ownership_only(),
+        )
+        .await;
+
+        assert_eq!(
+            result.code, None,
+            "a command reclaimed before it could finish has no exit code"
+        );
+        assert!(
+            result.stderr.contains("owns"),
+            "the failure has to name what could not be recorded: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A shell command whose only effect is to create `marker`.
+    ///
+    /// Quoted per platform shell, so a temp directory with a space in it cannot
+    /// turn "the command did not run" into a false pass.
+    pub(crate) fn marker_command(marker: &Path) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("type nul > \"{}\"", marker.display())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!(
+                "touch '{}'",
+                marker.to_string_lossy().replace('\'', r"'\''")
+            )
+        }
+    }
+
     #[tokio::test]
     async fn run_command_impl_reports_exit_code_and_output() {
         let state = AppState::default();
@@ -743,7 +905,14 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let cmd = command("c1", "echo hello");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert_eq!(result.command_id, "c1");
         assert_eq!(result.code, Some(0));
@@ -761,7 +930,14 @@ mod tests {
         let mut cmd = command("c1", "exit 3");
         cmd.kind = "test".to_string();
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert_eq!(result.code, Some(3));
         assert!(!result.timed_out);
@@ -778,7 +954,14 @@ mod tests {
         cmd.timeout_secs = Some(1);
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(result.timed_out);
         assert!(result.code.is_none());
@@ -804,7 +987,7 @@ mod tests {
         let projector = crate::test_support::RecordingProjector::shared();
         let cmd = command("c1", "echo hi");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
         assert_eq!(result.code, Some(0));
 
         let row = projector.only(ProcessKind::VerifyCommand);
@@ -865,7 +1048,7 @@ mod tests {
         let mut cmd = command("c1", "sleep 30");
         cmd.timeout_secs = Some(1);
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
         assert!(result.timed_out);
 
         let row = projector.only(ProcessKind::VerifyCommand);
@@ -914,8 +1097,7 @@ mod tests {
             notifier.notify_waiters();
         });
 
-        let result =
-            run_command_impl(&state, &cwd, &cmd, Some(&turn_id), Some(projector.clone())).await;
+        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), projector.clone()).await;
         assert!(!result.timed_out);
 
         let row = projector.only(ProcessKind::VerifyCommand);
@@ -972,7 +1154,7 @@ mod tests {
             })
         };
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
         assert_eq!(result.code, Some(0), "{result:?}");
 
         let (usage, sampled_at) = watcher
@@ -1037,7 +1219,14 @@ mod tests {
         );
         cmd.timeout_secs = Some(1);
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
         assert!(result.timed_out);
 
         let grandchild: u32 = std::fs::read_to_string(&pid_file)
@@ -1084,7 +1273,14 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let cmd = command("c1", "cat flood.txt");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(
             result.stdout.len() <= VERIFY_OUTPUT_CAP + 64,
@@ -1133,7 +1329,14 @@ mod tests {
         });
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            Some(&turn_id),
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(!result.timed_out);
         assert!(result.code.is_none());

@@ -214,9 +214,11 @@ const MIGRATION_V22: i64 = 22;
 const MIGRATION_V22_CHECKSUM: &str = "native-process-identity-v22-2026-08-14";
 const MIGRATION_V23: i64 = 23;
 const MIGRATION_V23_CHECKSUM: &str = "recorded-containment-and-tree-usage-v23-2026-08-15";
+const MIGRATION_V24: i64 = 24;
+const MIGRATION_V24_CHECKSUM: &str = "durable-supervised-ownership-v24-2026-08-15";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V23;
+const SCHEMA_VERSION: i64 = MIGRATION_V24;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -2278,6 +2280,16 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V23_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // One new table and two nullable columns, none of which an older binary
+    // selects, writes or has vocabulary for. Additive in the strict sense: it
+    // widens no `CHECK` over a table a V23 binary writes, and the new table's
+    // foreign key cascades rather than restricting, so even a delete that binary
+    // makes still succeeds.
+    (
+        MIGRATION_V24,
+        MIGRATION_V24_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -3007,6 +3019,60 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V23_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V23)
+            ],
+        )?;
+    }
+
+    let has_v24 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V24],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v24 {
+        // Guarded per statement rather than as a batch, for V22's reason taken
+        // one step further: this migration adds three independent things, and a
+        // run that died between them leaves a database where some exist. A single
+        // guard would then either re-create a table that is there or skip columns
+        // that are not, and either way the whole ladder would strand.
+        let has_table = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_process_owned_members'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_table {
+            transaction.execute_batch(MIGRATION_V24_SQL)?;
+        }
+        for (column, statement) in [
+            ("supervised_session_id", MIGRATION_V24_SESSION_SQL),
+            ("native_boot_marker", MIGRATION_V24_BOOT_SQL),
+        ] {
+            let present = transaction
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('agent_processes') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !present {
+                transaction.execute_batch(statement)?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V24,
+                MIGRATION_V24_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V24)
             ],
         )?;
     }
@@ -4146,6 +4212,63 @@ WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
 BEGIN
     SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
 END;
+"#;
+
+/// Supervised ownership survives the app that observed it (roadmap K4).
+///
+/// # The fact that was not durable
+///
+/// A supervised controller's owned set is **sticky**: a descendant it has once
+/// observed stays owned after it calls `setsid`, changes process group and
+/// re-parents, because "did this workload start it" does not stop being true when
+/// the descendant rearranges its own bookkeeping. That rule was held entirely in
+/// process memory. So an app that crashed lost the only record that the escaped
+/// descendant was ever ours, and the next session — finding a dead root and an
+/// empty process group — concluded `ConfirmedGone` about a process that was still
+/// running on the machine.
+///
+/// `agent_process_owned_members` is that set, made durable. The identity is the
+/// pair, never the pid: `(native_pid, native_start_time)` is what the reclaim
+/// re-validates before it signals anything, and a pid the kernel has since handed
+/// to somebody else fails that check and is left alone.
+///
+/// # The two columns beside it
+///
+/// `supervised_session_id` is the session the root *led*, captured at attach for
+/// the reason the process group already was: both are read off the root's own
+/// row, so the moment the root exits they stop being discoverable — which is
+/// exactly when a descendant that stayed in the session becomes unattributable.
+///
+/// `native_boot_marker` is what makes a stored identity comparable across a
+/// reboot on a host whose start-time clock restarts with the machine. NULL on
+/// macOS and Windows, whose start times are absolute; see
+/// `process_tree::boot_marker`.
+const MIGRATION_V24_SQL: &str = r#"
+CREATE TABLE agent_process_owned_members (
+    process_id TEXT NOT NULL REFERENCES agent_processes(process_id) ON DELETE CASCADE,
+    native_pid INTEGER NOT NULL CHECK (native_pid >= 0),
+    native_start_time INTEGER NOT NULL CHECK (native_start_time >= 0),
+    first_seen_at_ms INTEGER NOT NULL CHECK (first_seen_at_ms > 0),
+    last_seen_at_ms INTEGER NOT NULL CHECK (last_seen_at_ms > 0),
+    PRIMARY KEY (process_id, native_pid, native_start_time)
+) STRICT;
+
+CREATE INDEX agent_process_owned_members_process_idx
+    ON agent_process_owned_members(process_id);
+"#;
+
+/// The session the workload's root led, captured at attach — see
+/// [`MIGRATION_V24_SQL`]. Separate so a half-applied V24 can add exactly what is
+/// missing.
+const MIGRATION_V24_SESSION_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN supervised_session_id INTEGER
+    CHECK (supervised_session_id IS NULL OR supervised_session_id > 1);
+"#;
+
+/// The host boot the row's native identities belong to — see
+/// [`MIGRATION_V24_SQL`].
+const MIGRATION_V24_BOOT_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN native_boot_marker TEXT;
 "#;
 
 const MIGRATION_V21_SQL: &str = r#"
@@ -7997,6 +8120,166 @@ mod tests {
                 )
                 .is_err(),
             "half a breach must be refused by the rebuilt table's CHECK"
+        );
+    }
+
+    /// A V23 database gains the owned-member table and its two columns, keeps its
+    /// rows, and enforces the guards the reclaim depends on.
+    ///
+    /// The guards are the substance here, not the columns. Each one is a way the
+    /// startup reclaim could be handed something it would act on:
+    ///
+    /// - **The primary key is the identity, not the pid.** Two members with the
+    ///   same pid and different start times are two processes, and collapsing them
+    ///   would lose one.
+    /// - **`ON CONFLICT` updates rather than inserts.** A row per sample would
+    ///   grow the table with the clock, on a 500 ms tick, forever.
+    /// - **`first_seen_at_ms` is never rewritten.** When a member became this
+    ///   workload's is the audit fact worth keeping.
+    /// - **The foreign key cascades.** A deleted process must not leave members
+    ///   pointing at nothing, and must not be undeletable either.
+    #[test]
+    fn a_v23_database_gains_the_owned_member_journal_and_keeps_its_rows() {
+        let database = TempDb::new("owned-members-v24-upgrade");
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .connection
+                .execute(
+                    "INSERT INTO agent_processes
+                         (process_id, kind, external_id, state, created_at_ms, updated_at_ms,
+                          native_pid, native_start_time)
+                     VALUES ('fgsh-v23', 'foreground_shell', 'ext-v23', 'running', 10, 10,
+                             4242, 99)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Back to V23: drop what V24 added and forget it was applied, which is all
+        // the upgrade reads.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE agent_process_owned_members;
+                     DELETE FROM schema_migrations WHERE version = 24;",
+                )
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
+            "opening a V23 database must apply every migration above it"
+        );
+        // The row survived, and its new columns are absent rather than zeroed: a
+        // session id of 0 would name this app's own session.
+        let (pid, session, marker): (i64, Option<i64>, Option<String>) = ledger
+            .connection
+            .query_row(
+                "SELECT native_pid, supervised_session_id, native_boot_marker
+                 FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, 4242);
+        assert_eq!(session, None, "a legacy row names no session");
+        assert_eq!(marker, None, "and no boot");
+
+        let table = ledger.process_table();
+        let identity = |pid, start_time| crate::process_tree::ProcessIdentity { pid, start_time };
+
+        // Two members, then the same two again on a later tick.
+        table
+            .record_owned_members(
+                "fgsh-v23",
+                &[identity(4242, 99), identity(4243, 100)],
+                Some(4242),
+                Some("linux-btime:17"),
+                1_000,
+            )
+            .unwrap();
+        table
+            .record_owned_members("fgsh-v23", &[identity(4242, 99)], None, None, 2_000)
+            .unwrap();
+
+        let members = table.owned_members("fgsh-v23").unwrap();
+        assert_eq!(members.len(), 2, "the second tick inserted a duplicate row");
+        let first = members
+            .iter()
+            .find(|member| member.identity.pid == 4242)
+            .expect("the re-seen member is still there");
+        assert_eq!(first.first_seen_at_ms, 1_000, "first-seen was rewritten");
+        assert_eq!(first.last_seen_at_ms, 2_000, "last-seen was not advanced");
+        // The metadata is kept from the write that had it: a later tick that
+        // knows neither must not erase what an earlier one recorded.
+        let (session, marker): (Option<i64>, Option<String>) = ledger
+            .connection
+            .query_row(
+                "SELECT supervised_session_id, native_boot_marker
+                 FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session, Some(4242));
+        assert_eq!(marker.as_deref(), Some("linux-btime:17"));
+
+        // The pid alone is not the identity: the same number with a different
+        // start time is a different process and gets its own row.
+        table
+            .record_owned_members("fgsh-v23", &[identity(4242, 12_345)], None, None, 3_000)
+            .unwrap();
+        assert_eq!(
+            table.owned_members("fgsh-v23").unwrap().len(),
+            3,
+            "a reused pid was collapsed into the identity it replaced"
+        );
+
+        // Ownership for a process that does not exist is refused rather than
+        // orphaned — the fail-closed admission's other half.
+        assert!(table
+            .record_owned_members("nobody", &[identity(1, 1)], None, None, 4_000)
+            .is_err());
+
+        // And the foreign key cascades rather than restricting, so a delete still
+        // works and leaves nothing dangling.
+        ledger
+            .connection
+            .execute(
+                "DELETE FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+            )
+            .unwrap();
+        assert!(table.owned_members("fgsh-v23").unwrap().is_empty());
+        assert_eq!(
+            ledger
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .count(),
+            0,
+            "the owned-member journal left a dangling reference"
+        );
+    }
+
+    /// V24 is additive, so it must not raise the floor an older binary has to
+    /// clear: nothing it adds is vocabulary a V23 reader parses, or a `CHECK` on
+    /// a table that reader writes.
+    #[test]
+    fn the_owned_member_journal_does_not_raise_the_reader_floor() {
+        assert_eq!(
+            min_reader_version_for(MIGRATION_V24),
+            MIGRATION_V23,
+            "a purely additive migration must inherit the previous breaking floor"
         );
     }
 

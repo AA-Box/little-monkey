@@ -295,6 +295,21 @@ impl ForegroundShell {
         self.controller.root()
     }
 
+    /// Make what this shell owns durable against the row the caller has just
+    /// written.
+    ///
+    /// Wired here rather than in [`spawn_foreground`] because the row does not
+    /// exist yet at spawn time: the caller mints the external id and projects it
+    /// afterwards, so this is the first moment the ownership has somewhere to go.
+    /// Everything the supervisor has already captured — the root, at minimum — is
+    /// flushed by this call.
+    pub(crate) fn persist_ownership_to(
+        &mut self,
+        journal: std::sync::Arc<dyn crate::resource_control::OwnershipJournal>,
+    ) -> Result<(), String> {
+        self.controller.persist_ownership_to(journal)
+    }
+
     pub(crate) fn id(&self) -> Option<u32> {
         #[cfg(not(target_os = "windows"))]
         {

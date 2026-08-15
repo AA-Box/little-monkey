@@ -1570,16 +1570,33 @@ claim something false.
    against the budget it left, and is reclaimed by the same termination. Five
    tests drive real trees through exactly those escapes.
 
+   **That ownership now survives this app.** It used to live only in the
+   supervisor's memory, which meant a crash erased the one thing that could name
+   an escaped descendant: the next session found a dead root and an empty process
+   group, and concluded `ConfirmedGone` about a process still running on the
+   machine. Migration V24's `agent_process_owned_members` is the same sticky set
+   made durable — one row per `(pid, start-time)`, upserted as the supervisor
+   discovers members rather than once per sample — beside the session the root led
+   and, where the platform's start-time clock restarts with the machine, the host
+   boot those identities belong to. A restart takes the union of the persisted
+   members, the recorded group, the recorded session and the root's own identity;
+   an empty process group is no longer sufficient evidence of absence.
+
    What is left is narrow and real: a descendant that both `setsid`s **and**
    re-parents *before the supervisor has ever observed it* is outside every
    primitive an unprivileged process has — no group, no session, no parent link,
-   and nothing the kernel can be asked names the workload. It keeps its Seatbelt
-   filesystem and network confinement; what it escapes is the lifetime bound.
-   `the_one_escape_no_unprivileged_supervisor_can_follow` pins that boundary as a
-   test rather than as a sentence, and fails if it is ever closed without this
-   entry moving. Linux under a delegated cgroup has no such boundary at all —
-   membership is inherited and cannot be left — which is why the backend is
-   reported rather than assumed.
+   and nothing the kernel can be asked names the workload. Persistence does not
+   touch this case and is not claimed to: there is nothing to persist about a
+   process nobody ever saw. `the_one_escape_no_unprivileged_supervisor_can_follow`
+   pins that boundary as a test rather than as a sentence, and fails if it is ever
+   closed without this entry moving;
+   `a_child_observed_before_its_escape_is_journalled_and_one_never_observed_is_not`
+   pins the distinction beside it, which is the part that changed — *observed once*
+   is now durable, *never observed* is still the platform's floor. Linux under a
+   delegated cgroup has no such boundary at all — membership is inherited and
+   cannot be left — which is why the backend is reported rather than assumed, and
+   why cgroup membership stays the primary restart truth there rather than being
+   replaced by the journal.
 
 ### What was open, and is not
 
@@ -1624,6 +1641,19 @@ deleted, because what they say about *how the gap was found* is the useful part.
   with a typed exit — and close on `Drop` too, so an owner that returns early
   cannot leave a row claiming `running` until the next app launch.
 
+  **And the admission is fail-closed.** It was not at first: the admitting write
+  was fail-soft like every other write in that module, so a process table that
+  refused the row printed a warning and the command ran anyway — a contained,
+  limit-enforced, agent-controlled native tree with no entry in the ledger that
+  claims to hold every one of them. `admit` returns a `Result` now and a caller
+  that cannot get one does not spawn: verify reports *not started*, a hook's error
+  says the same rather than blaming the command, and a sandbox run does not launch
+  its child. The CLI's projector became fallible with it, because `None` there
+  meant "run the command with no row at all". Each is proved by a marker file the
+  workload would have created, not by a mocked spawn result — and the periodic
+  telemetry stayed fail-soft, so a missed sample still cannot kill a correctly
+  contained process.
+
 - **A restart closed rows it had established nothing about.** Startup
   reconciliation tried to kill a process group and then reaped every row it had
   looked at as `lost` regardless of the outcome. `Lost` asserts that the worker
@@ -1641,6 +1671,27 @@ deleted, because what they say about *how the gap was found* is the useful part.
   table and signalled by identity; a Windows job's `KILL_ON_JOB_CLOSE` is
   *checked* rather than assumed, because a process still alive at the recorded
   identity would mean the row's claim was wrong.
+
+  The supervised arm then had a hole of its own, closed by V24's ownership
+  journal: it asked the recorded process group, found nobody, and concluded
+  absence — while a descendant the supervisor had *already observed* went on
+  running outside it. Every persisted identity is now checked before absence may
+  be claimed, and each is re-validated against its recorded start time before
+  anything is signalled, so a reused pid is read as gone rather than killed.
+  Ownership that cannot be read back is `containment_lost` rather than an empty
+  set, and a workload whose *new* ownership cannot be written is reclaimed rather
+  than left running under a recovery guarantee that has stopped being true.
+
+  The same slice **narrowed** the group arm, which is the other half of the same
+  rule. It used to enumerate the recorded process group after the leader had been
+  reaped and kill each member by identity — precise about *which process* it was
+  signalling and silent about whether that process was ours. A process-group id is
+  its leader's pid, so once the leader is gone the kernel may hand the number to
+  somebody else who becomes a leader of their own, and the row then names a
+  stranger's group. Those members are now reported as `containment_lost` rather
+  than signalled. Narrowing it was only affordable *because* of the journal: the
+  descendant that sweep was reaching for is the one now recorded with its own
+  start time, and reclaimed through the arm that can prove ownership.
 
 - **A process report described the wrong machine.** `process_resource_report`
   built a controller on the host doing the reading and presented its capabilities

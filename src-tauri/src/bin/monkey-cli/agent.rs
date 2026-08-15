@@ -682,17 +682,14 @@ async fn run_verification_phase(
         return Ok(None);
     }
 
+    // Resolved once, before the phase runs, and fatal when it cannot be: a verify
+    // command is a bounded native execution, and one with no process-table row is
+    // a limit-enforced tree outside the ledger that claims to hold all of them.
+    let projector = little_monkey_lib::bounded_execution::cli_projector()?;
     let mut first_failure: Option<VerifyFailure> = None;
     for cmd in &commands {
         statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
-        let result = verify::run_command_impl(
-            state,
-            &root,
-            cmd,
-            None,
-            little_monkey_lib::bounded_execution::cli_projector(),
-        )
-        .await;
+        let result = verify::run_command_impl(state, &root, cmd, None, projector.clone()).await;
         let ok = !result.timed_out && result.code == Some(0);
         let output = build_verify_output(&result);
         statusln!(

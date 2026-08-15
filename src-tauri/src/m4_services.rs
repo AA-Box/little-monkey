@@ -3809,12 +3809,28 @@ mod tests {
             self.seen.lock().unwrap().push(projection.clone());
             Ok(())
         }
+
+        // A workflow run owns no native tree of its own, so nothing here ever
+        // records ownership; the method exists because the port has no default.
+        fn record_owned(
+            &self,
+            _owned: &crate::process_table::OwnedProcesses,
+        ) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     struct FailingProjector;
 
     impl ProcessProjector for FailingProjector {
         fn project(&self, _projection: &ProcessProjection) -> Result<(), String> {
+            Err("ledger is unavailable".to_string())
+        }
+
+        fn record_owned(
+            &self,
+            _owned: &crate::process_table::OwnedProcesses,
+        ) -> Result<(), String> {
             Err("ledger is unavailable".to_string())
         }
     }
