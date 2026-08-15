@@ -49,22 +49,6 @@ Give it a bug, a feature request, or a repository chore. It inspects the codebas
 
 You can inspect what the agent did instead of treating execution as a black box.
 
-### Start a long-running agent job and come back later
-
-Agent work should not disappear because you closed the UI. Jobs are tracked durably — execution state, limits, checkpoints and the processes they own.
-
-```text
-"Refactor this module and verify every call site"
-
-→ agent starts working
-→ task continues through multiple steps
-→ Little Monkey is restarted
-→ job state is restored
-→ inspect, resume, stop, or intervene
-```
-
-This makes agents usable for work that takes longer than a single chat turn.
-
 ### Let agents use your computer without unrestricted access
 
 An autonomous agent needs tools, but that should not mean handing a model your entire machine. Tool execution goes through one shared permission and isolation layer.
@@ -83,6 +67,35 @@ tracked execution
 
 Processes, tool calls, network access and execution state stay inspectable and controllable.
 
+### Start durable agent work and come back later
+
+Long-running work should not depend on a window staying open. Submit it as a background job: the daemon ticks independently of the app, the job carries a frozen recipe snapshot that fully describes how to run it, and its ledger row, checkpoints, limits and stop/suspend intent are written to disk as it goes.
+
+```text
+"Refactor this module and verify every call site"   → submitted as a background job
+
+→ agent works through multiple steps
+→ close and reopen Little Monkey
+→ the job, its row and its checkpoints are still there
+→ inspect, stop, suspend or intervene — from the app or a terminal
+```
+
+A daemon job is the one kind a supervisor can re-run after a crash, because it is the one kind with both a supervisor outliving the process and a durable description of what to run. Work the desktop hosts — a chat turn, a subagent, a Crew member — keeps durable *intent* and durable history across a restart, not a live loop: see **[Limitations](docs/limitations.md)**.
+
+### Run several agents without turning your repository into chaos
+
+Break larger work into parallel agent tasks while keeping their changes isolated.
+
+```text
+Main task
+├── Agent A: backend change
+├── Agent B: frontend change
+├── Agent C: tests
+└── Coordinator: review + integration
+```
+
+Agents can work in isolated Git worktrees, report back to a coordinator, and be stopped or inspected individually — multi-agent execution for real software work instead of several chat responses.
+
 ### Run capable agents locally without giving up real tools
 
 Use Ollama, `llama.cpp`, MLX or another configured provider while the agent runtime stays on your own machine.
@@ -98,20 +111,6 @@ local model
 ```
 
 Local does not have to mean "chat only." The same agent infrastructure works whether the model runs locally or through a provider you configure.
-
-### Run several agents without turning your repository into chaos
-
-Break larger work into parallel agent tasks while keeping their changes isolated.
-
-```text
-Main task
-├── Agent A: backend change
-├── Agent B: frontend change
-├── Agent C: tests
-└── Coordinator: review + integration
-```
-
-Agents can work in isolated Git worktrees, report back to a coordinator, and be stopped or inspected individually — multi-agent execution for real software work instead of several chat responses.
 
 ## How it fits together
 
