@@ -19,6 +19,43 @@ const ALLOWED_ACTIONS = new Set([
   "control_desktop",
 ]);
 
+// Every non-physical `DeviceCapability` the runner can grant a controller,
+// mapped to the surface in this client that spends it.
+//
+// The physical capabilities below answer "what may the runner ask of this
+// device"; these answer the other direction, and each one is a route the runner
+// already serves. A grant with no surface here is a grant an operator can make
+// and this client silently ignores — which is how `pause` and `control_desktop`
+// were once accepted at pairing and then unreachable. `web.rs` asserts this
+// object against the Rust enum, so a capability added there fails the build
+// here rather than becoming another dead letter.
+const CONTROLLER_CAPABILITIES = {
+  view_runs: "the run list and every run's durable detail",
+  view_events: "the replayed event timeline",
+  read_artifacts: "fetching a run's artifact by id",
+  approve: "deciding a digest-bound approval",
+  cancel: "requesting cancellation of a run",
+  pause: "pausing and resuming a run",
+  kill: "the emergency stop",
+  view_sessions: "reading paired conversations and their messages",
+  chat: "sending a message that becomes a durable run",
+  view_tasks: "listing the workflows declared on the runner",
+  run_workflows: "launching one of those workflows",
+  capture: "filing a note or file from this device",
+  // Driven from the runner's own desktop, with local visible consent there.
+  // This client is the *subject* of that session, never its operator, so it
+  // has no surface of its own — and saying so here is what keeps the parity
+  // check honest rather than silent.
+  control_desktop: null,
+  describe_node: null,
+  place_runs: null,
+  migrate: null,
+  peer_message: null,
+  peer_task_request: null,
+  peer_artifact: null,
+  admin: null,
+};
+
 // Physical capabilities this build can actually perform, mapped to the
 // browser feature that performs them. Advertised to the runner as "supported";
 // the runner intersects that with the operator's grant and the OS permission.
@@ -87,8 +124,27 @@ const state = {
   events: new Map(),
   eventStartCursors: new Map(),
   approvals: [],
+  // The paired conversation surface: what the runner last said, plus the
+  // unsent draft, which is the one thing here that survives being offline.
+  sessions: [],
+  selectedSessionId: null,
+  messages: new Map(),
+  drafts: {},
+  workflows: [],
   toastTimer: null,
   activeRequests: 0,
+};
+
+// Bounds on what this browser keeps for the train. Every one of them is a
+// count rather than a byte budget because IndexedDB has no quota this page can
+// read: a bound nobody can measure is not a bound.
+const CACHE_LIMITS = {
+  runs: 50,
+  eventsPerRun: 200,
+  approvalsPerRun: 20,
+  sessions: 50,
+  messagesPerSession: 200,
+  artifactsPerRun: 50,
 };
 
 const ui = Object.fromEntries(
@@ -141,6 +197,27 @@ const ui = Object.fromEntries(
     "pushStatus",
     "screenShareButton",
     "screenShareStatus",
+    "revokeSelfButton",
+    "pauseButton",
+    "resumeButton",
+    "chatPanel",
+    "chatRefreshButton",
+    "sessionSelect",
+    "chatEmpty",
+    "messageList",
+    "chatForm",
+    "chatInput",
+    "chatSendButton",
+    "workflowPanel",
+    "workflowRefreshButton",
+    "workflowList",
+    "workflowEmpty",
+    "capturePanel",
+    "captureForm",
+    "captureTitleInput",
+    "captureText",
+    "captureFile",
+    "captureButton",
     "connectionDot",
     "connectionText",
     "toast",
@@ -330,6 +407,24 @@ function validateStoredRecord(record) {
       throw new Error("A stored event cursor is invalid");
     }
   }
+  // Absent on a record written before capabilities were stored, which is not an
+  // error: `hasCapability` falls back to the legacy action mapping for exactly
+  // that pairing.
+  if (profile.capabilities !== undefined) {
+    if (!Array.isArray(profile.capabilities) || profile.capabilities.some((value) => typeof value !== "string")) {
+      throw new Error("The stored pairing capabilities are invalid");
+    }
+  }
+  if (record.drafts !== undefined) {
+    if (!record.drafts || typeof record.drafts !== "object" || Array.isArray(record.drafts)) {
+      throw new Error("The stored drafts are invalid");
+    }
+    for (const [sessionId, text] of Object.entries(record.drafts)) {
+      if (!validId(sessionId) || typeof text !== "string" || text.length > 4_000) {
+        throw new Error("A stored draft is invalid");
+      }
+    }
+  }
 }
 
 function validId(value) {
@@ -388,6 +483,25 @@ function scopeIsSubset(value, parent) {
 
 function hasScope(action) {
   return Boolean(state.profile?.scopes.actions.includes(action));
+}
+
+// Whether this pairing holds a capability, by the runner's own answer where one
+// is available.
+//
+// Three sources, deliberately in this order: the device-state route is
+// authoritative and is what an operator's later grant edit shows up in; the
+// accept response is what the runner said at pairing and is all a device has
+// while offline; and a pairing made before capabilities existed has neither, so
+// its legacy actions are mapped the same way `legacy_capabilities` maps them on
+// the runner. Nothing here can widen anything — a route the runner does not
+// grant answers 403 whatever this returns — it only decides whether a surface
+// is offered at all, and offering one that always fails is worse than hiding it.
+function hasCapability(capability) {
+  const granted = state.deviceState?.granted;
+  if (Array.isArray(granted)) return granted.includes(capability);
+  const paired = state.profile?.capabilities;
+  if (Array.isArray(paired) && paired.length > 0) return paired.includes(capability);
+  return hasScope(capability);
 }
 
 function randomToken(byteCount) {
@@ -655,10 +769,18 @@ async function acceptInvitation(invitation, deviceName) {
       deviceId: accepted.device_id,
       secretGeneration: accepted.secret_generation,
       scopes: accepted.scopes,
+      // What the runner says this pairing may reach beyond the legacy run
+      // actions. Kept so the chat, workflow and capture surfaces are decided
+      // correctly on the first frame and while offline, rather than only after
+      // the device-state route answers.
+      capabilities: Array.isArray(accepted.capabilities)
+        ? accepted.capabilities.filter((value) => typeof value === "string")
+        : [],
     },
     key,
     nextSequence: 1,
     eventCursors: {},
+    drafts: {},
   };
   validateStoredRecord(record);
   await saveActiveRecord(record);
@@ -673,6 +795,11 @@ function showPairing() {
   state.events.clear();
   state.eventStartCursors.clear();
   state.approvals = [];
+  state.sessions = [];
+  state.selectedSessionId = null;
+  state.messages.clear();
+  state.workflows = [];
+  state.drafts = {};
   ui.dashboardView.hidden = true;
   ui.pairingView.hidden = false;
   setConnection("idle", "Not paired");
@@ -686,8 +813,34 @@ function showDashboard(profile) {
   ui.killButton.hidden = !hasScope("kill");
   ui.artifactPanel.hidden = !hasScope("read_artifacts");
   ui.eventsPanel.hidden = !hasScope("view_events");
+  ui.capturePanel.hidden = !hasCapability("capture");
   renderDeviceState();
+  renderSessions();
+  renderWorkflows();
   setConnection("online", "Paired; checking runner…");
+}
+
+// Loads every capability surface this pairing actually holds.
+//
+// Failures are reported and swallowed one at a time rather than aborting the
+// batch: a runner build without the workflow service answers 501 for
+// workflows, and that is not a reason for the chat panel to stay empty.
+async function refreshCapabilitySurfaces() {
+  if (hasCapability("view_sessions")) {
+    try {
+      await loadSessions();
+    } catch (error) {
+      handleError(error, "Sessions could not be read");
+    }
+  }
+  if (hasCapability("view_tasks")) {
+    try {
+      await loadWorkflows();
+    } catch (error) {
+      handleError(error, "Workflows could not be read");
+    }
+  }
+  ui.capturePanel.hidden = !hasCapability("capture");
 }
 
 function setConnection(kind, message) {
@@ -823,13 +976,30 @@ async function loadRunDetail(runId) {
   if (!isRunSummary(value.run) || !value.spec || typeof value.spec !== "object") {
     throw new RemoteError("Runner returned invalid run details");
   }
-  state.selectedRun = value.run;
-  ui.detailRunId.textContent = value.run.run_id;
-  ui.detailStatus.textContent = humanize(value.run.status);
-  ui.detailStatus.dataset.status = value.run.status;
-  ui.specJson.textContent = JSON.stringify(value.spec, null, 2);
-  renderFacts(value.run);
-  ui.cancelButton.hidden = !hasScope("cancel") || TERMINAL_STATUSES.has(value.run.status);
+  // `paused` is a sibling of `run`, not a field on it: the daemon's job holds
+  // the flag and the run summary is the ledger's, so folding it in would mean
+  // one of the two shapes lying about where the state lives.
+  const paused = value.paused === true;
+  await cacheRunDetail(runId, value.run, value.spec, paused);
+  renderRunDetail(value.run, value.spec, paused);
+}
+
+function renderRunDetail(run, spec, paused) {
+  state.selectedRun = run;
+  ui.detailRunId.textContent = run.run_id;
+  ui.detailStatus.textContent = humanize(run.status);
+  ui.detailStatus.dataset.status = run.status;
+  ui.specJson.textContent = JSON.stringify(spec ?? {}, null, 2);
+  renderFacts(run);
+  const terminal = TERMINAL_STATUSES.has(run.status);
+  ui.cancelButton.hidden = !hasScope("cancel") || terminal;
+  // Pause and resume are one grant and two buttons, because "paused" is a
+  // state a controller has to be able to leave. Which of the two is offered
+  // follows the run's own answer rather than a local memory of what was
+  // clicked: a run resumed from the desktop must not still read as paused here.
+  ui.pauseButton.hidden = !hasCapability("pause") || terminal || paused;
+  ui.resumeButton.hidden = !hasCapability("pause") || terminal || !paused;
+  applyStaleState();
 }
 
 function renderFacts(run) {
@@ -863,7 +1033,40 @@ async function loadApprovals(runId) {
   if (state.selectedRunId !== runId) return;
   if (!Array.isArray(value.approvals)) throw new RemoteError("Runner returned invalid approvals");
   state.approvals = value.approvals.filter(isApproval);
+  await cacheApprovals(runId, state.approvals);
   renderApprovals();
+}
+
+// Pause and resume, which are the same grant and two different requests.
+//
+// The runner answers 202 with a *request* recorded, not a state reached: a run
+// between tool calls does not stop the instant somebody taps pause. Saying
+// "requested" rather than "paused" is the difference between reporting what
+// happened and reporting what was asked for.
+async function setRunPaused(paused) {
+  const runId = state.selectedRunId;
+  if (!runId) return;
+  const button = paused ? ui.pauseButton : ui.resumeButton;
+  setButtonBusy(button, true, paused ? "Pausing…" : "Resuming…");
+  try {
+    const value = await signedRequest(
+      "POST",
+      `/v1/remote/runs/${encodeURIComponent(runId)}/${paused ? "pause" : "resume"}`,
+      {},
+    );
+    showToast(
+      value.status === "already_terminal"
+        ? "The run had already finished."
+        : paused
+          ? "Pause requested. The run stops at its next safe point."
+          : "Resume requested.",
+    );
+    await Promise.all([loadRunDetail(runId), loadEventsIfPermitted(runId)]);
+  } catch (error) {
+    handleError(error, paused ? "Pause failed" : "Resume failed");
+  } finally {
+    setButtonBusy(button, false);
+  }
 }
 
 function isApproval(approval) {
@@ -978,6 +1181,7 @@ async function loadEvents(runId) {
   const merged = [...bySequence.values()].sort((left, right) => left.sequence - right.sequence).slice(-1000);
   state.events.set(runId, merged);
   await saveEventCursor(runId, value.next_cursor);
+  await cacheEvents(runId, merged);
   if (state.selectedRunId === runId) renderEvents();
 }
 
@@ -1036,6 +1240,257 @@ function summarizeEvent(event) {
   }
   const keys = Object.keys(payload).slice(0, 3).map(humanize);
   return keys.length > 0 ? keys.join(" · ") : "Durable event recorded.";
+}
+
+// --- Paired conversations --------------------------------------------------
+//
+// The runner has served these routes since the mobile companion existed; this
+// client simply never used them, so an operator could grant `chat` and watch
+// nothing appear. Everything below spends a capability the runner already
+// gates, and every one of these requests is refused with a 403 if the grant is
+// absent — the visibility rules here decide what to *offer*, never what is
+// allowed.
+
+function isSessionSummary(session) {
+  return Boolean(
+    session &&
+      validId(session.id) &&
+      typeof session.title === "string" &&
+      Number.isSafeInteger(session.updated_at_ms),
+  );
+}
+
+function isChatMessage(message) {
+  return Boolean(
+    message &&
+      validId(message.id) &&
+      typeof message.role === "string" &&
+      typeof message.text === "string" &&
+      Number.isSafeInteger(message.created_at_ms),
+  );
+}
+
+async function loadSessions() {
+  const value = await signedRequest("GET", "/v1/remote/mobile/sessions");
+  if (!Array.isArray(value.sessions)) throw new RemoteError("Runner returned an invalid session list");
+  state.sessions = value.sessions.filter(isSessionSummary);
+  await cacheSessions(state.sessions);
+  if (!state.sessions.some((session) => session.id === state.selectedSessionId)) {
+    state.selectedSessionId = state.sessions[0]?.id || null;
+  }
+  renderSessions();
+  if (state.selectedSessionId) await loadMessages(state.selectedSessionId);
+}
+
+async function loadMessages(sessionId) {
+  const value = await signedRequest(
+    "GET",
+    `/v1/remote/mobile/sessions/${encodeURIComponent(sessionId)}/messages`,
+  );
+  if (!Array.isArray(value.messages)) throw new RemoteError("Runner returned invalid messages");
+  const messages = value.messages.filter(isChatMessage);
+  state.messages.set(sessionId, messages);
+  await cacheMessages(sessionId, messages);
+  if (state.selectedSessionId === sessionId) renderMessages();
+}
+
+function renderSessions() {
+  if (!ui.chatPanel) return;
+  const visible = hasCapability("view_sessions");
+  ui.chatPanel.hidden = !visible;
+  if (!visible) return;
+  ui.sessionSelect.replaceChildren(
+    ...state.sessions.map((session) => {
+      const option = document.createElement("option");
+      option.value = session.id;
+      option.textContent = `${session.title || session.id} · ${relativeTime(session.updated_at_ms)}`;
+      option.selected = session.id === state.selectedSessionId;
+      return option;
+    }),
+  );
+  ui.sessionSelect.hidden = state.sessions.length === 0;
+  ui.chatEmpty.hidden = state.sessions.length !== 0;
+  ui.chatForm.hidden = !hasCapability("chat") || !state.selectedSessionId;
+  if (state.selectedSessionId) {
+    ui.chatInput.value = state.drafts[state.selectedSessionId] || "";
+  }
+  renderMessages();
+}
+
+function renderMessages() {
+  const messages = state.messages.get(state.selectedSessionId) || [];
+  ui.messageList.replaceChildren(...messages.map(messageRow));
+}
+
+function messageRow(message) {
+  const row = element("li", "message-row");
+  row.dataset.role = message.role;
+  const header = element("span", "message-head", `${humanize(message.role)} · ${formatDate(message.created_at_ms)}`);
+  const body = element("span", "message-body", message.text);
+  row.append(header, body);
+  // The runner's three states are `queued`, `accepted` and `failed`. Only the
+  // first and last are worth a badge: `queued` says the durable run has not
+  // finished, which is what keeps a slow answer from reading as a lost one, and
+  // `failed` says it never will. `accepted` is the answer sitting right above.
+  if (message.task_state === "queued" || message.task_state === "failed") {
+    row.append(element("span", "message-state", humanize(message.task_state)));
+  }
+  return row;
+}
+
+async function sendMessage() {
+  const sessionId = state.selectedSessionId;
+  const text = ui.chatInput.value.trim();
+  if (!sessionId || !text) return;
+  setButtonBusy(ui.chatSendButton, true, "Sending…");
+  try {
+    await signedRequest(
+      "POST",
+      `/v1/remote/mobile/sessions/${encodeURIComponent(sessionId)}/messages`,
+      { text },
+    );
+    // Cleared only after the runner accepted it. A draft dropped on a failed
+    // send is a message somebody has to retype, and this is the one screen
+    // where that is most likely to happen on a bad connection.
+    ui.chatInput.value = "";
+    await saveDraft(sessionId, "");
+    await loadMessages(sessionId);
+    showToast("Sent. The runner answers as a durable run under its own recipe.");
+  } catch (error) {
+    handleError(error, "The message was not sent");
+  } finally {
+    setButtonBusy(ui.chatSendButton, false);
+  }
+}
+
+// --- Workflows -------------------------------------------------------------
+
+async function loadWorkflows() {
+  const value = await signedRequest("GET", "/v1/remote/mobile/workflows");
+  if (!Array.isArray(value.workflows)) throw new RemoteError("Runner returned an invalid workflow list");
+  state.workflows = value.workflows.filter(
+    (workflow) => workflow && validId(workflow.id) && typeof workflow.name === "string",
+  );
+  renderWorkflows();
+}
+
+function renderWorkflows() {
+  if (!ui.workflowPanel) return;
+  const visible = hasCapability("view_tasks");
+  ui.workflowPanel.hidden = !visible;
+  if (!visible) return;
+  ui.workflowEmpty.hidden = state.workflows.length !== 0;
+  ui.workflowList.replaceChildren(
+    ...state.workflows.map((workflow) => {
+      const row = element("li", "workflow-row");
+      const label = document.createElement("span");
+      label.append(
+        element("span", "workflow-name", workflow.name),
+        element(
+          "span",
+          "workflow-meta",
+          `${workflow.summary || ""}${workflow.last_run_at_ms ? ` · last run ${relativeTime(workflow.last_run_at_ms)}` : ""}`,
+        ),
+      );
+      row.append(label);
+      if (hasCapability("run_workflows")) {
+        row.append(
+          actionButton("Launch", "secondary", (button) => launchWorkflow(workflow, button)),
+        );
+      }
+      return row;
+    }),
+  );
+  applyStaleState();
+}
+
+async function launchWorkflow(workflow, button) {
+  if (!confirm(`Launch '${workflow.name}' on the runner? It runs under the runner's own policy.`)) return;
+  setButtonBusy(button, true, "Launching…");
+  try {
+    const value = await signedRequest(
+      "POST",
+      `/v1/remote/mobile/workflows/${encodeURIComponent(workflow.id)}/runs`,
+      {},
+    );
+    showToast(`Launched as run ${value.run_id || "(pending)"}.`);
+    await refreshRuns();
+  } catch (error) {
+    handleError(error, "The workflow was not launched");
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+// --- Captures --------------------------------------------------------------
+//
+// The one direction in which this device hands the runner content on its own
+// initiative, rather than because a command asked for it. The runner re-derives
+// the digest and refuses anything whose bytes do not match what was declared,
+// so the check below is a courtesy that fails fast, never the authority.
+
+async function fileCapture(event) {
+  event.preventDefault();
+  const title = ui.captureTitleInput.value.trim();
+  const text = ui.captureText.value.trim();
+  const file = ui.captureFile.files?.[0] || null;
+  if (!title) {
+    showToast("A capture needs a title.", "error");
+    return;
+  }
+  const budget = Number(state.deviceState?.max_artifact_bytes || MAX_ARTIFACT_BYTES);
+  if (file && file.size > budget) {
+    showToast(`That file is ${formatBytes(file.size)}; this pairing allows ${formatBytes(budget)}.`, "error");
+    return;
+  }
+  setButtonBusy(ui.captureButton, true, "Filing…");
+  try {
+    const body = {
+      capture_id: `cap-${randomToken(18)}`,
+      kind: file ? (file.type.startsWith("image/") ? "image" : "file") : "text",
+      title,
+    };
+    if (text) body.text = text;
+    if (file) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      // Through the same FileReader the camera path uses, not
+      // `btoa(String.fromCharCode(...bytes))`: spreading a multi-megabyte array
+      // into arguments overflows the call stack, and the artifact budget here
+      // is eight megabytes.
+      body.content_base64 = await blobToBase64(file);
+      body.content_sha256 = await sha256Hex(bytes);
+      body.size_bytes = bytes.length;
+      body.mime_type = file.type || "application/octet-stream";
+    }
+    await signedRequest("POST", "/v1/remote/mobile/captures", body);
+    ui.captureForm.reset();
+    showToast("Filed on the runner.");
+  } catch (error) {
+    handleError(error, "The capture was not filed");
+  } finally {
+    setButtonBusy(ui.captureButton, false);
+  }
+}
+
+async function revokeSelf() {
+  if (
+    !confirm(
+      "Revoke this device on the runner? Its key stops working immediately, any live session it owns is force-stopped, and re-pairing needs a new invitation.",
+    )
+  ) {
+    return;
+  }
+  setButtonBusy(ui.revokeSelfButton, true, "Revoking…");
+  try {
+    await signedRequest("DELETE", "/v1/remote/mobile/devices/self", undefined);
+    await deleteActiveRecord();
+    showPairing();
+    showToast("This device is revoked on the runner and forgotten here.");
+  } catch (error) {
+    handleError(error, "The device could not revoke itself");
+  } finally {
+    setButtonBusy(ui.revokeSelfButton, false);
+  }
 }
 
 async function cancelSelectedRun(reason) {
@@ -1230,6 +1685,7 @@ function bindEvents() {
       showToast("Browser paired. The device key is non-exportable and scoped by the invitation.");
       await refreshRuns({ preserveSelection: false });
       await advertiseDevice();
+      await refreshCapabilitySurfaces();
       void runCommandLoop();
     } catch (error) {
       handleError(error, "Pairing failed");
@@ -1243,6 +1699,7 @@ function bindEvents() {
     setButtonBusy(ui.refreshButton, true, "Refreshing…");
     try {
       await refreshRuns();
+      await refreshCapabilitySurfaces();
       showToast("Runner state refreshed.");
     } catch (error) {
       handleError(error, "Refresh failed");
@@ -1326,6 +1783,54 @@ function bindEvents() {
       renderScreenShare();
     }
   });
+
+  ui.pauseButton?.addEventListener("click", () => void setRunPaused(true));
+  ui.resumeButton?.addEventListener("click", () => void setRunPaused(false));
+  ui.revokeSelfButton?.addEventListener("click", () => void revokeSelf());
+
+  ui.sessionSelect?.addEventListener("change", async () => {
+    state.selectedSessionId = ui.sessionSelect.value || null;
+    ui.chatInput.value = state.drafts[state.selectedSessionId] || "";
+    renderMessages();
+    if (state.selectedSessionId && !state.stale) {
+      try {
+        await loadMessages(state.selectedSessionId);
+      } catch (error) {
+        handleError(error, "Messages could not be read");
+      }
+    }
+  });
+  // Debounced by nothing on purpose: an IndexedDB put per keystroke is cheap,
+  // and a debounce is exactly what loses the last few characters when a phone
+  // is locked mid-sentence.
+  ui.chatInput?.addEventListener("input", () => {
+    if (state.selectedSessionId) void saveDraft(state.selectedSessionId, ui.chatInput.value);
+  });
+  ui.chatForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void sendMessage();
+  });
+  ui.chatRefreshButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.chatRefreshButton, true, "Checking…");
+    try {
+      await loadSessions();
+    } catch (error) {
+      handleError(error, "Sessions could not be read");
+    } finally {
+      setButtonBusy(ui.chatRefreshButton, false);
+    }
+  });
+  ui.workflowRefreshButton?.addEventListener("click", async () => {
+    setButtonBusy(ui.workflowRefreshButton, true, "Checking…");
+    try {
+      await loadWorkflows();
+    } catch (error) {
+      handleError(error, "Workflows could not be read");
+    } finally {
+      setButtonBusy(ui.workflowRefreshButton, false);
+    }
+  });
+  ui.captureForm?.addEventListener("submit", (event) => void fileCapture(event));
 
   ui.killButton.addEventListener("click", () => void engageKillSwitch());
   ui.artifactForm.addEventListener("submit", fetchArtifact);
@@ -1481,6 +1986,12 @@ function renderDeviceState() {
   ui.devicePermissions.textContent = entries.length
     ? entries.map(([capability, permission]) => `${humanize(capability)}: ${permission}`).join(" · ")
     : "not reported";
+  // The runner has just restated what this pairing holds, which is where an
+  // operator's grant edit becomes visible: a withdrawn `chat` has to take the
+  // composer with it rather than leaving a control that answers 403.
+  renderSessions();
+  renderWorkflows();
+  if (ui.capturePanel) ui.capturePanel.hidden = !hasCapability("capture");
 }
 
 // --- Performing one command ------------------------------------------------
@@ -2034,17 +2545,144 @@ async function rememberCommand(commandId, report) {
 }
 
 // Keeps the last view of the runner so the app opens to something on a train.
-// Bounded to 50 runs, and never anything that could be replayed as an action.
-async function cacheRuns(runs) {
+//
+// Everything the controller *reads* is cached — runs, their details, events,
+// approval metadata, artifact metadata, sessions and messages — and nothing it
+// *does* is. That asymmetry is the whole design: a queued approval replayed on
+// reconnect would act on a run whose state this device could not see, so no
+// action is ever buffered. A draft is the one exception, and it is not an
+// action: nothing has happened until it is sent.
+function emptyCache() {
+  return {
+    savedAtMs: 0,
+    runs: [],
+    details: {},
+    approvals: {},
+    events: {},
+    artifacts: {},
+    sessions: [],
+    messages: {},
+  };
+}
+
+async function updateRecord(mutate) {
   await withStore("readwrite", (store, transaction) => {
     const request = store.get(ACTIVE_RECORD);
     request.onsuccess = () => {
       const record = request.result;
       if (!record) return;
-      record.cache = { runs: runs.slice(0, 50), savedAtMs: Date.now() };
-      store.put(record);
+      try {
+        mutate(record);
+        store.put(record);
+      } catch {
+        transaction.abort();
+      }
     };
     request.onerror = () => transaction.abort();
+  });
+}
+
+async function cacheWrite(mutate) {
+  await updateRecord((record) => {
+    record.cache = { ...emptyCache(), ...(record.cache || {}) };
+    mutate(record.cache);
+    // Pruned on every write rather than on read: a bound enforced only when
+    // something reads it is a bound that grows without limit on a device that
+    // is never opened offline.
+    record.cache.runs = record.cache.runs.slice(0, CACHE_LIMITS.runs);
+    const visible = new Set(record.cache.runs.map((run) => run.run_id));
+    for (const key of ["details", "approvals", "events", "artifacts"]) {
+      for (const runId of Object.keys(record.cache[key])) {
+        if (!visible.has(runId)) delete record.cache[key][runId];
+      }
+    }
+    record.cache.sessions = record.cache.sessions.slice(0, CACHE_LIMITS.sessions);
+    const sessions = new Set(record.cache.sessions.map((session) => session.id));
+    for (const sessionId of Object.keys(record.cache.messages)) {
+      if (!sessions.has(sessionId)) delete record.cache.messages[sessionId];
+    }
+    record.cache.savedAtMs = Date.now();
+  });
+}
+
+async function cacheRuns(runs) {
+  await cacheWrite((cache) => {
+    cache.runs = runs.slice(0, CACHE_LIMITS.runs);
+  });
+}
+
+async function cacheRunDetail(runId, run, spec, paused) {
+  await cacheWrite((cache) => {
+    cache.details[runId] = { run, spec, paused };
+  });
+}
+
+async function cacheApprovals(runId, approvals) {
+  await cacheWrite((cache) => {
+    // Metadata only, which is all the route returns: an approval carries a
+    // digest and an expiry, never the operation's arguments.
+    cache.approvals[runId] = approvals.slice(0, CACHE_LIMITS.approvalsPerRun);
+  });
+}
+
+// Events, and the artifact metadata they announce.
+//
+// The bytes are never cached — an artifact is fetched over the signed route and
+// verified against its digest, and a copy sitting in this browser would be an
+// unverified second source. What is kept is that the artifact exists, so an
+// offline device can tell someone which id to ask for.
+async function cacheEvents(runId, events) {
+  await cacheWrite((cache) => {
+    cache.events[runId] = events.slice(-CACHE_LIMITS.eventsPerRun);
+    const artifacts = new Map(
+      (cache.artifacts[runId] || []).map((artifact) => [artifact.artifact_id, artifact]),
+    );
+    for (const envelope of events) {
+      if (envelope.event?.type !== "artifact_added") continue;
+      const payload = envelope.event.payload || {};
+      const artifactId = payload.artifact_id;
+      if (typeof artifactId !== "string" || !validId(artifactId)) continue;
+      artifacts.set(artifactId, {
+        artifact_id: artifactId,
+        media_type: typeof payload.media_type === "string" ? payload.media_type : null,
+        bytes: Number.isSafeInteger(payload.bytes) ? payload.bytes : null,
+        sequence: envelope.sequence,
+      });
+    }
+    cache.artifacts[runId] = [...artifacts.values()].slice(-CACHE_LIMITS.artifactsPerRun);
+  });
+}
+
+async function cacheSessions(sessions) {
+  await cacheWrite((cache) => {
+    cache.sessions = sessions.slice(0, CACHE_LIMITS.sessions);
+  });
+}
+
+async function cacheMessages(sessionId, messages) {
+  await cacheWrite((cache) => {
+    cache.messages[sessionId] = messages.slice(-CACHE_LIMITS.messagesPerSession);
+  });
+}
+
+// A draft is not an action, so unlike everything else on this screen it is kept
+// while offline and restored on the next load. It is stored beside the cache
+// rather than inside it, so pruning a run or a session never deletes something
+// a person typed.
+async function saveDraft(sessionId, text) {
+  // A draft keyed by something `validateStoredRecord` would later reject would
+  // invalidate the whole profile on the next load — which is to say, lose the
+  // device key over a piece of text. The session list only ever offers ids that
+  // already passed this check; the guard is what keeps that true.
+  if (!validId(sessionId)) return;
+  state.drafts[sessionId] = text;
+  await updateRecord((record) => {
+    record.drafts ||= {};
+    if (text.trim()) {
+      record.drafts[sessionId] = text.slice(0, 4_000);
+    } else {
+      delete record.drafts[sessionId];
+    }
   });
 }
 
@@ -2058,8 +2696,40 @@ function showStale(record, reason) {
   const cached = record?.cache;
   state.stale = true;
   state.lastSyncAtMs = cached?.savedAtMs || null;
+  state.drafts = record?.drafts || {};
   state.runs = Array.isArray(cached?.runs) ? cached.runs.filter(isRunSummary) : [];
+  state.sessions = Array.isArray(cached?.sessions) ? cached.sessions.filter(isSessionSummary) : [];
+  state.messages = new Map(
+    Object.entries(cached?.messages || {}).map(([sessionId, messages]) => [
+      sessionId,
+      (Array.isArray(messages) ? messages : []).filter(isChatMessage),
+    ]),
+  );
+  for (const [runId, events] of Object.entries(cached?.events || {})) {
+    state.events.set(runId, (Array.isArray(events) ? events : []).filter(isEventEnvelope));
+  }
   renderRuns();
+  if (!state.sessions.some((session) => session.id === state.selectedSessionId)) {
+    state.selectedSessionId = state.sessions[0]?.id || null;
+  }
+  renderSessions();
+  renderWorkflows();
+  // A cached run detail, so the offline view is a run rather than an empty
+  // panel. Chosen the same way the online path chooses: the previous selection
+  // if it is still visible, otherwise the first run.
+  const selected = state.runs.some((run) => run.run_id === state.selectedRunId)
+    ? state.selectedRunId
+    : state.runs[0]?.run_id || null;
+  state.selectedRunId = selected;
+  const detail = selected ? cached?.details?.[selected] : null;
+  ui.runPlaceholder.hidden = Boolean(detail);
+  ui.runDetail.hidden = !detail;
+  if (detail && isRunSummary(detail.run)) {
+    renderRunDetail(detail.run, detail.spec, detail.paused === true);
+    state.approvals = (cached?.approvals?.[selected] || []).filter(isApproval);
+    renderApprovals();
+    renderEvents();
+  }
   applyStaleState();
   setConnection("error", cached ? `Offline — showing ${relativeTime(cached.savedAtMs)}` : reason);
 }
@@ -2069,15 +2739,32 @@ function applyStaleState() {
     ui.staleBanner.hidden = !state.stale;
     if (state.stale) {
       ui.staleBanner.textContent = state.lastSyncAtMs
-        ? `Offline. Showing what the runner said ${relativeTime(state.lastSyncAtMs)}. Actions are disabled until it is reachable again.`
+        ? `Offline. Showing what the runner said ${relativeTime(state.lastSyncAtMs)}. Actions are disabled until it is reachable again; anything you type is kept as a draft.`
         : "Offline. No cached runner state is available.";
     }
   }
-  // Every control whose effect leaves this device.
-  for (const button of [ui.cancelButton, ui.killButton, ui.eventsButton, ui.artifactForm?.querySelector("button")]) {
+  // Every control whose effect leaves this device. A draft is not one of them —
+  // the composer stays usable, because typing changes nothing on the runner and
+  // the text is what a person would otherwise lose.
+  for (const button of [
+    ui.cancelButton,
+    ui.killButton,
+    ui.eventsButton,
+    ui.pauseButton,
+    ui.resumeButton,
+    ui.chatSendButton,
+    ui.chatRefreshButton,
+    ui.workflowRefreshButton,
+    ui.captureButton,
+    ui.revokeSelfButton,
+    ui.artifactForm?.querySelector("button"),
+  ]) {
     if (button) button.disabled = state.stale;
   }
   for (const button of ui.approvalsList?.querySelectorAll("button") || []) {
+    button.disabled = state.stale;
+  }
+  for (const button of ui.workflowList?.querySelectorAll("button") || []) {
     button.disabled = state.stale;
   }
 }
@@ -2189,6 +2876,9 @@ async function initialize() {
     showPairing();
     return;
   }
+  // Drafts before anything on the network: the text somebody typed is the one
+  // thing on this screen that does not depend on the runner being reachable.
+  state.drafts = record.drafts || {};
   showDashboard(record.profile);
   try {
     await refreshRuns({ preserveSelection: false });
@@ -2204,6 +2894,7 @@ async function initialize() {
   } catch (error) {
     handleError(error, "This device could not report what it can do");
   }
+  await refreshCapabilitySurfaces();
   void refreshPushState();
   renderScreenShare();
   // Deliberately not awaited: the loop runs for the life of the page.

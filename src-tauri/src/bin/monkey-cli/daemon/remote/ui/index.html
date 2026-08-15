@@ -122,6 +122,72 @@
             <button id="screenShareButton" class="button secondary" type="button">Allow screen capture</button>
             <p id="screenShareStatus" class="field-help"></p>
           </div>
+          <div class="device-push">
+            <button id="revokeSelfButton" class="button danger" type="button">Revoke this device</button>
+            <p class="field-help">
+              Severs this device on the runner itself, not only in this browser. Its key stops
+              working immediately and any live session it owns is force-stopped.
+            </p>
+          </div>
+        </section>
+
+        <section id="chatPanel" class="panel" aria-labelledby="chatTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Paired conversation</p>
+              <h2 id="chatTitle">Sessions</h2>
+            </div>
+            <button id="chatRefreshButton" class="button ghost compact-button" type="button">Check now</button>
+          </div>
+          <label class="search-label" for="sessionSelect">Session</label>
+          <select id="sessionSelect"></select>
+          <p id="chatEmpty" class="empty-state">No sessions are visible yet.</p>
+          <ol id="messageList" class="message-list" aria-live="polite"></ol>
+          <form id="chatForm" class="inline-form" hidden>
+            <label for="chatInput">Message</label>
+            <div class="input-action">
+              <textarea id="chatInput" maxlength="4000" rows="2" placeholder="Ask the runner…"></textarea>
+              <button id="chatSendButton" class="button primary" type="submit">Send</button>
+            </div>
+            <p class="field-help">
+              A message becomes a durable run under the runner&apos;s own recipe and permission
+              policy. Drafts stay on this device until you send them.
+            </p>
+          </form>
+        </section>
+
+        <section id="workflowPanel" class="panel" aria-labelledby="workflowTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Declared on the runner</p>
+              <h2 id="workflowTitle">Workflows</h2>
+            </div>
+            <button id="workflowRefreshButton" class="button ghost compact-button" type="button">Check now</button>
+          </div>
+          <ul id="workflowList" class="workflow-list"></ul>
+          <p id="workflowEmpty" class="empty-state">No workflows are declared on this runner.</p>
+        </section>
+
+        <section id="capturePanel" class="panel" aria-labelledby="captureTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">From this device</p>
+              <h2 id="captureTitle">Send to the runner</h2>
+            </div>
+          </div>
+          <form id="captureForm" class="inline-form">
+            <label for="captureTitleInput">Title</label>
+            <input id="captureTitleInput" maxlength="200" required placeholder="Whiteboard from the standup">
+            <label for="captureText">Note</label>
+            <textarea id="captureText" maxlength="4000" rows="2" placeholder="Optional text to file with it"></textarea>
+            <label for="captureFile">Image or file</label>
+            <input id="captureFile" type="file" accept="image/*,text/*,application/pdf">
+            <button id="captureButton" class="button secondary" type="submit">File this capture</button>
+            <p class="field-help">
+              Bounded by this pairing&apos;s artifact budget and digest-checked by the runner, which
+              refuses anything whose bytes do not match what was declared.
+            </p>
+          </form>
         </section>
 
         <div class="workspace-grid">
@@ -157,6 +223,8 @@
                 </div>
                 <dl id="runFacts" class="facts-grid"></dl>
                 <div class="run-actions">
+                  <button id="pauseButton" class="button secondary" type="button" hidden>Pause run</button>
+                  <button id="resumeButton" class="button secondary" type="button" hidden>Resume run</button>
                   <button id="cancelButton" class="button danger" type="button" hidden>Cancel run</button>
                   <button id="reloadRunButton" class="button secondary" type="button">Reload details</button>
                 </div>

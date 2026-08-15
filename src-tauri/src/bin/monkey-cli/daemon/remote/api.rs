@@ -851,12 +851,26 @@ impl RemoteApi {
         let run = self.authorized_run(scopes, run_id)?;
         let shared = SharedLedger::open(&self.paths.ledger_db).map_err(internal)?;
         let summary = summarize(&run, &shared).map_err(internal)?;
+        // Whether a pause is in effect, so a controller offers *resume* on a
+        // paused run rather than pause again. It lives on the daemon's job
+        // rather than in the run's status, and it is read here rather than in
+        // `summarize` because the run list does not need it and would pay a
+        // second database open per row for it. A machine whose daemon store
+        // cannot be opened reports `false`: "not paused" is the state every
+        // caller already handles, and refusing to describe a run because its
+        // pause flag is unreadable would be a worse answer than a missing
+        // button.
+        let paused = DaemonStore::open(&self.paths)
+            .ok()
+            .and_then(|store| store.get_job(run_id).ok().flatten())
+            .is_some_and(|job| job.pause_requested);
         // RunSpec contains only keychain references, never provider keys.
         Ok((
             200,
             serde_json::json!({
                 "protocol_version": REMOTE_PROTOCOL_VERSION,
                 "run": summary,
+                "paused": paused,
                 "spec": run.spec,
             }),
             Some(run_id.to_string()),

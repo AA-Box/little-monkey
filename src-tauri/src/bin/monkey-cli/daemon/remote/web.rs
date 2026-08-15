@@ -163,6 +163,160 @@ mod tests {
         }
     }
 
+    /// **Every capability the runner can grant reaches a surface on the phone,
+    /// or is named as deliberately having none.**
+    ///
+    /// The test above covers the legacy `RemoteAction` set and the physical
+    /// capabilities. It does not cover the rest of `DeviceCapability` — and the
+    /// rest is where the same defect had spread: `view_sessions`, `chat`,
+    /// `view_tasks`, `run_workflows` and `capture` were all grantable, all
+    /// served by routes in `api.rs`, and all unreachable from the bundled
+    /// client, so an operator could tick "chat" on an invitation and watch
+    /// nothing appear.
+    ///
+    /// Reading the variant names out of `protocol.rs` rather than listing them
+    /// here is the point: a capability added to the enum fails this test until
+    /// somebody decides, in `app.js`, whether the phone gets a surface for it.
+    /// `null` is an acceptable answer — `control_desktop` has one, because this
+    /// client is the subject of such a session and never its operator — but it
+    /// has to be written down.
+    #[test]
+    fn every_grantable_capability_has_a_surface_or_a_stated_reason_for_none() {
+        let protocol = include_str!("protocol.rs");
+        let variants = protocol
+            .split_once("pub enum DeviceCapability {")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("protocol.rs still declares DeviceCapability");
+        let tokens: Vec<String> = variants
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.ends_with(',')
+                    && !line.starts_with("//")
+                    && !line.starts_with('#')
+                    && line
+                        .trim_end_matches(',')
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+                    && line.starts_with(|character: char| character.is_ascii_uppercase())
+            })
+            .map(|line| {
+                let mut token = String::new();
+                for (index, character) in line.trim_end_matches(',').chars().enumerate() {
+                    if character.is_ascii_uppercase() {
+                        if index > 0 {
+                            token.push('_');
+                        }
+                        token.push(character.to_ascii_lowercase());
+                    } else {
+                        token.push(character);
+                    }
+                }
+                token
+            })
+            .collect();
+        assert!(
+            tokens.len() >= 20,
+            "the enum scan found only {} variants, so it is no longer reading the enum",
+            tokens.len()
+        );
+
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        let section = |marker: &str, end: &str| {
+            javascript
+                .split_once(marker)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body.to_string())
+                .unwrap_or_else(|| panic!("app.js still declares {marker}"))
+        };
+        let controller = section("const CONTROLLER_CAPABILITIES = {", "\n};");
+        let physical = section("const DEVICE_CAPABILITIES = {", "\n};");
+        for token in tokens {
+            assert!(
+                controller.contains(&format!("{token}:"))
+                    || physical.contains(&format!("{token}:")),
+                "the runner can grant '{token}' and the mobile client says nothing about it — \
+                 give it a surface in app.js, or map it to null with the reason"
+            );
+        }
+    }
+
+    /// The five mobile routes that had a grant and no caller.
+    ///
+    /// Pinned individually rather than trusting the scan above, because the
+    /// scan only proves the *token* is mentioned: a capability could be listed
+    /// with a description and still reach no route. These are the requests.
+    #[test]
+    fn the_mobile_client_calls_the_routes_its_capabilities_pay_for() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        for fragment in [
+            "\"GET\", \"/v1/remote/mobile/sessions\"",
+            "/v1/remote/mobile/sessions/${encodeURIComponent(sessionId)}/messages",
+            "\"GET\", \"/v1/remote/mobile/workflows\"",
+            "/v1/remote/mobile/workflows/${encodeURIComponent(workflow.id)}/runs",
+            "\"POST\", \"/v1/remote/mobile/captures\"",
+            "\"DELETE\", \"/v1/remote/mobile/devices/self\"",
+            "${paused ? \"pause\" : \"resume\"}",
+        ] {
+            assert!(
+                javascript.contains(fragment),
+                "the mobile client no longer calls {fragment}"
+            );
+        }
+    }
+
+    /// Offline keeps everything the controller *reads* and nothing it *does*.
+    ///
+    /// The distinction is the safety property: a cached run list is a stale
+    /// view somebody can be told is stale, and a queued approval is an action
+    /// that would land on a run whose state the device could not see. A draft
+    /// sits on the safe side — nothing has happened until it is sent — which is
+    /// why it is the one thing that survives being offline.
+    #[test]
+    fn the_offline_cache_covers_every_read_surface_and_no_action() {
+        let javascript = String::from_utf8(
+            asset("GET", "/v1/remote/ui/app.js")
+                .expect("javascript asset")
+                .body,
+        )
+        .unwrap();
+        for cached in [
+            "async function cacheRuns(",
+            "async function cacheRunDetail(",
+            "async function cacheApprovals(",
+            "async function cacheEvents(",
+            "async function cacheSessions(",
+            "async function cacheMessages(",
+            "cache.artifacts[runId]",
+        ] {
+            assert!(
+                javascript.contains(cached),
+                "{cached} is no longer cached offline"
+            );
+        }
+        // A draft persists; an action never does.
+        assert!(javascript.contains("async function saveDraft("));
+        assert!(javascript.contains("record.drafts[sessionId] = text.slice(0, 4_000)"));
+        assert!(
+            !javascript.contains("pendingActions") && !javascript.contains("replayQueue"),
+            "a queue of actions to replay on reconnect is exactly what offline must not have"
+        );
+        // The bounds, so the cache cannot grow without limit on a device nobody
+        // opens offline.
+        assert!(javascript.contains("const CACHE_LIMITS = {"));
+    }
+
     /// The compact pairing code the phone scans and the one the runner prints
     /// have to be the same format. Both sides are checked here rather than
     /// only in Rust, because the parser that matters is the one on the phone.
