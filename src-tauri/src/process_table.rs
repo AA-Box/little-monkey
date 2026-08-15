@@ -1432,7 +1432,7 @@ pub struct ProcessRecord {
     /// The most recent measurement of the owned tree, with the peaks it has
     /// reached. `None` where nothing sampled it — never a zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<crate::resource_control::ResourceSample>,
+    pub usage: Option<crate::resource_control::RecordedUsage>,
     /// When that measurement was taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_sampled_at_ms: Option<i64>,
@@ -4143,8 +4143,7 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessTableResult<Proce
     let usage_sampled_at_ms: Option<i64> = row.get(44)?;
     let usage = usage_sampled_at_ms
         .map(|_| -> rusqlite::Result<_> {
-            Ok(crate::resource_control::ResourceSample {
-                wall_ms: 0,
+            Ok(crate::resource_control::RecordedUsage {
                 rss_bytes: row.get::<_, Option<i64>>(39)?.map(|v| v as u64),
                 peak_rss_bytes: row.get::<_, Option<i64>>(40)?.map(|v| v as u64),
                 process_count: row.get::<_, Option<i64>>(41)?.map(|v| v as u32),

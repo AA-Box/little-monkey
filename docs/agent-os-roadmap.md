@@ -1483,16 +1483,14 @@ tested end to end against real child trees, a browser session is routed, the
 Processes panel shows what is bounding each process, and the scheduler audit is
 assertions in the test suite.
 
-**Two limits remain, and both are platform-fundamental rather than unfinished
+**One limit remains, and it is platform-fundamental rather than unfinished
 work.** macOS offers no kernel-owned process tree to an unprivileged process, so
-its bound is supervised and says so; and on Windows the owners that do not call
-`CreateProcessW` themselves — a browser session's Chromium, the verify runner, the
-hook runner — are assigned to their job immediately after creation rather than
-before the process is resumed, because a job cannot be carried into a process by a
-`Command` and those spawn sites have no pre-creation hook. Agent shells and the
-sandbox run do call it themselves and get the stronger ordering. Both limits are
-stated at the end of this section, reported truthfully by the capability API, and
-shown as such in the UI and the CLI. Neither is a resource left unbounded.
+its bound is supervised and says so. The Windows ordering gap that used to stand
+beside it is closed: every agent-controlled Windows workload is now created
+suspended, assigned to its job, and only resumed once the kernel reports the
+membership. The remaining limit is stated at the end of this section, reported
+truthfully by the capability API, and shown as such in the UI and the CLI. It is
+not a resource left unbounded.
 
 ### Shipped — one resource-control contract, and limits that fire
 
@@ -1560,34 +1558,105 @@ claim something false.
 
 ### What remains open
 
-1. **macOS has no kernel-owned process tree, and this does not invent one.** The
-   supervisor covers an ordinary descendant and a `setsid` escape, because
-   membership is the parent-link closure *unioned* with the process group and
-   each covers the other's escape. A descendant that both re-parents **and**
-   leaves the group, before ownership is captured, is outside any primitive macOS
-   offers without a privileged helper. It keeps its Seatbelt filesystem and
-   network confinement; what it escapes is the lifetime bound. The capability
-   says `supervised` and the UI says `Supervised`, which is the honest report of
-   a real platform limit rather than a deferred implementation.
+1. **macOS has no kernel-owned process tree, and this does not invent one.**
+   Ownership is captured, not derived: every process the workload is ever
+   observed to own is recorded by `(pid, start-time)` and **never removed**, and
+   the process group it started in is captured at attach — while the root is
+   certainly alive, which is the only time it is readable — so discovery keeps
+   working after the root exits. A descendant that leaves the group, changes
+   session or re-parents *after* it has been seen once stays owned, counts
+   against the budget it left, and is reclaimed by the same termination. Five
+   tests drive real trees through exactly those escapes.
 
-2. **On Windows, an owner that does not call `CreateProcessW` itself is assigned
-   to its job after creation rather than before it is resumed.** Three do:
-   Chromium, launched by a long-standing spawn site with its own argv,
-   environment and stdio; the verify runner; and the hook runner. A job object is
-   applied *to* a process and cannot be carried into one by a `Command`, so for
-   those the assignment happens in the microseconds after `CreateProcess`
-   returns, and a descendant created inside that window would be outside it. The
-   agent shells and the sandbox run build the process themselves — created
-   suspended, assigned, then resumed — and get the strong ordering, which is the
-   same ordering every owner gets on Unix, where the cgroup membership and the
-   process group are installed before `exec`. Stated rather than glossed as
-   equivalent; `ResourceController::adopt` carries the same note at the call, and
-   `attach` still refuses to run a workload whose membership does not read back.
+   What is left is narrow and real: a descendant that both `setsid`s **and**
+   re-parents *before the supervisor has ever observed it* is outside every
+   primitive an unprivileged process has — no group, no session, no parent link,
+   and nothing the kernel can be asked names the workload. It keeps its Seatbelt
+   filesystem and network confinement; what it escapes is the lifetime bound.
+   `the_one_escape_no_unprivileged_supervisor_can_follow` pins that boundary as a
+   test rather than as a sentence, and fails if it is ever closed without this
+   entry moving. Linux under a delegated cgroup has no such boundary at all —
+   membership is inherited and cannot be left — which is why the backend is
+   reported rather than assumed.
 
 ### What was open, and is not
 
 Each of these was a numbered gap in the list above. They are kept, rather than
 deleted, because what they say about *how the gap was found* is the useful part.
+
+- **On Windows, an owner that did not call `CreateProcessW` itself was assigned
+  to its job after creation rather than before it was resumed.** Three were in
+  that state: Chromium, the verify runner and the hook runner. A job is applied
+  *to* a process and cannot be carried into one by a `Command`, so the assignment
+  happened in the microseconds after `CreateProcess` returned — and a descendant
+  created inside that window belonged to no job. Chromium was the worst case,
+  because it forks renderer, GPU and network children within milliseconds of
+  starting.
+
+  `managed_spawn_windows` closes it without a fourth copy of `CreateProcessW`:
+  `Command::creation_flags(CREATE_SUSPENDED)`, then assign, then read the
+  membership back with `IsProcessInJob`, then find and resume the one thread a
+  suspended process has. `std` and `tokio` keep doing argv quoting, the
+  environment block and stdio; the only thing added is those four steps in that
+  order, behind `ResourceController::spawn_contained_*` — which is now the single
+  spawn entry point on both platforms, so a new owner cannot get the ordering
+  wrong by writing its own. Every failure path terminates the suspended child,
+  because one that is never resumed never exits and nothing about it looks wrong
+  to an observer. `every_agent_controlled_windows_spawn_is_contained_before_its_first_instruction`
+  fails a future spawn path that skips it.
+
+  The agent shells and the disposable-copy sandbox keep calling `CreateProcessW`
+  themselves — an AppContainer's capabilities can only reach a process through a
+  `STARTUPINFOEX` attribute list no `Command` can build — and they already had
+  the same ordering.
+
+- **Three agent-controlled executions were bounded and invisible.** The verify
+  runner, the hook runner and the sandbox run each ran under the same controller
+  as an agent shell — bound installed before the first instruction, tree
+  measured, breach reclaiming the whole thing — and none of them had a process
+  row. A limit that fired on a verify command was reported in that command's own
+  result string and nowhere the processes ledger could show it. Migration V23
+  admits the three kinds and `bounded_execution::BoundedExecution` is the one
+  lifecycle they share: admit before the spawn, record the identity and
+  containment the *attach verified*, sample on the controller's own tick, close
+  with a typed exit — and close on `Drop` too, so an owner that returns early
+  cannot leave a row claiming `running` until the next app launch.
+
+- **A restart closed rows it had established nothing about.** Startup
+  reconciliation tried to kill a process group and then reaped every row it had
+  looked at as `lost` regardless of the outcome. `Lost` asserts that the worker
+  went away, and it was being asserted with no evidence: a descendant that had
+  left the group, a cgroup whose members would not die, and a row too old to
+  carry an identity all closed as confidently dead while the machine kept running
+  them.
+
+  `orphan_reclaim` produces a verdict instead, and only a checked absence may
+  become `lost`; the third value is the new `containment_lost` exit. What can be
+  checked differs by backend, which is why the row now records which one held it:
+  a cgroup scope is named on the row, validated on the way back in — absolute,
+  under the cgroup2 mount, no `..`, and carrying the prefix this app mints —
+  killed, and read back until empty; a process group is enumerated from the host
+  table and signalled by identity; a Windows job's `KILL_ON_JOB_CLOSE` is
+  *checked* rather than assumed, because a process still alive at the recorded
+  identity would mean the row's claim was wrong.
+
+- **A process report described the wrong machine.** `process_resource_report`
+  built a controller on the host doing the reading and presented its capabilities
+  as what had enforced the row — so a workload the Linux kernel had held read
+  back as `supervisor` on a Mac, and as `supervisor` on the same Linux box once
+  its delegation changed. V23 stores the controller's own answer at attach time:
+  the backend, the tree primitive, the named mechanism per limit, and the durable
+  scope. "What would this machine use for a new process" is still answerable, and
+  is a different question with a different API.
+
+- **A live process reported almost nothing.** The sampling loop's readings never
+  left it — only the final sample reached a caller — so a build sitting at 6 GiB
+  for ten minutes displayed a blank until it finished, and its wall time was
+  reported as unavailable because it was not *final*, which is the one
+  measurement that is always takeable. `run_under_observed` hands every sample to
+  its owner, and current and peak RSS, current and peak process count, produced
+  output bytes and live elapsed time all reach the row, the panel and
+  `monkey processes show`.
 
 - **The Linux cgroup path had never executed anywhere.** "The Linux job is green"
   was read as "the cgroup backend works", and those are different claims: a hosted

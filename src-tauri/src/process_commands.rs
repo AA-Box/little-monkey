@@ -1600,8 +1600,7 @@ mod resource_report {
     fn current_and_peak_are_reported_separately() {
         let mut record = row(ProcessKind::ForegroundShell);
         record.containment = Some(held_by_a_kernel_cgroup());
-        record.usage = Some(crate::resource_control::ResourceSample {
-            wall_ms: 0,
+        record.usage = Some(crate::resource_control::RecordedUsage {
             rss_bytes: Some(2 * 1024 * 1024 * 1024),
             peak_rss_bytes: Some(6 * 1024 * 1024 * 1024),
             process_count: Some(3),

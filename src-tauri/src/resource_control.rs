@@ -312,6 +312,29 @@ pub struct ResourceSample {
     pub output_bytes: Option<u64>,
 }
 
+/// A measurement as a **row** stores it.
+///
+/// [`ResourceSample`] minus `wall_ms`, and the difference is the point: elapsed
+/// time is derivable from `started_at_ms` and `exited_at_ms`, which every row
+/// already carries, so storing it would be a third copy to disagree with the
+/// other two. Reusing `ResourceSample` here meant serialising `wallMs: 0` beside
+/// four honest `Option`s — an invented zero on the wire, which is the one thing
+/// this whole reporting surface refuses to do.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordedUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_process_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
+}
+
 /// Evidence, from the mechanism itself, that a configured bound fired.
 ///
 /// # Why `observed > configured` cannot be the only test
