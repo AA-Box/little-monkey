@@ -452,9 +452,21 @@ async fn handle_verify(state: &AppState, rest: &str) -> Result<(), String> {
             println!("No enabled verification commands configured for this workspace.");
             return Ok(());
         }
+        // Resolved once, before the first command runs, and fatal when it cannot
+        // be: a verify command is a bounded native execution, and running one
+        // with no process-table row would put a limit-enforced tree outside the
+        // ledger that claims to hold every one of them.
+        let projector = little_monkey_lib::bounded_execution::cli_projector()?;
         for cmd in &commands {
             println!("Running \"{}\"...", cmd.label);
-            let result = little_monkey_lib::verify::run_command_impl(state, &root, cmd, None).await;
+            let result = little_monkey_lib::verify::run_command_impl(
+                state,
+                &root,
+                cmd,
+                None,
+                projector.clone(),
+            )
+            .await;
             let ok = !result.timed_out && result.code == Some(0);
             println!(
                 "{} — {} ({} ms)",

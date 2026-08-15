@@ -208,9 +208,17 @@ const MIGRATION_V19: i64 = 19;
 const MIGRATION_V19_CHECKSUM: &str = "unattributed-egress-destinations-v19-2026-08-09";
 const MIGRATION_V20: i64 = 20;
 const MIGRATION_V20_CHECKSUM: &str = "subsystem-worktree-v20-2026-08-10";
+const MIGRATION_V21: i64 = 21;
+const MIGRATION_V21_CHECKSUM: &str = "foreground-shell-and-limit-breach-v21-2026-08-14";
+const MIGRATION_V22: i64 = 22;
+const MIGRATION_V22_CHECKSUM: &str = "native-process-identity-v22-2026-08-14";
+const MIGRATION_V23: i64 = 23;
+const MIGRATION_V23_CHECKSUM: &str = "recorded-containment-and-tree-usage-v23-2026-08-15";
+const MIGRATION_V24: i64 = 24;
+const MIGRATION_V24_CHECKSUM: &str = "durable-supervised-ownership-v24-2026-08-15";
 
 /// The newest schema this binary knows how to write.
-const SCHEMA_VERSION: i64 = MIGRATION_V20;
+const SCHEMA_VERSION: i64 = MIGRATION_V24;
 
 /// Whether a migration keeps older binaries able to open the database.
 ///
@@ -903,6 +911,38 @@ impl RunLedger {
     /// transaction spanning all of their normalized rows.
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    /// The process kinds the stored `CHECK` constraint will accept.
+    ///
+    /// Read out of the table's own DDL rather than restated, so it is genuinely
+    /// the database's answer and not a second copy of the Rust list. Exists for
+    /// the invariant that `ProcessKind::ALL` and the storage vocabulary name the
+    /// same set — a kind in one and not the other is either unstorable or
+    /// silently exempt from every per-kind check.
+    pub fn stored_process_kinds(&self) -> Result<std::collections::BTreeSet<String>, LedgerError> {
+        let ddl: String = self.connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_processes'",
+            [],
+            |row| row.get(0),
+        )?;
+        // The vocabulary is the quoted list inside `kind TEXT NOT NULL CHECK
+        // (kind IN ( … ))`. Scanning for quoted words after that marker is enough
+        // and stays right if the list is re-wrapped, which a rebuild migration
+        // does every time.
+        let start = ddl
+            .find("kind IN (")
+            .ok_or_else(|| LedgerError::Corrupt("agent_processes has no kind CHECK".into()))?;
+        let end = ddl[start..]
+            .find(')')
+            .map(|offset| start + offset)
+            .ok_or_else(|| LedgerError::Corrupt("agent_processes kind CHECK is unclosed".into()))?;
+        Ok(ddl[start..end]
+            .split('\'')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect())
     }
 
     /// A typed view of the unified agent process table on this connection.
@@ -2208,6 +2248,48 @@ const MIGRATION_LADDER: &[(i64, &str, Compatibility)] = &[
         MIGRATION_V20_CHECKSUM,
         Compatibility::RequiresThisVersion,
     ),
+    // Breaking for V18's reason again: it widens `agent_processes.kind` to admit
+    // `foreground_shell`, and a V20 binary's `ProcessKind::parse` rejects a kind
+    // it does not know — so every `list`/`get` on a database containing an agent
+    // shell's rows would error rather than degrade. The typed limit-breach
+    // columns it adds beside that are additive on their own; the kind is what
+    // raises the floor.
+    (
+        MIGRATION_V21,
+        MIGRATION_V21_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    // One nullable column beside `native_pid`, so a row names a *process* rather
+    // than a slot in the pid space. Additive in the strict sense an older binary
+    // cares about: it adds no vocabulary and widens no `CHECK`, so a V21 reader
+    // opens the database and simply never selects the column.
+    (
+        MIGRATION_V22,
+        MIGRATION_V22_CHECKSUM,
+        Compatibility::Additive,
+    ),
+    // Breaking for V18's and V21's reason a third time: it widens
+    // `agent_processes.kind` to admit `verify_command`, `hook_command` and
+    // `sandbox_run`, and `exit_status` to admit `containment_lost`. A V22 binary's
+    // `ProcessKind::parse` and `ExitStatus::parse` both reject a code they do not
+    // know, so a database carrying any of the four would fail that binary's every
+    // `list`/`get` rather than degrade. The ten containment and tree-usage columns
+    // beside them are additive on their own.
+    (
+        MIGRATION_V23,
+        MIGRATION_V23_CHECKSUM,
+        Compatibility::RequiresThisVersion,
+    ),
+    // One new table and two nullable columns, none of which an older binary
+    // selects, writes or has vocabulary for. Additive in the strict sense: it
+    // widens no `CHECK` over a table a V23 binary writes, and the new table's
+    // foreign key cascades rather than restricting, so even a delete that binary
+    // makes still succeeds.
+    (
+        MIGRATION_V24,
+        MIGRATION_V24_CHECKSUM,
+        Compatibility::Additive,
+    ),
 ];
 
 /// The oldest binary that may open a database with `version` applied.
@@ -2825,6 +2907,172 @@ fn apply_migrations(connection: &mut Connection) -> LedgerResult<()> {
                 MIGRATION_V20_CHECKSUM,
                 now_ms_i64()?,
                 min_reader_version_for(MIGRATION_V20)
+            ],
+        )?;
+    }
+
+    let has_v21 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V21],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v21 {
+        // Same probe as V18's and V20's: this widens a `CHECK` as well as adding
+        // columns, so the table's own DDL is the only thing that can say whether
+        // the rebuild already ran.
+        let already_wide = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%foreground_shell%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_wide {
+            transaction.execute_batch(MIGRATION_V21_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V21,
+                MIGRATION_V21_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V21)
+            ],
+        )?;
+    }
+
+    let has_v22 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V22],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v22 {
+        // A plain `ADD COLUMN`, so no rebuild and no probe of the table's DDL:
+        // this changes no `CHECK` and no vocabulary, unlike V18, V20 and V21.
+        // Guarded anyway, because a database that already carries the column
+        // from a half-applied run would otherwise fail the whole ladder.
+        let already_present = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%native_start_time%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_present {
+            transaction.execute_batch(MIGRATION_V22_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V22,
+                MIGRATION_V22_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V22)
+            ],
+        )?;
+    }
+
+    let has_v23 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V23],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v23 {
+        // The same probe as V18's, V20's and V21's: this widens two `CHECK`s as
+        // well as adding columns, so the table's own DDL is the only thing that
+        // can say whether the rebuild already ran.
+        let already_wide = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_processes'
+                   AND sql LIKE '%verify_command%'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !already_wide {
+            transaction.execute_batch(MIGRATION_V23_SQL)?;
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V23,
+                MIGRATION_V23_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V23)
+            ],
+        )?;
+    }
+
+    let has_v24 = transaction
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [MIGRATION_V24],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_v24 {
+        // Guarded per statement rather than as a batch, for V22's reason taken
+        // one step further: this migration adds three independent things, and a
+        // run that died between them leaves a database where some exist. A single
+        // guard would then either re-create a table that is there or skip columns
+        // that are not, and either way the whole ladder would strand.
+        let has_table = transaction
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'agent_process_owned_members'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_table {
+            transaction.execute_batch(MIGRATION_V24_SQL)?;
+        }
+        for (column, statement) in [
+            ("supervised_session_id", MIGRATION_V24_SESSION_SQL),
+            ("native_boot_marker", MIGRATION_V24_BOOT_SQL),
+        ] {
+            let present = transaction
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('agent_processes') WHERE name = ?1",
+                    [column],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !present {
+                transaction.execute_batch(statement)?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at_ms, min_reader_version)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                MIGRATION_V24,
+                MIGRATION_V24_CHECKSUM,
+                now_ms_i64()?,
+                min_reader_version_for(MIGRATION_V24)
             ],
         )?;
     }
@@ -3709,6 +3957,481 @@ ALTER TABLE agent_processes ADD COLUMN max_context_tokens INTEGER
 /// The two rebuilt triggers and six rebuilt indexes are transcribed from V5, V6,
 /// V7 and V8 unchanged. `agent_processes_kind_idx` and the rest are recreated by
 /// hand because `DROP TABLE` takes them with it.
+/// Admits `foreground_shell` to `agent_processes.kind`, and gives a limit kill a
+/// typed representation instead of a sentence (roadmap K4).
+///
+/// Two changes that have to travel together because both need the table rebuilt.
+///
+/// **The kind.** The agent shell a turn blocks on is the most common native
+/// process this app creates and the one that actually holds the memory a limit is
+/// about, and it had no row at all — so a limit could be declared on the turn
+/// while the process consuming the machine was invisible.
+///
+/// **The breach columns.** `ExitStatus::LimitExceeded` existed from V5 and the
+/// only place the *detail* could go was `exit_reason`, free text — and in the
+/// daemon's case a marker encoded into `last_error` and parsed back out, which
+/// that slice recorded as a deliberate second-best pending a migration. This is
+/// that migration. A reader asking "which limit, what was configured, what was
+/// measured, and what held it" now gets four columns rather than a prose parse.
+///
+/// They are constrained as a group rather than individually: a partial write —
+/// a limit named with no measurement, a measurement with no limit — is the one
+/// shape that would let a UI print a confident half-truth.
+/// A process row names a process, not a pid.
+///
+/// # Why a pid alone was not enough, and where it bit
+///
+/// Everything the resource controller does in memory is keyed on
+/// `(pid, start_time)` — `ProcessIdentity` — precisely so a pid the kernel has
+/// since handed to somebody else is never sampled as ours and, far worse, never
+/// signalled as ours. That identity died with the process holding it.
+///
+/// Startup reconciliation is exactly where that matters. After a crash the app
+/// reads rows a previous session left `running` and reclaims the trees behind
+/// them, and the only handle it had was `native_pid` plus "is something alive at
+/// that pid". On a machine that has been up for a while, and across a restart
+/// that may be hours later, that is a coin flip against the pid space: the
+/// answer is yes for the user's editor as readily as for the shell this app
+/// abandoned.
+///
+/// So the identity is durable now. The value is the platform's own opaque
+/// start-time stamp — `/proc` jiffies, a BSD start timeval, a Windows creation
+/// FILETIME — never compared across hosts, only ever against
+/// `ProcessIdentity::of(pid)` on the machine that wrote it.
+const MIGRATION_V22_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN native_start_time INTEGER
+    CHECK (native_start_time IS NULL OR native_start_time >= 0);
+"#;
+
+/// A process row records the mechanism that actually held it, and what that
+/// mechanism measured while it ran (roadmap K4).
+///
+/// Three changes that have to travel together because all three need the table
+/// rebuilt.
+///
+/// **Three kinds.** The verify runner, the hook runner and the disposable-copy
+/// sandbox run were bounded by the same `ResourceController` as an agent shell
+/// and had no row at all, so a limit that fired on one was reported in that
+/// command's own result and nowhere the processes ledger could show it. They are
+/// the last agent-controlled native executions with no lifecycle.
+///
+/// **`containment_lost`.** Startup reconciliation used to close every row it
+/// could not account for as `lost`, which asserts that the work went away. When
+/// the containment identity cannot be validated, or can be and will not empty,
+/// nothing has been established except that this app stopped tracking a workload.
+/// Those are different facts and a machine's operator needs to tell them apart,
+/// so the second one gets its own status rather than borrowing the first's.
+///
+/// **Ten columns.** The report a reader gets for a finished process used to be
+/// assembled from what the *current* host would do for a *new* process: a
+/// workload the Linux kernel had held read back as `supervisor` on a Mac, or on
+/// the same Linux box after its delegation changed. `resource_backend`,
+/// `resource_tree_primitive` and `resource_enforcement_json` are that answer
+/// recorded when the workload was attached, so the row says what enforced it
+/// rather than what would enforce something else today. `resource_scope` is the
+/// durable handle a later session can re-find the workload by — a cgroup path
+/// that is still enforcing after a crash, a process group, a Windows job — and is
+/// validated on the way back in rather than trusted. The five `tree_*` columns
+/// are the controller's own measurement, current and peak, so the panel can show
+/// what a live process is holding instead of only what it held at the end.
+const MIGRATION_V23_SQL: &str = r#"
+CREATE TABLE agent_processes_v23 (
+    process_id TEXT PRIMARY KEY,
+    parent_process_id TEXT REFERENCES agent_processes_v23(process_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'chat_turn', 'daemon_job', 'subagent', 'crew_member', 'workflow_run',
+        'workflow_node', 'remote_run', 'background_shell', 'side_task',
+        'browser_session', 'foreground_shell',
+        'verify_command', 'hook_command', 'sandbox_run'
+    )),
+    external_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'suspended', 'exited')),
+    run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    workspace TEXT,
+    profile TEXT,
+    native_pid INTEGER,
+    native_start_time INTEGER CHECK (native_start_time IS NULL OR native_start_time >= 0),
+    max_wall_ms INTEGER CHECK (max_wall_ms IS NULL OR max_wall_ms > 0),
+    max_memory_bytes INTEGER CHECK (max_memory_bytes IS NULL OR max_memory_bytes > 0),
+    max_output_bytes INTEGER CHECK (max_output_bytes IS NULL OR max_output_bytes > 0),
+    max_child_processes INTEGER CHECK (max_child_processes IS NULL OR max_child_processes > 0),
+    exit_status TEXT CHECK (exit_status IS NULL OR exit_status IN (
+        'succeeded', 'failed', 'cancelled', 'limit_exceeded', 'lost',
+        'needs_reconciliation', 'containment_lost'
+    )),
+    exit_code INTEGER,
+    exit_signal TEXT,
+    exit_reason TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    started_at_ms INTEGER CHECK (started_at_ms IS NULL OR started_at_ms > 0),
+    exited_at_ms INTEGER CHECK (exited_at_ms IS NULL OR exited_at_ms > 0),
+    stop_requested INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+    suspend_requested INTEGER NOT NULL DEFAULT 0 CHECK (suspend_requested IN (0, 1)),
+    signal_reason TEXT,
+    signal_requested_at_ms INTEGER
+        CHECK (signal_requested_at_ms IS NULL OR signal_requested_at_ms > 0),
+    kill_requested INTEGER NOT NULL DEFAULT 0 CHECK (kill_requested IN (0, 1)),
+    cpu_time_ms INTEGER CHECK (cpu_time_ms IS NULL OR cpu_time_ms >= 0),
+    peak_rss_bytes INTEGER CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0),
+    bytes_read INTEGER CHECK (bytes_read IS NULL OR bytes_read >= 0),
+    bytes_written INTEGER CHECK (bytes_written IS NULL OR bytes_written >= 0),
+    bytes_egressed INTEGER CHECK (bytes_egressed IS NULL OR bytes_egressed >= 0),
+    tokens_in INTEGER CHECK (tokens_in IS NULL OR tokens_in >= 0),
+    tokens_out INTEGER CHECK (tokens_out IS NULL OR tokens_out >= 0),
+    gpu_resident_bytes INTEGER CHECK (gpu_resident_bytes IS NULL OR gpu_resident_bytes >= 0),
+    gpu_device_ms INTEGER CHECK (gpu_device_ms IS NULL OR gpu_device_ms >= 0),
+    usage_unavailable_json TEXT,
+    egress_destinations_dropped INTEGER
+        CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0),
+    context_tokens_reused INTEGER
+        CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0),
+    max_context_tokens INTEGER CHECK (max_context_tokens IS NULL OR max_context_tokens > 0),
+    context_tokens_evaluated INTEGER
+        CHECK (context_tokens_evaluated IS NULL OR context_tokens_evaluated >= 0),
+    limit_kind TEXT CHECK (limit_kind IS NULL OR limit_kind IN (
+        'max_wall_ms', 'max_memory_bytes', 'max_output_bytes',
+        'max_child_processes', 'max_context_tokens'
+    )),
+    limit_configured INTEGER CHECK (limit_configured IS NULL OR limit_configured > 0),
+    limit_observed INTEGER CHECK (limit_observed IS NULL OR limit_observed >= 0),
+    limit_backend TEXT,
+    limit_level TEXT CHECK (limit_level IS NULL OR limit_level IN
+        ('kernel', 'supervised', 'owner-sourced')),
+    limit_observed_at_ms INTEGER
+        CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
+    limit_evidence TEXT,
+    -- What held *this* process. `resource_backend` is the queryable projection of
+    -- the same answer `resource_enforcement_json` carries per limit; the JSON is
+    -- where the named mechanism lives, and a name is what makes a claim checkable.
+    resource_backend TEXT,
+    resource_tree_primitive TEXT,
+    -- The durable handle, schemed so a reader can tell a cgroup path from a pid:
+    -- `cgroup2:<path>`, `pgroup:<pgid>`, `windows-job`. Never acted on without
+    -- being re-validated — see `ContainmentScope::parse`.
+    resource_scope TEXT,
+    resource_enforcement_json TEXT,
+    -- The controller's own measurement of the owned tree. Current and peak are
+    -- both kept because they answer different questions, and both are NULL rather
+    -- than 0 where a backend does not measure: a watchdog comparing a fabricated
+    -- zero against a budget is satisfied forever.
+    tree_rss_bytes INTEGER CHECK (tree_rss_bytes IS NULL OR tree_rss_bytes >= 0),
+    tree_peak_rss_bytes INTEGER CHECK (tree_peak_rss_bytes IS NULL OR tree_peak_rss_bytes >= 0),
+    tree_process_count INTEGER CHECK (tree_process_count IS NULL OR tree_process_count >= 0),
+    tree_peak_process_count INTEGER
+        CHECK (tree_peak_process_count IS NULL OR tree_peak_process_count >= 0),
+    tree_output_bytes INTEGER CHECK (tree_output_bytes IS NULL OR tree_output_bytes >= 0),
+    -- The stamp is what separates "measured, and it was nothing" from "never
+    -- measured": every other column here is meaningless without it.
+    tree_sampled_at_ms INTEGER CHECK (tree_sampled_at_ms IS NULL OR tree_sampled_at_ms > 0),
+    CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
+    CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
+    CHECK ((limit_kind IS NULL) = (limit_configured IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_observed IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_backend IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_level IS NULL)),
+    CHECK (limit_kind IS NULL OR exit_status = 'limit_exceeded'),
+    -- The containment travels as a unit for the breach columns' reason: a
+    -- tree primitive with no backend, or an enforcement map with neither, is a
+    -- partial write that a UI would print as a confident half-truth.
+    CHECK ((resource_backend IS NULL) = (resource_tree_primitive IS NULL)),
+    CHECK (resource_scope IS NULL OR resource_backend IS NOT NULL),
+    CHECK (resource_enforcement_json IS NULL OR resource_backend IS NOT NULL),
+    UNIQUE(kind, external_id)
+) STRICT;
+
+INSERT INTO agent_processes_v23 (
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, native_start_time, max_wall_ms, max_memory_bytes, max_output_bytes,
+    max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms,
+    updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested,
+    signal_reason, signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes,
+    bytes_read, bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes,
+    gpu_device_ms, usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated, limit_kind, limit_configured, limit_observed,
+    limit_backend, limit_level, limit_observed_at_ms, limit_evidence
+)
+SELECT
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, native_start_time, max_wall_ms, max_memory_bytes, max_output_bytes,
+    max_child_processes, exit_status, exit_code, exit_signal, exit_reason, created_at_ms,
+    updated_at_ms, started_at_ms, exited_at_ms, stop_requested, suspend_requested,
+    signal_reason, signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes,
+    bytes_read, bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes,
+    gpu_device_ms, usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated, limit_kind, limit_configured, limit_observed,
+    limit_backend, limit_level, limit_observed_at_ms, limit_evidence
+FROM agent_processes;
+
+DROP TABLE agent_processes;
+ALTER TABLE agent_processes_v23 RENAME TO agent_processes;
+
+CREATE INDEX agent_processes_live_idx ON agent_processes(created_at_ms DESC)
+    WHERE state <> 'exited';
+CREATE INDEX agent_processes_kind_idx ON agent_processes(kind, created_at_ms DESC);
+CREATE INDEX agent_processes_parent_idx ON agent_processes(parent_process_id)
+    WHERE parent_process_id IS NOT NULL;
+CREATE INDEX agent_processes_run_idx ON agent_processes(run_id)
+    WHERE run_id IS NOT NULL;
+CREATE INDEX agent_processes_workspace_idx ON agent_processes(workspace, created_at_ms DESC)
+    WHERE workspace IS NOT NULL;
+CREATE INDEX agent_processes_pending_signal_idx ON agent_processes(kind)
+    WHERE state <> 'exited' AND (stop_requested = 1 OR suspend_requested = 1);
+
+CREATE TRIGGER agent_processes_validate_transition
+BEFORE UPDATE OF state ON agent_processes
+WHEN OLD.state <> NEW.state AND NOT (
+       (OLD.state = 'admitted'  AND NEW.state IN ('running', 'exited'))
+    OR (OLD.state = 'running'   AND NEW.state IN ('suspended', 'exited'))
+    OR (OLD.state = 'suspended' AND NEW.state IN ('running', 'exited'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal agent process state transition');
+END;
+
+CREATE TRIGGER agent_processes_forbid_identity_update
+BEFORE UPDATE ON agent_processes
+WHEN OLD.process_id <> NEW.process_id
+  OR OLD.kind <> NEW.kind
+  OR OLD.external_id <> NEW.external_id
+  OR OLD.created_at_ms <> NEW.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent process identity is immutable');
+END;
+
+CREATE TRIGGER agent_processes_kill_implies_stop
+BEFORE UPDATE OF kill_requested ON agent_processes
+WHEN NEW.kill_requested = 1 AND NEW.stop_requested <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'kill_requested implies stop_requested');
+END;
+
+CREATE TRIGGER agent_processes_close_out_states_its_gaps
+BEFORE UPDATE OF state ON agent_processes
+WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
+"#;
+
+/// Supervised ownership survives the app that observed it (roadmap K4).
+///
+/// # The fact that was not durable
+///
+/// A supervised controller's owned set is **sticky**: a descendant it has once
+/// observed stays owned after it calls `setsid`, changes process group and
+/// re-parents, because "did this workload start it" does not stop being true when
+/// the descendant rearranges its own bookkeeping. That rule was held entirely in
+/// process memory. So an app that crashed lost the only record that the escaped
+/// descendant was ever ours, and the next session — finding a dead root and an
+/// empty process group — concluded `ConfirmedGone` about a process that was still
+/// running on the machine.
+///
+/// `agent_process_owned_members` is that set, made durable. The identity is the
+/// pair, never the pid: `(native_pid, native_start_time)` is what the reclaim
+/// re-validates before it signals anything, and a pid the kernel has since handed
+/// to somebody else fails that check and is left alone.
+///
+/// # The two columns beside it
+///
+/// `supervised_session_id` is the session the root *led*, captured at attach for
+/// the reason the process group already was: both are read off the root's own
+/// row, so the moment the root exits they stop being discoverable — which is
+/// exactly when a descendant that stayed in the session becomes unattributable.
+///
+/// `native_boot_marker` is what makes a stored identity comparable across a
+/// reboot on a host whose start-time clock restarts with the machine. NULL on
+/// macOS and Windows, whose start times are absolute; see
+/// `process_tree::boot_marker`.
+const MIGRATION_V24_SQL: &str = r#"
+CREATE TABLE agent_process_owned_members (
+    process_id TEXT NOT NULL REFERENCES agent_processes(process_id) ON DELETE CASCADE,
+    native_pid INTEGER NOT NULL CHECK (native_pid >= 0),
+    native_start_time INTEGER NOT NULL CHECK (native_start_time >= 0),
+    first_seen_at_ms INTEGER NOT NULL CHECK (first_seen_at_ms > 0),
+    last_seen_at_ms INTEGER NOT NULL CHECK (last_seen_at_ms > 0),
+    PRIMARY KEY (process_id, native_pid, native_start_time)
+) STRICT;
+
+CREATE INDEX agent_process_owned_members_process_idx
+    ON agent_process_owned_members(process_id);
+"#;
+
+/// The session the workload's root led, captured at attach — see
+/// [`MIGRATION_V24_SQL`]. Separate so a half-applied V24 can add exactly what is
+/// missing.
+const MIGRATION_V24_SESSION_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN supervised_session_id INTEGER
+    CHECK (supervised_session_id IS NULL OR supervised_session_id > 1);
+"#;
+
+/// The host boot the row's native identities belong to — see
+/// [`MIGRATION_V24_SQL`].
+const MIGRATION_V24_BOOT_SQL: &str = r#"
+ALTER TABLE agent_processes ADD COLUMN native_boot_marker TEXT;
+"#;
+
+const MIGRATION_V21_SQL: &str = r#"
+CREATE TABLE agent_processes_v21 (
+    process_id TEXT PRIMARY KEY,
+    parent_process_id TEXT REFERENCES agent_processes_v21(process_id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK (kind IN (
+        'chat_turn', 'daemon_job', 'subagent', 'crew_member', 'workflow_run',
+        'workflow_node', 'remote_run', 'background_shell', 'side_task',
+        'browser_session', 'foreground_shell'
+    )),
+    external_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'suspended', 'exited')),
+    run_id TEXT REFERENCES runs(run_id) ON DELETE RESTRICT,
+    workspace TEXT,
+    profile TEXT,
+    native_pid INTEGER,
+    max_wall_ms INTEGER CHECK (max_wall_ms IS NULL OR max_wall_ms > 0),
+    max_memory_bytes INTEGER CHECK (max_memory_bytes IS NULL OR max_memory_bytes > 0),
+    max_output_bytes INTEGER CHECK (max_output_bytes IS NULL OR max_output_bytes > 0),
+    max_child_processes INTEGER CHECK (max_child_processes IS NULL OR max_child_processes > 0),
+    exit_status TEXT CHECK (exit_status IS NULL OR exit_status IN (
+        'succeeded', 'failed', 'cancelled', 'limit_exceeded', 'lost', 'needs_reconciliation'
+    )),
+    exit_code INTEGER,
+    exit_signal TEXT,
+    exit_reason TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    started_at_ms INTEGER CHECK (started_at_ms IS NULL OR started_at_ms > 0),
+    exited_at_ms INTEGER CHECK (exited_at_ms IS NULL OR exited_at_ms > 0),
+    stop_requested INTEGER NOT NULL DEFAULT 0 CHECK (stop_requested IN (0, 1)),
+    suspend_requested INTEGER NOT NULL DEFAULT 0 CHECK (suspend_requested IN (0, 1)),
+    signal_reason TEXT,
+    signal_requested_at_ms INTEGER
+        CHECK (signal_requested_at_ms IS NULL OR signal_requested_at_ms > 0),
+    kill_requested INTEGER NOT NULL DEFAULT 0 CHECK (kill_requested IN (0, 1)),
+    cpu_time_ms INTEGER CHECK (cpu_time_ms IS NULL OR cpu_time_ms >= 0),
+    peak_rss_bytes INTEGER CHECK (peak_rss_bytes IS NULL OR peak_rss_bytes >= 0),
+    bytes_read INTEGER CHECK (bytes_read IS NULL OR bytes_read >= 0),
+    bytes_written INTEGER CHECK (bytes_written IS NULL OR bytes_written >= 0),
+    bytes_egressed INTEGER CHECK (bytes_egressed IS NULL OR bytes_egressed >= 0),
+    tokens_in INTEGER CHECK (tokens_in IS NULL OR tokens_in >= 0),
+    tokens_out INTEGER CHECK (tokens_out IS NULL OR tokens_out >= 0),
+    gpu_resident_bytes INTEGER CHECK (gpu_resident_bytes IS NULL OR gpu_resident_bytes >= 0),
+    gpu_device_ms INTEGER CHECK (gpu_device_ms IS NULL OR gpu_device_ms >= 0),
+    usage_unavailable_json TEXT,
+    egress_destinations_dropped INTEGER
+        CHECK (egress_destinations_dropped IS NULL OR egress_destinations_dropped >= 0),
+    context_tokens_reused INTEGER
+        CHECK (context_tokens_reused IS NULL OR context_tokens_reused >= 0),
+    max_context_tokens INTEGER CHECK (max_context_tokens IS NULL OR max_context_tokens > 0),
+    context_tokens_evaluated INTEGER
+        CHECK (context_tokens_evaluated IS NULL OR context_tokens_evaluated >= 0),
+    -- The `ProcessLimits` field name, so the row names the thing that was set
+    -- rather than a category. Constrained to the five that exist: a breach
+    -- naming a sixth is a bug, not a new resource.
+    limit_kind TEXT CHECK (limit_kind IS NULL OR limit_kind IN (
+        'max_wall_ms', 'max_memory_bytes', 'max_output_bytes',
+        'max_child_processes', 'max_context_tokens'
+    )),
+    limit_configured INTEGER CHECK (limit_configured IS NULL OR limit_configured > 0),
+    limit_observed INTEGER CHECK (limit_observed IS NULL OR limit_observed >= 0),
+    -- Which mechanism noticed, and whether it was kernel-held or supervised. The
+    -- second is the fact a reader cannot infer from the first: a supervised bound
+    -- dies with the supervisor and a kernel one does not.
+    limit_backend TEXT,
+    limit_level TEXT CHECK (limit_level IS NULL OR limit_level IN
+        ('kernel', 'supervised', 'owner-sourced')),
+    limit_observed_at_ms INTEGER
+        CHECK (limit_observed_at_ms IS NULL OR limit_observed_at_ms >= 0),
+    -- The kernel counter or notification that carried the proof, where the
+    -- breach came from a mechanism's own accounting rather than from the
+    -- supervisor's comparison. Deliberately *outside* the grouped CHECKs below:
+    -- a supervised bound has no such counter, and requiring one would force a
+    -- writer to invent it. See `resource_control::LimitEvent`.
+    limit_evidence TEXT,
+    CHECK ((state = 'exited') = (exit_status IS NOT NULL)),
+    CHECK (parent_process_id IS NULL OR parent_process_id <> process_id),
+    -- The breach travels as a unit. A limit named with no measurement, or a
+    -- measurement with no limit, is a partial write that would read as a
+    -- confident half-truth.
+    CHECK ((limit_kind IS NULL) = (limit_configured IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_observed IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_backend IS NULL)),
+    CHECK ((limit_kind IS NULL) = (limit_level IS NULL)),
+    -- A breach is only ever recorded on a row that ended because of it.
+    CHECK (limit_kind IS NULL OR exit_status = 'limit_exceeded'),
+    UNIQUE(kind, external_id)
+) STRICT;
+
+INSERT INTO agent_processes_v21 (
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+    exit_status, exit_code, exit_signal, exit_reason, created_at_ms, updated_at_ms,
+    started_at_ms, exited_at_ms, stop_requested, suspend_requested, signal_reason,
+    signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read,
+    bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms,
+    usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated
+)
+SELECT
+    process_id, parent_process_id, kind, external_id, state, run_id, workspace, profile,
+    native_pid, max_wall_ms, max_memory_bytes, max_output_bytes, max_child_processes,
+    exit_status, exit_code, exit_signal, exit_reason, created_at_ms, updated_at_ms,
+    started_at_ms, exited_at_ms, stop_requested, suspend_requested, signal_reason,
+    signal_requested_at_ms, kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read,
+    bytes_written, bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms,
+    usage_unavailable_json, egress_destinations_dropped, context_tokens_reused,
+    max_context_tokens, context_tokens_evaluated
+FROM agent_processes;
+
+DROP TABLE agent_processes;
+ALTER TABLE agent_processes_v21 RENAME TO agent_processes;
+
+CREATE INDEX agent_processes_live_idx ON agent_processes(created_at_ms DESC)
+    WHERE state <> 'exited';
+CREATE INDEX agent_processes_kind_idx ON agent_processes(kind, created_at_ms DESC);
+CREATE INDEX agent_processes_parent_idx ON agent_processes(parent_process_id)
+    WHERE parent_process_id IS NOT NULL;
+CREATE INDEX agent_processes_run_idx ON agent_processes(run_id)
+    WHERE run_id IS NOT NULL;
+CREATE INDEX agent_processes_workspace_idx ON agent_processes(workspace, created_at_ms DESC)
+    WHERE workspace IS NOT NULL;
+CREATE INDEX agent_processes_pending_signal_idx ON agent_processes(kind)
+    WHERE state <> 'exited' AND (stop_requested = 1 OR suspend_requested = 1);
+
+CREATE TRIGGER agent_processes_validate_transition
+BEFORE UPDATE OF state ON agent_processes
+WHEN OLD.state <> NEW.state AND NOT (
+       (OLD.state = 'admitted'  AND NEW.state IN ('running', 'exited'))
+    OR (OLD.state = 'running'   AND NEW.state IN ('suspended', 'exited'))
+    OR (OLD.state = 'suspended' AND NEW.state IN ('running', 'exited'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'illegal agent process state transition');
+END;
+
+CREATE TRIGGER agent_processes_forbid_identity_update
+BEFORE UPDATE ON agent_processes
+WHEN OLD.process_id <> NEW.process_id
+  OR OLD.kind <> NEW.kind
+  OR OLD.external_id <> NEW.external_id
+  OR OLD.created_at_ms <> NEW.created_at_ms
+BEGIN
+    SELECT RAISE(ABORT, 'agent process identity is immutable');
+END;
+
+CREATE TRIGGER agent_processes_kill_implies_stop
+BEFORE UPDATE OF kill_requested ON agent_processes
+WHEN NEW.kill_requested = 1 AND NEW.stop_requested <> 1
+BEGIN
+    SELECT RAISE(ABORT, 'kill_requested implies stop_requested');
+END;
+
+CREATE TRIGGER agent_processes_close_out_states_its_gaps
+BEFORE UPDATE OF state ON agent_processes
+WHEN NEW.state = 'exited' AND NEW.usage_unavailable_json IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'an exited agent process must state its unmeasured fields');
+END;
+"#;
+
 const MIGRATION_V18_SQL: &str = r#"
 CREATE TABLE agent_processes_v18 (
     process_id TEXT PRIMARY KEY,
@@ -6596,20 +7319,25 @@ mod tests {
                 SCHEMA_VERSION
             );
         }
-
         // A database written by a newer build is refused only when that build
         // said so. This is the whole point of V13: a future migration that only
         // *adds* costs a rollback nothing, and one that rejects this binary's
-        // writes still shuts the door. The version used here must stay one
-        // *above* the ladder head, or this asserts the checksum mismatch instead.
+        // writes still shuts the door.
+        //
+        // The version is derived from the ladder head rather than written out. It
+        // has to be exactly one *above* it — a literal equal to the head asserts
+        // a checksum mismatch instead, which is a different test passing for the
+        // wrong reason — and a literal is exactly what went stale the next time a
+        // migration landed.
+        let from_the_future = SCHEMA_VERSION + 1;
         {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
                     "INSERT INTO schema_migrations
                         (version, checksum, applied_at_ms, min_reader_version)
-                     VALUES (21, 'from-the-future-additive', 21, 20)",
-                    [],
+                     VALUES (?1, 'from-the-future-additive', 21, ?2)",
+                    params![from_the_future, SCHEMA_VERSION],
                 )
                 .unwrap();
         }
@@ -6622,15 +7350,15 @@ mod tests {
             let connection = Connection::open(&database.path).unwrap();
             connection
                 .execute(
-                    "UPDATE schema_migrations SET min_reader_version = 21 WHERE version = 21",
-                    [],
+                    "UPDATE schema_migrations SET min_reader_version = ?1 WHERE version = ?1",
+                    params![from_the_future],
                 )
                 .unwrap();
         }
         assert!(
             matches!(
                 RunLedger::open(&database.path),
-                Err(LedgerError::MigrationConflict { version: 21 })
+                Err(LedgerError::MigrationConflict { version }) if version == from_the_future
             ),
             "a future migration that requires a newer binary must still refuse"
         );
@@ -6909,6 +7637,11 @@ mod tests {
         // V20 widens the subsystem vocabulary itself, so like V18 it raises the
         // floor to itself.
         assert_eq!(min_reader_version_for(MIGRATION_V20), MIGRATION_V20);
+        // V21 widens the *kind* vocabulary, exactly as V18 did, so it raises the
+        // floor to itself for the same reason: an older binary's
+        // `ProcessKind::parse` errors on `foreground_shell` rather than ignoring
+        // it, which turns every process listing into a failure.
+        assert_eq!(min_reader_version_for(MIGRATION_V21), MIGRATION_V21);
         // And the pre-V9 ladder keeps exactly its old behaviour.
         assert_eq!(min_reader_version_for(MIGRATION_V8), MIGRATION_V8);
         assert_eq!(min_reader_version_for(MIGRATION_V1), MIGRATION_V1);
@@ -6932,10 +7665,12 @@ mod tests {
         let required = required_reader_version(&ledger.connection)
             .unwrap()
             .unwrap();
-        // V20 is the newest breaking migration: it widened
-        // `subsystem_events.subsystem` to admit `worktree`, which an older
-        // binary's `Subsystem::parse` rejects outright rather than ignoring.
-        assert_eq!(required, MIGRATION_V20);
+        // V23 is the newest breaking migration: it widened
+        // `agent_processes.kind` to admit the three bounded-execution kinds and
+        // `exit_status` to admit `containment_lost`, and an older binary's
+        // `ProcessKind::parse`/`ExitStatus::parse` reject a code they do not know
+        // outright rather than ignoring it.
+        assert_eq!(required, MIGRATION_V23);
         assert!(required <= SCHEMA_VERSION);
 
         // No row may be left at the `DEFAULT 1` the ALTER used: that would claim
@@ -6959,13 +7694,19 @@ mod tests {
             let ledger = RunLedger::open(&database.path).unwrap();
             assert_eq!(
                 ledger.applied_migrations().unwrap(),
-                vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+                MIGRATION_LADDER
+                    .iter()
+                    .map(|(version, _, _)| *version)
+                    .collect::<Vec<_>>()
             );
         }
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
             "reopening must not re-apply or add a migration"
         );
 
@@ -7214,7 +7955,10 @@ mod tests {
         let ledger = RunLedger::open(&database.path).unwrap();
         assert_eq!(
             ledger.applied_migrations().unwrap(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
             "opening a V10 database must apply every migration above it"
         );
         assert_eq!(
@@ -7240,6 +7984,303 @@ mod tests {
             .load_permission_decision("req-new")
             .unwrap()
             .is_some());
+    }
+
+    /// A database a previous release wrote gains V21 and V22 without losing a row.
+    ///
+    /// V21 is the only process migration that rebuilds the table rather than
+    /// adding to it — it widens the `kind` vocabulary for `foreground_shell` and
+    /// adds the five typed breach columns with an all-or-none `CHECK` — so it is
+    /// the one where an upgrade can silently drop a shipped user's history. The
+    /// probe is the same shape as the pre-V11 one above: wind the schema back to
+    /// what V20 left, reopen, and assert the ladder replays over real rows.
+    ///
+    /// What it pins beyond "the rows are still there": a row written before the
+    /// breach columns existed reads back as a row with *no* breach rather than one
+    /// with zeros, which is the difference between "this process was not stopped
+    /// by a limit" and "it was stopped by a limit configured at 0 bytes".
+    #[test]
+    fn a_v20_database_gains_the_breach_columns_and_keeps_its_rows() {
+        let database = TempDb::new("process-v21-upgrade");
+        // The V20 column set, which is also what V21's `INSERT ... SELECT` names.
+        const V20_COLUMNS: &str = "process_id, parent_process_id, kind, external_id, state, \
+             run_id, workspace, profile, native_pid, max_wall_ms, max_memory_bytes, \
+             max_output_bytes, max_child_processes, exit_status, exit_code, exit_signal, \
+             exit_reason, created_at_ms, updated_at_ms, started_at_ms, exited_at_ms, \
+             stop_requested, suspend_requested, signal_reason, signal_requested_at_ms, \
+             kill_requested, cpu_time_ms, peak_rss_bytes, bytes_read, bytes_written, \
+             bytes_egressed, tokens_in, tokens_out, gpu_resident_bytes, gpu_device_ms, \
+             usage_unavailable_json, egress_destinations_dropped, context_tokens_reused, \
+             max_context_tokens, context_tokens_evaluated";
+
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .connection
+                .execute(
+                    "INSERT INTO agent_processes (
+                         process_id, kind, external_id, state, created_at_ms, updated_at_ms,
+                         started_at_ms, exited_at_ms, native_pid, max_memory_bytes,
+                         exit_status, exit_code, exit_reason
+                     ) VALUES (
+                         'shell-v20', 'background_shell', 'ext-v20', 'exited', 10, 40,
+                         12, 40, 4242, 536870912,
+                         'failed', 1, 'the build failed'
+                     )",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Back to V20: a table with the old column set and none of the new
+        // constraints, which is all V21's rebuild reads from. Dropping is the only
+        // way there — the release that wrote the original is gone.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE agent_processes_v20 AS SELECT {V20_COLUMNS} FROM agent_processes;
+                     DROP TABLE agent_processes;
+                     ALTER TABLE agent_processes_v20 RENAME TO agent_processes;
+                     DELETE FROM schema_migrations WHERE version IN (21, 22);
+                     PRAGMA user_version = 20;"
+                ))
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
+            "opening a V20 database must apply every migration above it"
+        );
+
+        // The row survived, value for value, and its breach columns are absent
+        // rather than zeroed.
+        let (kind, pid, memory, status, reason, limit_kind, configured, start_time): (
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+        ) = ledger
+            .connection
+            .query_row(
+                "SELECT kind, native_pid, max_memory_bytes, exit_status, exit_reason,
+                        limit_kind, limit_configured, native_start_time
+                 FROM agent_processes WHERE process_id = 'shell-v20'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(kind, "background_shell");
+        assert_eq!(pid, 4242);
+        assert_eq!(memory, 536_870_912);
+        assert_eq!(status, "failed");
+        assert_eq!(reason, "the build failed");
+        assert_eq!(limit_kind, None, "a legacy row states no breach");
+        assert_eq!(configured, None, "and no number for one");
+        assert_eq!(start_time, None, "V22's identity is unknown for it");
+
+        // The vocabulary V21 exists for is accepted…
+        ledger
+            .connection
+            .execute(
+                "INSERT INTO agent_processes
+                     (process_id, kind, external_id, state, created_at_ms, updated_at_ms)
+                 VALUES ('fg-1', 'foreground_shell', 'ext-fg-1', 'running', 50, 50)",
+                [],
+            )
+            .unwrap();
+        // …and the all-or-none breach guard is a constraint, not merely absent.
+        assert!(
+            ledger
+                .connection
+                .execute(
+                    "UPDATE agent_processes SET limit_kind = 'max_memory_bytes'
+                     WHERE process_id = 'shell-v20'",
+                    [],
+                )
+                .is_err(),
+            "half a breach must be refused by the rebuilt table's CHECK"
+        );
+    }
+
+    /// A V23 database gains the owned-member table and its two columns, keeps its
+    /// rows, and enforces the guards the reclaim depends on.
+    ///
+    /// The guards are the substance here, not the columns. Each one is a way the
+    /// startup reclaim could be handed something it would act on:
+    ///
+    /// - **The primary key is the identity, not the pid.** Two members with the
+    ///   same pid and different start times are two processes, and collapsing them
+    ///   would lose one.
+    /// - **`ON CONFLICT` updates rather than inserts.** A row per sample would
+    ///   grow the table with the clock, on a 500 ms tick, forever.
+    /// - **`first_seen_at_ms` is never rewritten.** When a member became this
+    ///   workload's is the audit fact worth keeping.
+    /// - **The foreign key cascades.** A deleted process must not leave members
+    ///   pointing at nothing, and must not be undeletable either.
+    #[test]
+    fn a_v23_database_gains_the_owned_member_journal_and_keeps_its_rows() {
+        let database = TempDb::new("owned-members-v24-upgrade");
+        {
+            let ledger = RunLedger::open(&database.path).unwrap();
+            ledger
+                .connection
+                .execute(
+                    "INSERT INTO agent_processes
+                         (process_id, kind, external_id, state, created_at_ms, updated_at_ms,
+                          native_pid, native_start_time)
+                     VALUES ('fgsh-v23', 'foreground_shell', 'ext-v23', 'running', 10, 10,
+                             4242, 99)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Back to V23: drop what V24 added and forget it was applied, which is all
+        // the upgrade reads.
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE agent_process_owned_members;
+                     DELETE FROM schema_migrations WHERE version = 24;",
+                )
+                .unwrap();
+        }
+
+        let ledger = RunLedger::open(&database.path).unwrap();
+        assert_eq!(
+            ledger.applied_migrations().unwrap(),
+            MIGRATION_LADDER
+                .iter()
+                .map(|(version, _, _)| *version)
+                .collect::<Vec<_>>(),
+            "opening a V23 database must apply every migration above it"
+        );
+        // The row survived, and its new columns are absent rather than zeroed: a
+        // session id of 0 would name this app's own session.
+        let (pid, session, marker): (i64, Option<i64>, Option<String>) = ledger
+            .connection
+            .query_row(
+                "SELECT native_pid, supervised_session_id, native_boot_marker
+                 FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, 4242);
+        assert_eq!(session, None, "a legacy row names no session");
+        assert_eq!(marker, None, "and no boot");
+
+        let table = ledger.process_table();
+        let identity = |pid, start_time| crate::process_tree::ProcessIdentity { pid, start_time };
+
+        // Two members, then the same two again on a later tick.
+        table
+            .record_owned_members(
+                "fgsh-v23",
+                &[identity(4242, 99), identity(4243, 100)],
+                Some(4242),
+                Some("linux-btime:17"),
+                1_000,
+            )
+            .unwrap();
+        table
+            .record_owned_members("fgsh-v23", &[identity(4242, 99)], None, None, 2_000)
+            .unwrap();
+
+        let members = table.owned_members("fgsh-v23").unwrap();
+        assert_eq!(members.len(), 2, "the second tick inserted a duplicate row");
+        let first = members
+            .iter()
+            .find(|member| member.identity.pid == 4242)
+            .expect("the re-seen member is still there");
+        assert_eq!(first.first_seen_at_ms, 1_000, "first-seen was rewritten");
+        assert_eq!(first.last_seen_at_ms, 2_000, "last-seen was not advanced");
+        // The metadata is kept from the write that had it: a later tick that
+        // knows neither must not erase what an earlier one recorded.
+        let (session, marker): (Option<i64>, Option<String>) = ledger
+            .connection
+            .query_row(
+                "SELECT supervised_session_id, native_boot_marker
+                 FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session, Some(4242));
+        assert_eq!(marker.as_deref(), Some("linux-btime:17"));
+
+        // The pid alone is not the identity: the same number with a different
+        // start time is a different process and gets its own row.
+        table
+            .record_owned_members("fgsh-v23", &[identity(4242, 12_345)], None, None, 3_000)
+            .unwrap();
+        assert_eq!(
+            table.owned_members("fgsh-v23").unwrap().len(),
+            3,
+            "a reused pid was collapsed into the identity it replaced"
+        );
+
+        // Ownership for a process that does not exist is refused rather than
+        // orphaned — the fail-closed admission's other half.
+        assert!(table
+            .record_owned_members("nobody", &[identity(1, 1)], None, None, 4_000)
+            .is_err());
+
+        // And the foreign key cascades rather than restricting, so a delete still
+        // works and leaves nothing dangling.
+        ledger
+            .connection
+            .execute(
+                "DELETE FROM agent_processes WHERE process_id = 'fgsh-v23'",
+                [],
+            )
+            .unwrap();
+        assert!(table.owned_members("fgsh-v23").unwrap().is_empty());
+        assert_eq!(
+            ledger
+                .connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .count(),
+            0,
+            "the owned-member journal left a dangling reference"
+        );
+    }
+
+    /// V24 is additive, so it must not raise the floor an older binary has to
+    /// clear: nothing it adds is vocabulary a V23 reader parses, or a `CHECK` on
+    /// a table that reader writes.
+    #[test]
+    fn the_owned_member_journal_does_not_raise_the_reader_floor() {
+        assert_eq!(
+            min_reader_version_for(MIGRATION_V24),
+            MIGRATION_V23,
+            "a purely additive migration must inherit the previous breaking floor"
+        );
     }
 
     /// The bug K12's acceptance names: before this table, a gated tool call

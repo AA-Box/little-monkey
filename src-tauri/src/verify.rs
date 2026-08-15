@@ -37,7 +37,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
+use crate::process_table::{ProcessKind, ProcessLimitKind, ProcessLimits};
 use crate::profiles::ProfileScopedPaths;
+use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 use crate::{workspace, AppState};
 
 const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
@@ -45,7 +47,7 @@ const VERIFY_CONFIGS_FILE: &str = "verify_configs.json";
 /// Default per-command timeout when `VerifyCommand::timeout_secs` is unset —
 /// generous relative to `tools.rs`'s 120s `SHELL_TIMEOUT`, since test suites
 /// routinely outlive that.
-const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
+pub(crate) const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
 
 /// Each of stdout/stderr is tail-capped before ever leaving this module — a
 /// runaway test suite's output must not flood the model's context window.
@@ -54,7 +56,7 @@ const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 300;
 /// [`crate::output_cap`], shared with `tools.rs`'s shell tool, which had no cap at
 /// all. Previously documented as bounding "chars" while measuring `s.len()`, which
 /// is bytes.
-const VERIFY_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
+pub(crate) const VERIFY_OUTPUT_CAP: usize = crate::output_cap::MODEL_OUTPUT_CAP;
 
 /// One user-configured verification command.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -176,14 +178,19 @@ fn find_command<'a>(config: &'a VerifyConfig, command_id: &str) -> Option<&'a Ve
     config.commands.iter().find(|c| c.id == command_id)
 }
 
-/// Tail-caps `s` at [`VERIFY_OUTPUT_CAP`] bytes.
+/// A finished verify command, with both streams already held to
+/// [`VERIFY_OUTPUT_CAP`] as they arrived.
 ///
-/// A thin wrapper over [`crate::output_cap::cap_tail`], kept so this module's two
-/// call sites stay readable. `VerifyResult` has no truncation flag on the wire, so
-/// the marker in the text is the only signal here — unlike the shell tool, whose
-/// callers may need to parse the output as a whole document.
-fn cap_output(s: String) -> String {
-    crate::output_cap::cap_tail(s, VERIFY_OUTPUT_CAP).0
+/// Replaces `std::process::Output` here so the type itself carries the bound:
+/// `Output` holds two unbounded `Vec<u8>`s, which is what
+/// `wait_with_output` filled before anything trimmed them. `VerifyResult` has no
+/// truncation flag on the wire, so the marker in the text is the only signal —
+/// unlike the shell tool, whose callers may need to parse the output as a whole
+/// document.
+struct CapturedVerifyOutput {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 /// Core, `AppHandle`-free execution logic — a near-copy of
@@ -198,11 +205,18 @@ fn cap_output(s: String) -> String {
 /// the turn's `tool_cancel` `Notify` firing (the existing Stop button kills a
 /// running verify command with zero new wiring), and a per-command timeout
 /// (default [`DEFAULT_VERIFY_TIMEOUT_SECS`]).
+///
+/// The projector is not optional, and that is the fail-closed rule rather than a
+/// tidier signature: a verify command is a bounded native execution, and one
+/// running without a process-table row is exactly the case the ledger claims
+/// cannot exist. A host that cannot resolve one — `monkey-cli` with no readable
+/// profile directory — reports that instead of running the command untracked.
 pub async fn run_command_impl(
     state: &AppState,
     root: &Path,
     cmd: &VerifyCommand,
     turn_id: Option<&str>,
+    projector: std::sync::Arc<dyn crate::process_table::ProcessProjector>,
 ) -> VerifyResult {
     let started = Instant::now();
 
@@ -225,7 +239,10 @@ pub async fn run_command_impl(
         .kill_on_drop(true);
     // Its own process group, so a timeout can end the whole tree rather than the
     // shell alone — `kill_on_drop` reaps one pid, which for `sh -c "npm test"`
-    // leaves the test runner alive. Mirrors `tools.rs`'s own spawn.
+    // leaves the test runner alive. Set here as well as by the controller's
+    // supervised backend, exactly as `workspace_shell` does: a cgroup scope does
+    // not install one, and the group is what a later session's startup reclaim
+    // can still reach.
     #[cfg(unix)]
     command_builder.process_group(0);
     // Kernel-held bounds that outlive this app's supervision — see `os_limits`
@@ -243,21 +260,132 @@ pub async fn run_command_impl(
             .max(1),
     );
 
-    let child = match command_builder.spawn() {
+    // The same resource controller every agent shell runs under, for the same
+    // reason: a verify command is a build or a test runner, so the process that
+    // holds the machine is a *grandchild* of this `sh -c` and the deadline above
+    // is the only bound this path used to have. The class defaults supply the
+    // tree's memory and process ceilings; the command's own timeout is the wall
+    // bound, stated as a limit rather than as a `sleep` racing the wait, so a
+    // verify command that runs out of time is reclaimed by the same code that
+    // reclaims one that runs out of memory.
+    let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
+        LimitLayer::new(
+            LimitSource::ClassDefault,
+            ProcessKind::VerifyCommand.default_limits(),
+        ),
+        LimitLayer::new(
+            LimitSource::UserOverride,
+            ProcessLimits {
+                max_wall_ms: Some(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+                max_output_bytes: Some(u64::try_from(VERIFY_OUTPUT_CAP).unwrap_or(u64::MAX)),
+                ..ProcessLimits::default()
+            },
+        ),
+    ]));
+    let failed_to_start = |message: String| VerifyResult {
+        command_id: cmd.id.clone(),
+        label: cmd.label.clone(),
+        kind: cmd.kind.clone(),
+        code: None,
+        stdout: String::new(),
+        stderr: message,
+        duration_ms: started.elapsed().as_millis() as u64,
+        timed_out: false,
+    };
+    // The row, before the spawn rather than after the wait — and the command does
+    // not run without it. A verify command that fails to `exec` is exactly the
+    // case a reader wants a record of, and one written afterwards would miss
+    // every command that never started; one that could not be written at all
+    // would leave a bounded native tree the ledger never knew about.
+    //
+    // Held in an `Option` from here on because every close-out below consumes it,
+    // and each of them is on a path the others must not repeat.
+    let mut execution = match crate::bounded_execution::BoundedExecution::admit(
+        projector,
+        ProcessKind::VerifyCommand,
+        Some(root.to_string_lossy().into_owned()),
+        controller.limits().to_process_limits(),
+    ) {
+        Ok(mut execution) => {
+            if let Some(turn) = turn_id {
+                // The turn is what makes `monkey processes list --parent` answer
+                // "what did this turn verify".
+                execution.set_parent(ProcessKind::ChatTurn, turn);
+            }
+            Some(execution)
+        }
+        Err(error) => return failed_to_start(error.to_string()),
+    };
+    // Before the spawn, so the containment exists before the command's first
+    // instruction rather than being applied to a process already running.
+    if let Err(error) = controller.prepare_tokio(&mut command_builder) {
+        return failed_to_start(format!("Failed to bound command: {error}"));
+    }
+
+    // Through the controller, so on Windows the job holds this command before its
+    // first instruction rather than microseconds after it. On Unix this is the
+    // ordinary spawn: `prepare_tokio` above already installed the containment the
+    // child joins between `fork` and `exec`.
+    let mut child = match controller.spawn_contained_tokio(&mut command_builder) {
         Ok(child) => child,
         Err(e) => {
-            return VerifyResult {
-                command_id: cmd.id.clone(),
-                label: cmd.label.clone(),
-                kind: cmd.kind.clone(),
-                code: None,
-                stdout: String::new(),
-                stderr: format!("Failed to spawn command: {}", e),
-                duration_ms: started.elapsed().as_millis() as u64,
-                timed_out: false,
-            };
+            let message = format!("Failed to spawn command: {}", e);
+            if let Some(execution) = execution.take() {
+                execution.exited(
+                    crate::process_table::ProcessExit::failed(message.clone()),
+                    None,
+                );
+            }
+            return failed_to_start(message);
         }
     };
+
+    // Fail closed: a command that is *running* and cannot be shown to be inside
+    // its containment is reclaimed rather than reported as bounded. A command
+    // that simply finished first is not a containment failure.
+    if let Some(pid) = child.id() {
+        match controller.attach(pid) {
+            Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+            Err(crate::resource_control::AttachFailure::Containment(error)) => {
+                let _ = controller.terminate_tree();
+                let message = format!("Failed to bound command: {error}");
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::failed(message.clone()),
+                        None,
+                    );
+                }
+                return failed_to_start(message);
+            }
+        }
+    }
+    // Every native process this command's supervisor observes is recorded against
+    // this row from here on, so a descendant that escapes its process group after
+    // being seen is still reclaimable by the next session. Refusing the command
+    // when that cannot be established is the same rule as the containment check
+    // above: a workload this app could not find again must not be started.
+    if let Some(journal) = execution
+        .as_ref()
+        .map(crate::bounded_execution::BoundedExecution::ownership_journal)
+    {
+        if let Err(error) = controller.persist_ownership_to(journal) {
+            let _ = controller.terminate_tree();
+            let message =
+                format!("Failed to record what this command owns, so it was not run: {error}");
+            if let Some(execution) = execution.take() {
+                execution.exited(
+                    crate::process_table::ProcessExit::failed(message.clone()),
+                    None,
+                );
+            }
+            return failed_to_start(message);
+        }
+    }
+    // After the attach, not after the spawn: the row records the identity and the
+    // containment the attach has just *verified*, rather than one it assumed.
+    if let Some(execution) = execution.as_mut() {
+        execution.running(&controller);
+    }
 
     // Each turn gets its own cancellation channel so Stop in one pane never
     // kills a command the other pane's turn is still running — exact
@@ -270,34 +398,135 @@ pub async fn run_command_impl(
             .clone()
     });
 
-    // Captured before `wait_with_output` consumes the child; with
-    // `process_group(0)` above, the child's own pid is also its group id.
-    let child_pgid = child.id();
-
-    let (outcome, timed_out): (Result<std::process::Output, String>, bool) = match &cancel {
-        Some(cancel) => tokio::select! {
-            result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
-            _ = cancel.notified() => (Err("Command cancelled by the user".to_string()), false),
-            _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
-        },
-        // Lock poisoned — extremely unlikely, and cancellation simply isn't
-        // available for this run; the timeout still applies.
-        None => tokio::select! {
-            result = child.wait_with_output() => (result.map_err(|e| format!("Failed to run command: {}", e)), false),
-            _ = tokio::time::sleep(timeout) => (Err(format!("Command timed out after {} seconds", timeout.as_secs())), true),
-        },
+    // Bounded as the bytes arrive rather than trimmed after the child exits.
+    // `wait_with_output` collected both pipes whole, so a verify command that
+    // printed a gigabyte — a `-v` build, a test runner in debug mode — took a
+    // gigabyte of this app's heap before `cap_output` looked at any of it. The
+    // two drains run concurrently with the wait for the older reason: a child
+    // that fills one pipe while nothing reads it blocks forever.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let collect = async {
+        let (status, stdout, stderr) = tokio::try_join!(
+            child.wait(),
+            crate::output_cap::drain_capped(
+                stdout_pipe.expect("stdout was piped at spawn"),
+                Some(VERIFY_OUTPUT_CAP)
+            ),
+            crate::output_cap::drain_capped(
+                stderr_pipe.expect("stderr was piped at spawn"),
+                Some(VERIFY_OUTPUT_CAP)
+            ),
+        )?;
+        Ok::<_, std::io::Error>(CapturedVerifyOutput {
+            code: status.code(),
+            stdout: stdout.into_string().0,
+            stderr: stderr.into_string().0,
+        })
     };
 
-    // End the tree on a timeout or a cancel. A verify command is typically a
-    // build or a test runner, so the process that matters is almost always a
-    // grandchild of the `sh -c` this spawned — exactly the process `kill_on_drop`
-    // does not touch.
-    if outcome.is_err() {
-        if let Some(pgid) = child_pgid {
-            if let Err(error) = crate::os_signal::terminate_process_group(pgid) {
-                eprintln!("verify: could not terminate process group {pgid}: {error}");
+    // The wall bound, the memory bound and the process-count bound are all held
+    // by the controller now, and a breach of any of them has already reclaimed
+    // the whole tree by the time this returns. What is left for the `select` is
+    // the user's Stop, which is a different fact from a limit and stays one.
+    //
+    // The breach and the last sample are kept beside the outcome rather than
+    // folded into the message: a limit kill has to reach the row as typed fields
+    // — which limit, configured, observed, backend, level — and a UI cannot parse
+    // that back out of an English sentence.
+    let limit_breach: Option<crate::resource_control::LimitBreach>;
+    let last_sample: Option<crate::resource_control::ResourceSample>;
+    let observer = execution.as_ref();
+    let supervised = async {
+        let sampled = crate::resource_control::run_under_observed(
+            &mut controller,
+            collect,
+            // Every tick, so the panel can show what a running build is holding
+            // instead of only what it held once it was over.
+            |sample| {
+                if let Some(execution) = observer {
+                    execution.sampled(sample);
+                }
+            },
+        )
+        .await;
+        match sampled {
+            Ok(crate::resource_control::Supervised::Completed(result, sample)) => (
+                result.map_err(|e| format!("Failed to run command: {}", e)),
+                false,
+                None,
+                Some(sample),
+            ),
+            Ok(crate::resource_control::Supervised::Breached(breach, sample)) => {
+                // A wall breach *is* the timeout this command declared, so it
+                // keeps reporting as one. Any other limit is reported with both
+                // numbers and the mechanism that held it, because "the build
+                // failed" and "the build asked for 9 GiB" are different things
+                // for a reader to do something about.
+                let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+                let message = if timed_out {
+                    format!("Command timed out after {} seconds", timeout.as_secs())
+                } else {
+                    breach.describe()
+                };
+                (Err(message), timed_out, Some(breach), Some(sample))
             }
+            Err(error) => (
+                Err(format!("Failed to run command: {}", error)),
+                false,
+                None,
+                None,
+            ),
         }
+    };
+
+    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = {
+        let (outcome, timed_out, breach, sample) = match &cancel {
+            Some(cancel) => tokio::select! {
+                result = supervised => result,
+                _ = cancel.notified() => (
+                    Err("Command cancelled by the user".to_string()), false, None, None
+                ),
+            },
+            // Lock poisoned — extremely unlikely, and cancellation simply isn't
+            // available for this run; every limit still applies.
+            None => supervised.await,
+        };
+        limit_breach = breach;
+        last_sample = sample;
+        (outcome, timed_out)
+    };
+
+    // A cancel is the one exit that leaves the tree standing: the limits all
+    // reclaim it themselves. A verify command is typically a build or a test
+    // runner, so the process that matters is almost always a grandchild of the
+    // `sh -c` this spawned — exactly the process `kill_on_drop` does not touch.
+    if outcome.is_err() {
+        if let Err(error) = controller.terminate_tree() {
+            eprintln!("verify: could not terminate the command's process tree: {error}");
+        }
+    }
+
+    // The row's terminal state, with the cause typed rather than described. Four
+    // outcomes and four different facts: a resource kill is not a failure, a
+    // user's Stop is not a resource kill, and a command that exited non-zero on
+    // its own is neither.
+    if let Some(execution) = execution.take() {
+        let exit = match (&outcome, limit_breach) {
+            (_, Some(breach)) => crate::process_table::ProcessExit::limit_exceeded(breach),
+            (Ok(captured), None) => match captured.code {
+                Some(0) => crate::process_table::ProcessExit::succeeded(),
+                code => crate::process_table::ProcessExit {
+                    status: crate::process_table::ExitStatus::Failed,
+                    code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                },
+            },
+            (Err(reason), None) => crate::process_table::ProcessExit::cancelled(reason.clone()),
+        };
+        execution.exited(exit, last_sample);
     }
 
     // Drop this turn's channel once no other verify/shell command of the
@@ -320,9 +549,9 @@ pub async fn run_command_impl(
             command_id: cmd.id.clone(),
             label: cmd.label.clone(),
             kind: cmd.kind.clone(),
-            code: output.status.code(),
-            stdout: cap_output(String::from_utf8_lossy(&output.stdout).to_string()),
-            stderr: cap_output(String::from_utf8_lossy(&output.stderr).to_string()),
+            code: output.code,
+            stdout: output.stdout,
+            stderr: output.stderr,
             duration_ms,
             timed_out: false,
         },
@@ -396,11 +625,18 @@ pub async fn verify_run(
         .cloned()
         .ok_or_else(|| format!("Unknown verify command id '{}'", command_id))?;
 
-    Ok(run_command_impl(state.inner(), &root, &cmd, turn_id.as_deref()).await)
+    Ok(run_command_impl(
+        state.inner(),
+        &root,
+        &cmd,
+        turn_id.as_deref(),
+        crate::bounded_execution::AppProcessProjector::shared(app),
+    )
+    .await)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -532,6 +768,152 @@ mod tests {
         assert!(find_command(&config, "real-id").is_some());
     }
 
+    /// Fail-closed admission, proved against the filesystem rather than against a
+    /// mock.
+    ///
+    /// The command is one whose only job is to leave evidence it ran. If the
+    /// marker exists afterwards, a bounded native execution happened with no row
+    /// in the table that claims to hold every one of them — which is exactly the
+    /// state the old fail-soft projection allowed, and which no amount of asserting
+    /// on a returned struct would have caught.
+    #[tokio::test]
+    async fn a_verify_command_whose_row_cannot_be_written_never_runs() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_admission");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = cwd.join("the-command-ran");
+        let cmd = command("c1", &marker_command(&marker));
+
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::FailingProjector::shared(),
+        )
+        .await;
+
+        assert!(
+            !marker.exists(),
+            "the verify command executed even though its process row could not be created"
+        );
+        assert_eq!(result.code, None, "a command that never ran has no code");
+        assert!(
+            result.stderr.contains("was not started"),
+            "the failure has to say the command never started, not that it failed: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The CLI's shape of the same rule, against the projector it actually uses.
+    ///
+    /// `cli_projector` hands back a [`LedgerProcessProjector`] over the active
+    /// profile's database. When that database cannot be opened — which is what an
+    /// unresolvable profile directory amounts to — the command must not run. The
+    /// path here is a directory, which SQLite refuses to open as a file, so this
+    /// is the real failure rather than a fake standing in for it.
+    ///
+    /// [`LedgerProcessProjector`]: crate::process_table::LedgerProcessProjector
+    #[tokio::test]
+    async fn a_verify_command_whose_ledger_cannot_be_opened_never_runs() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_no_ledger");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = cwd.join("the-command-ran");
+        let cmd = command("c1", &marker_command(&marker));
+        // A directory where a database file should be: `RunLedger::open` fails,
+        // exactly as it would for a profile directory this host cannot use.
+        let unopenable = std::sync::Arc::new(crate::process_table::LedgerProcessProjector::new(
+            cwd.clone(),
+        ));
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, unopenable).await;
+
+        assert!(
+            !marker.exists(),
+            "the verify command ran with no process-table row behind it"
+        );
+        assert!(
+            result.stderr.contains("was not started"),
+            "the CLI has to say the command never started: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Ownership that cannot be made durable stops the command too — after
+    /// admission, where the failure means "this app can no longer recover what it
+    /// is about to run" rather than "there is nowhere to record it".
+    ///
+    /// The row exists in this case, so the assertion is about the command's own
+    /// result: a workload whose recovery guarantee has already lapsed must not be
+    /// left running.
+    #[tokio::test]
+    async fn a_verify_command_whose_ownership_cannot_be_recorded_is_not_left_running() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_ownership");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cmd = command("c1", &long_running_command());
+
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::FailingProjector::shared_for_ownership_only(),
+        )
+        .await;
+
+        assert_eq!(
+            result.code, None,
+            "a command reclaimed before it could finish has no exit code"
+        );
+        assert!(
+            result.stderr.contains("owns"),
+            "the failure has to name what could not be recorded: {}",
+            result.stderr
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A command that stays alive long enough to be attached and then reclaimed.
+    ///
+    /// `cmd` has no `sleep`, so Windows gets the usual stand-in: a ping with a
+    /// one-second interval, which is what makes this test's assertion about a
+    /// *running* workload rather than about one that had already exited.
+    pub(crate) fn long_running_command() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            "ping -n 31 127.0.0.1 > nul".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            "sleep 30".to_string()
+        }
+    }
+
+    /// A shell command whose only effect is to create `marker`.
+    ///
+    /// Quoted per platform shell, so a temp directory with a space in it cannot
+    /// turn "the command did not run" into a false pass.
+    pub(crate) fn marker_command(marker: &Path) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("type nul > \"{}\"", marker.display())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!(
+                "touch '{}'",
+                marker.to_string_lossy().replace('\'', r"'\''")
+            )
+        }
+    }
+
     #[tokio::test]
     async fn run_command_impl_reports_exit_code_and_output() {
         let state = AppState::default();
@@ -539,7 +921,14 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let cmd = command("c1", "echo hello");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert_eq!(result.command_id, "c1");
         assert_eq!(result.code, Some(0));
@@ -557,7 +946,14 @@ mod tests {
         let mut cmd = command("c1", "exit 3");
         cmd.kind = "test".to_string();
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert_eq!(result.code, Some(3));
         assert!(!result.timed_out);
@@ -574,7 +970,14 @@ mod tests {
         cmd.timeout_secs = Some(1);
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(result.timed_out);
         assert!(result.code.is_none());
@@ -585,22 +988,334 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
+    /// A verify command's whole process-table lifecycle, against a real child.
+    ///
+    /// The gap this closes: this path installed a real bound, measured a real
+    /// tree and reclaimed it on a breach, and none of it was visible — the row
+    /// did not exist. So the assertions are about what a reader can *find*
+    /// afterwards: the pid that ran, the identity that names it, the limits that
+    /// were installed, and the mechanism that held them.
+    #[tokio::test]
+    async fn a_verify_command_records_its_identity_limits_and_containment() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let cmd = command("c1", "echo hi");
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
+        assert_eq!(result.code, Some(0));
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        assert_eq!(row.state, crate::process_table::ProcessState::Exited);
+        assert_eq!(
+            row.exit.expect("an exited row carries its exit").status,
+            crate::process_table::ExitStatus::Succeeded
+        );
+        assert_eq!(
+            row.workspace.as_deref(),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        // The native identity, not a bare pid: a row that names only a pid cannot
+        // be reconciled after a restart without risking an unrelated process.
+        assert!(row.native_pid.is_some(), "the row records the pid that ran");
+        assert!(
+            row.native_start_time.is_some(),
+            "the row records the start time that makes the pid an identity"
+        );
+        // The *effective* limits, which for this command are the class defaults
+        // intersected with the runner's own deadline and output cap.
+        assert_eq!(
+            row.limits.max_memory_bytes,
+            ProcessKind::VerifyCommand.default_limits().max_memory_bytes
+        );
+        assert_eq!(
+            row.limits.max_output_bytes,
+            Some(VERIFY_OUTPUT_CAP as u64),
+            "the runner's own output cap is the tighter one and must be what is recorded"
+        );
+        // What actually held it, recorded rather than recomputed by whoever reads
+        // the row later.
+        let containment = row.containment.expect("the row states what held it");
+        assert!(!containment.backend.is_empty());
+        assert!(!containment.tree_primitive.is_empty());
+        assert!(
+            containment
+                .for_limit(ProcessLimitKind::Memory)
+                .is_some_and(|capability| capability.is_enforced()),
+            "a verify command's memory bound is held by something, and the row must name it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A limit kill has to reach the row as typed fields, not as prose.
+    ///
+    /// Before the row existed, a verify command reclaimed for exceeding its
+    /// deadline reported "Command timed out after 1 seconds" into its own result
+    /// and vanished. Nothing downstream — the panel, `monkey processes show`, a
+    /// query — could tell that from a command that failed on its own.
+    #[tokio::test]
+    async fn a_verify_command_stopped_by_a_limit_persists_the_typed_breach() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row_breach");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let mut cmd = command("c1", "sleep 30");
+        cmd.timeout_secs = Some(1);
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
+        assert!(result.timed_out);
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::LimitExceeded);
+        let breach = exit.breach.expect("a limit kill carries its typed breach");
+        assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
+        assert_eq!(breach.configured, 1_000);
+        assert!(
+            breach.observed >= 1_000,
+            "the observed value is a measurement, not the configured number echoed back"
+        );
+        assert!(!breach.backend.is_empty());
+        assert!(
+            matches!(breach.level.as_str(), "kernel" | "supervised"),
+            "a breach names the level that held it, got {}",
+            breach.level
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A user's Stop and a limit kill are different facts and stay different.
+    #[tokio::test]
+    async fn a_cancelled_verify_command_closes_as_cancelled_and_not_as_a_limit() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row_cancel");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let turn_id = "turn-cancel-row".to_string();
+        let cmd = command("c1", "sleep 30");
+
+        let cancel = state
+            .tool_cancel
+            .lock()
+            .map(|mut guard| {
+                guard
+                    .entry(turn_id.clone())
+                    .or_insert_with(|| Arc::new(Notify::new()))
+                    .clone()
+            })
+            .expect("the lock is not poisoned");
+        let notifier = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            notifier.notify_waiters();
+        });
+
+        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), projector.clone()).await;
+        assert!(!result.timed_out);
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled);
+        assert!(exit.breach.is_none(), "a Stop is not a resource kill");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A running process's row shows what it is holding, not a blank until it
+    /// ends.
+    ///
+    /// The gap: the sampling loop's readings never left it — only the final
+    /// sample reached a caller — so a build sitting at gigabytes for ten minutes
+    /// displayed nothing at all. The child here holds a real process tree for
+    /// longer than one sample interval, and the assertions are that the *live*
+    /// row carries a current measurement and a peak at least as large.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_live_command_reports_what_its_tree_is_holding_now() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_live_usage");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        // Three live processes for two seconds: comfortably more than one
+        // 500 ms sampling interval, and a tree rather than a single process, so
+        // the process count is a number a single `sleep` could not produce.
+        let mut cmd = command("c1", "sleep 2 & sleep 2 & sleep 2");
+        cmd.timeout_secs = Some(30);
+
+        let watcher = {
+            let projector = projector.clone();
+            tokio::spawn(async move {
+                // Sampled from outside the runner, while it is still running:
+                // reading after it returns would prove only that a final sample
+                // was written, which is the thing that already worked.
+                for _ in 0..60 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let rows = projector.rows(ProcessKind::VerifyCommand);
+                    let Some(row) = rows.into_iter().next() else {
+                        continue;
+                    };
+                    if row.state != crate::process_table::ProcessState::Running {
+                        continue;
+                    }
+                    if let Some(usage) = row.usage {
+                        if usage.rss_bytes.is_some() || usage.process_count.is_some() {
+                            return Some((usage, row.usage_sampled_at_ms));
+                        }
+                    }
+                }
+                None
+            })
+        };
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, projector.clone()).await;
+        assert_eq!(result.code, Some(0), "{result:?}");
+
+        let (usage, sampled_at) = watcher
+            .await
+            .expect("the watcher finishes")
+            .expect("a running command's row must carry a measurement while it is running");
+        assert!(
+            sampled_at.is_some(),
+            "a measurement is stamped with when it was taken"
+        );
+        if let Some(rss) = usage.rss_bytes {
+            assert!(
+                rss > 0,
+                "a live tree holding zero bytes is not a measurement"
+            );
+            assert!(
+                usage.peak_rss_bytes.unwrap_or(0) >= rss,
+                "a peak below the current reading is not a peak: {usage:?}"
+            );
+        }
+        if let Some(count) = usage.process_count {
+            assert!(count >= 1, "{usage:?}");
+            assert!(usage.peak_process_count.unwrap_or(0) >= count, "{usage:?}");
+        }
+
+        // And the wall clock is answerable for a *live* process, which is the
+        // other half of the same defect.
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let report = crate::process_commands::build_resource_report(&row, None, Some(i64::MAX / 2));
+        let wall = report
+            .limits
+            .iter()
+            .find(|limit| limit.limit == ProcessLimitKind::Wall.as_str())
+            .expect("wall is reported");
+        assert!(wall.observed.is_some(), "{wall:?}");
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A verify command's deadline ends the *tree*, not the shell it named.
+    ///
+    /// The property the resource controller brought to this path. A verify
+    /// command is a build or a test runner, so the process holding the machine is
+    /// a grandchild of the `sh -c` this spawns — and `kill_on_drop` reaps exactly
+    /// one pid. The backgrounded `sleep` is that grandchild: before the deadline
+    /// was a wall limit, it survived its own run by twenty-nine seconds.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_verify_deadline_ends_the_grandchild_and_not_only_the_shell() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_tree_timeout");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // The grandchild reports its own pid, because by the time the assertion
+        // runs the shell is gone and there is no tree left to walk down from.
+        let pid_file = cwd.join("grandchild.pid");
+        let mut cmd = command(
+            "c1",
+            &format!(
+                "sleep 30 & echo $! > {}; sleep 30",
+                pid_file.to_string_lossy()
+            ),
+        );
+        cmd.timeout_secs = Some(1);
+
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
+        assert!(result.timed_out);
+
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the command wrote its background pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // Settle rather than assert on the kill's timing: a wall breach reclaims
+        // the tree before returning, and a loaded host still takes a moment.
+        for _ in 0..50 {
+            if !crate::os_signal::process_is_alive(grandchild) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            !crate::os_signal::process_is_alive(grandchild),
+            "the backgrounded grandchild outlived the deadline that was supposed to end it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// The capture is front-truncated at the cap while the child is running.
+    ///
+    /// The workload is one program reading one file, rather than the `yes | head`
+    /// pipeline this used to run. That pipeline is three processes under `cmd`,
+    /// and it failed here about one Windows run in four with an empty capture —
+    /// on a host where nothing bounded a verify command at all until this branch,
+    /// so it had never run under the job before. A flaky test in a required gate
+    /// is worse than no test: it teaches everyone to re-run. The property being
+    /// checked is the cap, and the cap does not care how many processes produced
+    /// the bytes.
     #[tokio::test]
     async fn run_command_impl_caps_output_length() {
         let state = AppState::default();
         let cwd = temp_path("cwd_cap");
         std::fs::create_dir_all(&cwd).unwrap();
-        // Print well over VERIFY_OUTPUT_CAP characters of 'x'.
-        let cmd = command("c1", "yes x | head -c 50000");
+        // Well over VERIFY_OUTPUT_CAP bytes, written here so the command is a
+        // single read on every host.
+        std::fs::write(cwd.join("flood.txt"), "x".repeat(50_000)).unwrap();
+        #[cfg(target_os = "windows")]
+        let cmd = command("c1", "type flood.txt");
+        #[cfg(not(target_os = "windows"))]
+        let cmd = command("c1", "cat flood.txt");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            None,
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(
             result.stdout.len() <= VERIFY_OUTPUT_CAP + 64,
             "stdout not capped: {} chars",
             result.stdout.len()
         );
-        assert!(result.stdout.starts_with("… (truncated)"));
+        // The whole result on failure, not just the predicate. A short stdout has
+        // several causes that look identical from a bare `starts_with` — the
+        // command never ran, it was reclaimed for a limit, the shell could not
+        // find the program — and the first Windows failure of this assertion cost
+        // a CI round to tell them apart.
+        assert!(
+            result.stdout.starts_with("… (truncated)"),
+            "expected a front-truncated capture, got {} bytes; code={:?} timed_out={} stderr={:?}",
+            result.stdout.len(),
+            result.code,
+            result.timed_out,
+            result.stderr
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -630,7 +1345,14 @@ mod tests {
         });
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id)).await;
+        let result = run_command_impl(
+            &state,
+            &cwd,
+            &cmd,
+            Some(&turn_id),
+            crate::test_support::RecordingProjector::shared(),
+        )
+        .await;
 
         assert!(!result.timed_out);
         assert!(result.code.is_none());

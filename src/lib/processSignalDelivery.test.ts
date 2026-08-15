@@ -285,6 +285,19 @@ describe("who delivers what", () => {
     remote_run: false,
     // Cancelling a node means cancelling its run, which is a different request.
     workflow_node: false,
+    // Both own a real OS process, and the Rust side that spawned it is what
+    // signals it: a foreground shell through its resource controller, a browser
+    // session through its worker. Claiming delivery here would latch an intent
+    // this window has no primitive to act on.
+    foreground_shell: false,
+    browser_session: false,
+    // Each is one blocking step of the turn that started it: the turn's own
+    // cancellation ends the command and reclaims its tree, and nothing reads a
+    // latch between the spawn and the wait. `ProcessKind::signal_support` refuses
+    // them for exactly that reason.
+    verify_command: false,
+    hook_command: false,
+    sandbox_run: false,
   } satisfies Record<ProcessKind, boolean>;
 
   it("scopes the sweep to exactly the kinds it can deliver to", () => {

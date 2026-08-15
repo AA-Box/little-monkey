@@ -17,6 +17,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::output_cap::CappedStream;
 use crate::workspace::display_relative_path;
 use crate::{
     artifact_commands, artifact_store::ArtifactStore, checkpoints, memory, native_skill_commands,
@@ -867,6 +868,296 @@ pub fn signal_turn_shells(state: &AppState, turn_key: &str, suspend: bool) -> us
 /// let a crafted command spoof/misattribute an ordinary parent-turn command
 /// as a vetted subagent's — passing `agent_label` as its own field instead
 /// of text `detail` shares means there is nothing for `command` to forge.
+/// Everything between the permission gate and the reply: the confined spawn, the
+/// process-table row, the supervised wait, and the typed close-out.
+///
+/// Split out of [`tool_run_shell`] so the whole of it is one function a test can
+/// drive, on the same terms as `background_shell::start_background_command`. A
+/// test that re-assembled the spawn, the controller, the cancellation channel and
+/// the two projections would be a test of its own assembly rather than of the one
+/// that ships — and the foreground row is exactly the part that had never existed.
+pub(crate) async fn supervised_foreground_shell<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    command: &str,
+    workspace_root: &std::path::Path,
+    cwd_path: &std::path::Path,
+    cap: Option<usize>,
+    turn_id: Option<String>,
+    limits: crate::process_table::ProcessLimits,
+) -> Result<ShellCapture, String> {
+    // No caller override today: the shell tool exposes no limit argument, so the
+    // class defaults are what apply. Passing the empty record rather than
+    // skipping the parameter keeps one resolution path — a future per-call
+    // override lands here and cannot accidentally take a different one.
+    let mut child =
+        crate::workspace_shell::spawn_foreground(workspace_root, cwd_path, command, limits)
+            .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    // Captured before the capture future borrows the child. With
+    // `process_group(0)` above, the child's own pid is also its group id.
+    let child_pgid = child.id();
+
+    // The row, before the wait rather than after it.
+    //
+    // A foreground shell is the kind that holds this app's real resource bounds,
+    // and until now it was the kind with no row at all: `ProcessKind` had the
+    // variant, migration V21 widened the vocabulary for it, and nothing ever
+    // admitted one — so "what is this turn running, and under what limits" had no
+    // answer while the command was still running, which is the only time the
+    // question is useful. Written here so the row exists for the whole life of
+    // the process, with its native pid and the limits actually installed.
+    //
+    // Fail-soft, like every other adopter: a command must not fail because a
+    // bookkeeping row could not be written.
+    let shell_process_id = format!("fgsh-{}", uuid::Uuid::new_v4());
+    let shell_workspace = cwd_path.to_path_buf();
+    let shell_limits = child.effective_limits();
+    let shell_identity = child.identity();
+    // Recorded from the controller that attached this shell, not derived later by
+    // whoever reads the row: a row outlives its host, and "what would this machine
+    // build for a new process" is a different question from "what held this one".
+    let shell_containment = child.containment();
+    let running = crate::workspace_shell::foreground_projection(
+        &shell_process_id,
+        crate::process_table::ProcessState::Running,
+        &shell_workspace,
+        shell_identity,
+        shell_limits,
+        Some(shell_containment.clone()),
+        None,
+    );
+    // The turn is the parent when there is one, which is what makes
+    // `monkey processes list --parent` answer "what did this turn run".
+    let running = match turn_id.as_deref() {
+        Some(turn) => running.with_parent(crate::process_table::ProcessKind::ChatTurn, turn),
+        None => running,
+    };
+    project_foreground_shell(app, state, &running);
+    // Every native process this shell's supervisor observes is recorded against
+    // that row from here on — which is what lets the next session reclaim a
+    // descendant that has since left the process group, and is why the wiring
+    // happens the moment the row exists rather than at the spawn.
+    //
+    // Fail-closed, unlike the projection above: a missing row costs visibility,
+    // while an unrecordable owned set costs the ability to find this tree again
+    // after a crash. The shell is reclaimed rather than run without it.
+    if let Err(error) =
+        child.persist_ownership_to(crate::bounded_execution::ProjectedOwnership::shared(
+            crate::bounded_execution::AppProcessProjector::shared(app.clone()),
+            crate::process_table::ProcessKind::ForegroundShell,
+            shell_process_id.clone(),
+        ))
+    {
+        let message = format!("Failed to record what this shell owns, so it was not run: {error}");
+        child.terminate_tree();
+        let mut exited = crate::workspace_shell::foreground_projection(
+            &shell_process_id,
+            crate::process_table::ProcessState::Exited,
+            &shell_workspace,
+            shell_identity,
+            shell_limits,
+            Some(shell_containment.clone()),
+            None,
+        );
+        exited.exit = Some(crate::process_table::ProcessExit::failed(message.clone()));
+        project_foreground_shell(app, state, &exited);
+        return Err(message);
+    }
+    // Taken out of the child *before* the wait, so the two pipes can be drained
+    // concurrently with it. `Stdio::piped()` above guarantees both are `Some`;
+    // the `ok_or` is a refusal rather than an `expect` because a panic inside a
+    // Tauri command aborts the whole IPC task.
+    let stdout_pipe = child
+        .take_stdout()
+        .ok_or_else(|| "Shell child had no stdout pipe".to_string())?;
+    let stderr_pipe = child
+        .take_stderr()
+        .ok_or_else(|| "Shell child had no stderr pipe".to_string())?;
+
+    // Each turn gets its own cancellation channel so Stop in one pane never
+    // kills a command the other pane's turn is still running. Callers that
+    // don't thread a turn id share the "" channel.
+    let cancel_key = turn_id.unwrap_or_default();
+    let cancel = state
+        .tool_cancel
+        .lock()
+        .map_err(|_| "Tool-cancel lock poisoned".to_string())?
+        .entry(cancel_key.clone())
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+        .clone();
+
+    // Registered for the whole life of the child so a `process_signal
+    // <chat_turn> suspend` arriving mid-command can SIGSTOP it immediately,
+    // rather than the pause only landing whenever this command happens to
+    // finish. Deregistered right after the wait below, before the pid could
+    // be recycled by the kernel.
+    let registered_pgid = child_pgid
+        .and_then(|pgid| register_shell_process_group(state, &cancel_key, pgid).then_some(pgid));
+
+    // Kept beside `outcome` because the error string cannot carry it: a limit kill
+    // has to reach the row as typed fields — which limit, configured, observed,
+    // backend, level — and not only as prose the UI would have to parse back.
+    let mut limit_breach: Option<crate::resource_control::LimitBreach> = None;
+    // The last measurement anything took, so the terminal row carries the peaks
+    // rather than dropping them at the moment they stop changing.
+    let mut last_sample: Option<crate::resource_control::ResourceSample> = None;
+    let outcome = tokio::select! {
+        result = child.wait_supervised(stdout_pipe, stderr_pipe, cap, |sample| {
+            // Every tick, so the Processes panel shows a running build's current
+            // memory and process count instead of a blank until it finishes.
+            let sampled = crate::workspace_shell::foreground_projection(
+                &shell_process_id,
+                crate::process_table::ProcessState::Running,
+                &shell_workspace,
+                shell_identity,
+                shell_limits,
+                None,
+                Some(*sample),
+            );
+            project_foreground_shell(app, state, &sampled);
+        }) => {
+            match result {
+                // A limit fired: the tree is already down, and the message names
+                // which limit with both numbers so a reader can tell a wrong
+                // budget from a wrong command.
+                Ok(crate::resource_control::Supervised::Breached(breach, sample)) => {
+                    let described = breach.describe();
+                    limit_breach = Some(breach);
+                    last_sample = Some(sample);
+                    Err(described)
+                }
+                Ok(crate::resource_control::Supervised::Completed(captured, sample)) => {
+                    // The byte count the *owner* knows and no backend can: a pipe
+                    // is not a cgroup resource, so the drain is the only thing
+                    // that can say how much the child produced. Folded into the
+                    // sample rather than fed to the controller on purpose — the
+                    // output bound is a retention bound here, and telling the
+                    // controller would make it terminate the tree instead.
+                    let produced = captured.as_ref().ok().map(|captured| {
+                        captured.stdout.total_bytes() + captured.stderr.total_bytes()
+                    });
+                    last_sample = Some(crate::resource_control::ResourceSample {
+                        output_bytes: produced,
+                        ..sample
+                    });
+                    captured
+                    .map(|captured| ShellCapture {
+                        status: captured.status,
+                        stdout: captured.stdout,
+                        stderr: captured.stderr,
+                    })
+                    .map_err(|e| format!("Failed to run command: {}", e))
+                }
+                Err(e) => Err(format!("Failed to run command: {}", e)),
+            }
+        }
+        _ = cancel.notified() => {
+            Err("Command cancelled by the user".to_string())
+        }
+        _ = shell_timeout_elapsed(state, &cancel_key) => {
+            Err(format!(
+                "Command timed out after {} seconds",
+                SHELL_TIMEOUT.as_secs()
+            ))
+        }
+    };
+
+    // A timeout or a Stop must end the whole tree, not the shell we spawned.
+    //
+    // `kill_on_drop` (set above) SIGKILLs exactly one pid, so `sh -c "cargo
+    // build"` reaped the shell and left the compiler running — consuming the
+    // machine long after the tool reported "timed out after 120 seconds". The pgid
+    // was already known here and used for suspend/resume; it simply was not used
+    // for the kill. TERM first, so a build can flush and clean up its temp files.
+    if outcome.is_err() {
+        child.terminate_tree();
+    }
+
+    // The row's terminal state, with the cause typed rather than described.
+    //
+    // Four outcomes and four different facts, which is the distinction the panel
+    // and `monkey processes` exist to show: a resource kill is not a failure, a
+    // user's Stop is not a resource kill, and a command that exited non-zero on
+    // its own is neither.
+    let exit = match (&outcome, limit_breach) {
+        (_, Some(breach)) => crate::process_table::ProcessExit::limit_exceeded(breach),
+        (Ok(capture), None) => {
+            let code = capture.status.code();
+            if capture.status.success() {
+                crate::process_table::ProcessExit {
+                    status: crate::process_table::ExitStatus::Succeeded,
+                    code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                }
+            } else {
+                crate::process_table::ProcessExit {
+                    status: crate::process_table::ExitStatus::Failed,
+                    code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                }
+            }
+        }
+        (Err(reason), None) => crate::process_table::ProcessExit::cancelled(reason.clone()),
+    };
+    let mut exited = crate::workspace_shell::foreground_projection(
+        &shell_process_id,
+        crate::process_table::ProcessState::Exited,
+        &shell_workspace,
+        shell_identity,
+        shell_limits,
+        Some(shell_containment),
+        last_sample,
+    );
+    exited.exit = Some(exit);
+    project_foreground_shell(app, state, &exited);
+
+    if let Some(pgid) = registered_pgid {
+        forget_shell_process_group(state, &cancel_key, pgid);
+    }
+
+    // Drop this turn's channel once no other shell of the same turn still
+    // holds it (strong count 2 = the map's Arc + our clone), so the map
+    // doesn't accumulate one entry per turn forever. A racing new shell for
+    // the same turn simply recreates the entry.
+    {
+        let mut guard = state
+            .tool_cancel
+            .lock()
+            .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
+        if guard
+            .get(&cancel_key)
+            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
+        {
+            guard.remove(&cancel_key);
+        }
+    }
+
+    outcome
+}
+
+/// Writes one foreground-shell row, and never fails a command over it.
+///
+/// Fail-soft on the same terms as every other adopter of this table: the process
+/// table is an observability and arbitration surface, and a shell that refused to
+/// run because a row could not be written would be strictly worse than a missing
+/// row.
+fn project_foreground_shell<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    projection: &crate::process_table::ProcessProjection,
+) {
+    if let Err(error) = crate::process_commands::project_process_record(app, state, projection) {
+        eprintln!(
+            "run_shell: could not record {} in the process table: {error}",
+            projection.external_id
+        );
+    }
+}
+
 #[tauri::command(rename_all = "snake_case")]
 pub async fn tool_run_shell(
     app: tauri::AppHandle,
@@ -922,91 +1213,24 @@ pub async fn tool_run_shell(
     // before the first byte arrives.
     let cap = stream_cap(full_output);
 
-    let mut child = crate::workspace_shell::spawn_foreground(&workspace_root, &cwd_path, &command)
-        .map_err(|e| format!("Failed to spawn shell: {}", e))?;
-    // Captured before the capture future borrows the child. With
-    // `process_group(0)` above, the child's own pid is also its group id.
-    let child_pgid = child.id();
-    // Taken out of the child *before* the wait, so the two pipes can be drained
-    // concurrently with it. `Stdio::piped()` above guarantees both are `Some`;
-    // the `ok_or` is a refusal rather than an `expect` because a panic inside a
-    // Tauri command aborts the whole IPC task.
-    let stdout_pipe = child
-        .take_stdout()
-        .ok_or_else(|| "Shell child had no stdout pipe".to_string())?;
-    let stderr_pipe = child
-        .take_stderr()
-        .ok_or_else(|| "Shell child had no stderr pipe".to_string())?;
+    let capture = supervised_foreground_shell(
+        &app,
+        state.inner(),
+        &command,
+        &workspace_root,
+        &cwd_path,
+        cap,
+        turn_id,
+        // No caller override today: the shell tool exposes no limit argument, so
+        // the class defaults are what apply. Passing the empty record rather than
+        // skipping the parameter keeps one resolution path — a future per-call
+        // override lands here and cannot accidentally take a different one.
+        crate::process_table::ProcessLimits::default(),
+    )
+    .await;
 
-    // Each turn gets its own cancellation channel so Stop in one pane never
-    // kills a command the other pane's turn is still running. Callers that
-    // don't thread a turn id share the "" channel.
-    let cancel_key = turn_id.unwrap_or_default();
-    let cancel = state
-        .tool_cancel
-        .lock()
-        .map_err(|_| "Tool-cancel lock poisoned".to_string())?
-        .entry(cancel_key.clone())
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
-        .clone();
+    let output = capture?;
 
-    // Registered for the whole life of the child so a `process_signal
-    // <chat_turn> suspend` arriving mid-command can SIGSTOP it immediately,
-    // rather than the pause only landing whenever this command happens to
-    // finish. Deregistered right after the wait below, before the pid could
-    // be recycled by the kernel.
-    let registered_pgid = child_pgid.and_then(|pgid| {
-        register_shell_process_group(state.inner(), &cancel_key, pgid).then_some(pgid)
-    });
-
-    let outcome = tokio::select! {
-        result = capture_bounded(child.wait(), stdout_pipe, stderr_pipe, cap) => {
-            result.map_err(|e| format!("Failed to run command: {}", e))
-        }
-        _ = cancel.notified() => {
-            Err("Command cancelled by the user".to_string())
-        }
-        _ = shell_timeout_elapsed(state.inner(), &cancel_key) => {
-            Err(format!(
-                "Command timed out after {} seconds",
-                SHELL_TIMEOUT.as_secs()
-            ))
-        }
-    };
-
-    // A timeout or a Stop must end the whole tree, not the shell we spawned.
-    //
-    // `kill_on_drop` (set above) SIGKILLs exactly one pid, so `sh -c "cargo
-    // build"` reaped the shell and left the compiler running — consuming the
-    // machine long after the tool reported "timed out after 120 seconds". The pgid
-    // was already known here and used for suspend/resume; it simply was not used
-    // for the kill. TERM first, so a build can flush and clean up its temp files.
-    if outcome.is_err() {
-        child.terminate_tree();
-    }
-
-    if let Some(pgid) = registered_pgid {
-        forget_shell_process_group(state.inner(), &cancel_key, pgid);
-    }
-
-    // Drop this turn's channel once no other shell of the same turn still
-    // holds it (strong count 2 = the map's Arc + our clone), so the map
-    // doesn't accumulate one entry per turn forever. A racing new shell for
-    // the same turn simply recreates the entry.
-    {
-        let mut guard = state
-            .tool_cancel
-            .lock()
-            .map_err(|_| "Tool-cancel lock poisoned".to_string())?;
-        if guard
-            .get(&cancel_key)
-            .is_some_and(|n| std::sync::Arc::strong_count(n) <= 2)
-        {
-            guard.remove(&cancel_key);
-        }
-    }
-
-    let output = outcome?;
     // The command was watched to exit. A timeout or a Stop leaves only the
     // declaration above, which is the right way round: a killed `sh -c` had
     // already run for as long as it ran, and the preview says "may have" rather
@@ -1064,142 +1288,11 @@ fn stream_cap(full_output: Option<bool>) -> Option<usize> {
     }
 }
 
-/// One captured stream, already held to its ceiling.
-///
-/// Bytes rather than a `String` because the cap is enforced during the read, when
-/// a chunk boundary can land inside a multi-byte character and there is no whole
-/// string to decode yet. [`Self::into_string`] does the one decode, at the end,
-/// over a buffer that is bounded by construction.
-#[derive(Debug, Default)]
-struct CappedStream {
-    /// The kept tail. At most `cap` bytes once a cap is in force.
-    bytes: Vec<u8>,
-    /// Whether anything was dropped from the front to stay inside the cap.
-    truncated: bool,
-}
-
-impl CappedStream {
-    /// Appends `chunk`, dropping whole bytes off the *front* once `cap` is
-    /// exceeded.
-    ///
-    /// Tail, not head, for the reason [`crate::output_cap::cap_tail`] gives: a
-    /// failing command prints its diagnostic last. Front-dropping is what makes
-    /// this bounded in the first place — a head-keeping cap could stop reading,
-    /// but then the child blocks forever on a full pipe instead of running to
-    /// completion, which turns a noisy command into a timeout.
-    fn push(&mut self, chunk: &[u8], cap: Option<usize>) {
-        self.bytes.extend_from_slice(chunk);
-        let Some(cap) = cap else { return };
-        if self.bytes.len() <= cap {
-            return;
-        }
-        let overflow = self.bytes.len() - cap;
-        self.bytes.drain(..overflow);
-        self.truncated = true;
-    }
-
-    /// Decodes the kept tail, prefixing the shared truncation marker if the front
-    /// was dropped.
-    ///
-    /// The leading continuation bytes are shed first, so a cut that landed inside
-    /// a character widens the kept region forward to the next boundary instead of
-    /// decoding to a replacement character. That is exactly what `cap_tail` did
-    /// when it worked on a whole `String`, and keeping the behaviour identical is
-    /// why it is done here rather than left to `from_utf8_lossy`.
-    fn into_string(mut self) -> (String, bool) {
-        if self.truncated {
-            let keep = self
-                .bytes
-                .iter()
-                .position(|byte| (byte & 0b1100_0000) != 0b1000_0000)
-                .unwrap_or(self.bytes.len());
-            self.bytes.drain(..keep);
-        }
-        let decoded = String::from_utf8_lossy(&self.bytes).to_string();
-        if self.truncated {
-            (
-                format!("{}{decoded}", crate::output_cap::TRUNCATION_MARKER),
-                true,
-            )
-        } else {
-            (decoded, false)
-        }
-    }
-}
-
 /// What a finished `run_shell` child produced, with both streams already bounded.
-struct ShellCapture {
+pub(crate) struct ShellCapture {
     status: std::process::ExitStatus,
     stdout: CappedStream,
     stderr: CappedStream,
-}
-
-/// Reads one pipe to EOF, keeping at most `cap` bytes of its tail.
-///
-/// Reading to EOF rather than stopping at the cap is the whole point: an
-/// early-returning reader leaves the child blocked on a full pipe buffer, so a
-/// command that merely printed too much would report a timeout instead of its
-/// exit code.
-async fn drain_capped<R>(mut reader: R, cap: Option<usize>) -> std::io::Result<CappedStream>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut stream = CappedStream::default();
-    // 8 KiB: larger than the 64 KiB pipe buffer would not help (the kernel hands
-    // over what it has), and smaller would just mean more syscalls.
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        let read = reader.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(stream);
-        }
-        stream.push(&chunk[..read], cap);
-    }
-}
-
-/// Waits for `child` while draining both of its pipes, holding each to `cap`.
-///
-/// This is the fix for the last unbounded buffer on the shell path.
-/// `wait_with_output` materialized *both* streams in full before any cap applied,
-/// so `sh -c 'cat /dev/urandom | base64'` had the whole 120-second timeout to grow
-/// the app's own heap — the returned string was capped, the heap behind it was
-/// not.
-///
-/// The three futures are joined rather than sequenced, and that is the part with a
-/// failure mode: reading stdout to EOF *before* touching stderr deadlocks a child
-/// with a chatty stderr as soon as the 64 KiB stderr pipe buffer fills, and
-/// waiting for exit before reading either deadlocks on the first full pipe.
-/// `try_join!` polls all three, which is the service `wait_with_output` performed
-/// and the reason it could not simply be dropped.
-///
-/// Cancellation safety is inherited rather than argued: the caller races this
-/// whole future in a `tokio::select!`, and dropping it drops the two pipe readers
-/// (closing the read ends) and stops the wait. The child itself is killed by the
-/// caller's process-group terminate, with `kill_on_drop` as the backstop — the
-/// same two mechanisms as before this change.
-async fn capture_bounded<W, O, E>(
-    wait: W,
-    stdout_pipe: O,
-    stderr_pipe: E,
-    cap: Option<usize>,
-) -> std::io::Result<ShellCapture>
-where
-    W: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
-    O: tokio::io::AsyncRead + Unpin,
-    E: tokio::io::AsyncRead + Unpin,
-{
-    let (status, stdout, stderr) = tokio::try_join!(
-        wait,
-        drain_capped(stdout_pipe, cap),
-        drain_capped(stderr_pipe, cap),
-    )?;
-    Ok(ShellCapture {
-        status,
-        stdout,
-        stderr,
-    })
 }
 
 /// Save a short durable fact about the current project/user preferences to
@@ -1695,9 +1788,9 @@ mod tests {
         for _ in 0..4_096 {
             stream.push(&[b'x'; 1_000], Some(CAP));
             assert!(
-                stream.bytes.len() <= CAP,
+                stream.as_bytes().len() <= CAP,
                 "the buffer grew to {} bytes past a {CAP}-byte cap",
-                stream.bytes.len()
+                stream.as_bytes().len()
             );
         }
         let (value, truncated) = stream.into_string();
@@ -1741,60 +1834,6 @@ mod tests {
     ///
     /// A child that fills stderr while stdout is still open wedges any reader
     /// that drains one pipe to EOF before touching the other: the 64 KiB stderr
-    /// pipe buffer fills, the child blocks writing to it, and stdout never sees
-    /// EOF. Both streams here are far past that buffer, and both are past the
-    /// cap, so this also proves the bounded read still lets the child *finish*
-    /// rather than stopping early and hanging it.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_child_that_floods_both_pipes_still_exits_and_is_held_to_the_cap() {
-        use std::process::Stdio;
-
-        const CAP: usize = 4_096;
-
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            // ~200 KiB down each pipe, interleaved, so neither can be drained
-            // to completion before the other is read.
-            .arg(
-                "i=0; while [ $i -lt 200 ]; do \
-                   printf 'o%.0s' $(seq 1 1024); \
-                   printf 'e%.0s' $(seq 1 1024) >&2; \
-                   i=$((i+1)); \
-                 done; exit 3",
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn the flooding child");
-
-        let stdout_pipe = child.stdout.take().expect("stdout pipe");
-        let stderr_pipe = child.stderr.take().expect("stderr pipe");
-
-        let captured = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, Some(CAP)),
-        )
-        .await
-        .expect("draining both pipes concurrently must not deadlock")
-        .expect("the child ran to completion");
-
-        assert_eq!(
-            captured.status.code(),
-            Some(3),
-            "the child's own exit code must survive a truncated capture"
-        );
-        assert!(captured.stdout.bytes.len() <= CAP);
-        assert!(captured.stderr.bytes.len() <= CAP);
-
-        let (stdout, stdout_truncated) = captured.stdout.into_string();
-        let (stderr, stderr_truncated) = captured.stderr.into_string();
-        assert!(stdout_truncated && stderr_truncated);
-        assert!(stdout.ends_with('o'), "the tail is what is kept");
-        assert!(stderr.ends_with('e'), "the tail is what is kept");
-    }
-
     /// The uncapped path still returns the whole document, because
     /// `securityAutofix.ts` `JSON.parse`s it and a truncated tail there reads as
     /// zero vulnerabilities.
@@ -1814,10 +1853,13 @@ mod tests {
         let stdout_pipe = child.stdout.take().expect("stdout pipe");
         let stderr_pipe = child.stderr.take().expect("stderr pipe");
 
-        let captured = super::capture_bounded(child.wait(), stdout_pipe, stderr_pipe, None)
-            .await
-            .expect("the child ran");
-        let (stdout, truncated) = captured.stdout.into_string();
+        let (_, stdout, _) = tokio::try_join!(
+            child.wait(),
+            crate::output_cap::drain_capped(stdout_pipe, None),
+            crate::output_cap::drain_capped(stderr_pipe, None),
+        )
+        .expect("the child ran");
+        let (stdout, truncated) = stdout.into_string();
         assert_eq!(stdout.len(), 100_000);
         assert!(!truncated);
     }
@@ -2201,5 +2243,243 @@ mod tests {
                 "file content corrupted rather than a clean win by one editor: {final_content:?}"
             );
         }
+    }
+}
+
+/// The foreground shell's own row, end to end through the tool's real path.
+///
+/// `supervised_foreground_shell` is everything `tool_run_shell` does after the
+/// permission gate, so these cross the whole lifecycle: the confined spawn, the
+/// `ResourceController`, a real child and grandchild, the supervised wait, the
+/// whole-tree termination, and the process-table row with its native pid, its
+/// effective limits and its typed exit.
+///
+/// The row is the part that did not exist. `ProcessKind::ForegroundShell` was
+/// declared, migration V21 widened the schema's vocabulary for it, and nothing
+/// ever admitted one — so every claim about what a foreground shell was bounded
+/// by could only be read from the code.
+#[cfg(all(test, unix))]
+mod foreground_process_row {
+    use super::*;
+    use crate::process_table::{
+        ExitStatus, ProcessKind, ProcessLimits, ProcessRecord, ProcessState,
+    };
+    use crate::run_ledger::RunLedger;
+    use tauri::Manager;
+
+    struct Harness {
+        _app: tauri::App<tauri::test::MockRuntime>,
+        handle: tauri::AppHandle<tauri::test::MockRuntime>,
+        root: std::path::PathBuf,
+        workspace: std::path::PathBuf,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl Harness {
+        fn create() -> Self {
+            let app =
+                crate::test_support::build(tauri::test::mock_builder().manage(AppState::default()));
+            let handle = app.handle().clone();
+            *handle.state::<AppState>().run_ledger.lock().unwrap() =
+                Some(RunLedger::open_in_memory().expect("an in-memory ledger"));
+            let root = std::env::temp_dir().join(format!(
+                "little-monkey-fg-row-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let workspace = root.join("workspace");
+            std::fs::create_dir_all(&workspace).expect("create workspace");
+            let workspace =
+                crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+            Harness {
+                _app: app,
+                handle,
+                root,
+                workspace,
+            }
+        }
+
+        async fn run(&self, command: &str, limits: ProcessLimits) -> Result<ShellCapture, String> {
+            let state = self.handle.state::<AppState>();
+            supervised_foreground_shell(
+                &self.handle,
+                state.inner(),
+                command,
+                &self.workspace,
+                &self.workspace,
+                Some(crate::output_cap::MODEL_OUTPUT_CAP),
+                Some("turn-under-test".to_string()),
+                limits,
+            )
+            .await
+        }
+
+        fn only_row(&self) -> ProcessRecord {
+            let state = self.handle.state::<AppState>();
+            let mut rows =
+                crate::process_commands::with_process_table(&self.handle, state.inner(), |table| {
+                    table.list(&crate::process_table::ProcessFilter {
+                        kinds: vec![ProcessKind::ForegroundShell],
+                        live_only: false,
+                        parent_process_id: None,
+                        workspace: None,
+                        limit: None,
+                    })
+                })
+                .expect("the process table reads");
+            assert_eq!(rows.len(), 1, "one command, one row: {rows:?}");
+            rows.pop().expect("a row")
+        }
+    }
+
+    fn confinement_available() -> bool {
+        if crate::sandbox::sandbox_enforcement() == crate::sandbox::SandboxEnforcement::OsEnforced {
+            return true;
+        }
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI platform did not provide its required shell confinement backend"
+        );
+        false
+    }
+
+    /// Normal completion: the row exists, carries the pid and the effective
+    /// limits, and closes as `succeeded` with no breach.
+    #[tokio::test]
+    async fn a_completed_foreground_shell_is_a_row_with_its_pid_limits_and_exit() {
+        if !confinement_available() {
+            return;
+        }
+        let harness = Harness::create();
+        let capture = harness
+            .run("printf ok", ProcessLimits::default())
+            .await
+            .expect("the command runs");
+        assert!(capture.status.success());
+
+        let row = harness.only_row();
+        assert_eq!(row.state, ProcessState::Exited);
+        assert!(
+            row.native_pid.is_some_and(|pid| pid > 0),
+            "the row must carry the process it bounded: {row:?}"
+        );
+        // The *effective* limits, not the caller's empty record: what the row
+        // states has to be the number installed on the tree.
+        let class = ProcessKind::ForegroundShell.default_limits();
+        assert_eq!(row.limits.max_memory_bytes, class.max_memory_bytes);
+        assert_eq!(row.limits.max_child_processes, class.max_child_processes);
+        let exit = row.exit.expect("a terminal row carries its exit");
+        assert_eq!(exit.status, ExitStatus::Succeeded);
+        assert!(exit.breach.is_none(), "{exit:?}");
+    }
+
+    /// A command that fails on its own is `failed`, never `limit_exceeded`.
+    #[tokio::test]
+    async fn a_foreground_shell_that_exits_non_zero_is_failed_and_not_a_resource_kill() {
+        if !confinement_available() {
+            return;
+        }
+        let harness = Harness::create();
+        let capture = harness
+            .run("exit 7", ProcessLimits::default())
+            .await
+            .expect("a non-zero exit is an outcome, not an error");
+        assert_eq!(capture.status.code(), Some(7));
+
+        let exit = harness.only_row().exit.expect("exit");
+        assert_eq!(exit.status, ExitStatus::Failed);
+        assert_eq!(exit.code, Some(7));
+        assert!(exit.breach.is_none(), "{exit:?}");
+    }
+
+    /// A user's Stop is a cancellation, never a resource kill.
+    ///
+    /// The counter-test that keeps the two apart in the direction the panel cares
+    /// about. A command stopped by a person and a command stopped for holding
+    /// 9 GiB are different facts, and a row that called both the same is what made
+    /// a working budget look like an unexplained disappearance — and would equally
+    /// make a user's own Stop look like the app policing them.
+    #[tokio::test]
+    async fn a_user_s_stop_is_cancelled_and_never_a_limit_kill() {
+        if !confinement_available() {
+            return;
+        }
+        let harness = Harness::create();
+        let state = harness.handle.state::<AppState>();
+        // The same channel `tool_run_shell` selects on, keyed by the turn this
+        // harness passes.
+        let cancel = state
+            .tool_cancel
+            .lock()
+            .unwrap()
+            .entry("turn-under-test".to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .clone();
+        let stop = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.notify_waiters();
+        });
+
+        let error = harness
+            .run("sleep 30", ProcessLimits::default())
+            .await
+            .err()
+            .expect("a cancelled command ends the call");
+        let _ = stop.await;
+        assert!(error.contains("cancelled"), "{error}");
+
+        let exit = harness.only_row().exit.expect("exit");
+        assert_eq!(
+            exit.status,
+            ExitStatus::Cancelled,
+            "a person stopping a command is not the system enforcing a limit: {exit:?}"
+        );
+        assert!(exit.breach.is_none(), "{exit:?}");
+    }
+
+    /// A limit kill: the row is `limit_exceeded` and carries the typed breach,
+    /// and the whole tree — including the grandchild holding the memory — is
+    /// gone.
+    #[tokio::test]
+    async fn a_foreground_shell_past_its_budget_is_limit_exceeded_with_a_typed_breach() {
+        if !confinement_available() {
+            return;
+        }
+        let harness = Harness::create();
+        let error = harness
+            .run(
+                "sleep 30 & sleep 30",
+                ProcessLimits {
+                    max_wall_ms: Some(1_000),
+                    ..ProcessLimits::default()
+                },
+            )
+            .await
+            .err()
+            .expect("a limit kill ends the call");
+        assert!(error.contains("max_wall_ms"), "{error}");
+
+        let row = harness.only_row();
+        let native_pid = u32::try_from(row.native_pid.expect("a pid")).expect("a pid fits");
+        let exit = row.exit.expect("exit");
+        assert_eq!(
+            exit.status,
+            ExitStatus::LimitExceeded,
+            "a resource kill must not be recorded as a cancellation: {exit:?}"
+        );
+        let breach = exit.breach.expect("a limit kill carries its typed breach");
+        assert_eq!(breach.limit, "max_wall_ms");
+        assert_eq!(breach.configured, 1_000);
+        assert!(!breach.backend.is_empty());
+        assert!(
+            crate::process_tree::measure_tree(native_pid)
+                .expect("snapshot")
+                .is_none(),
+            "neither the shell nor either sleep may survive its deadline"
+        );
     }
 }

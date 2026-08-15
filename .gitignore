@@ -30,7 +30,11 @@ src-tauri/target
 src-tauri/gen/schemas
 
 # CLI sidecar staged by scripts/stage-cli-sidecar.mjs before tauri dev/build
-src-tauri/binaries/
+# Without a trailing slash, so it also matches the *symlink* a git worktree needs
+# to build: `binaries/` ignores a directory only, so `git add -A` in a worktree
+# happily committed the link — and CI, where its target does not exist, failed
+# `mkdir` on a dangling symlink before any test ran, on all three platform legs.
+src-tauri/binaries
 
 # Verified llama.cpp runtime staged by scripts/stage-managed-runtime.mjs.
 # The small README stays tracked so Tauri's resource glob also resolves
