@@ -634,7 +634,7 @@ function CeilingInput({
 }
 
 /**
- * K9 (docs/agent-os-roadmap.md) — authoring surface for dispatch policies.
+ * Authoring surface for dispatch policies.
  *
  * The list order is the evaluation order (`matchPolicy` takes the first
  * enabled policy covering a task class), which is why the reorder buttons are
