@@ -569,8 +569,16 @@ pub async fn issue_to_pr_run_checks(
                 enabled: true,
                 timeout_secs: None,
             };
-            let result =
-                run_command_impl(state.inner(), &root, &verify_command, Some(&run_id)).await;
+            let result = run_command_impl(
+                state.inner(),
+                &root,
+                &verify_command,
+                Some(&run_id),
+                Some(crate::bounded_execution::AppProcessProjector::shared(
+                    app.clone(),
+                )),
+            )
+            .await;
             let passed = result.code == Some(0) && !result.timed_out;
             all_passed = all_passed && passed;
             outcomes.push(CheckOutcome {

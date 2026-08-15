@@ -243,6 +243,10 @@ mod tools;
 // Long-running agent shell commands that outlive the turn that started them
 // (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
 pub mod background_shell;
+// The process-table lifecycle every bounded agent-controlled execution shares:
+// the verify runner, the hook runner and the sandbox run, which were bounded by
+// a resource controller long before any of them had a row.
+pub mod bounded_execution;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;

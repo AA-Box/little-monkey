@@ -210,6 +210,7 @@ pub async fn run_command_impl(
     root: &Path,
     cmd: &VerifyCommand,
     turn_id: Option<&str>,
+    projector: Option<std::sync::Arc<dyn crate::process_table::ProcessProjector>>,
 ) -> VerifyResult {
     let started = Instant::now();
 
@@ -264,7 +265,7 @@ pub async fn run_command_impl(
     let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
         LimitLayer::new(
             LimitSource::ClassDefault,
-            ProcessKind::ForegroundShell.default_limits(),
+            ProcessKind::VerifyCommand.default_limits(),
         ),
         LimitLayer::new(
             LimitSource::UserOverride,
@@ -275,6 +276,26 @@ pub async fn run_command_impl(
             },
         ),
     ]));
+    // The row, before the spawn rather than after the wait. A verify command
+    // that fails to `exec` is exactly the case a reader wants a record of, and
+    // one written afterwards would miss every command that never started.
+    //
+    // `None` only where there is nothing to project onto — `monkey-cli` and this
+    // module's own tests, which have no ledger. A missing projector is a missing
+    // row, never a refused command.
+    let mut execution = projector.map(|projector| {
+        crate::bounded_execution::BoundedExecution::admit(
+            projector,
+            ProcessKind::VerifyCommand,
+            Some(root.to_string_lossy().into_owned()),
+            controller.limits().to_process_limits(),
+        )
+    });
+    if let (Some(execution), Some(turn)) = (execution.as_mut(), turn_id) {
+        // The turn is what makes `monkey processes list --parent` answer "what
+        // did this turn verify".
+        execution.set_parent(ProcessKind::ChatTurn, turn);
+    }
     let failed_to_start = |message: String| VerifyResult {
         command_id: cmd.id.clone(),
         label: cmd.label.clone(),
@@ -304,9 +325,21 @@ pub async fn run_command_impl(
             Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
             Err(crate::resource_control::AttachFailure::Containment(error)) => {
                 let _ = controller.terminate_tree();
-                return failed_to_start(format!("Failed to bound command: {error}"));
+                let message = format!("Failed to bound command: {error}");
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::failed(message.clone()),
+                        None,
+                    );
+                }
+                return failed_to_start(message);
             }
         }
+    }
+    // After the attach, not after the spawn: the row records the identity and the
+    // containment the attach has just *verified*, rather than one it assumed.
+    if let Some(execution) = execution.as_mut() {
+        execution.running(&controller);
     }
 
     // Each turn gets its own cancellation channel so Stop in one pane never
@@ -351,13 +384,35 @@ pub async fn run_command_impl(
     // by the controller now, and a breach of any of them has already reclaimed
     // the whole tree by the time this returns. What is left for the `select` is
     // the user's Stop, which is a different fact from a limit and stays one.
+    //
+    // The breach and the last sample are kept beside the outcome rather than
+    // folded into the message: a limit kill has to reach the row as typed fields
+    // — which limit, configured, observed, backend, level — and a UI cannot parse
+    // that back out of an English sentence.
+    let limit_breach: Option<crate::resource_control::LimitBreach>;
+    let last_sample: Option<crate::resource_control::ResourceSample>;
+    let observer = execution.as_ref();
     let supervised = async {
-        match crate::resource_control::run_under(&mut controller, collect).await {
-            Ok(crate::resource_control::Supervised::Completed(result, _)) => (
+        let sampled = crate::resource_control::run_under_observed(
+            &mut controller,
+            collect,
+            // Every tick, so the panel can show what a running build is holding
+            // instead of only what it held once it was over.
+            |sample| {
+                if let Some(execution) = observer {
+                    execution.sampled(sample);
+                }
+            },
+        )
+        .await;
+        match sampled {
+            Ok(crate::resource_control::Supervised::Completed(result, sample)) => (
                 result.map_err(|e| format!("Failed to run command: {}", e)),
                 false,
+                None,
+                Some(sample),
             ),
-            Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+            Ok(crate::resource_control::Supervised::Breached(breach, sample)) => {
                 // A wall breach *is* the timeout this command declared, so it
                 // keeps reporting as one. Any other limit is reported with both
                 // numbers and the mechanism that held it, because "the build
@@ -369,20 +424,32 @@ pub async fn run_command_impl(
                 } else {
                     breach.describe()
                 };
-                (Err(message), timed_out)
+                (Err(message), timed_out, Some(breach), Some(sample))
             }
-            Err(error) => (Err(format!("Failed to run command: {}", error)), false),
+            Err(error) => (
+                Err(format!("Failed to run command: {}", error)),
+                false,
+                None,
+                None,
+            ),
         }
     };
 
-    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = match &cancel {
-        Some(cancel) => tokio::select! {
-            result = supervised => result,
-            _ = cancel.notified() => (Err("Command cancelled by the user".to_string()), false),
-        },
-        // Lock poisoned — extremely unlikely, and cancellation simply isn't
-        // available for this run; every limit still applies.
-        None => supervised.await,
+    let (outcome, timed_out): (Result<CapturedVerifyOutput, String>, bool) = {
+        let (outcome, timed_out, breach, sample) = match &cancel {
+            Some(cancel) => tokio::select! {
+                result = supervised => result,
+                _ = cancel.notified() => (
+                    Err("Command cancelled by the user".to_string()), false, None, None
+                ),
+            },
+            // Lock poisoned — extremely unlikely, and cancellation simply isn't
+            // available for this run; every limit still applies.
+            None => supervised.await,
+        };
+        limit_breach = breach;
+        last_sample = sample;
+        (outcome, timed_out)
     };
 
     // A cancel is the one exit that leaves the tree standing: the limits all
@@ -393,6 +460,28 @@ pub async fn run_command_impl(
         if let Err(error) = controller.terminate_tree() {
             eprintln!("verify: could not terminate the command's process tree: {error}");
         }
+    }
+
+    // The row's terminal state, with the cause typed rather than described. Four
+    // outcomes and four different facts: a resource kill is not a failure, a
+    // user's Stop is not a resource kill, and a command that exited non-zero on
+    // its own is neither.
+    if let Some(execution) = execution.take() {
+        let exit = match (&outcome, limit_breach) {
+            (_, Some(breach)) => crate::process_table::ProcessExit::limit_exceeded(breach),
+            (Ok(captured), None) => match captured.code {
+                Some(0) => crate::process_table::ProcessExit::succeeded(),
+                code => crate::process_table::ProcessExit {
+                    status: crate::process_table::ExitStatus::Failed,
+                    code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                },
+            },
+            (Err(reason), None) => crate::process_table::ProcessExit::cancelled(reason.clone()),
+        };
+        execution.exited(exit, last_sample);
     }
 
     // Drop this turn's channel once no other verify/shell command of the
@@ -491,7 +580,14 @@ pub async fn verify_run(
         .cloned()
         .ok_or_else(|| format!("Unknown verify command id '{}'", command_id))?;
 
-    Ok(run_command_impl(state.inner(), &root, &cmd, turn_id.as_deref()).await)
+    Ok(run_command_impl(
+        state.inner(),
+        &root,
+        &cmd,
+        turn_id.as_deref(),
+        Some(crate::bounded_execution::AppProcessProjector::shared(app)),
+    )
+    .await)
 }
 
 #[cfg(test)]
@@ -634,7 +730,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let cmd = command("c1", "echo hello");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
 
         assert_eq!(result.command_id, "c1");
         assert_eq!(result.code, Some(0));
@@ -652,7 +748,7 @@ mod tests {
         let mut cmd = command("c1", "exit 3");
         cmd.kind = "test".to_string();
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
 
         assert_eq!(result.code, Some(3));
         assert!(!result.timed_out);
@@ -669,13 +765,150 @@ mod tests {
         cmd.timeout_secs = Some(1);
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
 
         assert!(result.timed_out);
         assert!(result.code.is_none());
         // The whole call returned near the 1s timeout, not the 30s sleep —
         // proof the child was actually killed rather than awaited out.
         assert!(started.elapsed() < Duration::from_secs(10));
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A verify command's whole process-table lifecycle, against a real child.
+    ///
+    /// The gap this closes: this path installed a real bound, measured a real
+    /// tree and reclaimed it on a breach, and none of it was visible — the row
+    /// did not exist. So the assertions are about what a reader can *find*
+    /// afterwards: the pid that ran, the identity that names it, the limits that
+    /// were installed, and the mechanism that held them.
+    #[tokio::test]
+    async fn a_verify_command_records_its_identity_limits_and_containment() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let cmd = command("c1", "echo hi");
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        assert_eq!(result.code, Some(0));
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        assert_eq!(row.state, crate::process_table::ProcessState::Exited);
+        assert_eq!(
+            row.exit.expect("an exited row carries its exit").status,
+            crate::process_table::ExitStatus::Succeeded
+        );
+        assert_eq!(
+            row.workspace.as_deref(),
+            Some(cwd.to_string_lossy().as_ref())
+        );
+        // The native identity, not a bare pid: a row that names only a pid cannot
+        // be reconciled after a restart without risking an unrelated process.
+        assert!(row.native_pid.is_some(), "the row records the pid that ran");
+        assert!(
+            row.native_start_time.is_some(),
+            "the row records the start time that makes the pid an identity"
+        );
+        // The *effective* limits, which for this command are the class defaults
+        // intersected with the runner's own deadline and output cap.
+        assert_eq!(
+            row.limits.max_memory_bytes,
+            ProcessKind::VerifyCommand.default_limits().max_memory_bytes
+        );
+        assert_eq!(
+            row.limits.max_output_bytes,
+            Some(VERIFY_OUTPUT_CAP as u64),
+            "the runner's own output cap is the tighter one and must be what is recorded"
+        );
+        // What actually held it, recorded rather than recomputed by whoever reads
+        // the row later.
+        let containment = row.containment.expect("the row states what held it");
+        assert!(!containment.backend.is_empty());
+        assert!(!containment.tree_primitive.is_empty());
+        assert!(
+            containment
+                .for_limit(ProcessLimitKind::Memory)
+                .is_some_and(|capability| capability.is_enforced()),
+            "a verify command's memory bound is held by something, and the row must name it"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A limit kill has to reach the row as typed fields, not as prose.
+    ///
+    /// Before the row existed, a verify command reclaimed for exceeding its
+    /// deadline reported "Command timed out after 1 seconds" into its own result
+    /// and vanished. Nothing downstream — the panel, `monkey processes show`, a
+    /// query — could tell that from a command that failed on its own.
+    #[tokio::test]
+    async fn a_verify_command_stopped_by_a_limit_persists_the_typed_breach() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row_breach");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let mut cmd = command("c1", "sleep 30");
+        cmd.timeout_secs = Some(1);
+
+        let result = run_command_impl(&state, &cwd, &cmd, None, Some(projector.clone())).await;
+        assert!(result.timed_out);
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::LimitExceeded);
+        let breach = exit.breach.expect("a limit kill carries its typed breach");
+        assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
+        assert_eq!(breach.configured, 1_000);
+        assert!(
+            breach.observed >= 1_000,
+            "the observed value is a measurement, not the configured number echoed back"
+        );
+        assert!(!breach.backend.is_empty());
+        assert!(
+            matches!(breach.level.as_str(), "kernel" | "supervised"),
+            "a breach names the level that held it, got {}",
+            breach.level
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// A user's Stop and a limit kill are different facts and stay different.
+    #[tokio::test]
+    async fn a_cancelled_verify_command_closes_as_cancelled_and_not_as_a_limit() {
+        let state = AppState::default();
+        let cwd = temp_path("cwd_row_cancel");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let projector = crate::test_support::RecordingProjector::shared();
+        let turn_id = "turn-cancel-row".to_string();
+        let cmd = command("c1", "sleep 30");
+
+        let cancel = state
+            .tool_cancel
+            .lock()
+            .map(|mut guard| {
+                guard
+                    .entry(turn_id.clone())
+                    .or_insert_with(|| Arc::new(Notify::new()))
+                    .clone()
+            })
+            .expect("the lock is not poisoned");
+        let notifier = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            notifier.notify_waiters();
+        });
+
+        let result =
+            run_command_impl(&state, &cwd, &cmd, Some(&turn_id), Some(projector.clone())).await;
+        assert!(!result.timed_out);
+
+        let row = projector.only(ProcessKind::VerifyCommand);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::Cancelled);
+        assert!(exit.breach.is_none(), "a Stop is not a resource kill");
 
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -705,7 +938,7 @@ mod tests {
         );
         cmd.timeout_secs = Some(1);
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
         assert!(result.timed_out);
 
         let grandchild: u32 = std::fs::read_to_string(&pid_file)
@@ -752,7 +985,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let cmd = command("c1", "cat flood.txt");
 
-        let result = run_command_impl(&state, &cwd, &cmd, None).await;
+        let result = run_command_impl(&state, &cwd, &cmd, None, None).await;
 
         assert!(
             result.stdout.len() <= VERIFY_OUTPUT_CAP + 64,
@@ -801,7 +1034,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id)).await;
+        let result = run_command_impl(&state, &cwd, &cmd, Some(&turn_id), None).await;
 
         assert!(!result.timed_out);
         assert!(result.code.is_none());

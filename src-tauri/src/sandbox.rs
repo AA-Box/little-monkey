@@ -1400,7 +1400,7 @@ fn sandbox_run_limits(timeout: Duration) -> EffectiveLimits {
     EffectiveLimits::resolve(&[
         LimitLayer::new(
             LimitSource::ClassDefault,
-            ProcessKind::ForegroundShell.default_limits(),
+            ProcessKind::SandboxRun.default_limits(),
         ),
         LimitLayer::new(
             LimitSource::UserOverride,
@@ -1441,6 +1441,10 @@ pub async fn execute_in_sandbox(
     timeout: Duration,
     allow_network: bool,
     approved_env: &[String],
+    // The process-table lifecycle, when the caller has somewhere to project onto.
+    // `None` in `monkey-cli` and in this module's own tests, which have no
+    // ledger: a missing row never refuses a run.
+    mut execution: Option<crate::bounded_execution::BoundedExecution>,
 ) -> io::Result<SandboxExecOutcome> {
     let sandbox_root = plain_canonical(sandbox_root)?;
     let workspace_dir = plain_canonical(workspace_dir)?;
@@ -1552,6 +1556,14 @@ pub async fn execute_in_sandbox(
         // alive for the block because it owns the original job handle; the one
         // handed to the spawn is a duplicate.
         let controller = ResourceController::new(sandbox_run_limits(timeout));
+        // The job exists before `CreateProcessW`, so the row can state what will
+        // hold this run before the run's first instruction. The native identity
+        // lands with it on every other platform; here `run_confined` owns the
+        // whole spawn-and-wait and does not surface a pid, so the row carries the
+        // mechanism without one rather than inventing one.
+        if let Some(execution) = execution.as_mut() {
+            execution.running(&controller);
+        }
         let job = controller.windows_job_for_spawn()?;
         // The container is the filesystem boundary; the job is the process-tree
         // one. A machine that cannot give us the container still gets the job,
@@ -1594,8 +1606,49 @@ pub async fn execute_in_sandbox(
             allow_network,
             timeout,
         )
-        .await?;
+        .await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::failed(error.to_string()),
+                        None,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        if let Some(execution) = execution.take() {
+            let exit = match (output.timed_out, output.exit_code) {
+                // The job's own deadline, which for this path is the wall bound
+                // the controller was built with. Reported as the limit it is
+                // rather than as an unexplained missing exit code.
+                (true, _) => crate::process_table::ProcessExit::limit_exceeded(
+                    crate::resource_control::LimitBreach {
+                        limit: ProcessLimitKind::Wall.as_str().to_string(),
+                        configured: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                        observed: duration_ms,
+                        backend: controller.capabilities().backend,
+                        level: crate::resource_control::EnforcementLevel::Supervised
+                            .as_str()
+                            .to_string(),
+                        observed_at_ms: unix_time_ms(),
+                        evidence: None,
+                    },
+                ),
+                (false, Some(0)) => crate::process_table::ProcessExit::succeeded(),
+                (false, code) => crate::process_table::ProcessExit {
+                    status: crate::process_table::ExitStatus::Failed,
+                    code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                },
+            };
+            execution.exited(exit, None);
+        }
         return Ok(SandboxExecOutcome {
             isolation,
             exit_code: output.exit_code,
@@ -1698,11 +1751,21 @@ pub async fn execute_in_sandbox(
                 Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
                 Err(crate::resource_control::AttachFailure::Containment(error)) => {
                     let _ = controller.terminate_tree();
-                    return Err(io::Error::other(format!(
-                        "sandboxed command could not be bounded: {error}"
-                    )));
+                    let message = format!("sandboxed command could not be bounded: {error}");
+                    if let Some(execution) = execution.take() {
+                        execution.exited(
+                            crate::process_table::ProcessExit::failed(message.clone()),
+                            None,
+                        );
+                    }
+                    return Err(io::Error::other(message));
                 }
             }
+        }
+        // After the attach, so the row records the containment the attach has
+        // verified rather than one it assumed.
+        if let Some(execution) = execution.as_mut() {
+            execution.running(&controller);
         }
 
         // Bounded as the bytes arrive rather than collected whole and trimmed
@@ -1729,12 +1792,60 @@ pub async fn execute_in_sandbox(
             Ok::<_, io::Error>((status, stdout, stderr))
         };
 
-        let supervised = crate::resource_control::run_under(&mut controller, capture).await;
+        let observer = execution.as_ref();
+        let supervised = crate::resource_control::run_under_observed(
+            &mut controller,
+            capture,
+            // Every tick, so the panel shows what a running sandboxed command is
+            // holding rather than only what it held once it was over.
+            |sample| {
+                if let Some(execution) = observer {
+                    execution.sampled(sample);
+                }
+            },
+        )
+        .await;
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        match supervised? {
-            crate::resource_control::Supervised::Completed(result, _) => {
-                let (status, stdout, stderr) = result?;
+        let supervised = match supervised {
+            Ok(supervised) => supervised,
+            Err(error) => {
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::failed(error.to_string()),
+                        None,
+                    );
+                }
+                return Err(error);
+            }
+        };
+        match supervised {
+            crate::resource_control::Supervised::Completed(result, sample) => {
+                let (status, stdout, stderr) = match result {
+                    Ok(captured) => captured,
+                    Err(error) => {
+                        if let Some(execution) = execution.take() {
+                            execution.exited(
+                                crate::process_table::ProcessExit::failed(error.to_string()),
+                                Some(sample),
+                            );
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Some(execution) = execution.take() {
+                    let exit = match status.code() {
+                        Some(0) => crate::process_table::ProcessExit::succeeded(),
+                        code => crate::process_table::ProcessExit {
+                            status: crate::process_table::ExitStatus::Failed,
+                            code,
+                            signal: None,
+                            reason: None,
+                            breach: None,
+                        },
+                    };
+                    execution.exited(exit, Some(sample));
+                }
                 Ok(SandboxExecOutcome {
                     isolation,
                     exit_code: status.code(),
@@ -1750,8 +1861,15 @@ pub async fn execute_in_sandbox(
             // the only one this outcome type has ever been able to express; the
             // rest surface as a failed run with the breach on stderr, which beats
             // an unexplained missing exit code.
-            crate::resource_control::Supervised::Breached(breach, _) => {
+            crate::resource_control::Supervised::Breached(breach, sample) => {
                 let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+                let described = breach.describe();
+                if let Some(execution) = execution.take() {
+                    execution.exited(
+                        crate::process_table::ProcessExit::limit_exceeded(breach),
+                        Some(sample),
+                    );
+                }
                 Ok(SandboxExecOutcome {
                     isolation,
                     exit_code: None,
@@ -1760,7 +1878,7 @@ pub async fn execute_in_sandbox(
                     stderr: if timed_out {
                         Vec::new()
                     } else {
-                        breach.describe().into_bytes()
+                        described.into_bytes()
                     },
                     duration_ms,
                 })
@@ -2205,6 +2323,17 @@ async fn run_sandboxed_body(
         engine.clone(),
     )?;
 
+    // The row exists before the copy is executed against, and names the run that
+    // asked for it, so `monkey processes list --parent` answers "what did this
+    // sandbox run start".
+    let mut execution = crate::bounded_execution::BoundedExecution::admit(
+        crate::bounded_execution::AppProcessProjector::shared(app.clone()),
+        crate::process_table::ProcessKind::SandboxRun,
+        Some(workspace_dir.to_string_lossy().into_owned()),
+        sandbox_run_limits(request.timeout()).to_process_limits(),
+    );
+    execution.set_parent(crate::process_table::ProcessKind::WorkflowRun, run_id);
+
     let outcome = execute_in_sandbox(
         sandbox_root,
         workspace_dir,
@@ -2214,6 +2343,7 @@ async fn run_sandboxed_body(
         request.timeout(),
         request.allow_network,
         &request.approved_env,
+        Some(execution),
     )
     .await
     .map_err(|error| format!("Failed to execute the sandboxed command: {error}"))?;
@@ -3115,6 +3245,7 @@ mod tests {
             Duration::from_secs(10),
             false,
             &[],
+            None,
         )
         .await
         .expect("command executes");
@@ -3140,6 +3271,109 @@ mod tests {
         );
 
         std::env::remove_var("SANDBOX_TEST_CHILD_SECRET");
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    /// A sandbox run's whole process-table lifecycle, against a real child.
+    ///
+    /// The third of the three bounded executions that had no row: this path
+    /// installed a real memory and process-count bound, reclaimed the tree on a
+    /// breach, and left nothing a reader could find afterwards.
+    #[tokio::test]
+    async fn a_sandbox_run_records_its_limits_and_containment() {
+        let sandbox_root = temp_dir("sandbox-row");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("sandbox-row-real");
+        let profile_path = sandbox_root.join("run.sb");
+        let projector = crate::test_support::RecordingProjector::shared();
+        let timeout = Duration::from_secs(30);
+
+        let outcome = execute_in_sandbox(
+            &sandbox_root,
+            &workspace_dir,
+            &real_workspace,
+            &profile_path,
+            "echo marker",
+            timeout,
+            false,
+            &[],
+            Some(crate::bounded_execution::BoundedExecution::admit(
+                projector.clone(),
+                ProcessKind::SandboxRun,
+                Some(workspace_dir.to_string_lossy().into_owned()),
+                sandbox_run_limits(timeout).to_process_limits(),
+            )),
+        )
+        .await
+        .expect("the sandbox launches");
+        assert_eq!(outcome.exit_code, Some(0));
+
+        let row = projector.only(ProcessKind::SandboxRun);
+        assert_eq!(row.state, crate::process_table::ProcessState::Exited);
+        assert_eq!(
+            row.exit.expect("an exited row carries its exit").status,
+            crate::process_table::ExitStatus::Succeeded
+        );
+        assert_eq!(
+            row.limits.max_wall_ms,
+            Some(u64::try_from(timeout.as_millis()).unwrap()),
+            "the run's own deadline is the wall bound the row must state"
+        );
+        assert_eq!(
+            row.limits.max_memory_bytes,
+            ProcessKind::SandboxRun.default_limits().max_memory_bytes
+        );
+        let containment = row.containment.expect("the row states what held it");
+        assert!(!containment.backend.is_empty());
+        assert!(!containment.tree_primitive.is_empty());
+
+        let _ = fs::remove_dir_all(&sandbox_root);
+        let _ = fs::remove_dir_all(&real_workspace);
+    }
+
+    /// A sandbox run reclaimed for exceeding its deadline persists the limit as
+    /// typed fields, not as an unexplained missing exit code.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn a_sandbox_run_stopped_by_its_deadline_persists_the_typed_breach() {
+        let sandbox_root = temp_dir("sandbox-row-breach");
+        let workspace_dir = sandbox_root.join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("create sandbox workspace");
+        let real_workspace = temp_dir("sandbox-row-breach-real");
+        let profile_path = sandbox_root.join("run.sb");
+        let projector = crate::test_support::RecordingProjector::shared();
+        let timeout = Duration::from_secs(1);
+
+        let outcome = execute_in_sandbox(
+            &sandbox_root,
+            &workspace_dir,
+            &real_workspace,
+            &profile_path,
+            "sleep 30",
+            timeout,
+            false,
+            &[],
+            Some(crate::bounded_execution::BoundedExecution::admit(
+                projector.clone(),
+                ProcessKind::SandboxRun,
+                Some(workspace_dir.to_string_lossy().into_owned()),
+                sandbox_run_limits(timeout).to_process_limits(),
+            )),
+        )
+        .await
+        .expect("the sandbox launches");
+        assert!(outcome.timed_out);
+
+        let row = projector.only(ProcessKind::SandboxRun);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::LimitExceeded);
+        let breach = exit.breach.expect("a limit kill carries its typed breach");
+        assert_eq!(breach.limit, ProcessLimitKind::Wall.as_str());
+        assert_eq!(breach.configured, 1_000);
+        assert!(!breach.backend.is_empty());
+
         let _ = fs::remove_dir_all(&sandbox_root);
         let _ = fs::remove_dir_all(&real_workspace);
     }
@@ -3176,6 +3410,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             &[],
+            None,
         )
         .await
         .expect("the sandbox launches");
@@ -3312,6 +3547,7 @@ mod tests {
                 Duration::from_secs(10),
                 allow_network,
                 &[],
+                None,
             )
             .await
             .expect("the sandbox launches");
@@ -3662,6 +3898,7 @@ mod tests {
                 Duration::from_secs(10),
                 allow_network,
                 &[],
+                None,
             )
             .await
             .expect("the sandbox launches");
@@ -3880,6 +4117,7 @@ mod tests {
                 Duration::from_secs(30),
                 allow_network,
                 &[],
+                None,
             )
             .await
             .expect("the sandbox launches");

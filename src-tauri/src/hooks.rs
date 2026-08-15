@@ -17,14 +17,14 @@
 //! and discards, so a chatty hook can never block on a full pipe — it just
 //! loses output past the cap.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::app_paths;
-use crate::process_table::{ProcessKind, ProcessLimitKind, ProcessLimits};
+use crate::process_table::{ProcessExit, ProcessKind, ProcessLimitKind, ProcessLimits};
 use crate::resource_control::{EffectiveLimits, LimitLayer, LimitSource, ResourceController};
 use crate::AppState;
 
@@ -111,6 +111,7 @@ async fn drain_capped<R: AsyncRead + Unpin>(mut pipe: R, cap: usize) -> std::io:
 /// would be wrong for anything model-supplied.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn hook_exec(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     command: String,
     payload: String,
@@ -123,6 +124,29 @@ pub async fn hook_exec(
         .or_else(app_paths::data_dir)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    hook_exec_impl(
+        &cwd,
+        &command,
+        &payload,
+        Some(crate::bounded_execution::AppProcessProjector::shared(app)),
+    )
+    .await
+}
+
+/// Everything the command does once the working directory is settled.
+///
+/// Split out for the reason `verify::run_command_impl` is: the whole of it is
+/// then one function a test can drive against a real child process, and the part
+/// that had never been tested is exactly the part this slice added — the row.
+/// A `tauri::command`'s `AppHandle` cannot be conjured in a unit test, and a test
+/// that reassembled the spawn, the controller and the two projections would be a
+/// test of its own assembly rather than of the one that ships.
+pub(crate) async fn hook_exec_impl(
+    cwd: &Path,
+    command: &str,
+    payload: &str,
+    projector: Option<std::sync::Arc<dyn crate::process_table::ProcessProjector>>,
+) -> Result<HookExecOutcome, String> {
     #[cfg(target_os = "windows")]
     let (shell, shell_flag) = ("cmd", "/C");
     #[cfg(not(target_os = "windows"))]
@@ -131,8 +155,8 @@ pub async fn hook_exec(
     let mut builder = tokio::process::Command::new(shell);
     builder
         .arg(shell_flag)
-        .arg(&command)
-        .current_dir(&cwd)
+        .arg(command)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -155,7 +179,7 @@ pub async fn hook_exec(
     let mut controller = ResourceController::new(EffectiveLimits::resolve(&[
         LimitLayer::new(
             LimitSource::ClassDefault,
-            ProcessKind::ForegroundShell.default_limits(),
+            ProcessKind::HookCommand.default_limits(),
         ),
         LimitLayer::new(
             LimitSource::UserOverride,
@@ -166,15 +190,34 @@ pub async fn hook_exec(
             },
         ),
     ]));
+    // The row, before the spawn. A hook that fails to `exec` is exactly the case
+    // a reader wants a record of, and one written after the wait would miss it.
+    let mut execution = projector.map(|projector| {
+        crate::bounded_execution::BoundedExecution::admit(
+            projector,
+            ProcessKind::HookCommand,
+            Some(cwd.to_string_lossy().into_owned()),
+            controller.limits().to_process_limits(),
+        )
+    });
     // Before the spawn: the containment has to exist before the hook's first
     // instruction, not be applied to a process already running.
-    controller
+    let bound = controller
         .prepare_tokio(&mut builder)
-        .map_err(|error| format!("Failed to bound hook: {error}"))?;
-
-    let mut child = builder
-        .spawn()
-        .map_err(|error| format!("Failed to spawn hook: {}", error))?;
+        .map_err(|error| format!("Failed to bound hook: {error}"));
+    let mut child = match bound.and_then(|()| {
+        builder
+            .spawn()
+            .map_err(|error| format!("Failed to spawn hook: {}", error))
+    }) {
+        Ok(child) => child,
+        Err(message) => {
+            if let Some(execution) = execution.take() {
+                execution.exited(ProcessExit::failed(message.clone()), None);
+            }
+            return Err(message);
+        }
+    };
 
     // Fail closed: a hook that is running and cannot be shown to be inside its
     // containment is reclaimed rather than reported as bounded. One that simply
@@ -184,9 +227,17 @@ pub async fn hook_exec(
             Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
             Err(crate::resource_control::AttachFailure::Containment(error)) => {
                 let _ = controller.terminate_tree();
-                return Err(format!("Failed to bound hook: {error}"));
+                let message = format!("Failed to bound hook: {error}");
+                if let Some(execution) = execution.take() {
+                    execution.exited(ProcessExit::failed(message.clone()), None);
+                }
+                return Err(message);
             }
         }
+    }
+    // After the attach, so the row records the containment the attach verified.
+    if let Some(execution) = execution.as_mut() {
+        execution.running(&controller);
     }
 
     // Payload first, then the pipe is CLOSED (dropped) — a hook that reads
@@ -219,10 +270,43 @@ pub async fn hook_exec(
     // The deadline is a wall limit now rather than a `sleep` racing the capture,
     // so it is reclaimed by the same code that reclaims a hook that runs out of
     // memory — and the tree, not just the shell, whichever bound fired.
-    match crate::resource_control::run_under(&mut controller, capture).await {
-        Ok(crate::resource_control::Supervised::Completed(result, _)) => {
-            let (status, stdout, stderr) =
-                result.map_err(|error| format!("Failed to run hook: {}", error))?;
+    let observer = execution.as_ref();
+    let supervised = crate::resource_control::run_under_observed(
+        &mut controller,
+        capture,
+        // Every tick, so a hook that is still running shows what it is holding.
+        |sample| {
+            if let Some(execution) = observer {
+                execution.sampled(sample);
+            }
+        },
+    )
+    .await;
+    match supervised {
+        Ok(crate::resource_control::Supervised::Completed(result, sample)) => {
+            let (status, stdout, stderr) = match result {
+                Ok(captured) => captured,
+                Err(error) => {
+                    let message = format!("Failed to run hook: {}", error);
+                    if let Some(execution) = execution.take() {
+                        execution.exited(ProcessExit::failed(message.clone()), Some(sample));
+                    }
+                    return Err(message);
+                }
+            };
+            if let Some(execution) = execution.take() {
+                let exit = match status.code() {
+                    Some(0) => ProcessExit::succeeded(),
+                    code => ProcessExit {
+                        status: crate::process_table::ExitStatus::Failed,
+                        code,
+                        signal: None,
+                        reason: None,
+                        breach: None,
+                    },
+                };
+                execution.exited(exit, Some(sample));
+            }
             Ok(HookExecOutcome {
                 exit_code: status.code(),
                 stdout,
@@ -230,24 +314,30 @@ pub async fn hook_exec(
                 timed_out: false,
             })
         }
-        Ok(crate::resource_control::Supervised::Breached(breach, _)) => {
+        Ok(crate::resource_control::Supervised::Breached(breach, sample)) => {
             // A wall breach *is* the deadline this hook was given, so it keeps
             // reporting as one. Any other limit says which, with both numbers and
             // the mechanism that held it — a hook that was stopped for holding
             // 9 GiB and one that ran long are different things to fix.
             let timed_out = breach.limit == ProcessLimitKind::Wall.as_str();
+            let described = breach.describe();
+            if let Some(execution) = execution.take() {
+                execution.exited(ProcessExit::limit_exceeded(breach), Some(sample));
+            }
             Ok(HookExecOutcome {
                 exit_code: None,
                 stdout: String::new(),
-                stderr: if timed_out {
-                    String::new()
-                } else {
-                    breach.describe()
-                },
+                stderr: if timed_out { String::new() } else { described },
                 timed_out,
             })
         }
-        Err(error) => Err(format!("Failed to run hook: {}", error)),
+        Err(error) => {
+            let message = format!("Failed to run hook: {}", error);
+            if let Some(execution) = execution.take() {
+                execution.exited(ProcessExit::failed(message.clone()), None);
+            }
+            Err(message)
+        }
     }
 }
 
@@ -255,6 +345,65 @@ pub async fn hook_exec(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A hook's whole process-table lifecycle, against a real child.
+    ///
+    /// The same gap the verify runner had: a hook ran under a real bound and
+    /// left no trace of having run at all.
+    #[tokio::test]
+    async fn a_hook_records_its_identity_limits_and_containment() {
+        let cwd = std::env::temp_dir();
+        let projector = crate::test_support::RecordingProjector::shared();
+
+        let outcome = hook_exec_impl(&cwd, "cat", "hello", Some(projector.clone()))
+            .await
+            .expect("the hook runs");
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(outcome.stdout, "hello");
+
+        let row = projector.only(ProcessKind::HookCommand);
+        assert_eq!(row.state, crate::process_table::ProcessState::Exited);
+        assert_eq!(
+            row.exit.expect("an exited row carries its exit").status,
+            crate::process_table::ExitStatus::Succeeded
+        );
+        assert!(row.native_pid.is_some(), "the row records the pid that ran");
+        assert!(row.native_start_time.is_some());
+        assert_eq!(
+            row.limits.max_wall_ms,
+            Some(u64::try_from(HOOK_TIMEOUT.as_millis()).unwrap()),
+            "the hook's own deadline is the wall bound the row must state"
+        );
+        assert_eq!(
+            row.limits.max_output_bytes,
+            Some(HOOK_OUTPUT_CAP as u64),
+            "the hook's own capture cap is the tighter one"
+        );
+        let containment = row.containment.expect("the row states what held it");
+        assert!(!containment.backend.is_empty());
+        assert!(containment
+            .for_limit(ProcessLimitKind::ChildProcesses)
+            .is_some_and(|capability| capability.is_enforced()));
+    }
+
+    /// A hook that fails on its own is a failure, not a limit kill — the two
+    /// have to stay distinguishable on the row.
+    #[tokio::test]
+    async fn a_failing_hook_closes_as_failed_with_its_code() {
+        let cwd = std::env::temp_dir();
+        let projector = crate::test_support::RecordingProjector::shared();
+
+        let outcome = hook_exec_impl(&cwd, "exit 7", "", Some(projector.clone()))
+            .await
+            .expect("the hook runs");
+        assert_eq!(outcome.exit_code, Some(7));
+
+        let row = projector.only(ProcessKind::HookCommand);
+        let exit = row.exit.expect("an exited row carries its exit");
+        assert_eq!(exit.status, crate::process_table::ExitStatus::Failed);
+        assert_eq!(exit.code, Some(7));
+        assert!(exit.breach.is_none(), "nothing bounded this hook out");
+    }
 
     #[test]
     fn hooks_use_authored_config_with_legacy_fallback() {

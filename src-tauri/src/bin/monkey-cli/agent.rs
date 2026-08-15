@@ -685,7 +685,14 @@ async fn run_verification_phase(
     let mut first_failure: Option<VerifyFailure> = None;
     for cmd in &commands {
         statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
-        let result = verify::run_command_impl(state, &root, cmd, None).await;
+        let result = verify::run_command_impl(
+            state,
+            &root,
+            cmd,
+            None,
+            little_monkey_lib::bounded_execution::cli_projector(),
+        )
+        .await;
         let ok = !result.timed_out && result.code == Some(0);
         let output = build_verify_output(&result);
         statusln!(

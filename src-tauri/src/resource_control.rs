@@ -1323,6 +1323,29 @@ pub async fn run_under<F>(
 where
     F: std::future::Future,
 {
+    run_under_observed(controller, work, |_| {}).await
+}
+
+/// [`run_under`] with a look at every measurement as it is taken.
+///
+/// The observer exists because a sample that only reaches the caller *after* the
+/// workload ends can never answer "what is this process holding right now",
+/// which is the question a live Processes panel is for. Before this, the final
+/// sample was the only one anything outside the loop ever saw, so a build sitting
+/// at 6 GiB for ten minutes displayed nothing at all until it finished.
+///
+/// Deliberately synchronous and infallible: it runs on the sampling tick, and a
+/// bookkeeping write that could delay or fail the next resource check would put
+/// the ledger in front of the bound. Every implementation is expected to be
+/// fail-soft in the way [`crate::bounded_execution::BoundedExecution`] is.
+pub async fn run_under_observed<F>(
+    controller: &mut ResourceController,
+    work: F,
+    mut observe: impl FnMut(&ResourceSample),
+) -> io::Result<Supervised<F::Output>>
+where
+    F: std::future::Future,
+{
     let mut work = std::pin::pin!(work);
     let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
     // The first tick of a tokio interval completes immediately, which is wanted:
@@ -1355,7 +1378,10 @@ where
                     ResourceCheck::Breached { breach, sample } => {
                         return Ok(Supervised::Breached(breach, sample.unwrap_or(last)));
                     }
-                    ResourceCheck::Running(sample) => last = sample,
+                    ResourceCheck::Running(sample) => {
+                        observe(&sample);
+                        last = sample;
+                    }
                     // The workload is gone but `work` has not resolved yet —
                     // usually a pipe still draining. Keep waiting for it rather
                     // than reporting a breach against a corpse.

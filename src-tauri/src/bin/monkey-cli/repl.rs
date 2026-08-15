@@ -454,7 +454,14 @@ async fn handle_verify(state: &AppState, rest: &str) -> Result<(), String> {
         }
         for cmd in &commands {
             println!("Running \"{}\"...", cmd.label);
-            let result = little_monkey_lib::verify::run_command_impl(state, &root, cmd, None).await;
+            let result = little_monkey_lib::verify::run_command_impl(
+                state,
+                &root,
+                cmd,
+                None,
+                little_monkey_lib::bounded_execution::cli_projector(),
+            )
+            .await;
             let ok = !result.timed_out && result.code == Some(0);
             println!(
                 "{} — {} ({} ms)",
