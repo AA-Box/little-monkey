@@ -1135,70 +1135,30 @@ pub(crate) fn project_process_record<R: tauri::Runtime>(
 /// per app launch regardless of how many windows open, and before any new turn
 /// can admit a process that would then be in the live set. Failure is logged and
 /// swallowed — a stale row is not worth refusing to start over.
-/// End the shell trees a previous app session left running, and prove each one
-/// first.
+/// The startup reap, minus the rows [`crate::orphan_reclaim`] has already
+/// closed with a verdict of their own.
 ///
-/// # What survives a crash, and what does not
-///
-/// A shell's *bound* and a shell's *supervisor* have different lifetimes, and the
-/// distinction is the whole reason this exists. Each platform answers it
-/// differently, and only one of the three leaves anything here to do:
-///
-/// - **Linux.** A cgroup scope's `memory.max` and `pids.max` keep holding after
-///   the app dies; the kernel does not care that the process which wrote them is
-///   gone. The tree is still running and still bounded, and has nothing watching
-///   it.
-/// - **Windows.** The job carries `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the
-///   kernel closes the handles a dead process held — so the tree died with the
-///   app and there is nothing to find. Both are asserted in
-///   `resource_control`'s own tests rather than assumed here.
-/// - **Supervised, on every platform.** The bound died with the supervisor. The
-///   tree is running under no limit at all, which is the case this most exists
-///   for.
-///
-/// So after a restart there may be a tree that is still running, may or may not
-/// still be bounded, and has nothing watching it. None of those is a state to
-/// leave a machine in.
-///
-/// Reclaiming goes through the recorded identity, never through the pid alone:
-/// see [`crate::process_table::still_the_recorded_process`] for why a row that
-/// cannot prove which process it named is skipped rather than signalled.
-///
-/// The stale cgroup directory is not cleaned here. A scope is named with a fresh
-/// uuid and lives under a delegated subtree; once its members are gone the kernel
-/// leaves an empty directory, which holds nothing and is removed by the same
-/// `Drop` on any session that still has the handle. Removing directories this
-/// process did not create, by pattern, against a hierarchy another instance may
-/// be using, is a worse trade than an empty directory.
-fn reclaim_orphaned_shell_trees(table: &ProcessTable<'_>) -> Result<usize, String> {
-    let live = table
-        .list(&ProcessFilter {
-            kinds: vec![ProcessKind::ForegroundShell, ProcessKind::BackgroundShell],
-            live_only: true,
-            ..ProcessFilter::default()
+/// Every kind that owns a native tree is settled by evidence rather than by this
+/// blanket pass — see that module for why closing a row as `lost` without
+/// checking is the thing it exists to stop. What is left here is the kinds whose
+/// worker was a loop inside the WebView: it died with the previous process, so
+/// "the app restarted while this was running" is the whole of the available
+/// evidence and is a true statement about them.
+fn desktop_kinds_with_no_native_tree() -> Vec<ProcessKind> {
+    ProcessKind::DESKTOP_OWNED
+        .iter()
+        .copied()
+        .filter(|kind| {
+            !matches!(
+                kind,
+                ProcessKind::ForegroundShell
+                    | ProcessKind::BackgroundShell
+                    | ProcessKind::VerifyCommand
+                    | ProcessKind::HookCommand
+                    | ProcessKind::SandboxRun
+            )
         })
-        .map_err(to_message)?;
-
-    let mut killed = 0;
-    for record in live {
-        if !crate::process_table::still_the_recorded_process(&record) {
-            continue;
-        }
-        let Some(pid) = record.native_pid.and_then(|pid| u32::try_from(pid).ok()) else {
-            continue;
-        };
-        // The group, because that is what a shell's pid leads and what this
-        // session can still reach: the controller that recorded the out-of-group
-        // members died with the previous process, and nothing durable replaces
-        // it. Stated rather than glossed — a descendant that both re-parented and
-        // left the group before the crash is not reclaimable by any later
-        // session, which is the same macOS lifetime limit `docs/limitations.md`
-        // already records for a live one.
-        if crate::os_signal::terminate_process_group(pid).is_ok() {
-            killed += 1;
-        }
-    }
-    Ok(killed)
+        .collect()
 }
 
 pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
@@ -1212,18 +1172,37 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
             return;
         }
     };
-    // Killed *before* the reap, because the reap is what erases the evidence: it
-    // closes every one of these rows, and the recorded pid is the only handle
-    // anything has on a native tree the previous app process left running. The
-    // WebView kinds need no equivalent — their worker was a loop that died with
-    // the app, so there is nothing left to signal.
-    match with_process_table(app, state, |table| Ok(reclaim_orphaned_shell_trees(table))) {
-        Ok(Ok(killed)) if killed > 0 => {
-            eprintln!("process table: reclaimed {killed} shell tree(s) left by a previous session")
+    // Every native-tree row is settled here, with the verdict its own evidence
+    // earns — reclaimed, confirmed gone, or explicitly uncertain. This both kills
+    // and closes, because the two cannot be separated: the reap is what erases
+    // the pid and the containment handle, which are the only things that could
+    // have found the workload.
+    match with_process_table(app, state, |table| {
+        Ok(crate::orphan_reclaim::reclaim_orphaned_native_trees(
+            table,
+            "the app restarted while this process was still running",
+            now,
+        ))
+    }) {
+        Ok(Ok(uncertain)) if !uncertain.is_empty() => {
+            // Named rather than counted: a workload this app could not prove had
+            // ended is the one finding an operator has to act on.
+            for record in &uncertain {
+                eprintln!(
+                    "process table: containment lost for {} ({}): {}",
+                    record.process_id,
+                    record.kind.as_str(),
+                    record
+                        .exit
+                        .as_ref()
+                        .and_then(|exit| exit.reason.as_deref())
+                        .unwrap_or("no reason recorded")
+                );
+            }
         }
         Ok(Ok(_)) => {}
         Ok(Err(error)) | Err(error) => {
-            eprintln!("process table: shell orphan reclaim failed: {error}")
+            eprintln!("process table: native orphan reclaim failed: {error}")
         }
     }
     match with_process_table(app, state, |table| {
@@ -1241,7 +1220,7 @@ pub(crate) fn reap_desktop_processes_at_startup<R: tauri::Runtime>(
     }
 
     let scope = ProcessFilter {
-        kinds: ProcessKind::DESKTOP_OWNED.to_vec(),
+        kinds: desktop_kinds_with_no_native_tree(),
         ..ProcessFilter::default()
     };
     // Nothing this app instance owns can still be running: its workers died with

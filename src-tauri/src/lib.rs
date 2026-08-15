@@ -247,6 +247,9 @@ pub mod background_shell;
 // the verify runner, the hook runner and the sandbox run, which were bounded by
 // a resource controller long before any of them had a row.
 pub mod bounded_execution;
+// What a new app session may conclude about native work an old one left behind —
+// and, crucially, what it may not.
+pub mod orphan_reclaim;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;

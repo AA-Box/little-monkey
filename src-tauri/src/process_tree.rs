@@ -97,6 +97,33 @@ pub fn tree_members(nodes: &[ProcessNode], root_pid: u32) -> BTreeSet<u32> {
 /// tree on a busy host is forty walks of the whole table every sampling tick.
 #[must_use]
 pub fn tree_members_of_any(nodes: &[ProcessNode], roots: &[u32]) -> BTreeSet<u32> {
+    tree_members_of_any_in(nodes, roots, &[], None)
+}
+
+/// [`tree_members_of_any`] with the group and session a workload started in
+/// stated rather than derived from a live root.
+///
+/// # Why the group cannot be looked up when it matters most
+///
+/// The union below reads each root's group id *out of the snapshot*, which works
+/// exactly while the root is alive — and the moment it stops being true is the
+/// moment ownership matters: the shell exits, its group id is no longer readable
+/// from any live process, and a descendant that had stayed in the group becomes
+/// unattributable. So a supervisor that recorded the group at attach passes it
+/// here, and membership survives the root.
+///
+/// `session` narrows the residual escape by one step. A child that calls
+/// `setpgid` gets a new *group* and keeps the session, so once its parent dies
+/// and it re-parents, the session is the only thing still tying it to this
+/// workload. Only a child that calls `setsid` — a new session *and* a new group —
+/// and then re-parents leaves every primitive an unprivileged process has.
+#[must_use]
+pub fn tree_members_of_any_in(
+    nodes: &[ProcessNode],
+    roots: &[u32],
+    groups: &[u32],
+    session: Option<u32>,
+) -> BTreeSet<u32> {
     let mut members = BTreeSet::new();
 
     let by_parent: BTreeMap<u32, Vec<u32>> = nodes.iter().fold(BTreeMap::new(), |mut map, node| {
@@ -132,7 +159,7 @@ pub fn tree_members_of_any(nodes: &[ProcessNode], roots: &[u32]) -> BTreeSet<u32
 
     // Group union. A group id of zero is "no group", never "every ungrouped
     // process on the host".
-    let groups: BTreeSet<u32> = roots
+    let mut group_ids: BTreeSet<u32> = roots
         .iter()
         .filter_map(|root_pid| {
             nodes
@@ -142,15 +169,73 @@ pub fn tree_members_of_any(nodes: &[ProcessNode], roots: &[u32]) -> BTreeSet<u32
         })
         .filter(|group| *group != 0)
         .collect();
-    if !groups.is_empty() {
+    group_ids.extend(groups.iter().copied().filter(|group| *group != 0));
+    if !group_ids.is_empty() {
         for node in nodes {
-            if groups.contains(&node.process_group_id) {
+            if group_ids.contains(&node.process_group_id) {
+                members.insert(node.pid);
+            }
+        }
+    }
+
+    // Session last, and only when one was recorded: it is the widest of the three
+    // primitives, so asking for it without one would be asking for the machine.
+    if let Some(session) = session.filter(|session| *session != 0) {
+        for node in nodes {
+            if members.contains(&node.pid) {
+                continue;
+            }
+            if session_of(node.pid) == Some(session) {
                 members.insert(node.pid);
             }
         }
     }
 
     members
+}
+
+/// The session a pid belongs to, where the platform has sessions.
+///
+/// A pure query with no side effect, and one syscall — which is why it is asked
+/// per non-member rather than folded into the snapshot: adding a session column
+/// would cost the same syscall for every process on the host on every tick,
+/// including the ones the closure already claimed.
+#[cfg(unix)]
+#[must_use]
+pub fn session_of(pid: u32) -> Option<u32> {
+    let target = libc::pid_t::try_from(pid).ok()?;
+    // Safe: asks the kernel which session one pid is in. No state is changed, and
+    // a pid that has gone answers -1.
+    let session = unsafe { libc::getsid(target) };
+    u32::try_from(session).ok()
+}
+
+#[cfg(not(unix))]
+#[must_use]
+pub fn session_of(_pid: u32) -> Option<u32> {
+    // Windows has no POSIX session; the job object is the containment there and
+    // there is nothing weaker to fall back to.
+    None
+}
+
+/// Every process currently in `pgid`, read from the host process table.
+///
+/// Used by the startup reclaim, which cannot ask a live controller anything: the
+/// controller died with the session that created it, and the group id on the row
+/// is the only handle left.
+#[must_use]
+pub fn process_group_members(pgid: u32) -> Vec<u32> {
+    if pgid == 0 {
+        return Vec::new();
+    }
+    let Ok(nodes) = snapshot() else {
+        return Vec::new();
+    };
+    nodes
+        .iter()
+        .filter(|node| node.process_group_id == pgid)
+        .map(|node| node.pid)
+        .collect()
 }
 
 /// Measure the tree rooted at `root_pid`.

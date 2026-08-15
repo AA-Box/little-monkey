@@ -448,6 +448,94 @@ impl Drop for CgroupScope {
     }
 }
 
+/// What a restart found when it went looking for a scope a previous session
+/// created.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScopeReclaim {
+    /// The directory is not there. Nothing is enforcing it and nothing is in it,
+    /// because a cgroup with members cannot be removed.
+    Absent,
+    /// It exists and holds nothing executing.
+    Empty,
+    /// It held members, they were killed, and it is empty now.
+    Reclaimed(usize),
+    /// It held members that would not die. Naming them, because this is the case
+    /// the caller must not record as a clean exit.
+    Survivors(Vec<u32>),
+}
+
+/// Reclaim a scope a previous app session left behind, and prove the result.
+///
+/// # Why this exists at all
+///
+/// A cgroup's bound is held by the kernel, which does not care that the process
+/// which wrote it is gone. So after a crash the tree under a scope is *still
+/// running and still bounded*, with nothing watching it — and until the scope
+/// path became a durable part of the row, the only handle a restart had was a
+/// pid, which proves nothing about the tree beneath it.
+///
+/// # The validation is the point
+///
+/// `path` comes out of a database, and what happens to it is `cgroup.kill`. It is
+/// therefore only ever reached through
+/// [`crate::resource_control::ContainmentScope::parse`], which requires an
+/// absolute path under the cgroup2 mount, with no `..`, whose final component
+/// carries the prefix this module mints. This function re-states the last of
+/// those rather than trusting the caller, because the cost of being wrong is
+/// killing whatever else happens to live at a path.
+pub fn reclaim_scope(path: &Path) -> ScopeReclaim {
+    let named_by_us = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("little-monkey-"));
+    if !named_by_us || !path.starts_with(CGROUP_ROOT) {
+        // Not a scope this app could have created. Reported as absent rather
+        // than acted on: refusing to touch it is the only safe answer, and the
+        // caller's own uncertainty handling covers the row.
+        return ScopeReclaim::Absent;
+    }
+    let procs = path.join("cgroup.procs");
+    if !procs.exists() {
+        return ScopeReclaim::Absent;
+    }
+    let members = live_members(&procs);
+    if members.is_empty() {
+        // Empty and ours, so the directory is pure residue. Removing it here is
+        // safe in a way removing it by pattern never would be: this path came
+        // from a row this app wrote, and it has just been read as holding
+        // nothing.
+        let _ = fs::remove_dir(path);
+        return ScopeReclaim::Empty;
+    }
+    let found = members.len();
+    let _ = fs::write(path.join("cgroup.kill"), "1");
+    for _ in 0..10 {
+        if live_members(&procs).is_empty() {
+            let _ = fs::remove_dir(path);
+            return ScopeReclaim::Reclaimed(found);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    ScopeReclaim::Survivors(live_members(&procs))
+}
+
+/// Members of a scope that are still executing.
+///
+/// A zombie is not one: it holds nothing, cannot fork, and stays listed until its
+/// parent reaps it — which after a crash is `init`, on its own schedule. Counting
+/// it would make every reclaim report a survivor it could never kill.
+fn live_members(procs: &Path) -> Vec<u32> {
+    fs::read_to_string(procs)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| {
+            crate::process_tree::ProcessIdentity::of(*pid)
+                .is_some_and(|identity| identity.is_running())
+        })
+        .collect()
+}
+
 /// Migrate the calling process into the scope. Runs between `fork` and `exec`.
 ///
 /// Writing `0` names the calling process, so nothing has to format a pid — which

@@ -87,6 +87,12 @@ function kindLabel(t: Translate, kind: ProcessKind): string {
       return t("ProcessesPanel.kindBrowserSession");
     case "side_task":
       return t("ProcessesPanel.kindSideTask");
+    case "verify_command":
+      return t("ProcessesPanel.kindVerifyCommand");
+    case "hook_command":
+      return t("ProcessesPanel.kindHookCommand");
+    case "sandbox_run":
+      return t("ProcessesPanel.kindSandboxRun");
     default:
       return kind;
   }
@@ -105,7 +111,12 @@ function stateLabel(t: Translate, record: ProcessRecord): string {
     case "stopping":
       return t("ProcessesPanel.stateStopping");
     default:
-      return t("ProcessesPanel.stateExited");
+      // "Exited" asserts that the work ended. A row closed because a restart
+      // could not establish that must not borrow the claim — see
+      // `orphan_reclaim.rs` for why the two are different findings.
+      return record.exit?.status === "containment_lost"
+        ? t("ProcessesPanel.stateContainmentLost")
+        : t("ProcessesPanel.stateExited");
   }
 }
 
@@ -166,6 +177,11 @@ function ProcessRow({ record, now }: { record: ProcessRecord; now: number }) {
       )}
       {record.signalReason && display !== "running" && (
         <p className="mt-1 truncate text-[11px] text-faint">{record.signalReason}</p>
+      )}
+      {/* The reason is the whole value of this state: it names what could not be
+          shown to have ended, so an operator has somewhere to look. */}
+      {record.exit?.status === "containment_lost" && record.exit.reason && (
+        <p className="mt-1 text-[11px] text-warning">{record.exit.reason}</p>
       )}
 
       <div className="mt-2 flex items-center gap-1">
