@@ -933,6 +933,104 @@ mod tests {
         );
     }
 
+    /// Readiness lost *after* the start is not a reason to strand the effect.
+    ///
+    /// The mirror of the test above, and the boundary between them is the whole
+    /// point: the start check exists to stop a *new* physical effect, so it
+    /// belongs to `leased` → `running` and to nothing else. Once an execution
+    /// holds the command the camera may already have fired, and the device's own
+    /// retry — because the reply was lost and the page then went to the
+    /// background — has to be answered as the recovery it is. Failing it there
+    /// would turn a glance at another app into a revocation of work already
+    /// authorized, and leave a staged result with nowhere to go.
+    #[test]
+    fn readiness_lost_after_the_start_still_lets_the_same_execution_recover() {
+        let fixture = fixture();
+        let durable = Arc::new(Mutex::new(DurableDeviceState::default()));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let device = SimulatedDevice::new(
+            &fixture.api,
+            &fixture.device_id,
+            &fixture.secret,
+            durable,
+            effects.clone(),
+        );
+        device.advertise(true);
+        let command_id = queue(&fixture, DeviceCapability::CameraCapture, None);
+        assert_eq!(
+            device
+                .request("GET", "/v1/remote/device/commands/next", b"")
+                .status,
+            200
+        );
+        let start_path = format!("/v1/remote/device/commands/{command_id}/start");
+        let (status, started) = device.json(
+            "POST",
+            &start_path,
+            serde_json::json!({ "execution_id": "exec-recover-01" }),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(started["started"], serde_json::json!(true));
+
+        // The reply was lost, and by the time the device asks again the page has
+        // gone to the background: every readiness axis now says no.
+        device.advertise(false);
+        let (status, again) = device.json(
+            "POST",
+            &start_path,
+            serde_json::json!({ "execution_id": "exec-recover-01" }),
+        );
+        assert_eq!(
+            status, 200,
+            "the same execution's retry is a recovery: {again}"
+        );
+        assert_eq!(
+            again["started"],
+            serde_json::json!(false),
+            "a recovery must never authorize a second physical effect"
+        );
+        assert_eq!(again["recoverable"], serde_json::json!(true));
+        assert_eq!(
+            command_state(&fixture, &command_id),
+            DeviceCommandState::Running,
+            "a readiness check at a boundary it already passed must not end the command"
+        );
+
+        // A *different* execution asking for the same command is still refused,
+        // background or not.
+        let (status, _) = device.json(
+            "POST",
+            &start_path,
+            serde_json::json!({ "execution_id": "exec-intruder-1" }),
+        );
+        assert_eq!(status, 409);
+        assert_eq!(
+            command_state(&fixture, &command_id),
+            DeviceCommandState::Running
+        );
+
+        // And the result it staged before the interruption is still deliverable.
+        let (status, _) = device.json(
+            "POST",
+            &format!("/v1/remote/device/commands/{command_id}/result"),
+            serde_json::json!({
+                "protocol_version": REMOTE_PROTOCOL_VERSION,
+                "outcome": "succeeded",
+                "result": { "width": 4, "height": 3 },
+                "artifact_base64": null,
+                "artifact_media_type": null,
+                "artifact_sha256": null,
+                "error": null,
+                "execution_id": "exec-recover-01",
+            }),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            command_state(&fixture, &command_id),
+            DeviceCommandState::Succeeded
+        );
+    }
+
     /// The control channel reports lost *authority*, not lost readiness.
     ///
     /// A page that goes to the background loses readiness for a moment. Telling

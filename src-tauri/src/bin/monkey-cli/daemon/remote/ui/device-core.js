@@ -61,7 +61,10 @@ const FOREGROUND_CAPABILITIES = new Set([
  *
  * `probe` is the collected browser state:
  *   supported            — the capability is implemented by this build
- *   permissions          — Permissions API answers keyed by capability
+ *   permissions          — Permissions API answers keyed by capability, `null`
+ *                          where the browser could not answer at all
+ *   sessionVerified      — permission names this controller session has itself
+ *                          just obtained through a real user gesture
  *   notificationPermission — `Notification.permission`, or null
  *   screenShareLive      — an armed display stream is running
  *   audioEnabled         — someone has enabled playback with a gesture
@@ -97,7 +100,7 @@ export function describeCapability(capability, probe) {
         readiness: probe.audioEnabled ? READINESS.ready : READINESS.interactionRequired,
       };
     default: {
-      const permission = mapQueryPermission(probe.permissions?.[capability]);
+      const permission = queriedPermission(capability, probe);
       let readiness = READINESS.ready;
       if (permission === PERMISSION.denied) readiness = READINESS.unavailable;
       else if (FOREGROUND_CAPABILITIES.has(capability) && !probe.foreground) {
@@ -124,6 +127,36 @@ function mapQueryPermission(state) {
   if (state === "granted") return PERMISSION.granted;
   if (state === "denied") return PERMISSION.denied;
   return PERMISSION.promptable;
+}
+
+/**
+ * The permission for a capability the Permissions API answers for — or, where
+ * it cannot answer, what this session has itself verified.
+ *
+ * Two different kinds of evidence, and conflating them was the bug:
+ *
+ *   the live query      — authoritative wherever it exists. Never overridden,
+ *                         in either direction: a `denied` stays denied however
+ *                         many gestures preceded it.
+ *   session preparation — the only evidence available on a browser that cannot
+ *                         query camera, microphone or geolocation at all
+ *                         (Safari has never answered for camera or microphone).
+ *                         Without it those capabilities were reported
+ *                         `promptable` forever and were therefore *permanently*
+ *                         ineffective, whatever the user pressed.
+ *
+ * Session-scoped on purpose. It is set by one thing only — the real browser
+ * permission operation, invoked from a real user gesture, returning
+ * successfully — and it is held in memory, so a reload falls back to
+ * fail-closed rather than remembering a grant nothing can re-verify.
+ */
+function queriedPermission(capability, probe) {
+  const answer = probe.permissions?.[capability];
+  if (answer === undefined || answer === null) {
+    const name = PERMISSION_NAMES[capability];
+    if (name && probe.sessionVerified?.[name] === true) return PERMISSION.granted;
+  }
+  return mapQueryPermission(answer);
 }
 
 /**
@@ -383,6 +416,200 @@ export async function acquireExecutor(locks, name, body) {
   });
 }
 
+// --- Cancellation, and what an outcome means -------------------------------
+//
+// Three cancellation answers, kept apart rather than collapsed into one word,
+// because an operator reading a result has to be able to tell a photograph that
+// never happened from one that did:
+//
+//   cancelled_before_effect — nothing physical occurred. Safe to retry.
+//   cancelled_during_effect — it happened and was cut short. Never "not done".
+//   failed                  — the capability itself went wrong.
+//
+// A cancellation reported as a failure is the same lie in the other direction,
+// which is why speech no longer rejects on `speechSynthesis.cancel()`.
+
+export function aborted(signal) {
+  return Boolean(signal?.aborted);
+}
+
+/** Resolves when the delay elapses or the signal aborts, whichever is first. */
+export function waitOrAbort(milliseconds, signal, { setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  return new Promise((resolve) => {
+    const timer = setTimer(finish, milliseconds);
+    function finish() {
+      clearTimer(timer);
+      signal?.removeEventListener?.("abort", finish);
+      resolve();
+    }
+    signal?.addEventListener?.("abort", finish, { once: true });
+  });
+}
+
+export function cancelledBeforeEffectReport(error) {
+  return {
+    outcome: "cancelled",
+    result: { cancellation: "cancelled_before_effect" },
+    error: error || "Cancelled before this device performed the action",
+  };
+}
+
+/** The terminal report for a capability that carries no bytes. */
+export function plainOutcome(outcome) {
+  if (outcome?.cancelledBeforeEffect) return cancelledBeforeEffectReport();
+  if (outcome?.cancelledDuringEffect) {
+    return {
+      outcome: "cancelled",
+      result: { ...(outcome.result || {}), cancellation: "cancelled_during_effect" },
+      error: "Stopped part-way through; what had already happened was not undone",
+    };
+  }
+  return { outcome: "succeeded", result: outcome?.result ?? null };
+}
+
+/**
+ * The terminal report for a capability that produced bytes.
+ *
+ * `digest` hashes the artifact once, here, and the same value is declared to
+ * the runner on every later delivery — so a truncated redelivery is refused
+ * rather than accepted as authoritative bytes.
+ */
+export async function artifactOutcome(outcome, { digest, maxBytes }) {
+  if (outcome?.cancelledBeforeEffect) return cancelledBeforeEffectReport();
+  const { blob, mediaType, result } = outcome || {};
+  if (!blob) return { outcome: "failed", error: "The device produced no artifact" };
+  if (blob.size > maxBytes) {
+    return { outcome: "failed", error: "The captured artifact is larger than this device allows" };
+  }
+  return {
+    // The effect happened. If a cancellation arrived mid-way the artifact is
+    // still reported — losing it would be pretending the action did not occur.
+    outcome: outcome.cancelledDuringEffect ? "cancelled" : "succeeded",
+    result: outcome.cancelledDuringEffect
+      ? { ...(result || {}), cancellation: "cancelled_during_effect" }
+      : result,
+    error: outcome.cancelledDuringEffect
+      ? "Stopped part-way through; what had already been captured is attached"
+      : null,
+    artifactBlob: blob,
+    artifactMediaType: mediaType,
+    artifactSha256: await digest(blob),
+  };
+}
+
+/**
+ * Speaks one sentence and reports honestly how it ended.
+ *
+ * `speechSynthesis.cancel()` ends an utterance with an `error` event whose
+ * reason is `canceled` or `interrupted`. Treating that as a synthesis failure —
+ * which is what a rejected promise became — reported a *cancelled* command as
+ * `failed`, so the operator who stopped it read that their device could not
+ * speak. The answer is structured like every other capability's and mapped by
+ * `plainOutcome`: before speech began nothing was heard, after it began
+ * something was.
+ */
+export function speakText(text, signal, { synthesis, createUtterance }) {
+  return new Promise((resolve, reject) => {
+    if (aborted(signal)) {
+      resolve({ cancelledBeforeEffect: true });
+      return;
+    }
+    const utterance = createUtterance(String(text ?? ""));
+    let audible = false;
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.("abort", stop);
+      resolve(value);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.("abort", stop);
+      reject(error);
+    };
+    function stop() {
+      // Requested, not observed: the error event this provokes is a
+      // cancellation this device asked for, and is reported as one.
+      synthesis.cancel();
+      settle(
+        audible
+          ? { cancelledDuringEffect: true, result: { spoken: false } }
+          : { cancelledBeforeEffect: true },
+      );
+    }
+    utterance.onstart = () => {
+      audible = true;
+    };
+    utterance.onend = () => settle({ result: { spoken: true } });
+    utterance.onerror = (event) => {
+      const reason = event?.error;
+      if (reason === "canceled" || reason === "interrupted") {
+        // Somebody else's cancel — the browser's own stop control, or another
+        // page's utterance. Still a cancellation, never a synthesis failure.
+        settle(
+          audible
+            ? { cancelledDuringEffect: true, result: { spoken: false } }
+            : { cancelledBeforeEffect: true },
+        );
+        return;
+      }
+      fail(new Error(`Speech synthesis failed${reason ? `: ${reason}` : ""}`));
+    };
+    signal?.addEventListener?.("abort", stop, { once: true });
+    synthesis.speak(utterance);
+  });
+}
+
+/**
+ * Records the microphone for a bounded time, stopping early when cancelled.
+ *
+ * A cancelled recording still recorded: the honest answer keeps the audio it
+ * captured and says it was cut short, rather than claiming the microphone never
+ * opened. The stream is closed on every path — success, failure, cancellation —
+ * because a microphone left open is the failure that matters here.
+ */
+export async function recordAudio(
+  durationMs,
+  signal,
+  { openStream, createRecorder, stopStream, createBlob, now = () => Date.now(), wait = waitOrAbort, maxMs, sliceMs = 200 },
+) {
+  const bounded = Math.min(Math.max(Number(durationMs) || 10_000, 1), maxMs);
+  if (aborted(signal)) return { cancelledBeforeEffect: true };
+  const stream = await openStream();
+  try {
+    const recorder = createRecorder(stream);
+    const chunks = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data?.size) chunks.push(event.data);
+    };
+    const finished = new Promise((resolve) => {
+      recorder.onstop = resolve;
+    });
+    recorder.start();
+    const started = now();
+    // Woken by the cancellation signal rather than polled: a stop asked for now
+    // reaches the recorder now, not up to a slice later.
+    while (now() - started < bounded && !aborted(signal)) {
+      await wait(Math.min(sliceMs, bounded - (now() - started)), signal);
+    }
+    recorder.stop();
+    await finished;
+    const mediaType = recorder.mimeType || "audio/webm";
+    const blob = createBlob(chunks, mediaType);
+    const cancelled = aborted(signal);
+    return {
+      blob,
+      mediaType: blob.type || mediaType,
+      cancelledDuringEffect: cancelled,
+      result: { duration_ms: now() - started, cancelled },
+    };
+  } finally {
+    stopStream(stream);
+  }
+}
+
 /**
  * Whether a leased command may be executed at all, given what this device
  * already knows about it.
@@ -403,4 +630,229 @@ export function leaseDecision(entry) {
     default:
       return { action: "report_unknown", reason: "already_started" };
   }
+}
+
+// --- Running one command ----------------------------------------------------
+
+export const TERMINAL_COMMAND_STATES = new Set(["succeeded", "failed", "cancelled", "expired"]);
+
+/**
+ * Holds one long-poll open for as long as the command runs, and cancels the
+ * work when the runner says cancellation was asked for.
+ *
+ * Its own `signal` — never the physical operation's. The two are stopped by
+ * different things and in different directions: this one is stopped *by* the
+ * work finishing, and the work is stopped by what this one hears. Sharing a
+ * controller meant the only way to stop the watcher was to abort the work, so
+ * the watcher could only be wound up after the effect had already happened, and
+ * the caller then waited on a pending HTTP request holding the one result that
+ * existed nowhere but in memory.
+ */
+export async function watchCommandControl(
+  commandId,
+  { request, waitMs, signal, onCancel = () => {}, wait = waitOrAbort, retryMs = 2_000, yieldMs = 250 },
+) {
+  while (!aborted(signal)) {
+    let control;
+    try {
+      control = await request(
+        "GET",
+        `/v1/remote/device/commands/${encodeURIComponent(commandId)}/control?wait_ms=${waitMs}`,
+        undefined,
+        { signal, longPoll: true },
+      );
+    } catch (error) {
+      if (aborted(signal)) return { reason: "stopped" };
+      // The poll gave the transport up so the work itself could use it — a
+      // voice stream's chunk, an artifact fetch. Nothing is wrong, so ask again
+      // shortly rather than backing off; the pause is only so the work gets the
+      // transport before this asks for it back.
+      if (error?.cancelled === true) {
+        await wait(yieldMs, signal);
+        continue;
+      }
+      // A watcher that cannot reach the runner must not stop the work: the
+      // effect may be half done and the runner has said nothing.
+      await wait(retryMs, signal);
+      continue;
+    }
+    if (control?.cancel_requested === true || control?.revoked === true) {
+      onCancel(control);
+      return { reason: "cancelled" };
+    }
+    if (control?.state && TERMINAL_COMMAND_STATES.has(control.state)) return { reason: "terminal" };
+  }
+  return { reason: "stopped" };
+}
+
+/**
+ * One leased command, from journal entry to terminal report.
+ *
+ * Every ordering here is load-bearing, and this is why the whole sequence is a
+ * function over injected effects rather than control flow inside a browser
+ * handler: the properties it exists for are orderings, and an ordering that can
+ * only be exercised by opening a real camera is an ordering nobody tests.
+ *
+ *   journal the command
+ *   → mint and journal an execution id
+ *   → ask the runner to authorize a start
+ *   → only then touch hardware
+ *   → **stage the result durably, with no network wait in between**
+ *   → stop the control watcher
+ *   → deliver.
+ *
+ * The staging step's position is the one that used to be wrong. The watcher was
+ * wound up first, and winding it up meant awaiting a long-poll that could still
+ * be pending: a photograph existed only in memory while a request finished. A
+ * crash in that window lost bytes an effect had really produced, and recovery
+ * could only report the outcome unknown. Nothing may be awaited between the
+ * result existing and the result being durable.
+ */
+export async function runLeasedCommand(command, deps) {
+  const {
+    journal,
+    request,
+    perform,
+    deliver,
+    report,
+    newExecutionId,
+    artifactCeiling,
+    controlWaitMs,
+    now = () => Date.now(),
+    notify = () => {},
+    onStartFailed = () => {},
+    onCancelRequested = () => {},
+  } = deps;
+  const commandId = command.command_id;
+  const startPath = `/v1/remote/device/commands/${encodeURIComponent(commandId)}/start`;
+
+  const existing = await journal.get(commandId);
+  const decision = leaseDecision(existing);
+  if (decision.action === "none") return { action: "none" };
+  if (decision.action === "deliver_staged") {
+    await deliver(existing);
+    return { action: "deliver_staged" };
+  }
+  if (decision.action === "report_unknown") {
+    const unknown = unknownOutcomeReport(decision.reason);
+    await report(commandId, unknown, existing?.executionId ?? null);
+    await journal.write({
+      ...existing,
+      phase: PHASE.resultAcked,
+      ...unknown,
+      artifactBlob: null,
+      artifactBytes: 0,
+    });
+    return { action: "report_unknown", reason: decision.reason };
+  }
+  if (command.cancel_requested) {
+    await report(commandId, cancelledBeforeEffectReport("Cancelled before this device started it"));
+    return { action: "cancelled_before_start" };
+  }
+  // Room for the result BEFORE the effect. Discovering there is nowhere to put
+  // a photograph after taking it leaves a choice between losing it and evicting
+  // somebody else's undelivered result; refusing up front keeps both.
+  const refusal = capacityRefusal(await journal.all(), command.capability, artifactCeiling);
+  if (refusal) {
+    await report(commandId, { outcome: "failed", error: refusal });
+    return { action: "refused", reason: refusal };
+  }
+
+  const executionId = newExecutionId();
+  await journal.write({
+    commandId,
+    capability: command.capability,
+    argumentsSha256: command.arguments_sha256 || null,
+    executionId,
+    phase: PHASE.received,
+    expiresAtMs: Number(command.expires_at_ms) || 0,
+    receivedAtMs: now(),
+    artifactBlob: null,
+    artifactBytes: 0,
+  });
+
+  let started;
+  try {
+    started = await request("POST", startPath, { execution_id: executionId });
+  } catch (error) {
+    // Nothing was authorized, so nothing physical happened. The runner may
+    // safely hand this out again once the lease lapses.
+    await journal.remove([commandId]);
+    onStartFailed(error);
+    return { action: "start_refused", error };
+  }
+  if (started.started !== true) {
+    // Already running (this device before a reconnect, and the runner said so).
+    // Doing it again would take a second photograph.
+    await journal.write({
+      commandId,
+      capability: command.capability,
+      executionId: started.execution_id ?? executionId,
+      phase: PHASE.startAuthorized,
+      startedAtMs: now(),
+      artifactBlob: null,
+      artifactBytes: 0,
+    });
+    return { action: "already_running" };
+  }
+  // Durable before the effect. If the browser dies on the next line, recovery
+  // finds this phase and reports the outcome unknown rather than repeating it.
+  await journal.write({
+    commandId,
+    capability: command.capability,
+    argumentsSha256: command.arguments_sha256 || null,
+    executionId,
+    phase: PHASE.startAuthorized,
+    startedAtMs: now(),
+    expiresAtMs: Number(command.expires_at_ms) || 0,
+    artifactBlob: null,
+    artifactBytes: 0,
+  });
+
+  const physical = new AbortController();
+  const watcher = new AbortController();
+  const watching = watchCommandControl(commandId, {
+    request,
+    waitMs: controlWaitMs,
+    signal: watcher.signal,
+    onCancel: () => {
+      onCancelRequested(commandId);
+      physical.abort();
+    },
+  });
+  notify(command.capability);
+
+  let outcome;
+  try {
+    outcome = await perform(command, physical.signal);
+  } catch (error) {
+    outcome = { outcome: "failed", error: String(error?.message || error) };
+  }
+  try {
+    // Nothing between the effect's result and this write. Not the watcher, not
+    // a request, not a render.
+    await journal.write({
+      commandId,
+      capability: command.capability,
+      executionId,
+      phase: PHASE.resultStaged,
+      outcome: outcome.outcome,
+      result: outcome.result ?? null,
+      error: outcome.error ?? null,
+      // The bytes, durably. This is the difference between a reload losing a
+      // photograph and a reload delivering it.
+      artifactBlob: outcome.artifactBlob ?? null,
+      artifactMediaType: outcome.artifactMediaType ?? null,
+      artifactSha256: outcome.artifactSha256 ?? null,
+      artifactBytes: outcome.artifactBlob ? outcome.artifactBlob.size : 0,
+      deliveryAttempts: 0,
+    });
+  } finally {
+    // Only now, and whatever happened above: the watcher's pending request is
+    // cancelled rather than waited out.
+    watcher.abort();
+    await watching.catch(() => {});
+  }
+  await deliver(await journal.get(commandId));
+  return { action: "performed", executionId };
 }

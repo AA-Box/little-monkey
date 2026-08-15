@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD;
@@ -235,6 +236,20 @@ pub struct RemoteApi {
     /// any build without a configured daemon) refuses peer traffic outright
     /// rather than recording envelopes it could never act on.
     peer_runs: Option<Arc<dyn crate::daemon::channel_worker::RunQueue>>,
+    /// One lock per device command, held across its whole terminal commit.
+    ///
+    /// The commit is "decide whether this report is authoritative, publish its
+    /// artifact bytes, then write the row that names them", and those three are
+    /// one decision: a second report that lost the race must leave the winner's
+    /// file *and* row exactly as they are. Checking the row, releasing, writing
+    /// the file and taking the row again leaves a window where the loser's bytes
+    /// replace the winner's under the winner's digest.
+    ///
+    /// Deliberately not the store lock: an artifact fsync is long, and every
+    /// other request would queue behind it. Deliberately in memory: this API is
+    /// one process, cloned per connection over shared `Arc`s, so every task that
+    /// can commit a given command shares this map.
+    terminal_commits: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Where remote requests land in the unified subsystem event stream
     /// (roadmap K12).
     ///
@@ -257,6 +272,9 @@ impl Clone for RemoteApi {
             mobile_chat: self.mobile_chat.clone(),
             placement: self.placement.clone(),
             peer_runs: self.peer_runs.clone(),
+            // Shared, not copied: two clones that each had their own map would
+            // be two locks over one command, which is no lock at all.
+            terminal_commits: Arc::clone(&self.terminal_commits),
             audit: self.audit.clone(),
         }
     }
@@ -282,6 +300,7 @@ impl RemoteApi {
             mobile_chat: Some(mobile_chat),
             placement: Some(placement),
             peer_runs: Some(peer_runs),
+            terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
         })
     }
@@ -310,6 +329,7 @@ impl RemoteApi {
             mobile_chat: None,
             placement: None,
             peer_runs: None,
+            terminal_commits: Arc::new(Mutex::new(HashMap::new())),
             audit,
         }
     }
@@ -2110,6 +2130,15 @@ impl RemoteApi {
     /// moment hardware is touched are different moments, and a grant withdrawn
     /// or a permission revoked in between has to stop the action — the whole
     /// point of the split is that nothing physical has happened yet.
+    ///
+    /// That re-check belongs to the `leased` → `running` transition and to
+    /// nothing else. The same route also answers a *recovery*: an execution that
+    /// already holds this command and lost the reply. Re-running readiness there
+    /// would fail a command whose effect may already have happened because the
+    /// page went to the background afterwards — turning a momentary loss of
+    /// readiness into a revocation of work already authorized. What ends a
+    /// running command is cancellation or revocation, both on the control
+    /// channel; never a readiness check at a boundary it already passed.
     fn device_command_start(
         &self,
         body: &[u8],
@@ -2136,7 +2165,11 @@ impl RemoteApi {
             store.expire_device_commands(now_ms).map_err(internal)?;
             return Err((409, "This command expired before it started".to_string()));
         }
-        if !record.state.terminal() {
+        // Only the one transition that authorizes a *new* physical effect. A
+        // `running` command falls through to `start_device_command`, which
+        // answers a matching execution with `started: false, recoverable: true`
+        // and a different one with a refusal.
+        if matches!(record.state, DeviceCommandState::Leased) {
             let surface = store.device_surface(&device.device_id).map_err(internal)?;
             let granted = granted_capabilities(device);
             if let Some(block) = capability_block(&granted, surface.as_ref(), record.capability) {
@@ -2332,7 +2365,16 @@ impl RemoteApi {
                 .map(|error| super::store::bounded(error, 4_096))
                 .as_deref(),
         );
-        {
+        // From here to the acknowledgement is one serialized commit per command.
+        // Two conflicting reports racing each other must not be able to leave
+        // the row naming one digest and the file holding the other's bytes.
+        let commit = self.terminal_commit_lock(command_id);
+        let _committing = commit
+            .lock()
+            .map_err(|_| internal("Device command commit lock was poisoned"))?;
+        // Re-read *inside* the lock: whatever was true before it was taken is
+        // exactly the state a racing commit may have changed.
+        let already_terminal = {
             let store = self.locked_store()?;
             let existing = store
                 .device_command(command_id)
@@ -2342,6 +2384,9 @@ impl RemoteApi {
             if existing.state.terminal() {
                 if let Some(stored) = &existing.terminal_sha256 {
                     if stored != &digest {
+                        // The loser, and it changes nothing: not the file, not
+                        // the row, not the digest. It is refused before a single
+                        // byte of its artifact is written.
                         return Err((
                             409,
                             format!(
@@ -2352,10 +2397,32 @@ impl RemoteApi {
                         ));
                     }
                 }
+                true
+            } else {
+                // Ownership is settled before the artifact is published, not
+                // after: an execution that does not hold this command must not
+                // be able to write over the artifact path of the one that does.
+                if let (Some(held), Some(offered)) =
+                    (&existing.execution_id, result.execution_id.as_deref())
+                {
+                    if held != offered {
+                        return Err((
+                            409,
+                            "This result belongs to a different execution of the command"
+                                .to_string(),
+                        ));
+                    }
+                }
+                false
             }
-        }
-        if let Some((bytes, _)) = &decoded {
-            self.persist_device_artifact(command_id, bytes)?;
+        };
+        // A replay publishes nothing. The stored bytes are the authoritative
+        // ones and they are already on disk under this command's name; rewriting
+        // them would be a write with no answer it could change.
+        if !already_terminal {
+            if let Some((bytes, _)) = &decoded {
+                self.persist_device_artifact(command_id, bytes)?;
+            }
         }
         let record = self
             .locked_store()?
@@ -2383,6 +2450,30 @@ impl RemoteApi {
             }),
             Some(record.command_id),
         ))
+    }
+
+    /// The commit lock for one command, minted on first use.
+    ///
+    /// Swept while the map is held rather than on a timer: an entry nobody else
+    /// holds is a command whose commit is over, and dropping it costs one
+    /// comparison. The bound is what stops a long-lived runner accumulating one
+    /// mutex per command it ever completed.
+    fn terminal_commit_lock(&self, command_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = match self.terminal_commits.lock() {
+            Ok(value) => value,
+            // A poisoned map is not a reason to skip serialization: an
+            // unshared lock still serializes nothing but is safe to return, and
+            // the commit below re-reads authoritative state either way.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if locks.len() > 256 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
+        Arc::clone(
+            locks
+                .entry(command_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
     }
 
     /// Writes one artifact so a crash can never leave a stored record pointing
@@ -5988,6 +6079,206 @@ mod tests {
             .join(&command.command_id)
             .exists());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One running command, and a terminal report to race against itself.
+    ///
+    /// Returns the fixture, the device record the commit path needs, and the
+    /// command id — leased, started, and owned by `exec-race-0001`.
+    fn running_command_fixture() -> (
+        PathBuf,
+        RemoteApi,
+        crate::daemon::remote::store::DeviceRecord,
+        String,
+    ) {
+        let (root, api, _secrets, device_id, secret) = fixture();
+        grant(&api, &device_id, &[DeviceCapability::CameraCapture]);
+        advertise(
+            &api,
+            &device_id,
+            &secret,
+            1,
+            &[DeviceCapability::CameraCapture],
+            &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
+        );
+        let queued = api
+            .store
+            .lock()
+            .unwrap()
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device_id.clone(),
+                    capability: DeviceCapability::CameraCapture,
+                    arguments: serde_json::json!({ "position": "back" }),
+                    source_run_id: Some("run-one".into()),
+                    source_session_id: None,
+                    source_tool_call_id: Some("call-race".into()),
+                    invocation_id: None,
+                    expires_at_ms: 300_000,
+                },
+                2_000,
+            )
+            .unwrap();
+        let leased = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                2,
+                "cmd-race-lease",
+                "GET",
+                "/v1/remote/device/commands/next",
+                b"",
+            ),
+            2_000,
+        );
+        assert_eq!(leased.status, 200);
+        let start_path = format!("/v1/remote/device/commands/{}/start", queued.command_id);
+        let started = api.handle(
+            signed(
+                &device_id,
+                &secret,
+                3,
+                "cmd-race-start",
+                "POST",
+                &start_path,
+                br#"{"execution_id":"exec-race-0001"}"#,
+            ),
+            2_000,
+        );
+        assert_eq!(started.status, 200);
+        let device = api
+            .store
+            .lock()
+            .unwrap()
+            .device(&device_id)
+            .unwrap()
+            .unwrap();
+        (root, api, device, queued.command_id)
+    }
+
+    fn camera_report(bytes: &[u8], execution_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&DeviceCommandResult {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            outcome: DeviceCommandState::Succeeded,
+            result: Some(serde_json::json!({ "bytes": bytes.len() })),
+            artifact_base64: Some(STANDARD.encode(bytes)),
+            artifact_media_type: Some("image/jpeg".into()),
+            artifact_sha256: Some(sha256_hex(bytes)),
+            error: None,
+            execution_id: Some(execution_id.to_string()),
+        })
+        .unwrap()
+    }
+
+    /// What the runner holds, as two facts that must agree: the digest in the
+    /// row, and the bytes on disk.
+    fn stored_artifact(
+        root: &std::path::Path,
+        api: &RemoteApi,
+        command_id: &str,
+    ) -> (String, String) {
+        let stored = api
+            .store
+            .lock()
+            .unwrap()
+            .device_command(command_id)
+            .unwrap()
+            .unwrap();
+        let bytes = std::fs::read(root.join("daemon/device-artifacts").join(command_id))
+            .expect("a terminal record must never name bytes that are not there");
+        (stored.artifact.unwrap().sha256, sha256_hex(&bytes))
+    }
+
+    /// The same result delivered twice at the same moment.
+    ///
+    /// The device cannot tell a lost response from a lost request, so it
+    /// retries — and nothing stops the retry overlapping the original. Both
+    /// deliveries have to be acknowledged, and between them they may leave only
+    /// one artifact.
+    #[test]
+    fn two_identical_terminal_reports_racing_each_other_commit_once() {
+        for round in 0..8 {
+            let (root, api, device, command_id) = running_command_fixture();
+            let body = camera_report(b"jpeg-bytes-identical", "exec-race-0001");
+            let gate = std::sync::Barrier::new(2);
+            let (first, second) = std::thread::scope(|scope| {
+                let one = scope.spawn(|| {
+                    gate.wait();
+                    api.device_command_result(&body, &device, &command_id, 2_100)
+                });
+                let two = scope.spawn(|| {
+                    gate.wait();
+                    api.device_command_result(&body, &device, &command_id, 2_100)
+                });
+                (one.join().unwrap(), two.join().unwrap())
+            });
+            for answer in [&first, &second] {
+                let (status, _, _) = answer.as_ref().unwrap_or_else(|error| {
+                    panic!("round {round}: an identical retry was refused: {error:?}")
+                });
+                assert_eq!(*status, 200);
+            }
+            let (row, file) = stored_artifact(&root, &api, &command_id);
+            assert_eq!(row, sha256_hex(b"jpeg-bytes-identical"));
+            assert_eq!(row, file, "round {round}: the row and the bytes disagree");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Two *different* results for one physical action, delivered at the same
+    /// moment.
+    ///
+    /// Exactly one may win, and the loser must change nothing — not the row,
+    /// not the digest, and above all not the bytes. Publishing the artifact
+    /// outside the commit is what used to make "the row says A, the file holds
+    /// B" reachable.
+    #[test]
+    fn a_conflicting_terminal_report_racing_the_winner_changes_nothing() {
+        for round in 0..8 {
+            let (root, api, device, command_id) = running_command_fixture();
+            let first_body = camera_report(b"jpeg-bytes-first", "exec-race-0001");
+            let second_body = camera_report(b"jpeg-bytes-second", "exec-race-0001");
+            let gate = std::sync::Barrier::new(2);
+            let (first, second) = std::thread::scope(|scope| {
+                let one = scope.spawn(|| {
+                    gate.wait();
+                    api.device_command_result(&first_body, &device, &command_id, 2_100)
+                });
+                let two = scope.spawn(|| {
+                    gate.wait();
+                    api.device_command_result(&second_body, &device, &command_id, 2_100)
+                });
+                (one.join().unwrap(), two.join().unwrap())
+            });
+            let accepted = [&first, &second]
+                .iter()
+                .filter(|answer| answer.is_ok())
+                .count();
+            assert_eq!(
+                accepted, 1,
+                "round {round}: exactly one report is authoritative"
+            );
+            for answer in [&first, &second] {
+                if let Err((status, _)) = answer {
+                    assert_eq!(
+                        *status, 409,
+                        "round {round}: the loser is refused, not failed"
+                    );
+                }
+            }
+            let (row, file) = stored_artifact(&root, &api, &command_id);
+            let winner = if first.is_ok() {
+                b"jpeg-bytes-first".as_slice()
+            } else {
+                b"jpeg-bytes-second".as_slice()
+            };
+            assert_eq!(row, sha256_hex(winner));
+            assert_eq!(
+                row, file,
+                "round {round}: the loser's bytes replaced the winner's under the winner's digest"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// Authority is re-checked at the moment the command is handed over, not

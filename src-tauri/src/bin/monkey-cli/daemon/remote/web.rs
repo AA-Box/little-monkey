@@ -467,8 +467,16 @@ mod tests {
         // against a stale view.
         assert!(javascript.contains("while (state.profile && !state.stale)"));
         // `start` before the physical action, and a `started: false` reply
-        // performs nothing — the exactly-once contract, on the client side.
-        assert!(javascript.contains("if (started.started !== true)"));
+        // performs nothing — the exactly-once contract, on the client side. It
+        // lives in the module the runtime tests drive; this pins that the phone
+        // is served that module and not a second copy of the rule.
+        let core = String::from_utf8(
+            asset("GET", "/v1/remote/ui/device-core.js")
+                .expect("device core asset")
+                .body,
+        )
+        .unwrap();
+        assert!(core.contains("if (started.started !== true)"));
     }
 
     /// The client's decision logic is a module the runner serves and the tests
@@ -507,7 +515,9 @@ mod tests {
     /// Each of these is a step whose *position* is the safety property, so each
     /// is pinned where a refactor would otherwise quietly reorder it. The
     /// behaviour behind them is exercised in `device_e2e.rs` (runner side) and
-    /// `src/lib/pairedDeviceCore.test.ts` (device side).
+    /// `src/lib/pairedDeviceCore.test.ts` plus
+    /// `src/lib/pairedDeviceRuntime.test.ts` (device side), which run the very
+    /// module this serves.
     #[test]
     fn the_client_stages_results_durably_and_forgets_them_only_after_the_runner_acknowledges() {
         let javascript = String::from_utf8(
@@ -540,16 +550,42 @@ mod tests {
             flush < reconcile && reconcile < lease,
             "the loop must flush staged results and reconcile running commands before leasing"
         );
-        // The start transition is durable before anything physical happens, and
-        // carries the execution identity that tells a reconnect from a second
-        // device.
-        assert!(javascript.contains("execution_id: executionId"));
-        assert!(javascript.contains("phase: PHASE.startAuthorized"));
-        // A running command is watched, so a cancellation reaches it.
-        assert!(javascript.contains("/control?wait_ms="));
-        assert!(javascript.contains("new AbortController()"));
-        // Room for the result is checked before the effect, never after.
-        assert!(javascript.contains("capacityRefusal(await journalEntries()"));
+        // The orderings inside one command live in the module the runtime tests
+        // drive, so they are pinned there rather than here: the start is durable
+        // before anything physical happens and carries the execution identity, a
+        // running command is watched on its own abortable request, the result is
+        // staged before that watcher is stopped, and room for the result is
+        // checked before the effect rather than after it.
+        let core = String::from_utf8(
+            asset("GET", "/v1/remote/ui/device-core.js")
+                .expect("device core asset")
+                .body,
+        )
+        .unwrap();
+        assert!(core.contains("execution_id: executionId"));
+        assert!(core.contains("phase: PHASE.startAuthorized"));
+        assert!(core.contains("/control?wait_ms=${waitMs}"));
+        assert!(core.contains("capacityRefusal(await journal.all()"));
+        let run = core
+            .split_once("export async function runLeasedCommand(")
+            .map(|(_, tail)| tail.to_string())
+            .expect("device-core.js still runs one leased command");
+        let staged = run
+            .find("phase: PHASE.resultStaged")
+            .expect("the result is staged");
+        let stop_watching = run.find("watcher.abort()").expect("the watcher is stopped");
+        assert!(
+            staged < stop_watching,
+            "the result must be durable before anything waits on the watcher's request"
+        );
+        // Two controllers, not one: the watcher's request has to be cancellable
+        // without cancelling the physical work, which is what let the staging
+        // above move in front of it.
+        assert!(core.contains("const physical = new AbortController()"));
+        assert!(core.contains("const watcher = new AbortController()"));
+        // …and the request layer has to honour that signal, or nothing above is
+        // true: a long poll that cannot be cancelled is waited out.
+        assert!(javascript.contains("signal: controller.signal"));
         // The recovery route is a reconciliation, never a second lease.
         assert!(javascript.contains("\"GET\", \"/v1/remote/device/commands/recover\""));
         // Coming back online wakes the outbox. This is the one thing that

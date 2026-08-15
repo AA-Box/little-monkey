@@ -81,6 +81,59 @@ describe("capability permission and readiness mapping", () => {
     expect(isEffective({ granted: true, supported: true, ...answer })).toBe(false);
   });
 
+  it("accepts this session's own successful preparation where the browser cannot answer", () => {
+    // Safari has never answered `permissions.query` for camera or microphone.
+    // Without this the only honest report was `promptable` — forever, whatever
+    // the user pressed — so the capability could never become effective and the
+    // grant was a dead letter on those browsers.
+    const unqueryable = probe({ permissions: { camera_capture: null } });
+    expect(describeCapability("camera_capture", unqueryable).permission).toBe(PERMISSION.promptable);
+
+    const prepared = probe({
+      permissions: { camera_capture: null },
+      sessionVerified: { camera: true },
+    });
+    const answer = describeCapability("camera_capture", prepared);
+    expect(answer.permission).toBe(PERMISSION.granted);
+    expect(answer.readiness).toBe(READINESS.ready);
+    expect(isEffective({ granted: true, supported: true, ...answer })).toBe(true);
+  });
+
+  it("covers both microphone capabilities with one microphone consent", () => {
+    const prepared = probe({
+      permissions: { microphone_capture: null, voice_stream: null },
+      sessionVerified: { microphone: true },
+    });
+    for (const capability of ["microphone_capture", "voice_stream"]) {
+      expect(describeCapability(capability, prepared).permission).toBe(PERMISSION.granted);
+    }
+    // …and nothing else. One consent is not a skeleton key.
+    expect(
+      describeCapability("camera_capture", probe({ permissions: {}, sessionVerified: { microphone: true } }))
+        .permission,
+    ).toBe(PERMISSION.promptable);
+  });
+
+  it("never lets a session's preparation override a permission the browser can answer", () => {
+    // The live answer is authoritative wherever it exists, in both directions:
+    // a preparation that was once verified cannot outvote a later denial.
+    const denied = probe({
+      permissions: { camera_capture: "denied" },
+      sessionVerified: { camera: true },
+    });
+    expect(describeCapability("camera_capture", denied).permission).toBe(PERMISSION.denied);
+    expect(describeCapability("camera_capture", denied).readiness).toBe(READINESS.unavailable);
+  });
+
+  it("does not carry an unverifiable permission across a reload", () => {
+    // A fresh session has verified nothing, because the record lives in memory
+    // and nothing else may write it. Fail closed until a gesture proves it again.
+    const reloaded = probe({ permissions: { camera_capture: null }, sessionVerified: {} });
+    const answer = describeCapability("camera_capture", reloaded);
+    expect(answer.permission).toBe(PERMISSION.promptable);
+    expect(isEffective({ granted: true, supported: true, ...answer })).toBe(false);
+  });
+
   it("maps the browser's own notification permission", () => {
     const cases: Array<[string, string]> = [
       ["granted", PERMISSION.granted],
