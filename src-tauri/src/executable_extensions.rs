@@ -6531,9 +6531,18 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "'{invocation_id}' never registered for cancellation"
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+
+    /// How often the two waits above look at the registry.
+    ///
+    /// Short because what they are watching is transient: an entry exists only
+    /// from the moment its invocation registers to the moment it ends, and for
+    /// a guest that is racing its fuel ceiling that can be a fraction of a
+    /// second. Cheap to poll, and the alternative — a spin — would slow the
+    /// very work being watched.
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     /// Wait for `invocation_id` to register and cancel it without releasing
     /// the registry in between.
@@ -6553,11 +6562,11 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "'{invocation_id}' never registered for cancellation"
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn infinite_guest_can_be_cancelled_and_host_remains_usable() {
         let _runtime = runtime_guard();
         let root = TestRoot::new();
@@ -6585,6 +6594,40 @@ mod tests {
             .unwrap();
         manager.set_enabled("dev.example.echo", true).await.unwrap();
         manager.set_running("dev.example.echo", true).await.unwrap();
+        // Both watchers start before either invocation does, and neither waits
+        // on the other. That independence is the whole point.
+        //
+        // A guest that loops forever is racing its own fuel ceiling from its
+        // first instruction, so the window in which it is registered is only
+        // as long as its fuel lasts. Watching for one registration and *then*
+        // for the other put the second watch behind the first's compile — and
+        // on the slowest runner in the fleet the second guest had registered,
+        // burned its fuel and been forgotten before anything looked for it.
+        // Two concurrent watchers each see their own invocation's whole
+        // window.
+        //
+        // What each watcher does differs on purpose: one spends the
+        // in-process token, the other writes the on-disk marker for its own
+        // invocation id. Both are per-invocation mechanisms, and the assertion
+        // below is that each invocation ended by cancellation rather than by
+        // running out of anything.
+        //
+        // The waits sleep rather than spinning on `yield_now`: a tight loop
+        // burns the core the compile it is waiting for needs. Their budgets
+        // are generous because what they guard is a hang, not a stopwatch.
+        let token_watcher = tokio::spawn(cancel_once_registered("cancel-loop"));
+        let marker_manager = manager.clone();
+        let marker_watcher = tokio::spawn(async move {
+            wait_until_registered("second-loop").await;
+            atomic_write(
+                &marker_manager
+                    .invocation_cancel_path("second-loop")
+                    .unwrap(),
+                b"cancel\n",
+            )
+            .unwrap();
+        });
+
         let invocation_id = "cancel-loop".to_string();
         let running_manager = manager.clone();
         let task = tokio::spawn(async move {
@@ -6614,33 +6657,23 @@ mod tests {
                 })
                 .await
         });
-        // Each invocation is cancelled as soon as *it* registers, rather than
-        // after both have. Waiting for the pair coupled the first guest's
-        // lifetime to the second's start-up: an infinite guest is racing its
-        // own fuel ceiling from the instant it begins, and on a runner slow
-        // enough that the second component's compile took a while, the first
-        // had already trapped by the time anything cancelled it — the cancel
-        // then applied to an invocation that was simply over.
-        //
-        // The waits sleep rather than spinning on `yield_now`, for the same
-        // reason: a tight loop burns the core the compile it is waiting for
-        // needs. Their budgets are generous because what they guard is a hang,
-        // not a stopwatch.
-        cancel_once_registered("cancel-loop").await;
-        wait_until_registered("second-loop").await;
-        // Cancellation is per invocation, not a switch on the extension: the
-        // other one is still in flight. Read as registry membership rather
-        // than as `!second_task.is_finished()`, because an entry is removed
-        // exactly when its invocation ends — which is the same fact without a
-        // timing window around it.
-        assert!(CANCELLATIONS.lock().unwrap().contains_key("second-loop"));
-        atomic_write(
-            &manager.invocation_cancel_path("second-loop").unwrap(),
-            b"cancel\n",
-        )
-        .unwrap();
-        assert!(task.await.unwrap().is_err());
-        assert!(second_task.await.unwrap().is_err());
+        token_watcher.await.unwrap();
+        marker_watcher.await.unwrap();
+        // Not merely "it failed": a guest that simply exhausted its fuel would
+        // also fail, and that is the outcome this test would otherwise be
+        // unable to tell apart from the one it is about.
+        assert_eq!(
+            task.await.unwrap().unwrap_err(),
+            "Extension invocation was cancelled"
+        );
+        assert_eq!(
+            second_task.await.unwrap().unwrap_err(),
+            "Extension invocation was cancelled"
+        );
+        // Cancellation is keyed by invocation, not by extension: an id nobody
+        // is running cancels nothing, and each of the two above was reached
+        // only through its own id.
+        assert!(!cancel("no-such-invocation").unwrap());
         assert!(manager.list().is_ok());
         let detail = manager.inspect("dev.example.echo").unwrap();
         assert_eq!(
