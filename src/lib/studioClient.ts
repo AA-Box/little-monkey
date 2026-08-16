@@ -156,6 +156,16 @@ export interface LicenseGate {
   acceptanceRequired: boolean;
 }
 
+/**
+ * Which engine renders a model.
+ *
+ * `stable_diffusion_cpp` is the bundled engine and the default every model
+ * written before this field existed still deserializes to. `mlx_video` is the
+ * video service inside the installed MLX package: Apple silicon only, and the
+ * only engine that can read an MLX-quantized checkpoint.
+ */
+export type GenerationEngineKind = "stable_diffusion_cpp" | "mlx_video";
+
 /** A model exactly as stored in the user's library. */
 export interface GenerationModelSpec {
   id: string;
@@ -167,6 +177,7 @@ export interface GenerationModelSpec {
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
+  engine: GenerationEngineKind;
 }
 
 export interface GenerationModel {
@@ -179,6 +190,7 @@ export interface GenerationModel {
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
+  engine: GenerationEngineKind;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
@@ -499,6 +511,8 @@ export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
         acceptanceRequired: false,
       },
       extraLaunchArgs: [],
+      // Never launched locally, so the field only has to be a valid one.
+      engine: "stable_diffusion_cpp" as GenerationEngineKind,
       installed: true,
       totalBytes: 0,
       missingBytes: 0,
@@ -788,5 +802,6 @@ export function emptyModelSpec(): GenerationModelSpec {
       acceptanceRequired: false,
     },
     extraLaunchArgs: [],
+    engine: "stable_diffusion_cpp",
   };
 }

@@ -78,6 +78,7 @@ jobs:
           VERSION=$(basename "$ARCHIVE" .tar.gz)
           gh release create "$VERSION" "$ARCHIVE" \
             --title "$VERSION" \
+            --latest=false \
             --notes "MLX service package for Apple silicon. Installed from the Runtime Hub." \
             || gh release upload "$VERSION" "$ARCHIVE" --clobber
           echo "MLX_DOWNLOAD_URL=$(gh release view "$VERSION" --json assets \
@@ -115,6 +116,7 @@ jobs:
           set -euo pipefail
           gh release create mlx-catalog packaging/mlx/mlx-catalog.json \
             --title "MLX catalog" \
+            --latest=false \
             --notes "Component catalog for the MLX runtime. Download this file, then import it in the Runtime Hub under Components → Import catalog." \
             || gh release upload mlx-catalog packaging/mlx/mlx-catalog.json --clobber
 
