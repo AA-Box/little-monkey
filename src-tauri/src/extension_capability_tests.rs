@@ -649,11 +649,9 @@ async fn an_extension_model_answers_through_the_normal_provider_stream() {
         serde_json::from_slice(&seen).expect("the guest was handed bounded JSON");
     let messages = seen
         .pointer("/event/messages")
-        .or_else(|| seen.pointer("/event/first_event"))
-        .cloned()
-        .unwrap_or_default();
+        .expect("the open event carries the conversation");
     assert!(
-        serde_json::to_string(&messages)
+        serde_json::to_string(messages)
             .unwrap()
             .contains("capital of France"),
         "the prompt did not reach the sandbox: {seen}"

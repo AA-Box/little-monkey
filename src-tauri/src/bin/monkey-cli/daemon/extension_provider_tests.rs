@@ -720,7 +720,11 @@ async fn an_extension_webhook_handler_runs_only_after_the_delivery_is_durable() 
     );
 
     let pending = store.pending_delivery_payloads(10).unwrap();
-    assert_eq!(pending.len(), 1, "one committed delivery, awaiting its pass");
+    assert_eq!(
+        pending.len(),
+        1,
+        "one committed delivery, awaiting its pass"
+    );
 
     let queue = super::channel_restart_tests::FakeQueue::default();
     super::dispatch_extension_delivery(
