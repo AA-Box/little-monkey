@@ -181,6 +181,11 @@ export interface ProviderConfig {
   base_url: string;
   is_custom: boolean;
   has_key: boolean;
+  /** A provider a sandboxed executable extension contributes. It reaches the
+   * network from inside its own sandbox, through the origins it was granted,
+   * so it has no base URL and no key here — its credentials live on the
+   * extension's declared secret slots. */
+  is_extension: boolean;
 }
 
 /** Mirrors the Rust `ProviderModelInfo` struct exactly. */

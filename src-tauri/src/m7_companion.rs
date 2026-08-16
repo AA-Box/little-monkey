@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
+use crate::executable_extensions::{CapabilityKind, ExtensionManager};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "companion-config-v1.json";
@@ -73,13 +74,18 @@ pub struct CompanionArtifact {
 pub enum TranscriptionBackendKind {
     LocalWhisper,
     Provider,
+    ExecutableExtension,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Which synthesizer speaks. `System` is this machine's own voice — `say`,
+/// `espeak-ng`, SAPI — and is the default so an installation that predates
+/// extension providers keeps the voice it had.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechBackendKind {
     #[default]
     System,
+    ExecutableExtension,
 }
 
 fn default_provider_model() -> String {
@@ -118,10 +124,28 @@ pub struct VoiceConfig {
     pub provider_id: Option<String>,
     #[serde(default = "default_provider_model")]
     pub provider_model: String,
+    #[serde(default)]
+    pub extension_id: Option<String>,
+    #[serde(default)]
+    pub extension_capability_id: Option<String>,
     #[serde(default = "default_language")]
     pub language: String,
     #[serde(default)]
     pub tts_voice: Option<String>,
+    #[serde(default)]
+    pub tts_extension_id: Option<String>,
+    #[serde(default)]
+    pub tts_extension_capability_id: Option<String>,
+    /// Which backend serves a *live* call. Separate from `tts_backend`
+    /// because the two are different jobs: one synthesizes a clip, the other
+    /// holds a conversation open. An operator may well want the system voice
+    /// on the desktop and a realtime provider on the phone line.
+    #[serde(default)]
+    pub realtime_backend: SpeechBackendKind,
+    #[serde(default)]
+    pub realtime_extension_id: Option<String>,
+    #[serde(default)]
+    pub realtime_extension_capability_id: Option<String>,
     #[serde(default)]
     pub save_raw_audio: bool,
     #[serde(default)]
@@ -152,12 +176,19 @@ impl Default for VoiceConfig {
             whisper_model: None,
             provider_id: None,
             provider_model: "whisper-1".to_string(),
+            extension_id: None,
+            extension_capability_id: None,
             language: "auto".to_string(),
             tts_voice: None,
+            tts_backend: SpeechBackendKind::System,
+            tts_extension_id: None,
+            tts_extension_capability_id: None,
+            realtime_backend: SpeechBackendKind::System,
+            realtime_extension_id: None,
+            realtime_extension_capability_id: None,
             save_raw_audio: false,
             input_device_id: None,
             output_device_id: None,
-            tts_backend: SpeechBackendKind::System,
             vad_min_speech_ms: default_vad_min_speech_ms(),
             vad_silence_ms: default_vad_silence_ms(),
             vad_max_utterance_ms: default_vad_max_utterance_ms(),
@@ -332,6 +363,7 @@ struct ImageProgressEvent {
 }
 
 pub struct M7CompanionState {
+    app_data_dir: PathBuf,
     root: PathBuf,
     config: Mutex<CompanionConfig>,
     grants: Mutex<BTreeMap<String, CaptureGrant>>,
@@ -339,6 +371,93 @@ pub struct M7CompanionState {
     gallery: Mutex<Vec<ImageGalleryEntry>>,
     talk_metrics: Mutex<Vec<TalkMetric>>,
     artifacts: ArtifactStore,
+}
+
+struct TemporaryArtifactRoot {
+    path: PathBuf,
+}
+
+impl TemporaryArtifactRoot {
+    fn new(parent: &Path) -> Result<Self, String> {
+        let path = parent.join(format!("stt-artifacts-{}", Uuid::new_v4().simple()));
+        ensure_private_directory(&path)?;
+        Ok(Self { path })
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.path.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect temporary STT artifact store {}: {error}",
+                    self.path.display()
+                ));
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Temporary STT artifact store {} is no longer a real directory",
+                self.path.display()
+            ));
+        }
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove temporary STT artifact store {}: {error}",
+                    self.path.display()
+                ));
+            }
+        }
+        self.path.clear();
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryArtifactRoot {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+struct ExtensionAudioArtifacts {
+    store: ArtifactStore,
+    temporary_root: Option<TemporaryArtifactRoot>,
+}
+
+impl ExtensionAudioArtifacts {
+    fn cleanup(&mut self) -> Result<(), String> {
+        self.temporary_root
+            .as_mut()
+            .map_or(Ok(()), TemporaryArtifactRoot::cleanup)
+    }
+}
+
+fn extension_audio_artifacts(
+    state: &M7CompanionState,
+    persist_raw_audio: bool,
+) -> Result<ExtensionAudioArtifacts, String> {
+    if persist_raw_audio {
+        return Ok(ExtensionAudioArtifacts {
+            store: state.artifacts.clone(),
+            temporary_root: None,
+        });
+    }
+    let temporary_root = TemporaryArtifactRoot::new(&state.root.join("tmp"))?;
+    let store = ArtifactStore::with_max_blob_size(&temporary_root.path, MAX_MEDIA_BYTES)
+        .map_err(|error| error.to_string())?;
+    Ok(ExtensionAudioArtifacts {
+        store,
+        temporary_root: Some(temporary_root),
+    })
 }
 
 impl M7CompanionState {
@@ -357,6 +476,7 @@ impl M7CompanionState {
             talk_metrics.drain(..talk_metrics.len() - MAX_TALK_METRICS);
         }
         Ok(Self {
+            app_data_dir: app_data_dir.to_path_buf(),
             root,
             config: Mutex::new(config),
             grants: Mutex::new(BTreeMap::new()),
@@ -369,6 +489,21 @@ impl M7CompanionState {
             )
             .map_err(|error| error.to_string())?,
         })
+    }
+
+    /// The companion configuration, for a test that needs to select a
+    /// provider before driving a normal entry point. Panics rather than
+    /// returning a result: a fixture whose own state directory cannot be read
+    /// has nothing left to assert.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> CompanionConfig {
+        self.config().expect("fixture companion state is readable")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_config_for_test(&self, config: CompanionConfig) {
+        self.save_config(config)
+            .expect("fixture companion configuration is valid");
     }
 
     fn config(&self) -> Result<CompanionConfig, String> {
@@ -685,6 +820,43 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     if let Some(model) = &config.voice.whisper_model {
         validate_absolute_regular(model, false)?;
     }
+    if let Some(extension_id) = &config.voice.extension_id {
+        validate_id("extensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.extension_capability_id {
+        validate_id("extensionCapabilityId", capability_id)?;
+    }
+    if let Some(extension_id) = &config.voice.tts_extension_id {
+        validate_id("ttsExtensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.tts_extension_capability_id {
+        validate_id("ttsExtensionCapabilityId", capability_id)?;
+    }
+    if config.voice.tts_backend == SpeechBackendKind::ExecutableExtension
+        && (config.voice.tts_extension_id.is_none()
+            || config.voice.tts_extension_capability_id.is_none())
+    {
+        return Err(
+            "An executable speech provider needs both its owning extension and its capability"
+                .to_string(),
+        );
+    }
+    if let Some(extension_id) = &config.voice.realtime_extension_id {
+        validate_id("realtimeExtensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.realtime_extension_capability_id {
+        validate_id("realtimeExtensionCapabilityId", capability_id)?;
+    }
+    if config.voice.realtime_backend == SpeechBackendKind::ExecutableExtension
+        && (config.voice.realtime_extension_id.is_none()
+            || config.voice.realtime_extension_capability_id.is_none())
+    {
+        return Err(
+            "An executable realtime voice provider needs both its owning extension and its \
+             capability"
+                .to_string(),
+        );
+    }
     let mut ids = BTreeSet::new();
     for endpoint in &config.image_endpoints {
         validate_id("endpointId", &endpoint.endpoint_id)?;
@@ -752,6 +924,10 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Str
 
 fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    atomic_write_file(path, &bytes)
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -763,10 +939,13 @@ fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
     let mut file = options
         .open(&temp)
         .map_err(|error| format!("Could not stage {}: {error}", path.display()))?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temp, path)
-        .map_err(|error| format!("Could not publish {}: {error}", path.display()))
+    drop(file);
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("Could not publish {}: {error}", path.display())
+    })
 }
 
 fn bounded_file(path: &str) -> Result<(PathBuf, Vec<u8>), String> {
@@ -946,6 +1125,13 @@ pub fn m7_talk_status(
             voice.whisper_binary.is_some() && voice.whisper_model.is_some()
         }
         TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
+        // Both halves, because either one alone resolves to nothing: the
+        // capability names what to run and the extension id names whose copy
+        // of it, and Talk would otherwise report itself ready and then fail on
+        // the first utterance.
+        TranscriptionBackendKind::ExecutableExtension => {
+            voice.extension_id.is_some() && voice.extension_capability_id.is_some()
+        }
     };
     let now = now_ms();
     let active_microphone_grants = lock(&state.grants, "capture grants")?
@@ -1208,6 +1394,29 @@ fn extract_speaker_segments(value: &Value) -> Vec<SpeakerSegment> {
         .collect()
 }
 
+fn extension_transcription_input(audio: &ArtifactBlob, language: &str) -> String {
+    json!({
+        "artifact_id": audio.id.as_str(),
+        "language": if language == "auto" { None } else { Some(language) },
+    })
+    .to_string()
+}
+
+fn normalize_extension_transcript(
+    output_json: &str,
+) -> Result<(String, Vec<SpeakerSegment>), String> {
+    if output_json.is_empty() || output_json.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("Extension transcript is empty or exceeds its byte limit".to_string());
+    }
+    let value: Value = serde_json::from_str(output_json)
+        .map_err(|error| format!("Decode extension transcript: {error}"))?;
+    let text = extract_transcript(&value);
+    if text.is_empty() || text.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("Extension returned an empty or oversized transcript".to_string());
+    }
+    Ok((text, extract_speaker_segments(&value)))
+}
+
 async fn transcribe_path(
     state: &M7CompanionState,
     job_id: &str,
@@ -1343,6 +1552,59 @@ async fn transcribe_path(
             }
             let segments = extract_speaker_segments(&value);
             Ok((text, format!("provider:{provider}"), segments))
+        }
+        TranscriptionBackendKind::ExecutableExtension => {
+            let extension_id = config
+                .extension_id
+                .as_deref()
+                .ok_or("Choose the owning executable STT extension first")?;
+            let capability_id = config
+                .extension_capability_id
+                .as_deref()
+                .ok_or("Choose a healthy executable STT capability first")?;
+            let mut artifacts = extension_audio_artifacts(state, config.save_raw_audio)?;
+            let outcome = async {
+                let audio = artifacts
+                    .store
+                    .import_file(path)
+                    .map_err(|error| format!("Publish extension audio input: {error}"))?;
+                let input_json = extension_transcription_input(&audio, &config.language);
+                let invocation_id = format!("m7-stt-{}", Uuid::new_v4().simple());
+                let manager = ExtensionManager::new(&state.app_data_dir)?
+                    .with_artifact_root(artifacts.store.root())?;
+                let invocation = manager.invoke_owned_active_capability(
+                    CapabilityKind::Stt,
+                    extension_id,
+                    capability_id,
+                    input_json,
+                    Some(invocation_id.clone()),
+                    vec![audio.id],
+                );
+                tokio::pin!(invocation);
+                let result = tokio::select! {
+                    biased;
+                    result = &mut invocation => result,
+                    _ = cancellation.cancelled() => {
+                        let _ = crate::executable_extensions::cancel(&invocation_id);
+                        let _ = invocation.await;
+                        Err("Transcription cancelled".to_string())
+                    }
+                }?;
+                let (text, segments) = normalize_extension_transcript(&result.output_json)?;
+                Ok((
+                    text,
+                    format!("extension:{extension_id}:{capability_id}"),
+                    segments,
+                ))
+            }
+            .await;
+            let cleanup = artifacts.cleanup();
+            match (outcome, cleanup) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+                (Err(error), Err(cleanup_error)) => Err(format!("{error}; {cleanup_error}")),
+            }
         }
     }
 }
@@ -1570,6 +1832,33 @@ pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
                 );
             }
         }
+        TranscriptionBackendKind::ExecutableExtension => {
+            let extension_id = voice
+                .extension_id
+                .as_deref()
+                .ok_or(
+                    "Transcription is set to an executable extension, but its owning extension is not selected, so nothing said on a call can be understood.",
+                )?;
+            let capability_id = voice
+                .extension_capability_id
+                .as_deref()
+                .ok_or(
+                    "Transcription is set to an executable extension, but no STT capability is chosen, so nothing said on a call can be understood.",
+                )?;
+            let active = ExtensionManager::new(app_data_dir)?
+                .resolve_active_capability(CapabilityKind::Stt, capability_id)
+                .map_err(|error| {
+                    format!(
+                        "The configured executable STT capability is not healthy and active: {error}"
+                    )
+                })?;
+            if active.extension_id != extension_id {
+                return Err(
+                    "The configured executable STT capability is now owned by a different extension; reselect it in Settings"
+                        .to_string(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1633,6 +1922,256 @@ pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<S
     result.map(|(text, _backend, _segments)| text)
 }
 
+/// The largest synthesized clip an extension may hand back. Generous enough
+/// for a long spoken turn at 16-bit/16 kHz and far below the runtime's own
+/// output ceiling, so an oversized answer is refused here with a sentence an
+/// operator can act on rather than as a generic runtime failure.
+const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ExtensionSpeechOutput {
+    artifact_id: String,
+    #[serde(default)]
+    media_type: Option<String>,
+}
+
+/// Synthesize `text` through the extension TTS provider the operator selected.
+///
+/// The audio comes back as an artifact id, never a path: a guest that could
+/// name a file would be choosing what the host reads. The id is then checked
+/// against the set of artifacts *this invocation actually wrote* — the store
+/// is content-addressed and shared, so a guessed or previously-seen id would
+/// otherwise resolve to somebody else's content.
+async fn synthesize_via_extension(
+    app_data_dir: &Path,
+    text: &str,
+    voice: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<u8>, String> {
+    let config = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    let extension_id = config
+        .tts_extension_id
+        .as_deref()
+        .ok_or("Choose the owning executable speech extension first")?;
+    let capability_id = config
+        .tts_extension_capability_id
+        .as_deref()
+        .ok_or("Choose a healthy executable speech capability first")?;
+    let input_json = json!({
+        "text": text,
+        "voice": voice,
+        // The one format every consumer in this app can read. A provider that
+        // synthesizes something else has to convert before it answers.
+        "format": "wav",
+    })
+    .to_string();
+    let invocation_id = format!("m7-tts-{}", Uuid::new_v4().simple());
+    let store = ArtifactStore::with_max_blob_size(
+        app_data_dir.join("content-v1"),
+        MAX_SYNTHESIZED_AUDIO_BYTES as u64,
+    )
+    .map_err(|error| format!("Cannot open the artifact store: {error}"))?;
+    let manager = ExtensionManager::new(app_data_dir)?.with_artifact_root(store.root())?;
+    let invocation = manager.invoke_owned_active_capability(
+        CapabilityKind::Tts,
+        extension_id,
+        capability_id,
+        input_json,
+        Some(invocation_id.clone()),
+        Vec::new(),
+    );
+    tokio::pin!(invocation);
+    let result = match cancellation {
+        Some(cancellation) => tokio::select! {
+            biased;
+            result = &mut invocation => result,
+            _ = cancellation.cancelled() => {
+                let _ = crate::executable_extensions::cancel(&invocation_id);
+                let _ = invocation.await;
+                Err("Speech synthesis cancelled".to_string())
+            }
+        },
+        None => invocation.await,
+    }?;
+    let output: ExtensionSpeechOutput = serde_json::from_str(&result.output_json)
+        .map_err(|error| format!("The speech extension returned invalid output: {error}"))?;
+    if !result.written_artifact_ids.contains(&output.artifact_id) {
+        return Err(
+            "The speech extension named an artifact it did not write; audio refused".to_string(),
+        );
+    }
+    if let Some(media_type) = output
+        .media_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !media_type.eq_ignore_ascii_case("audio/wav")
+            && !media_type.eq_ignore_ascii_case("audio/x-wav")
+            && !media_type.eq_ignore_ascii_case("audio/wave")
+        {
+            return Err(format!(
+                "The speech extension returned '{media_type}' rather than WAV audio"
+            ));
+        }
+    }
+    let bytes = store
+        .read(&output.artifact_id)
+        .map_err(|error| format!("Cannot read the synthesized audio: {error}"))?;
+    if bytes.len() > MAX_SYNTHESIZED_AUDIO_BYTES {
+        return Err("The speech extension returned oversized audio".to_string());
+    }
+    // Cheapest honest check that this is the container it claims to be: the
+    // consumers downstream parse a RIFF/WAVE header and a caller deserves the
+    // failure named here rather than "could not decode" three layers on.
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("The speech extension did not return WAV audio".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Speak `text` on this machine's speakers with an extension's voice.
+///
+/// The system backend hands text to a synthesizer that also plays it. An
+/// extension only produces audio, so the two halves are separate here: the
+/// clip is synthesized into a private temporary file and handed to the
+/// platform's own player, which is the same program in each case that a user
+/// double-clicking a WAV would reach.
+async fn speak_via_extension(
+    app_data_dir: &Path,
+    temp_root: &Path,
+    text: &str,
+    voice: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let bytes = synthesize_via_extension(app_data_dir, text, voice, Some(cancellation)).await?;
+    ensure_private_directory(temp_root)?;
+    let path = temp_root.join(format!("speech-{}.wav", Uuid::new_v4().simple()));
+    atomic_write_file(&path, &bytes)?;
+    let played = play_wav_file(&path, cancellation).await;
+    let _ = fs::remove_file(&path);
+    played
+}
+
+/// Hand one WAV file to the platform's audio player and wait for it, killing
+/// it the moment the job is cancelled.
+async fn play_wav_file(path: &Path, cancellation: &CancellationToken) -> Result<(), String> {
+    let path_arg = path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/usr/bin/afplay");
+        command.arg(&path_arg);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        // `aplay` ships with alsa-utils and is what every desktop image with
+        // working audio already has; `paplay` is the PulseAudio equivalent and
+        // is tried only if the first is absent.
+        let program = if which_exists("aplay") {
+            "aplay"
+        } else {
+            "paplay"
+        };
+        let mut command = tokio::process::Command::new(program);
+        command.arg(&path_arg);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let escaped = path_arg.replace('\'', "''");
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync(); $p.Dispose()"
+            ),
+        ]);
+        command
+    };
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("Could not start audio playback: {error}"))?;
+    tokio::select! {
+        _ = cancellation.cancelled() => {
+            let _ = child.kill().await;
+            Err("Speech playback cancelled".to_string())
+        }
+        status = child.wait() => {
+            let status = status.map_err(|error| error.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("Audio playback exited with {status}"))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn which_exists(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+    })
+}
+
+/// The extension-backed selections the companion currently holds, for the
+/// Security Doctor's orphaned-provider check.
+///
+/// Read-only and total: a machine whose companion state has never been written
+/// simply has no selections, which is not a finding.
+#[derive(Debug, Default, Clone)]
+pub struct PersistedVoiceSelections {
+    pub transcription: Option<(String, String)>,
+    pub speech: Option<(String, String)>,
+    pub realtime: Option<(String, String)>,
+}
+
+pub fn persisted_voice_selections(app_data_dir: &Path) -> PersistedVoiceSelections {
+    let Ok(voice) = call_voice_config(app_data_dir) else {
+        return PersistedVoiceSelections::default();
+    };
+    let pair = |enabled: bool, extension: &Option<String>, capability: &Option<String>| {
+        if !enabled {
+            return None;
+        }
+        Some((extension.clone()?, capability.clone()?))
+    };
+    PersistedVoiceSelections {
+        transcription: pair(
+            voice.backend == TranscriptionBackendKind::ExecutableExtension,
+            &voice.extension_id,
+            &voice.extension_capability_id,
+        ),
+        speech: pair(
+            voice.tts_backend == SpeechBackendKind::ExecutableExtension,
+            &voice.tts_extension_id,
+            &voice.tts_extension_capability_id,
+        ),
+        realtime: pair(
+            voice.realtime_backend == SpeechBackendKind::ExecutableExtension,
+            &voice.realtime_extension_id,
+            &voice.realtime_extension_capability_id,
+        ),
+    }
+}
+
+/// The voice configuration a call needs, read through the same companion
+/// state the desktop writes.
+///
+/// Exposed because the daemon serves phone calls in its own process and must
+/// use the operator's actual selection rather than a default it invented.
+pub fn call_voice_config(app_data_dir: &Path) -> Result<VoiceConfig, String> {
+    Ok(M7CompanionState::production(app_data_dir)?.config()?.voice)
+}
+
 /// Synthesize `text` to a WAV file with the operator's system voice.
 ///
 /// The speaking half of the same rule: [`m7_tts_speak`] plays to this machine's
@@ -1644,21 +2183,36 @@ pub async fn synthesize_speech_to_wav(
     text: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    let voice = M7CompanionState::production(app_data_dir)?
-        .config()?
-        .voice
-        .tts_voice
-        .filter(|value| !value.is_empty());
-    synthesize_speech_to_wav_with_voice(voice, text, destination).await
+    let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    synthesize_speech_to_wav_with_voice(
+        app_data_dir,
+        &voice,
+        voice.tts_voice.clone().filter(|value| !value.is_empty()),
+        text,
+        destination,
+    )
+    .await
 }
 
+/// The synthesis both entry points share, with the backend decision made once.
+///
+/// Talk and a phone call reach speech through different commands, and the
+/// operator chose one synthesizer for both. Branching here rather than in each
+/// caller is what stops a provider that is selected in Settings from serving
+/// one of them and not the other.
 async fn synthesize_speech_to_wav_with_voice(
+    app_data_dir: &Path,
+    config: &VoiceConfig,
     voice: Option<String>,
     text: &str,
     destination: &Path,
 ) -> Result<(), String> {
     if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
         return Err("Speech text is empty or exceeds its limit".to_string());
+    }
+    if config.tts_backend == SpeechBackendKind::ExecutableExtension {
+        let bytes = synthesize_via_extension(app_data_dir, text, voice.as_deref(), None).await?;
+        return atomic_write_file(destination, &bytes);
     }
     let destination_arg = destination.to_string_lossy().to_string();
 
@@ -1735,12 +2289,17 @@ pub async fn m7_tts_synthesize(
         .root
         .join("tmp")
         .join(format!("talk-speech-{}.wav", Uuid::new_v4().simple()));
-    let voice = state
-        .config()?
-        .voice
-        .tts_voice
-        .filter(|value| !value.is_empty());
-    let synthesis = synthesize_speech_to_wav_with_voice(voice, &text, &destination);
+    let voice_config = state.config()?.voice;
+    let synthesis = synthesize_speech_to_wav_with_voice(
+        &state.app_data_dir,
+        &voice_config,
+        voice_config
+            .tts_voice
+            .clone()
+            .filter(|value| !value.is_empty()),
+        &text,
+        &destination,
+    );
     let result = tokio::select! {
         _ = cancellation.cancelled() => Err("Speech synthesis cancelled".to_string()),
         result = synthesis => result,
@@ -1778,7 +2337,20 @@ pub async fn m7_tts_speak(
         return Err("Speech text is empty or exceeds its limit".to_string());
     }
     let cancellation = state.begin_job(&job_id)?;
-    let voice = state.config()?.voice.tts_voice;
+    let voice_config = state.config()?.voice;
+    let voice = voice_config.tts_voice.clone();
+    if voice_config.tts_backend == SpeechBackendKind::ExecutableExtension {
+        let result = speak_via_extension(
+            &state.app_data_dir,
+            &state.root.join("tmp"),
+            &text,
+            voice.as_deref().filter(|value| !value.is_empty()),
+            &cancellation,
+        )
+        .await;
+        state.finish_job(&job_id);
+        return result;
+    }
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = tokio::process::Command::new("/usr/bin/say");
@@ -2307,6 +2879,85 @@ mod tests {
     }
 
     #[test]
+    fn extension_transcripts_are_normalized_and_bounded() {
+        let (text, segments) = normalize_extension_transcript(
+            r#"{"text":"  Hello there  ","segments":[{"speaker":"Agent","start":0.5,"text":"Hello there"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(text, "Hello there");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_ms, Some(500));
+
+        let oversized = format!(r#"{{"text":"{}"}}"#, "x".repeat(MAX_TRANSCRIPT_BYTES));
+        assert!(normalize_extension_transcript(&oversized).is_err());
+        assert!(normalize_extension_transcript(r#"{"language":"en"}"#).is_err());
+    }
+
+    #[test]
+    fn extension_audio_input_uses_the_host_published_artifact() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let audio = b"trusted audio bytes";
+        let blob = state.artifacts.put(audio).unwrap();
+        let input: Value =
+            serde_json::from_str(&extension_transcription_input(&blob, "auto")).unwrap();
+
+        assert_eq!(input, json!({"artifact_id": blob.id, "language": null}));
+        assert_eq!(state.artifacts.read(&blob.id).unwrap(), audio);
+    }
+
+    #[test]
+    fn extension_audio_artifacts_are_temporary_unless_raw_audio_is_opted_in() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let audio = b"private transient audio";
+        let temporary_root;
+        let temporary_id;
+        {
+            let mut artifacts = extension_audio_artifacts(&state, false).unwrap();
+            temporary_root = artifacts.store.root().to_path_buf();
+            let blob = artifacts.store.put(audio).unwrap();
+            temporary_id = blob.id;
+            assert!(temporary_root.starts_with(state.root.join("tmp")));
+            assert!(temporary_root.exists());
+            assert!(state.artifacts.read(&temporary_id).is_err());
+            artifacts.cleanup().unwrap();
+            assert!(!temporary_root.exists());
+        }
+        assert!(!temporary_root.exists());
+
+        let durable = extension_audio_artifacts(&state, true).unwrap();
+        let blob = durable.store.put(audio).unwrap();
+        assert_eq!(durable.store.root(), state.artifacts.root());
+        drop(durable);
+        assert_eq!(state.artifacts.read(&blob.id).unwrap(), audio);
+    }
+
+    #[test]
+    fn call_readiness_requires_the_selected_extension_to_be_active() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let mut config = state.config().unwrap();
+        config.voice.backend = TranscriptionBackendKind::ExecutableExtension;
+        state.save_config(config.clone()).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("owning extension is not selected"));
+
+        config.voice.extension_id = Some("dev.example.stt".to_string());
+        state.save_config(config.clone()).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("no STT capability is chosen"));
+
+        config.voice.extension_capability_id = Some("transcribe".to_string());
+        state.save_config(config).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("not healthy and active"));
+    }
+
+    #[test]
     fn config_roundtrips_atomically_and_rejects_duplicate_endpoints() {
         let root = TempRoot::new();
         let state = M7CompanionState::production(&root.0).unwrap();
@@ -2322,6 +2973,9 @@ mod tests {
             enabled: true,
         };
         config.image_endpoints = vec![endpoint.clone()];
+        config.voice.backend = TranscriptionBackendKind::ExecutableExtension;
+        config.voice.extension_id = Some("dev.example.stt".to_string());
+        config.voice.extension_capability_id = Some("transcribe".to_string());
         state.save_config(config.clone()).unwrap();
         assert_eq!(state.config().unwrap(), config);
         config.image_endpoints.push(endpoint);
@@ -2330,6 +2984,14 @@ mod tests {
         let mut invalid_shortcut = state.config().unwrap();
         invalid_shortcut.overlay_shortcut = "definitely not a shortcut".to_string();
         assert!(state.save_config(invalid_shortcut).is_err());
+
+        let mut invalid_capability = state.config().unwrap();
+        invalid_capability.voice.extension_capability_id = Some("not a capability".to_string());
+        assert!(state.save_config(invalid_capability).is_err());
+
+        let mut invalid_extension = state.config().unwrap();
+        invalid_extension.voice.extension_id = Some("not an extension".to_string());
+        assert!(state.save_config(invalid_extension).is_err());
     }
 
     #[test]

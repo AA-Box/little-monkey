@@ -17,7 +17,7 @@ const CHEAP = providerModelTargetKey("openai", "gpt-cheap");
 const PRICEY = providerModelTargetKey("anthropic", "claude-pricey");
 
 function provider(id: string, label: string) {
-  return { id, label, base_url: `https://${id}.example`, is_custom: false, has_key: true };
+  return { id, label, base_url: `https://${id}.example`, is_custom: false, has_key: true, is_extension: false };
 }
 
 /** Two connected cloud providers with one model each, plus user-entered rates

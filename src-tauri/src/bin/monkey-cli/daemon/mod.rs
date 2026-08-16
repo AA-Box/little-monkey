@@ -16,6 +16,8 @@ pub(crate) mod channel_tool;
 mod channel_webhook_tests;
 pub(crate) mod channel_worker;
 mod engine;
+#[cfg(test)]
+mod extension_provider_tests;
 pub(crate) mod fail_points;
 /// The cross-origin contract: every conversational turn, one durable path.
 #[cfg(test)]
@@ -345,6 +347,9 @@ pub enum TriggerCmd {
     },
     Remove {
         id: String,
+        /// Fail closed unless the trigger belongs to this executable extension.
+        #[arg(long)]
+        extension_id: Option<String>,
     },
     /// Store a workflow webhook HMAC secret under an opaque OS-keychain
     /// reference. The secret value is read from the named environment variable
@@ -355,9 +360,7 @@ pub enum TriggerCmd {
         secret_env: String,
     },
     /// Remove an opaque workflow webhook HMAC secret from the OS keychain.
-    SecretRemove {
-        reference: String,
-    },
+    SecretRemove { reference: String },
     /// Offline/forwarder-friendly signed ingestion path. The resident HTTP
     /// endpoint uses the exact same verifier and dedupe transaction.
     Deliver {
@@ -395,6 +398,19 @@ pub struct TriggerTargetArgs {
     /// target and checked against the daemon trigger kind/configuration.
     #[arg(long)]
     workflow_trigger_json: Option<String>,
+    /// Installed executable extension target, mutually exclusive with recipe
+    /// and workflow targets.
+    #[arg(long)]
+    extension_id: Option<String>,
+    /// Exact declared extension capability that receives the event.
+    #[arg(long)]
+    extension_handler_id: Option<String>,
+    /// Immutable installed extension version pinned by the trigger.
+    #[arg(long)]
+    extension_version: Option<String>,
+    /// SHA-256 of the exact signed manifest pinned by the trigger.
+    #[arg(long)]
+    extension_manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2386,7 +2402,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 workflow,
                 schedule: cron.clone(),
             };
-            add_trigger(&mut shared, id, config, None)?;
+            add_trigger(&paths, &mut shared, id, config, None)?;
         }
         TriggerCmd::AddFilesystem {
             id,
@@ -2411,7 +2427,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 pattern,
                 last_fingerprint: None,
             };
-            add_trigger(&mut shared, id, config, None)?;
+            add_trigger(&paths, &mut shared, id, config, None)?;
         }
         TriggerCmd::AddWebhook {
             id,
@@ -2440,6 +2456,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
             };
             let secret_slot = config.secret_reference(id).to_string();
             add_trigger(
+                &paths,
                 &mut shared,
                 id,
                 config,
@@ -2481,7 +2498,13 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 allow_review_comment: *allow_review_comment,
                 max_skew_ms: *max_skew_ms,
             };
-            add_trigger(&mut shared, id, config, Some((&secrets, id, &secret)))?;
+            add_trigger(
+                &paths,
+                &mut shared,
+                id,
+                config,
+                Some((&secrets, id, &secret)),
+            )?;
         }
         TriggerCmd::List { json } => {
             let triggers = shared.list_triggers()?;
@@ -2515,12 +2538,19 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 }
             }
         }
-        TriggerCmd::Remove { id } => {
+        TriggerCmd::Remove { id, extension_id } => {
             let stored = shared
                 .trigger(id)?
                 .ok_or_else(|| format!("Unknown trigger '{id}'"))?;
             let config: TriggerConfig = serde_json::from_slice(&stored.config_json)
                 .map_err(|error| format!("Invalid trigger '{id}': {error}"))?;
+            if let Some(expected) = extension_id {
+                if config.extension_target().map(|target| target.0) != Some(expected.as_str()) {
+                    return Err(
+                        "Trigger does not belong to the expected executable extension".to_string(),
+                    );
+                }
+            }
             if config
                 .workflow_binding()
                 .is_some_and(|binding| binding.managed_by_batch)
@@ -2586,6 +2616,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
 }
 
 fn add_trigger(
+    paths: &DaemonPaths,
     shared: &mut SharedLedger,
     id: &str,
     config: TriggerConfig,
@@ -2594,6 +2625,7 @@ fn add_trigger(
     validate_trigger_id(id)?;
     config.validate()?;
     validate_trigger_recipe(&config)?;
+    validate_extension_trigger(paths, &config)?;
     if let Some((store, slot, secret)) = secret {
         store.put(slot, secret)?;
     }
@@ -2609,6 +2641,39 @@ fn add_trigger(
         next,
     )?;
     println!("Trigger '{id}' installed ({})", config.kind_token());
+    Ok(())
+}
+
+fn validate_extension_trigger(paths: &DaemonPaths, config: &TriggerConfig) -> Result<(), String> {
+    let Some((extension_id, handler_id, version, manifest_sha256)) = config.extension_target()
+    else {
+        return Ok(());
+    };
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let detail = little_monkey_lib::executable_extensions::ExtensionManager::new(app_data)?
+        .inspect(extension_id)?;
+    if detail.active_version != version || detail.trust.manifest_sha256 != manifest_sha256 {
+        return Err("Extension trigger must pin the active immutable manifest".to_string());
+    }
+    if !detail
+        .manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.capability_id == handler_id)
+    {
+        return Err("Extension trigger handler is not a declared capability".to_string());
+    }
+    if !detail.permissions.iter().any(|permission| {
+        permission.granted
+            && permission.kind
+                == little_monkey_lib::executable_extensions::PermissionKind::WebhookReceive
+            && permission.scope == handler_id
+    }) {
+        return Err("Extension trigger handler lacks its exact ingress grant".to_string());
+    }
     Ok(())
 }
 
@@ -2645,9 +2710,15 @@ fn build_trigger_target(
         || args.definition_sha256.is_some()
         || args.workflow_version.is_some()
         || args.workflow_trigger_json.is_some();
+    let extension_fields_present = args.extension_id.is_some()
+        || args.extension_handler_id.is_some()
+        || args.extension_version.is_some()
+        || args.extension_manifest_sha256.is_some();
     if let Some(recipe) = &args.recipe {
-        if workflow_fields_present {
-            return Err("RECIPE and workflow target flags are mutually exclusive".to_string());
+        if workflow_fields_present || extension_fields_present {
+            return Err(
+                "Recipe, workflow, and extension targets are mutually exclusive".to_string(),
+            );
         }
         return Ok((
             TriggerTarget::Recipe {
@@ -2660,6 +2731,30 @@ fn build_trigger_target(
     }
     if !params.is_empty() || payload_param.is_some() {
         return Err("--param/--payload-param are supported only for recipe targets".to_string());
+    }
+    if extension_fields_present {
+        if workflow_fields_present {
+            return Err("Workflow and extension target flags are mutually exclusive".to_string());
+        }
+        return Ok((
+            TriggerTarget::Extension {
+                extension_id: args
+                    .extension_id
+                    .clone()
+                    .ok_or_else(|| "Extension target requires --extension-id".to_string())?,
+                handler_id: args.extension_handler_id.clone().ok_or_else(|| {
+                    "Extension target requires --extension-handler-id".to_string()
+                })?,
+                version: args
+                    .extension_version
+                    .clone()
+                    .ok_or_else(|| "Extension target requires --extension-version".to_string())?,
+                manifest_sha256: args.extension_manifest_sha256.clone().ok_or_else(|| {
+                    "Extension target requires --extension-manifest-sha256".to_string()
+                })?,
+            },
+            None,
+        ));
     }
     let workflow_id = args
         .workflow_id
@@ -2872,6 +2967,7 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         poll_persistent_triggers(&mut engine.shared, &mut engine.store, now)?;
         if let Err(error) =
             process_pending_deliveries(cli, &paths, &config, &mut engine.store, &mut engine.shared)
+                .await
         {
             eprintln!("Persistent trigger delivery paused: {error}");
         }
@@ -3008,7 +3104,7 @@ fn reconcile_reserved_deliveries(
     Ok(())
 }
 
-fn process_pending_deliveries(
+async fn process_pending_deliveries(
     cli: &crate::Cli,
     paths: &DaemonPaths,
     config: &DaemonConfig,
@@ -3017,7 +3113,7 @@ fn process_pending_deliveries(
 ) -> Result<(), String> {
     for pending in store.pending_delivery_payloads(64)? {
         if let Err(error) =
-            process_one_pending_delivery(cli, paths, config, store, shared, &pending)
+            process_one_pending_delivery(cli, paths, config, store, shared, &pending).await
         {
             eprintln!(
                 "Persistent trigger delivery '{}/{}' paused: {error}",
@@ -3028,7 +3124,7 @@ fn process_pending_deliveries(
     Ok(())
 }
 
-fn process_one_pending_delivery(
+async fn process_one_pending_delivery(
     cli: &crate::Cli,
     paths: &DaemonPaths,
     config: &DaemonConfig,
@@ -3042,6 +3138,20 @@ fn process_one_pending_delivery(
     let trigger: TriggerConfig =
         serde_json::from_slice(&stored_trigger.config_json).map_err(|error| error.to_string())?;
     trigger.validate()?;
+    if let Some((extension_id, handler_id, version, manifest_sha256)) = trigger.extension_target() {
+        return dispatch_extension_delivery(
+            paths,
+            store,
+            shared,
+            &DaemonChannelQueue::new(paths.clone()),
+            pending,
+            extension_id,
+            handler_id,
+            version,
+            manifest_sha256,
+        )
+        .await;
+    }
     if let Some((workflow_id, definition_sha256, binding)) = trigger.workflow_target() {
         return dispatch_workflow_delivery(
             paths,
@@ -3127,6 +3237,148 @@ fn process_one_pending_delivery(
         now_ms()?,
     )?;
     store.mark_delivery_submitted(&pending.trigger_id, &pending.delivery_id, &queued.job_id)
+}
+
+pub(crate) async fn dispatch_extension_delivery(
+    paths: &DaemonPaths,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+    queue: &dyn channel_worker::RunQueue,
+    pending: &PendingDelivery,
+    extension_id: &str,
+    handler_id: &str,
+    version: &str,
+    manifest_sha256: &str,
+) -> Result<(), String> {
+    match shared.delivery(&pending.trigger_id, &pending.delivery_id)? {
+        Some((status, _, None)) if status == "submitted" => {
+            store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)?;
+            return Ok(());
+        }
+        Some((status, _, None)) if status == "accepted" => {}
+        Some((status, _, run_id)) => {
+            return Err(format!(
+                "Extension delivery has incompatible shared state status={status} run_id={run_id:?}"
+            ));
+        }
+        None => return Err("Extension delivery is missing from the replay ledger".to_string()),
+    }
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let manager = little_monkey_lib::executable_extensions::ExtensionManager::new(app_data)?;
+    let detail = manager.inspect(extension_id)?;
+    if detail.active_version != version || detail.trust.manifest_sha256 != manifest_sha256 {
+        return Err("Extension trigger is pinned to a different immutable version".to_string());
+    }
+    if !detail.permissions.iter().any(|permission| {
+        permission.granted
+            && permission.kind
+                == little_monkey_lib::executable_extensions::PermissionKind::WebhookReceive
+            && permission.scope == handler_id
+    }) {
+        return Err("Extension trigger handler no longer has its exact ingress grant".to_string());
+    }
+    let payload: serde_json::Value = serde_json::from_str(&pending.payload_json)
+        .map_err(|error| format!("Stored trigger payload is invalid JSON: {error}"))?;
+    let invocation_id = format!(
+        "extension-trigger-{}",
+        &sha256_hex(format!("{}:{}", pending.trigger_id, pending.delivery_id).as_bytes())[..32]
+    );
+    let input_json = serde_json::to_string(&serde_json::json!({
+        "trigger_id": pending.trigger_id,
+        "delivery_id": pending.delivery_id,
+        "received_at_ms": pending.received_at_ms,
+        "payload": payload,
+    }))
+    .map_err(|error| error.to_string())?;
+    let result = manager
+        .invoke(
+            little_monkey_lib::executable_extensions::InvocationRequest {
+                extension_id: extension_id.to_string(),
+                capability_id: handler_id.to_string(),
+                input_json,
+                invocation_id: Some(invocation_id.clone()),
+                input_artifact_ids: Vec::new(),
+                expected_kind: Some(
+                    little_monkey_lib::executable_extensions::CapabilityKind::Channel,
+                ),
+                expected_version: Some(version.to_string()),
+            },
+        )
+        .await?;
+    if result.invocation_id != invocation_id {
+        return Err("Extension delivery returned a mismatched invocation id".to_string());
+    }
+    // What the handler normalized, if anything, enters the ordinary channel
+    // path from here. This is the whole reason a channel capability is invoked
+    // on a delivery rather than a plain webhook handler: the extension's job
+    // ends at "these are the messages that arrived", and everything after it —
+    // access policy, pairing, dedupe, routing, the session a turn lands in — is
+    // the same code every other provider goes through.
+    ingest_extension_channel_envelopes(store, queue, &result.output_json)?;
+    // The extension invocation/result commits first. A crash before these
+    // markers re-enters with the same id and receives the cached result.
+    shared.mark_delivery_submitted_external(
+        &pending.trigger_id,
+        &pending.delivery_id,
+        now_ms()?,
+    )?;
+    store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)
+}
+
+/// Hand a channel handler's normalized output to `channel_ingress`.
+///
+/// A handler that produced no `account_id` produced no channel traffic — a
+/// webhook that was a receipt, a heartbeat or a status callback — and that is
+/// a successful delivery with nothing to route, not an error.
+///
+/// The account is looked up rather than trusted: the envelope's kind, and the
+/// binding it must match, come from the stored account row, so a handler
+/// cannot address an account belonging to another extension or forge a
+/// Telegram envelope. Acceptance itself is idempotent on
+/// `(account_id, provider_event_id)`, which is what makes a redelivered
+/// webhook collapse onto one turn.
+fn ingest_extension_channel_envelopes(
+    store: &mut DaemonStore,
+    queue: &dyn channel_worker::RunQueue,
+    output_json: &str,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct HandlerOutput {
+        #[serde(default)]
+        account_id: Option<String>,
+        #[serde(flatten)]
+        inbound: crate::daemon::adapters::extension::ExtensionInbound,
+    }
+    let output: HandlerOutput = serde_json::from_str(output_json)
+        .map_err(|error| format!("Extension channel handler returned unusable output: {error}"))?;
+    let Some(account_id) = output.account_id else {
+        return Ok(());
+    };
+    if output.inbound.messages.is_empty() {
+        return Ok(());
+    }
+    let account = store
+        .channel_account(&account_id)?
+        .ok_or_else(|| format!("Extension channel handler named unknown account '{account_id}'"))?;
+    if account.kind != little_monkey_lib::channels::types::ChannelKind::Extension {
+        return Err(format!(
+            "Account '{account_id}' is not an extension channel account"
+        ));
+    }
+    if !account.enabled {
+        return Ok(());
+    }
+    let envelopes = crate::daemon::adapters::extension::normalize_envelopes(
+        &account_id,
+        output.inbound.messages,
+    )?;
+    for envelope in &envelopes {
+        channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms()? as i64)?;
+    }
+    Ok(())
 }
 
 fn dispatch_workflow_delivery(
@@ -3416,6 +3668,10 @@ mod tests {
             definition_sha256: None,
             workflow_version: None,
             workflow_trigger_json: None,
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         let (target, binding) = build_trigger_target(
             &recipe_args,
@@ -3439,6 +3695,10 @@ mod tests {
                 })
                 .to_string(),
             ),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         let (target, binding) = build_trigger_target(&workflow_args, &[], &None).unwrap();
         assert!(matches!(target, TriggerTarget::Workflow { .. }));
@@ -3456,6 +3716,10 @@ mod tests {
             definition_sha256: Some("a".repeat(64)),
             workflow_version: Some(1),
             workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         assert!(build_trigger_target(&ambiguous, &[], &None).is_err());
 
@@ -3465,8 +3729,47 @@ mod tests {
             definition_sha256: Some("a".repeat(64)),
             workflow_version: Some(1),
             workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         assert!(build_trigger_target(&workflow, &["x=y".into()], &None).is_err());
+    }
+
+    #[test]
+    fn trigger_target_args_pin_an_extension_handler_to_immutable_identity() {
+        let args = TriggerTargetArgs {
+            recipe: None,
+            workflow_id: None,
+            definition_sha256: None,
+            workflow_version: None,
+            workflow_trigger_json: None,
+            extension_id: Some("dev.example.webhook".into()),
+            extension_handler_id: Some("incoming".into()),
+            extension_version: Some("1.2.3".into()),
+            extension_manifest_sha256: Some("a".repeat(64)),
+        };
+        let (target, binding) = build_trigger_target(&args, &[], &None).unwrap();
+        assert!(matches!(
+            target,
+            TriggerTarget::Extension {
+                extension_id,
+                handler_id,
+                version,
+                manifest_sha256,
+            } if extension_id == "dev.example.webhook"
+                && handler_id == "incoming"
+                && version == "1.2.3"
+                && manifest_sha256 == "a".repeat(64)
+        ));
+        assert!(binding.is_none());
+
+        let incomplete = TriggerTargetArgs {
+            extension_manifest_sha256: None,
+            ..args
+        };
+        assert!(build_trigger_target(&incomplete, &[], &None).is_err());
     }
 
     #[test]

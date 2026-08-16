@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::call_media::{
-    run_media_session, CallIdentity, ConfiguredSpeech, MediaSocket, QueuedCallTurns,
+    run_media_session, select_call_speech, CallIdentity, MediaSocket, QueuedCallTurns,
 };
 use super::store::{DaemonPaths, DaemonStore};
 use super::telecom_store::{CallDirection, InboundCallPolicy};
@@ -198,11 +198,29 @@ pub(crate) async fn handle_media_upgrade(
             queue: &queue,
             target,
         };
-        let speech = ConfiguredSpeech {
-            app_data_dir: paths.root.clone(),
+        let app_data_dir = match paths.app_data() {
+            Ok(app_data) => app_data.to_path_buf(),
+            Err(error) => {
+                eprintln!("monkey daemon: a call could not resolve app data: {error}");
+                return;
+            }
         };
-        let report =
-            run_media_session(&mut socket, &speech, &sink, provider.as_ref(), identity).await;
+        let speech = match select_call_speech(&app_data_dir) {
+            Ok(speech) => speech,
+            Err(error) => {
+                eprintln!("monkey daemon: a call could not start its speech backend: {error}");
+                return;
+            }
+        };
+        let report = run_media_session(
+            &mut socket,
+            speech.as_ref(),
+            &sink,
+            provider.as_ref(),
+            identity,
+        )
+        .await;
+        speech.finish().await;
         eprintln!(
             "monkey daemon: a call ended after {} turn(s)",
             report.turns_submitted

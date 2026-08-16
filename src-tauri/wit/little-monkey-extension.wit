@@ -1,0 +1,49 @@
+package little-monkey:extension@1.0.0;
+
+interface host {
+  record header {
+    name: string,
+    value: string,
+  }
+
+  record http-request {
+    method: string,
+    url: string,
+    headers: list<header>,
+    body: list<u8>,
+    auth-slot: option<string>,
+  }
+
+  record http-response {
+    status: u16,
+    headers: list<header>,
+    body: list<u8>,
+  }
+
+  log: func(level: string, message: string) -> result<_, string>;
+  now-ms: func() -> u64;
+  random-bytes: func(length: u32) -> result<list<u8>, string>;
+  config-get: func(key: string) -> result<option<string>, string>;
+  state-get: func(key: string) -> result<option<list<u8>>, string>;
+  state-put: func(key: string, value: list<u8>) -> result<_, string>;
+  send-http: func(request: http-request) -> result<http-response, string>;
+  artifact-read: func(artifact-id: string) -> result<list<u8>, string>;
+  artifact-write: func(bytes: list<u8>) -> result<string, string>;
+  workspace-read: func(handle: string, relative-path: string) -> result<list<u8>, string>;
+  workspace-write: func(handle: string, relative-path: string, bytes: list<u8>) -> result<_, string>;
+  model-invoke: func(model-id: string, request-json: string) -> result<string, string>;
+  device-request: func(device-id: string, capability: string, request-json: string) -> result<string, string>;
+  emit-event: func(kind: string, payload-json: string) -> result<_, string>;
+  set-tool-result: func(payload-json: string) -> result<_, string>;
+  is-cancelled: func() -> bool;
+  telemetry: func(name: string, value: u64) -> result<_, string>;
+}
+
+interface guest {
+  run: func(capability-id: string, input-json: string) -> result<string, string>;
+}
+
+world extension {
+  import host;
+  export guest;
+}

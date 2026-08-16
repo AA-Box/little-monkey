@@ -33,6 +33,7 @@ pub mod browser_worker;
 // Typed, fixed-argument desktop bridge to the bundled authoritative daemon
 // and optional user-owned remote controller. No arbitrary CLI execution.
 mod daemon_commands;
+mod extension_commands;
 mod m6a_desktop_bridge;
 // Digest-confirmed owned-worktree/GitHub delivery and local PR review. The
 // core is kept Tauri-light so repository identity and safety policy remain in
@@ -87,6 +88,9 @@ pub mod native_skills;
 // Studio" (Phase 8): real Ollama Modelfile grammar, short-name hardening,
 // and GGUF/safetensors header sanity checks, independent of `ollama.rs`'s
 // own `ollama create -f` invocation (which stays in `ollama.rs`, unchanged).
+/// Sandboxed third-party WebAssembly components. This is deliberately
+/// separate from `package_ecosystem`, whose bundles remain data-only.
+pub mod executable_extensions;
 pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
@@ -463,6 +467,9 @@ pub mod local_apps;
 // through, so no two of them share an app-data directory (or a run ledger).
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod extension_capability_tests;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -1205,6 +1212,8 @@ pub fn run() {
             connectors::connectors_add_github,
             connectors::connectors_add_token,
             connectors::connectors_add_s3,
+            connectors::connectors_add_extension,
+            connectors::connectors_list_extension_options,
             connectors::connectors_remove,
             connectors::connectors_reverify,
             connectors::connectors_export_audit,
@@ -1651,6 +1660,28 @@ pub fn run() {
             browser_worker::browser_scroll,
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
+            extension_commands::extensions_discover,
+            extension_commands::extensions_list,
+            extension_commands::extensions_active_capabilities,
+            extension_commands::extensions_inspect,
+            extension_commands::extensions_install,
+            extension_commands::extensions_validate,
+            extension_commands::extensions_set_enabled,
+            extension_commands::extensions_set_running,
+            extension_commands::extensions_preview_update,
+            extension_commands::extensions_update,
+            extension_commands::extensions_rollback,
+            extension_commands::extensions_uninstall,
+            extension_commands::extensions_status,
+            extension_commands::extensions_logs,
+            extension_commands::extensions_set_config,
+            extension_commands::extensions_set_secret,
+            extension_commands::extensions_remove_secret,
+            extension_commands::extensions_invoke,
+            extension_commands::extensions_cancel,
+            extension_commands::extensions_webhooks,
+            extension_commands::extensions_register_webhook,
+            extension_commands::extensions_remove_webhook,
             daemon_commands::channels_list,
             daemon_commands::channels_add,
             daemon_commands::channels_probe,
@@ -1850,6 +1881,8 @@ pub fn run() {
         // get to actually be killed before the process itself exits.
         if let tauri::RunEvent::Exit = event {
             let _ = tauri::async_runtime::block_on(server::shutdown_unified_server(app_handle));
+            let _ = executable_extensions::close_all_sessions();
+            let _ = executable_extensions::cancel_all();
 
             let m3 = app_handle.state::<m3_commands::M3CommandState>();
             let _ = m3.cancel_all_and_shutdown_owned(std::time::Duration::from_secs(5));

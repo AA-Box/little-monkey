@@ -67,7 +67,7 @@ const PROVIDER_A: ProviderConfig = {
   label: "Provider A",
   base_url: "https://provider-a.test/v1",
   is_custom: true,
-  has_key: true,
+  has_key: true, is_extension: false
 };
 
 const PROVIDER_B: ProviderConfig = {
@@ -75,7 +75,7 @@ const PROVIDER_B: ProviderConfig = {
   label: "Provider B",
   base_url: "https://provider-b.test/v1",
   is_custom: true,
-  has_key: true,
+  has_key: true, is_extension: false
 };
 
 function providerTarget(provider: ProviderConfig, model: string): ModelTargetSnapshot {

@@ -95,6 +95,11 @@ pub struct StackSource {
 pub enum EmbeddingBackend {
     Llama,
     Ollama,
+    /// A sandboxed executable extension owns the vectors. `model_id_or_tag` is
+    /// the extension's declared embedding capability id and `extension_id`
+    /// names the installation that must still own it — a stack indexed by one
+    /// publisher's provider must never be silently re-embedded by another's.
+    Extension,
 }
 
 /// Pins the exact embedding model (and its output dimensionality) a stack's
@@ -116,6 +121,49 @@ pub struct EmbeddingSpec {
     /// nomic-embed needs `"search_document: "`).
     #[serde(default)]
     pub doc_prefix: String,
+    /// Which extension owns [`EmbeddingBackend::Extension`]'s capability.
+    /// Required for that backend and refused for every other, so a stack can
+    /// never carry a dangling owner that a later install would inherit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+}
+
+impl EmbeddingSpec {
+    /// Reject a spec whose owner field does not match its backend.
+    ///
+    /// The two halves are checked together because either one alone is a
+    /// silent failure: an extension spec with no owner would resolve to
+    /// "whoever currently declares this capability id", and a llama spec that
+    /// carries an owner reads, to anyone auditing the file, as if a sandboxed
+    /// provider produced vectors that a local server actually produced.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model_id_or_tag.trim().is_empty()
+            || self.model_id_or_tag.len() > 1_024
+            || self.dim == 0
+            || self.dim > 65_536
+        {
+            return Err("Embedding model and dimension are required".to_string());
+        }
+        match (self.backend, self.extension_id.as_deref()) {
+            (EmbeddingBackend::Extension, None) => {
+                Err("An executable embedding provider must name its owning extension".to_string())
+            }
+            (EmbeddingBackend::Extension, Some(extension_id)) => {
+                crate::executable_extensions::validate_extension_identifier(
+                    "extension id",
+                    extension_id,
+                )?;
+                crate::executable_extensions::validate_extension_identifier(
+                    "capability id",
+                    &self.model_id_or_tag,
+                )
+            }
+            (_, Some(_)) => {
+                Err("Only an executable embedding provider may name an extension".to_string())
+            }
+            (_, None) => Ok(()),
+        }
+    }
 }
 
 /// One named knowledge stack — the registry's unit of storage, mirrored
@@ -172,6 +220,27 @@ pub(crate) fn stacks_base_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app_data_dir(app)?.join("stacks");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create stacks dir: {e}"))?;
     Ok(dir)
+}
+
+/// Every knowledge stack whose vectors come from an extension, as
+/// `(label, (extension_id, capability_id))`, for the Security Doctor's
+/// orphaned-provider check. Total: an unreadable registry means no
+/// selections, which is a different finding than a stale one.
+pub fn persisted_embedding_selections(app_data: &Path) -> Vec<(String, (String, String))> {
+    load_registry(&app_data.join("stacks"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|stack| stack.embedding.backend == EmbeddingBackend::Extension)
+        .filter_map(|stack| {
+            Some((
+                format!("Knowledge stack '{}'", stack.name),
+                (
+                    stack.embedding.extension_id.clone()?,
+                    stack.embedding.model_id_or_tag.clone(),
+                ),
+            ))
+        })
+        .collect()
 }
 
 fn registry_path(base: &Path) -> PathBuf {
@@ -250,6 +319,7 @@ pub fn create_impl(
     name: String,
     embedding: EmbeddingSpec,
 ) -> Result<KnowledgeStack, String> {
+    embedding.validate()?;
     let mut registry = load_registry(base)?;
     let stack = KnowledgeStack {
         id: uuid::Uuid::new_v4().to_string(),
@@ -287,11 +357,11 @@ pub fn import_definitions_impl(
         if stack.name.trim().is_empty() || stack.name.len() > 512 {
             return Err("Portable stack name must be 1..=512 bytes".to_string());
         }
-        if stack.embedding.model_id_or_tag.trim().is_empty()
-            || stack.embedding.model_id_or_tag.len() > 1_024
-            || stack.embedding.dim == 0
-            || stack.embedding.dim > 65_536
-            || stack.chunk_chars == 0
+        stack
+            .embedding
+            .validate()
+            .map_err(|error| format!("Portable stack '{}': {error}", stack.id))?;
+        if stack.chunk_chars == 0
             || stack.chunk_chars > 1_000_000
             || stack.chunk_overlap >= stack.chunk_chars
         {
@@ -586,6 +656,96 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
     Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
 }
 
+/// The largest embedding request one extension batch may carry, and the
+/// largest response it may answer with. The runtime already caps a guest's
+/// output; these are the embedding-shaped bounds on top of it, so a provider
+/// cannot answer a 32-text batch with a million-dimension matrix.
+const MAX_EXTENSION_EMBED_INPUT_CHARS: usize = 512 * 1024;
+const MAX_EXTENSION_EMBED_DIM: usize = 65_536;
+
+#[derive(Serialize)]
+struct ExtensionEmbeddingInput<'a> {
+    model: &'a str,
+    /// `query` or `document`. A provider that prefixes or pools differently
+    /// per role needs to be told which one it was handed.
+    input_kind: &'a str,
+    dimensions: u32,
+    texts: &'a [String],
+}
+
+#[derive(Deserialize)]
+struct ExtensionEmbeddingOutput {
+    vectors: Vec<Vec<f32>>,
+}
+
+/// Embed one batch through the extension that owns `spec`'s capability.
+///
+/// Everything the caller trusts is supplied by the host: the owning extension
+/// id comes from the stack's persisted spec (never from the guest), and the
+/// returned matrix is checked for shape and finiteness before a single value
+/// reaches an index — a NaN here would poison every later cosine score.
+async fn embed_via_extension(
+    app_data: &Path,
+    spec: &EmbeddingSpec,
+    texts: &[String],
+    is_query: bool,
+) -> Result<Vec<Vec<f32>>, String> {
+    let extension_id = spec.extension_id.as_deref().ok_or(
+        "This stack's embedding provider has no owning extension recorded — reindex required",
+    )?;
+    let total_chars: usize = texts.iter().map(String::len).sum();
+    if total_chars > MAX_EXTENSION_EMBED_INPUT_CHARS {
+        return Err(format!(
+            "An embedding batch of {total_chars} bytes exceeds the {MAX_EXTENSION_EMBED_INPUT_CHARS}-byte extension limit"
+        ));
+    }
+    let input_json = serde_json::to_string(&ExtensionEmbeddingInput {
+        model: &spec.model_id_or_tag,
+        input_kind: if is_query { "query" } else { "document" },
+        dimensions: spec.dim,
+        texts,
+    })
+    .map_err(|error| format!("Could not encode the embedding request: {error}"))?;
+    let result = crate::executable_extensions::ExtensionManager::new(app_data)?
+        .invoke_owned_active_capability(
+            crate::executable_extensions::CapabilityKind::EmbeddingProvider,
+            extension_id,
+            &spec.model_id_or_tag,
+            input_json,
+            None,
+            Vec::new(),
+        )
+        .await?;
+    let parsed: ExtensionEmbeddingOutput = serde_json::from_str(&result.output_json)
+        .map_err(|error| format!("The embedding extension returned invalid output: {error}"))?;
+    if parsed.vectors.len() != texts.len() {
+        return Err(format!(
+            "The embedding extension returned {} vectors for {} inputs",
+            parsed.vectors.len(),
+            texts.len()
+        ));
+    }
+    for vector in &parsed.vectors {
+        if vector.is_empty() || vector.len() > MAX_EXTENSION_EMBED_DIM {
+            return Err(format!(
+                "The embedding extension returned a {}-dimension vector",
+                vector.len()
+            ));
+        }
+        if vector.len() != spec.dim as usize {
+            return Err(format!(
+                "The embedding extension returned {}-dim vectors but this stack expects {} — reindex required",
+                vector.len(),
+                spec.dim
+            ));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err("The embedding extension returned a non-finite value".to_string());
+        }
+    }
+    Ok(parsed.vectors)
+}
+
 /// Embeds `texts` against `spec`, dispatching to the recorded backend,
 /// applying `spec.query_prefix`/`spec.doc_prefix` (per `is_query`) to every
 /// text first, batching requests at [`EMBED_BATCH_SIZE`], and L2-normalizing
@@ -593,6 +753,23 @@ async fn embed_via_llama(model: &str, texts: &[String]) -> Result<Vec<Vec<f32>>,
 /// the model's actual output dimensionality doesn't match `spec.dim` — see
 /// [`spec_matches`]'s doc comment for why that must never be papered over.
 pub async fn embed_batch(
+    spec: &EmbeddingSpec,
+    texts: &[String],
+    is_query: bool,
+) -> Result<Vec<Vec<f32>>, String> {
+    let app_data = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
+    embed_batch_under(&app_data, spec, texts, is_query).await
+}
+
+/// [`embed_batch`] against an explicit data root.
+///
+/// Only the extension backend reads it — the two local servers are addressed
+/// by port — but it is the whole path's parameter rather than that backend's,
+/// so a caller that already knows which profile it is indexing for cannot
+/// accidentally embed one profile's documents through another's provider.
+pub async fn embed_batch_under(
+    app_data: &Path,
     spec: &EmbeddingSpec,
     texts: &[String],
     is_query: bool,
@@ -612,6 +789,9 @@ pub async fn embed_batch(
         let mut vectors = match spec.backend {
             EmbeddingBackend::Llama => embed_via_llama(&spec.model_id_or_tag, batch).await?,
             EmbeddingBackend::Ollama => crate::ollama::embed(&spec.model_id_or_tag, batch).await?,
+            EmbeddingBackend::Extension => {
+                embed_via_extension(app_data, spec, batch, is_query).await?
+            }
         };
         for v in &mut vectors {
             l2_normalize(v);
@@ -785,6 +965,7 @@ mod tests {
             dim,
             query_prefix: String::new(),
             doc_prefix: String::new(),
+            extension_id: None,
         }
     }
 

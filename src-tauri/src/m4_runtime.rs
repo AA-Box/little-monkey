@@ -133,7 +133,7 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
+pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
@@ -153,6 +153,18 @@ fn atomic_write_private(path: &Path, bytes: &[u8], replace: bool) -> Result<(), 
         let _ = fs::remove_file(&temporary);
         format!("commit {}: {e}", path.display())
     })?;
+    sync_directory(parent)
+}
+
+pub(crate) fn atomic_replace_file(temporary: &Path, path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("path has no parent: {}", path.display()))?;
+    if temporary.parent() != Some(parent) {
+        return Err("atomic replacement must stay within one directory".to_string());
+    }
+    commit_private_temp(temporary, path, true)
+        .map_err(|error| format!("commit {}: {error}", path.display()))?;
     sync_directory(parent)
 }
 

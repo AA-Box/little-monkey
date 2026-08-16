@@ -9,7 +9,7 @@ const provider = {
   label: "OpenRouter",
   base_url: "https://openrouter.ai/api/v1",
   is_custom: false,
-  has_key: true,
+  has_key: true, is_extension: false
 };
 
 describe("/model provider curation", () => {

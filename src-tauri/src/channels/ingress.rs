@@ -24,8 +24,8 @@ use crate::channels::types::{BoundedMetadata, ChannelAttachment, ChannelEnvelope
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationSource {
-    /// The desktop app's own chat. Present so the enum describes every producer,
-    /// not because the GUI turn loop routes through here today.
+    /// The desktop app's own chat: the operator pressing Send in the webview,
+    /// and the editor protocol client on the same machine.
     Desktop,
     /// A paired mobile device submitting a turn over the remote protocol.
     Mobile,

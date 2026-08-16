@@ -784,7 +784,8 @@ mod tests {
     fn a_run_with_no_channel_origin_has_nowhere_to_send() {
         // No job id in the environment: every non-channel run looks like this.
         std::env::remove_var(JOB_ID_ENV);
-        let error = send_message(&request("hello"), &reply_authority(), None).expect_err("no origin");
+        let error =
+            send_message(&request("hello"), &reply_authority(), None).expect_err("no origin");
         assert!(error.contains("did not arrive from a messaging conversation"));
     }
 

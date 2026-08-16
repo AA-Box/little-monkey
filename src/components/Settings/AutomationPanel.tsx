@@ -16,7 +16,7 @@ import {
 import { useModelStore } from "../../store/modelStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { useVerifyStore, type VerifyCommand, type VerifyCommandKind } from "../../store/verifyStore";
-import { useWebStore, type SearchProvider } from "../../store/webStore";
+import { useWebStore, type FetchProvider, type SearchProvider } from "../../store/webStore";
 import { useCliInstallStore } from "../../store/cliInstallStore";
 import { providerModelKey } from "../../lib/visionModels";
 import { useT } from "../../lib/i18n";
@@ -74,6 +74,10 @@ const WEB_PROVIDER_OPTIONS: { value: SearchProvider; labelKey: string; descripti
   { value: "brave", labelKey: "WebPanel.providerBraveLabel", descriptionKey: "WebPanel.providerBraveDescription" },
   { value: "searxng", labelKey: "WebPanel.providerSearxngLabel", descriptionKey: "WebPanel.providerSearxngDescription" },
 ];
+
+function extensionCapabilityValue(extensionId: string | null, capabilityId: string): string {
+  return JSON.stringify([extensionId, capabilityId]);
+}
 
 const STRATEGY_OPTIONS: { value: ContextTrimStrategy; labelKey: string; descriptionKey: string }[] = [
   { value: "summarize", labelKey: "AutomationPanel.strategySummarizeLabel", descriptionKey: "AutomationPanel.strategySummarizeDescription" },
@@ -338,7 +342,7 @@ function CustomAgentsSection() {
  * namespace (unchanged) since renaming them would only add translation
  * churn for a purely internal relocation.
  */
-function WebSettingsSection() {
+export function WebSettingsSection() {
   const { t } = useT();
   const webToolsEnabled = useSettingsStore((s) => s.webToolsEnabled);
   const setWebToolsEnabled = useSettingsStore((s) => s.setWebToolsEnabled);
@@ -346,6 +350,8 @@ function WebSettingsSection() {
   const settings = useWebStore((s) => s.settings);
   const hasBraveKey = useWebStore((s) => s.hasBraveKey);
   const loaded = useWebStore((s) => s.loaded);
+  const searchCapabilities = useWebStore((s) => s.searchCapabilities);
+  const fetchCapabilities = useWebStore((s) => s.fetchCapabilities);
   const refresh = useWebStore((s) => s.refresh);
   const setSettings = useWebStore((s) => s.setSettings);
   const setBraveKey = useWebStore((s) => s.setBraveKey);
@@ -369,10 +375,94 @@ function WebSettingsSection() {
     setSearxngUrlInput(settings.searxng_base_url ?? "");
   }, [settings.searxng_base_url]);
 
+  const searchSelectionValue = settings.search_extension_capability_id
+    ? extensionCapabilityValue(settings.search_extension_id, settings.search_extension_capability_id)
+    : "";
+  const searchSelectionAvailable = searchCapabilities.some(
+    (capability) => capability.extension_id === settings.search_extension_id
+      && capability.capability_id === settings.search_extension_capability_id,
+  );
+  const fetchSelectionValue = settings.fetch_extension_capability_id
+    ? extensionCapabilityValue(settings.fetch_extension_id, settings.fetch_extension_capability_id)
+    : "";
+  const fetchSelectionAvailable = fetchCapabilities.some(
+    (capability) => capability.extension_id === settings.fetch_extension_id
+      && capability.capability_id === settings.fetch_extension_capability_id,
+  );
+
   async function handleProviderChange(provider: SearchProvider) {
     setSettingsError(null);
     try {
-      await setSettings({ ...settings, search_provider: provider });
+      const activeCapability = searchSelectionAvailable
+        ? searchCapabilities.find(
+          (capability) => capability.extension_id === settings.search_extension_id
+            && capability.capability_id === settings.search_extension_capability_id,
+        )
+        : searchCapabilities[0];
+      await setSettings({
+        ...settings,
+        search_provider: provider,
+        search_extension_id:
+          provider === "executable_extension" ? activeCapability?.extension_id ?? null : settings.search_extension_id,
+        search_extension_capability_id:
+          provider === "executable_extension" ? activeCapability?.capability_id ?? null : settings.search_extension_capability_id,
+      });
+    } catch (err) {
+      setSettingsError(errorMessage(err));
+    }
+  }
+
+  async function handleSearchCapabilityChange(selection: string) {
+    setSettingsError(null);
+    try {
+      const capability = searchCapabilities.find(
+        (candidate) => extensionCapabilityValue(candidate.extension_id, candidate.capability_id) === selection,
+      );
+      if (!capability) return;
+      await setSettings({
+        ...settings,
+        search_extension_id: capability.extension_id,
+        search_extension_capability_id: capability.capability_id,
+      });
+    } catch (err) {
+      setSettingsError(errorMessage(err));
+    }
+  }
+
+  async function handleFetchProviderChange(provider: FetchProvider) {
+    setSettingsError(null);
+    try {
+      const activeCapability = fetchSelectionAvailable
+        ? fetchCapabilities.find(
+          (capability) => capability.extension_id === settings.fetch_extension_id
+            && capability.capability_id === settings.fetch_extension_capability_id,
+        )
+        : fetchCapabilities[0];
+      await setSettings({
+        ...settings,
+        fetch_provider: provider,
+        fetch_extension_id:
+          provider === "executable_extension" ? activeCapability?.extension_id ?? null : settings.fetch_extension_id,
+        fetch_extension_capability_id:
+          provider === "executable_extension" ? activeCapability?.capability_id ?? null : settings.fetch_extension_capability_id,
+      });
+    } catch (err) {
+      setSettingsError(errorMessage(err));
+    }
+  }
+
+  async function handleFetchCapabilityChange(selection: string) {
+    setSettingsError(null);
+    try {
+      const capability = fetchCapabilities.find(
+        (candidate) => extensionCapabilityValue(candidate.extension_id, candidate.capability_id) === selection,
+      );
+      if (!capability) return;
+      await setSettings({
+        ...settings,
+        fetch_extension_id: capability.extension_id,
+        fetch_extension_capability_id: capability.capability_id,
+      });
     } catch (err) {
       setSettingsError(errorMessage(err));
     }
@@ -455,9 +545,96 @@ function WebSettingsSection() {
               </span>
             </label>
           ))}
+          <label className="flex items-start gap-2">
+            <input
+              type="radio"
+              name="web-search-provider"
+              checked={settings.search_provider === "executable_extension"}
+              disabled={searchCapabilities.length === 0 && settings.search_provider !== "executable_extension"}
+              onChange={() => void handleProviderChange("executable_extension")}
+              className="mt-1"
+            />
+            <span>
+              <span className="text-sm text-foreground">Executable extension</span>
+              <p className="text-xs text-muted">Use a healthy, active web-search capability installed under Extensions.</p>
+            </span>
+          </label>
+          {settings.search_provider === "executable_extension" && (
+            <select
+              aria-label="Executable web-search capability"
+              value={searchSelectionValue}
+              onChange={(event) => void handleSearchCapabilityChange(event.target.value)}
+              disabled={searchCapabilities.length === 0}
+              className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {settings.search_extension_capability_id && !searchSelectionAvailable
+                && <option value={searchSelectionValue}>Configured capability unavailable — reselect it</option>}
+              {searchCapabilities.length === 0 && <option value="">No healthy web-search capabilities</option>}
+              {searchCapabilities.map((capability) => (
+                <option
+                  key={`${capability.extension_id}:${capability.capability_id}`}
+                  value={extensionCapabilityValue(capability.extension_id, capability.capability_id)}
+                >
+                  {capability.display_name} · {capability.extension_id} · {capability.version}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         {settingsError && <p className="text-xs text-danger">{settingsError}</p>}
+
+        <div className="flex flex-col gap-2 border-t border-border pt-2.5">
+          <span className="text-sm font-medium text-foreground">Page fetch provider</span>
+          <label className="flex items-start gap-2">
+            <input
+              type="radio"
+              name="web-fetch-provider"
+              checked={settings.fetch_provider === "builtin"}
+              onChange={() => void handleFetchProviderChange("builtin")}
+              className="mt-1"
+            />
+            <span>
+              <span className="text-sm text-foreground">Built-in fetcher</span>
+              <p className="text-xs text-muted">Use Little Monkey's guarded HTTP and content-normalization pipeline.</p>
+            </span>
+          </label>
+          <label className="flex items-start gap-2">
+            <input
+              type="radio"
+              name="web-fetch-provider"
+              checked={settings.fetch_provider === "executable_extension"}
+              disabled={fetchCapabilities.length === 0 && settings.fetch_provider !== "executable_extension"}
+              onChange={() => void handleFetchProviderChange("executable_extension")}
+              className="mt-1"
+            />
+            <span>
+              <span className="text-sm text-foreground">Executable extension</span>
+              <p className="text-xs text-muted">Use a healthy, active web-fetch capability installed under Extensions.</p>
+            </span>
+          </label>
+          {settings.fetch_provider === "executable_extension" && (
+            <select
+              aria-label="Executable web-fetch capability"
+              value={fetchSelectionValue}
+              onChange={(event) => void handleFetchCapabilityChange(event.target.value)}
+              disabled={fetchCapabilities.length === 0}
+              className="h-8 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+            >
+              {settings.fetch_extension_capability_id && !fetchSelectionAvailable
+                && <option value={fetchSelectionValue}>Configured capability unavailable — reselect it</option>}
+              {fetchCapabilities.length === 0 && <option value="">No healthy web-fetch capabilities</option>}
+              {fetchCapabilities.map((capability) => (
+                <option
+                  key={`${capability.extension_id}:${capability.capability_id}`}
+                  value={extensionCapabilityValue(capability.extension_id, capability.capability_id)}
+                >
+                  {capability.display_name} · {capability.extension_id} · {capability.version}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
 
         <div className="flex flex-col gap-1.5 border-t border-border pt-2.5">
           <span className="text-sm text-foreground">{t("WebPanel.braveKeyLabel")}</span>

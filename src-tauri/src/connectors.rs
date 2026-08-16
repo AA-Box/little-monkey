@@ -89,6 +89,12 @@ pub enum ConnectorProvider {
     Notion,
     Jira,
     S3,
+    /// A sandboxed executable extension supplies the documents. The account
+    /// holds no credential of its own: the extension authenticates from
+    /// inside the sandbox through the secret slots it declared and the user
+    /// filled in, which is why `credential_ref` is `None` for these and why
+    /// nothing here ever sees the token.
+    Extension,
 }
 
 impl ConnectorProvider {
@@ -99,6 +105,7 @@ impl ConnectorProvider {
             ConnectorProvider::Notion => "notion",
             ConnectorProvider::Jira => "jira",
             ConnectorProvider::S3 => "s3",
+            ConnectorProvider::Extension => "extension",
         }
     }
 }
@@ -682,6 +689,20 @@ async fn verify_s3(
 /// `connector_account_id`-referencing connectors (GitHub is the one
 /// exception: it never stores a credential, so it resolves through
 /// `m5_delivery::github`'s `gh` bridge instead of this catalog).
+/// One account from the catalog under an explicit data root.
+///
+/// The knowledge pipeline already knows which profile's data root it is
+/// collecting for, and resolving the catalog under that root rather than
+/// through the ambient one keeps a source bound to the profile it belongs to
+/// — and makes the path exercisable without a real installation.
+pub fn account_by_id_under(app_data: &Path, id: &str) -> Result<ConnectorAccount, String> {
+    load_config_impl(&app_data.join(CONFIG_FILE))?
+        .accounts
+        .into_iter()
+        .find(|account| account.id == id)
+        .ok_or_else(|| format!("Unknown connector account '{id}'"))
+}
+
 pub fn account_by_id(id: &str) -> Result<ConnectorAccount, String> {
     load_config_impl(&config_file_path()?)?
         .accounts
@@ -860,6 +881,10 @@ async fn verify_token(
             "GitHub connects via `gh` — use connectors_add_github instead of a pasted token"
                 .to_string(),
         ),
+        ConnectorProvider::Extension => Err(
+            "An extension connector holds its own credentials — use connectors_add_extension"
+                .to_string(),
+        ),
         ConnectorProvider::Slack => verify_slack(token).await.map(|identity| (identity, None)),
         ConnectorProvider::Notion => verify_notion(token).await.map(|identity| (identity, None)),
         ConnectorProvider::Jira => {
@@ -967,6 +992,138 @@ pub async fn connectors_add_token(
         scopes,
         email,
         site_url,
+    )
+    .await
+}
+
+/// The extension and capability an extension-backed connector account is
+/// bound to, read out of the account's `connection` metadata.
+///
+/// Both halves are persisted at connect time and re-checked on every use, so
+/// an account cannot end up pointing at whichever extension happens to
+/// declare that capability id today.
+pub fn extension_connector_target(account: &ConnectorAccount) -> Result<(String, String), String> {
+    if account.provider != ConnectorProvider::Extension {
+        return Err("The selected connector account is not an extension account".to_string());
+    }
+    let connection = account
+        .connection
+        .as_ref()
+        .ok_or_else(|| "Missing extension connector details".to_string())?;
+    let extension_id = connection
+        .get("extension_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Missing the owning extension id".to_string())?;
+    let capability_id = connection
+        .get("capability_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Missing the connector capability id".to_string())?;
+    Ok((extension_id.to_string(), capability_id.to_string()))
+}
+
+/// One connector capability an installed extension currently offers, as shown
+/// in the connect dialog. A live read of the extension registry, so a
+/// disabled or uninstalled extension simply stops being offered.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionConnectorOption {
+    pub extension_id: String,
+    pub capability_id: String,
+    pub display_name: String,
+    pub description: String,
+}
+
+#[tauri::command]
+pub fn connectors_list_extension_options() -> Result<Vec<ExtensionConnectorOption>, String> {
+    let Some(app_data) = crate::app_paths::data_dir() else {
+        return Ok(Vec::new());
+    };
+    Ok(
+        crate::executable_extensions::ExtensionManager::new(app_data)?
+            .active_capabilities(Some(
+                crate::executable_extensions::CapabilityKind::Connector,
+            ))?
+            .into_iter()
+            .map(|capability| ExtensionConnectorOption {
+                extension_id: capability.extension_id,
+                capability_id: capability.capability_id,
+                display_name: capability.display_name,
+                description: capability.description,
+            })
+            .collect(),
+    )
+}
+
+/// Connect an extension-backed connector.
+///
+/// There is no token to take here and none to store: the extension holds its
+/// own credentials in its declared secret slots, and this account records
+/// only which capability of which installation the user chose. The capability
+/// is resolved live first, so an account is never created against an
+/// extension that is not installed, healthy and running.
+async fn add_extension_impl(
+    state: &AppState,
+    path: &Path,
+    label: String,
+    extension_id: String,
+    capability_id: String,
+) -> Result<ConnectorAccount, String> {
+    validate_label(&label)?;
+    crate::executable_extensions::validate_extension_identifier("extension id", &extension_id)?;
+    crate::executable_extensions::validate_extension_identifier("capability id", &capability_id)?;
+    let app_data = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
+    let owner = crate::executable_extensions::ExtensionManager::new(app_data)?
+        .resolve_active_capability(
+            crate::executable_extensions::CapabilityKind::Connector,
+            &capability_id,
+        )?;
+    if owner.extension_id != extension_id {
+        return Err(format!(
+            "Capability '{capability_id}' is owned by '{}', not '{extension_id}'",
+            owner.extension_id
+        ));
+    }
+    let now = crate::run_commands::unix_time_ms()?;
+    let account = ConnectorAccount {
+        id: uuid::Uuid::new_v4().to_string(),
+        provider: ConnectorProvider::Extension,
+        label,
+        scopes: vec!["read".to_string()],
+        credential_ref: None,
+        identity: Some(format!("{extension_id}:{capability_id}")),
+        created_at: now,
+        last_verified_at: Some(now),
+        last_error: None,
+        connection: Some(serde_json::json!({
+            "extension_id": extension_id,
+            "capability_id": capability_id,
+            "version": owner.version,
+        })),
+    };
+    let _guard = state
+        .connectors_config_lock
+        .lock()
+        .map_err(|_| "Connector catalog lock poisoned".to_string())?;
+    let mut config = load_config_impl(path)?;
+    config.version = SCHEMA_VERSION;
+    config.accounts.push(account.clone());
+    save_config_impl(path, &config)?;
+    Ok(account)
+}
+
+#[tauri::command]
+pub async fn connectors_add_extension(
+    state: tauri::State<'_, AppState>,
+    label: String,
+    extension_id: String,
+    capability_id: String,
+) -> Result<ConnectorAccount, String> {
+    add_extension_impl(
+        state.inner(),
+        &config_file_path()?,
+        label,
+        extension_id,
+        capability_id,
     )
     .await
 }
@@ -1171,6 +1328,29 @@ async fn reverify_impl(
                 let secret_key = read_credential(&account)?;
                 let (endpoint, bucket, region, access_key) = s3_connection(&account)?;
                 verify_s3(&endpoint, &bucket, &region, &access_key, &secret_key).await
+            }
+            // Reverifying an extension connector asks the runtime, not a
+            // remote service: the question is whether the capability this
+            // account was bound to is still owned by the same installation and
+            // still healthy. That is the whole of what could have changed, and
+            // it is the state every other consumer fails closed on.
+            ConnectorProvider::Extension => {
+                let (extension_id, capability_id) = extension_connector_target(&account)?;
+                let app_data = crate::app_paths::data_dir().ok_or_else(|| {
+                    "Could not resolve the Little Monkey app-data directory".to_string()
+                })?;
+                let owner = crate::executable_extensions::ExtensionManager::new(app_data)?
+                    .resolve_active_capability(
+                        crate::executable_extensions::CapabilityKind::Connector,
+                        &capability_id,
+                    )?;
+                if owner.extension_id != extension_id {
+                    return Err(format!(
+                        "Capability '{capability_id}' is now owned by '{}'; reconnect this account",
+                        owner.extension_id
+                    ));
+                }
+                Ok(format!("{extension_id}:{capability_id}@{}", owner.version))
             }
         }
     }

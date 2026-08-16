@@ -47,6 +47,10 @@ const BARGE_IN_MS: u32 = 240;
 /// The longest single utterance transcribed. A caller who talks past this is
 /// answered rather than left talking into a machine that stopped listening.
 const MAX_UTTERANCE_MS: u32 = 20_000;
+/// The longest transcript one turn may produce. A realtime provider that
+/// answers a 20-second utterance with a megabyte of text is malfunctioning,
+/// and the text goes straight into a conversation.
+const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
 
 /// What one carrier's media stream is actually shaped like.
 ///
@@ -582,6 +586,280 @@ impl CallTurnSink for QueuedCallTurns<'_> {
 /// state so a call uses exactly what the desktop uses.
 pub(crate) struct ConfiguredSpeech {
     pub app_data_dir: std::path::PathBuf,
+}
+
+/// A speech backend a call owns for its whole duration.
+///
+/// The two implementations differ in exactly one way that matters here:
+/// [`ConfiguredSpeech`] is stateless and answers each turn on its own, while
+/// [`RealtimeExtensionSpeech`] holds one sandboxed session open across the
+/// call. `finish` is what lets the second one close that session when the
+/// call ends; it does nothing for the first.
+#[async_trait]
+pub(crate) trait CallSpeechBackend: CallSpeech {
+    async fn finish(&self);
+}
+
+#[async_trait]
+impl CallSpeechBackend for ConfiguredSpeech {
+    async fn finish(&self) {}
+}
+
+/// Pick the speech backend this call should use.
+///
+/// The realtime provider is chosen the same way every other provider in this
+/// app is: by an operator's persisted selection, resolved against the live
+/// extension registry. A selection whose extension is gone, disabled or
+/// unhealthy fails here rather than half-way through a call.
+pub(crate) fn select_call_speech(
+    app_data_dir: &std::path::Path,
+) -> Result<Box<dyn CallSpeechBackend>, String> {
+    let voice = little_monkey_lib::m7_companion::call_voice_config(app_data_dir)?;
+    match (
+        voice.realtime_backend,
+        voice.realtime_extension_id.as_deref(),
+        voice.realtime_extension_capability_id.as_deref(),
+    ) {
+        (
+            little_monkey_lib::m7_companion::SpeechBackendKind::ExecutableExtension,
+            Some(extension_id),
+            Some(capability_id),
+        ) => Ok(Box::new(RealtimeExtensionSpeech::new(
+            app_data_dir,
+            extension_id,
+            capability_id,
+        )?)),
+        (little_monkey_lib::m7_companion::SpeechBackendKind::ExecutableExtension, _, _) => Err(
+            "Realtime voice is set to an executable extension, but no extension and capability \
+             are selected"
+                .to_string(),
+        ),
+        _ => Ok(Box::new(ConfiguredSpeech {
+            app_data_dir: app_data_dir.to_path_buf(),
+        })),
+    }
+}
+
+/// A live call served by one sandboxed extension session.
+///
+/// The session is the point. A realtime provider is not a pair of one-shot
+/// functions that happen to be called in a loop: it keeps conversation state —
+/// a partial utterance, a speaker profile, an upstream socket it owns inside
+/// its own sandbox — and it needs the same identity to be talking to it from
+/// the first frame to the last. The host owns that session: its id, its
+/// deadline, its version pin, and the fact that it is closed when the call
+/// ends. See `executable_extensions`'s session section for the guarantees.
+pub(crate) struct RealtimeExtensionSpeech {
+    manager: little_monkey_lib::executable_extensions::ExtensionManager,
+    artifacts: little_monkey_lib::artifact_store::ArtifactStore,
+    extension_id: String,
+    capability_id: String,
+    /// `Opening` until the first turn, `Open` for the life of the call, and
+    /// `Ended` the moment a step fails or the call finishes. A backend that
+    /// has ended fails closed rather than quietly opening a second session
+    /// mid-call, which would hand the rest of the conversation to a guest
+    /// that knows nothing about the first half of it.
+    session: tokio::sync::Mutex<RealtimeSessionState>,
+}
+
+enum RealtimeSessionState {
+    Unopened,
+    Open(String),
+    Ended,
+}
+
+/// The largest audio clip one realtime step may carry, in either direction.
+/// A 30-second utterance at 8 kHz/16-bit is under 500 KiB, so this carries the
+/// longest turn `MAX_UTTERANCE_MS` allows with room over.
+const MAX_REALTIME_AUDIO_BYTES: usize = 2 * 1024 * 1024;
+
+impl RealtimeExtensionSpeech {
+    fn new(
+        app_data_dir: &std::path::Path,
+        extension_id: &str,
+        capability_id: &str,
+    ) -> Result<Self, String> {
+        let artifacts = little_monkey_lib::artifact_store::ArtifactStore::with_max_blob_size(
+            app_data_dir.join("content-v1"),
+            MAX_REALTIME_AUDIO_BYTES as u64,
+        )
+        .map_err(|error| format!("Cannot open the artifact store: {error}"))?;
+        let manager =
+            little_monkey_lib::executable_extensions::ExtensionManager::new(app_data_dir)?
+                .with_artifact_root(artifacts.root())?;
+        Ok(Self {
+            manager,
+            artifacts,
+            extension_id: extension_id.to_string(),
+            capability_id: capability_id.to_string(),
+            session: tokio::sync::Mutex::new(RealtimeSessionState::Unopened),
+        })
+    }
+
+    /// Run one event through the call's session, opening it on first use.
+    ///
+    /// Every step goes through here so there is exactly one place that decides
+    /// what happens when a step fails: the session ends. Half a call served by
+    /// a guest that already failed is worse than a call that stops and says so.
+    async fn step(
+        &self,
+        event: serde_json::Value,
+        granted_artifact_ids: Vec<String>,
+    ) -> Result<little_monkey_lib::executable_extensions::SessionStep, String> {
+        use little_monkey_lib::executable_extensions::SessionInput;
+        let mut guard = self.session.lock().await;
+        let outcome = match &*guard {
+            RealtimeSessionState::Ended => {
+                return Err("This call's realtime speech session has ended".to_string())
+            }
+            // The first turn of a call opens the session *and* carries its
+            // event, so the open step needs the same grant a later send would
+            // have had. Anything else would make the first utterance the one
+            // the provider cannot hear.
+            RealtimeSessionState::Unopened => {
+                self.manager
+                    .open_session(
+                        little_monkey_lib::executable_extensions::CapabilityKind::RealtimeVoice,
+                        &self.extension_id,
+                        &self.capability_id,
+                        SessionInput::event(serde_json::json!({
+                            "sample_rate": CALL_SAMPLE_RATE,
+                            "encoding": "pcm_s16le",
+                            "first_event": event,
+                        }))
+                        .reading_artifacts(granted_artifact_ids),
+                    )
+                    .await
+            }
+            RealtimeSessionState::Open(session_id) => {
+                self.manager
+                    .session_send(
+                        session_id,
+                        SessionInput::event(event).reading_artifacts(granted_artifact_ids),
+                    )
+                    .await
+            }
+        };
+        match outcome {
+            Ok(step) => {
+                *guard = if step.done {
+                    RealtimeSessionState::Ended
+                } else {
+                    RealtimeSessionState::Open(step.session_id.clone())
+                };
+                Ok(step)
+            }
+            Err(error) => {
+                *guard = RealtimeSessionState::Ended;
+                Err(error)
+            }
+        }
+    }
+
+    /// The first event of `kind` this step emitted, if any.
+    fn event<'a>(
+        step: &'a little_monkey_lib::executable_extensions::SessionStep,
+        kind: &str,
+    ) -> Option<&'a serde_json::Value> {
+        step.events
+            .iter()
+            .find(|event| event.kind == kind)
+            .map(|event| &event.payload)
+    }
+}
+
+#[async_trait]
+impl CallSpeech for RealtimeExtensionSpeech {
+    async fn transcribe(&self, wav: Vec<u8>) -> Result<String, String> {
+        if wav.len() > MAX_REALTIME_AUDIO_BYTES {
+            return Err("The caller's turn exceeds the realtime audio limit".to_string());
+        }
+        // The audio goes in as an artifact the host published, not as base64
+        // in the event: the session event budget is small on purpose, and an
+        // artifact is the one channel with a size bound the runtime enforces.
+        let audio = self
+            .artifacts
+            .put(&wav)
+            .map_err(|error| format!("Could not publish the caller's audio: {error}"))?;
+        // Two separate statements about the same id: the event *names* it so
+        // the guest knows what to ask for, and the grant beside it is what
+        // makes the ask succeed. The host wrote these bytes a line ago, which
+        // is the only reason it has the standing to hand them over.
+        let step = self
+            .step(
+                serde_json::json!({
+                    "kind": "caller_audio",
+                    "artifact_id": audio.id,
+                    "byte_len": wav.len(),
+                }),
+                vec![audio.id.clone()],
+            )
+            .await?;
+        let payload = Self::event(&step, "transcript")
+            .ok_or_else(|| "The realtime extension returned no transcript".to_string())?;
+        let text = payload
+            .get("text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if text.is_empty() || text.len() > MAX_TRANSCRIPT_BYTES {
+            return Err(
+                "The realtime extension returned an empty or oversized transcript".to_string(),
+            );
+        }
+        Ok(text)
+    }
+
+    async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
+        let step = self
+            .step(
+                serde_json::json!({ "kind": "agent_text", "text": text }),
+                Vec::new(),
+            )
+            .await?;
+        let payload = Self::event(&step, "audio")
+            .ok_or_else(|| "The realtime extension returned no audio".to_string())?;
+        let artifact_id = payload
+            .get("artifact_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "The realtime extension returned audio with no artifact".to_string())?;
+        if !step.written_artifact_ids.iter().any(|id| id == artifact_id) {
+            return Err(
+                "The realtime extension named audio it did not write; the clip was refused"
+                    .to_string(),
+            );
+        }
+        let bytes = self
+            .artifacts
+            .read(artifact_id)
+            .map_err(|error| format!("Could not read the synthesized audio: {error}"))?;
+        if bytes.len() > MAX_REALTIME_AUDIO_BYTES {
+            return Err("The realtime extension returned oversized audio".to_string());
+        }
+        read_wav_as_call_audio(&bytes)
+    }
+
+    async fn keep_audio(&self, wav: Vec<u8>) -> Result<String, String> {
+        // Voicemail is host business, not the provider's: the recording is
+        // already in hand and belongs in the same store every other attachment
+        // uses, whichever backend was going to transcribe it.
+        self.artifacts
+            .put(&wav)
+            .map(|blob| blob.id)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl CallSpeechBackend for RealtimeExtensionSpeech {
+    async fn finish(&self) {
+        let mut guard = self.session.lock().await;
+        if let RealtimeSessionState::Open(session_id) = &*guard {
+            let _ = self.manager.session_close(session_id).await;
+        }
+        *guard = RealtimeSessionState::Ended;
+    }
 }
 
 #[async_trait]

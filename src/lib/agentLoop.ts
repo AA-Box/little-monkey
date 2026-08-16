@@ -39,6 +39,7 @@ import {
 import { cachedLearningMode } from './skillLearningClient';
 import type { NativeSkillScope } from './nativeSkillsClient';
 import { mcpToolDefs } from './mcpTools';
+import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
 import {
@@ -2776,6 +2777,7 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+  const { defs: extensionDefs, registry: extensionRegistry } = await executableExtensionToolDefs();
 
   // This session's attached knowledge stacks (see `ChatSession.attachedStackIds`,
   // `StackPicker.tsx`), resolved against the current stack registry once per
@@ -2857,7 +2859,7 @@ async function runAgentTurnBody(
   // offer it). The result lives in private app storage, not the workspace,
   // so it has no edit-permission or selected-folder dependency.
   const baseToolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs], mode),
+    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled,
     // Ultracode force-offers the `task` tool even when the subagents toggle
@@ -3496,6 +3498,8 @@ async function runAgentTurnBody(
         undefined,
         skillToolContext,
         sessionId,
+        undefined,
+        extensionRegistry,
       );
       return finishObservedTool(result);
     });
@@ -3508,7 +3512,7 @@ async function runAgentTurnBody(
       const modelResultContent = protectToolResult(
         toolCall.function.name,
         resultContent,
-        mcpRegistry.has(toolCall.function.name),
+        mcpRegistry.has(toolCall.function.name) || extensionRegistry.has(toolCall.function.name),
       );
       const toolMessage: ChatMessage = {
         role: 'tool',
