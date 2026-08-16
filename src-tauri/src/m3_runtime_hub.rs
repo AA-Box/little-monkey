@@ -8852,14 +8852,22 @@ mod tests {
                         .and_then(|line| line.split(' ').nth(1))
                         .unwrap_or("/")
                         .to_string();
+                    // Every response says `connection: close`, because this
+                    // fixture serves one request per connection and then drops
+                    // it. Without saying so it looks like a keep-alive server,
+                    // and the hop-limit test — four requests to one origin in a
+                    // row — fails on a pooled socket the fixture had already
+                    // closed rather than on the hop limit under test. It passed
+                    // alone and failed in a loaded suite, which is the shape
+                    // that costs an afternoon.
                     let redirect = |location: &str| {
                         format!(
-                            "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\n\r\n"
+                            "HTTP/1.1 302 Found\r\nlocation: {location}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
                         )
                     };
                     let response = match path.as_str() {
                         "/catalog.json" => format!(
-                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{PUBLISHED_CATALOG}",
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{PUBLISHED_CATALOG}",
                             PUBLISHED_CATALOG.len()
                         ),
                         // The shape a GitHub release answers with, minus the
@@ -8881,11 +8889,12 @@ mod tests {
                                 .trim()
                                 .to_string();
                             format!(
-                                "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\n\r\n{range}",
+                                "HTTP/1.1 206 Partial Content\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{range}",
                                 range.len()
                             )
                         }
-                        _ => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".to_string(),
+                        _ => "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                            .to_string(),
                     };
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.flush().await;
