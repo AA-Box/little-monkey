@@ -35,6 +35,7 @@ use little_monkey_lib::channels::types::{
     ChannelSender, SendOutcome,
 };
 
+use super::super::telecom_store::CallDirection;
 use super::{CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind, TelecomProvider};
 
 pub struct MockProvider {
@@ -75,6 +76,9 @@ pub struct DialedCall {
     /// Whether the account asked for this call to be recorded, so a test can
     /// prove the setting reached the carrier rather than stopping at the UI.
     pub record: bool,
+    /// The call row's idempotency key, so a restart test can prove the retry
+    /// carried the same one rather than dialing as a fresh call.
+    pub idempotency_key: String,
 }
 
 impl MockProvider {
@@ -141,6 +145,64 @@ impl MockProvider {
         })
     }
 
+    /// A signed `(headers, body)` pair a test can feed into `verify_webhook`
+    /// to exercise the inbound-call path — the carrier asking what to do with
+    /// a ringing line.
+    pub fn sign_inbound_call(
+        &self,
+        provider_call_id: &str,
+        from_number: &str,
+    ) -> (Vec<(String, String)>, Vec<u8>) {
+        self.sign_body(&MockWebhookBody::InboundCall {
+            provider_call_id: provider_call_id.to_string(),
+            from: from_number.to_string(),
+            to: self.from_number.clone(),
+        })
+    }
+
+    /// A signed `(headers, body)` pair for a call this machine placed being
+    /// picked up at the far end — the moment its audio has to be connected.
+    pub fn sign_outbound_answered(
+        &self,
+        provider_call_id: &str,
+        to_number: &str,
+    ) -> (Vec<(String, String)>, Vec<u8>) {
+        self.sign_body(&MockWebhookBody::OutboundAnswered {
+            provider_call_id: provider_call_id.to_string(),
+            request_id: None,
+            to: to_number.to_string(),
+        })
+    }
+
+    /// The same, for a carrier that identifies the live call by a different id
+    /// than the one it accepted the dial with.
+    pub fn sign_outbound_answered_with_request_id(
+        &self,
+        provider_call_id: &str,
+        request_id: &str,
+    ) -> (Vec<(String, String)>, Vec<u8>) {
+        self.sign_body(&MockWebhookBody::OutboundAnswered {
+            provider_call_id: provider_call_id.to_string(),
+            request_id: Some(request_id.to_string()),
+            to: "+15551234567".to_string(),
+        })
+    }
+
+    /// A signed `(headers, body)` pair carrying a delivery receipt for a text
+    /// this carrier accepted earlier.
+    pub fn sign_sms_status(
+        &self,
+        provider_message_id: &str,
+        delivered: bool,
+        error: Option<&str>,
+    ) -> (Vec<(String, String)>, Vec<u8>) {
+        self.sign_body(&MockWebhookBody::SmsStatus {
+            provider_message_id: provider_message_id.to_string(),
+            delivered,
+            error: error.map(str::to_string),
+        })
+    }
+
     /// A signed `(headers, body)` pair that normalizes to
     /// `TelecomEvent::Ignored` — a carrier heartbeat, in mock form.
     pub fn sign_ignored(&self) -> (Vec<(String, String)>, Vec<u8>) {
@@ -181,6 +243,21 @@ enum MockWebhookBody {
     CallProgress {
         provider_call_id: String,
         state: CallState,
+    },
+    InboundCall {
+        provider_call_id: String,
+        from: String,
+        to: String,
+    },
+    OutboundAnswered {
+        provider_call_id: String,
+        request_id: Option<String>,
+        to: String,
+    },
+    SmsStatus {
+        provider_message_id: String,
+        delivered: bool,
+        error: Option<String>,
     },
     Ignored,
 }
@@ -226,6 +303,21 @@ impl TelecomProvider for MockProvider {
         Some(MEDIA_FORMAT)
     }
 
+    /// The mock streams like Twilio, so it answers like Twilio. Without a
+    /// document here the whole answering path — the route deciding a ringing
+    /// line gets connected, and to which socket — would have nothing that could
+    /// exercise it end to end, which is exactly how a carrier that never
+    /// produced an inbound call at all went unnoticed.
+    fn answer_instructions(&self, media_url: &str) -> Option<super::AnswerDocument> {
+        Some(super::AnswerDocument {
+            content_type: "text/xml; charset=utf-8",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"{}\"/></Connect></Response>",
+                crate::daemon::service::xml_escape(media_url)
+            ),
+        })
+    }
+
     async fn probe(&self) -> ChannelHealth {
         ChannelHealth::connected(now_ms(), Some(self.from_number.clone()))
     }
@@ -259,12 +351,14 @@ impl TelecomProvider for MockProvider {
         to_number: &str,
         answer_url: &str,
         record: bool,
+        idempotency_key: &str,
     ) -> Result<CallHandle, String> {
         let mut state = self.state.lock().unwrap();
         state.dialed_calls.push(DialedCall {
             to_number: to_number.to_string(),
             answer_url: answer_url.to_string(),
             record,
+            idempotency_key: idempotency_key.to_string(),
         });
         if let Some(outcome) = state.call_outcomes.pop_front() {
             return outcome;
@@ -283,6 +377,7 @@ impl TelecomProvider for MockProvider {
 
     fn verify_webhook(
         &self,
+        _path: &str,
         headers: &[(String, String)],
         body: &[u8],
         now_ms: i64,
@@ -304,8 +399,9 @@ impl TelecomProvider for MockProvider {
                 to,
                 text,
             } => {
+                let from = super::normalize_e164(&from);
                 let mut metadata = BoundedMetadata::new();
-                metadata.insert("to_number", to);
+                metadata.insert("to_number", super::normalize_e164(&to));
                 Ok(TelecomEvent::InboundSms(Box::new(ChannelEnvelope {
                     account_id: self.account_id.clone(),
                     kind: ChannelKind::Sms,
@@ -328,6 +424,39 @@ impl TelecomProvider for MockProvider {
                 state,
                 detail: None,
             }),
+            MockWebhookBody::InboundCall {
+                provider_call_id,
+                from,
+                to,
+            } => Ok(TelecomEvent::AnswerRequest {
+                provider_call_id,
+                request_id: None,
+                direction: CallDirection::Inbound,
+                from_number: super::normalize_e164(&from),
+                to_number: super::normalize_e164(&to),
+                received_at_ms: now_ms,
+            }),
+            MockWebhookBody::OutboundAnswered {
+                provider_call_id,
+                request_id,
+                to,
+            } => Ok(TelecomEvent::AnswerRequest {
+                provider_call_id,
+                request_id,
+                direction: CallDirection::Outbound,
+                from_number: super::normalize_e164(&self.from_number),
+                to_number: super::normalize_e164(&to),
+                received_at_ms: now_ms,
+            }),
+            MockWebhookBody::SmsStatus {
+                provider_message_id,
+                delivered,
+                error,
+            } => Ok(TelecomEvent::SmsStatus {
+                provider_message_id,
+                delivered,
+                error,
+            }),
             MockWebhookBody::Ignored => Ok(TelecomEvent::Ignored),
         }
     }
@@ -336,6 +465,14 @@ impl TelecomProvider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The path a carrier's answer request arrives on, which is what its
+    /// signature covers. Built from the shared function rather than typed, so
+    /// a test cannot agree with a verifier that has drifted from the route.
+    const ANSWER_PATH: &str = "/v1/telecom/acct-1";
+    /// Where a carrier reports what became of a message or a call.
+    #[allow(dead_code)]
+    const STATUS_PATH: &str = "/v1/telecom/acct-1/status";
 
     fn config() -> TelecomConfig {
         TelecomConfig {
@@ -359,7 +496,9 @@ mod tests {
     fn a_correctly_signed_body_verifies() {
         let provider = provider();
         let (headers, body) = provider.sign_inbound_sms("+15551230000", "+15550001111", "hi");
-        assert!(provider.verify_webhook(&headers, &body, 0).is_ok());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+            .is_ok());
     }
 
     #[test]
@@ -367,7 +506,9 @@ mod tests {
         let provider = provider();
         let (headers, _) = provider.sign_inbound_sms("+15551230000", "+15550001111", "hi");
         let tampered = br#"{"type":"inbound_sms","message_id":"mock-msg-1","from":"+1evil","to":"+1","text":"hi"}"#;
-        assert!(provider.verify_webhook(&headers, tampered, 0).is_err());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, tampered, 0)
+            .is_err());
     }
 
     #[test]
@@ -378,14 +519,16 @@ mod tests {
             ..config()
         });
         let (headers, body) = other.sign_inbound_sms("+15551230000", "+15550001111", "hi");
-        assert!(provider.verify_webhook(&headers, &body, 0).is_err());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+            .is_err());
     }
 
     #[test]
     fn a_missing_signature_header_is_rejected() {
         let provider = provider();
         let (_, body) = provider.sign_inbound_sms("+15551230000", "+15550001111", "hi");
-        assert!(provider.verify_webhook(&[], &body, 0).is_err());
+        assert!(provider.verify_webhook(ANSWER_PATH, &[], &body, 0).is_err());
     }
 
     // --- normalization ----------------------------------------------------
@@ -395,7 +538,7 @@ mod tests {
         let provider = provider();
         let (headers, body) = provider.sign_inbound_sms("+15551230000", "+15550001111", "hello");
         let event = provider
-            .verify_webhook(&headers, &body, 1_700_000_000_000)
+            .verify_webhook(ANSWER_PATH, &headers, &body, 1_700_000_000_000)
             .unwrap();
         match event {
             TelecomEvent::InboundSms(envelope) => {
@@ -413,7 +556,9 @@ mod tests {
     fn call_progress_normalizes_to_the_scripted_state() {
         let provider = provider();
         let (headers, body) = provider.sign_call_progress("call-1", CallState::Ringing);
-        let event = provider.verify_webhook(&headers, &body, 0).unwrap();
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+            .unwrap();
         assert_eq!(
             event,
             TelecomEvent::CallProgress {
@@ -425,10 +570,68 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_ring_normalizes_to_an_inbound_call() {
+        let provider = provider();
+        let (headers, body) = provider.sign_inbound_call("mock-call-7", "15551230000");
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, &body, 1_700_000_000_000)
+            .expect("verifies");
+
+        assert_eq!(
+            event,
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
+                provider_call_id: "mock-call-7".to_string(),
+                from_number: "+15551230000".to_string(),
+                to_number: "+15550001111".to_string(),
+                received_at_ms: 1_700_000_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn a_signed_receipt_normalizes_to_a_delivery_state() {
+        let provider = provider();
+        let (headers, body) = provider.sign_sms_status("mock-msg-1", false, Some("handset off"));
+
+        assert_eq!(
+            provider
+                .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+                .expect("verifies"),
+            TelecomEvent::SmsStatus {
+                provider_message_id: "mock-msg-1".to_string(),
+                delivered: false,
+                error: Some("handset off".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_tampered_ring_produces_no_event() {
+        let provider = provider();
+        let (headers, mut body) = provider.sign_inbound_call("mock-call-7", "+15551230000");
+        body = body
+            .iter()
+            .map(|byte| if *byte == b'7' { b'8' } else { *byte })
+            .collect();
+
+        assert!(
+            provider
+                .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+                .is_err(),
+            "a rewritten call id must not answer a call"
+        );
+    }
+
+    #[test]
     fn an_uninteresting_callback_is_ignored() {
         let provider = provider();
         let (headers, body) = provider.sign_ignored();
-        let event = provider.verify_webhook(&headers, &body, 0).unwrap();
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, &body, 0)
+            .unwrap();
         assert_eq!(event, TelecomEvent::Ignored);
     }
 
@@ -486,7 +689,12 @@ mod tests {
     async fn the_recording_setting_reaches_the_carrier() {
         let provider = provider();
         let _ = provider
-            .place_call("+15551230000", "https://example.com/answer", true)
+            .place_call(
+                "+15551230000",
+                "https://example.com/answer",
+                true,
+                "outbound:job-1:+15551230000",
+            )
             .await;
         assert!(
             provider.dialed_calls()[0].record,
@@ -502,7 +710,12 @@ mod tests {
             state: CallState::Queued,
         }));
         let handle = provider
-            .place_call("+1", "https://example.com/answer", false)
+            .place_call(
+                "+1",
+                "https://example.com/answer",
+                false,
+                "outbound:job-1:+1",
+            )
             .await
             .unwrap();
         assert_eq!(handle.provider_call_id, "scripted-1");
@@ -512,6 +725,7 @@ mod tests {
                 record: false,
                 to_number: "+1".to_string(),
                 answer_url: "https://example.com/answer".to_string(),
+                idempotency_key: "outbound:job-1:+1".to_string(),
             }]
         );
     }

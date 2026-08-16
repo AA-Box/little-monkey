@@ -29,6 +29,7 @@ function account(overrides: Partial<TelecomAccount> = {}): TelecomAccount {
       recording_enabled: false,
     },
     health: { state: "connected", detail: null, last_error: null, probed_at_ms: 1 },
+    callback_rejections: { count: 0, last_reason: null, last_at_ms: null },
     updated_at_ms: 1,
     ...overrides,
   };

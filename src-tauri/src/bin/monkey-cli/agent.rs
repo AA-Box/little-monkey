@@ -1024,14 +1024,28 @@ async fn execute_tool_call(
             .unwrap_or_default()
             .to_string();
         // The approval prompt shows the words that will be said, because the
-        // words are most of what the operator is approving.
+        // words are most of what the operator is approving. An account set to
+        // dial without asking skips the prompt — that setting is the standing
+        // approval, and prompting anyway would make it mean nothing.
         let detail = format!("call {to_number} from {account_id} and say: {opening_line}");
-        return match perms.request("place_call", &detail).await {
+        let gate = if crate::daemon::telecom_tool::outbound_needs_prompt(&account_id) {
+            perms.request("place_call", &detail).await
+        } else {
+            Ok(())
+        };
+        return match gate {
             Ok(()) => {
                 match crate::daemon::telecom_tool::place_call(
                     &account_id,
                     &to_number,
                     &opening_line,
+                    // The loop's own id for this invocation, which is what a
+                    // replayed run resolves to the same call by. Never
+                    // anything the model supplied.
+                    &crate::daemon::telecom_tool::CallInvocation {
+                        job_id: None,
+                        tool_call_id: Some(tool_call_id.to_string()),
+                    },
                 )
                 .await
                 {

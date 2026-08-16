@@ -25,12 +25,12 @@
 //!
 //! `verify_webhook` receives only headers, a body and a clock reading (see
 //! `mod.rs`'s trait doc) — never the request path — so the URL Twilio signed
-//! has to be reconstructed rather than observed. [`WEBHOOK_PATH`] is the
-//! fixed path this provider assumes the operator's Twilio console points both
-//! the incoming-message and call-status-callback URLs at; combined with
-//! [`TelecomConfig::public_base_url`] (never a `Host` or `X-Forwarded-*`
-//! header — those are attacker-controlled on an unauthenticated request) it
-//! is the whole of the URL Twilio signed over.
+//! has to be reconstructed rather than observed. It is
+//! [`super::callback_path`] under [`TelecomConfig::public_base_url`] — the same
+//! function the listener routes on and the setup UI tells the operator to
+//! paste into the Twilio console, so the three cannot drift apart. The base is
+//! never a `Host` or `X-Forwarded-*` header: those are attacker-controlled on
+//! an unauthenticated request.
 
 use std::collections::BTreeMap;
 
@@ -43,6 +43,7 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
+use super::super::telecom_store::CallDirection;
 use super::{
     AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
     TelecomProvider,
@@ -50,10 +51,10 @@ use super::{
 
 const API_BASE: &str = "https://api.twilio.com/2010-04-01";
 
-/// See the module doc's "Reconstructing the signed URL" section.
-const WEBHOOK_PATH: &str = "/webhooks/telephony/twilio";
-
 pub struct TwilioProvider {
+    /// This app's own id for the account, which is what its callback path is
+    /// keyed by. See the module doc's "Reconstructing the signed URL".
+    account_id: String,
     account_sid: String,
     auth_token: String,
     from_number: String,
@@ -66,6 +67,7 @@ pub struct TwilioProvider {
 impl TwilioProvider {
     pub fn new(config: TelecomConfig) -> Self {
         Self {
+            account_id: config.account_id,
             account_sid: config.carrier_account_id,
             auth_token: config.secret,
             from_number: config.from_number,
@@ -119,11 +121,24 @@ impl TwilioProvider {
         )
     }
 
-    fn webhook_url(&self) -> Result<String, String> {
+    /// The URL Twilio signed: the operator's configured base plus the exact
+    /// path this daemon served the request on. A status callback and an answer
+    /// request arrive on different paths and are signed over different URLs, so
+    /// the path cannot be assumed.
+    fn signed_url(&self, path: &str) -> Result<String, String> {
         let base = self.public_base_url.as_deref().ok_or_else(|| {
             "no public base URL is configured; cannot verify a Twilio webhook signature".to_string()
         })?;
-        Ok(format!("{}{WEBHOOK_PATH}", base.trim_end_matches('/')))
+        Ok(format!("{}{path}", base.trim_end_matches('/')))
+    }
+
+    /// Where Twilio is told to report what became of a message or a call.
+    /// `None` when the operator has configured no public base, in which case
+    /// nothing can be reported to us at all.
+    fn status_callback(&self) -> Option<String> {
+        self.public_base_url
+            .as_deref()
+            .map(|base| super::status_callback_url(base, &self.account_id))
     }
 }
 
@@ -221,11 +236,18 @@ impl TelecomProvider for TwilioProvider {
             Ok(client) => client,
             Err(error) => return SendOutcome::PermanentFailure { error },
         };
+        // Twilio sends delivery updates for a REST message only to a
+        // `StatusCallback` given on the message itself; without one the
+        // delivery parser downstream never sees anything to parse.
+        let status_callback = self.status_callback();
         let mut params = vec![
             ("To", to_number),
             ("From", self.from_number.as_str()),
             ("Body", text),
         ];
+        if let Some(callback) = status_callback.as_deref() {
+            params.push(("StatusCallback", callback));
+        }
         // Twilio fetches each MediaUrl itself, which is why the URLs are signed
         // and short-lived rather than public.
         for url in media_urls {
@@ -286,13 +308,30 @@ impl TelecomProvider for TwilioProvider {
         to_number: &str,
         answer_url: &str,
         record: bool,
+        idempotency_key: &str,
     ) -> Result<CallHandle, String> {
+        // No caller-supplied dedupe key on this carrier's call API; the outbox
+        // row's own state machine is what stops a second dial.
+        let _ = idempotency_key;
         let client = self.client()?;
+        let status_callback = self.status_callback();
         let mut params = vec![
             ("To", to_number),
             ("From", self.from_number.as_str()),
+            // Requested when the far end picks up. The reply to it is the
+            // TwiML that connects this call to its media socket.
             ("Url", answer_url),
+            ("Method", "POST"),
         ];
+        if let Some(callback) = status_callback.as_deref() {
+            params.push(("StatusCallback", callback));
+            params.push(("StatusCallbackMethod", "POST"));
+            // Every lifecycle transition the call store models. Twilio sends
+            // only `completed` unless the others are asked for by name.
+            for event in ["initiated", "ringing", "answered", "completed"] {
+                params.push(("StatusCallbackEvent", event));
+            }
+        }
         if record {
             // Twilio records the whole call from answer and stores it under the
             // operator's own account, where their retention settings apply.
@@ -359,16 +398,17 @@ impl TelecomProvider for TwilioProvider {
 
     fn verify_webhook(
         &self,
+        path: &str,
         headers: &[(String, String)],
         body: &[u8],
         now_ms: i64,
     ) -> Result<TelecomEvent, String> {
         let signature_b64 = header(headers, "X-Twilio-Signature")
             .ok_or_else(|| "missing X-Twilio-Signature header".to_string())?;
-        let url = self.webhook_url()?;
+        let url = self.signed_url(path)?;
         let params = decode_form_urlencoded(body)?;
         twilio_verify_signature(&self.auth_token, &url, &params, signature_b64)?;
-        normalize_twilio_params(&params, now_ms)
+        normalize_twilio_params(&params, path.ends_with("/status"), now_ms)
     }
 }
 
@@ -383,16 +423,57 @@ fn twilio_call_status_to_state(status: &str) -> Option<CallState> {
     }
 }
 
+/// Twilio's terminal delivery states, and whether each one means it arrived.
+///
+/// The intermediate ones (`queued`, `sending`, `sent`, `accepted`) are not
+/// answers to "did it reach the handset?" — they are the carrier repeating that
+/// it has the message — so they normalize to `Ignored` rather than being
+/// recorded as a delivery that has not happened.
+fn twilio_delivery(status: &str) -> Option<bool> {
+    match status {
+        "delivered" => Some(true),
+        "undelivered" | "failed" => Some(false),
+        _ => None,
+    }
+}
+
 fn normalize_twilio_params(
     params: &BTreeMap<String, String>,
+    on_status_path: bool,
     received_at_ms: i64,
 ) -> Result<TelecomEvent, String> {
+    // A delivery receipt carries `MessageStatus` and the same `MessageSid` as
+    // the message it is about. Checked *before* the inbound-message arm: an
+    // inbound message has no `MessageStatus`, and treating a receipt as an
+    // inbound text would deliver an empty message to the agent, apparently
+    // from the recipient of the text we just sent.
+    if let (Some(message_sid), Some(status)) = (
+        params.get("MessageSid").or_else(|| params.get("SmsSid")),
+        params.get("MessageStatus").or_else(|| {
+            params
+                .get("SmsStatus")
+                .filter(|value| value.as_str() != "received")
+        }),
+    ) {
+        let Some(delivered) = twilio_delivery(status) else {
+            return Ok(TelecomEvent::Ignored);
+        };
+        return Ok(TelecomEvent::SmsStatus {
+            provider_message_id: message_sid.clone(),
+            delivered,
+            error: (!delivered).then(|| match params.get("ErrorCode") {
+                Some(code) => format!("Twilio reported {status} (error {code})"),
+                None => format!("Twilio reported {status}"),
+            }),
+        });
+    }
     if let Some(message_sid) = params.get("MessageSid") {
-        let from = params
-            .get("From")
-            .cloned()
-            .ok_or_else(|| "Twilio inbound SMS is missing From".to_string())?;
-        let to = params.get("To").cloned().unwrap_or_default();
+        let from = super::normalize_e164(
+            params
+                .get("From")
+                .ok_or_else(|| "Twilio inbound SMS is missing From".to_string())?,
+        );
+        let to = super::normalize_e164(params.get("To").map(String::as_str).unwrap_or_default());
         let text = params.get("Body").cloned().unwrap_or_default();
         let num_media: usize = params
             .get("NumMedia")
@@ -439,8 +520,46 @@ fn normalize_twilio_params(
         };
         return Ok(TelecomEvent::InboundSms(Box::new(envelope)));
     }
-    if let (Some(call_sid), Some(call_status)) = (params.get("CallSid"), params.get("CallStatus")) {
-        if let Some(state) = twilio_call_status_to_state(call_status) {
+    if let Some(call_sid) = params.get("CallSid") {
+        let direction = params.get("Direction").map(String::as_str).unwrap_or("");
+        let inbound = direction.starts_with("inbound");
+        // Twilio asks what to do with a live call by requesting the voice URL,
+        // and reports what became of one on the status URL. Both carry a
+        // `CallSid` and a `CallStatus`; only the path says which question is
+        // being asked. Answering a status callback with stream markup would
+        // connect a call that has already ended, and acknowledging a voice
+        // request leaves whoever picked up listening to silence — which is
+        // exactly what outbound calls used to do.
+        if !on_status_path {
+            return Ok(TelecomEvent::AnswerRequest {
+                provider_call_id: call_sid.clone(),
+                request_id: None,
+                direction: if inbound {
+                    CallDirection::Inbound
+                } else {
+                    CallDirection::Outbound
+                },
+                from_number: super::normalize_e164(
+                    params
+                        .get("From")
+                        .or_else(|| params.get("Caller"))
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                ),
+                to_number: super::normalize_e164(
+                    params
+                        .get("To")
+                        .or_else(|| params.get("Called"))
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                ),
+                received_at_ms,
+            });
+        }
+        if let Some(state) = params
+            .get("CallStatus")
+            .and_then(|status| twilio_call_status_to_state(status))
+        {
             return Ok(TelecomEvent::CallProgress {
                 provider_call_id: call_sid.clone(),
                 state,
@@ -547,6 +666,14 @@ struct TwilioCallResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The path a carrier's answer request arrives on, which is what its
+    /// signature covers. Built from the shared function rather than typed, so
+    /// a test cannot agree with a verifier that has drifted from the route.
+    const ANSWER_PATH: &str = "/v1/telecom/acct-1";
+    /// Where a carrier reports what became of a message or a call.
+    #[allow(dead_code)]
+    const STATUS_PATH: &str = "/v1/telecom/acct-1/status";
 
     fn config(base_url: &str) -> TelecomConfig {
         TelecomConfig {
@@ -663,7 +790,7 @@ mod tests {
     #[test]
     fn verify_webhook_normalizes_an_inbound_sms() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let mut params = BTreeMap::new();
         params.insert("MessageSid".to_string(), "SM123".to_string());
         params.insert("From".to_string(), "+15551230000".to_string());
@@ -673,7 +800,7 @@ mod tests {
         let body = "MessageSid=SM123&From=%2B15551230000&To=%2B15550001111&Body=hello+there";
         let headers = vec![("X-Twilio-Signature".to_string(), signature)];
         let event = provider
-            .verify_webhook(&headers, body.as_bytes(), 1_700_000_000_000)
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 1_700_000_000_000)
             .expect("verifies");
         match event {
             TelecomEvent::InboundSms(envelope) => {
@@ -690,7 +817,9 @@ mod tests {
     #[test]
     fn verify_webhook_normalizes_a_call_status() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        // A status callback arrives on the status path and is signed over it.
+        // On the voice path the same body means "this line is up, what now?".
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
         let mut params = BTreeMap::new();
         params.insert("CallSid".to_string(), "CA999".to_string());
         params.insert("CallStatus".to_string(), "in-progress".to_string());
@@ -698,7 +827,7 @@ mod tests {
         let body = "CallSid=CA999&CallStatus=in-progress";
         let headers = vec![("X-Twilio-Signature".to_string(), signature)];
         let event = provider
-            .verify_webhook(&headers, body.as_bytes(), 0)
+            .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
             .expect("verifies");
         assert_eq!(
             event,
@@ -711,20 +840,150 @@ mod tests {
     }
 
     #[test]
+    fn a_ringing_inbound_call_is_a_call_to_answer_not_a_status_update() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let mut params = BTreeMap::new();
+        params.insert("CallSid".to_string(), "CA1".to_string());
+        params.insert("CallStatus".to_string(), "ringing".to_string());
+        params.insert("Direction".to_string(), "inbound".to_string());
+        params.insert("From".to_string(), "+15551230000".to_string());
+        params.insert("To".to_string(), "+15550001111".to_string());
+        let signature = sign(&provider.auth_token, &url, &params);
+        let body = "CallSid=CA1&CallStatus=ringing&Direction=inbound&From=%2B15551230000&To=%2B15550001111";
+        let headers = vec![("X-Twilio-Signature".to_string(), signature)];
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 1_700_000_000_000)
+            .expect("verifies");
+
+        assert_eq!(
+            event,
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
+                provider_call_id: "CA1".to_string(),
+                from_number: "+15551230000".to_string(),
+                to_number: "+15550001111".to_string(),
+                received_at_ms: 1_700_000_000_000,
+            },
+            "as a CallProgress for a call nobody placed this would be dropped, \
+             and the number would never answer"
+        );
+    }
+
+    #[test]
+    fn a_status_callback_about_an_inbound_call_is_progress_not_a_second_ring() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
+        let mut params = BTreeMap::new();
+        params.insert("CallSid".to_string(), "CA1".to_string());
+        params.insert("CallStatus".to_string(), "completed".to_string());
+        params.insert("Direction".to_string(), "inbound".to_string());
+        let signature = sign(&provider.auth_token, &url, &params);
+        let body = "CallSid=CA1&CallStatus=completed&Direction=inbound";
+        let headers = vec![("X-Twilio-Signature".to_string(), signature)];
+
+        assert_eq!(
+            provider
+                .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
+                .expect("verifies"),
+            TelecomEvent::CallProgress {
+                provider_call_id: "CA1".to_string(),
+                state: CallState::Completed,
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_delivery_receipt_is_not_read_as_an_inbound_text() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let mut params = BTreeMap::new();
+        params.insert("MessageSid".to_string(), "SM1".to_string());
+        params.insert("MessageStatus".to_string(), "undelivered".to_string());
+        params.insert("ErrorCode".to_string(), "30006".to_string());
+        let signature = sign(&provider.auth_token, &url, &params);
+        let body = "ErrorCode=30006&MessageSid=SM1&MessageStatus=undelivered";
+        let headers = vec![("X-Twilio-Signature".to_string(), signature)];
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 0)
+            .expect("verifies");
+
+        match event {
+            TelecomEvent::SmsStatus {
+                provider_message_id,
+                delivered,
+                error,
+            } => {
+                assert_eq!(provider_message_id, "SM1");
+                assert!(!delivered);
+                let error = error.expect("a reason");
+                assert!(error.contains("undelivered"), "{error}");
+                assert!(error.contains("30006"), "{error}");
+            }
+            other => panic!(
+                "a receipt read as {other:?} would hand the agent an empty text \
+                 apparently from the person we just texted"
+            ),
+        }
+    }
+
+    #[test]
+    fn an_intermediate_message_status_is_not_a_delivery_answer() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let mut params = BTreeMap::new();
+        params.insert("MessageSid".to_string(), "SM2".to_string());
+        params.insert("MessageStatus".to_string(), "sent".to_string());
+        let signature = sign(&provider.auth_token, &url, &params);
+        let body = "MessageSid=SM2&MessageStatus=sent";
+        let headers = vec![("X-Twilio-Signature".to_string(), signature)];
+
+        assert_eq!(
+            provider
+                .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 0)
+                .expect("verifies"),
+            TelecomEvent::Ignored
+        );
+    }
+
+    #[test]
+    fn the_signed_url_is_the_one_the_operator_was_told_to_configure() {
+        let provider = provider("https://ops.example.com/");
+
+        assert_eq!(
+            provider
+                .signed_url(ANSWER_PATH)
+                .expect("a base is configured"),
+            "https://ops.example.com/v1/telecom/acct-1",
+            "this is the path the daemon serves and the UI publishes; a \
+             verifier that rebuilt any other one would reject every genuine \
+             callback"
+        );
+    }
+
+    #[test]
     fn verify_webhook_ignores_an_uninteresting_callback() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let params: BTreeMap<String, String> = BTreeMap::new();
         let signature = sign(&provider.auth_token, &url, &params);
         let headers = vec![("X-Twilio-Signature".to_string(), signature)];
-        let event = provider.verify_webhook(&headers, b"", 0).expect("verifies");
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, b"", 0)
+            .expect("verifies");
         assert_eq!(event, TelecomEvent::Ignored);
     }
 
     #[test]
     fn verify_webhook_rejects_a_missing_signature_header() {
         let provider = provider("https://ops.example.com");
-        let error = provider.verify_webhook(&[], b"Body=hi", 0).unwrap_err();
+        let error = provider
+            .verify_webhook(ANSWER_PATH, &[], b"Body=hi", 0)
+            .unwrap_err();
         assert!(error.contains("X-Twilio-Signature"));
     }
 
@@ -736,7 +995,12 @@ mod tests {
             STANDARD.encode(b"nonsense"),
         )];
         assert!(provider
-            .verify_webhook(&headers, b"MessageSid=SM1&From=%2B1&Body=hi", 0)
+            .verify_webhook(
+                ANSWER_PATH,
+                &headers,
+                b"MessageSid=SM1&From=%2B1&Body=hi",
+                0
+            )
             .is_err());
     }
 
@@ -792,6 +1056,56 @@ mod tests {
                 provider_message_id: Some("SM_ABC".to_string())
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_asks_twilio_for_the_delivery_updates_it_will_be_sent() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) = test_http::serve(vec![(200, r#"{"sid":"SM_ABC"}"#.to_string())]);
+        let mut provider = provider("https://ops.example.com");
+        provider.base_url = base;
+
+        provider.send_sms("+15551230000", "hi", &[], "idem-1").await;
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        // Twilio sends delivery updates for a REST message only to a
+        // `StatusCallback` named on the message. Parsing those callbacks while
+        // never asking for them is a delivery state that can only ever appear
+        // in a mock.
+        assert!(
+            request.contains(
+                "StatusCallback=https%3A%2F%2Fops.example.com%2Fv1%2Ftelecom%2Facct-1%2Fstatus"
+            ),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_asks_twilio_for_every_lifecycle_event_the_store_models() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) = test_http::serve(vec![(
+            201,
+            r#"{"sid":"CA_ABC","status":"queued"}"#.to_string(),
+        )]);
+        let mut provider = provider("https://ops.example.com");
+        provider.base_url = base;
+
+        provider
+            .place_call("+15551230000", "https://ops.example.com/answer", false, "k")
+            .await
+            .expect("placed");
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        assert!(request.contains("StatusCallback="), "{request}");
+        // Twilio sends only `completed` unless the rest are asked for by name,
+        // so a ring that is never answered would otherwise look like nothing
+        // happening at all.
+        for event in ["initiated", "ringing", "answered", "completed"] {
+            assert!(
+                request.contains(&format!("StatusCallbackEvent={event}")),
+                "{event} not requested: {request}"
+            );
+        }
     }
 
     #[tokio::test]

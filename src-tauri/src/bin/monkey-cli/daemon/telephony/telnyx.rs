@@ -21,6 +21,21 @@
 //! into an error by hand, so [`TelnyxProvider::redact`] scrubs it anyway, the
 //! same discipline every other adapter in this tree uses.
 //!
+//! # Call Control is commands, not markup
+//!
+//! Telnyx Voice is not a TwiML-shaped carrier. A ringing call is answered by
+//! `POST /v2/calls/{call_control_id}/actions/answer`, and the media stream is
+//! an argument of that command (`stream_url`); a call already up is streamed
+//! with `actions/streaming_start`. Returning XML to the webhook answers
+//! nothing at all — Telnyx reads the response body of a webhook only for its
+//! status code. So [`TelnyxProvider::answer_instructions`] is deliberately
+//! `None` and [`TelnyxProvider::connect_media`] carries the whole of it.
+//!
+//! The call this module can act on is identified by `payload.call_control_id`.
+//! `data.id` is the id of the *webhook*, and `payload.id` does not exist on a
+//! Voice event — using either as the call id leaves every command addressed to
+//! nothing.
+//!
 //! # Call Control's `connection_id`
 //!
 //! Placing a Call Control call requires a `connection_id` naming which Telnyx
@@ -39,6 +54,7 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
+use super::super::telecom_store::CallDirection;
 use super::{
     AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
     TelecomProvider,
@@ -103,6 +119,15 @@ impl TelnyxProvider {
     fn hangup_url(&self, call_control_id: &str) -> String {
         format!("{}/calls/{call_control_id}/actions/hangup", self.base_url)
     }
+    fn answer_url(&self, call_control_id: &str) -> String {
+        format!("{}/calls/{call_control_id}/actions/answer", self.base_url)
+    }
+    fn streaming_start_url(&self, call_control_id: &str) -> String {
+        format!(
+            "{}/calls/{call_control_id}/actions/streaming_start",
+            self.base_url
+        )
+    }
     fn phone_numbers_url(&self) -> String {
         format!("{}/phone_numbers?page[size]=1", self.base_url)
     }
@@ -136,14 +161,70 @@ impl TelecomProvider for TelnyxProvider {
     /// different host — which is why the two are written out separately rather
     /// than shared: a compatibility layer that silently drifts is worse than two
     /// short strings.
-    fn answer_instructions(&self, media_url: &str) -> Option<AnswerDocument> {
-        Some(AnswerDocument {
-            content_type: "text/xml; charset=utf-8",
-            body: format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Connect><Stream url=\"{}\" bidirectionalMode=\"rtp\"/></Connect></Response>",
-                crate::daemon::service::xml_escape(media_url)
-            ),
-        })
+    /// None: see the module doc. Telnyx ignores a webhook's response body, so
+    /// a document here would be markup nobody reads and a caller connected to
+    /// silence.
+    fn answer_instructions(&self, _media_url: &str) -> Option<AnswerDocument> {
+        None
+    }
+
+    /// Answer a ringing call with the stream attached, or start a stream on a
+    /// call that is already up.
+    ///
+    /// Two commands because Telnyx rejects the wrong one: `answer` on an
+    /// answered call and `streaming_start` on a ringing one are both errors,
+    /// and an error here is a call nobody can hear.
+    async fn connect_media(
+        &self,
+        provider_call_id: &str,
+        media_url: &str,
+        answered_already: bool,
+        record: bool,
+    ) -> Result<(), String> {
+        let client = self.client()?;
+        let (url, mut body) = if answered_already {
+            (
+                self.streaming_start_url(provider_call_id),
+                serde_json::json!({
+                    "stream_url": media_url,
+                    "stream_track": "both_tracks",
+                    "stream_bidirectional_mode": "rtp",
+                    "stream_bidirectional_codec": "PCMU",
+                }),
+            )
+        } else {
+            (
+                self.answer_url(provider_call_id),
+                serde_json::json!({
+                    "stream_url": media_url,
+                    "stream_track": "both_tracks",
+                    // Audio only flows both ways on an RTP bidirectional
+                    // stream, and only µ-law matches what the rest of this
+                    // pipeline speaks.
+                    "stream_bidirectional_mode": "rtp",
+                    "stream_bidirectional_codec": "PCMU",
+                }),
+            )
+        };
+        // A command id makes the retry of a dropped request a no-op at Telnyx
+        // rather than a second answer.
+        body["command_id"] = serde_json::json!(telnyx_command_id(
+            if answered_already { "stream" } else { "answer" },
+            provider_call_id
+        ));
+        if record && !answered_already {
+            body["record"] = serde_json::json!("record-from-answer");
+            body["record_channels"] = serde_json::json!("single");
+        }
+        let request = client.post(url).bearer_auth(&self.api_key).json(&body);
+        let response = little_monkey_lib::egress::send(request)
+            .await
+            .map_err(|error| self.redact(format!("Could not reach Telnyx: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(self.redact(format!("Telnyx returned {status} connecting the call")));
+        }
+        Ok(())
     }
 
     async fn probe(&self) -> ChannelHealth {
@@ -259,17 +340,29 @@ impl TelecomProvider for TelnyxProvider {
         to_number: &str,
         answer_url: &str,
         record: bool,
+        idempotency_key: &str,
     ) -> Result<CallHandle, String> {
         let client = self.client()?;
         let mut body = serde_json::json!({
             "connection_id": self.connection_id,
+            // Telnyx ignores a second command carrying a `command_id` it has
+            // already seen. That is the difference between a retried run
+            // reaching the carrier twice and it ringing somebody's phone
+            // twice, so the key is the call row's own — stable across the
+            // retry, unique across calls.
+            "command_id": telnyx_command_id("dial", idempotency_key),
             "to": to_number,
             "from": self.from_number,
+            // Every event for this call comes back here. Telnyx has one
+            // webhook URL per call rather than a separate status URL, which is
+            // why its normalizer reads the event type rather than the path.
+            //
+            // No stream fields here: `stream_url` names a socket that is
+            // scoped to one call, and the call does not exist yet. The stream
+            // is attached by `connect_media` when Telnyx says the far end
+            // answered.
             "webhook_url": answer_url,
-            // Audio only flows both ways on an RTP bidirectional stream, and
-            // only µ-law matches what the rest of this pipeline speaks.
-            "stream_bidirectional_mode": "rtp",
-            "stream_bidirectional_codec": "PCMU",
+            "webhook_url_method": "POST",
         });
         if record {
             body["record"] = serde_json::json!("record-from-answer");
@@ -317,7 +410,9 @@ impl TelecomProvider for TelnyxProvider {
         let request = client
             .post(self.hangup_url(provider_call_id))
             .bearer_auth(&self.api_key)
-            .json(&serde_json::json!({}));
+            .json(&serde_json::json!({
+                "command_id": telnyx_command_id("hangup", provider_call_id),
+            }));
         let response = little_monkey_lib::egress::send(request)
             .await
             .map_err(|error| self.redact(format!("Telnyx hangup outcome unknown: {error}")))?;
@@ -330,10 +425,14 @@ impl TelecomProvider for TelnyxProvider {
 
     fn verify_webhook(
         &self,
+        _path: &str,
         headers: &[(String, String)],
         body: &[u8],
         now_ms: i64,
     ) -> Result<TelecomEvent, String> {
+        // Telnyx has one webhook URL per call rather than a separate status
+        // URL, and its signature covers `timestamp|body` rather than a URL, so
+        // the path decides nothing here: the event type does.
         let signature_b64 = header(headers, "telnyx-signature-ed25519")
             .ok_or_else(|| "missing telnyx-signature-ed25519 header".to_string())?;
         let timestamp_str = header(headers, "telnyx-timestamp")
@@ -365,26 +464,64 @@ impl TelecomProvider for TelnyxProvider {
     }
 }
 
+/// A stable `command_id` for one Telnyx call command.
+///
+/// Telnyx wants a UUID, and the values this derives from are not — so they are
+/// hashed into one. Deterministic, so the retry of a command produces the id
+/// the first attempt used and Telnyx drops it; namespaced by `verb`, so a dial
+/// and the hangup that ends it never collide.
+fn telnyx_command_id(verb: &str, key: &str) -> String {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("little-monkey:{verb}:{key}").as_bytes(),
+    );
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<TelecomEvent, String> {
+    // Voice and messaging events disagree about the shape of `payload`, so the
+    // event type decides which one to read. A voice payload parsed as a
+    // messaging one yields an empty call id, and a command addressed to an
+    // empty id reaches nothing.
+    let voice = || -> Result<TelnyxCallPayload, String> {
+        serde_json::from_value::<TelnyxCallPayload>(data.payload.clone())
+            .map_err(|error| format!("Telnyx voice payload could not be read: {error}"))
+    };
     match data.event_type.as_str() {
         "message.received" => {
-            let from = data
-                .payload
-                .from
-                .as_ref()
-                .map(|address| address.phone_number.clone())
-                .ok_or_else(|| "Telnyx inbound message is missing from".to_string())?;
-            let to = data
-                .payload
-                .to
-                .as_ref()
-                .and_then(|list| list.first())
-                .map(|address| address.phone_number.clone())
-                .unwrap_or_default();
+            let payload: TelnyxPayload = serde_json::from_value(data.payload.clone())
+                .map_err(|error| format!("Telnyx message payload could not be read: {error}"))?;
+            let from = super::normalize_e164(
+                payload
+                    .from
+                    .as_ref()
+                    .map(|address| address.phone_number.as_str())
+                    .ok_or_else(|| "Telnyx inbound message is missing from".to_string())?,
+            );
+            let to = super::normalize_e164(
+                payload
+                    .to
+                    .as_ref()
+                    .and_then(|list| list.first())
+                    .map(|address| address.phone_number.as_str())
+                    .unwrap_or_default(),
+            );
             let mut metadata = BoundedMetadata::new();
             metadata.insert("to_number", to);
-            let attachments = data
-                .payload
+            let attachments = payload
                 .media
                 .as_deref()
                 .unwrap_or(&[])
@@ -410,10 +547,10 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
             let envelope = ChannelEnvelope {
                 account_id: String::new(),
                 kind: ChannelKind::Sms,
-                provider_event_id: data.payload.id.clone(),
+                provider_event_id: payload.id.clone(),
                 conversation: ChannelConversation::direct(from.clone()),
                 sender: ChannelSender::new(from),
-                text: data.payload.text.clone().unwrap_or_default(),
+                text: payload.text.clone().unwrap_or_default(),
                 attachments,
                 reply_to_provider_id: None,
                 mentions_self: false,
@@ -422,49 +559,62 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
             };
             Ok(TelecomEvent::InboundSms(Box::new(envelope)))
         }
-        "call.initiated" if data.payload.direction.as_deref() == Some("incoming") => {
-            Ok(TelecomEvent::InboundCall {
-                provider_call_id: data.payload.id.clone(),
-                from_number: data
-                    .payload
-                    .from
-                    .as_ref()
-                    .map(|address| address.phone_number.clone())
-                    .unwrap_or_default(),
-                to_number: data
-                    .payload
-                    .to
-                    .as_ref()
-                    .and_then(|list| list.first())
-                    .map(|address| address.phone_number.clone())
-                    .unwrap_or_default(),
+        // A call arriving at the operator's number. The answering policy
+        // decides what happens; Telnyx is answered with a command, not with
+        // this webhook's response body.
+        "call.initiated" if voice()?.direction.as_deref() == Some("incoming") => {
+            let payload = voice()?;
+            Ok(TelecomEvent::AnswerRequest {
+                provider_call_id: payload.call_control_id.clone(),
+                request_id: None,
+                direction: CallDirection::Inbound,
+                from_number: super::normalize_e164(payload.from.as_deref().unwrap_or_default()),
+                to_number: super::normalize_e164(payload.to.as_deref().unwrap_or_default()),
                 received_at_ms,
             })
         }
         "call.initiated" => Ok(TelecomEvent::CallProgress {
-            provider_call_id: data.payload.id.clone(),
+            provider_call_id: voice()?.call_control_id,
             state: CallState::Queued,
             detail: None,
         }),
-        "call.answered" => Ok(TelecomEvent::CallProgress {
-            provider_call_id: data.payload.id.clone(),
-            state: CallState::InProgress,
-            detail: None,
-        }),
+        // The far end picked up. On an outbound call this is the moment the
+        // stream has to be attached, so it is an answer request rather than
+        // plain progress; the worker connects it and marks the call up.
+        "call.answered" => {
+            let payload = voice()?;
+            if payload.direction.as_deref() == Some("incoming") {
+                return Ok(TelecomEvent::CallProgress {
+                    provider_call_id: payload.call_control_id,
+                    state: CallState::InProgress,
+                    detail: None,
+                });
+            }
+            Ok(TelecomEvent::AnswerRequest {
+                provider_call_id: payload.call_control_id.clone(),
+                request_id: None,
+                direction: CallDirection::Outbound,
+                from_number: super::normalize_e164(payload.from.as_deref().unwrap_or_default()),
+                to_number: super::normalize_e164(payload.to.as_deref().unwrap_or_default()),
+                received_at_ms,
+            })
+        }
         "call.hangup" => {
-            let state = match data.payload.hangup_cause.as_deref() {
+            let payload = voice()?;
+            let state = match payload.hangup_cause.as_deref() {
                 Some("normal_clearing") | None => CallState::Completed,
                 Some(_) => CallState::Failed,
             };
             Ok(TelecomEvent::CallProgress {
-                provider_call_id: data.payload.id.clone(),
+                provider_call_id: payload.call_control_id,
                 state,
-                detail: data.payload.hangup_cause.clone(),
+                detail: payload.hangup_cause,
             })
         }
         "message.finalized" => {
-            let failed = data
-                .payload
+            let payload: TelnyxPayload = serde_json::from_value(data.payload.clone())
+                .map_err(|error| format!("Telnyx message payload could not be read: {error}"))?;
+            let failed = payload
                 .to
                 .as_ref()
                 .map(|list| {
@@ -473,7 +623,7 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
                 })
                 .unwrap_or(false);
             Ok(TelecomEvent::SmsStatus {
-                provider_message_id: data.payload.id.clone(),
+                provider_message_id: payload.id.clone(),
                 delivered: !failed,
                 error: if failed {
                     Some("Telnyx reported delivery_failed".to_string())
@@ -500,6 +650,30 @@ struct TelnyxMedia {
     content_type: Option<String>,
 }
 
+/// A Voice event's payload.
+///
+/// Deliberately separate from the messaging payload above: on a Voice webhook
+/// `from` and `to` are plain strings, there is no `payload.id`, and the only
+/// identifier any command can be addressed to is `call_control_id`. Sharing one
+/// struct with messaging is what made Voice events deserialize into an empty
+/// call id — and the tests did not catch it because they were written from the
+/// struct rather than from a real payload.
+#[derive(Debug, Deserialize)]
+struct TelnyxCallPayload {
+    #[serde(default)]
+    call_control_id: String,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    /// `incoming` for a call arriving at the operator's number, `outgoing` for
+    /// one this machine placed.
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    hangup_cause: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TelnyxPayload {
     #[serde(default)]
@@ -511,17 +685,16 @@ struct TelnyxPayload {
     #[serde(default)]
     to: Option<Vec<TelnyxAddress>>,
     #[serde(default)]
-    direction: Option<String>,
-    #[serde(default)]
-    hangup_cause: Option<String>,
-    #[serde(default)]
     media: Option<Vec<TelnyxMedia>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelnyxData {
     event_type: String,
-    payload: TelnyxPayload,
+    /// Kept unparsed so one webhook body can carry either shape: messaging and
+    /// voice disagree about what `payload` is, and only `event_type` says
+    /// which to expect.
+    payload: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -552,6 +725,14 @@ struct TelnyxCallEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The path a carrier's answer request arrives on, which is what its
+    /// signature covers. Built from the shared function rather than typed, so
+    /// a test cannot agree with a verifier that has drifted from the route.
+    const ANSWER_PATH: &str = "/v1/telecom/acct-1";
+    /// Where a carrier reports what became of a message or a call.
+    #[allow(dead_code)]
+    const STATUS_PATH: &str = "/v1/telecom/acct-1/status";
 
     /// Deterministic Ed25519 keypair: a fixed 32-byte seed rather than
     /// `SystemRandom`, so a signature fixture computed once in a test stays
@@ -608,7 +789,7 @@ mod tests {
         let now = 1_700_000_000_000;
         let headers = signed_headers(&pair, now / 1000, body);
         let event = provider
-            .verify_webhook(&headers, body, now)
+            .verify_webhook(ANSWER_PATH, &headers, body, now)
             .expect("verifies");
         match event {
             TelecomEvent::InboundSms(envelope) => {
@@ -628,7 +809,9 @@ mod tests {
         let now = 1_700_000_000_000;
         let headers = signed_headers(&pair, now / 1000, body);
         let tampered = br#"{"data":{"event_type":"message.received","payload":{"id":"msg-2","from":{"phone_number":"+1"}}}}"#;
-        assert!(provider.verify_webhook(&headers, tampered, now).is_err());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, tampered, now)
+            .is_err());
     }
 
     #[test]
@@ -639,7 +822,9 @@ mod tests {
         let body = br#"{"data":{"event_type":"message.received","payload":{"id":"msg-1","from":{"phone_number":"+1"}}}}"#;
         let now = 1_700_000_000_000;
         let headers = signed_headers(&pair, now / 1000, body);
-        assert!(provider.verify_webhook(&headers, body, now).is_err());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, body, now)
+            .is_err());
     }
 
     #[test]
@@ -650,7 +835,9 @@ mod tests {
         let now = 1_700_000_000_000;
         let stale_timestamp = now / 1000 - (MAX_TIMESTAMP_SKEW_SECS + 60);
         let headers = signed_headers(&pair, stale_timestamp, body);
-        let error = provider.verify_webhook(&headers, body, now).unwrap_err();
+        let error = provider
+            .verify_webhook(ANSWER_PATH, &headers, body, now)
+            .unwrap_err();
         assert!(error.contains("stale"), "{error}");
     }
 
@@ -660,7 +847,7 @@ mod tests {
         let provider = provider(&pair);
         let headers = vec![("telnyx-timestamp".to_string(), "1700000000".to_string())];
         assert!(provider
-            .verify_webhook(&headers, b"{}", 1_700_000_000_000)
+            .verify_webhook(ANSWER_PATH, &headers, b"{}", 1_700_000_000_000)
             .is_err());
     }
 
@@ -673,8 +860,21 @@ mod tests {
             STANDARD.encode([0u8; 64]),
         )];
         assert!(provider
-            .verify_webhook(&headers, b"{}", 1_700_000_000_000)
+            .verify_webhook(ANSWER_PATH, &headers, b"{}", 1_700_000_000_000)
             .is_err());
+    }
+
+    /// A Telnyx Voice webhook, written from Telnyx's own published shape
+    /// rather than from this module's structs: `payload.call_control_id` is
+    /// the only id a command can be addressed to, `from` and `to` are plain
+    /// strings, and `data.id` identifies the webhook, not the call.
+    fn voice_body(event_type: &str, extra: &str) -> String {
+        let payload = format!(
+            r#"{{"call_control_id":"v3:ccid-1","call_leg_id":"leg-1","from":"+15551230000","to":"+15550001111"{extra}}}"#
+        );
+        format!(
+            r#"{{"data":{{"event_type":"{event_type}","id":"webhook-evt-1","payload":{payload}}}}}"#
+        )
     }
 
     #[test]
@@ -682,30 +882,252 @@ mod tests {
         let pair = keypair();
         let provider = provider(&pair);
         let now = 1_700_000_000_000;
-        for (event_type, hangup_cause, expected) in [
-            ("call.answered", None, CallState::InProgress),
-            ("call.hangup", Some("normal_clearing"), CallState::Completed),
-            ("call.hangup", Some("call_rejected"), CallState::Failed),
+        for (event_type, extra, hangup_cause, expected) in [
+            (
+                "call.answered",
+                r#","direction":"incoming""#,
+                None,
+                CallState::InProgress,
+            ),
+            (
+                "call.hangup",
+                r#","hangup_cause":"normal_clearing""#,
+                Some("normal_clearing"),
+                CallState::Completed,
+            ),
+            (
+                "call.hangup",
+                r#","hangup_cause":"call_rejected""#,
+                Some("call_rejected"),
+                CallState::Failed,
+            ),
         ] {
-            let body = if let Some(cause) = hangup_cause {
-                format!(
-                    r#"{{"data":{{"event_type":"{event_type}","payload":{{"id":"call-1","hangup_cause":"{cause}"}}}}}}"#
-                )
-            } else {
-                format!(r#"{{"data":{{"event_type":"{event_type}","payload":{{"id":"call-1"}}}}}}"#)
-            };
+            let body = voice_body(event_type, extra);
             let headers = signed_headers(&pair, now / 1000, body.as_bytes());
+
             let event = provider
-                .verify_webhook(&headers, body.as_bytes(), now)
+                .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), now)
                 .expect("verifies");
+
             assert_eq!(
                 event,
                 TelecomEvent::CallProgress {
-                    provider_call_id: "call-1".to_string(),
+                    // The controllable id, not `data.id` and not a `payload.id`
+                    // that Voice events do not carry at all.
+                    provider_call_id: "v3:ccid-1".to_string(),
                     state: expected,
                     detail: hangup_cause.map(|value| value.to_string()),
                 }
             );
+        }
+    }
+
+    #[test]
+    fn an_incoming_call_is_an_answer_request_addressed_to_its_control_id() {
+        let pair = keypair();
+        let provider = provider(&pair);
+        let now = 1_700_000_000_000;
+        let body = voice_body(
+            "call.initiated",
+            r#","direction":"incoming","state":"parked""#,
+        );
+        let headers = signed_headers(&pair, now / 1000, body.as_bytes());
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), now)
+            .expect("verifies");
+
+        assert_eq!(
+            event,
+            TelecomEvent::AnswerRequest {
+                provider_call_id: "v3:ccid-1".to_string(),
+                request_id: None,
+                direction: CallDirection::Inbound,
+                from_number: "+15551230000".to_string(),
+                to_number: "+15550001111".to_string(),
+                received_at_ms: now,
+            }
+        );
+    }
+
+    #[test]
+    fn an_outbound_call_being_picked_up_is_an_answer_request_not_plain_progress() {
+        let pair = keypair();
+        let provider = provider(&pair);
+        let now = 1_700_000_000_000;
+        let body = voice_body("call.answered", r#","direction":"outgoing""#);
+        let headers = signed_headers(&pair, now / 1000, body.as_bytes());
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), now)
+            .expect("verifies");
+
+        assert!(
+            matches!(
+                event,
+                TelecomEvent::AnswerRequest {
+                    ref provider_call_id,
+                    direction: CallDirection::Outbound,
+                    ..
+                } if provider_call_id == "v3:ccid-1"
+            ),
+            "as plain progress the stream is never started and whoever picked \
+             up hears nothing: {event:?}"
+        );
+    }
+
+    #[test]
+    fn a_voice_payload_is_not_read_as_a_messaging_one() {
+        let pair = keypair();
+        let provider = provider(&pair);
+        let now = 1_700_000_000_000;
+        // The real shape: `from` is a string here and an object on a messaging
+        // event. Read through the messaging struct this deserializes to an
+        // empty call id, and a command addressed to an empty id reaches
+        // nothing.
+        let body = voice_body("call.hangup", r#","hangup_cause":"normal_clearing""#);
+        let headers = signed_headers(&pair, now / 1000, body.as_bytes());
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), now)
+            .expect("verifies");
+
+        match event {
+            TelecomEvent::CallProgress {
+                provider_call_id, ..
+            } => assert_eq!(provider_call_id, "v3:ccid-1"),
+            other => panic!("expected progress, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_ringing_call_is_answered_by_command_with_the_stream_attached() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) = test_http::serve(vec![(200, r#"{"data":{}}"#.to_string())]);
+        let provider = provider_with_base(&base);
+
+        provider
+            .connect_media("v3:ccid-1", "wss://ops.example.com/media", false, false)
+            .await
+            .expect("answered");
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        // Returning XML to a Telnyx webhook answers nothing: the call is
+        // answered by this command, and the stream is an argument of it.
+        assert!(
+            request.contains("/calls/v3:ccid-1/actions/answer"),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""stream_url":"wss://ops.example.com/media""#),
+            "`webhook_url` is where events go; `stream_url` is where the audio goes: {request}"
+        );
+        assert!(
+            request.contains(r#""stream_bidirectional_mode":"rtp""#),
+            "{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_already_up_gets_a_stream_started_rather_than_answered_again() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) = test_http::serve(vec![(200, r#"{"data":{}}"#.to_string())]);
+        let provider = provider_with_base(&base);
+
+        provider
+            .connect_media("v3:ccid-2", "wss://ops.example.com/media", true, false)
+            .await
+            .expect("streaming");
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        // Answering an answered call is an error at Telnyx, and an error here
+        // is an outbound call nobody can hear.
+        assert!(
+            request.contains("/calls/v3:ccid-2/actions/streaming_start"),
+            "{request}"
+        );
+        assert!(request.contains(r#""stream_url""#), "{request}");
+    }
+
+    #[tokio::test]
+    async fn a_dial_carries_no_stream_url_because_the_call_does_not_exist_yet() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) = test_http::serve(vec![(
+            200,
+            r#"{"data":{"call_control_id":"v3:ccid-3"}}"#.to_string(),
+        )]);
+        let provider = provider_with_base(&base);
+
+        provider
+            .place_call(
+                "+15551230000",
+                "https://ops.example.com/v1/telecom/acct-1",
+                false,
+                "k",
+            )
+            .await
+            .expect("placed");
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        assert!(request.contains(r#""webhook_url""#), "{request}");
+        // The media socket's token is scoped to one call, and the call has no
+        // id until Telnyx answers this request. The stream is attached on
+        // `call.answered` instead.
+        assert!(
+            !request.contains(r#""stream_url""#),
+            "a stream_url here would name a socket for a call that does not exist: {request}"
+        );
+    }
+
+    #[test]
+    fn a_retried_dial_carries_the_command_id_the_first_attempt_used() {
+        // Telnyx drops a command whose `command_id` it has already seen, which
+        // is the only thing between a retried run and a second ring at
+        // somebody's phone. Same call row, same id; a different call, a
+        // different id.
+        let first = telnyx_command_id("dial", "outbound:job-1:+15551230000");
+        assert_eq!(
+            first,
+            telnyx_command_id("dial", "outbound:job-1:+15551230000")
+        );
+        assert_ne!(
+            first,
+            telnyx_command_id("dial", "outbound:job-2:+15551230000")
+        );
+        // The hangup that ends this call must not be mistaken for the dial.
+        assert_ne!(
+            first,
+            telnyx_command_id("hangup", "outbound:job-1:+15551230000")
+        );
+        // Telnyx wants a UUID shape.
+        let parts: Vec<usize> = first.split('-').map(str::len).collect();
+        assert_eq!(parts, vec![8, 4, 4, 4, 12], "{first}");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn a_finalized_message_that_never_arrived_says_so() {
+        let pair = keypair();
+        let provider = provider(&pair);
+        let body = br#"{"data":{"event_type":"message.finalized","payload":{"id":"msg-9","to":[{"phone_number":"+15551230000","status":"delivery_failed"}]}}}"#;
+        let now = 1_700_000_000_000;
+        let headers = signed_headers(&pair, now / 1000, body);
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body, now)
+            .expect("verifies");
+
+        match event {
+            TelecomEvent::SmsStatus {
+                provider_message_id,
+                delivered,
+                error,
+            } => {
+                assert_eq!(provider_message_id, "msg-9");
+                assert!(!delivered);
+                assert!(error.is_some());
+            }
+            other => panic!("expected a delivery receipt, got {other:?}"),
         }
     }
 
@@ -718,7 +1140,7 @@ mod tests {
         let now = 1_700_000_000_000;
         let headers = signed_headers(&pair, now / 1000, body);
         let event = provider
-            .verify_webhook(&headers, body, now)
+            .verify_webhook(ANSWER_PATH, &headers, body, now)
             .expect("verifies");
         assert_eq!(event, TelecomEvent::Ignored);
     }

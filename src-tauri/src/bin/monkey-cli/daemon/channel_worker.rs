@@ -1079,24 +1079,24 @@ fn reconcile_workers_with(
         // An SMS account's carrier credential lives on the telephony account of
         // the same id, not on this row, so it is resolved from there.
         let secret = if is_sms {
-            match store
+            // The same carrier credential also signs the media URLs an MMS
+            // attachment is fetched from, so an absent one is a failure to
+            // report, never an empty key to run on.
+            let reference = store
                 .telecom_account(&account.account_id)
                 .ok()
                 .flatten()
-                .and_then(|telecom| telecom.credential_ref)
-            {
-                Some(reference) => match secrets.get(&reference) {
-                    Ok(secret) => secret,
-                    Err(error) => {
-                        eprintln!(
-                            "monkey daemon: SMS account {} cannot send: {error}",
-                            account.account_id
-                        );
-                        mark_failed(store, &account, &error);
-                        continue;
-                    }
-                },
-                None => String::new(),
+                .and_then(|telecom| telecom.credential_ref);
+            match super::channel_adapter::resolve_credential(secrets, reference.as_deref()) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    eprintln!(
+                        "monkey daemon: SMS account {} cannot send: {error}",
+                        account.account_id
+                    );
+                    mark_failed(store, &account, &error);
+                    continue;
+                }
             }
         } else {
             match &account.credential_ref {
@@ -1182,10 +1182,8 @@ fn build_sms_adapter(
     let telecom = store
         .telecom_account(account_id)?
         .ok_or_else(|| "its telephony account no longer exists".to_string())?;
-    let secret = match &telecom.credential_ref {
-        Some(reference) => secrets.get(reference)?,
-        None => String::new(),
-    };
+    let secret =
+        super::channel_adapter::resolve_credential(secrets, telecom.credential_ref.as_deref())?;
     // The app data directory is the daemon root's parent, the same derivation
     // the remote API uses to find the shared blob store.
     let app_data = paths
