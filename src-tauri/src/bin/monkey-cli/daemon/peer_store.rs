@@ -1,5 +1,14 @@
 //! Durable storage for peer threads and the messages in them. Owns the
-//! `peer_*` tables created by `DAEMON_V9_SQL` in `store.rs`.
+//! `peer_*` tables created by `DAEMON_V9_SQL` and reshaped by `DAEMON_V16_SQL`
+//! in `store.rs`.
+//!
+//! # Identity is the pairing, not the envelope
+//!
+//! Every key here starts with `peer_device_id` — the authenticated pairing the
+//! signature resolved to. A thread id and a message id are the peer's own
+//! words, so two peers may legitimately use the same ones; scoping to the
+//! pairing is what stops one peer landing in another's conversation or
+//! collapsing another's message onto its own dedupe row.
 //!
 //! # Recording before deciding
 //!
@@ -108,6 +117,14 @@ pub struct PeerMessageRecord {
     pub created_at_ms: i64,
 }
 
+/// A refusal that never became a message row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRejectionEvent {
+    pub peer_device_id: String,
+    pub reason: String,
+    pub occurred_at_ms: i64,
+}
+
 /// What recording a message did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerRecording {
@@ -146,13 +163,14 @@ impl DaemonStore {
         transaction
             .execute(
                 "INSERT INTO peer_threads (
-                    thread_id, peer_device_id, peer_instance_id, session_key,
+                    peer_device_id, thread_id, peer_instance_id, session_key,
                     created_at_ms, last_activity_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-                 ON CONFLICT(thread_id) DO UPDATE SET last_activity_at_ms=excluded.last_activity_at_ms",
+                 ON CONFLICT(peer_device_id, thread_id)
+                 DO UPDATE SET last_activity_at_ms=excluded.last_activity_at_ms",
                 params![
-                    thread_id,
                     peer_device_id,
+                    thread_id,
                     peer_instance_id,
                     session_key,
                     now_ms
@@ -163,13 +181,82 @@ impl DaemonStore {
             .query_row(
                 "SELECT thread_id, peer_device_id, peer_instance_id, session_key,
                         created_at_ms, last_activity_at_ms
-                 FROM peer_threads WHERE thread_id=?1",
-                [thread_id],
+                 FROM peer_threads WHERE peer_device_id=?1 AND thread_id=?2",
+                params![peer_device_id, thread_id],
                 read_thread,
             )
             .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(thread)
+    }
+
+    /// Record a refusal that happened before a thread could exist.
+    ///
+    /// Shape, hop, loop and expiry rules run *before* anything is written, so
+    /// those refusals leave no message row by design — a peer must not be able
+    /// to fill this database with junk that never became anything. This bounded
+    /// table is what Security Doctor reads instead: a pairing, a reason and a
+    /// time, with no peer text and no unvalidated identifier.
+    pub fn record_peer_rejection_event(
+        &mut self,
+        peer_device_id: &str,
+        message_id: Option<&str>,
+        thread_id: Option<&str>,
+        reason: PeerRejection,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        // The identifiers are the peer's own and may be anything at all — this
+        // refusal is often *because* they were malformed. Only well-formed ones
+        // are kept; the rest become NULL rather than failing the insert or
+        // storing an unbounded string.
+        fn bounded<'a>(value: Option<&'a str>) -> Option<&'a str> {
+            value.filter(|candidate| {
+                !candidate.is_empty()
+                    && candidate.len() <= 128
+                    && candidate
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+            })
+        }
+        self.connection
+            .execute(
+                "INSERT INTO peer_rejection_events (
+                    event_id, peer_device_id, message_id, thread_id, reason, occurred_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    format!("prej-{}", uuid::Uuid::new_v4().simple()),
+                    peer_device_id,
+                    bounded(message_id),
+                    bounded(thread_id),
+                    reason.as_str(),
+                    now_ms.max(1),
+                ],
+            )
+            .map_err(|error| format!("Failed to record the peer refusal: {error}"))?;
+        Ok(())
+    }
+
+    /// Recent pre-thread refusals, newest first. Bounded by the caller.
+    pub fn peer_rejection_events(&self, limit: u32) -> Result<Vec<PeerRejectionEvent>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT peer_device_id, reason, occurred_at_ms
+                 FROM peer_rejection_events
+                 ORDER BY occurred_at_ms DESC, event_id DESC LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([i64::from(limit)], |row| {
+                Ok(PeerRejectionEvent {
+                    peer_device_id: row.get(0)?,
+                    reason: row.get(1)?,
+                    occurred_at_ms: row.get(2)?,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     /// Record one inbound envelope, before anything decides what to do with it.
@@ -263,7 +350,7 @@ impl DaemonStore {
                     direction, kind, correlation_id, disposition, rejection, envelope_json,
                     ingress_id, job_id, created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, ?12)
-                 ON CONFLICT(sender_instance_id, message_id, direction) DO NOTHING",
+                 ON CONFLICT(peer_device_id, message_id, direction) DO NOTHING",
                 params![
                     row_id,
                     thread_id,
@@ -286,8 +373,8 @@ impl DaemonStore {
             let (row_id, disposition, job_id): (String, String, Option<String>) = transaction
                 .query_row(
                     "SELECT row_id, disposition, job_id FROM peer_messages
-                     WHERE sender_instance_id=?1 AND message_id=?2 AND direction=?3",
-                    params![sender_instance_id, message_id, direction.as_str()],
+                     WHERE peer_device_id=?1 AND message_id=?2 AND direction=?3",
+                    params![peer_device_id, message_id, direction.as_str()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .map_err(|error| error.to_string())?;
@@ -340,13 +427,21 @@ impl DaemonStore {
         Ok(())
     }
 
-    pub fn peer_thread(&self, thread_id: &str) -> Result<Option<PeerThreadRecord>, String> {
+    /// One thread, named by the pairing that owns it.
+    ///
+    /// The device id is not a filter that could be dropped for convenience:
+    /// without it a peer could read another peer's thread by guessing its id.
+    pub fn peer_thread(
+        &self,
+        peer_device_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<PeerThreadRecord>, String> {
         self.connection
             .query_row(
                 "SELECT thread_id, peer_device_id, peer_instance_id, session_key,
                         created_at_ms, last_activity_at_ms
-                 FROM peer_threads WHERE thread_id=?1",
-                [thread_id],
+                 FROM peer_threads WHERE peer_device_id=?1 AND thread_id=?2",
+                params![peer_device_id, thread_id],
                 read_thread,
             )
             .optional()
@@ -378,6 +473,7 @@ impl DaemonStore {
 
     pub fn peer_messages(
         &self,
+        peer_device_id: &str,
         thread_id: &str,
         limit: u32,
     ) -> Result<Vec<PeerMessageRecord>, String> {
@@ -387,12 +483,15 @@ impl DaemonStore {
                 "SELECT row_id, thread_id, peer_device_id, sender_instance_id, message_id,
                         direction, kind, correlation_id, disposition, rejection, envelope_json,
                         ingress_id, job_id, created_at_ms
-                 FROM peer_messages WHERE thread_id=?1
-                 ORDER BY created_at_ms ASC, row_id ASC LIMIT ?2",
+                 FROM peer_messages WHERE peer_device_id=?1 AND thread_id=?2
+                 ORDER BY created_at_ms ASC, row_id ASC LIMIT ?3",
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map(params![thread_id, i64::from(limit)], read_message)
+            .query_map(
+                params![peer_device_id, thread_id, i64::from(limit)],
+                read_message,
+            )
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?
@@ -404,10 +503,11 @@ impl DaemonStore {
     /// yet — the work list for materializing results.
     pub fn peer_messages_awaiting_result(
         &self,
+        peer_device_id: &str,
         thread_id: &str,
     ) -> Result<Vec<PeerMessageRecord>, String> {
         Ok(self
-            .peer_messages(thread_id, 1_000)?
+            .peer_messages(peer_device_id, thread_id, 1_000)?
             .into_iter()
             .filter(|message| {
                 message.direction == PeerDirection::Inbound
@@ -438,6 +538,12 @@ impl DaemonStore {
         let threads = transaction
             .execute(
                 "DELETE FROM peer_threads WHERE peer_device_id=?1",
+                [peer_device_id],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "DELETE FROM peer_rejection_events WHERE peer_device_id=?1",
                 [peer_device_id],
             )
             .map_err(|error| error.to_string())?;
@@ -574,7 +680,13 @@ mod tests {
                 job_id: Some("ingress-abc".into()),
             }
         );
-        assert_eq!(store.peer_messages("thread-1", 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .peer_messages("device-1", "thread-1", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -611,7 +723,7 @@ mod tests {
             }
         ));
 
-        let stored = &store.peer_messages("thread-1", 10).unwrap()[0];
+        let stored = &store.peer_messages("device-1", "thread-1", 10).unwrap()[0];
         assert_eq!(stored.rejection.as_deref(), Some("missing_capability"));
     }
 
@@ -648,7 +760,7 @@ mod tests {
             .expect("result again");
         assert!(matches!(again, PeerRecording::Duplicate { .. }));
 
-        let messages = store.peer_messages("thread-1", 10).unwrap();
+        let messages = store.peer_messages("device-1", "thread-1", 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].direction, PeerDirection::Outbound);
         assert_eq!(messages[0].job_id.as_deref(), Some("ingress-abc"));
@@ -686,7 +798,9 @@ mod tests {
             .reject_peer_message(&row_id, PeerRejection::PeerRevoked)
             .expect("reject");
 
-        let awaiting = store.peer_messages_awaiting_result("thread-1").unwrap();
+        let awaiting = store
+            .peer_messages_awaiting_result("device-1", "thread-1")
+            .unwrap();
         assert_eq!(awaiting.len(), 1);
         assert_eq!(awaiting[0].message_id, "msg-1");
     }
@@ -713,8 +827,8 @@ mod tests {
             .expect("other thread");
 
         assert_eq!(store.delete_peer_traffic("device-1").unwrap(), 1);
-        assert!(store.peer_thread("thread-1").unwrap().is_none());
-        assert!(store.peer_thread("thread-2").unwrap().is_some());
+        assert!(store.peer_thread("device-1", "thread-1").unwrap().is_none());
+        assert!(store.peer_thread("device-2", "thread-2").unwrap().is_some());
         assert_eq!(store.peer_threads(None, 10).unwrap().len(), 1);
     }
 }

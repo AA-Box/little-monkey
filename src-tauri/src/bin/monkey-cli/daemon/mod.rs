@@ -27,6 +27,8 @@ mod ledger;
 #[cfg(test)]
 mod live_smoke;
 pub(crate) mod peer_audit;
+#[cfg(test)]
+mod peer_e2e;
 pub(crate) mod peer_ingress;
 pub(crate) mod peer_store;
 pub(crate) mod peer_tool;

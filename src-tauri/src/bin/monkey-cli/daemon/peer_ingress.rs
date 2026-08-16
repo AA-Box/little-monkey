@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 
+use little_monkey_lib::artifact_store::ArtifactStore;
 use little_monkey_lib::channels::ingress::{
     ConversationIngress, ConversationSource, MAX_LISTED_ATTACHMENTS,
 };
@@ -54,6 +55,12 @@ pub(crate) struct PeerContext<'a> {
     pub revoked: bool,
     /// This installation's own instance id, for the loop check.
     pub local_instance_id: &'a str,
+    /// The content store an artifact reference must already resolve in.
+    ///
+    /// Present rather than optional because the check it enables is
+    /// fail-closed: an envelope naming content this node was never handed is
+    /// refused, so a run never sees an attachment nobody can read.
+    pub artifacts: &'a ArtifactStore,
 }
 
 /// What this node did with one peer envelope.
@@ -98,8 +105,17 @@ pub(crate) fn accept_peer_envelope(
 ) -> Result<PeerAcceptance, String> {
     // Shape, hops, loops, bounds and expiry first: a malformed or looping
     // envelope must not be able to create a thread row, or a peer could fill
-    // this table with junk that never became anything.
+    // this table with junk that never became anything. The refusal still leaves
+    // a bounded trace, because "someone keeps sending us loops" is exactly the
+    // kind of thing an operator needs to be able to see.
     if let Err(reason) = envelope.validate(context.local_instance_id, now_ms) {
+        store.record_peer_rejection_event(
+            context.device_id,
+            Some(envelope.message_id.as_str()),
+            Some(envelope.thread_id.as_str()),
+            reason,
+            now_ms,
+        )?;
         return Ok(PeerAcceptance::Rejected {
             thread_id: None,
             reason,
@@ -151,6 +167,24 @@ pub(crate) fn accept_peer_envelope(
                 thread.thread_id,
                 message_row_id,
                 PeerRejection::MissingCapability,
+            );
+        }
+    }
+    // Content is handed over before it is referenced. Checking here — after the
+    // artifact grant, before anything runs — means a peer cannot make this node
+    // queue a turn that carries an attachment it will never be able to open,
+    // and cannot use a reference to probe for content it did not send.
+    for artifact in &envelope.artifacts {
+        if !context
+            .artifacts
+            .exists(&artifact.artifact_id)
+            .unwrap_or(false)
+        {
+            return reject(
+                store,
+                thread.thread_id,
+                message_row_id,
+                PeerRejection::ArtifactUnavailable,
             );
         }
     }
@@ -246,18 +280,38 @@ fn ingress_for(envelope: &PeerEnvelope, device_id: &str, session_key: &str) -> C
             filename: artifact.filename.clone(),
             mime_type: artifact.media_type.clone(),
             declared_size_bytes: artifact.size_bytes,
-            // A handle, not a URL: the bytes are fetched through the artifact
-            // mechanisms this node already has, from the peer that offered
-            // them. Nothing here can name a path on this machine.
+            // A handle, not a URL: nothing here can name a path on this
+            // machine, and there is nothing left to fetch — the sender handed
+            // the bytes over before it referenced them, so the content store
+            // already holds them under `stored_artifact_id`.
             source: AttachmentSource::ProviderHandle {
                 handle: format!("peer:{device_id}:{}", artifact.artifact_id),
             },
-            stored_artifact_id: None,
+            stored_artifact_id: Some(artifact.artifact_id.clone()),
             fetch_error: None,
             text_excerpt: None,
         })
         .collect();
     ingress
+}
+
+/// The content store peer artifacts live in, bounded at what a peer may offer.
+///
+/// The same store every other attachment path uses — a peer's bytes are not
+/// special, and giving them their own directory would only mean a second place
+/// to audit.
+pub(crate) fn peer_content_store(
+    paths: &super::store::DaemonPaths,
+) -> Result<ArtifactStore, String> {
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        little_monkey_lib::peers::MAX_PEER_ARTIFACT_BYTES,
+    )
+    .map_err(|error| format!("Failed to open the content store: {error}"))
 }
 
 #[cfg(test)]
@@ -304,12 +358,36 @@ mod tests {
         ])
     }
 
-    fn context<'a>(granted: &'a BTreeSet<DeviceCapability>) -> PeerContext<'a> {
+    /// A content store in its own temporary directory, so an artifact test
+    /// proves the store lookup rather than inheriting another test's blobs.
+    fn artifacts() -> (TempRoot, ArtifactStore) {
+        let root = TempRoot(
+            std::env::temp_dir().join(format!("little-monkey-peer-blobs-{}", uuid::Uuid::new_v4())),
+        );
+        let store = ArtifactStore::new(root.0.join("content-v1")).expect("content store");
+        (root, store)
+    }
+
+    /// A directory that removes itself, so a failing assertion does not leave
+    /// blobs behind in the system temp directory.
+    struct TempRoot(std::path::PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn context<'a>(
+        granted: &'a BTreeSet<DeviceCapability>,
+        artifacts: &'a ArtifactStore,
+    ) -> PeerContext<'a> {
         PeerContext {
             device_id: "device-1",
             granted,
             revoked: false,
             local_instance_id: LOCAL,
+            artifacts,
         }
     }
 
@@ -330,12 +408,13 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
 
         let accepted = accept_peer_envelope(
             &mut store,
             &queue,
             &envelope("msg-1", PeerMessageKind::TaskRequest),
-            &context(&grants),
+            &context(&grants, &blobs),
             NOW,
         )
         .expect("accept");
@@ -365,11 +444,12 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
         accept_peer_envelope(
             &mut store,
             &queue,
             &envelope("msg-1", PeerMessageKind::TaskRequest),
-            &context(&grants),
+            &context(&grants, &blobs),
             NOW,
         )
         .expect("accept");
@@ -391,12 +471,13 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = BTreeSet::from([DeviceCapability::PeerMessage]);
+        let (_blob_dir, blobs) = artifacts();
 
         let refused = accept_peer_envelope(
             &mut store,
             &queue,
             &envelope("msg-1", PeerMessageKind::TaskRequest),
-            &context(&grants),
+            &context(&grants, &blobs),
             NOW,
         )
         .expect("decide");
@@ -415,18 +496,27 @@ mod tests {
     fn attaching_an_artifact_needs_its_own_grant() {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
-        let grants = BTreeSet::from([DeviceCapability::PeerMessage]);
+        let (_blob_dir, blobs) = artifacts();
+        // The sender handed the bytes over first, so the reference resolves.
+        let blob = blobs.put(b"build failed at step 4").expect("store bytes");
         let mut with_file = envelope("msg-1", PeerMessageKind::Message);
         with_file.artifacts.push(PeerArtifactRef {
-            artifact_id: "art-1".into(),
-            sha256: "a".repeat(64),
+            artifact_id: blob.id.clone(),
+            sha256: blob.id.clone(),
             filename: Some("build.log".into()),
             media_type: Some("text/plain".into()),
-            size_bytes: Some(2048),
+            size_bytes: Some(blob.size),
         });
 
-        let refused = accept_peer_envelope(&mut store, &queue, &with_file, &context(&grants), NOW)
-            .expect("decide");
+        let grants = BTreeSet::from([DeviceCapability::PeerMessage]);
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &with_file,
+            &context(&grants, &blobs),
+            NOW,
+        )
+        .expect("decide");
         assert!(matches!(
             refused,
             PeerAcceptance::Rejected {
@@ -435,21 +525,77 @@ mod tests {
             }
         ));
 
-        // With the grant, the reference travels as an artifact handle — never
-        // as a path.
+        // With the grant, the reference travels as a handle plus the local id
+        // the bytes were stored under — never as a path.
         let grants = all_grants();
         let mut allowed = with_file.clone();
         allowed.message_id = "msg-2".into();
-        accept_peer_envelope(&mut store, &queue, &allowed, &context(&grants), NOW).expect("accept");
+        accept_peer_envelope(&mut store, &queue, &allowed, &context(&grants, &blobs), NOW)
+            .expect("accept");
         let submitted = queue.submitted.lock().unwrap();
         let attachment = &submitted[0].0.attachments[0];
         assert_eq!(
             attachment.source,
             AttachmentSource::ProviderHandle {
-                handle: "peer:device-1:art-1".into()
+                handle: format!("peer:device-1:{}", blob.id)
             }
         );
+        assert_eq!(
+            attachment.stored_artifact_id.as_deref(),
+            Some(blob.id.as_str())
+        );
         assert_eq!(attachment.filename.as_deref(), Some("build.log"));
+    }
+
+    #[test]
+    fn a_reference_to_content_this_node_never_received_is_refused() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let mut dangling = envelope("msg-1", PeerMessageKind::Artifact);
+        dangling.artifacts.push(PeerArtifactRef {
+            artifact_id: "a".repeat(64),
+            sha256: "a".repeat(64),
+            filename: Some("secrets.env".into()),
+            media_type: None,
+            size_bytes: Some(64),
+        });
+
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &dangling,
+            &context(&grants, &blobs),
+            NOW,
+        )
+        .expect("decide");
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+        assert!(queue.submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_that_never_became_a_message_still_leaves_a_trace() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let mut looped = envelope("msg-1", PeerMessageKind::Message);
+        looped.origin_chain.push(LOCAL.to_string());
+
+        accept_peer_envelope(&mut store, &queue, &looped, &context(&grants, &blobs), NOW)
+            .expect("decide");
+
+        let events = store.peer_rejection_events(10).expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].peer_device_id, "device-1");
+        assert_eq!(events[0].reason, "origin_loop");
     }
 
     #[test]
@@ -457,7 +603,8 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
-        let mut context = context(&grants);
+        let (_blob_dir, blobs) = artifacts();
+        let mut context = context(&grants, &blobs);
         context.revoked = true;
 
         let refused = accept_peer_envelope(
@@ -484,12 +631,19 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
         let sent = envelope("msg-1", PeerMessageKind::TaskRequest);
 
-        let first =
-            accept_peer_envelope(&mut store, &queue, &sent, &context(&grants), NOW).expect("first");
-        let second = accept_peer_envelope(&mut store, &queue, &sent, &context(&grants), NOW + 500)
-            .expect("second");
+        let first = accept_peer_envelope(&mut store, &queue, &sent, &context(&grants, &blobs), NOW)
+            .expect("first");
+        let second = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &sent,
+            &context(&grants, &blobs),
+            NOW + 500,
+        )
+        .expect("second");
 
         let PeerAcceptance::Accepted { job_id, .. } = first else {
             panic!("expected acceptance");
@@ -514,11 +668,13 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
         let mut looped = envelope("msg-1", PeerMessageKind::Message);
         looped.origin_chain.push(LOCAL.to_string());
 
-        let refused = accept_peer_envelope(&mut store, &queue, &looped, &context(&grants), NOW)
-            .expect("decide");
+        let refused =
+            accept_peer_envelope(&mut store, &queue, &looped, &context(&grants, &blobs), NOW)
+                .expect("decide");
 
         assert_eq!(
             refused,
@@ -527,7 +683,7 @@ mod tests {
                 reason: PeerRejection::OriginLoop,
             }
         );
-        assert!(store.peer_thread("thread-1").unwrap().is_none());
+        assert!(store.peer_thread("device-1", "thread-1").unwrap().is_none());
         assert!(queue.submitted.lock().unwrap().is_empty());
     }
 
@@ -536,13 +692,14 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
         let stale = envelope("msg-1", PeerMessageKind::TaskRequest);
 
         let refused = accept_peer_envelope(
             &mut store,
             &queue,
             &stale,
-            &context(&grants),
+            &context(&grants, &blobs),
             stale.expires_at_ms + 1,
         )
         .expect("decide");
@@ -562,17 +719,18 @@ mod tests {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
 
         accept_peer_envelope(
             &mut store,
             &queue,
             &envelope("msg-1", PeerMessageKind::Message),
-            &context(&grants),
+            &context(&grants, &blobs),
             NOW,
         )
         .expect("first peer");
 
-        let mut other = context(&grants);
+        let mut other = context(&grants, &blobs);
         other.device_id = "device-2";
         let mut theirs = envelope("msg-1", PeerMessageKind::Message);
         theirs.thread_id = "thread-2".into();

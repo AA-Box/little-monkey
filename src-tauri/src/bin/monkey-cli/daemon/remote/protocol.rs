@@ -697,7 +697,14 @@ impl RemoteScopes {
         &self,
         capabilities: &BTreeSet<DeviceCapability>,
     ) -> Result<(), String> {
-        if is_peer_only(capabilities)
+        // A capability set that is empty, or holds nothing but peer grants, is
+        // authority over no run and no workspace — so the run-scope rules have
+        // nothing to constrain and only the bounds apply. The empty case is not
+        // a degenerate one: "paired, and may not ask for anything" is the state
+        // an operator lands in by clearing a peer's grants, and refusing it here
+        // made clearing them impossible.
+        let peer_shaped = capabilities.is_empty() || is_peer_only(capabilities);
+        if peer_shaped
             && self.actions.is_empty()
             && self.run_ids.is_empty()
             && self.workspace_ids.is_empty()
@@ -987,6 +994,20 @@ pub struct ControllerProfile {
     pub next_sequence: u64,
     #[serde(default)]
     pub event_cursors: BTreeMap<String, u64>,
+    /// When this peer last *answered*, not when it was last asked. Written only
+    /// by a successful `peers hello`, so a failed probe never reads as contact.
+    #[serde(default)]
+    pub last_seen_at_ms: Option<u64>,
+    /// What the far side says it can accept from peers. A claim it made about
+    /// itself, kept separate from [`Self::capabilities`] — which is what it
+    /// actually granted this installation — for the same reason the answering
+    /// side keeps them apart.
+    #[serde(default)]
+    pub peer_advertised: BTreeSet<DeviceCapability>,
+    /// What this installation asked the far side to grant it. Recorded so the
+    /// Peers screen can show an ask that has not been answered yet.
+    #[serde(default)]
+    pub peer_requested: BTreeSet<DeviceCapability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1987,6 +2008,205 @@ fn validate_talk_frame_size(frame: &impl Serialize) -> Result<(), String> {
         return Err(format!("Talk frame exceeds {MAX_TALK_FRAME_BYTES} bytes"));
     }
     Ok(())
+}
+
+// --- Peer plane -----------------------------------------------------------
+
+/// Most bytes one peer may hand another in a single artifact upload. Mirrors
+/// [`little_monkey_lib::peers::MAX_PEER_ARTIFACT_BYTES`], which is what an
+/// envelope may *claim*; this is what the transport will actually take.
+pub const MAX_PEER_ARTIFACT_BYTES: usize =
+    little_monkey_lib::peers::MAX_PEER_ARTIFACT_BYTES as usize;
+
+/// One peer introducing itself to another.
+///
+/// Deliberately says nothing a gate reads. `advertised` and `requested` are
+/// claims the receiving operator sees on the Peers screen and acts on or
+/// ignores; nothing here can change what the sender is allowed to do, which is
+/// why a peer may call this with any peer grant at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerHelloRequest {
+    pub protocol_version: u32,
+    /// The caller's own instance id, for display and loop diagnostics. Identity
+    /// remains the signed device credential; this is never trusted for it.
+    pub instance_id: String,
+    #[serde(default)]
+    pub advertised: BTreeSet<DeviceCapability>,
+    #[serde(default)]
+    pub requested: BTreeSet<DeviceCapability>,
+}
+
+impl PeerHelloRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        validate_peer_instance_id(&self.instance_id)?;
+        for (label, claimed) in [
+            ("advertised", &self.advertised),
+            ("requested", &self.requested),
+        ] {
+            if !claimed.is_empty() && !is_peer_only(claimed) {
+                return Err(format!("A peer may only {label} peer capabilities"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The answer: who this installation is, what time it thinks it is, and what
+/// the caller may actually do here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerHelloResponse {
+    pub protocol_version: u32,
+    pub instance_id: String,
+    pub now_ms: u64,
+    /// Every peer capability this build understands. Not a promise to grant
+    /// any of them.
+    pub advertised: BTreeSet<DeviceCapability>,
+    /// What the caller is granted here, right now. The one field in this
+    /// response that is authoritative — and it is authoritative because the
+    /// answering side computed it from its own pairing record.
+    pub granted: BTreeSet<DeviceCapability>,
+}
+
+impl PeerHelloResponse {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        validate_peer_instance_id(&self.instance_id)?;
+        for (label, claimed) in [("advertise", &self.advertised), ("grant", &self.granted)] {
+            if !claimed.is_empty() && !is_peer_only(claimed) {
+                return Err(format!("A peer may only {label} peer capabilities"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Content a peer hands over *before* the envelope that references it.
+///
+/// Push rather than pull, and that is the whole design: a receiver that had to
+/// fetch would need an outbound pairing back to every peer that ever wrote to
+/// it. The sender already has one, so the sender carries the bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerArtifactUpload {
+    pub protocol_version: u32,
+    /// SHA-256 the sender claims. The receiver hashes what it decoded and
+    /// refuses a mismatch, so this is a checksum, never an identifier it
+    /// trusts.
+    pub sha256: String,
+    pub content_base64: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+}
+
+impl PeerArtifactUpload {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.protocol_version != REMOTE_PROTOCOL_VERSION {
+            return Err(format!(
+                "Unsupported remote protocol version {}",
+                self.protocol_version
+            ));
+        }
+        if self.sha256.len() != 64 || !self.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("A peer artifact digest must be 64 hex characters".to_string());
+        }
+        if self.content_base64.is_empty() {
+            return Err("A peer artifact carries no content".to_string());
+        }
+        // Refused on the encoded length, before anything is decoded.
+        if self.content_base64.len() > MAX_PEER_ARTIFACT_BYTES * 4 / 3 + 4 {
+            return Err(format!(
+                "A peer artifact may carry at most {MAX_PEER_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        if let Some(filename) = &self.filename {
+            if filename.trim().is_empty()
+                || filename.len() > little_monkey_lib::peers::MAX_ARTIFACT_FILENAME_BYTES
+                || filename == "."
+                || filename == ".."
+                || filename.contains(['/', '\\'])
+                || filename.chars().any(char::is_control)
+            {
+                return Err("A peer artifact filename is invalid".to_string());
+            }
+        }
+        if let Some(media_type) = &self.media_type {
+            if media_type.trim().is_empty()
+                || media_type.len() > little_monkey_lib::peers::MAX_ARTIFACT_MEDIA_TYPE_BYTES
+                || !media_type.is_ascii()
+                || media_type.chars().any(char::is_control)
+            {
+                return Err("A peer artifact media type is invalid".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What the receiver stored. The id is the content digest, so both sides name
+/// the same bytes without either trusting the other's naming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerArtifactStored {
+    pub artifact_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// An instance id as it may appear on the peer plane: the same alphabet the
+/// envelope accepts, so a value that passes here passes there.
+fn validate_peer_instance_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > little_monkey_lib::peers::MAX_ID_LEN {
+        return Err("A peer instance id must be 1-128 characters".to_string());
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err("A peer instance id contains an unsupported character".to_string());
+    }
+    Ok(())
+}
+
+/// Every peer capability this build understands, for a hello response.
+pub fn all_peer_capabilities() -> BTreeSet<DeviceCapability> {
+    BTreeSet::from([
+        DeviceCapability::PeerMessage,
+        DeviceCapability::PeerTaskRequest,
+        DeviceCapability::PeerArtifact,
+    ])
+}
+
+/// Just the peer grants out of a capability set.
+pub fn peer_capabilities_of(
+    capabilities: &BTreeSet<DeviceCapability>,
+) -> BTreeSet<DeviceCapability> {
+    capabilities
+        .iter()
+        .copied()
+        .filter(|capability| {
+            matches!(
+                capability,
+                DeviceCapability::PeerMessage
+                    | DeviceCapability::PeerTaskRequest
+                    | DeviceCapability::PeerArtifact
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -28,12 +28,19 @@ export interface InboundPeer {
   device_id: string;
   label: string;
   grants: PeerGrant[];
+  /** What this installation says it can receive from the peer. */
+  advertised_grants: PeerGrant[];
+  /** What the peer has asked this installation to grant. */
+  requested_grants: PeerGrant[];
   state: "active" | "revoked";
   /** True when the pairing carries peer grants and nothing else — no runs, no
    * approvals, no desktop. False means the same credential is also a
    * controller or a companion device, which the UI has to say out loud. */
   peer_only: boolean;
   last_sequence: number;
+  last_seen_at_ms: number | null;
+  presence: PeerPresence;
+  secret_generation: number;
 }
 
 /** An installation this one is paired *with*, reachable by alias. */
@@ -43,8 +50,15 @@ export interface OutboundPeer {
   peer_url: string;
   /** What the far side allows this installation to do there. */
   grants: PeerGrant[];
+  advertised_grants: PeerGrant[];
+  requested_grants: PeerGrant[];
   certificate_sha256: string;
+  last_seen_at_ms: number | null;
+  presence: PeerPresence;
+  secret_generation: number;
 }
+
+export type PeerPresence = "online" | "offline" | "unknown";
 
 export interface PeerThreadMessage {
   message_id: string;
@@ -53,6 +67,7 @@ export interface PeerThreadMessage {
   disposition: "accepted" | "rejected" | "delivered";
   rejection: string | null;
   job_id: string | null;
+  correlation_id?: string | null;
   created_at_ms: number;
 }
 
@@ -88,6 +103,28 @@ export const peersGrant = (deviceId: string, allow: PeerGrant[]) =>
 
 export const peersRevoke = (deviceId: string, reason: string) =>
   invoke<void>("peers_revoke", { deviceId, reason });
+
+export const peersRotate = (deviceId: string, output: string) =>
+  invoke<{ device_id: string; secret_generation: number; output: string }>("peers_rotate", {
+    deviceId,
+    output,
+  });
+
+export const peersAcceptRotation = (bundle: string, alias: string) =>
+  invoke<{ alias: string; secret_generation: number; certificate_sha256: string }>("peers_accept_rotation", {
+    bundle,
+    alias,
+  });
+
+export const peersClear = (deviceId: string) =>
+  invoke<{ device_id: string; threads_removed: number; grants_cleared: boolean }>("peers_clear", { deviceId });
+
+export const peersForget = (alias: string) => invoke<void>("peers_forget", { alias });
+
+export const peersStatus = (alias: string) =>
+  invoke<{ alias: string; peer_id: string; last_seen_at_ms: number | null; presence: PeerPresence }>("peers_status", {
+    alias,
+  });
 
 export const peersThreads = (peer: string | null = null, limit = 20) =>
   invoke<{ threads: PeerThread[]; recipe: string }>("peers_threads", { peer, limit });

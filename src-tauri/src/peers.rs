@@ -46,9 +46,24 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 /// Most artifact references one envelope may carry.
 pub const MAX_ARTIFACT_REFS: usize = 8;
 
+/// Artifact metadata is display data, not a path. Keep each field bounded even
+/// though only a handful of references fit in an envelope.
+pub const MAX_ARTIFACT_FILENAME_BYTES: usize = 255;
+pub const MAX_ARTIFACT_MEDIA_TYPE_BYTES: usize = 255;
+
+/// A peer reference may never advertise content larger than the remote
+/// artifact ceiling. The content store applies the same limit before a local
+/// id is offered by the agent tool.
+pub const MAX_PEER_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Longest an envelope may claim to live. Past this a sender is asking a
 /// receiver to hold state indefinitely.
 pub const MAX_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// A signed request already has a five-minute clock-skew window. The envelope
+/// gets the same allowance, rather than accepting work authored arbitrarily
+/// far in the future.
+pub const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 
 /// Longest identifier accepted anywhere in an envelope.
 pub const MAX_ID_LEN: usize = 128;
@@ -163,12 +178,22 @@ pub enum PeerRejection {
     HopLimitExceeded,
     ZeroHops,
     OriginLoop,
+    InvalidOriginChain,
     OriginChainTooLong,
+    InvalidTimestamp,
+    CreatedInFuture,
     Expired,
     ExpiryTooFar,
+    ArtifactMetadataTooLarge,
+    ArtifactTooLarge,
+    /// The envelope names content this installation was never handed. A sender
+    /// uploads before it references; anything else would be a reference to
+    /// bytes nobody here can read.
+    ArtifactUnavailable,
     Duplicate,
     MissingCapability,
     PeerRevoked,
+    LocalUnavailable,
 }
 
 impl PeerRejection {
@@ -182,12 +207,19 @@ impl PeerRejection {
             PeerRejection::HopLimitExceeded => "hop_limit_exceeded",
             PeerRejection::ZeroHops => "zero_hops",
             PeerRejection::OriginLoop => "origin_loop",
+            PeerRejection::InvalidOriginChain => "invalid_origin_chain",
             PeerRejection::OriginChainTooLong => "origin_chain_too_long",
+            PeerRejection::InvalidTimestamp => "invalid_timestamp",
+            PeerRejection::CreatedInFuture => "created_in_future",
             PeerRejection::Expired => "expired",
             PeerRejection::ExpiryTooFar => "expiry_too_far",
+            PeerRejection::ArtifactMetadataTooLarge => "artifact_metadata_too_large",
+            PeerRejection::ArtifactTooLarge => "artifact_too_large",
+            PeerRejection::ArtifactUnavailable => "artifact_unavailable",
             PeerRejection::Duplicate => "duplicate",
             PeerRejection::MissingCapability => "missing_capability",
             PeerRejection::PeerRevoked => "peer_revoked",
+            PeerRejection::LocalUnavailable => "local_unavailable",
         }
     }
 
@@ -204,12 +236,27 @@ impl PeerRejection {
             PeerRejection::HopLimitExceeded => "The hop limit is above the maximum",
             PeerRejection::ZeroHops => "The envelope has no hops left",
             PeerRejection::OriginLoop => "This installation is already in the origin chain",
+            PeerRejection::InvalidOriginChain => {
+                "The origin chain does not describe one unambiguous route"
+            }
             PeerRejection::OriginChainTooLong => "The origin chain is longer than allowed",
+            PeerRejection::InvalidTimestamp => "The envelope timestamps are malformed",
+            PeerRejection::CreatedInFuture => "The envelope was created too far in the future",
             PeerRejection::Expired => "The envelope expired before it arrived",
             PeerRejection::ExpiryTooFar => "The envelope asks to stay valid for too long",
+            PeerRejection::ArtifactMetadataTooLarge => {
+                "An artifact reference carries invalid or oversized metadata"
+            }
+            PeerRejection::ArtifactTooLarge => {
+                "An artifact reference is larger than a peer may offer"
+            }
+            PeerRejection::ArtifactUnavailable => {
+                "An artifact was referenced before its content was handed over"
+            }
             PeerRejection::Duplicate => "This message was delivered before",
             PeerRejection::MissingCapability => "This peer was not granted that capability",
             PeerRejection::PeerRevoked => "This peer's pairing was revoked",
+            PeerRejection::LocalUnavailable => "This installation cannot route peer work right now",
         }
     }
 }
@@ -242,13 +289,34 @@ impl PeerEnvelope {
         }
     }
 
-    /// Check everything that can be decided from the envelope itself plus who
-    /// this installation is.
+    /// Check everything a sender can prove before the envelope leaves.
+    pub fn validate_for_send(&self, now_ms: i64) -> Result<(), PeerRejection> {
+        self.validate_common(now_ms)
+    }
+
+    /// Check the envelope plus the receiver-specific origin-loop rule.
+    pub fn validate_for_receive(
+        &self,
+        local_instance_id: &str,
+        now_ms: i64,
+    ) -> Result<(), PeerRejection> {
+        self.validate_common(now_ms)?;
+        if self.origin_chain.iter().any(|hop| hop == local_instance_id) {
+            return Err(PeerRejection::OriginLoop);
+        }
+        Ok(())
+    }
+
+    /// Backward-compatible receiver validation entry point.
     ///
     /// Deliberately does not take a store: the parts that need one — dedupe,
     /// revocation, capability — are the receiver's, and keeping them out means
     /// the loop, bound and expiry rules are provable without a database.
     pub fn validate(&self, local_instance_id: &str, now_ms: i64) -> Result<(), PeerRejection> {
+        self.validate_for_receive(local_instance_id, now_ms)
+    }
+
+    fn validate_common(&self, now_ms: i64) -> Result<(), PeerRejection> {
         if self.version != PEER_ENVELOPE_VERSION {
             return Err(PeerRejection::UnsupportedVersion);
         }
@@ -267,11 +335,15 @@ impl PeerEnvelope {
         if self.origin_chain.len() > MAX_ORIGIN_CHAIN {
             return Err(PeerRejection::OriginChainTooLong);
         }
+        if self.origin_chain.first() != Some(&self.sender_instance_id) {
+            return Err(PeerRejection::InvalidOriginChain);
+        }
+        let mut unique_hops = BTreeSet::new();
         for hop in &self.origin_chain {
             check_id(hop)?;
-        }
-        if self.origin_chain.iter().any(|hop| hop == local_instance_id) {
-            return Err(PeerRejection::OriginLoop);
+            if !unique_hops.insert(hop.as_str()) {
+                return Err(PeerRejection::InvalidOriginChain);
+            }
         }
         if self.body.len() > MAX_BODY_BYTES {
             return Err(PeerRejection::BodyTooLarge);
@@ -286,9 +358,32 @@ impl PeerEnvelope {
             {
                 return Err(PeerRejection::MalformedId);
             }
+            if artifact
+                .size_bytes
+                .is_some_and(|size| size > MAX_PEER_ARTIFACT_BYTES)
+            {
+                return Err(PeerRejection::ArtifactTooLarge);
+            }
+            if artifact
+                .filename
+                .as_deref()
+                .is_some_and(|value| !valid_filename(value))
+                || artifact
+                    .media_type
+                    .as_deref()
+                    .is_some_and(|value| !valid_media_type(value))
+            {
+                return Err(PeerRejection::ArtifactMetadataTooLarge);
+            }
         }
         if self.body.trim().is_empty() && self.artifacts.is_empty() {
             return Err(PeerRejection::MissingBody);
+        }
+        if self.created_at_ms <= 0 || self.expires_at_ms <= self.created_at_ms {
+            return Err(PeerRejection::InvalidTimestamp);
+        }
+        if self.created_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS) {
+            return Err(PeerRejection::CreatedInFuture);
         }
         if self.expires_at_ms <= now_ms {
             return Err(PeerRejection::Expired);
@@ -340,6 +435,10 @@ impl PeerEnvelope {
         if self.origin_chain.len() >= MAX_ORIGIN_CHAIN {
             return Err(PeerRejection::OriginChainTooLong);
         }
+        if self.origin_chain.iter().any(|hop| hop == local_instance_id) {
+            return Err(PeerRejection::OriginLoop);
+        }
+        check_id(local_instance_id)?;
         let mut forwarded = self.clone();
         forwarded.hop_limit -= 1;
         forwarded.origin_chain.push(local_instance_id.to_string());
@@ -391,6 +490,22 @@ fn check_id(value: &str) -> Result<(), PeerRejection> {
         return Err(PeerRejection::MalformedId);
     }
     Ok(())
+}
+
+fn valid_filename(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_ARTIFACT_FILENAME_BYTES
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_media_type(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_ARTIFACT_MEDIA_TYPE_BYTES
+        && value.is_ascii()
+        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -563,6 +678,183 @@ mod tests {
             envelope(PeerMessageKind::TaskRequest).required_capabilities(),
             BTreeSet::from([PeerCapability::TaskRequest])
         );
+    }
+
+    #[test]
+    fn the_origin_chain_has_to_describe_one_route() {
+        // A chain that does not start with the author is a chain that has been
+        // edited; there is no legitimate way to produce one.
+        let mut disowned = envelope(PeerMessageKind::Message);
+        disowned.origin_chain = vec!["instance-someone-else".into()];
+        assert_eq!(
+            disowned.validate(LOCAL, NOW + 1),
+            Err(PeerRejection::InvalidOriginChain)
+        );
+
+        let mut empty = envelope(PeerMessageKind::Message);
+        empty.origin_chain.clear();
+        assert_eq!(
+            empty.validate(LOCAL, NOW + 1),
+            Err(PeerRejection::InvalidOriginChain)
+        );
+
+        // A repeated hop would let a forwarder hide a loop inside the chain.
+        let mut doubled = envelope(PeerMessageKind::Message);
+        doubled.origin_chain.push("instance-middle".into());
+        doubled.origin_chain.push("instance-middle".into());
+        assert_eq!(
+            doubled.validate(LOCAL, NOW + 1),
+            Err(PeerRejection::InvalidOriginChain)
+        );
+
+        // And forwarding refuses rather than producing one of the above.
+        let received = envelope(PeerMessageKind::Message);
+        assert_eq!(
+            received.forwarded_from("instance-remote"),
+            Err(PeerRejection::OriginLoop)
+        );
+    }
+
+    #[test]
+    fn timestamps_have_to_make_sense_before_anything_else_is_believed() {
+        let mut backwards = envelope(PeerMessageKind::Message);
+        backwards.expires_at_ms = backwards.created_at_ms;
+        assert_eq!(
+            backwards.validate(LOCAL, NOW - 1),
+            Err(PeerRejection::InvalidTimestamp)
+        );
+
+        let mut unborn = envelope(PeerMessageKind::Message);
+        unborn.created_at_ms = 0;
+        assert_eq!(
+            unborn.validate(LOCAL, NOW + 1),
+            Err(PeerRejection::InvalidTimestamp)
+        );
+
+        // Dating an envelope into the future would otherwise buy a sender an
+        // arbitrarily long life for it.
+        let mut ahead = envelope(PeerMessageKind::Message);
+        ahead.created_at_ms = NOW + MAX_FUTURE_SKEW_MS + 1;
+        ahead.expires_at_ms = ahead.created_at_ms + 60_000;
+        assert_eq!(
+            ahead.validate(LOCAL, NOW),
+            Err(PeerRejection::CreatedInFuture)
+        );
+
+        // Ordinary clock skew inside the allowance is fine.
+        let mut skewed = envelope(PeerMessageKind::Message);
+        skewed.created_at_ms = NOW + MAX_FUTURE_SKEW_MS - 1;
+        skewed.expires_at_ms = skewed.created_at_ms + 60_000;
+        assert_eq!(skewed.validate(LOCAL, NOW), Ok(()));
+    }
+
+    #[test]
+    fn artifact_metadata_is_display_data_and_is_bounded_like_it() {
+        let with_ref = |filename: Option<&str>, media_type: Option<&str>, size: Option<u64>| {
+            let mut envelope = envelope(PeerMessageKind::Artifact);
+            envelope.artifacts.push(PeerArtifactRef {
+                artifact_id: "art-1".into(),
+                sha256: "d".repeat(64),
+                filename: filename.map(str::to_string),
+                media_type: media_type.map(str::to_string),
+                size_bytes: size,
+            });
+            envelope.validate(LOCAL, NOW + 1)
+        };
+
+        // A filename is a label, never a path — and never a way to climb out.
+        assert_eq!(
+            with_ref(Some("../../etc/passwd"), None, None),
+            Err(PeerRejection::ArtifactMetadataTooLarge)
+        );
+        assert_eq!(
+            with_ref(Some(".."), None, None),
+            Err(PeerRejection::ArtifactMetadataTooLarge)
+        );
+        assert_eq!(
+            with_ref(Some("build\nlog.txt"), None, None),
+            Err(PeerRejection::ArtifactMetadataTooLarge)
+        );
+        assert_eq!(
+            with_ref(
+                Some(&"x".repeat(MAX_ARTIFACT_FILENAME_BYTES + 1)),
+                None,
+                None
+            ),
+            Err(PeerRejection::ArtifactMetadataTooLarge)
+        );
+        assert_eq!(
+            with_ref(
+                None,
+                Some(&"t".repeat(MAX_ARTIFACT_MEDIA_TYPE_BYTES + 1)),
+                None
+            ),
+            Err(PeerRejection::ArtifactMetadataTooLarge)
+        );
+        assert_eq!(
+            with_ref(None, None, Some(MAX_PEER_ARTIFACT_BYTES + 1)),
+            Err(PeerRejection::ArtifactTooLarge)
+        );
+        assert_eq!(
+            with_ref(Some("build.log"), Some("text/plain"), Some(2_048)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_sender_can_validate_everything_except_the_receivers_own_loop_rule() {
+        // Its own id in the chain is normal for a sender and a loop for a
+        // receiver, which is exactly why the two entry points differ.
+        let outgoing = envelope(PeerMessageKind::Message);
+        assert_eq!(outgoing.validate_for_send(NOW + 1), Ok(()));
+        assert_eq!(
+            outgoing.validate_for_receive("instance-remote", NOW + 1),
+            Err(PeerRejection::OriginLoop)
+        );
+        assert_eq!(outgoing.validate_for_receive(LOCAL, NOW + 1), Ok(()));
+
+        // Everything else is refused on both sides alike.
+        let mut expired = outgoing.clone();
+        expired.expires_at_ms = NOW + 1;
+        assert_eq!(
+            expired.validate_for_send(NOW + 2),
+            Err(PeerRejection::Expired)
+        );
+    }
+
+    #[test]
+    fn every_rejection_has_a_distinct_token_and_a_sentence() {
+        let all = [
+            PeerRejection::UnsupportedVersion,
+            PeerRejection::MalformedId,
+            PeerRejection::BodyTooLarge,
+            PeerRejection::TooManyArtifacts,
+            PeerRejection::MissingBody,
+            PeerRejection::HopLimitExceeded,
+            PeerRejection::ZeroHops,
+            PeerRejection::OriginLoop,
+            PeerRejection::InvalidOriginChain,
+            PeerRejection::OriginChainTooLong,
+            PeerRejection::InvalidTimestamp,
+            PeerRejection::CreatedInFuture,
+            PeerRejection::Expired,
+            PeerRejection::ExpiryTooFar,
+            PeerRejection::ArtifactMetadataTooLarge,
+            PeerRejection::ArtifactTooLarge,
+            PeerRejection::ArtifactUnavailable,
+            PeerRejection::Duplicate,
+            PeerRejection::MissingCapability,
+            PeerRejection::PeerRevoked,
+            PeerRejection::LocalUnavailable,
+        ];
+        let tokens: BTreeSet<&str> = all.iter().map(|reason| reason.as_str()).collect();
+        assert_eq!(tokens.len(), all.len(), "two rejections share a token");
+        for reason in all {
+            // The token is what a store column and an audit row hold; the
+            // sentence is what a peer is told. Neither may be empty.
+            assert!(!reason.as_str().is_empty());
+            assert!(!reason.message().is_empty());
+        }
     }
 
     #[test]

@@ -96,6 +96,9 @@ pub async fn accept_invitation(
         capabilities: granted_capabilities,
         next_sequence: 1,
         event_cursors: Default::default(),
+        last_seen_at_ms: None,
+        peer_advertised: Default::default(),
+        peer_requested: Default::default(),
     };
     let mut store = RemoteStore::open(&paths.root)?;
     store.save_controller(

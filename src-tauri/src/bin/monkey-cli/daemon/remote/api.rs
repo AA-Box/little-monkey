@@ -23,15 +23,17 @@ use little_monkey_lib::run_protocol::OutputChannel;
 use super::desktop::DesktopControlRuntime;
 use super::migrate::land_migration;
 use super::protocol::{
-    canonical_request, capability_block, effective_capabilities, legacy_capabilities, sha256_hex,
-    terminal_digest, ApprovalRequestBody, CancelRequestBody, DesktopControlActionRequest,
-    DesktopControlStartRequest, DesktopControlStopRequest, DeviceCapability, DeviceCommand,
-    DeviceCommandControl, DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest,
-    DeviceCommandState, DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest,
-    MigrationReceipt, PairAcceptRequest, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
-    SignedRequestHeaders, TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest,
-    VoiceCloseRequest, DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES,
-    MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
+    all_peer_capabilities, canonical_request, capability_block, effective_capabilities,
+    legacy_capabilities, peer_capabilities_of, sha256_hex, terminal_digest, ApprovalRequestBody,
+    CancelRequestBody, DesktopControlActionRequest, DesktopControlStartRequest,
+    DesktopControlStopRequest, DeviceCapability, DeviceCommand, DeviceCommandControl,
+    DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest, DeviceCommandState,
+    DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest, MigrationReceipt,
+    PairAcceptRequest, PeerArtifactStored, PeerArtifactUpload, PeerHelloRequest, PeerHelloResponse,
+    RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary, SignedRequestHeaders,
+    TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest, VoiceCloseRequest,
+    DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES,
+    PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
     CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
@@ -915,6 +917,12 @@ impl RemoteApi {
             ("GET", ["v1", "remote", "peer", "threads", thread_id]) => {
                 require_any_peer_capability(device)
                     .and_then(|_| self.peer_thread_get(device, thread_id, now_ms))
+            }
+            ("POST", ["v1", "remote", "peer", "hello"]) => require_any_peer_capability(device)
+                .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
+            ("POST", ["v1", "remote", "peer", "artifacts"]) => {
+                require_capability(device, DeviceCapability::PeerArtifact)
+                    .and_then(|_| self.peer_artifact_post(device, &request.body))
             }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
@@ -3245,11 +3253,14 @@ impl RemoteApi {
             return Err((409, "Global kill switch is engaged".to_string()));
         }
         let granted = granted_capabilities(device);
+        let artifacts = crate::daemon::peer_ingress::peer_content_store(&self.paths)
+            .map_err(|error| (500, error))?;
         let context = crate::daemon::peer_ingress::PeerContext {
             device_id: &device.device_id,
             granted: &granted,
             revoked: !device.active(),
             local_instance_id: &self.host.runner_id,
+            artifacts: &artifacts,
         };
         let accepted = crate::daemon::peer_ingress::accept_peer_envelope(
             &mut store,
@@ -3323,6 +3334,93 @@ impl RemoteApi {
         }
     }
 
+    /// One peer introducing itself, and learning what it may actually do here.
+    ///
+    /// The only route on this plane that changes nothing durable about
+    /// authority: what the caller advertises and asks for is stored beside the
+    /// pairing, never merged into it, so an operator sees the ask and decides.
+    /// `granted` in the reply is computed here from the pairing record — the
+    /// caller cannot influence it by anything it sent.
+    fn peer_hello_post(
+        &self,
+        device: &DeviceRecord,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let hello: PeerHelloRequest = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid peer hello: {error}")))?;
+        hello.validate().map_err(|error| (400, error))?;
+        let granted = peer_capabilities_of(&granted_capabilities(device));
+        if device.active() {
+            RemoteStore::open(&self.paths.root)
+                .map_err(internal)?
+                .record_peer_advertisement(
+                    &device.device_id,
+                    &hello.instance_id,
+                    &hello.advertised,
+                    &hello.requested,
+                    now_ms,
+                )
+                .map_err(internal)?;
+        }
+        let response = PeerHelloResponse {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            instance_id: self.host.runner_id.clone(),
+            now_ms,
+            advertised: all_peer_capabilities(),
+            granted,
+        };
+        Ok((
+            200,
+            serde_json::to_value(&response).map_err(internal)?,
+            Some(format!("peer:{}", device.device_id)),
+        ))
+    }
+
+    /// Take the bytes behind an artifact a peer is about to reference.
+    ///
+    /// Push rather than pull. The digest the sender declared is a checksum, not
+    /// an identifier this node trusts: the content store hashes what it
+    /// actually wrote, and a mismatch is refused rather than stored under the
+    /// name the sender chose.
+    fn peer_artifact_post(
+        &self,
+        device: &DeviceRecord,
+        body: &[u8],
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let upload: PeerArtifactUpload = serde_json::from_slice(body)
+            .map_err(|error| (400, format!("Invalid peer artifact: {error}")))?;
+        upload.validate().map_err(|error| (400, error))?;
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &upload.content_base64,
+        )
+        .map_err(|_| (400, "Peer artifact content is not valid base64".to_string()))?;
+        let store = crate::daemon::peer_ingress::peer_content_store(&self.paths)
+            .map_err(|error| (500, error))?;
+        let blob = store
+            .put(&bytes)
+            .map_err(|error| (400, format!("Could not store the peer artifact: {error}")))?;
+        // The store is content-addressed, so the id it returns *is* the digest
+        // of what was written. Comparing it to the claim is the whole check.
+        if blob.id != upload.sha256.to_ascii_lowercase() {
+            return Err((
+                400,
+                "Peer artifact content does not match its declared digest".to_string(),
+            ));
+        }
+        let stored = PeerArtifactStored {
+            artifact_id: blob.id,
+            sha256: upload.sha256.to_ascii_lowercase(),
+            size_bytes: blob.size,
+        };
+        Ok((
+            201,
+            serde_json::to_value(&stored).map_err(internal)?,
+            Some(format!("peer-artifact:{}", device.device_id)),
+        ))
+    }
+
     /// What a thread looks like now, including results for finished work.
     ///
     /// The peer polls this rather than being called back. That is not a
@@ -3337,17 +3435,21 @@ impl RemoteApi {
         now_ms: u64,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
         let mut store = DaemonStore::open(&self.paths).map_err(internal)?;
-        let Some(thread) = store.peer_thread(thread_id).map_err(internal)? else {
+        // Scoped to the calling pairing in the query itself: a peer reads its
+        // own threads and nobody else's, and a thread belonging to someone else
+        // is indistinguishable from one that does not exist, so probing cannot
+        // enumerate other peers.
+        let Some(thread) = store
+            .peer_thread(&device.device_id, thread_id)
+            .map_err(internal)?
+        else {
             return Err((404, "Unknown peer thread".to_string()));
         };
-        // A peer reads its own threads and nobody else's. Same 404 as a thread
-        // that does not exist, so probing cannot enumerate other peers.
-        if thread.peer_device_id != device.device_id {
-            return Err((404, "Unknown peer thread".to_string()));
-        }
         self.materialize_peer_results(&mut store, &thread, now_ms)?;
 
-        let messages = store.peer_messages(thread_id, 200).map_err(internal)?;
+        let messages = store
+            .peer_messages(&device.device_id, thread_id, 200)
+            .map_err(internal)?;
         let rows: Vec<serde_json::Value> = messages
             .iter()
             .map(|message| {
@@ -3392,7 +3494,7 @@ impl RemoteApi {
         now_ms: u64,
     ) -> Result<(), (u16, String)> {
         let awaiting = store
-            .peer_messages_awaiting_result(&thread.thread_id)
+            .peer_messages_awaiting_result(&thread.peer_device_id, &thread.thread_id)
             .map_err(internal)?;
         if awaiting.is_empty() {
             return Ok(());
