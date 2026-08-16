@@ -197,14 +197,7 @@ async fn serve_bound(
                     .accept(stream)
                     .await
                     .map_err(|error| format!("TLS handshake from {peer} failed: {error}"))?;
-                http1::Builder::new()
-                    .keep_alive(true)
-                    .serve_connection(
-                        TokioIo::new(tls),
-                        service_fn(move |request| handle_http(api.clone(), request)),
-                    )
-                    .await
-                    .map_err(|error| format!("Remote HTTP connection failed: {error}"))
+                serve_upgradable(TokioIo::new(tls), api).await
             }
             .await;
             if let Err(error) = result {
@@ -214,9 +207,33 @@ async fn serve_bound(
     }
 }
 
-async fn handle_http(
+/// Serves one already-accepted connection.
+///
+/// **`with_upgrades` is the whole reason this is a named function.** Without it
+/// the Talk route answers its `101` and then stops: `hyper::upgrade::on` only
+/// ever resolves for a connection served with upgrades enabled, so the
+/// handshake succeeds, the client waits, and the socket never arrives. That is
+/// invisible to every test that does not open a real WebSocket — so the test
+/// that does opens it through *this* function, and a future edit that drops the
+/// call takes the end-to-end Talk test down with it.
+pub(super) async fn serve_upgradable<I>(io: I, api: RemoteApi) -> Result<(), String>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(
+            io,
+            service_fn(move |request| handle_http(api.clone(), request)),
+        )
+        .with_upgrades()
+        .await
+        .map_err(|error| format!("Remote HTTP connection failed: {error}"))
+}
+
+pub(super) async fn handle_http(
     api: RemoteApi,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let method = request.method().as_str().to_ascii_uppercase();
     let path_and_query = request
@@ -226,6 +243,13 @@ async fn handle_http(
         .unwrap_or_else(|| "/".to_string());
     if let Some(response) = super::web::asset(&method, &path_and_query) {
         return Ok(to_http(response));
+    }
+    // Checked before the body is collected, because there is no body: this is
+    // the one route on the plane that becomes a socket instead of answering.
+    if method == "GET" {
+        if let Some(upgrade) = talk_upgrade(&api, &mut request, &path_and_query) {
+            return Ok(upgrade);
+        }
     }
     let auth = parse_auth(request.headers());
     let body = match Limited::new(request.into_body(), MAX_REMOTE_BODY_BYTES)
@@ -283,7 +307,156 @@ fn header<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Result<&'a str, Stri
         .map_err(|_| format!("Invalid {name} header"))
 }
 
+// --- The Talk WebSocket ----------------------------------------------------
+//
+// **Why the handshake is written out here rather than delegated.** The one
+// thing a WebSocket upgrade must not do is bypass the checks every other route
+// on this plane passes. So the sequence is deliberate and short: recognise the
+// path, refuse anything that is not a real upgrade, spend the one-use ticket
+// *before* answering 101, and only then hand the connection over. A socket that
+// reaches `run_talk_session` has already proven, through the signed request that
+// minted its ticket, exactly what a signed request proves.
+
+/// The session id and ticket of a Talk stream request, if this is one.
+///
+/// The ticket is a query parameter rather than a path segment on purpose: it
+/// keeps the bearer out of anything that treats a path as an identifier.
+fn talk_stream_target(path_and_query: &str) -> Option<(String, String)> {
+    let (path, query) = path_and_query.split_once('?')?;
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let ["v1", "remote", "device", "talk", session_id, "stream"] = segments.as_slice() else {
+        return None;
+    };
+    let ticket = query.split('&').find_map(|pair| {
+        pair.strip_prefix("ticket=")
+            .map(|value| percent_decode(value))
+    })?;
+    Some((percent_decode(session_id), ticket))
+}
+
+/// Minimal, allocation-bounded percent decoding for the two values above. Both
+/// are validated as strict identifiers/tokens downstream, so anything this
+/// leaves malformed is refused there rather than here.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn header_contains(headers: &hyper::HeaderMap, name: &str, needle: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(needle))
+        })
+}
+
+/// RFC 6455's `Sec-WebSocket-Accept`. SHA-1 here is protocol, not security —
+/// it authenticates nothing, and the ticket above is what does.
+fn websocket_accept(key: &str) -> String {
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let digest = ring::digest::digest(
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+        format!("{key}{GUID}").as_bytes(),
+    );
+    STANDARD.encode(digest.as_ref())
+}
+
+fn talk_upgrade(
+    api: &RemoteApi,
+    request: &mut Request<Incoming>,
+    path_and_query: &str,
+) -> Option<Response<Full<Bytes>>> {
+    let (session_id, ticket) = talk_stream_target(path_and_query)?;
+    if !header_contains(request.headers(), "upgrade", "websocket")
+        || !header_contains(request.headers(), "connection", "upgrade")
+    {
+        // Not an upgrade: fall through to the ordinary signed dispatch, which
+        // answers 426 and says how to open one properly.
+        return None;
+    }
+    let key = request
+        .headers()
+        .get("sec-websocket-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let Some(key) = key else {
+        return Some(to_http(ApiResponse::error(
+            400,
+            "A WebSocket upgrade needs a Sec-WebSocket-Key",
+        )));
+    };
+    if request
+        .headers()
+        .get("sec-websocket-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        != Some("13")
+    {
+        return Some(to_http(ApiResponse::error(
+            400,
+            "Only WebSocket version 13 is supported",
+        )));
+    }
+    // Spent before the 101 is written, under the API's own lock: two sockets
+    // racing with one ticket means exactly one of them is admitted.
+    let Some(authorization) = api.consume_talk_ticket(&session_id, &ticket, now_ms()) else {
+        return Some(to_http(ApiResponse::error(
+            401,
+            "That Talk ticket is unknown, expired, or already spent",
+        )));
+    };
+    let upgraded = hyper::upgrade::on(request);
+    let api = api.clone();
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(connection) => {
+                super::talk_socket::serve(api, authorization, TokioIo::new(connection)).await;
+            }
+            Err(error) => eprintln!("remote runner: Talk upgrade failed: {error}"),
+        }
+    });
+    Some(
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(hyper::header::CONNECTION, "Upgrade")
+            .header(hyper::header::UPGRADE, "websocket")
+            .header("sec-websocket-accept", websocket_accept(&key))
+            .body(Full::new(Bytes::new()))
+            .expect("static upgrade response is valid"),
+    )
+}
+
 fn to_http(value: ApiResponse) -> Response<Full<Bytes>> {
+    // The controller document gets a policy that permits what it implements;
+    // everything else keeps the deny-everything one. A single header for both
+    // was the bug: it denied this page the camera, microphone, location and
+    // screen capture it exists to reach, so the preparation controls could not
+    // work however the browser's own permission prompt was answered.
+    let document = super::web::is_controller_document(value.content_type);
+    let (permissions, csp) = if document {
+        (
+            super::web::CONTROLLER_PERMISSIONS_POLICY,
+            super::web::CONTROLLER_CSP,
+        )
+    } else {
+        (super::web::API_PERMISSIONS_POLICY, super::web::API_CSP)
+    };
     Response::builder()
         .status(StatusCode::from_u16(value.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header(CONTENT_TYPE, value.content_type)
@@ -292,16 +465,10 @@ fn to_http(value: ApiResponse) -> Response<Full<Bytes>> {
         .header("x-content-type-options", "nosniff")
         .header("x-frame-options", "DENY")
         .header("referrer-policy", "no-referrer")
-        .header(
-            "permissions-policy",
-            "camera=(), microphone=(), geolocation=(), display-capture=(), payment=(), usb=()",
-        )
+        .header("permissions-policy", permissions)
         .header("cross-origin-opener-policy", "same-origin")
         .header("cross-origin-resource-policy", "same-origin")
-        .header(
-            "content-security-policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'",
-        )
+        .header("content-security-policy", csp)
         .body(Full::new(Bytes::from(value.body)))
         .expect("static remote response is valid")
 }
@@ -451,6 +618,62 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
+    /// Only the Talk stream path, and only with a ticket, is a candidate for an
+    /// upgrade. Everything else falls through to the ordinary signed dispatch —
+    /// which is what stops the upgrade branch from becoming a second, weaker
+    /// way into the plane.
+    #[test]
+    fn only_a_ticketed_talk_stream_path_is_a_websocket_candidate() {
+        assert_eq!(
+            talk_stream_target("/v1/remote/device/talk/session-one/stream?ticket=abc123"),
+            Some(("session-one".to_string(), "abc123".to_string()))
+        );
+        // The ticket may be any query parameter position, and is decoded.
+        assert_eq!(
+            talk_stream_target("/v1/remote/device/talk/s1/stream?x=1&ticket=a%2Db"),
+            Some(("s1".to_string(), "a-b".to_string()))
+        );
+        for refused in [
+            // No ticket at all.
+            "/v1/remote/device/talk/session-one/stream",
+            "/v1/remote/device/talk/session-one/stream?other=1",
+            // Not the stream route.
+            "/v1/remote/device/talk/ticket?ticket=abc",
+            "/v1/remote/runs?ticket=abc",
+            // Neighbouring shapes that must not be mistaken for it.
+            "/v1/remote/device/talk/session-one/stream/extra?ticket=abc",
+            "/v1/remote/device/voice/session-one/chunk?ticket=abc",
+        ] {
+            assert!(talk_stream_target(refused).is_none(), "{refused}");
+        }
+    }
+
+    /// RFC 6455's example handshake, so a browser that follows the spec is
+    /// answered correctly rather than "it worked on the one client I tried".
+    #[test]
+    fn the_handshake_answers_the_key_the_specification_defines() {
+        assert_eq!(
+            websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    /// `Connection: keep-alive, Upgrade` is what real clients send; a check
+    /// that compared the whole header would refuse them.
+    #[test]
+    fn upgrade_headers_are_read_as_lists_rather_than_as_whole_values() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("connection", "keep-alive, Upgrade".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        assert!(header_contains(&headers, "connection", "upgrade"));
+        assert!(header_contains(&headers, "upgrade", "websocket"));
+        assert!(!header_contains(&headers, "upgrade", "h2c"));
+
+        let mut plain = hyper::HeaderMap::new();
+        plain.insert("connection", "keep-alive".parse().unwrap());
+        assert!(!header_contains(&plain, "connection", "upgrade"));
+    }
+
     #[test]
     fn advertised_url_rejects_http_credentials_query_and_fragment() {
         let base = RemoteHostConfig {
@@ -500,5 +723,103 @@ mod tests {
         assert!(policy.contains("default-src 'none'"));
         assert!(policy.contains("connect-src 'self'"));
         assert!(policy.contains("frame-ancestors 'none'"));
+
+        // The microphone is open to this page and to nothing else. Both halves
+        // matter: `()` would deny Talk and `voice_stream` outright, and `*`
+        // would hand the microphone to anything this page ever embeds. Which
+        // *other* features the document may use is
+        // `the_controller_document_is_permitted_to_use_what_it_implements`'s
+        // question, and asserting it twice from here would only mean this test
+        // failed every time a capability was added.
+        let permissions = response.headers()["permissions-policy"].to_str().unwrap();
+        assert!(permissions.contains("microphone=(self)"));
+        assert!(!permissions.contains("microphone=*"));
+        assert!(permissions.contains("payment=()"));
+    }
+
+    /// The controller must be permitted to use the hardware it implements.
+    ///
+    /// This is the assertion whose absence let every device test pass while the
+    /// real browser path was dead: an empty allowlist — `camera=()` — disables
+    /// the feature for the document, so `getUserMedia`, `getDisplayMedia` and
+    /// `getCurrentPosition` were refused before any permission prompt could
+    /// appear, and no amount of correct client logic could reach hardware.
+    #[test]
+    fn the_controller_document_is_permitted_to_use_what_it_implements() {
+        let response = to_http(super::super::web::asset("GET", "/remote").unwrap());
+        let policy = response.headers()["permissions-policy"].to_str().unwrap();
+        for feature in ["camera", "microphone", "geolocation", "display-capture"] {
+            assert!(
+                policy.contains(&format!("{feature}=(self)")),
+                "the controller implements {feature} and this policy forbids it: {policy}"
+            );
+            assert!(
+                !policy.contains(&format!("{feature}=()")),
+                "an empty allowlist disables {feature} outright: {policy}"
+            );
+        }
+        // Narrow, not open: this origin only, and nothing it does not use.
+        assert!(
+            !policy.contains('*'),
+            "the allowlist must name self, not all"
+        );
+        for denied in ["payment=()", "usb=()"] {
+            assert!(
+                policy.contains(denied),
+                "{denied} must stay denied: {policy}"
+            );
+        }
+    }
+
+    /// …and nothing else is. A signed API response has no reason to reach a
+    /// camera, so it keeps the deny-everything policy.
+    #[test]
+    fn an_api_response_still_denies_every_hardware_feature() {
+        let response = to_http(ApiResponse::error(401, "nope"));
+        let policy = response.headers()["permissions-policy"].to_str().unwrap();
+        for feature in ["camera", "microphone", "geolocation", "display-capture"] {
+            assert!(
+                policy.contains(&format!("{feature}=()")),
+                "{feature} must stay denied outside the controller document: {policy}"
+            );
+        }
+    }
+
+    /// The audio the controller plays has to be allowed to load.
+    ///
+    /// `media-src` has no fallback but `default-src`, which is `'none'` here, so
+    /// without it the two real audio sources — a `blob:` URL for an artifact and
+    /// a `data:` URL for the silence that unlocks autoplay — were both refused.
+    /// The header and the document's own `<meta>` copy are both enforced and the
+    /// browser intersects them, so they are checked together: a directive
+    /// present in one and missing from the other still blocks.
+    #[test]
+    fn the_controller_may_load_the_audio_it_plays_under_both_policy_copies() {
+        let response = to_http(super::super::web::asset("GET", "/remote").unwrap());
+        let header = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let html = String::from_utf8(super::super::web::asset("GET", "/remote").unwrap().body)
+            .expect("the controller document is text");
+        let meta = html
+            .split_once("http-equiv=\"Content-Security-Policy\" content=\"")
+            .and_then(|(_, tail)| tail.split_once('"'))
+            .map(|(value, _)| value.to_string())
+            .expect("the controller document still declares its own policy");
+        assert_eq!(
+            header, meta,
+            "both copies are enforced and the browser intersects them; they must not drift"
+        );
+        for policy in [&header, &meta] {
+            assert!(policy.contains("media-src 'self' blob: data:"), "{policy}");
+            // The strictness the relaxation must not have cost.
+            assert!(policy.contains("default-src 'none'"), "{policy}");
+            assert!(policy.contains("object-src 'none'"), "{policy}");
+            assert!(policy.contains("frame-ancestors 'none'"), "{policy}");
+            assert!(policy.contains("base-uri 'none'"), "{policy}");
+            assert!(!policy.contains("unsafe-inline"), "{policy}");
+            assert!(!policy.contains("unsafe-eval"), "{policy}");
+        }
     }
 }

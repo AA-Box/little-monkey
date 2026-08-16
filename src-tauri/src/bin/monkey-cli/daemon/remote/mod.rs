@@ -2,11 +2,18 @@ pub(crate) mod api;
 mod client;
 mod desktop;
 pub(crate) mod device;
+/// The device plane end to end, against the real store and the real signed
+/// API. Tests only — see the module's own documentation.
+#[cfg(test)]
+mod device_e2e;
 pub(crate) mod migrate;
 pub(crate) mod protocol;
 pub(crate) mod push;
+pub(crate) mod qr;
 mod server;
 pub(crate) mod store;
+pub(crate) mod talk;
+pub(crate) mod talk_socket;
 pub(crate) mod voice;
 pub(crate) mod watch;
 mod web;
@@ -75,6 +82,27 @@ pub enum RemoteCmd {
     },
     /// Ask a paired device to do something once, and wait for the answer.
     DeviceAction(RemoteDeviceActionArgs),
+    /// Check a real paired device end to end and exit non-zero if it is not
+    /// working.
+    ///
+    /// Safe by default: it reads the device's own advertised surface and asks
+    /// it to describe itself, which touches no sensor. `--dangerous` adds the
+    /// physical actions — a photograph, a short recording, a location fix, a
+    /// notification — and is opt-in precisely because each of those happens in
+    /// a room somebody is in. Needs no credentials of any kind: it uses the
+    /// pairing the operator already made.
+    DeviceCheck {
+        /// Which paired device. Omit when exactly one is paired.
+        #[arg(long = "device-id")]
+        device_id: Option<String>,
+        /// Also perform the physical actions this device is granted.
+        #[arg(long)]
+        dangerous: bool,
+        #[arg(long, default_value_t = 60_000)]
+        wait_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Recent commands queued for one device.
     DeviceCommands {
         device_id: String,
@@ -344,6 +372,11 @@ pub struct RemotePairCreateArgs {
     /// writing the invitation file.
     #[arg(long)]
     qr: bool,
+    /// Print the result as JSON — the invitation path, the compact bootstrap
+    /// URI, and (with `--qr`) the code as an SVG. This is what the desktop's
+    /// pairing panel reads; a terminal wants the human form above it.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -375,6 +408,13 @@ pub struct RemoteDeviceActionArgs {
     pub artifact_id: Option<String>,
     #[arg(long = "wait-ms", default_value_t = 60_000)]
     pub wait_ms: u64,
+    /// The durable invocation asking for this, when a caller has one.
+    ///
+    /// Two deliveries of the same invocation produce one command and therefore
+    /// one physical effect. Omitted — an operator running this by hand — every
+    /// invocation is its own command, because two deliberate asks are two asks.
+    #[arg(long = "invocation-id")]
+    pub invocation_id: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -532,6 +572,12 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
             capabilities,
         } => device_grant(&paths, device_id, capabilities)?,
         RemoteCmd::DeviceAction(args) => device_action(&paths, args).await?,
+        RemoteCmd::DeviceCheck {
+            device_id,
+            dangerous,
+            wait_ms,
+            json,
+        } => device_check(&paths, device_id.as_deref(), *dangerous, *wait_ms, *json).await?,
         RemoteCmd::DeviceCommands {
             device_id,
             limit,
@@ -1196,6 +1242,23 @@ fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
 /// external side effects before the network went, and this machine cannot know —
 /// so re-placing without a human is exactly the "confirmed mutations are not
 /// replayed" rule the daemon's own `reconcile_interrupted` already holds to.
+/// Terminates device work whose deadline has passed, including the capture rows
+/// an open Talk socket registers.
+///
+/// **Why this needs its own tick.** Both expiry sweeps used to run in exactly
+/// one place — the device long-poll — so nothing swept until some device asked
+/// for work. A runner that died mid-conversation therefore left a `running`
+/// `voice_stream` row behind, and the security audit went on reporting a
+/// microphone in flight for a socket that no longer existed. A stale "something
+/// is listening" is worse than useless: it is the alarm nobody believes.
+pub(crate) fn expire_device_work(paths: &DaemonPaths) -> Result<u64, String> {
+    let now = now_ms()?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    let expired = store.expire_device_commands(now)?;
+    voice::expire(&mut store, now)?;
+    Ok(expired)
+}
+
 pub(crate) async fn placement_sync(paths: &DaemonPaths) -> Result<(), String> {
     let now = now_ms()?;
     for alias in aliases(paths, None)? {
@@ -1365,6 +1428,39 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         capabilities: invitation.capabilities,
     };
     protected_json(&args.output, &value)?;
+    // The same one-time token, in the form a camera can read. It pins the
+    // certificate by fingerprint rather than carrying the PEM — see
+    // `PairingBootstrap`. Always computed, because the desktop's JSON reader
+    // shows the code beside the file and a terminal only prints it on `--qr`.
+    let bootstrap = PairingBootstrap {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        runner_id: value.runner_id.clone(),
+        runner_url: value.runner_url.clone(),
+        pairing_id: value.pairing_id.clone(),
+        pairing_token: value.pairing_token.clone(),
+        certificate_sha256: value.server_certificate_sha256.clone(),
+        expires_at_ms: value.expires_at_ms,
+    };
+    let uri = bootstrap.to_uri()?;
+    if args.json {
+        // The SVG rather than the matrix: the caller is a webview, and handing
+        // it a grid of booleans would put the rendering rules — quiet zone,
+        // crisp edges, contrast — in a second place.
+        let code = qr::encode(&uri)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "invitation_path": args.output.display().to_string(),
+                "controller_url": controller_url(&value.runner_url),
+                "expires_at_ms": value.expires_at_ms,
+                "bootstrap_uri": uri,
+                "bootstrap_bytes": uri.len(),
+                "qr_svg": code.to_svg(4),
+                "qr_modules": code.size,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "One-time pairing invitation written to {} (expires at {}). Transfer it securely, open {}, and choose the file.",
         args.output.display(),
@@ -1372,22 +1468,9 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         controller_url(&value.runner_url)
     );
     if args.qr {
-        // The same one-time token, in the form a camera can read. It pins the
-        // certificate by fingerprint rather than carrying the PEM — see
-        // `PairingBootstrap`.
-        let bootstrap = PairingBootstrap {
-            protocol_version: REMOTE_PROTOCOL_VERSION,
-            runner_id: value.runner_id.clone(),
-            runner_url: value.runner_url.clone(),
-            pairing_id: value.pairing_id.clone(),
-            pairing_token: value.pairing_token.clone(),
-            certificate_sha256: value.server_certificate_sha256.clone(),
-            expires_at_ms: value.expires_at_ms,
-        };
-        println!(
-            "\nScan or paste this pairing code on the device (it expires with the invitation):\n{}",
-            bootstrap.to_uri()?
-        );
+        println!("\nScan this with the device's camera (it expires with the invitation):\n");
+        println!("{}", qr::encode(&uri)?.to_terminal());
+        println!("Or paste this code into the controller's pairing field:\n{uri}");
     }
     Ok(())
 }
@@ -1415,7 +1498,37 @@ fn device_rows(paths: &DaemonPaths) -> Result<Vec<serde_json::Value>, String> {
                 "granted": device.capabilities,
                 "advertised": surface.as_ref().map(|surface| surface.capabilities.clone()),
                 "os_permissions": surface.as_ref().map(|surface| surface.permissions.clone()),
+                "readiness": surface.as_ref().map(|surface| surface.readiness.clone()),
                 "effective": effective,
+                // One row per physical capability with the four axes kept
+                // apart and the single reason it is not effective named. The
+                // intersection alone tells an operator nothing they can act on.
+                "physical": protocol::PHYSICAL_DEVICE_CAPABILITIES
+                    .iter()
+                    .map(|capability| {
+                        let block = protocol::capability_block(
+                            &device.capabilities,
+                            surface.as_ref(),
+                            *capability,
+                        );
+                        serde_json::json!({
+                            "capability": capability,
+                            "granted": device.capabilities.contains(capability),
+                            "supported": surface
+                                .as_ref()
+                                .is_some_and(|surface| surface.capabilities.contains(capability)),
+                            "permission": surface
+                                .as_ref()
+                                .map(|surface| surface.permission(*capability)),
+                            "readiness": surface
+                                .as_ref()
+                                .map(|surface| surface.readiness(*capability)),
+                            "effective": block.is_none(),
+                            "blocked_by": block.map(|block| block.as_str()),
+                            "reason": block.map(|block| block.explain(*capability)),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
                 "platform": surface.as_ref().map(|surface| surface.platform.clone()),
                 "platform_version": surface.as_ref().map(|surface| surface.platform_version.clone()),
                 "app_version": surface.as_ref().map(|surface| surface.app_version.clone()),
@@ -1441,6 +1554,9 @@ fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value 
         "updated_at_ms": record.updated_at_ms,
         "expires_at_ms": record.expires_at_ms,
         "source_run_id": record.source_run_id,
+        // Which attempt owns a running command, so an operator can see that a
+        // reconnect resumed the same one rather than starting a second.
+        "execution_id": record.execution_id,
         "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
             "sha256": artifact.sha256,
             "bytes": artifact.bytes,
@@ -1569,7 +1685,11 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
             wait_ms: args.wait_ms,
             source_run_id: None,
             source_session_id: None,
-            source_tool_call_id: None,
+            source_tool_call_id: args.invocation_id.clone(),
+            // Supplied only by a caller that has a durable invocation to name —
+            // the desktop passes its turn and tool-call ids. An operator typing
+            // this command twice means it twice.
+            invocation_id: args.invocation_id.clone(),
         },
         now_ms()?,
     )
@@ -1589,6 +1709,186 @@ async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Re
             "  artifact: {} bytes of {} (sha256 {})",
             artifact.bytes, artifact.media_type, artifact.sha256
         );
+    }
+    Ok(())
+}
+
+/// Exercises a genuinely paired device and says whether it works.
+///
+/// The one thing the automated suite cannot cover: real hardware, over the real
+/// signed transport, on somebody's actual phone. It needs no credentials, no
+/// account and no project — the pairing the operator already made is the whole
+/// setup — and it is never part of a normal test run, because a photograph is
+/// not something CI should take.
+///
+/// Safe checks run by default and touch no sensor. `--dangerous` adds the
+/// physical ones, each of which is skipped unless the device says it is
+/// effective, so the check reports "not ready" rather than hanging on a
+/// capability the phone cannot serve.
+async fn device_check(
+    paths: &DaemonPaths,
+    device_id: Option<&str>,
+    dangerous: bool,
+    wait_ms: u64,
+    json: bool,
+) -> Result<(), String> {
+    let rows = device_rows(paths)?;
+    let row = match device_id {
+        Some(device_id) => rows
+            .iter()
+            .find(|row| row["device_id"].as_str() == Some(device_id))
+            .ok_or_else(|| format!("No paired device '{device_id}'"))?,
+        None => match rows.len() {
+            0 => return Err("No device is paired with this runner.".to_string()),
+            1 => &rows[0],
+            _ => {
+                return Err(format!(
+                    "{} devices are paired — name one with --device-id",
+                    rows.len()
+                ))
+            }
+        },
+    };
+    let device_id = row["device_id"].as_str().unwrap_or_default().to_string();
+    let physical = row["physical"].as_array().cloned().unwrap_or_default();
+    let effective = |capability: &str| {
+        physical.iter().any(|entry| {
+            entry["capability"].as_str() == Some(capability)
+                && entry["effective"] == serde_json::json!(true)
+        })
+    };
+
+    if !json {
+        println!(
+            "Checking {} ({})",
+            row["device_name"].as_str().unwrap_or_default(),
+            device_id
+        );
+        for entry in &physical {
+            println!(
+                "  {:<20} granted={} supported={} permission={} readiness={} effective={}{}",
+                entry["capability"].as_str().unwrap_or_default(),
+                entry["granted"],
+                entry["supported"],
+                entry["permission"].as_str().unwrap_or("not reported"),
+                entry["readiness"].as_str().unwrap_or("not reported"),
+                entry["effective"],
+                match entry["reason"].as_str() {
+                    Some(reason) => format!("\n      {reason}"),
+                    None => String::new(),
+                },
+            );
+        }
+    }
+
+    // Safe first, then the physical ones only when asked for. `device_info`
+    // reads the device's own name and nothing else, which is why it is the
+    // default check: it proves the whole path — queue, wake, lease, start,
+    // result — without touching a sensor.
+    let mut plan: Vec<(&str, serde_json::Value)> = vec![("device_info", serde_json::json!({}))];
+    if dangerous {
+        plan.extend([
+            ("camera_capture", serde_json::json!({ "position": "back" })),
+            (
+                "microphone_capture",
+                serde_json::json!({ "duration_ms": 2_000 }),
+            ),
+            ("screen_capture", serde_json::json!({})),
+            ("location_read", serde_json::json!({ "accuracy": "coarse" })),
+            (
+                "notification_post",
+                serde_json::json!({ "title": "Little Monkey", "body": "Device check" }),
+            ),
+            (
+                "audio_playback",
+                serde_json::json!({ "text": "Device check" }),
+            ),
+        ]);
+    }
+
+    let mut results = Vec::new();
+    let mut failures = 0usize;
+    for (action, arguments) in plan {
+        if !effective(action) {
+            results.push(serde_json::json!({
+                "action": action,
+                "status": "skipped",
+                "detail": "not effective on this device",
+            }));
+            if !json {
+                println!("  {action}: skipped (not effective)");
+            }
+            continue;
+        }
+        let capability = device::capability_for_action(action)?;
+        let record = device::dispatch(
+            paths,
+            &device::DeviceActionRequest {
+                device_id: Some(device_id.clone()),
+                capability,
+                arguments,
+                wait_ms,
+                source_run_id: None,
+                source_session_id: None,
+                source_tool_call_id: None,
+                // Each check is its own ask, so none of them dedupes against
+                // another.
+                invocation_id: None,
+            },
+            now_ms()?,
+        )
+        .await?;
+        // The shape, not merely the state: a success carrying neither a result
+        // nor an artifact has not proven anything.
+        let succeeded = record.state == protocol::DeviceCommandState::Succeeded;
+        let has_payload = record.result.is_some() || record.artifact.is_some();
+        let artifact_ok = record.artifact.as_ref().is_none_or(|artifact| {
+            artifact.bytes > 0
+                && artifact.sha256.len() == 64
+                && !artifact.media_type.trim().is_empty()
+        });
+        if !(succeeded && has_payload && artifact_ok) {
+            failures += 1;
+        }
+        results.push(serde_json::json!({
+            "action": action,
+            "status": if succeeded && has_payload && artifact_ok { "ok" } else { "failed" },
+            "state": record.state.as_str(),
+            "command_id": record.command_id,
+            "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
+                "sha256": artifact.sha256,
+                "bytes": artifact.bytes,
+                "media_type": artifact.media_type,
+            })),
+            "error": record.error,
+        }));
+        if !json {
+            println!(
+                "  {action}: {} ({}){}",
+                if succeeded && has_payload && artifact_ok {
+                    "ok"
+                } else {
+                    "FAILED"
+                },
+                record.state.as_str(),
+                match &record.error {
+                    Some(error) => format!(" — {error}"),
+                    None => String::new(),
+                }
+            );
+        }
+    }
+
+    if json {
+        print_json(serde_json::json!({
+            "device_id": device_id,
+            "physical": physical,
+            "checks": results,
+            "failures": failures,
+        }))?;
+    }
+    if failures > 0 {
+        return Err(format!("{failures} device check(s) failed"));
     }
     Ok(())
 }
@@ -1862,6 +2162,16 @@ async fn migrate_run(
         departure.sequence, departure.event_hash
     );
     Ok(())
+}
+
+/// The advertised transport, for callers outside this module that need to
+/// describe it — the security audit asks whether a phone holding a camera grant
+/// is talking over a pinned connection, and there must be one answer to that
+/// rather than a second reader of the same file.
+pub(crate) fn host_config(
+    paths: &DaemonPaths,
+) -> Result<Option<protocol::RemoteHostConfig>, String> {
+    server::load_host_config(paths)
 }
 
 fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {

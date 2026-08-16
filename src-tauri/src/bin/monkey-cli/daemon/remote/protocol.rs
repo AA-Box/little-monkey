@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use little_monkey_lib::run_ledger::StoredRun;
 use ring::rand::SecureRandom;
@@ -16,6 +16,26 @@ pub const DEFAULT_REQUEST_SKEW_MS: u64 = 5 * 60 * 1_000;
 /// grant after authentication.
 pub const MAX_REMOTE_BODY_BYTES: usize = 48 * 1024 * 1024;
 pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Dedicated Talk frames are versioned independently so their WebSocket wire
+/// shape can evolve without changing the signed HTTP remote plane.
+pub const TALK_PROTOCOL_VERSION: u32 = 1;
+pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
+pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
+pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
+pub const MAX_TALK_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_TALK_ERROR_BYTES: usize = 4 * 1024;
+pub const MAX_TALK_MEDIA_TYPE_BYTES: usize = 128;
+pub const MAX_TALK_SESSION_ID_BYTES: usize = 256;
+pub const MAX_TALK_SESSION_GENERATION_BYTES: usize = 128;
+pub const MAX_TALK_TICKET_BYTES: usize = 128;
+pub const DEFAULT_TALK_TICKET_TTL_MS: u64 = 30_000;
+pub const MAX_TALK_TICKET_TTL_MS: u64 = 60_000;
+/// The longest span a Talk latency sample may claim. Matches the desktop's own
+/// telemetry ceiling, so a phone and a laptop are graded on one scale.
+pub const MAX_TALK_LATENCY_MS: u64 = 10 * 60 * 1_000;
+const TALK_SESSION_GENERATION_RANDOM_BYTES: usize = 18;
+const TALK_TICKET_RANDOM_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -240,7 +260,10 @@ pub fn validate_capabilities(
 ///
 /// `Unsupported` and `Denied` are deliberately distinct: an operator looking at
 /// a phone that cannot capture the screen at all should not be told to go turn
-/// a permission on.
+/// a permission on. `NotRequired` is distinct again, and is the variant that
+/// makes the model honest: several physical capabilities have no persistent OS
+/// permission at all (reading the device's own name, playing a sound), and
+/// pretending they do left them advertised and permanently ineffective.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OsPermission {
@@ -248,9 +271,106 @@ pub enum OsPermission {
     Denied,
     /// The OS has not been asked yet — the device will prompt when a command
     /// first needs it.
+    ///
+    /// Retained as the wire spelling older device builds send. Identical to
+    /// [`Self::Promptable`] everywhere it is judged: neither is permission.
     Undetermined,
+    /// The OS has not been asked yet and *can* be asked, from a user gesture on
+    /// the device. Never asked on the runner's behalf.
+    Promptable,
+    /// This capability needs no persistent OS permission on this platform.
+    NotRequired,
     /// This platform/build has no such facility.
     Unsupported,
+}
+
+impl OsPermission {
+    /// Whether this state is permission to act. `Undetermined`/`Promptable` are
+    /// deliberately not: "the OS has not been asked" is never a yes.
+    pub fn is_sufficient(self) -> bool {
+        matches!(self, Self::Granted | Self::NotRequired)
+    }
+}
+
+/// Whether the device could act *right now*, given everything the OS permission
+/// does not cover.
+///
+/// A separate axis from the permission because the answers are separate
+/// questions with separate fixes. A browser that holds the camera permission
+/// still cannot capture while the tab is in the background; a display stream
+/// needs the user to share once and stays shared until they stop; autoplay
+/// stays blocked until the page has been interacted with. Collapsing any of
+/// those into "permission denied" would send the operator to a settings screen
+/// that would not help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceReadiness {
+    Ready,
+    /// The device can do this, but only while its screen is on and the
+    /// controller is in front.
+    ForegroundRequired,
+    /// The platform demands a user gesture before this works at all (autoplay
+    /// being the usual one).
+    InteractionRequired,
+    /// A one-time consent the user must arm, which then stays armed until they
+    /// end it — screen sharing.
+    ArmedRequired,
+    /// Nothing can be done about it from here.
+    Unavailable,
+}
+
+/// Whether a physical capability has an OS permission to speak of.
+///
+/// Written down per capability so a new variant cannot enter
+/// [`PHYSICAL_DEVICE_CAPABILITIES`] without someone deciding what its
+/// permission means — the failure this whole model exists to stop was exactly a
+/// capability advertised with an imaginary permission it could never satisfy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionRequirement {
+    /// The device must hold a real OS permission.
+    OsPermission,
+    /// There is no such permission; readiness is the whole story.
+    None,
+}
+
+pub const PHYSICAL_CAPABILITY_SEMANTICS: &[(DeviceCapability, PermissionRequirement)] = &[
+    (DeviceCapability::DeviceInfo, PermissionRequirement::None),
+    (
+        DeviceCapability::CameraCapture,
+        PermissionRequirement::OsPermission,
+    ),
+    (
+        DeviceCapability::MicrophoneCapture,
+        PermissionRequirement::OsPermission,
+    ),
+    (
+        DeviceCapability::LocationRead,
+        PermissionRequirement::OsPermission,
+    ),
+    (
+        DeviceCapability::NotificationPost,
+        PermissionRequirement::OsPermission,
+    ),
+    // Sharing a screen is a per-session consent, not a stored permission: the
+    // browser asks once, the user may stop at any moment, and nothing is
+    // remembered afterwards. That is readiness, not permission.
+    (DeviceCapability::ScreenCapture, PermissionRequirement::None),
+    // No platform has an "may this app make a sound" permission. Autoplay
+    // policy is a readiness state.
+    (DeviceCapability::AudioPlayback, PermissionRequirement::None),
+    (
+        DeviceCapability::VoiceStream,
+        PermissionRequirement::OsPermission,
+    ),
+];
+
+/// What a physical capability's permission means, or `None` for a capability
+/// that is not physical at all.
+pub fn permission_requirement(capability: DeviceCapability) -> Option<PermissionRequirement> {
+    PHYSICAL_CAPABILITY_SEMANTICS
+        .iter()
+        .find(|(value, _)| *value == capability)
+        .map(|(_, requirement)| *requirement)
 }
 
 /// Bounds the device says it will enforce on its own, so the runner can refuse
@@ -301,6 +421,15 @@ pub struct DeviceSurface {
     /// is treated as [`OsPermission::Undetermined`].
     #[serde(default)]
     pub permissions: BTreeMap<DeviceCapability, OsPermission>,
+    /// Whether the device could act right now, per capability.
+    ///
+    /// A capability absent from this map reads as [`DeviceReadiness::Unavailable`]
+    /// — fail closed. A surface stored by an older build carries no readiness at
+    /// all, and that device's physical capabilities stay ineffective until it
+    /// reconnects and says what it can do now. Missing security fields are never
+    /// read as consent.
+    #[serde(default)]
+    pub readiness: BTreeMap<DeviceCapability, DeviceReadiness>,
     #[serde(default)]
     pub constraints: DeviceConstraints,
     pub reported_at_ms: u64,
@@ -326,7 +455,8 @@ impl DeviceSurface {
                 ));
             }
         }
-        if self.capabilities.len() > 64 || self.permissions.len() > 64 {
+        if self.capabilities.len() > 64 || self.permissions.len() > 64 || self.readiness.len() > 64
+        {
             return Err("Device surface advertises too many capabilities".to_string());
         }
         if self.constraints.max_artifact_bytes == 0
@@ -364,10 +494,143 @@ impl DeviceSurface {
             .copied()
             .unwrap_or(OsPermission::Undetermined)
     }
+
+    /// Fail-closed on purpose: an unstated readiness is not readiness.
+    pub fn readiness(&self, capability: DeviceCapability) -> DeviceReadiness {
+        self.readiness
+            .get(&capability)
+            .copied()
+            .unwrap_or(DeviceReadiness::Unavailable)
+    }
 }
 
-/// `operator grant ∩ advertised support ∩ current OS permission`, evaluated for
-/// the physical capabilities and only for them.
+/// Why one capability is not effective, in the vocabulary the fix is written in.
+///
+/// A caller that only learns "device unavailable" cannot tell an operator what
+/// to do; each of these maps to exactly one action, which is why they are not
+/// collapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityBlock {
+    NotGranted,
+    /// The device has never told the runner what it is.
+    NoSurface,
+    Unsupported,
+    PermissionRequired,
+    PermissionDenied,
+    ForegroundRequired,
+    InteractionRequired,
+    ScreenCaptureNotArmed,
+    Unavailable,
+}
+
+impl CapabilityBlock {
+    /// The wire token, so a caller can branch on the reason rather than parse
+    /// the sentence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotGranted => "not_granted",
+            Self::NoSurface => "no_surface",
+            Self::Unsupported => "unsupported",
+            Self::PermissionRequired => "permission_required",
+            Self::PermissionDenied => "permission_denied",
+            Self::ForegroundRequired => "foreground_required",
+            Self::InteractionRequired => "interaction_required",
+            Self::ScreenCaptureNotArmed => "screen_capture_not_armed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// What the operator has to do about it, named for the surface they would
+    /// do it on.
+    pub fn explain(self, capability: DeviceCapability) -> String {
+        let name = capability_token(capability).replace('_', " ");
+        match self {
+            Self::NotGranted => format!(
+                "'{name}' is not granted to this device. Grant it from the device's card in \
+                 Settings, then retry."
+            ),
+            Self::NoSurface => format!(
+                "This device has never advertised what it can do, so '{name}' cannot be used. \
+                 Open the paired-device controller on the device once and retry."
+            ),
+            Self::Unsupported => {
+                format!("This device's build cannot do '{name}' at all.")
+            }
+            Self::PermissionRequired => format!(
+                "'{name}' is granted and supported, but this device has not granted the matching \
+                 operating-system permission. Open the paired-device controller, allow it under \
+                 Device readiness, then retry."
+            ),
+            Self::PermissionDenied => format!(
+                "This device's operating system denies '{name}'. Allow it in the device's own \
+                 system settings, then retry."
+            ),
+            Self::ForegroundRequired => format!(
+                "'{name}' needs the paired-device controller open and in front on the device. \
+                 Bring it to the foreground and retry."
+            ),
+            Self::InteractionRequired => format!(
+                "'{name}' needs someone to enable it on the device first. Open the paired-device \
+                 controller, tap the control under Device readiness, then retry."
+            ),
+            Self::ScreenCaptureNotArmed => format!(
+                "'{name}' needs screen sharing to be armed on the device. Open the paired-device \
+                 controller, allow screen capture, then retry."
+            ),
+            Self::Unavailable => format!("'{name}' is unavailable on this device right now."),
+        }
+    }
+}
+
+fn capability_token(capability: DeviceCapability) -> String {
+    serde_json::to_value(capability)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// The first thing standing between this device and the capability, or `None`
+/// when nothing does.
+///
+/// The single place the four axes are judged; `effective_capabilities` is this
+/// function applied to a set, so the operator's card, the tool's error message
+/// and the lease check can never disagree about why something is refused.
+pub fn capability_block(
+    granted: &BTreeSet<DeviceCapability>,
+    surface: Option<&DeviceSurface>,
+    capability: DeviceCapability,
+) -> Option<CapabilityBlock> {
+    if !granted.contains(&capability) {
+        return Some(CapabilityBlock::NotGranted);
+    }
+    if !capability.is_physical() {
+        return None;
+    }
+    let Some(surface) = surface else {
+        return Some(CapabilityBlock::NoSurface);
+    };
+    if !surface.capabilities.contains(&capability) {
+        return Some(CapabilityBlock::Unsupported);
+    }
+    match surface.permission(capability) {
+        OsPermission::Granted | OsPermission::NotRequired => {}
+        OsPermission::Denied => return Some(CapabilityBlock::PermissionDenied),
+        OsPermission::Unsupported => return Some(CapabilityBlock::Unsupported),
+        OsPermission::Undetermined | OsPermission::Promptable => {
+            return Some(CapabilityBlock::PermissionRequired)
+        }
+    }
+    match surface.readiness(capability) {
+        DeviceReadiness::Ready => None,
+        DeviceReadiness::ForegroundRequired => Some(CapabilityBlock::ForegroundRequired),
+        DeviceReadiness::InteractionRequired => Some(CapabilityBlock::InteractionRequired),
+        DeviceReadiness::ArmedRequired => Some(CapabilityBlock::ScreenCaptureNotArmed),
+        DeviceReadiness::Unavailable => Some(CapabilityBlock::Unavailable),
+    }
+}
+
+/// `granted ∧ supported ∧ permission ∈ {granted, not_required} ∧ readiness ==
+/// ready`, evaluated for the physical capabilities and only for them.
 ///
 /// A run-facing grant (`view_runs`, `chat`, `place_runs`, …) passes through
 /// untouched: those act on the runner, not on the phone, and every device
@@ -381,15 +644,7 @@ pub fn effective_capabilities(
     granted
         .iter()
         .copied()
-        .filter(|capability| {
-            if !capability.is_physical() {
-                return true;
-            }
-            surface.is_some_and(|surface| {
-                surface.capabilities.contains(capability)
-                    && surface.permission(*capability) == OsPermission::Granted
-            })
-        })
+        .filter(|capability| capability_block(granted, surface, *capability).is_none())
         .collect()
 }
 
@@ -985,8 +1240,37 @@ pub struct DeviceCommandResult {
     pub artifact_base64: Option<String>,
     #[serde(default)]
     pub artifact_media_type: Option<String>,
+    /// What the device says the artifact's bytes hash to. Checked against the
+    /// bytes actually received, so a truncated upload is refused rather than
+    /// stored as authoritative.
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The execution this report belongs to, matching the one `start`
+    /// authorized. Present, it is what tells a replay from a contradiction.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+}
+
+/// The identity of one terminal report — outcome, result and artifact digest.
+///
+/// Retrying a delivery must be accepted; contradicting one must not. Comparing
+/// this digest is how the runner tells them apart without keeping a second copy
+/// of the report to compare field by field.
+pub fn terminal_digest(
+    outcome: DeviceCommandState,
+    result: Option<&serde_json::Value>,
+    artifact_sha256: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let canonical = serde_json::json!({
+        "outcome": outcome.as_str(),
+        "result": result,
+        "artifact_sha256": artifact_sha256,
+        "error": error,
+    });
+    sha256_hex(canonical.to_string().as_bytes())
 }
 
 impl DeviceCommandResult {
@@ -1021,6 +1305,15 @@ impl DeviceCommandResult {
                 return Err("A device artifact must declare its media type".to_string());
             }
         }
+        if let Some(digest) = &self.artifact_sha256 {
+            validate_sha256(digest)?;
+            if self.artifact_base64.is_none() {
+                return Err("An artifact digest was declared with no artifact".to_string());
+            }
+        }
+        if let Some(execution_id) = &self.execution_id {
+            validate_id(execution_id)?;
+        }
         if self.error.as_ref().is_some_and(|error| error.len() > 4_096) {
             return Err("Device command error text exceeds 4 KiB".to_string());
         }
@@ -1029,11 +1322,71 @@ impl DeviceCommandResult {
 }
 
 /// Body of `POST /v1/remote/device/commands/{id}/start` — the device saying it
-/// is about to touch hardware. Empty on purpose: the command id in the path and
-/// the signature over it are the whole statement.
+/// is about to touch hardware.
+///
+/// The `execution_id` is the device's own durable name for *this attempt*,
+/// minted and journalled before the request is sent. It is what makes a
+/// reconnect distinguishable from a second device: the same id back is the same
+/// attempt resuming and is answered `started: false, recoverable: true`; a
+/// different id is refused outright, because two executions of one physical
+/// command is the failure this whole design exists to prevent. Absent (an older
+/// client) it degrades to the previous behaviour, which is safe but cannot tell
+/// resumption from intrusion.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceCommandStartRequest {}
+pub struct DeviceCommandStartRequest {
+    #[serde(default)]
+    pub execution_id: Option<String>,
+}
+
+impl DeviceCommandStartRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        match &self.execution_id {
+            None => Ok(()),
+            Some(value) if value.len() >= 8 => validate_id(value),
+            Some(_) => Err("An execution id must be at least 8 characters".to_string()),
+        }
+    }
+}
+
+/// One nonterminal command the runner still believes this device owns, returned
+/// by `GET /v1/remote/device/commands/recover`.
+///
+/// Deliberately not a lease: a `running` command handed back through the
+/// ordinary queue would be a second execution. This says "you started this and
+/// never finished it" and leaves what to do about it to the device's own
+/// journal — deliver the staged result, or report the outcome unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommandRecovery {
+    pub command_id: String,
+    pub capability: DeviceCapability,
+    pub arguments_sha256: String,
+    pub state: DeviceCommandState,
+    /// The execution the runner authorized, when it recorded one.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    pub started_at_ms: Option<u64>,
+    pub expires_at_ms: u64,
+    pub cancel_requested: bool,
+}
+
+/// The answer to `GET /v1/remote/device/commands/{id}/control` — a running
+/// command's control signals, on a request the device makes once rather than a
+/// poll it repeats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceCommandControl {
+    pub protocol_version: u32,
+    pub command_id: String,
+    pub state: DeviceCommandState,
+    pub cancel_requested: bool,
+    /// The pairing itself was revoked or the grant withdrawn: stop, and do not
+    /// bother reporting.
+    pub revoked: bool,
+    /// When this command stops being worth finishing.
+    pub deadline_ms: u64,
+}
 
 // --- Voice streaming ------------------------------------------------------
 //
@@ -1165,6 +1518,475 @@ impl VoiceCloseRequest {
         }
         Ok(())
     }
+}
+
+// --- Realtime Talk --------------------------------------------------------
+
+/// Audio formats accepted on the dedicated Talk WebSocket. The capture
+/// formats match the existing voice upload surface; MPEG is also accepted for
+/// speech output produced by a configured TTS backend.
+pub const TALK_MEDIA_TYPES: &[&str] = &[
+    "audio/webm",
+    "audio/webm;codecs=opus",
+    "audio/ogg",
+    "audio/ogg;codecs=opus",
+    "audio/mp4",
+    "audio/wav",
+    "audio/mpeg",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TalkState {
+    Idle,
+    Starting,
+    Listening,
+    Transcribing,
+    Thinking,
+    Speaking,
+    Interrupted,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TalkTicketRequest {
+    pub protocol_version: u32,
+    pub session_id: String,
+}
+
+impl TalkTicketRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_protocol_version(self.protocol_version)?;
+        validate_talk_session_id(&self.session_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TalkTicketResponse {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub ticket: String,
+    pub expires_at_ms: u64,
+    /// Does not contain the bearer ticket. Clients append it as the `ticket`
+    /// query parameter immediately before opening the WebSocket.
+    pub websocket_path: String,
+}
+
+impl TalkTicketResponse {
+    pub fn issue(session_id: impl Into<String>, now_ms: u64, ttl_ms: u64) -> Result<Self, String> {
+        if ttl_ms == 0 || ttl_ms > MAX_TALK_TICKET_TTL_MS {
+            return Err(format!(
+                "Talk ticket lifetime must be between 1 and {MAX_TALK_TICKET_TTL_MS} ms"
+            ));
+        }
+        let session_id = session_id.into();
+        validate_talk_session_id(&session_id)?;
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| "Talk ticket expiry overflowed".to_string())?;
+        let response = Self {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            websocket_path: format!("/v1/remote/device/talk/{session_id}/stream"),
+            session_id,
+            session_generation: random_token(TALK_SESSION_GENERATION_RANDOM_BYTES)?,
+            ticket: random_token(TALK_TICKET_RANDOM_BYTES)?,
+            expires_at_ms,
+        };
+        response.validate(now_ms)?;
+        Ok(response)
+    }
+
+    pub fn validate(&self, now_ms: u64) -> Result<(), String> {
+        validate_talk_protocol_version(self.protocol_version)?;
+        validate_talk_session_id(&self.session_id)?;
+        validate_talk_session_generation(&self.session_generation)?;
+        validate_talk_token("ticket", &self.ticket, 32, MAX_TALK_TICKET_BYTES)?;
+        if self.expires_at_ms <= now_ms {
+            return Err("Talk ticket has expired".to_string());
+        }
+        if self.expires_at_ms.saturating_sub(now_ms) > MAX_TALK_TICKET_TTL_MS {
+            return Err("Talk ticket expiry exceeds the maximum lifetime".to_string());
+        }
+        let expected_path = format!("/v1/remote/device/talk/{}/stream", self.session_id);
+        if self.websocket_path != expected_path {
+            return Err("Talk WebSocket path does not match its session".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Envelope shared by every device-to-runner Talk frame. The generation is a
+/// random token issued with the one-use ticket; sequences restart only when a
+/// new generation is issued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkClientFrame {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub frame_sequence: u64,
+    #[serde(flatten)]
+    pub kind: TalkClientFrameKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TalkClientFrameKind {
+    Hello {
+        media_type: String,
+        sample_rate_hz: u32,
+        channels: u8,
+    },
+    Audio {
+        audio_sequence: u64,
+        media_type: String,
+        audio_base64: String,
+        /// Last chunk of this utterance. The device's own local voice activity
+        /// detector decides where an utterance ends — the runner never guesses
+        /// from silence it cannot hear — so this flag is what hands one
+        /// complete recording over to transcription.
+        #[serde(default)]
+        last: bool,
+    },
+    State {
+        state: TalkState,
+    },
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// What the device's half of one utterance cost, in milliseconds.
+    ///
+    /// The runner can time everything from transcription onwards itself, but
+    /// the three spans before that happen on the phone and are invisible here.
+    /// They ride their own frame, and they are durations — carrying the
+    /// transcript or the audio on a telemetry frame is exactly the mistake this
+    /// shape exists to make impossible.
+    Metrics {
+        /// The `audio_sequence` of the first audio frame of the utterance these
+        /// spans describe. Required, and required *before* that frame is sent:
+        /// the runner answers the moment an utterance closes, so a metrics frame
+        /// that arrives after it would otherwise be filed against the next one.
+        audio_sequence: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speech_detection_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capture_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upload_ms: Option<u64>,
+    },
+}
+
+impl TalkClientFrame {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_envelope(
+            self.protocol_version,
+            &self.session_id,
+            &self.session_generation,
+            self.frame_sequence,
+        )?;
+        match &self.kind {
+            TalkClientFrameKind::Hello {
+                media_type,
+                sample_rate_hz,
+                channels,
+            } => {
+                validate_talk_media_type(media_type)?;
+                if !(8_000..=192_000).contains(sample_rate_hz) {
+                    return Err("Talk sample rate must be between 8000 and 192000 Hz".to_string());
+                }
+                if !(1..=2).contains(channels) {
+                    return Err("Talk audio must have one or two channels".to_string());
+                }
+            }
+            TalkClientFrameKind::Audio {
+                audio_sequence,
+                media_type,
+                audio_base64,
+                ..
+            } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
+                validate_talk_media_type(media_type)?;
+                validate_talk_audio(audio_base64)?;
+            }
+            TalkClientFrameKind::State { .. } => {}
+            TalkClientFrameKind::Interrupt { reason } => {
+                if let Some(reason) = reason {
+                    validate_talk_text("interrupt reason", reason, MAX_TALK_ERROR_BYTES)?;
+                }
+            }
+            TalkClientFrameKind::Metrics {
+                audio_sequence,
+                speech_detection_ms,
+                capture_ms,
+                upload_ms,
+            } => {
+                if *audio_sequence == 0 {
+                    return Err("Talk metrics must name the utterance they measure".to_string());
+                }
+                for span in [speech_detection_ms, capture_ms, upload_ms]
+                    .into_iter()
+                    .flatten()
+                {
+                    if *span > MAX_TALK_LATENCY_MS {
+                        return Err(format!(
+                            "Talk latency spans must be at most {MAX_TALK_LATENCY_MS} ms"
+                        ));
+                    }
+                }
+            }
+        }
+        validate_talk_frame_size(self)
+    }
+
+    pub fn audio_sequence(&self) -> Option<u64> {
+        match &self.kind {
+            TalkClientFrameKind::Audio { audio_sequence, .. } => Some(*audio_sequence),
+            _ => None,
+        }
+    }
+}
+
+/// Envelope shared by every runner-to-device Talk frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TalkServerFrame {
+    pub protocol_version: u32,
+    pub session_id: String,
+    pub session_generation: String,
+    pub frame_sequence: u64,
+    #[serde(flatten)]
+    pub kind: TalkServerFrameKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TalkServerFrameKind {
+    Ready,
+    State {
+        state: TalkState,
+    },
+    Transcript {
+        text: String,
+        is_final: bool,
+    },
+    AssistantDelta {
+        text: String,
+    },
+    OutputAudio {
+        audio_sequence: u64,
+        media_type: String,
+        audio_base64: String,
+    },
+    Error {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl TalkServerFrame {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_talk_envelope(
+            self.protocol_version,
+            &self.session_id,
+            &self.session_generation,
+            self.frame_sequence,
+        )?;
+        match &self.kind {
+            TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::Transcript { text, .. }
+            | TalkServerFrameKind::AssistantDelta { text } => {
+                validate_talk_text("Talk text", text, MAX_TALK_TEXT_BYTES)?;
+            }
+            TalkServerFrameKind::OutputAudio {
+                audio_sequence,
+                media_type,
+                audio_base64,
+            } => {
+                validate_talk_audio_sequence(*audio_sequence)?;
+                validate_talk_media_type(media_type)?;
+                validate_talk_audio(audio_base64)?;
+            }
+            TalkServerFrameKind::Error { code, message, .. } => {
+                if code.is_empty()
+                    || code.len() > 128
+                    || !code.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'-' | b'.')
+                    })
+                {
+                    return Err("Talk error code is invalid".to_string());
+                }
+                validate_talk_text("Talk error message", message, MAX_TALK_ERROR_BYTES)?;
+            }
+        }
+        validate_talk_frame_size(self)
+    }
+}
+
+/// Stateful replay guard for one direction of one session generation. Use one
+/// tracker for client frames and another for server frames.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TalkSequenceTracker {
+    last_frame_sequence: u64,
+    last_audio_sequence: u64,
+}
+
+impl TalkSequenceTracker {
+    pub fn accept(
+        &mut self,
+        frame_sequence: u64,
+        audio_sequence: Option<u64>,
+    ) -> Result<(), String> {
+        if frame_sequence == 0 || frame_sequence <= self.last_frame_sequence {
+            return Err(format!(
+                "Talk frame sequence must increase beyond {}",
+                self.last_frame_sequence
+            ));
+        }
+        if let Some(audio_sequence) = audio_sequence {
+            if audio_sequence == 0 || audio_sequence <= self.last_audio_sequence {
+                return Err(format!(
+                    "Talk audio sequence must increase beyond {}",
+                    self.last_audio_sequence
+                ));
+            }
+        }
+        self.last_frame_sequence = frame_sequence;
+        if let Some(audio_sequence) = audio_sequence {
+            self.last_audio_sequence = audio_sequence;
+        }
+        Ok(())
+    }
+
+    pub fn last_frame_sequence(&self) -> u64 {
+        self.last_frame_sequence
+    }
+
+    pub fn last_audio_sequence(&self) -> u64 {
+        self.last_audio_sequence
+    }
+}
+
+fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
+    if protocol_version != TALK_PROTOCOL_VERSION {
+        return Err(format!(
+            "Unsupported Talk protocol version {protocol_version}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.len() > MAX_TALK_SESSION_ID_BYTES {
+        return Err(format!(
+            "Talk session id exceeds {MAX_TALK_SESSION_ID_BYTES} bytes"
+        ));
+    }
+    validate_id(session_id)
+}
+
+fn validate_talk_session_generation(session_generation: &str) -> Result<(), String> {
+    validate_talk_token(
+        "session generation",
+        session_generation,
+        16,
+        MAX_TALK_SESSION_GENERATION_BYTES,
+    )?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(session_generation)
+        .map_err(|_| "Talk session generation is not URL-safe base64".to_string())?;
+    if decoded.len() != TALK_SESSION_GENERATION_RANDOM_BYTES {
+        return Err("Talk session generation has the wrong entropy length".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_token(
+    label: &str,
+    value: &str,
+    min_bytes: usize,
+    max_bytes: usize,
+) -> Result<(), String> {
+    if value.len() < min_bytes
+        || value.len() > max_bytes
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!("Talk {label} is invalid"));
+    }
+    Ok(())
+}
+
+fn validate_talk_envelope(
+    protocol_version: u32,
+    session_id: &str,
+    session_generation: &str,
+    frame_sequence: u64,
+) -> Result<(), String> {
+    validate_talk_protocol_version(protocol_version)?;
+    validate_talk_session_id(session_id)?;
+    validate_talk_session_generation(session_generation)?;
+    if frame_sequence == 0 {
+        return Err("Talk frame sequence must be positive".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_audio_sequence(audio_sequence: u64) -> Result<(), String> {
+    if audio_sequence == 0 {
+        return Err("Talk audio sequence must be positive".to_string());
+    }
+    Ok(())
+}
+
+fn validate_talk_media_type(media_type: &str) -> Result<(), String> {
+    if media_type.len() > MAX_TALK_MEDIA_TYPE_BYTES || !TALK_MEDIA_TYPES.contains(&media_type) {
+        return Err(format!("Unsupported Talk media type '{media_type}'"));
+    }
+    Ok(())
+}
+
+fn validate_talk_audio(audio_base64: &str) -> Result<(), String> {
+    if audio_base64.is_empty() {
+        return Err("Talk audio payload is empty".to_string());
+    }
+    if audio_base64.len() > MAX_TALK_AUDIO_BASE64_BYTES {
+        return Err(format!(
+            "Talk audio payload exceeds {MAX_TALK_AUDIO_BYTES} decoded bytes"
+        ));
+    }
+    let decoded = STANDARD
+        .decode(audio_base64)
+        .map_err(|_| "Talk audio payload is not valid base64".to_string())?;
+    if decoded.len() > MAX_TALK_AUDIO_BYTES {
+        return Err(format!(
+            "Talk audio payload exceeds {MAX_TALK_AUDIO_BYTES} decoded bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_text(label: &str, value: &str, max_bytes: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > max_bytes {
+        return Err(format!(
+            "{label} must contain between 1 and {max_bytes} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_talk_frame_size(frame: &impl Serialize) -> Result<(), String> {
+    let bytes = serde_json::to_vec(frame)
+        .map_err(|error| format!("Talk frame cannot be serialized: {error}"))?;
+    if bytes.len() > MAX_TALK_FRAME_BYTES {
+        return Err(format!("Talk frame exceeds {MAX_TALK_FRAME_BYTES} bytes"));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1419,6 +2241,7 @@ mod tests {
     fn surface(
         capabilities: &[DeviceCapability],
         permissions: &[(DeviceCapability, OsPermission)],
+        readiness: &[(DeviceCapability, DeviceReadiness)],
     ) -> DeviceSurface {
         DeviceSurface {
             protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -1428,40 +2251,81 @@ mod tests {
             device_model: "iPhone".into(),
             capabilities: capabilities.iter().copied().collect(),
             permissions: permissions.iter().copied().collect(),
+            readiness: readiness.iter().copied().collect(),
             constraints: DeviceConstraints::default(),
             reported_at_ms: 1_000,
         }
     }
 
-    /// The rule the whole physical-device surface rests on: three sets have to
+    /// The rule the whole physical-device surface rests on: four axes have to
     /// agree, and any one of them saying no is enough.
     #[test]
-    fn effective_authority_is_grant_intersect_advertised_intersect_os_permission() {
+    fn effective_authority_is_grant_support_permission_and_readiness() {
         let granted = BTreeSet::from([
             DeviceCapability::ViewRuns,
             DeviceCapability::CameraCapture,
             DeviceCapability::LocationRead,
             DeviceCapability::ScreenCapture,
             DeviceCapability::NotificationPost,
+            DeviceCapability::AudioPlayback,
         ]);
         let advertised = surface(
             &[
                 DeviceCapability::CameraCapture,
                 DeviceCapability::LocationRead,
                 DeviceCapability::NotificationPost,
+                DeviceCapability::ScreenCapture,
+                DeviceCapability::AudioPlayback,
             ],
             &[
                 (DeviceCapability::CameraCapture, OsPermission::Granted),
                 (DeviceCapability::LocationRead, OsPermission::Denied),
-                // NotificationPost advertised but never asked for: undetermined
+                // NotificationPost advertised but never asked for: promptable
                 // is not permission.
+                (DeviceCapability::NotificationPost, OsPermission::Promptable),
+                // Screen capture and audio playback need no OS permission at
+                // all; readiness is what decides them.
+                (DeviceCapability::ScreenCapture, OsPermission::NotRequired),
+                (DeviceCapability::AudioPlayback, OsPermission::NotRequired),
+            ],
+            &[
+                (DeviceCapability::CameraCapture, DeviceReadiness::Ready),
+                (DeviceCapability::LocationRead, DeviceReadiness::Ready),
+                (DeviceCapability::NotificationPost, DeviceReadiness::Ready),
+                // Nobody has shared a screen, so it is armable, not ready.
+                (
+                    DeviceCapability::ScreenCapture,
+                    DeviceReadiness::ArmedRequired,
+                ),
+                (DeviceCapability::AudioPlayback, DeviceReadiness::Ready),
             ],
         );
         let effective = effective_capabilities(&granted, Some(&advertised));
         assert_eq!(
             effective,
-            BTreeSet::from([DeviceCapability::ViewRuns, DeviceCapability::CameraCapture]),
-            "only a capability granted, advertised and OS-permitted is effective"
+            BTreeSet::from([
+                DeviceCapability::ViewRuns,
+                DeviceCapability::CameraCapture,
+                DeviceCapability::AudioPlayback,
+            ]),
+            "only a capability granted, advertised, permitted and ready is effective"
+        );
+        // Each refusal keeps its own reason rather than collapsing to one.
+        assert_eq!(
+            capability_block(&granted, Some(&advertised), DeviceCapability::LocationRead),
+            Some(CapabilityBlock::PermissionDenied)
+        );
+        assert_eq!(
+            capability_block(
+                &granted,
+                Some(&advertised),
+                DeviceCapability::NotificationPost
+            ),
+            Some(CapabilityBlock::PermissionRequired)
+        );
+        assert_eq!(
+            capability_block(&granted, Some(&advertised), DeviceCapability::ScreenCapture),
+            Some(CapabilityBlock::ScreenCaptureNotArmed)
         );
         // A capability the OS permits but the operator never granted stays out.
         let ungranted = effective_capabilities(
@@ -1469,9 +2333,153 @@ mod tests {
             Some(&surface(
                 &[DeviceCapability::CameraCapture],
                 &[(DeviceCapability::CameraCapture, OsPermission::Granted)],
+                &[(DeviceCapability::CameraCapture, DeviceReadiness::Ready)],
             )),
         );
         assert_eq!(ungranted, BTreeSet::from([DeviceCapability::ViewRuns]));
+    }
+
+    /// The whole matrix, for every physical capability, so a future one cannot
+    /// enter the enum with undefined permission/readiness semantics.
+    #[test]
+    fn every_physical_capability_answers_the_complete_permission_matrix() {
+        for capability in PHYSICAL_DEVICE_CAPABILITIES {
+            let capability = *capability;
+            let requirement = permission_requirement(capability).unwrap_or_else(|| {
+                panic!(
+                    "'{capability:?}' is physical but has no entry in \
+                     PHYSICAL_CAPABILITY_SEMANTICS — decide what its OS permission means"
+                )
+            });
+            let granted = BTreeSet::from([capability]);
+            let sufficient = match requirement {
+                PermissionRequirement::OsPermission => OsPermission::Granted,
+                PermissionRequirement::None => OsPermission::NotRequired,
+            };
+            let ready = surface(
+                &[capability],
+                &[(capability, sufficient)],
+                &[(capability, DeviceReadiness::Ready)],
+            );
+
+            // grant = no
+            assert_eq!(
+                capability_block(&BTreeSet::new(), Some(&ready), capability),
+                Some(CapabilityBlock::NotGranted)
+            );
+            // support = no
+            assert_eq!(
+                capability_block(
+                    &granted,
+                    Some(&surface(
+                        &[],
+                        &[(capability, sufficient)],
+                        &[(capability, DeviceReadiness::Ready)]
+                    )),
+                    capability
+                ),
+                Some(CapabilityBlock::Unsupported)
+            );
+            // no surface at all
+            assert_eq!(
+                capability_block(&granted, None, capability),
+                Some(CapabilityBlock::NoSurface)
+            );
+            // permission = denied
+            assert_eq!(
+                capability_block(
+                    &granted,
+                    Some(&surface(
+                        &[capability],
+                        &[(capability, OsPermission::Denied)],
+                        &[(capability, DeviceReadiness::Ready)]
+                    )),
+                    capability
+                ),
+                Some(CapabilityBlock::PermissionDenied)
+            );
+            // permission = promptable, and the legacy spelling of it
+            for pending in [OsPermission::Promptable, OsPermission::Undetermined] {
+                assert_eq!(
+                    capability_block(
+                        &granted,
+                        Some(&surface(
+                            &[capability],
+                            &[(capability, pending)],
+                            &[(capability, DeviceReadiness::Ready)]
+                        )),
+                        capability
+                    ),
+                    Some(CapabilityBlock::PermissionRequired),
+                    "'{capability:?}' with a {pending:?} permission must not be effective"
+                );
+            }
+            // readiness != ready, in each of its shapes
+            for (readiness, expected) in [
+                (
+                    DeviceReadiness::ForegroundRequired,
+                    CapabilityBlock::ForegroundRequired,
+                ),
+                (
+                    DeviceReadiness::InteractionRequired,
+                    CapabilityBlock::InteractionRequired,
+                ),
+                (
+                    DeviceReadiness::ArmedRequired,
+                    CapabilityBlock::ScreenCaptureNotArmed,
+                ),
+                (DeviceReadiness::Unavailable, CapabilityBlock::Unavailable),
+            ] {
+                assert_eq!(
+                    capability_block(
+                        &granted,
+                        Some(&surface(
+                            &[capability],
+                            &[(capability, sufficient)],
+                            &[(capability, readiness)]
+                        )),
+                        capability
+                    ),
+                    Some(expected)
+                );
+            }
+            // A surface that says nothing about readiness fails closed — this
+            // is what an upgrade from a build without the field looks like.
+            assert_eq!(
+                capability_block(
+                    &granted,
+                    Some(&surface(&[capability], &[(capability, sufficient)], &[])),
+                    capability
+                ),
+                Some(CapabilityBlock::Unavailable),
+                "'{capability:?}' with no stated readiness must fail closed"
+            );
+            // everything satisfied
+            assert_eq!(capability_block(&granted, Some(&ready), capability), None);
+            assert!(effective_capabilities(&granted, Some(&ready)).contains(&capability));
+        }
+    }
+
+    /// `device_info` is the capability the old model could never make
+    /// effective: it has no OS permission to grant, so a runner demanding
+    /// `granted` refused it forever.
+    #[test]
+    fn device_info_becomes_effective_without_an_imaginary_permission() {
+        let granted = BTreeSet::from([DeviceCapability::DeviceInfo]);
+        let advertised = surface(
+            &[DeviceCapability::DeviceInfo],
+            &[(DeviceCapability::DeviceInfo, OsPermission::NotRequired)],
+            &[(DeviceCapability::DeviceInfo, DeviceReadiness::Ready)],
+        );
+        assert_eq!(
+            effective_capabilities(&granted, Some(&advertised)),
+            granted,
+            "a capability needing no permission must be effective once it is ready"
+        );
+        assert_eq!(
+            permission_requirement(DeviceCapability::DeviceInfo),
+            Some(PermissionRequirement::None)
+        );
     }
 
     /// A device paired before this feature existed advertises nothing. Its
@@ -1518,6 +2526,187 @@ mod tests {
         assert!(validate_capabilities(&capabilities, &scopes).is_ok());
     }
 
+    fn talk_generation() -> String {
+        random_token(TALK_SESSION_GENERATION_RANDOM_BYTES).unwrap()
+    }
+
+    fn client_talk_frame(frame_sequence: u64, kind: TalkClientFrameKind) -> TalkClientFrame {
+        TalkClientFrame {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            session_generation: talk_generation(),
+            frame_sequence,
+            kind,
+        }
+    }
+
+    fn server_talk_frame(frame_sequence: u64, kind: TalkServerFrameKind) -> TalkServerFrame {
+        TalkServerFrame {
+            protocol_version: TALK_PROTOCOL_VERSION,
+            session_id: "session-one".into(),
+            session_generation: talk_generation(),
+            frame_sequence,
+            kind,
+        }
+    }
+
+    #[test]
+    fn talk_tickets_bind_random_generations_to_a_bounded_session_path() {
+        let first =
+            TalkTicketResponse::issue("session-one", 1_000, DEFAULT_TALK_TICKET_TTL_MS).unwrap();
+        let second =
+            TalkTicketResponse::issue("session-one", 1_000, DEFAULT_TALK_TICKET_TTL_MS).unwrap();
+        assert_ne!(first.session_generation, second.session_generation);
+        assert_ne!(first.ticket, second.ticket);
+        assert_eq!(
+            first.websocket_path,
+            "/v1/remote/device/talk/session-one/stream"
+        );
+        assert!(!first.websocket_path.contains(&first.ticket));
+        assert!(first.validate(1_000).is_ok());
+        assert!(first.validate(first.expires_at_ms).is_err());
+        assert!(TalkTicketResponse::issue("bad/session", 1_000, 1_000).is_err());
+    }
+
+    #[test]
+    fn every_talk_frame_kind_round_trips_and_validates() {
+        let audio = STANDARD.encode(b"bounded audio");
+        let client_frames = vec![
+            client_talk_frame(
+                1,
+                TalkClientFrameKind::Hello {
+                    media_type: "audio/webm;codecs=opus".into(),
+                    sample_rate_hz: 48_000,
+                    channels: 1,
+                },
+            ),
+            client_talk_frame(
+                2,
+                TalkClientFrameKind::Audio {
+                    audio_sequence: 1,
+                    media_type: "audio/webm;codecs=opus".into(),
+                    audio_base64: audio.clone(),
+                    last: false,
+                },
+            ),
+            client_talk_frame(
+                3,
+                TalkClientFrameKind::State {
+                    state: TalkState::Listening,
+                },
+            ),
+            client_talk_frame(
+                4,
+                TalkClientFrameKind::Interrupt {
+                    reason: Some("barge_in".into()),
+                },
+            ),
+        ];
+        for frame in client_frames {
+            frame.validate().unwrap();
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TalkClientFrame>(&json).unwrap(),
+                frame
+            );
+        }
+
+        let server_frames = vec![
+            server_talk_frame(1, TalkServerFrameKind::Ready),
+            server_talk_frame(
+                2,
+                TalkServerFrameKind::State {
+                    state: TalkState::Thinking,
+                },
+            ),
+            server_talk_frame(
+                3,
+                TalkServerFrameKind::Transcript {
+                    text: "hello".into(),
+                    is_final: true,
+                },
+            ),
+            server_talk_frame(4, TalkServerFrameKind::AssistantDelta { text: "hi".into() }),
+            server_talk_frame(
+                5,
+                TalkServerFrameKind::OutputAudio {
+                    audio_sequence: 1,
+                    media_type: "audio/mpeg".into(),
+                    audio_base64: audio,
+                },
+            ),
+            server_talk_frame(
+                6,
+                TalkServerFrameKind::Error {
+                    code: "provider_unavailable".into(),
+                    message: "Try again".into(),
+                    retryable: true,
+                },
+            ),
+        ];
+        for frame in server_frames {
+            frame.validate().unwrap();
+            let json = serde_json::to_string(&frame).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TalkServerFrame>(&json).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn talk_frames_reject_unversioned_unbounded_or_malformed_payloads() {
+        let mut frame = client_talk_frame(
+            1,
+            TalkClientFrameKind::Audio {
+                audio_sequence: 1,
+                media_type: "audio/webm".into(),
+                audio_base64: STANDARD.encode(b"audio"),
+                last: false,
+            },
+        );
+        frame.protocol_version += 1;
+        assert!(frame.validate().is_err());
+        frame.protocol_version = TALK_PROTOCOL_VERSION;
+        frame.session_generation = "predictable".into();
+        assert!(frame.validate().is_err());
+        frame.session_generation = talk_generation();
+        frame.kind = TalkClientFrameKind::Audio {
+            audio_sequence: 1,
+            media_type: "video/webm".into(),
+            audio_base64: STANDARD.encode(b"audio"),
+            last: false,
+        };
+        assert!(frame.validate().is_err());
+        frame.kind = TalkClientFrameKind::Audio {
+            audio_sequence: 1,
+            media_type: "audio/webm".into(),
+            audio_base64: STANDARD.encode(vec![0; MAX_TALK_AUDIO_BYTES + 1]),
+            last: false,
+        };
+        assert!(frame.validate().is_err());
+
+        let oversized_text = server_talk_frame(
+            1,
+            TalkServerFrameKind::AssistantDelta {
+                text: "x".repeat(MAX_TALK_TEXT_BYTES + 1),
+            },
+        );
+        assert!(oversized_text.validate().is_err());
+    }
+
+    #[test]
+    fn talk_sequence_tracker_rejects_frame_and_audio_replay() {
+        let mut tracker = TalkSequenceTracker::default();
+        tracker.accept(1, None).unwrap();
+        tracker.accept(2, Some(1)).unwrap();
+        assert!(tracker.accept(2, None).is_err());
+        assert!(tracker.accept(3, Some(1)).is_err());
+        assert_eq!(tracker.last_frame_sequence(), 2);
+        assert_eq!(tracker.last_audio_sequence(), 1);
+        tracker.accept(4, Some(2)).unwrap();
+    }
+
     /// The size claim the compact code exists for. A realistic runner URL,
     /// full-length token and fingerprint must stay well inside the target, and
     /// the PEM must not have crept back in.
@@ -1561,7 +2750,9 @@ mod tests {
             result: None,
             artifact_base64: Some("A".repeat(4_096)),
             artifact_media_type: Some("image/jpeg".into()),
+            artifact_sha256: None,
             error: None,
+            execution_id: None,
         };
         assert!(result.validate(4_096).is_ok());
         assert!(result.validate(1_024).is_err());
@@ -1580,6 +2771,73 @@ mod tests {
             running.validate(4_096).is_err(),
             "a device may not report a non-terminal outcome as its result"
         );
+    }
+
+    /// A retry and a contradiction have to be distinguishable without keeping
+    /// the first report around to compare field by field.
+    #[test]
+    fn a_terminal_digest_separates_a_retry_from_a_different_answer() {
+        let value = serde_json::json!({ "width": 1_280 });
+        let first = terminal_digest(
+            DeviceCommandState::Succeeded,
+            Some(&value),
+            Some(&"a".repeat(64)),
+            None,
+        );
+        assert_eq!(
+            first,
+            terminal_digest(
+                DeviceCommandState::Succeeded,
+                Some(&value),
+                Some(&"a".repeat(64)),
+                None
+            ),
+            "the same report must digest the same, or every retry becomes a conflict"
+        );
+        for different in [
+            terminal_digest(
+                DeviceCommandState::Failed,
+                Some(&value),
+                Some(&"a".repeat(64)),
+                None,
+            ),
+            terminal_digest(
+                DeviceCommandState::Succeeded,
+                Some(&serde_json::json!({ "width": 640 })),
+                Some(&"a".repeat(64)),
+                None,
+            ),
+            terminal_digest(
+                DeviceCommandState::Succeeded,
+                Some(&value),
+                Some(&"b".repeat(64)),
+                None,
+            ),
+        ] {
+            assert_ne!(first, different);
+        }
+    }
+
+    #[test]
+    fn a_start_request_refuses_an_unusable_execution_id() {
+        assert!(DeviceCommandStartRequest { execution_id: None }
+            .validate()
+            .is_ok());
+        assert!(DeviceCommandStartRequest {
+            execution_id: Some("exec-0123456789".into()),
+        }
+        .validate()
+        .is_ok());
+        assert!(DeviceCommandStartRequest {
+            execution_id: Some("short".into()),
+        }
+        .validate()
+        .is_err());
+        assert!(DeviceCommandStartRequest {
+            execution_id: Some("exec with spaces".into()),
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

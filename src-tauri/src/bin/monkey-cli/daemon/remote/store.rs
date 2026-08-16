@@ -289,6 +289,64 @@ CREATE TABLE IF NOT EXISTS remote_push_watch (
 ) STRICT;
 "#;
 
+/// Columns added to `remote_device_actions` after it shipped, applied only when
+/// they are absent.
+///
+/// Additive and re-runnable rather than a versioned migration ledger: this
+/// database is opened by several processes and by whichever build the operator
+/// happens to run, and a forward-only version gate here would refuse to open a
+/// pairing that an unrelated branch had already upgraded. Every column is
+/// nullable, so a row written before them reads back unchanged and no device has
+/// to re-pair.
+///
+/// * `execution_id` — the device's durable name for one attempt, which is what
+///   separates "the same phone reconnecting" from "a second phone".
+/// * `terminal_sha256` — the digest of the terminal report already accepted, so
+///   a retried delivery is recognised as a retry and a different one as a
+///   contradiction.
+/// * `invocation_id` — the durable tool invocation that asked for this, unique
+///   so two deliveries of one invocation cannot become two physical commands.
+const REMOTE_DEVICE_ACTION_COLUMNS: &[(&str, &str)] = &[
+    ("execution_id", "TEXT"),
+    ("terminal_sha256", "TEXT"),
+    ("invocation_id", "TEXT"),
+];
+
+const REMOTE_DEVICE_ACTION_INDEXES: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS remote_device_actions_invocation_idx
+    ON remote_device_actions(invocation_id) WHERE invocation_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS remote_device_actions_recover_idx
+    ON remote_device_actions(device_id,state);
+"#;
+
+fn add_missing_columns(connection: &Connection) -> Result<(), String> {
+    let mut present = std::collections::BTreeSet::new();
+    {
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('remote_device_actions')")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            present.insert(row.map_err(|error| error.to_string())?);
+        }
+    }
+    for (column, declaration) in REMOTE_DEVICE_ACTION_COLUMNS {
+        if present.contains(*column) {
+            continue;
+        }
+        connection
+            .execute_batch(&format!(
+                "ALTER TABLE remote_device_actions ADD COLUMN {column} {declaration};"
+            ))
+            .map_err(|error| format!("Could not add '{column}' to the device queue: {error}"))?;
+    }
+    connection
+        .execute_batch(REMOTE_DEVICE_ACTION_INDEXES)
+        .map_err(|error| format!("Could not index the device queue: {error}"))
+}
+
 pub trait RemoteSecretStore: Send + Sync {
     fn get(&self, slot: &str) -> Result<Vec<u8>, String>;
     fn set(&self, slot: &str, secret: &[u8]) -> Result<(), String>;
@@ -464,7 +522,47 @@ pub struct DeviceCommandRequest {
     pub source_run_id: Option<String>,
     pub source_session_id: Option<String>,
     pub source_tool_call_id: Option<String>,
+    /// The durable identity of the invocation that asked, when there is one.
+    ///
+    /// Present, this makes queueing idempotent: the same invocation delivered
+    /// twice returns the first command rather than taking a second photograph.
+    /// Absent — a manual CLI call, an operator pressing a button — every request
+    /// is its own command, because two deliberate asks that happen to carry
+    /// identical arguments are two asks.
+    pub invocation_id: Option<String>,
     pub expires_at_ms: u64,
+}
+
+impl DeviceCommandRequest {
+    /// The invocation identity a durable tool call carries, if it carries one.
+    ///
+    /// The run and the tool call together, because a tool call id is only
+    /// unique inside its run.
+    pub fn invocation_id_for(
+        source_run_id: Option<&str>,
+        source_tool_call_id: Option<&str>,
+    ) -> Option<String> {
+        match (source_run_id, source_tool_call_id) {
+            (Some(run_id), Some(tool_call_id))
+                if !run_id.is_empty() && !tool_call_id.is_empty() =>
+            {
+                Some(format!("{run_id}:{tool_call_id}"))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What `start_device_command` decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceCommandStart {
+    /// True only for the transition that authorizes the physical effect. A
+    /// device that sees `false` must never touch hardware.
+    pub started: bool,
+    /// The command is already running under *this* execution — a reconnect
+    /// resuming, which may deliver a staged result but must not re-execute.
+    pub recoverable: bool,
+    pub execution_id: Option<String>,
 }
 
 /// An artifact a device produced, already written to disk by the caller.
@@ -497,6 +595,12 @@ pub struct DeviceCommandRecord {
     pub result: Option<serde_json::Value>,
     pub artifact: Option<DeviceArtifact>,
     pub error: Option<String>,
+    /// The execution the runner authorized, once one started.
+    pub execution_id: Option<String>,
+    /// Digest of the terminal report already accepted. `None` on a nonterminal
+    /// command, and on one completed by a build that predates this column.
+    pub terminal_sha256: Option<String>,
+    pub invocation_id: Option<String>,
 }
 
 /// One microphone stream's ledger row. The audio lives beside the database —
@@ -556,7 +660,7 @@ const DEVICE_COMMAND_SELECT: &str = "SELECT command_id,device_id,capability,argu
         arguments_sha256,source_run_id,source_session_id,source_tool_call_id,state,attempt,
         cancel_requested,created_at_ms,updated_at_ms,expires_at_ms,lease_expires_at_ms,
         started_at_ms,completed_at_ms,result_json,artifact_sha256,artifact_bytes,
-        artifact_media_type,error
+        artifact_media_type,error,execution_id,terminal_sha256,invocation_id
      FROM remote_device_actions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,6 +692,7 @@ impl RemoteStore {
         connection
             .execute_batch(REMOTE_SCHEMA)
             .map_err(|error| format!("Could not migrate remote runner state: {error}"))?;
+        add_missing_columns(&connection)?;
         crate::daemon::store::restrict_file(&path)?;
         Ok(Self { connection })
     }
@@ -1471,13 +1576,34 @@ impl RemoteStore {
         }
         let command_id = format!("dcmd-{}", random_token_id(18)?);
         let arguments_sha256 = sha256_hex(&arguments);
+        // Queueing is not exactly-once on its own: a durable tool invocation
+        // that is retried — because the turn was replayed, or the answer to the
+        // first call was lost — would otherwise become a second photograph.
+        // Checked before the insert *and* enforced by the unique index below,
+        // because two processes can reach this at once and only the index can
+        // arbitrate that.
+        if let Some(invocation_id) = &request.invocation_id {
+            if let Some(existing) = self.device_command_by_invocation(invocation_id)? {
+                if existing.device_id != request.device_id
+                    || existing.capability != request.capability
+                    || existing.arguments_sha256 != arguments_sha256
+                {
+                    return Err(format!(
+                        "Invocation '{invocation_id}' already queued a different device command \
+                         ({}); refusing to replace it",
+                        existing.command_id
+                    ));
+                }
+                return Ok(existing);
+            }
+        }
         self.connection
             .execute(
                 "INSERT INTO remote_device_actions(
                     command_id,device_id,capability,arguments_json,arguments_sha256,
                     source_run_id,source_session_id,source_tool_call_id,state,
-                    created_at_ms,updated_at_ms,expires_at_ms)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,?9,?10)",
+                    created_at_ms,updated_at_ms,expires_at_ms,invocation_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'queued',?9,?9,?10,?11)",
                 params![
                     command_id,
                     request.device_id,
@@ -1489,9 +1615,31 @@ impl RemoteStore {
                     request.source_tool_call_id,
                     to_i64(now_ms)?,
                     to_i64(request.expires_at_ms)?,
+                    request.invocation_id,
                 ],
             )
-            .map_err(|error| error.to_string())?;
+            .or_else(|error| {
+                // Lost the race to another process holding the same invocation.
+                // Its row is the answer, exactly as if this call had seen it above.
+                match (&request.invocation_id, &error) {
+                    (Some(invocation_id), rusqlite::Error::SqliteFailure(failure, _))
+                        if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        match self.device_command_by_invocation(invocation_id) {
+                            Ok(Some(_)) => Ok(0),
+                            _ => Err(error.to_string()),
+                        }
+                    }
+                    _ => Err(error.to_string()),
+                }
+            })?;
+        if let Some(invocation_id) = &request.invocation_id {
+            if let Some(existing) = self.device_command_by_invocation(invocation_id)? {
+                if existing.command_id != command_id {
+                    return Ok(existing);
+                }
+            }
+        }
         self.audit(
             now_ms,
             Some(&request.device_id),
@@ -1502,6 +1650,79 @@ impl RemoteStore {
         )?;
         self.device_command(&command_id)?
             .ok_or_else(|| "Queued device command disappeared".to_string())
+    }
+
+    /// Registers an open Talk socket as a capture that is happening right now.
+    ///
+    /// **Why a device command row.** "Which device can hear the room, and is it
+    /// hearing it now" is a question the security audit already answers, and it
+    /// answers it by reading non-terminal `remote_device_actions`. A Talk socket
+    /// that did not appear there would be the one microphone in the product
+    /// that an audit could not see — so it appears there, as the `voice_stream`
+    /// capture it is.
+    ///
+    /// It goes straight to `running` rather than through `queued`/`leased`
+    /// because there is nothing to lease: the socket is the transport, it is
+    /// already open, and the audio is already flowing. The expiry is the
+    /// socket's own ceiling, so a runner that dies mid-conversation leaves a row
+    /// that the ordinary sweep terminates as unproven rather than one that
+    /// claims a microphone is open forever.
+    pub fn open_talk_capture(
+        &mut self,
+        device_id: &str,
+        session_id: &str,
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<DeviceCommandRecord, String> {
+        let record = self.enqueue_device_command(
+            &DeviceCommandRequest {
+                device_id: device_id.to_string(),
+                capability: DeviceCapability::VoiceStream,
+                // Bounded, and nothing anybody said: which conversation, over
+                // which transport.
+                arguments: serde_json::json!({
+                    "transport": "talk_socket",
+                    "sessionId": session_id,
+                }),
+                source_run_id: None,
+                source_session_id: Some(session_id.to_string()),
+                source_tool_call_id: None,
+                // A socket is not an invocation delivered twice: the ticket is
+                // one-use, so every admitted socket is its own capture and the
+                // idempotency this field buys has nothing to collapse.
+                invocation_id: None,
+                expires_at_ms,
+            },
+            now_ms,
+        )?;
+        self.connection
+            .execute(
+                "UPDATE remote_device_actions
+                 SET state='running', started_at_ms=?2, updated_at_ms=?2
+                 WHERE command_id=?1",
+                params![record.command_id, to_i64(now_ms)?],
+            )
+            .map_err(|error| error.to_string())?;
+        self.device_command(&record.command_id)?
+            .ok_or_else(|| "Open Talk capture disappeared".to_string())
+    }
+
+    /// Ends the capture a Talk socket registered. Idempotent, and safe to call
+    /// for a row the expiry sweep already terminated.
+    pub fn close_talk_capture(
+        &mut self,
+        device_id: &str,
+        command_id: &str,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let outcome = if error.is_some() {
+            DeviceCommandState::Failed
+        } else {
+            DeviceCommandState::Succeeded
+        };
+        self.complete_device_command(device_id, command_id, outcome, None, None, error, None, now_ms)
+            .map(|_| ())
     }
 
     /// Advances every command whose deadline has passed.
@@ -1611,24 +1832,66 @@ impl RemoteStore {
         self.device_command(&command_id)
     }
 
-    /// The device says it is about to touch hardware.
+    /// The device says it is about to touch hardware, naming the attempt.
     ///
-    /// Returns `false` when the command was already `running`, which is how a
-    /// reconnecting device that lost the response to its first `start` learns
-    /// not to perform the action again. Any other non-`leased` state is an
-    /// error: a cancelled or expired command must not begin.
+    /// The one transition that authorizes a physical effect, so it is the one
+    /// that has to be exactly-once:
+    ///
+    /// * `leased` + any execution id → `running`, the id is recorded, and
+    ///   `started` is true. This is the only answer a device may act on.
+    /// * `running` + the same execution id → `started: false, recoverable:
+    ///   true`. The same attempt is reconnecting: it may deliver a result it
+    ///   already staged, and must not repeat the action.
+    /// * `running` + a *different* execution id → refused. Another execution
+    ///   holds this command; authorizing a second one is how two photographs
+    ///   get taken.
+    ///
+    /// A device that names no execution id at all (an older build) is answered
+    /// as before: `false` on a running command, which is safe but cannot tell
+    /// its own reconnect from someone else's.
     pub fn start_device_command(
         &mut self,
         device_id: &str,
         command_id: &str,
+        execution_id: Option<&str>,
         now_ms: u64,
-    ) -> Result<bool, String> {
+    ) -> Result<DeviceCommandStart, String> {
         let record = self
             .device_command(command_id)?
             .filter(|record| record.device_id == device_id)
             .ok_or_else(|| "Unknown device command".to_string())?;
         match record.state {
-            DeviceCommandState::Running => return Ok(false),
+            DeviceCommandState::Running => {
+                let holder = record.execution_id.clone();
+                let same = match (&holder, execution_id) {
+                    (Some(held), Some(offered)) => held == offered,
+                    // Nothing was recorded, or nothing was offered: the runner
+                    // cannot prove this is a different device, and refusing
+                    // would strand a legacy client's own reconnect. It is still
+                    // told not to execute.
+                    _ => true,
+                };
+                if !same {
+                    self.audit(
+                        now_ms,
+                        Some(device_id),
+                        "device_command_execution_conflict",
+                        Some(command_id),
+                        "denied",
+                        None,
+                    )?;
+                    return Err(
+                        "This command is already running under another execution and will not be \
+                         started again"
+                            .to_string(),
+                    );
+                }
+                return Ok(DeviceCommandStart {
+                    started: false,
+                    recoverable: true,
+                    execution_id: holder,
+                });
+            }
             DeviceCommandState::Leased => {}
             other => return Err(format!("A {} command cannot be started", other.as_str())),
         }
@@ -1648,9 +1911,9 @@ impl RemoteStore {
             .connection
             .execute(
                 "UPDATE remote_device_actions
-                 SET state='running', started_at_ms=?2, updated_at_ms=?2
+                 SET state='running', started_at_ms=?2, updated_at_ms=?2, execution_id=?3
                  WHERE command_id=?1 AND state='leased'",
-                params![command_id, to_i64(now_ms)?],
+                params![command_id, to_i64(now_ms)?, execution_id],
             )
             .map_err(|error| error.to_string())?;
         if changed != 1 {
@@ -1664,11 +1927,66 @@ impl RemoteStore {
             "allowed",
             Some(&record.arguments_sha256),
         )?;
-        Ok(true)
+        Ok(DeviceCommandStart {
+            started: true,
+            recoverable: false,
+            execution_id: execution_id.map(str::to_string),
+        })
     }
 
-    /// Records the device's terminal report. Idempotent: a retried report for a
-    /// command that already reached a terminal state leaves the first one alone.
+    /// The nonterminal commands this device is still on the hook for.
+    ///
+    /// Only `running` ones: a `queued` or `leased` command needs no
+    /// reconciliation — nothing physical has happened, and the ordinary lease
+    /// (or its expiry) is the right way to reach it. A `running` command is the
+    /// one the normal queue deliberately never hands out again, which is
+    /// exactly why it would otherwise be stranded.
+    pub fn recoverable_device_commands(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<DeviceCommandRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{DEVICE_COMMAND_SELECT} WHERE device_id=?1 AND state='running'
+                 ORDER BY created_at_ms ASC, command_id ASC LIMIT 64"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![device_id], read_device_command)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn device_command_by_invocation(
+        &self,
+        invocation_id: &str,
+    ) -> Result<Option<DeviceCommandRecord>, String> {
+        self.connection
+            .query_row(
+                &format!("{DEVICE_COMMAND_SELECT} WHERE invocation_id=?1"),
+                [invocation_id],
+                read_device_command,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Records the device's terminal report.
+    ///
+    /// Delivery is at-least-once by design — a device that staged a result and
+    /// lost the reply must retry until it is acknowledged — so this has to tell
+    /// a retry from a contradiction:
+    ///
+    /// * already terminal, same digest → the first record is returned unchanged
+    ///   and the retry is acknowledged. This is the ordinary lost-ACK path.
+    /// * already terminal, different digest → refused. The stored outcome and
+    ///   its artifact stay authoritative; a second answer to a physical action
+    ///   that already happened is not an update, it is a contradiction.
+    /// * already terminal, nothing recorded to compare (a row completed by a
+    ///   build that predates the digest) → acknowledged without mutation, which
+    ///   is the safe direction.
     pub fn complete_device_command(
         &mut self,
         device_id: &str,
@@ -1677,6 +1995,7 @@ impl RemoteStore {
         result: Option<&serde_json::Value>,
         artifact: Option<&DeviceArtifact>,
         error: Option<&str>,
+        execution_id: Option<&str>,
         now_ms: u64,
     ) -> Result<DeviceCommandRecord, String> {
         if !outcome.terminal() {
@@ -1686,8 +2005,61 @@ impl RemoteStore {
             .device_command(command_id)?
             .filter(|record| record.device_id == device_id)
             .ok_or_else(|| "Unknown device command".to_string())?;
+        let bounded_error = error.map(|value| bounded(value, 4_096));
+        let digest = super::protocol::terminal_digest(
+            outcome,
+            result,
+            artifact.map(|artifact| artifact.sha256.as_str()),
+            bounded_error.as_deref(),
+        );
         if record.state.terminal() {
+            match &record.terminal_sha256 {
+                Some(stored) if stored == &digest => {
+                    self.audit(
+                        now_ms,
+                        Some(device_id),
+                        "device_command_result_replayed",
+                        Some(command_id),
+                        record.state.as_str(),
+                        Some(&digest),
+                    )?;
+                }
+                Some(_) => {
+                    self.audit(
+                        now_ms,
+                        Some(device_id),
+                        "device_command_result_conflict",
+                        Some(command_id),
+                        "denied",
+                        Some(&digest),
+                    )?;
+                    return Err(format!(
+                        "This command already reported {} and that result is authoritative; a \
+                         different result cannot replace it",
+                        record.state.as_str()
+                    ));
+                }
+                None => {}
+            }
             return Ok(record);
+        }
+        // A report from an execution the runner never authorized is refused
+        // rather than recorded: it would mean a second device answering for a
+        // physical effect it did not perform.
+        if let (Some(held), Some(offered)) = (&record.execution_id, execution_id) {
+            if held != offered {
+                self.audit(
+                    now_ms,
+                    Some(device_id),
+                    "device_command_execution_conflict",
+                    Some(command_id),
+                    "denied",
+                    None,
+                )?;
+                return Err(
+                    "This result belongs to a different execution of the command".to_string(),
+                );
+            }
         }
         let encoded = result
             .map(|value| serde_json::to_vec(value))
@@ -1697,7 +2069,8 @@ impl RemoteStore {
             .execute(
                 "UPDATE remote_device_actions
                  SET state=?2, completed_at_ms=?3, updated_at_ms=?3, result_json=?4,
-                     artifact_sha256=?5, artifact_bytes=?6, artifact_media_type=?7, error=?8
+                     artifact_sha256=?5, artifact_bytes=?6, artifact_media_type=?7, error=?8,
+                     terminal_sha256=?9
                  WHERE command_id=?1",
                 params![
                     command_id,
@@ -1709,7 +2082,8 @@ impl RemoteStore {
                         .map(|artifact| to_i64(artifact.bytes))
                         .transpose()?,
                     artifact.map(|artifact| artifact.media_type.clone()),
-                    error.map(|value| bounded(value, 4_096)),
+                    bounded_error,
+                    digest,
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -2752,6 +3126,9 @@ fn read_device_command(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceComman
         result,
         artifact,
         error: row.get(21)?,
+        execution_id: row.get(22)?,
+        terminal_sha256: row.get(23)?,
+        invocation_id: row.get(24)?,
     })
 }
 
@@ -2771,7 +3148,9 @@ fn validate_device_name(value: &str) -> Result<(), String> {
     }
 }
 
-fn bounded(value: &str, max: usize) -> String {
+/// Shared with `api.rs` so the digest it computes over a terminal report is
+/// taken over the same bytes this module stores.
+pub(super) fn bounded(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
@@ -2970,6 +3349,7 @@ mod tests {
                     source_run_id: Some("run-one".into()),
                     source_session_id: None,
                     source_tool_call_id: Some("call-1".into()),
+                    invocation_id: None,
                     expires_at_ms: now_ms + 300_000,
                 },
                 now_ms,
@@ -3005,9 +3385,17 @@ mod tests {
         assert_eq!(released.attempt, 2, "a requeue is a second attempt");
 
         // Now the device starts. From here the lease lapsing must NOT requeue.
-        assert!(store
-            .start_device_command(&device_id, &queued.command_id, 50_002)
-            .unwrap());
+        assert!(
+            store
+                .start_device_command(
+                    &device_id,
+                    &queued.command_id,
+                    Some("exec-first-attempt"),
+                    50_002
+                )
+                .unwrap()
+                .started
+        );
         store.expire_device_commands(90_000).unwrap();
         let still_running = store.device_command(&queued.command_id).unwrap().unwrap();
         assert_eq!(
@@ -3021,10 +3409,38 @@ mod tests {
             .is_none());
 
         // A reconnecting device that lost its first `start` response is told
-        // the action already began rather than being allowed to repeat it.
-        assert!(!store
-            .start_device_command(&device_id, &queued.command_id, 90_002)
-            .unwrap());
+        // the action already began rather than being allowed to repeat it —
+        // and that it may still deliver what it staged.
+        let resumed = store
+            .start_device_command(
+                &device_id,
+                &queued.command_id,
+                Some("exec-first-attempt"),
+                90_002,
+            )
+            .unwrap();
+        assert!(!resumed.started);
+        assert!(resumed.recoverable);
+        // A *different* execution is refused outright rather than authorized:
+        // that is a second device, and a second photograph.
+        assert!(store
+            .start_device_command(
+                &device_id,
+                &queued.command_id,
+                Some("exec-other-device"),
+                90_003
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .recoverable_device_commands(&device_id)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.command_id)
+                .collect::<Vec<_>>(),
+            vec![queued.command_id.clone()],
+            "a running command is exactly what recovery must offer"
+        );
 
         // Overall expiry with no report terminates it as failed-and-unproven,
         // never as a retry.
@@ -3057,7 +3473,7 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .start_device_command(&device_id, &late.command_id, 20_002)
+            .start_device_command(&device_id, &late.command_id, Some("exec-late"), 20_002)
             .unwrap();
         let flagged = store
             .request_device_cancel(&late.command_id, 20_003)
@@ -3069,25 +3485,47 @@ mod tests {
         );
         assert!(flagged.cancel_requested);
 
-        // The device's own report decides the terminal state, and a retried
-        // report does not overwrite it.
+        // The device's own report decides the terminal state.
+        let artifact = DeviceArtifact {
+            sha256: "a".repeat(64),
+            bytes: 12,
+            media_type: "image/jpeg".into(),
+        };
         let completed = store
             .complete_device_command(
                 &device_id,
                 &late.command_id,
                 DeviceCommandState::Succeeded,
                 Some(&serde_json::json!({ "captured": true })),
-                Some(&DeviceArtifact {
-                    sha256: "a".repeat(64),
-                    bytes: 12,
-                    media_type: "image/jpeg".into(),
-                }),
+                Some(&artifact),
                 None,
+                Some("exec-late"),
                 20_004,
             )
             .unwrap();
         assert_eq!(completed.state, DeviceCommandState::Succeeded);
-        let retried = store
+
+        // Delivery is at-least-once, so the identical report arriving again —
+        // the device never saw the first acknowledgement — is accepted and
+        // answered with the authoritative record.
+        let replayed = store
+            .complete_device_command(
+                &device_id,
+                &late.command_id,
+                DeviceCommandState::Succeeded,
+                Some(&serde_json::json!({ "captured": true })),
+                Some(&artifact),
+                None,
+                Some("exec-late"),
+                20_005,
+            )
+            .unwrap();
+        assert_eq!(replayed.state, DeviceCommandState::Succeeded);
+        assert_eq!(replayed.artifact.as_ref().unwrap().bytes, 12);
+
+        // A *different* answer to the same command is a contradiction, not an
+        // update: refused, and the first result stays authoritative.
+        assert!(store
             .complete_device_command(
                 &device_id,
                 &late.command_id,
@@ -3095,12 +3533,82 @@ mod tests {
                 None,
                 None,
                 Some("second thoughts"),
-                20_005,
+                Some("exec-late"),
+                20_006,
             )
-            .unwrap();
-        assert_eq!(retried.state, DeviceCommandState::Succeeded);
-        assert_eq!(retried.artifact.unwrap().bytes, 12);
+            .is_err());
+        let intact = store.device_command(&late.command_id).unwrap().unwrap();
+        assert_eq!(intact.state, DeviceCommandState::Succeeded);
+        assert_eq!(intact.artifact.unwrap().sha256, "a".repeat(64));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One durable tool invocation must produce one physical command, however
+    /// many times it is delivered — and two different asks that happen to share
+    /// an invocation identity must not silently replace one another.
+    #[test]
+    fn one_invocation_queues_one_command_and_a_different_ask_conflicts() {
+        let (root, mut store, secrets, scopes) = fixture();
+        let device_id = paired(&mut store, &secrets, &scopes);
+        let request = DeviceCommandRequest {
+            device_id: device_id.clone(),
+            capability: DeviceCapability::CameraCapture,
+            arguments: serde_json::json!({ "position": "back" }),
+            source_run_id: Some("job-7".into()),
+            source_session_id: None,
+            source_tool_call_id: Some("tool-1-1".into()),
+            invocation_id: Some("job-7:tool-1-1".into()),
+            expires_at_ms: 400_000,
+        };
+        let first = store.enqueue_device_command(&request, 10_000).unwrap();
+        let again = store.enqueue_device_command(&request, 10_001).unwrap();
+        assert_eq!(
+            first.command_id, again.command_id,
+            "a redelivered invocation must reach the command it already created"
+        );
+        assert_eq!(store.device_commands(&device_id, 50).unwrap().len(), 1);
+
+        let different = DeviceCommandRequest {
+            arguments: serde_json::json!({ "position": "front" }),
+            ..request.clone()
+        };
+        assert!(
+            store.enqueue_device_command(&different, 10_002).is_err(),
+            "the same invocation asking for something else is a conflict, not a replacement"
+        );
+
+        // A manual ask carries no invocation identity and is never deduplicated
+        // against another that happens to look the same.
+        let manual = DeviceCommandRequest {
+            invocation_id: None,
+            ..request
+        };
+        let one = store.enqueue_device_command(&manual, 10_003).unwrap();
+        let two = store.enqueue_device_command(&manual, 10_004).unwrap();
+        assert_ne!(one.command_id, two.command_id);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The invocation identity is only formed when the runtime supplied both
+    /// halves; half of it is not an identity.
+    #[test]
+    fn an_invocation_identity_needs_both_halves() {
+        assert_eq!(
+            DeviceCommandRequest::invocation_id_for(Some("run-1"), Some("tool-1-1")),
+            Some("run-1:tool-1-1".to_string())
+        );
+        assert_eq!(
+            DeviceCommandRequest::invocation_id_for(Some("run-1"), None),
+            None
+        );
+        assert_eq!(
+            DeviceCommandRequest::invocation_id_for(None, Some("tool-1-1")),
+            None
+        );
+        assert_eq!(
+            DeviceCommandRequest::invocation_id_for(Some(""), Some("tool-1-1")),
+            None
+        );
     }
 
     /// The queue outlives the process. Reopening the database must find a
@@ -3147,6 +3655,7 @@ mod tests {
             device_model: "Pixel".into(),
             capabilities: BTreeSet::from([DeviceCapability::CameraCapture]),
             permissions: Default::default(),
+            readiness: Default::default(),
             constraints: Default::default(),
             reported_at_ms: 10_000,
         };
@@ -3176,6 +3685,7 @@ mod tests {
                     source_run_id: None,
                     source_session_id: None,
                     source_tool_call_id: None,
+                    invocation_id: None,
                     expires_at_ms: 300_000,
                 },
                 12_001,

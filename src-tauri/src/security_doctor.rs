@@ -121,6 +121,18 @@ pub struct PushPrivacySnapshot {
     pub registered_devices: usize,
 }
 
+/// The operator's voice configuration, reduced to the three questions the audit
+/// asks: is anything listening without being asked, is it opt-in, and could
+/// what it hears leave the machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoicePrivacySnapshot {
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    /// True when transcription runs on this machine. False means audio is
+    /// uploaded to a provider the operator configured.
+    pub local_only: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecurityRuntimeSnapshot {
     pub browser_grants: Vec<BrowserGrantSnapshot>,
@@ -136,6 +148,25 @@ pub struct SecurityRuntimeSnapshot {
     pub device_state_observed: bool,
     pub device_state_error: Option<String>,
     pub push: Option<PushPrivacySnapshot>,
+    /// How a device reaches this runner, as the runner advertises it.
+    ///
+    /// Separate from `audit_remote_host`'s own checks because the question this
+    /// answers is a different one: that function asks whether the *listener* is
+    /// configured safely, and this asks whether the transport a phone with a
+    /// camera grant is talking over is pinned at all. A development listener on
+    /// plain loopback is a reasonable thing to have and an unreasonable thing to
+    /// hand a microphone.
+    pub transport: Option<TransportSnapshot>,
+    pub voice: Option<VoicePrivacySnapshot>,
+}
+
+/// The advertised transport, reduced to what the device audit asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    pub enabled: bool,
+    pub advertise_url: String,
+    /// Whether the runner holds a certificate fingerprint for devices to pin.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +232,7 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
     audit_paired_devices(&request.runtime, &mut findings);
+    audit_voice_privacy(&request.runtime, &mut findings);
     audit_workspace_skill_root(request.workspace.as_deref(), &mut findings);
     audit_sandbox_enforcement(&mut findings);
 
@@ -1185,6 +1217,46 @@ fn audit_paired_devices(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Se
         }
     }
 
+    // The transport those grants are exercised over.
+    //
+    // A hardware grant is only as private as the connection that carries the
+    // photograph back. `pair-create` refuses a non-HTTPS advertised URL, so this
+    // is not a hole an operator can open by accident — but a certificate can be
+    // replaced, a fingerprint can go missing from the configuration, and a
+    // development listener set up for a laptop can outlive the afternoon it was
+    // meant for. The finding names the devices, because "your transport is
+    // unpinned" and "your transport is unpinned and three phones can hear the
+    // room over it" are different sentences.
+    if let Some(transport) = &runtime.transport {
+        let hardware: Vec<&str> = active
+            .iter()
+            .filter(|device| !device.granted_physical.is_empty())
+            .map(|device| device.device_name.as_str())
+            .collect();
+        let insecure = !transport.advertise_url.starts_with("https://");
+        if transport.enabled && !hardware.is_empty() && (insecure || !transport.pinned) {
+            findings.push(finding(
+                "devices.transport_unpinned",
+                "devices",
+                "Hardware grants are reachable over an unpinned transport",
+                &format!(
+                    "{} is {}, and {} hold hardware grants over it.",
+                    transport.advertise_url,
+                    if insecure {
+                        "not HTTPS"
+                    } else {
+                        "advertised without a certificate fingerprint for devices to pin"
+                    },
+                    hardware.join(", ")
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Reconfigure the remote host with a certificate valid for the advertised name, then re-pair: `monkey daemon remote host-configure --advertise-url https://… --tls-certificate … --tls-private-key …`."),
+            ));
+        }
+    }
+
     // A revoked device keeps nothing, including an address. This catches the
     // one row that could outlive a revocation and quietly keep a wiped phone
     // on the notification list.
@@ -1567,6 +1639,88 @@ fn summarize(findings: &[SecurityFinding]) -> SecuritySummary {
     summary
 }
 
+/// The voice surface: a microphone that opens itself, and where what it hears
+/// goes.
+///
+/// **Why this is its own audit rather than a line in the device one.** The
+/// device audit asks what a *phone* was granted. This asks what *this machine*
+/// does on its own — a wake phrase and always-listening are desktop settings,
+/// not grants, and nothing in the grant model would ever surface them. The
+/// combination that matters most is the one neither half sees alone:
+/// always-listening plus a hosted transcription provider is a room whose audio
+/// leaves the machine without anyone pressing anything.
+fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
+    let Some(voice) = &runtime.voice else {
+        return;
+    };
+    if voice.always_listening && !voice.local_only {
+        findings.push(finding(
+            "voice.passive_cloud_upload",
+            "voice",
+            "An always-on microphone is uploading to a provider",
+            "Always-listening is on and transcription is a hosted provider, so audio captured \
+             without anyone pressing anything can leave this machine.",
+            FindingStatus::Critical,
+            false,
+            None,
+            Some(
+                "Either turn always-listening off, or switch transcription to local Whisper in \
+                 Settings → Companion → Voice.",
+            ),
+        ));
+    } else if voice.always_listening {
+        findings.push(finding(
+            "voice.always_listening",
+            "voice",
+            "The microphone is always listening",
+            "This machine listens for a wake phrase continuously. Detection is local and no \
+             audio is uploaded until the phrase is heard, but the microphone is open.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some(
+                "Turn always-listening off in Settings → Companion → Voice when it is not in use.",
+            ),
+        ));
+    } else if voice.wake_phrase_enabled {
+        findings.push(finding(
+            "voice.wake_phrase_enabled",
+            "voice",
+            "A wake phrase is enabled",
+            "The wake phrase is armed but the microphone only opens when Talk is started.",
+            FindingStatus::Info,
+            false,
+            None,
+            None,
+        ));
+    } else {
+        findings.push(finding(
+            "voice.wake_disabled",
+            "voice",
+            "Nothing is listening on its own",
+            "The wake phrase and always-listening are both off; the microphone opens only when \
+             it is pressed.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+    if !voice.local_only {
+        findings.push(finding(
+            "voice.hosted_transcription",
+            "voice",
+            "Speech is transcribed by a hosted provider",
+            "What is said into Talk, the companion overlay and answered calls is uploaded to the \
+             transcription provider configured in Settings.",
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Local Whisper keeps every recording on this machine."),
+        ));
+    }
+}
+
 fn finding(
     id: &str,
     category: &str,
@@ -1664,6 +1818,97 @@ mod tests {
         findings.iter().any(|finding| finding.id == id)
     }
 
+    fn voice_findings(voice: Option<VoicePrivacySnapshot>) -> Vec<SecurityFinding> {
+        let mut findings = Vec::new();
+        audit_voice_privacy(
+            &SecurityRuntimeSnapshot {
+                voice,
+                ..SecurityRuntimeSnapshot::default()
+            },
+            &mut findings,
+        );
+        findings
+    }
+
+    /// The voice surface graded by what it can actually do, worst case first.
+    ///
+    /// The combination the operator most needs named is always-listening plus a
+    /// hosted transcription backend: neither is alarming alone, and together
+    /// they are a microphone that uploads a room nobody opened.
+    #[test]
+    fn the_doctor_grades_always_listening_by_where_the_audio_goes() {
+        let leaking = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: false,
+        }));
+        assert!(has(&leaking, "voice.passive_cloud_upload"));
+        assert_eq!(
+            leaking
+                .iter()
+                .find(|finding| finding.id == "voice.passive_cloud_upload")
+                .unwrap()
+                .status,
+            FindingStatus::Critical
+        );
+
+        // The same setting, kept on this machine, is a warning rather than a
+        // critical: the microphone is open, but nothing leaves.
+        let local = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: true,
+        }));
+        assert!(has(&local, "voice.always_listening"));
+        assert!(!has(&local, "voice.passive_cloud_upload"));
+        assert!(!has(&local, "voice.hosted_transcription"));
+
+        // Armed but not listening, and the default: neither is a problem, and
+        // both are stated rather than left silent.
+        let armed = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&armed, "voice.wake_phrase_enabled"));
+        let quiet = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: false,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&quiet, "voice.wake_disabled"));
+        assert_eq!(quiet[0].status, FindingStatus::Pass);
+
+        // Nothing observed says nothing, rather than claiming the microphone is
+        // quiet on evidence it does not have.
+        assert!(voice_findings(None).is_empty());
+    }
+
+    /// An open Talk socket is a running `voice_stream` command, so the device
+    /// audit already names it. This pins that, because the property is what
+    /// makes "an unexpected active stream" visible at all.
+    #[test]
+    fn a_live_voice_stream_is_reported_as_a_capture_in_flight() {
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![device("phone", &["voice_stream"], Some(now_ms()))],
+            device_commands: vec![DeviceCommandSnapshot {
+                command_id: "cmd-1".into(),
+                device_id: "device-phone".into(),
+                capability: "voice_stream".into(),
+                state: "running".into(),
+            }],
+            ..SecurityRuntimeSnapshot::default()
+        });
+        let in_flight = findings
+            .iter()
+            .find(|finding| finding.id == "devices.capture_in_flight")
+            .expect("a running stream is named");
+        assert_eq!(in_flight.status, FindingStatus::Critical);
+        assert!(in_flight.detail.contains("voice_stream"));
+        assert!(has(&findings, "devices.intimate_grant"));
+    }
+
     /// The four things an operator most needs told about a phone they granted
     /// hardware to: it can hear the room, it can do a lot, it has not been seen
     /// in a month, and something is capturing right now.
@@ -1715,6 +1960,51 @@ mod tests {
         assert!(!has(&quiet, "devices.intimate_grant"));
         assert!(!has(&quiet, "devices.broad_grant"));
         assert!(!has(&quiet, "devices.stale_grant"));
+    }
+
+    /// A hardware grant is only as private as the connection carrying the
+    /// photograph back, and a development listener can outlive the afternoon it
+    /// was set up for.
+    #[test]
+    fn the_doctor_flags_hardware_grants_reachable_over_an_unpinned_transport() {
+        let now = now_ms();
+        let with_transport = |advertise_url: &str, pinned: bool, granted: &[&str]| {
+            device_findings(SecurityRuntimeSnapshot {
+                device_state_observed: true,
+                devices: vec![device("phone", granted, Some(now))],
+                transport: Some(TransportSnapshot {
+                    enabled: true,
+                    advertise_url: advertise_url.to_string(),
+                    pinned,
+                }),
+                ..Default::default()
+            })
+        };
+        let plain = with_transport("http://192.168.1.4:8443", true, &["camera_capture"]);
+        let finding = plain
+            .iter()
+            .find(|finding| finding.id == "devices.transport_unpinned")
+            .expect("an unencrypted transport carrying a camera grant must be reported");
+        assert_eq!(finding.status, FindingStatus::Critical);
+        // The devices are named: "unpinned" and "unpinned, and this phone can
+        // see through its camera over it" are different sentences.
+        assert!(finding.detail.contains("phone"));
+
+        assert!(has(
+            &with_transport("https://runner.example.net", false, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        // A pinned HTTPS transport, and a plain one that no hardware grant is
+        // reachable over, are both silent — the second because a development
+        // listener is a reasonable thing to have until a camera is behind it.
+        assert!(!has(
+            &with_transport("https://runner.example.net", true, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        assert!(!has(
+            &with_transport("http://127.0.0.1:8443", false, &[]),
+            "devices.transport_unpinned"
+        ));
     }
 
     /// A revoked device must keep nothing, an address included.

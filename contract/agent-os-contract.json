@@ -1,5 +1,5 @@
 {
-  "contract_version": "1.5.0",
+  "contract_version": "1.6.0",
   "support_window_days": 180,
   "http_routes": [
     {
@@ -440,6 +440,18 @@
     },
     {
       "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/commands/recover",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/commands/{command_id}/control",
+      "gate": "self_service"
+    },
+    {
+      "plane": "device",
       "method": "POST",
       "path": "/v1/remote/device/commands/{command_id}/start",
       "gate": "self_service"
@@ -460,6 +472,18 @@
       "plane": "device",
       "method": "POST",
       "path": "/v1/remote/device/voice/{session_id}/close",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
+      "method": "POST",
+      "path": "/v1/remote/device/talk/ticket",
+      "gate": "capability:VoiceStream"
+    },
+    {
+      "plane": "device",
+      "method": "GET",
+      "path": "/v1/remote/device/talk/{session_id}/stream",
       "gate": "capability:VoiceStream"
     },
     {

@@ -177,6 +177,20 @@ fn collect_device_state(runtime: &mut SecurityRuntimeSnapshot) {
     let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() else {
         return;
     };
+    collect_device_state_at(runtime, &paths);
+}
+
+/// The same reader against an explicit daemon root.
+///
+/// Split out so a test can prove that opening a real Talk socket makes this
+/// production reader report a capture in flight. Asserting on a hand-built
+/// snapshot would prove only that the audit can format a struct — which is
+/// exactly how the documentation came to claim an observability the socket did
+/// not actually have.
+pub(crate) fn collect_device_state_at(
+    runtime: &mut SecurityRuntimeSnapshot,
+    paths: &crate::daemon::store::DaemonPaths,
+) {
     let store = match crate::daemon::remote::store::RemoteStore::open(&paths.root) {
         Ok(store) => store,
         Err(error) => {
@@ -233,7 +247,20 @@ fn collect_device_state(runtime: &mut SecurityRuntimeSnapshot) {
             state: command.state.as_str().to_string(),
         });
     }
-    let push = crate::daemon::remote::push::load_config(&paths)
+    // Read from the same configuration the listener itself uses, so the audit
+    // describes the transport devices actually reach rather than a second copy
+    // of what it should be.
+    runtime.transport = crate::daemon::remote::host_config(paths)
+        .ok()
+        .flatten()
+        .map(
+            |config| little_monkey_lib::security_doctor::TransportSnapshot {
+                enabled: config.enabled,
+                pinned: !config.certificate_sha256.is_empty(),
+                advertise_url: config.advertise_url,
+            },
+        );
+    let push = crate::daemon::remote::push::load_config(paths)
         .ok()
         .flatten();
     runtime.push = Some(PushPrivacySnapshot {
