@@ -3569,17 +3569,29 @@ mod tests {
         assert_eq!(hits[0].role, "artifact");
     }
 
-    /// A payload of `count` one-line messages in a single session.
-    fn bulk_payload(count: usize) -> String {
-        let messages = (0..count)
+    /// Fill one profile with `matching` messages the search below finds plus
+    /// `filler` messages it must never look at.
+    fn seed_searchable_messages(
+        env: &TestEnv,
+        matching: usize,
+        filler: usize,
+    ) -> (RunLedger, ArtifactStore) {
+        let (mut ledger, artifacts) = env.open();
+        let messages = (0..matching)
             .map(|index| {
                 json!({
                     "role": "user",
                     "content": format!("performance needle record {index}")
                 })
             })
+            .chain((0..filler).map(|index| {
+                json!({
+                    "role": "user",
+                    "content": format!("unrelated chatter record {index}")
+                })
+            }))
             .collect::<Vec<_>>();
-        serde_json::to_string(&json!({
+        let payload = serde_json::to_string(&json!({
             "activeSessionId": "bulk-session",
             "groups": [],
             "sessions": [{
@@ -3597,100 +3609,101 @@ mod tests {
                 "subagentRuns": {}
             }]
         }))
-        .unwrap()
-    }
-
-    /// Import one fresh profile of `count` messages and report what it cost.
-    fn timed_import(label: &str, count: usize) -> (TestEnv, Duration) {
-        let env = TestEnv::new(label);
-        let (mut ledger, artifacts) = env.open();
-        let payload = bulk_payload(count);
-        let started = Instant::now();
+        .unwrap();
         let saved = save_payload(&mut ledger, &artifacts, &payload).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(saved.counts.messages, count);
-        (env, elapsed)
+        assert_eq!(saved.counts.messages, matching + filler);
+        (ledger, artifacts)
     }
 
-    /// Import cost has to stay proportional to the number of messages, and a
-    /// search over ten thousand of them has to stay interactive.
-    ///
-    /// # Why the import budget is a ratio and not a stopwatch
-    ///
-    /// It used to be `import < 30s`, which is only a statement about this code
-    /// on an otherwise idle machine. On a loaded one — a full `cargo test` runs
-    /// a dozen test binaries at once, each hammering the same disk — the same
-    /// unchanged code measured over 30s and failed, while measuring 3s alone
-    /// minutes later. A wall-clock ceiling on a contended shared resource does
-    /// not test the code; it tests what else the machine happened to be doing.
-    ///
-    /// What the test actually wants to protect is that importing ten times as
-    /// many messages costs about ten times as much — that nothing here is
-    /// quadratic in message count. Measuring a small import in the same process,
-    /// under the same contention, and comparing the per-message cost holds that
-    /// property whatever the machine is doing: both halves are slowed by the
-    /// same factor, and the ratio is not. The absolute ceiling stays as a
-    /// generous backstop against an outright hang rather than as the signal.
-    #[test]
-    fn ten_thousand_message_fixture_reports_bounded_import_and_search_time() {
-        const SMALL: usize = 1_000;
-        const LARGE: usize = 10_000;
-
-        let (_small_env, small_elapsed) = timed_import("thousand", SMALL);
-        let (env, import_elapsed) = timed_import("ten-thousand", LARGE);
-        let (mut ledger, _artifacts) = env.open();
-
-        // Per message, at the larger size, against per message at the smaller.
-        // Three is slack for fixed setup costs amortizing differently and for
-        // scheduling noise, and is still far below what any superlinear term
-        // would produce over a tenfold increase.
-        let small_per_message = small_elapsed.as_secs_f64() / SMALL as f64;
-        let large_per_message = import_elapsed.as_secs_f64() / LARGE as f64;
-        let scaling = large_per_message / small_per_message;
-        eprintln!(
-            "profile import scaling: {SMALL}={small_elapsed:?}, {LARGE}={import_elapsed:?}, per-message ratio={scaling:.2}"
-        );
-        assert!(
-            scaling < 3.0,
-            "importing {LARGE} messages cost {scaling:.2}x as much per message as importing {SMALL} \
-             ({small_elapsed:?} then {import_elapsed:?}); import is no longer proportional to size"
-        );
+    fn search_once(ledger: &mut RunLedger) -> Duration {
         let request = GlobalSearchRequest {
             query: "performance needle".to_string(),
             limit: 10,
             ..GlobalSearchRequest::default()
         };
-        let mut samples = Vec::with_capacity(50);
-        for _ in 0..50 {
-            let search_started = Instant::now();
-            let hits = global_search(&mut ledger, &request).unwrap();
-            samples.push(search_started.elapsed());
-            assert_eq!(hits.len(), 10);
+        let started = Instant::now();
+        let hits = global_search(ledger, &request).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(hits.len(), 10);
+        elapsed
+    }
+
+    /// Search cost must follow how many documents *match*, not how many the
+    /// profile holds.
+    ///
+    /// # Why this is a ratio and not a millisecond budget
+    ///
+    /// The property worth protecting is that a search reads the FTS index. The
+    /// regression that would matter is a query plan that stops using
+    /// `profile_search_fts` and walks `profile_search_documents` instead, and
+    /// the signature of that is cost that grows with the profile even when the
+    /// answer does not.
+    ///
+    /// An absolute wall-clock budget cannot see that property. It measures the
+    /// machine as much as the code: this test runs alongside every other test
+    /// in its binary, so each sample carries whatever else the scheduler was
+    /// doing. That is how the earlier form of this test failed CI at 428 ms
+    /// against a 400 ms budget with nothing regressed — and a budget widened
+    /// until shared runners stop reaching it has stopped measuring anything.
+    ///
+    /// So both profiles hold the same 250 matching messages, and only one of
+    /// them also holds 9,750 the query must never look at. An index answers
+    /// both in about the same time; a scan pays forty times more for the second
+    /// one, which no amount of load can disguise as the 6× allowed here.
+    /// Samples are interleaved so a scheduling spike lands on both sides, and
+    /// medians rather than tails are compared for the same reason.
+    #[test]
+    fn search_cost_follows_the_matches_rather_than_the_profile_size() {
+        const MATCHING: usize = 250;
+        const FILLER: usize = 9_750;
+        /// Enough headroom that an index is never accused of scanning, far
+        /// below the ~40× a scan of this profile would actually cost.
+        const ALLOWED_GROWTH: u32 = 6;
+
+        let matches_only_env = TestEnv::new("search-matches-only");
+        let with_filler_env = TestEnv::new("search-with-filler");
+        let (mut matches_only, _matches_artifacts) =
+            seed_searchable_messages(&matches_only_env, MATCHING, 0);
+
+        let import_started = Instant::now();
+        let (mut with_filler, _filler_artifacts) =
+            seed_searchable_messages(&with_filler_env, MATCHING, FILLER);
+        let import_elapsed = import_started.elapsed();
+
+        // The first search of a ledger also syncs its search documents, which
+        // is one-time work and not what is being measured.
+        search_once(&mut matches_only);
+        search_once(&mut with_filler);
+
+        let mut matches_only_samples = Vec::with_capacity(25);
+        let mut with_filler_samples = Vec::with_capacity(25);
+        for _ in 0..25 {
+            matches_only_samples.push(search_once(&mut matches_only));
+            with_filler_samples.push(search_once(&mut with_filler));
         }
-        samples.sort_unstable();
-        let p95 = samples[47];
-        eprintln!("profile 10k timing: import={import_elapsed:?}, search_p95={p95:?}");
-        // A backstop against an outright hang, not the regression signal — that
-        // is the scaling ratio above. Deliberately far above anything a loaded
-        // machine produces, because a number a contended runner can trip is a
-        // number that will be re-tuned rather than believed.
+        matches_only_samples.sort_unstable();
+        with_filler_samples.sort_unstable();
+        let indexed_median = matches_only_samples[12];
+        let with_filler_median = with_filler_samples[12];
+        eprintln!(
+            "profile search scaling: import={import_elapsed:?}, \
+             {MATCHING} matches={indexed_median:?}, \
+             +{FILLER} unmatched={with_filler_median:?}"
+        );
+
+        // Import is the one wall-clock bound left, and it is deliberately far
+        // looser than any machine needs: it exists to catch an import that
+        // stopped terminating, not to grade a runner.
         assert!(
             import_elapsed.as_secs() < 120,
             "10k import took {import_elapsed:?}, which is not slow — it is stuck"
         );
-        // Shared GitHub Actions runners have observably noisier tail latency
-        // than a local dev machine (seen up to ~227ms against this 200ms
-        // budget across unrelated PRs' CI runs) — widen the budget under CI
-        // rather than chase a threshold no shared runner can hit reliably,
-        // while keeping the tight local budget as the real regression signal.
-        let budget_ms = if std::env::var_os("CI").is_some() {
-            400
-        } else {
-            200
-        };
         assert!(
-            p95 < Duration::from_millis(budget_ms),
-            "10k search p95 exceeded {budget_ms} ms: {p95:?}"
+            with_filler_median <= indexed_median * ALLOWED_GROWTH,
+            "{FILLER} documents the query cannot match still cost {:.1}× \
+             ({indexed_median:?} → {with_filler_median:?}); search is reading \
+             the profile rather than the index",
+            with_filler_median.as_secs_f64() / indexed_median.as_secs_f64().max(f64::MIN_POSITIVE),
         );
     }
 
