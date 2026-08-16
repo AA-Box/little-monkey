@@ -527,6 +527,7 @@ fn normalize_event(
                             .map(str::to_string),
                         mime_type: None,
                         declared_size_bytes: message.get("fileSize").and_then(JsonValue::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: id.to_string(),
                         },

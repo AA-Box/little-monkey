@@ -731,6 +731,7 @@ fn normalize_update(
                 filename: None,
                 mime_type: None,
                 declared_size_bytes: largest.file_size.map(|size| size as u64),
+                stored_size_bytes: None,
                 source: AttachmentSource::ProviderHandle {
                     handle: largest.file_id.clone(),
                 },
@@ -747,6 +748,7 @@ fn normalize_update(
             filename: document.file_name.clone(),
             mime_type: document.mime_type.clone(),
             declared_size_bytes: document.file_size.map(|size| size as u64),
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: document.file_id.clone(),
             },
@@ -762,6 +764,7 @@ fn normalize_update(
             filename: None,
             mime_type: voice.mime_type.clone(),
             declared_size_bytes: voice.file_size.map(|size| size as u64),
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: voice.file_id.clone(),
             },
@@ -777,6 +780,7 @@ fn normalize_update(
             filename: audio.file_name.clone(),
             mime_type: audio.mime_type.clone(),
             declared_size_bytes: audio.file_size.map(|size| size as u64),
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: audio.file_id.clone(),
             },
@@ -792,6 +796,7 @@ fn normalize_update(
             filename: None,
             mime_type: video.mime_type.clone(),
             declared_size_bytes: video.file_size.map(|size| size as u64),
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: video.file_id.clone(),
             },
@@ -1176,6 +1181,7 @@ mod tests {
             filename: Some("build.log".into()),
             mime_type: Some("text/plain".into()),
             declared_size_bytes: None,
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: "f1".into(),
             },
@@ -1236,6 +1242,7 @@ mod tests {
                 filename: Some("build.log".into()),
                 mime_type: Some("text/plain".into()),
                 declared_size_bytes: None,
+                stored_size_bytes: None,
                 source: AttachmentSource::ProviderHandle {
                     handle: "f1".into(),
                 },
@@ -1263,7 +1270,12 @@ mod tests {
             Some("fixture-blob")
         );
         assert_eq!(attachment.text_excerpt.as_deref(), Some("error: nope"));
-        assert_eq!(attachment.declared_size_bytes, Some(11));
+        // The measured size lands in its own field. `declared_size_bytes` stays
+        // what the provider said, which here is nothing — hydration used to
+        // overwrite it with the measurement, which is what made the two
+        // impossible to compare.
+        assert_eq!(attachment.stored_size_bytes, Some(11));
+        assert_eq!(attachment.declared_size_bytes, None);
         assert!(attachment.fetch_error.is_none());
     }
 
@@ -1287,6 +1299,7 @@ mod tests {
                 filename: Some("gone.png".into()),
                 mime_type: None,
                 declared_size_bytes: None,
+                stored_size_bytes: None,
                 source: AttachmentSource::ProviderHandle {
                     handle: "gone".into(),
                 },

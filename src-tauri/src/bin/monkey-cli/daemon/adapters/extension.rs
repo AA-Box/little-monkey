@@ -469,6 +469,7 @@ pub(crate) fn normalize_envelopes(
                 filename: attachment.filename,
                 mime_type: attachment.mime_type,
                 declared_size_bytes: attachment.declared_size_bytes,
+                stored_size_bytes: None,
                 source: AttachmentSource::Url {
                     url: attachment.url,
                 },

@@ -1084,6 +1084,7 @@ fn normalize_activity(
                             .map(str::to_string),
                         mime_type: mime_type.map(str::to_string),
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::Url {
                             url: content_url.to_string(),
                         },

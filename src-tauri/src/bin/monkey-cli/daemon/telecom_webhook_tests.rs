@@ -674,3 +674,103 @@ async fn the_sms_side_of_a_number_carries_the_messaging_defaults() {
         "a text from a stranger starts a pairing handshake, exactly as on every other channel"
     );
 }
+
+/// A picture somebody texted actually arrives.
+///
+/// This is the whole MMS path and it used to end in nothing: an inbound text
+/// was ingested inline, and nothing on that path ever downloaded media. The
+/// attachment reached the agent with no bytes and — worse — no error, which
+/// reads as "there was no attachment".
+///
+/// The two halves this asserts are the ones that matter:
+///
+/// 1. **The carrier's request downloads nothing.** A media host that is slow
+///    would otherwise run the callback past the carrier's timeout, and a
+///    carrier that times out redelivers: one picture, two conversations.
+/// 2. **The pending pass fetches it with the account's own carrier
+///    credential** and stores the bytes, exactly as every delivered-to
+///    messaging provider does.
+#[tokio::test]
+async fn an_inbound_picture_is_acknowledged_first_and_downloaded_afterwards() {
+    let (media_base, media_requests) =
+        super::channel_adapter::test_http::serve(vec![(200, "the picture bytes".to_string())]);
+    let (paths, account) = seeded(InboundCallPolicy::Reject);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551234567");
+    let carrier = carrier();
+    let (headers, body) = carrier.sign_inbound_mms(
+        "+15551234567",
+        NUMBER,
+        "look at this",
+        &[(format!("{media_base}/media-1"), "image/png".to_string())],
+    );
+
+    let response = test_route::post(&paths, &path(), &headers, &body).await;
+    assert_eq!(response.status, 202);
+    assert!(
+        media_requests.try_recv().is_err(),
+        "the carrier's own request must not wait on a media download"
+    );
+
+    // The event is durable and unfinished: that is what makes the
+    // acknowledgement honest and a crash here free.
+    let mut store = store(&paths);
+    let pending = store
+        .recent_channel_events(ACCOUNT, 10)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.envelope_json.contains("look at this"))
+        .expect("the message is durable before the carrier is answered");
+    assert!(
+        pending.job_id.is_none(),
+        "nothing runs from inside the carrier's request"
+    );
+
+    // Now the pass that finishes it, with the real SMS adapter — the same one
+    // the supervisor loads for this account.
+    let adapter: std::sync::Arc<dyn super::channel_adapter::ChannelAdapter> = std::sync::Arc::new(
+        super::adapters::sms::SmsAdapter::new(&account, SECRET.to_string(), paths.root.clone())
+            .expect("sms adapter"),
+    );
+    let fetchers = std::collections::BTreeMap::from([(ACCOUNT.to_string(), adapter)]);
+    let queue = super::channel_restart_tests::FakeQueue::default();
+    super::channel_worker::process_pending_channel_ingress(
+        &mut store,
+        &queue,
+        &fetchers,
+        &super::channel_adapter::DaemonBlobs,
+        NOW,
+    )
+    .await
+    .expect("a pass over the accepted events");
+
+    let request =
+        String::from_utf8_lossy(&media_requests.recv().expect("the media download")).to_string();
+    assert!(
+        request.starts_with("GET /media-1"),
+        "the carrier's media URL is what gets fetched: {request}"
+    );
+    let stored = store
+        .recent_channel_events(ACCOUNT, 10)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.envelope_json.contains("look at this"))
+        .expect("the message");
+    let envelope: little_monkey_lib::channels::types::ChannelEnvelope =
+        serde_json::from_str(&stored.envelope_json).expect("envelope");
+    let attachment = &envelope.attachments[0];
+    assert!(
+        attachment.stored_artifact_id.is_some(),
+        "the picture's bytes are on disk: {attachment:?}"
+    );
+    assert_eq!(
+        attachment.stored_size_bytes,
+        Some("the picture bytes".len() as u64)
+    );
+    assert!(attachment.fetch_error.is_none(), "{attachment:?}");
+    // And the provenance survives: the URL the carrier named is still there.
+    assert!(matches!(
+        attachment.source,
+        little_monkey_lib::channels::types::AttachmentSource::Url { .. }
+    ));
+}

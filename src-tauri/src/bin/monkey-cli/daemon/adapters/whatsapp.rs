@@ -729,6 +729,7 @@ fn normalize_message(
                     filename,
                     mime_type,
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle { handle },
                 });
             }

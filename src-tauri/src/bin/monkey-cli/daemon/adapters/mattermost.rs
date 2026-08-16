@@ -689,6 +689,7 @@ fn normalize_posted_event(
                     filename: None,
                     mime_type: None,
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
                         handle: file_id.to_string(),
                     },

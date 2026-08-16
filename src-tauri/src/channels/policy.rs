@@ -657,6 +657,7 @@ mod tests {
             filename: None,
             mime_type: None,
             declared_size_bytes: Some(10),
+            stored_size_bytes: None,
             source: AttachmentSource::ProviderHandle {
                 handle: "file-1".into(),
             },

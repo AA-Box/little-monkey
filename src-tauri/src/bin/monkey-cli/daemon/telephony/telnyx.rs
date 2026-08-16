@@ -153,6 +153,16 @@ impl TelecomProvider for TelnyxProvider {
         TelecomKind::Telnyx
     }
 
+    /// Telnyx hands out a media URL that needs no credential of ours, so this
+    /// is the plain hardened download -- same cap, same redirect policy, no
+    /// header. Implemented rather than left to the refusing default: "this
+    /// carrier cannot download attachments" would be false.
+    async fn fetch_media(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        crate::daemon::channel_adapter::fetch_url(url, None, max_bytes)
+            .await
+            .map_err(|error| self.redact(error))
+    }
+
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
         Some(MEDIA_FORMAT)
     }
@@ -539,6 +549,7 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
                     filename: None,
                     mime_type: media.content_type.clone(),
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::Url {
                         url: media.url.clone(),
                     },

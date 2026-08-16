@@ -141,6 +141,19 @@ impl TelecomProvider for PlivoProvider {
         TelecomKind::Plivo
     }
 
+    /// Plivo, like Twilio, serves inbound media from its own API behind the
+    /// account's HTTP credential.
+    async fn fetch_media(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        crate::daemon::channel_adapter::fetch_url_basic_auth(
+            url,
+            &self.auth_id,
+            &self.auth_token,
+            max_bytes,
+        )
+        .await
+        .map_err(|error| self.redact(error))
+    }
+
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
         Some(MEDIA_FORMAT)
     }
@@ -535,6 +548,7 @@ fn normalize_plivo_params(
                 filename: None,
                 mime_type: media.content_type,
                 declared_size_bytes: None,
+                stored_size_bytes: None,
                 source: AttachmentSource::Url {
                     url: media.media_url,
                 },

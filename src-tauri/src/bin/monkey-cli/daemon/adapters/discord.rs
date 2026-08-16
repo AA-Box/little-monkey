@@ -1364,6 +1364,7 @@ fn normalize_message_create(
                             .map(str::to_string),
                         mime_type,
                         declared_size_bytes: attachment.get("size").and_then(Value::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::Url { url },
                     })
                 })

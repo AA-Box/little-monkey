@@ -1003,6 +1003,7 @@ fn normalize_message_event(
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         declared_size_bytes: file.get("size").and_then(Value::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle { handle },
                     })
                 })

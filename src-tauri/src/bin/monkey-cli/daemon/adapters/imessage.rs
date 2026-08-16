@@ -382,6 +382,7 @@ mod macos {
                                 .map(str::to_string),
                             mime_type,
                             declared_size_bytes: item.get("size").and_then(Value::as_u64),
+                            stored_size_bytes: None,
                             // An opaque handle the *helper* issued and only the
                             // helper can resolve. This process never learns
                             // where the file is, let alone opens it — which is
@@ -1019,6 +1020,7 @@ done
                     filename: Some("x.png".to_string()),
                     mime_type: Some("image/png".to_string()),
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
                         // An opaque row id. This process could not open the file
                         // if it wanted to — it does not know where it is.
@@ -1151,6 +1153,7 @@ done
                         filename: None,
                         mime_type: None,
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: hostile.to_string(),
                         },

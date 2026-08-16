@@ -725,6 +725,7 @@ fn normalize_event(
                             .map(str::to_string),
                         mime_type: mime_type.map(str::to_string),
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: resource.to_string(),
                         },

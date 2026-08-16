@@ -525,6 +525,26 @@ pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
         Err("This carrier has no way to connect a call to a media stream".to_string())
     }
 
+    /// Download one inbound MMS attachment from the carrier.
+    ///
+    /// A carrier-specific call rather than a plain GET, because the media URL a
+    /// carrier puts in its callback is not a public one: Twilio and Plivo serve
+    /// theirs from their own API and require the account's HTTP credential, and
+    /// an unauthenticated fetch of either gets a `401`, not the picture. Only
+    /// the carrier knows which credential and which header.
+    ///
+    /// `max_bytes` is the account's ceiling and must be enforced *while
+    /// streaming*: a `Content-Length` is a claim by the same host that is
+    /// sending the body, so a cap applied after the fact is not a cap. Every
+    /// implementation goes through [`super::channel_adapter::fetch_url`], which
+    /// abandons the body the moment it crosses.
+    ///
+    /// The default refuses, so a carrier that gains MMS says so rather than
+    /// silently handing back nothing.
+    async fn fetch_media(&self, _url: &str, _max_bytes: u64) -> Result<Vec<u8>, String> {
+        Err("This carrier cannot download inbound attachments".to_string())
+    }
+
     /// Verify a carrier callback over the exact bytes received and normalize
     /// it. An unverified body must return `Err` and leave no trace: it has not
     /// earned a durable row.

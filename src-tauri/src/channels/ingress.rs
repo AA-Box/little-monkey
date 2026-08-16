@@ -588,7 +588,17 @@ impl ConversationIngress {
                     Some(filename) => format!(" \"{}\"", one_line(filename)),
                     None => String::new(),
                 },
-                match (&attachment.mime_type, attachment.declared_size_bytes) {
+                // The measured size when the bytes are here, the sender's claim
+                // when they are not. Never both, and never the claim over the
+                // measurement: hydration refuses a file whose size does not
+                // match what was declared, so once something is on disk its own
+                // weight is the only true answer.
+                match (
+                    &attachment.mime_type,
+                    attachment
+                        .stored_size_bytes
+                        .or(attachment.declared_size_bytes),
+                ) {
                     (Some(mime), Some(size)) => format!(", {}, {size} bytes", one_line(mime)),
                     (Some(mime), None) => format!(", {}", one_line(mime)),
                     (None, Some(size)) => format!(", {size} bytes"),
@@ -842,6 +852,7 @@ mod tests {
             filename: Some("shot.png".into()),
             mime_type: Some("image/png".into()),
             declared_size_bytes: Some(1024),
+            stored_size_bytes: None,
             source: crate::channels::types::AttachmentSource::ProviderHandle {
                 handle: "file-1".into(),
             },
@@ -863,6 +874,7 @@ mod tests {
             filename: filename.map(str::to_string),
             mime_type: mime.map(str::to_string),
             declared_size_bytes: size,
+            stored_size_bytes: None,
             source: crate::channels::types::AttachmentSource::ProviderHandle {
                 handle: "file-1".into(),
             },

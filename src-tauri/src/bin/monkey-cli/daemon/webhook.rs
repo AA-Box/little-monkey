@@ -462,7 +462,7 @@ fn record_durable_addressing(
 /// envelope stored here. Nothing about the sender's access, the route or the
 /// recipe is consulted at this point: those are reads of operator
 /// configuration, and none of them change whether this message arrived.
-fn record_accepted_event(
+pub(super) fn record_accepted_event(
     store: &mut DaemonStore,
     envelope: &little_monkey_lib::channels::types::ChannelEnvelope,
 ) -> Result<super::channel_store::EventRecording, String> {

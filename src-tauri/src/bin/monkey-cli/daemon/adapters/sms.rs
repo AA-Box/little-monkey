@@ -253,6 +253,37 @@ impl ChannelAdapter for SmsAdapter {
         Ok(InboundBatch::default())
     }
 
+    /// Download one inbound MMS attachment.
+    ///
+    /// Delegated to the carrier because the media URL in a callback is not a
+    /// public one: Twilio and Plivo serve theirs from their own API behind the
+    /// account's HTTP credential, and only the carrier knows which credential
+    /// and which header. The default implementation of this method would GET
+    /// the URL with no auth at all and store the `401` body as somebody's
+    /// photo.
+    ///
+    /// Runs in the pending-ingress pass, never in the carrier's own request:
+    /// a slow media host must not push a callback past the carrier's timeout,
+    /// because a carrier that times out redelivers and one picture becomes two
+    /// conversations.
+    async fn fetch_attachment(
+        &self,
+        attachment: &little_monkey_lib::channels::types::ChannelAttachment,
+        limits: super::super::channel_adapter::AttachmentLimits,
+    ) -> Result<Vec<u8>, String> {
+        match &attachment.source {
+            little_monkey_lib::channels::types::AttachmentSource::Url { url } => {
+                self.carrier.fetch_media(url, limits.max_bytes).await
+            }
+            // No carrier hands out an opaque handle for inbound media; every
+            // one of them puts a URL in the callback. Refused rather than
+            // guessed at.
+            little_monkey_lib::channels::types::AttachmentSource::ProviderHandle { .. } => {
+                Err("This carrier's attachment cannot be downloaded".to_string())
+            }
+        }
+    }
+
     async fn send(&self, message: &OutboundMessage) -> SendOutcome {
         // A reply to a phone call is spoken, not texted. Call conversations are
         // `call:<call_id>`, and the line is either still up — in which case the

@@ -431,6 +431,7 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
                             .map(str::to_string),
                         mime_type: content_type,
                         declared_size_bytes: item.get("size").and_then(Value::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle { handle: id },
                     })
                 })

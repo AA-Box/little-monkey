@@ -322,10 +322,30 @@ pub struct ChannelAttachment {
     pub filename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// What the provider said this file weighs, before anything was fetched.
+    ///
+    /// The sender's claim, never overwritten with what actually arrived —
+    /// keeping them apart is the whole of what makes the comparison possible.
+    /// Checked twice: once before a socket is opened, so a file declared over
+    /// the account's limit costs nothing at all, and once against the bytes
+    /// received, because a provider that described a different file than it
+    /// sent has described the wrong thing to the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_size_bytes: Option<u64>,
+    /// What the bytes on disk actually weigh.
+    ///
+    /// Present exactly when `stored_artifact_id` is: it is measured from the
+    /// body that was stored. Separate from the declaration above rather than
+    /// replacing it, which is what a single field made impossible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_size_bytes: Option<u64>,
     /// How the bytes are obtained. Either an https URL or a provider handle the
     /// adapter knows how to resolve.
+    ///
+    /// Kept after the download rather than cleared: this is the attachment's
+    /// provenance, and an artifact in the shared content store with no record
+    /// of where it came from is indistinguishable from one the operator put
+    /// there.
     pub source: AttachmentSource,
     /// Content-store id once the bytes have actually been fetched.
     ///

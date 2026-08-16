@@ -615,6 +615,7 @@ fn attachment_from(
         filename: (!filename.is_empty()).then(|| filename.to_string()),
         mime_type,
         declared_size_bytes: size,
+        stored_size_bytes: None,
         source: AttachmentSource::ProviderHandle { handle },
     })
 }
