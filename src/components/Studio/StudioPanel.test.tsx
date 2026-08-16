@@ -231,4 +231,30 @@ describe("StudioPanel extension history", () => {
     expect(undo().hasAttribute("disabled")).toBe(true);
     expect(redo().hasAttribute("disabled")).toBe(true);
   });
+
+  /** The engine rounds an edge up to a multiple of 32. A field left holding
+   *  the raw number reports a canvas the run never had. */
+  it("holds the size the engine will really render", async () => {
+    await setup();
+    // The label holds both controls; typing happens in the number one.
+    const typed = screen
+      .getByLabelText("Width")
+      .parentElement!.querySelector<HTMLInputElement>('input[type="number"]')!;
+    fireEvent.change(typed, { target: { value: "645" } });
+    fireEvent.blur(typed);
+    await waitFor(() => expect(widthValue()).toBe("672"));
+  });
+
+  it("takes the canvas from the source image's own size", async () => {
+    vi.stubGlobal(
+      "Image",
+      class extends StubImage {
+        naturalWidth = 645;
+        naturalHeight = 890;
+      },
+    );
+    await setup();
+    fireEvent.click(screen.getByLabelText("Original size of the source image"));
+    await waitFor(() => expect(widthValue()).toBe("672"));
+  });
 });

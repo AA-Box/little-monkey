@@ -8,6 +8,7 @@ import {
   ArrowUp,
   ChevronDown,
   Download,
+  Image as ImageIcon,
   Loader2,
   Plus,
   RectangleHorizontal,
@@ -95,6 +96,20 @@ interface RunSettings {
   hires: HiresSettings | null;
 }
 
+/** A base64 picture's own pixel size, for the "original size" canvas button. */
+async function imageSize(base64: string): Promise<{ width: number; height: number }> {
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("That image could not be read"));
+    image.src = `data:image/png;base64,${base64}`;
+  });
+  if (!image.naturalWidth || !image.naturalHeight) {
+    throw new Error("That image could not be read");
+  }
+  return { width: image.naturalWidth, height: image.naturalHeight };
+}
+
 /** The file extension a saved asset should carry, from its media type. */
 function extensionFor(mediaType: string): string {
   const subtype = mediaType.split("/")[1] ?? "bin";
@@ -110,6 +125,7 @@ function SliderField({
   max,
   step,
   hint,
+  snap,
   onChange,
 }: {
   label: string;
@@ -118,6 +134,10 @@ function SliderField({
   max: number;
   step: number;
   hint?: string;
+  /** Rounds a typed value to one the backend accepts, once the field is left.
+   *  On every keystroke instead would fight the typing: "1024" would be
+   *  rewritten to a valid size after the "1". */
+  snap?: (value: number) => number;
   onChange: (value: number) => void;
 }) {
   return (
@@ -143,6 +163,7 @@ function SliderField({
           step={step}
           value={value}
           onChange={(event) => onChange(Number(event.target.value))}
+          onBlur={snap ? () => onChange(snap(value)) : undefined}
           className="w-16 shrink-0 rounded border border-border bg-background px-1.5 py-1 text-center text-xs text-foreground"
         />
       </span>
@@ -674,8 +695,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
     if (!selected) return;
     setOverrides([]);
     setSettings({
-      width: selected.defaults.width,
-      height: selected.defaults.height,
+      // Aligned here as well as on the controls: a model may list defaults the
+      // engine cannot render as given, and the form must not open on a size
+      // that is not the one it would generate.
+      width: normalizeDimension(selected.defaults.width),
+      height: normalizeDimension(selected.defaults.height),
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
       sampler: selected.defaults.sampleMethod,
@@ -822,6 +846,34 @@ export function StudioPanel({ mode, railSlot }: Props) {
     if (!current) return;
     try {
       receive(await runPreprocessor(current, kind));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
+  /** The one way the canvas size is set from the controls.
+   *
+   *  The engine rounds every edge up to a multiple of 32, so the form holds
+   *  the size that will really be rendered — a field reading 645 beside a
+   *  picture generated at 672 reports a canvas that never existed. */
+  const setCanvas = (width: number, height: number) =>
+    setSettings((current) =>
+      current
+        ? {
+            ...current,
+            width: normalizeDimension(width),
+            height: normalizeDimension(height),
+          }
+        : current,
+    );
+
+  /** Sizes the canvas to the source picture, so a run redraws it at its own
+   *  resolution instead of the model's default shape. */
+  const useOriginalSize = async () => {
+    if (!initImage) return;
+    try {
+      const { width, height } = await imageSize(initImage);
+      setCanvas(width, height);
     } catch (cause) {
       setError(String(cause));
     }
@@ -1703,14 +1755,24 @@ export function StudioPanel({ mode, railSlot }: Props) {
                         }
                         aria-label={t(`Studio.aspect.${preset.id}`)}
                         title={`${t(`Studio.aspect.${preset.id}`)} · ${preset.width}×${preset.height}`}
-                        onClick={() =>
-                          setSettings({ ...settings, width: preset.width, height: preset.height })
-                        }
+                        onClick={() => setCanvas(preset.width, preset.height)}
                       >
                         <Icon size={13} />
                       </IconButton>
                     );
                   })}
+                  {/* Only offered once there is a picture to take a size from. */}
+                  {initImage && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.aspect.original")}
+                      title={t("Studio.aspect.original")}
+                      onClick={() => void useOriginalSize()}
+                    >
+                      <ImageIcon size={13} />
+                    </IconButton>
+                  )}
                 </div>
               </div>
 
@@ -1721,6 +1783,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   min={64}
                   max={2048}
                   step={32}
+                  snap={normalizeDimension}
                   onChange={(width) => setSettings({ ...settings, width })}
                 />
                 <SliderField
@@ -1730,8 +1793,10 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   max={2048}
                   step={32}
                   // The engine aligns edges up to a multiple of 32, so show the
-                  // canvas that will really be rendered.
+                  // canvas that will really be rendered — which is what the
+                  // fields hold too, once a typed value has been committed.
                   hint={`${normalizeDimension(settings.width)}×${normalizeDimension(settings.height)}`}
+                  snap={normalizeDimension}
                   onChange={(height) => setSettings({ ...settings, height })}
                 />
               </div>
