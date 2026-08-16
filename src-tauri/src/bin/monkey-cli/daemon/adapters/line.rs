@@ -107,6 +107,10 @@ impl WebhookChannelAdapter for LineAdapter {
         ChannelKind::Line
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// LINE's own requirement, and the one its console's Verify button checks:
     /// status 200. It reads nothing else, including on a redelivery of an event
     /// this daemon already has.

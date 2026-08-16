@@ -463,6 +463,69 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Count one webhook delivery this account refused to authenticate.
+    ///
+    /// Best-effort by signature at every call site, and deliberately so: the
+    /// request is already being refused, and failing to write the tally would
+    /// only turn a refusal into a second failure. What must not happen is the
+    /// reason growing — [`super::telecom_store::excerpt`]'s bound applies here
+    /// for the same reason it does there: this column is read in a settings
+    /// panel, and a rejected delivery is an attacker-controlled payload.
+    pub fn record_channel_callback_rejection(
+        &mut self,
+        account_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE channel_accounts
+                 SET rejected_callbacks = rejected_callbacks + 1,
+                     last_rejection = ?2,
+                     last_rejection_at_ms = ?3
+                 WHERE account_id=?1",
+                params![account_id, super::telecom_store::excerpt(reason), now_ms],
+            )
+            .map_err(|error| format!("Failed to record a rejected callback: {error}"))?;
+        Ok(())
+    }
+
+    /// Forget them, because one finally verified. The count means "since it
+    /// last worked", which is the only version of it an operator can act on.
+    pub fn clear_channel_callback_rejections(&mut self, account_id: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE channel_accounts
+                 SET rejected_callbacks = 0, last_rejection = NULL, last_rejection_at_ms = NULL
+                 WHERE account_id=?1 AND rejected_callbacks > 0",
+                [account_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn channel_callback_rejections(
+        &self,
+        account_id: &str,
+    ) -> Result<super::telecom_store::CallbackRejections, String> {
+        self.connection
+            .query_row(
+                "SELECT rejected_callbacks, last_rejection, last_rejection_at_ms
+                 FROM channel_accounts WHERE account_id=?1",
+                [account_id],
+                |row| {
+                    Ok(super::telecom_store::CallbackRejections {
+                        count: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(u32::MAX),
+                        last_reason: row.get(1)?,
+                        last_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(Option::unwrap_or_default)
+    }
+
     pub fn delete_channel_account(&mut self, account_id: &str) -> Result<bool, String> {
         self.connection
             .execute(

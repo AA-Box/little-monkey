@@ -495,6 +495,10 @@ impl WebhookChannelAdapter for TeamsAdapter {
         ChannelKind::Teams
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// The Bot Framework connector treats `200` as delivered and reads the
     /// body as an optional response activity; an empty JSON object is how a
     /// bot that will answer later says there is nothing to send back now.

@@ -1057,7 +1057,11 @@ impl DaemonStore {
 
 /// Keep a stored string short enough to read in a settings panel and small
 /// enough that nothing here becomes a place to park data.
-fn excerpt(value: &str) -> String {
+///
+/// Shared with the messaging side's identical column rather than copied: two
+/// bounds that are meant to be the same bound drift, and the one that drifts
+/// upward is the one holding a string an unauthenticated caller influenced.
+pub(super) fn excerpt(value: &str) -> String {
     const MAX_CHARS: usize = 160;
     if value.chars().count() <= MAX_CHARS {
         return value.to_string();

@@ -283,6 +283,10 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         ChannelKind::GoogleChat
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// Google Chat reads a `200`'s body as an optional immediate reply and
     /// treats any other status as a failed delivery. An empty JSON object is
     /// how an app that will answer through the API later says there is nothing

@@ -324,12 +324,16 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 &mut report,
                 crate::telecom_audit::telecom_findings(now_ms_for_audit()),
             );
-            // Peer state lives in the two databases the daemon owns, which the
-            // library cannot open either.
+            // Peer and messaging state live in the databases the daemon owns,
+            // which the library cannot open either.
             if let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() {
                 append_findings(
                     &mut report,
                     crate::daemon::peer_audit::audit_peers(&paths, now_ms_for_audit()),
+                );
+                append_findings(
+                    &mut report,
+                    crate::daemon::channel_audit::channel_findings(&paths, now_ms_for_audit()),
                 );
             }
             if *json {

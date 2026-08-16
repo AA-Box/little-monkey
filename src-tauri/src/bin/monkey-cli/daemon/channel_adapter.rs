@@ -479,6 +479,16 @@ impl VerifiedWebhookDelivery {
 pub trait WebhookChannelAdapter: Send + Sync {
     fn kind(&self) -> ChannelKind;
 
+    /// The account this adapter was built for.
+    ///
+    /// Not read from the request: the adapter is constructed from the stored
+    /// account the listener's own route matched, so this is the operator's
+    /// configuration rather than anything a caller claimed. Used to attribute a
+    /// refused delivery to the account it was aimed at, which is the only way
+    /// an operator ever learns that a rotated secret or a stale callback URL is
+    /// why their messages stopped arriving.
+    fn account_id(&self) -> &str;
+
     /// What this provider needs to see to consider the delivery finished.
     ///
     /// The default is the one every provider accepts; each adapter that wants

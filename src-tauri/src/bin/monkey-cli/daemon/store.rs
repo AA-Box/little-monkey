@@ -2415,6 +2415,33 @@ CREATE INDEX peer_outbound_messages_recent_idx
     ON peer_outbound_messages(sent_at_ms DESC);
 "#;
 
+const DAEMON_V19: i64 = 19;
+const DAEMON_V19_CHECKSUM: &str = "daemon-jobs-v19-channel-callback-rejections";
+
+/// A messaging provider whose deliveries never authenticate.
+///
+/// V17 gave telephony accounts this and left the messaging side without it, and
+/// the asymmetry is not defensible: a webhook provider — WhatsApp, Teams, Google
+/// Chat, LINE — whose signing secret was rotated on one side, or whose console
+/// points at a URL that no longer resolves here, produces *exactly nothing*. No
+/// event row, no health transition, no error anywhere an operator can look. The
+/// delivery is refused before anything durable is written, which is the correct
+/// thing to do with an unauthenticated request and the worst possible thing to
+/// do to somebody trying to work out why their messages stopped arriving.
+///
+/// So the refusal itself becomes the bounded, non-secret record: how many in a
+/// row, the last reason code, and when. Never the body, never a header, never
+/// the signature that failed — a rejected delivery is an attacker-controlled
+/// payload, and this is a column an operator reads, not an evidence locker.
+///
+/// Cleared the moment one verifies, so the count reads "since it last worked"
+/// rather than "ever" — the same rule the telephony columns follow.
+const DAEMON_V19_SQL: &str = r#"
+ALTER TABLE channel_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2444,12 +2471,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
     (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
     (DAEMON_V18, DAEMON_V18_CHECKSUM, DAEMON_V18_SQL),
+    (DAEMON_V19, DAEMON_V19_CHECKSUM, DAEMON_V19_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V18;
+const DAEMON_LATEST: i64 = DAEMON_V19;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2624,7 +2652,22 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            DAEMON_V18
+            DAEMON_V19
+        );
+        // V19's columns exist and defaulted, on the account row that was
+        // written before they did. An `ALTER TABLE ... NOT NULL DEFAULT` that
+        // was mis-declared would fail the migration outright; what this proves
+        // is the historical row reads as "nothing has been refused" rather than
+        // as NULL, which is what the audit's threshold compares against.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rejected_callbacks FROM channel_accounts WHERE account_id='acct-1'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
         // v17's own columns still hold what they held. An upgrade that quietly
         // recreated a table would pass a "the table exists" check and fail this.

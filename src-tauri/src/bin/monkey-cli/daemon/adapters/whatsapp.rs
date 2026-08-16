@@ -148,6 +148,10 @@ impl WebhookChannelAdapter for WhatsAppAdapter {
         ChannelKind::WhatsApp
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// Meta asks for a `200` and reads nothing else. Anything else — including
     /// a `202` — counts as a failed delivery, is retried, and eventually gets
     /// the callback URL disabled.

@@ -355,11 +355,30 @@ pub(crate) fn accept_webhook_delivery(
         delivery.now_ms,
     ) {
         Ok(verified) => verified,
-        // Deliberately opaque, and deliberately not recorded. Covers both a
-        // delivery that did not authenticate and one that did but could not
-        // produce the addressing its own message requires.
-        Err(_) => return DeliveryOutcome::Rejected,
+        // The *caller* is still told nothing: an unverified body has not earned
+        // a row, and the response stays a bare 401 with no hint about which
+        // half of the check failed. What is recorded is a counter on the
+        // operator's own account, because the alternative — the original
+        // behaviour — was total silence, and a rotated signing secret or a
+        // console pointed at a stale URL then has no symptom at all: messages
+        // simply stop, and every other check on the page passes.
+        //
+        // Best-effort: this delivery is already being refused, and failing to
+        // tally it must not turn one failure into two.
+        Err(reason) => {
+            let _ = store.record_channel_callback_rejection(
+                adapter.account_id(),
+                &reason,
+                delivery.now_ms,
+            );
+            return DeliveryOutcome::Rejected;
+        }
     };
+    // It verified, so the streak is over. Cleared here rather than after the
+    // envelopes land, because what this counter measures is authentication, and
+    // authentication is what just succeeded — an event that fails to commit
+    // afterwards is a different problem with its own visible symptom.
+    let _ = store.clear_channel_callback_rejections(adapter.account_id());
     let super::channel_adapter::VerifiedWebhookDelivery {
         envelopes,
         durable_addressing,
