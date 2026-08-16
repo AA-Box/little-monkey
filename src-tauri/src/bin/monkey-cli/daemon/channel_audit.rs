@@ -123,15 +123,34 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
         }
     }
 
-    if findings.is_empty() && accounts.iter().any(|account| account.enabled) {
-        findings.push(f(
-            "channels.posture",
-            "Messaging accounts are configured conservatively",
-            "Every connected account decides who may talk to it, can authenticate what its \
-             provider sends, and is bounded in what one message may cost.",
-            FindingStatus::Pass,
-            None,
-        ));
+    if findings.is_empty() {
+        // Three different situations, and each gets said. An account switched
+        // off is not audited — it can receive nothing — but contributing
+        // *nothing at all* for a page full of switched-off accounts reads as a
+        // category that never ran, which is the one thing a security page must
+        // never do.
+        findings.push(if accounts.iter().any(|account| account.enabled) {
+            f(
+                "channels.posture",
+                "Messaging accounts are configured conservatively",
+                "Every connected account decides who may talk to it, can authenticate what its \
+                 provider sends, and is bounded in what one message may cost.",
+                FindingStatus::Pass,
+                None,
+            )
+        } else {
+            f(
+                "channels.all_disabled",
+                "Every messaging account is switched off",
+                &format!(
+                    "{} account(s) are configured and none of them is on, so nothing can reach an \
+                     agent this way and their settings were not checked.",
+                    accounts.len()
+                ),
+                FindingStatus::Pass,
+                None,
+            )
+        });
     }
     findings
 }
@@ -760,16 +779,29 @@ mod tests {
 
     /// An account switched off is not audited: it cannot receive anything, and
     /// a finding about it is a finding about a setting nobody is using.
+    /// A switched-off account cannot receive anything, so its settings are not
+    /// audited -- but the page still says the category ran. Contributing
+    /// nothing at all reads as a check that never happened, which on a
+    /// security page is worse than a finding.
     #[test]
-    fn a_disabled_account_is_not_audited() {
+    fn a_disabled_account_is_not_audited_but_is_still_accounted_for() {
         let (_root, paths) = store();
         let mut account = account("acct-1", ChannelKind::Telegram);
         account.enabled = false;
         account.access_policy.direct = AccessPolicy::Open;
         seed(&paths, &account);
-        assert!(!ids(&channel_findings(&paths, NOW))
+        let findings = channel_findings(&paths, NOW);
+        assert!(!ids(&findings)
             .iter()
             .any(|id| id.starts_with("channels.open_direct")));
+        let disabled = findings
+            .iter()
+            .find(|f| f.id == "channels.all_disabled")
+            .expect("the category has to say it ran");
+        assert!(disabled.detail.contains("1 account(s)"), "{disabled:?}");
+        // And not the posture pass, which would claim the settings were
+        // checked and found conservative.
+        assert!(!ids(&findings).contains(&"channels.posture"));
     }
 
     /// SMS is telephony's messaging face and `telecom_audit` already reports on
