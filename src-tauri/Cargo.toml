@@ -279,6 +279,11 @@ matrix-sdk = { version = "0.18", default-features = false, features = ["e2e-encr
 # type. Already in the tree via reqwest/matrix-sdk; named here because this is
 # the one place our own code constructs one.
 mime = "0.3"
+# Executable extensions are WebAssembly components only. Keep Wasmtime's
+# optional surface narrow: no cache/profiling/debug-server/native plugin path,
+# and Preview 2 is the sole WASI ABI linked into extension stores.
+wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "=47.0.3", default-features = false, features = ["p2"] }
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.
@@ -366,3 +371,6 @@ matrix-sdk = { version = "0.18", default-features = false, features = [
 # The sync-response builder those helpers take, for putting a room, a timeline
 # event or a to-device message into one `/sync` answer.
 matrix-sdk-test = "0.18"
+# Tiny hostile/limit fixtures compile from WAT during host tests; contributors
+# do not need a guest-language toolchain for the sandbox test suite.
+wat = "1"

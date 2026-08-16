@@ -38,6 +38,12 @@ pub enum TriggerTarget {
         workflow_id: String,
         definition_sha256: String,
     },
+    Extension {
+        extension_id: String,
+        handler_id: String,
+        version: String,
+        manifest_sha256: String,
+    },
 }
 
 /// Exact M4 trigger declaration carried across the daemon adapter boundary.
@@ -124,6 +130,7 @@ impl TriggerConfig {
                 payload_param,
             } => Some((recipe, params, payload_param.as_deref())),
             TriggerTarget::Workflow { .. } => None,
+            TriggerTarget::Extension { .. } => None,
         }
     }
 
@@ -136,6 +143,18 @@ impl TriggerConfig {
                 },
                 Some(binding),
             ) => Some((workflow_id, definition_sha256, binding)),
+            _ => None,
+        }
+    }
+
+    pub fn extension_target(&self) -> Option<(&str, &str, &str, &str)> {
+        match self.target() {
+            TriggerTarget::Extension {
+                extension_id,
+                handler_id,
+                version,
+                manifest_sha256,
+            } => Some((extension_id, handler_id, version, manifest_sha256)),
             _ => None,
         }
     }
@@ -189,6 +208,21 @@ impl TriggerConfig {
                     return Err("workflow trigger version must be positive".to_string());
                 }
                 self.validate_workflow_binding(binding)?;
+            }
+            TriggerTarget::Extension {
+                extension_id,
+                handler_id,
+                version,
+                manifest_sha256,
+            } => {
+                validate_workflow_id(extension_id)?;
+                validate_workflow_id(handler_id)?;
+                little_monkey_lib::package_ecosystem::SemanticVersion::parse(version)
+                    .map_err(|error| format!("Invalid extension trigger version: {error}"))?;
+                validate_sha256(manifest_sha256, "extension manifest digest")?;
+                if self.workflow_binding().is_some() {
+                    return Err("extension trigger cannot carry a workflow binding".to_string());
+                }
             }
         }
         match self {

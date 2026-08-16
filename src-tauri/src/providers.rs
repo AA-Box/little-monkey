@@ -100,6 +100,11 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub is_custom: bool,
     pub has_key: bool,
+    /// True for a provider a sandboxed executable extension contributes. Such
+    /// a provider has no base URL and no key of its own — it authenticates
+    /// through its own declared secret slots inside the sandbox — so the two
+    /// fields above are empty and `has_key` is meaningless for it.
+    pub is_extension: bool,
 }
 
 /// A user-added OpenAI-compatible endpoint (Groq, Mistral, self-hosted,
@@ -266,12 +271,94 @@ fn write_custom_providers(app: &AppHandle, entries: &[CustomProviderEntry]) -> R
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
+// ---------------------------------------------------------------------------
+// Executable-extension model providers
+// ---------------------------------------------------------------------------
+
+/// The prefix that marks a provider id as belonging to a sandboxed extension.
+///
+/// The owning extension is part of the id rather than a lookup beside it, so
+/// every place a provider selection is persisted — settings, a frozen run
+/// snapshot, a recipe — already records *whose* provider it was. Resolution
+/// then re-checks that the same installation still owns the capability, which
+/// is what stops a later install inheriting an uninstalled provider's name.
+pub const EXTENSION_PROVIDER_PREFIX: &str = "extension:";
+
+/// Split `extension:<extension-id>:<capability-id>` back into its two halves.
+///
+/// Returns `None` for every other id, so an ordinary preset or custom
+/// provider falls through untouched.
+pub fn extension_provider_target(provider_id: &str) -> Option<(String, String)> {
+    let rest = provider_id.strip_prefix(EXTENSION_PROVIDER_PREFIX)?;
+    let (extension_id, capability_id) = rest.split_once(':')?;
+    if extension_id.is_empty() || capability_id.is_empty() || capability_id.contains(':') {
+        return None;
+    }
+    Some((extension_id.to_string(), capability_id.to_string()))
+}
+
+/// Compose the provider id for one discovered capability, or `None` if either
+/// half contains the separator and would not round-trip.
+fn extension_provider_id(extension_id: &str, capability_id: &str) -> Option<String> {
+    if extension_id.contains(':') || capability_id.contains(':') {
+        return None;
+    }
+    Some(format!(
+        "{EXTENSION_PROVIDER_PREFIX}{extension_id}:{capability_id}"
+    ))
+}
+
+/// Every model provider a healthy, running, trusted extension currently
+/// contributes.
+///
+/// Discovery is a live read of the extension registry, never a persisted
+/// mirror of it: a provider whose extension is disabled, stopped, degraded or
+/// uninstalled simply stops being returned, which is what makes disable and
+/// uninstall take effect everywhere at once rather than in each list that
+/// happened to remember it.
+pub fn extension_model_providers() -> Vec<ProviderConfig> {
+    let Some(app_data) = crate::app_paths::data_dir() else {
+        return Vec::new();
+    };
+    let Ok(manager) = crate::executable_extensions::ExtensionManager::new(app_data) else {
+        return Vec::new();
+    };
+    manager
+        .active_capabilities(Some(
+            crate::executable_extensions::CapabilityKind::ModelProvider,
+        ))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|capability| {
+            Some(ProviderConfig {
+                id: extension_provider_id(&capability.extension_id, &capability.capability_id)?,
+                label: capability.display_name,
+                base_url: String::new(),
+                is_custom: false,
+                has_key: false,
+                is_extension: true,
+            })
+        })
+        .collect()
+}
+
 /// Pure preset-then-custom lookup, parameterized by an already-loaded
 /// `custom` list so it needs no `AppHandle` — reused by [`find_base_url`]
 /// (which loads `custom` from `providers.json` via the GUI's app data dir)
 /// and by the CLI (which loads the same file directly, having no WebView/
 /// AppHandle of its own to resolve that path through).
 pub fn resolve_base_url(id: &str, custom: &[CustomProviderEntry]) -> Result<String, String> {
+    if extension_provider_target(id).is_some() {
+        // Naming the reason matters: an extension provider reaches the network
+        // from inside the sandbox, through its own granted origins, so there
+        // is no endpoint here to hand out and "unknown provider" would send
+        // somebody looking for a configuration mistake that does not exist.
+        return Err(format!(
+            "'{id}' is an extension provider: it reaches the network from inside its sandbox, \
+             so it has no endpoint here and its credentials are set on the extension's own \
+             secret slots in Settings > Extensions"
+        ));
+    }
     if let Some(preset) = PROVIDER_PRESETS.iter().find(|p| p.id == id) {
         return Ok(preset.base_url.to_string());
     }
@@ -541,8 +628,9 @@ pub fn providers_list_presets() -> Vec<ProviderPreset> {
         .collect()
 }
 
-/// Every configured provider (built-in presets + custom), each annotated
-/// with a live `has_key` keychain probe.
+/// Every configured provider (built-in presets + custom + the ones healthy
+/// executable extensions contribute), each annotated with a live `has_key`
+/// keychain probe.
 #[tauri::command]
 pub fn providers_list_configured(app: AppHandle) -> Result<Vec<ProviderConfig>, String> {
     let custom = read_custom_providers(&app)?;
@@ -555,6 +643,7 @@ pub fn providers_list_configured(app: AppHandle) -> Result<Vec<ProviderConfig>, 
             base_url: p.base_url.to_string(),
             is_custom: false,
             has_key: has_key(p.id),
+            is_extension: false,
         })
         .collect();
 
@@ -565,8 +654,11 @@ pub fn providers_list_configured(app: AppHandle) -> Result<Vec<ProviderConfig>, 
             label: c.label,
             base_url: c.base_url,
             is_custom: true,
+            is_extension: false,
         });
     }
+
+    out.extend(extension_model_providers());
 
     Ok(out)
 }
@@ -606,6 +698,7 @@ pub fn providers_add_custom(
         base_url,
         is_custom: true,
         has_key: false,
+        is_extension: false,
     })
 }
 
@@ -662,9 +755,79 @@ pub async fn providers_list_models(
     app: AppHandle,
     id: String,
 ) -> Result<Vec<ProviderModelInfo>, String> {
+    if let Some((extension_id, capability_id)) = extension_provider_target(&id) {
+        let app_data = crate::app_paths::data_dir()
+            .ok_or_else(|| "Could not resolve the app-data directory".to_string())?;
+        return extension_models(&app_data, &extension_id, &capability_id).await;
+    }
     let base_url = find_base_url(&app, &id)?;
     let api_key = read_key(&id)?;
     fetch_models(&base_url, &id, &api_key).await
+}
+
+/// How many models one extension provider may advertise.
+const MAX_EXTENSION_MODELS: usize = 512;
+
+#[derive(Deserialize)]
+struct ExtensionModelList {
+    #[serde(default)]
+    models: Vec<ExtensionModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ExtensionModelEntry {
+    id: String,
+    #[serde(default)]
+    vision: Option<bool>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    tool_calling: Option<bool>,
+}
+
+/// Ask an extension model provider which models it offers.
+///
+/// This is the one query on a model-provider capability that is not a
+/// session: it has no streaming half and no state to carry, so making it a
+/// session would only add a table row to tear down. A guest distinguishes the
+/// two by shape — a session step always arrives with a `session` object, this
+/// arrives with `query: "models"` — which is the contract the SDK and the
+/// host documentation both spell out.
+pub(crate) async fn extension_models(
+    app_data: &std::path::Path,
+    extension_id: &str,
+    capability_id: &str,
+) -> Result<Vec<ProviderModelInfo>, String> {
+    let result = crate::executable_extensions::ExtensionManager::new(app_data)?
+        .invoke_owned_active_capability(
+            crate::executable_extensions::CapabilityKind::ModelProvider,
+            extension_id,
+            capability_id,
+            json!({ "query": "models" }).to_string(),
+            None,
+            Vec::new(),
+        )
+        .await?;
+    let parsed: ExtensionModelList = serde_json::from_str(&result.output_json)
+        .map_err(|error| format!("{extension_id} returned an unusable model list: {error}"))?;
+    if parsed.models.len() > MAX_EXTENSION_MODELS {
+        return Err(format!(
+            "{extension_id} advertised more than {MAX_EXTENSION_MODELS} models"
+        ));
+    }
+    parsed
+        .models
+        .into_iter()
+        .map(|model| {
+            crate::executable_extensions::validate_extension_identifier("model id", &model.id)?;
+            Ok(ProviderModelInfo {
+                id: model.id,
+                vision: model.vision,
+                context_length: model.context_length,
+                tool_calling: model.tool_calling,
+            })
+        })
+        .collect()
 }
 
 /// Model Retirement and Compatibility Warnings (ROADMAP.md Phase 8, item 14):
@@ -752,6 +915,46 @@ pub async fn providers_stream_chat(
         if !VALID_EFFORT_LEVELS.contains(&e.as_str()) {
             return Err(format!("Unknown effort level '{e}'"));
         }
+    }
+
+    if let Some((extension_id, capability_id)) = extension_provider_target(&provider_id) {
+        let cancel = Arc::new(Notify::new());
+        state
+            .stream_cancels
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), cancel.clone());
+        let scope = match run_id.as_deref() {
+            Some(run_id) => RunScope::run(run_id),
+            None => RunScope::Unattributed(Unattributed::UserAction),
+        };
+        let result = crate::run_commands::scoped_with_egress(
+            &app,
+            state.inner(),
+            scope,
+            run_extension_chat(
+                &app,
+                &crate::app_paths::data_dir()
+                    .ok_or_else(|| "Could not resolve the app-data directory".to_string())?,
+                &request_id,
+                &extension_id,
+                &capability_id,
+                &model,
+                messages,
+                tools,
+                effort,
+                cancel,
+            ),
+        )
+        .await;
+        state.stream_cancels.lock().unwrap().remove(&request_id);
+        if let Err(ref message) = result {
+            let _ = app.emit(
+                "provider://chat-error",
+                json!({ "request_id": request_id, "message": message }),
+            );
+        }
+        return result;
     }
 
     let frozen_endpoint = match run_id.as_deref() {
@@ -893,6 +1096,208 @@ pub fn build_chat_request(
         .bearer_auth(api_key)
         .json(&body);
     add_anthropic_headers(request, provider_id, api_key)
+}
+
+/// How many steps one extension completion may take.
+///
+/// Every step is a bounded sandboxed invocation with its own fuel and wall
+/// clock, so this is not what stops a runaway guest — it is what stops a
+/// well-behaved-looking one from emitting a single token per step forever.
+const MAX_EXTENSION_CHAT_STEPS: u32 = 4_096;
+
+/// One normalized event a model-provider extension emits during a step.
+///
+/// This is the whole model vocabulary an extension speaks. It is deliberately
+/// not "whatever JSON the upstream provider returned": the extension does the
+/// provider-specific parsing inside the sandbox and hands back these shapes,
+/// and the host renders them into the wire format the existing stream reader
+/// already parses. No provider-specific JSON crosses into the frontend.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExtensionChatEvent {
+    /// More assistant text.
+    TextDelta { text: String },
+    /// A tool call, whole or in fragments. `index` groups fragments of the
+    /// same call exactly as the OpenAI stream shape does.
+    ToolCall {
+        #[serde(default)]
+        index: u32,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        arguments: Option<String>,
+    },
+    /// Token accounting, when the provider reports it.
+    Usage {
+        #[serde(default)]
+        prompt_tokens: u64,
+        #[serde(default)]
+        completion_tokens: u64,
+        #[serde(default)]
+        total_tokens: Option<u64>,
+    },
+    /// The generation stopped for a named reason (`stop`, `tool_calls`,
+    /// `length`, …). Flushes any accumulated tool call downstream.
+    Finish { reason: String },
+    /// The provider itself failed. Distinct from a guest trap: the extension
+    /// is working correctly and is reporting that the upstream is not.
+    Error { message: String },
+}
+
+/// Run one completion against an extension model provider.
+///
+/// The session is the streaming boundary: the host opens it with the request,
+/// pulls until the guest says it is done, and turns each normalized event into
+/// the one SSE frame shape this app's stream reader parses. Cancellation stops
+/// pulling and closes the session, which cancels the step still inside the
+/// sandbox.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_extension_chat(
+    app: &AppHandle,
+    app_data: &std::path::Path,
+    request_id: &str,
+    extension_id: &str,
+    capability_id: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    tools: Vec<serde_json::Value>,
+    effort: Option<String>,
+    cancel: Arc<Notify>,
+) -> Result<(), String> {
+    let manager = crate::executable_extensions::ExtensionManager::new(app_data)?;
+    let open_input = json!({
+        "model": model,
+        "messages": messages,
+        "tools": tools,
+        "effort": effort,
+    });
+    let emit_chunk = |payload: serde_json::Value| {
+        let _ = app.emit(
+            "provider://chat-chunk",
+            json!({ "request_id": request_id, "chunk": format!("data: {payload}\n\n") }),
+        );
+    };
+    let mut step = tokio::select! {
+        _ = cancel.notified() => {
+            let _ = app.emit(
+                "provider://chat-done",
+                json!({ "request_id": request_id, "cancelled": true }),
+            );
+            return Ok(());
+        }
+        opened = manager.open_session(
+            crate::executable_extensions::CapabilityKind::ModelProvider,
+            extension_id,
+            capability_id,
+            open_input,
+        ) => opened?,
+    };
+    let session_id = step.session_id.clone();
+    let mut steps = 0u32;
+    loop {
+        for event in &step.events {
+            // The session envelope carries `kind` beside `payload`; the event
+            // enum is tagged, so the two are flattened back into one object
+            // before it is read. A payload key named `kind` never wins.
+            let mut tagged = match &event.payload {
+                serde_json::Value::Object(payload) => payload.clone(),
+                serde_json::Value::Null => serde_json::Map::new(),
+                _ => {
+                    let _ = crate::executable_extensions::close_session(&session_id);
+                    return Err("The model extension emitted a non-object event".to_string());
+                }
+            };
+            tagged.insert("kind".to_string(), json!(event.kind));
+            let parsed: ExtensionChatEvent =
+                serde_json::from_value(serde_json::Value::Object(tagged)).map_err(|error| {
+                    let _ = crate::executable_extensions::close_session(&session_id);
+                    format!("The model extension emitted an unusable event: {error}")
+                })?;
+            match parsed {
+                ExtensionChatEvent::TextDelta { text } => {
+                    if !text.is_empty() {
+                        emit_chunk(json!({
+                            "choices": [{ "delta": { "content": text } }],
+                        }));
+                    }
+                }
+                ExtensionChatEvent::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let mut function = serde_json::Map::new();
+                    if let Some(name) = name {
+                        function.insert("name".to_string(), json!(name));
+                    }
+                    if let Some(arguments) = arguments {
+                        function.insert("arguments".to_string(), json!(arguments));
+                    }
+                    let mut fragment = serde_json::Map::new();
+                    fragment.insert("index".to_string(), json!(index));
+                    if let Some(id) = id {
+                        fragment.insert("id".to_string(), json!(id));
+                    }
+                    fragment.insert("function".to_string(), serde_json::Value::Object(function));
+                    emit_chunk(json!({
+                        "choices": [{
+                            "delta": { "tool_calls": [serde_json::Value::Object(fragment)] },
+                        }],
+                    }));
+                }
+                ExtensionChatEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => {
+                    emit_chunk(json!({
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens
+                                .unwrap_or(prompt_tokens.saturating_add(completion_tokens)),
+                        },
+                    }));
+                }
+                ExtensionChatEvent::Finish { reason } => {
+                    emit_chunk(json!({
+                        "choices": [{ "delta": {}, "finish_reason": reason }],
+                    }));
+                }
+                ExtensionChatEvent::Error { message } => {
+                    let _ = crate::executable_extensions::close_session(&session_id);
+                    return Err(format!("{extension_id} reported: {message}"));
+                }
+            }
+        }
+        if step.done {
+            break;
+        }
+        steps = steps.saturating_add(1);
+        if steps >= MAX_EXTENSION_CHAT_STEPS {
+            let _ = crate::executable_extensions::close_session(&session_id);
+            return Err(format!(
+                "{extension_id} did not finish within {MAX_EXTENSION_CHAT_STEPS} steps"
+            ));
+        }
+        step = tokio::select! {
+            _ = cancel.notified() => {
+                let _ = crate::executable_extensions::close_session(&session_id);
+                let _ = app.emit(
+                    "provider://chat-done",
+                    json!({ "request_id": request_id, "cancelled": true }),
+                );
+                return Ok(());
+            }
+            next = manager.session_send(&session_id, json!({ "kind": "pull" })) => next?,
+        };
+    }
+    let _ = crate::executable_extensions::close_session(&session_id);
+    let _ = app.emit("provider://chat-done", json!({ "request_id": request_id }));
+    Ok(())
 }
 
 async fn run_stream_chat(

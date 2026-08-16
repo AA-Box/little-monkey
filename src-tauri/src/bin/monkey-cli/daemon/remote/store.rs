@@ -1721,8 +1721,10 @@ impl RemoteStore {
         } else {
             DeviceCommandState::Succeeded
         };
-        self.complete_device_command(device_id, command_id, outcome, None, None, error, None, now_ms)
-            .map(|_| ())
+        self.complete_device_command(
+            device_id, command_id, outcome, None, None, error, None, now_ms,
+        )
+        .map(|_| ())
     }
 
     /// Advances every command whose deadline has passed.

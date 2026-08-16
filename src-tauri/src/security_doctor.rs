@@ -28,6 +28,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use walkdir::WalkDir;
 
+use crate::executable_extensions::{
+    extension_security_snapshots, CapabilityKind, ExtensionSecuritySnapshot, HealthState,
+    PermissionKind, PermissionRisk, TrustState,
+};
 use crate::sandbox::SandboxEnforcement;
 
 pub const SECURITY_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -229,6 +233,7 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_loopback_services(app_data, &mut findings);
     audit_remote_host(app_data, request.deep, request.fix, &mut findings);
     audit_mcp_origins(app_data, request.fix, &mut findings);
+    audit_executable_extensions(app_data, &mut findings);
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
     audit_paired_devices(&request.runtime, &mut findings);
@@ -245,6 +250,319 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
         summary,
         findings,
     })
+}
+
+fn audit_executable_extensions(app_data: &Path, findings: &mut Vec<SecurityFinding>) {
+    match extension_security_snapshots(app_data) {
+        Ok(snapshots) => {
+            audit_extension_snapshots(&snapshots, findings);
+            audit_extension_provider_selections(app_data, &snapshots, findings);
+        }
+        Err(error) => findings.push(finding(
+            "extensions.store_invalid",
+            "extensions",
+            "Executable extension state failed closed",
+            &error,
+            FindingStatus::Critical,
+            false,
+            None,
+            Some("Keep executable extensions disabled and repair or remove the corrupt app-owned extension registry."),
+        )),
+    }
+}
+
+/// Persisted provider selections that no longer resolve to an owner.
+///
+/// Every native subsystem that can be pointed at an extension records *which
+/// installation* it chose, and re-checks that ownership on every use — so a
+/// stale selection is safe: it fails closed. Safe is not the same as
+/// harmless, though. A transcription backend that silently stopped
+/// transcribing, or a knowledge stack that will not re-embed, reads to an
+/// operator as a broken feature rather than as an uninstalled extension, and
+/// this is the one place that says which it is.
+fn audit_extension_provider_selections(
+    app_data: &Path,
+    snapshots: &[ExtensionSecuritySnapshot],
+    findings: &mut Vec<SecurityFinding>,
+) {
+    let owned: std::collections::BTreeSet<(CapabilityKind, String)> = snapshots
+        .iter()
+        // Only a healthy extension actually serves a provider registry, so an
+        // unhealthy owner is an orphaned selection too.
+        .filter(|snapshot| snapshot.health.state == HealthState::Healthy)
+        .flat_map(|snapshot| snapshot.capabilities.iter().cloned())
+        .collect();
+
+    let mut orphaned: Vec<String> = Vec::new();
+    let mut check = |kind: CapabilityKind, selection: Option<(String, String)>, label: &str| {
+        if let Some((extension_id, capability_id)) = selection {
+            if !owned.contains(&(kind, capability_id.clone())) {
+                orphaned.push(format!("{label} → {extension_id}:{capability_id}"));
+            }
+        }
+    };
+
+    let voice = crate::m7_companion::persisted_voice_selections(app_data);
+    check(CapabilityKind::Stt, voice.transcription, "Transcription");
+    check(CapabilityKind::Tts, voice.speech, "Speech synthesis");
+    check(
+        CapabilityKind::RealtimeVoice,
+        voice.realtime,
+        "Realtime voice",
+    );
+    let web = crate::web::persisted_extension_selections(app_data);
+    check(CapabilityKind::WebSearch, web.search, "Web search");
+    check(CapabilityKind::WebFetch, web.fetch, "Web fetch");
+    for (label, selection) in crate::knowledge_core::persisted_embedding_selections(app_data) {
+        check(CapabilityKind::EmbeddingProvider, Some(selection), &label);
+    }
+
+    if orphaned.is_empty() {
+        return;
+    }
+    findings.push(finding(
+        "extensions.provider_orphaned",
+        "extensions",
+        "A feature is pointed at an extension that no longer owns its capability",
+        &format!(
+            "These selections resolve to nothing healthy and therefore do nothing: {}.",
+            orphaned.join("; ")
+        ),
+        FindingStatus::Warning,
+        false,
+        None,
+        Some("Reinstall or re-enable the owning extension, or choose a different provider in that feature's settings."),
+    ));
+}
+
+fn audit_extension_snapshots(
+    snapshots: &[ExtensionSecuritySnapshot],
+    findings: &mut Vec<SecurityFinding>,
+) {
+    if snapshots.is_empty() {
+        findings.push(finding(
+            "extensions.none",
+            "extensions",
+            "No executable extensions are installed",
+            "The Wasm extension runtime has no installed third-party components.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    for snapshot in snapshots {
+        let suffix = short_hash(snapshot.extension_id.as_bytes());
+        match snapshot.trust {
+            TrustState::Verified => findings.push(finding(
+                &format!("extensions.trust.{suffix}"),
+                "extensions",
+                "Extension signature is verified",
+                &format!(
+                    "{} {} was verified against an authorized publisher key.",
+                    snapshot.extension_id, snapshot.version
+                ),
+                FindingStatus::Pass,
+                false,
+                None,
+                None,
+            )),
+            TrustState::Unsigned => findings.push(finding(
+                &format!("extensions.unsigned.{suffix}"),
+                "extensions",
+                "Unsigned executable extension is installed",
+                &format!(
+                    "{} {} is unsigned: {}",
+                    snapshot.extension_id, snapshot.version, snapshot.trust_reason
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Install a publisher-signed build from a trusted source, or disable and uninstall this extension."),
+            )),
+            TrustState::Untrusted | TrustState::Invalid => findings.push(finding(
+                &format!("extensions.untrusted.{suffix}"),
+                "extensions",
+                "Executable extension is not trusted",
+                &format!(
+                    "{} {}: {}",
+                    snapshot.extension_id, snapshot.version, snapshot.trust_reason
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Disable the extension and verify its publisher, provenance, signature, and checksums before use."),
+            )),
+        }
+
+        if !snapshot.compatible {
+            findings.push(finding(
+                &format!("extensions.incompatible.{suffix}"),
+                "extensions",
+                "Installed extension is incompatible",
+                snapshot
+                    .compatibility_reason
+                    .as_deref()
+                    .unwrap_or("The host compatibility contract does not match."),
+                if snapshot.health.enabled {
+                    FindingStatus::Critical
+                } else {
+                    FindingStatus::Warning
+                },
+                false,
+                None,
+                Some("Keep the extension disabled and install a host-compatible version."),
+            ));
+        }
+
+        let elevated = snapshot
+            .permissions
+            .iter()
+            .filter(|permission| {
+                permission.granted
+                    && matches!(
+                        permission.risk,
+                        PermissionRisk::High | PermissionRisk::Critical
+                    )
+            })
+            .count();
+        if elevated > 0 {
+            findings.push(finding(
+                &format!("extensions.elevated_grants.{suffix}"),
+                "extensions",
+                "Extension has elevated resource grants",
+                &format!(
+                    "{} has {elevated} exact high/critical-risk grant(s). Review each origin, workspace handle, secret slot, and device capability in Settings.",
+                    snapshot.extension_id
+                ),
+                if snapshot.health.enabled {
+                    FindingStatus::Warning
+                } else {
+                    FindingStatus::Info
+                },
+                false,
+                None,
+                Some("Remove grants that are no longer required; permission-expanding updates require a new exact approval."),
+            ));
+        }
+
+        let insecure_origins = snapshot
+            .permissions
+            .iter()
+            .filter(|permission| {
+                permission.granted
+                    && permission.kind == PermissionKind::NetworkOrigin
+                    && Url::parse(&permission.scope).is_ok_and(|url| url.scheme() == "http")
+            })
+            .count();
+        if insecure_origins > 0 {
+            findings.push(finding(
+                &format!("extensions.plaintext_origins.{suffix}"),
+                "extensions",
+                "Extension can use plaintext HTTP origins",
+                &format!(
+                    "{} has {insecure_origins} exact plaintext origin grant(s).",
+                    snapshot.extension_id
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Prefer exact HTTPS origins and remove plaintext grants."),
+            ));
+        }
+
+        let has_network = snapshot.permissions.iter().any(|permission| {
+            permission.granted && permission.kind == PermissionKind::NetworkOrigin
+        });
+        let has_secret = snapshot.configured_secret_slots > 0
+            && snapshot.permissions.iter().any(|permission| {
+                permission.granted && permission.kind == PermissionKind::SecretUse
+            });
+        if has_network && has_secret {
+            findings.push(finding(
+                &format!("extensions.secret_network.{suffix}"),
+                "extensions",
+                "Extension combines secret-backed authentication with network access",
+                &format!(
+                    "{} has configured secret slots and exact network origins. Secret bytes remain host-owned, but this combined authority deserves review.",
+                    snapshot.extension_id
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Confirm every origin and secret slot is required and remove stale credentials."),
+            ));
+        }
+
+        if snapshot.health.undeclared_attempts > 0 {
+            findings.push(finding(
+                &format!("extensions.undeclared.{suffix}"),
+                "extensions",
+                "Extension attempted undeclared resource access",
+                &format!(
+                    "{} recorded {} denied undeclared attempt(s).",
+                    snapshot.extension_id, snapshot.health.undeclared_attempts
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Disable the extension and inspect its bounded runtime logs before trusting it again."),
+            ));
+        }
+
+        if !snapshot.component_intact {
+            findings.push(finding(
+                &format!("extensions.component_missing.{suffix}"),
+                "extensions",
+                "Installed extension component is missing or modified",
+                &format!(
+                    "{} {} is registered, but its component file is absent or no longer matches the digest its manifest promised.",
+                    snapshot.extension_id, snapshot.version
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Nothing will run from this version — every invocation re-verifies the digest. Reinstall the extension from a verified bundle, or uninstall it."),
+            ));
+        }
+
+        match snapshot.health.state {
+            HealthState::ProtectiveDisabled | HealthState::Unhealthy => findings.push(finding(
+                &format!("extensions.health.{suffix}"),
+                "extensions",
+                "Extension runtime is unhealthy",
+                &format!(
+                    "{} is {:?} after {} consecutive failure(s) and {} trap(s).",
+                    snapshot.extension_id,
+                    snapshot.health.state,
+                    snapshot.health.consecutive_failures,
+                    snapshot.health.trap_count
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Keep it stopped; validate or roll back to a previously verified cached version before re-enabling."),
+            )),
+            HealthState::Degraded => findings.push(finding(
+                &format!("extensions.health.{suffix}"),
+                "extensions",
+                "Extension runtime is degraded",
+                &format!(
+                    "{} has {} consecutive failure(s) and {} trap(s).",
+                    snapshot.extension_id,
+                    snapshot.health.consecutive_failures,
+                    snapshot.health.trap_count
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Review the bounded logs and stop or roll back the extension if failures continue."),
+            )),
+            _ => {}
+        }
+    }
 }
 
 fn audit_owned_permissions(
@@ -1907,6 +2225,79 @@ mod tests {
         assert_eq!(in_flight.status, FindingStatus::Critical);
         assert!(in_flight.detail.contains("voice_stream"));
         assert!(has(&findings, "devices.intimate_grant"));
+    }
+
+    #[test]
+    fn the_doctor_reports_extension_trust_authority_and_protective_disable() {
+        let mut findings = Vec::new();
+        audit_extension_snapshots(
+            &[ExtensionSecuritySnapshot {
+                extension_id: "dev.example.risky".into(),
+                version: "1.0.0".into(),
+                trust: TrustState::Unsigned,
+                trust_reason: "local unsigned bundle".into(),
+                compatible: true,
+                compatibility_reason: None,
+                permissions: vec![
+                    crate::executable_extensions::PermissionView {
+                        permission_id: "network".into(),
+                        kind: PermissionKind::NetworkOrigin,
+                        scope: "http://example.com".into(),
+                        reason: "fixture".into(),
+                        risk: PermissionRisk::High,
+                        granted: true,
+                        binding_label: None,
+                    },
+                    crate::executable_extensions::PermissionView {
+                        permission_id: "api_token".into(),
+                        kind: PermissionKind::SecretUse,
+                        scope: "api_token".into(),
+                        reason: "fixture".into(),
+                        risk: PermissionRisk::High,
+                        granted: true,
+                        binding_label: None,
+                    },
+                ],
+                configured_secret_slots: 1,
+                health: crate::executable_extensions::RuntimeHealth {
+                    state: HealthState::ProtectiveDisabled,
+                    validated: true,
+                    enabled: false,
+                    running: false,
+                    consecutive_failures: 3,
+                    trap_count: 3,
+                    undeclared_attempts: 1,
+                    last_error: Some("guest trapped".into()),
+                    last_invocation_at_ms: Some(now_ms()),
+                },
+                component_intact: false,
+                capabilities: vec![(CapabilityKind::Tool, "risky".into())],
+            }],
+            &mut findings,
+        );
+
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        for prefix in [
+            "extensions.unsigned.",
+            "extensions.elevated_grants.",
+            "extensions.plaintext_origins.",
+            "extensions.secret_network.",
+            "extensions.undeclared.",
+            "extensions.component_missing.",
+            "extensions.health.",
+        ] {
+            assert!(
+                ids.iter().any(|id| id.starts_with(prefix)),
+                "missing {prefix}"
+            );
+        }
+        assert!(findings.iter().any(|finding| {
+            finding.id.starts_with("extensions.health.")
+                && finding.status == FindingStatus::Critical
+        }));
     }
 
     /// The four things an operator most needs told about a phone they granted

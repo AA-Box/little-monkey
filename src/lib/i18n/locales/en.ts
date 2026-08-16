@@ -4,6 +4,7 @@ import { searchLocale } from "./search";
 import { translationLocale } from "./translation";
 import { portabilityLocale } from "./portability";
 import { ecosystemLocale } from "./ecosystem";
+import { executableExtensionsLocale } from "./executableExtensions";
 import { developerLocale } from "./developer";
 import { issueToPrLocale } from "./issueToPr";
 import { triageLocale } from "./triage";
@@ -54,6 +55,7 @@ export const en: Record<string, string> = {
   ...translationLocale,
   ...portabilityLocale,
   ...ecosystemLocale,
+  ...executableExtensionsLocale,
   ...developerLocale,
   ...issueToPrLocale,
   ...triageLocale,
@@ -1110,7 +1112,15 @@ export const en: Record<string, string> = {
     "Applies to work started from now on. Long by design: work waiting on a permission prompt is still counted as running.",
   "AutomationPanel.processWallBudgetHoursUnit": "hours",
   "ProviderCard.connected": "Connected",
+  "KnowledgePanel.backendExtension": "Extension",
+  "KnowledgePanel.selectEmbeddingExtension": "Select an embedding capability",
+  "KnowledgePanel.selectEmbeddingExtensionError": "Choose a healthy embedding extension first.",
+  "KnowledgePanel.embeddingDimension": "Vector dimension",
+  "KnowledgePanel.embeddingDimensionError": "Vector dimension must be between 1 and 65536.",
   "ProviderCard.custom": "Custom",
+  "ProviderCard.extension": "Extension",
+  "ProviderCard.extensionEndpoint": "Reached from inside the extension's sandbox",
+  "ProviderCard.extensionCredentials": "Credentials live on this extension's secret slots, under Settings > Extensions.",
   "ProviderCard.remove": "Remove",
   "ProviderCard.apiKeyPlaceholder": "API key",
   "ProviderCard.saving": "Saving…",

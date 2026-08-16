@@ -1618,6 +1618,7 @@ mod tests {
                 dim: 768,
                 query_prefix: String::new(),
                 doc_prefix: String::new(),
+                extension_id: None,
             },
             chunk_chars: 1_600,
             chunk_overlap: 200,

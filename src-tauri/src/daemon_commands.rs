@@ -266,6 +266,10 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
         .args(&args)
         .output()
         .map_err(|error| format!("Failed to start bundled monkey-cli: {error}"))?;
+    finish_cli_output(output)
+}
+
+fn finish_cli_output(output: std::process::Output) -> Result<String, String> {
     if output.stdout.len() > MAX_CLI_OUTPUT_BYTES || output.stderr.len() > MAX_CLI_OUTPUT_BYTES {
         return Err("Daemon command output exceeded 4 MiB".to_string());
     }
@@ -278,6 +282,15 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
         });
     }
     String::from_utf8(output.stdout).map_err(|_| "Daemon output is not valid UTF-8".to_string())
+}
+
+fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, String> {
+    let output = Command::new(cli_path())
+        .args(&args)
+        .env("LM_EXTENSION_WEBHOOK_SECRET", secret)
+        .output()
+        .map_err(|error| format!("Failed to start bundled monkey-cli: {error}"))?;
+    finish_cli_output(output)
 }
 
 pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
@@ -1549,6 +1562,218 @@ pub async fn tool_device_action(
         ]);
     }
     parse_json(&command(args).await?)
+}
+
+/// Fixed, pre-authorized device bridge for the Wasm permission broker. The
+/// extension host has already intersected the exact manifest grant with the
+/// invocation's artifact set; this function retains the daemon's authoritative
+/// paired-device capability intersection and argument normalization.
+pub(crate) async fn extension_device_action(
+    device_id: &str,
+    action: &str,
+    request: &Value,
+    invocation_id: &str,
+) -> Result<Value, String> {
+    validate_id("device id", device_id)?;
+    validate_id("extension invocation id", invocation_id)?;
+    if !matches!(
+        action,
+        "device_info"
+            | "camera_capture"
+            | "microphone_capture"
+            | "location_read"
+            | "notification_post"
+            | "screen_capture"
+            | "audio_playback"
+    ) {
+        return Err("Unsupported device capability".to_string());
+    }
+    let object = request
+        .as_object()
+        .ok_or_else(|| "Device request must be a JSON object".to_string())?;
+    let allowed = [
+        "position",
+        "duration_ms",
+        "accuracy",
+        "title",
+        "body",
+        "text",
+        "artifact_id",
+        "wait_ms",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("Unknown device request field '{field}'"));
+    }
+
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-action".into(),
+        action.into(),
+        "--device-id".into(),
+        device_id.into(),
+        "--run-id".into(),
+        invocation_id.into(),
+        "--json".into(),
+    ];
+    for (field, flag, max) in [
+        ("position", "--position", 16usize),
+        ("accuracy", "--accuracy", 16usize),
+        ("title", "--title", 128usize),
+        ("body", "--body", 512usize),
+        ("text", "--text", 4_096usize),
+    ] {
+        if let Some(value) = object.get(field).and_then(Value::as_str) {
+            validate_token(field, value, max)?;
+            args.extend([flag.into(), value.into()]);
+        }
+    }
+    if let Some(value) = object.get("artifact_id").and_then(Value::as_str) {
+        validate_id("artifact id", value)?;
+        args.extend(["--artifact-id".into(), value.into()]);
+    }
+    if let Some(value) = object.get("duration_ms").and_then(Value::as_u64) {
+        if value == 0 || value > 300_000 {
+            return Err("Device duration_ms is out of range".to_string());
+        }
+        args.extend(["--duration-ms".into(), value.to_string()]);
+    }
+    let wait_ms = object
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(10_000);
+    if !(1_000..=20_000).contains(&wait_ms) {
+        return Err("Device wait_ms must be 1000..=20000".to_string());
+    }
+    args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    parse_json(&command(args).await?)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct ExtensionWebhookStatus {
+    pub trigger_id: String,
+    pub handler_id: String,
+    pub version: String,
+    pub enabled: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn extension_webhook_register(
+    trigger_id: &str,
+    extension_id: &str,
+    handler_id: &str,
+    version: &str,
+    manifest_sha256: &str,
+    secret: String,
+    max_skew_ms: u64,
+) -> Result<(), String> {
+    validate_id("trigger id", trigger_id)?;
+    validate_id("extension id", extension_id)?;
+    validate_id("handler id", handler_id)?;
+    validate_id("extension version", version)?;
+    validate_id("extension manifest digest", manifest_sha256)?;
+    if secret.is_empty() || secret.len() > 64 * 1024 {
+        return Err("Webhook secret must contain 1-65536 bytes".to_string());
+    }
+    if !(1_000..=60 * 60 * 1_000).contains(&max_skew_ms) {
+        return Err("Webhook signature skew must be 1000..=3600000 ms".to_string());
+    }
+    let args = vec![
+        "daemon".into(),
+        "trigger".into(),
+        "add-webhook".into(),
+        trigger_id.into(),
+        "--extension-id".into(),
+        extension_id.into(),
+        "--extension-handler-id".into(),
+        handler_id.into(),
+        "--extension-version".into(),
+        version.into(),
+        "--extension-manifest-sha256".into(),
+        manifest_sha256.into(),
+        "--secret-env".into(),
+        "LM_EXTENSION_WEBHOOK_SECRET".into(),
+        "--max-skew-ms".into(),
+        max_skew_ms.to_string(),
+    ];
+    tokio::task::spawn_blocking(move || run_cli_with_secret(args, secret))
+        .await
+        .map_err(|error| error.to_string())??;
+    Ok(())
+}
+
+pub(crate) async fn extension_webhook_remove(
+    trigger_id: &str,
+    extension_id: &str,
+) -> Result<(), String> {
+    validate_id("trigger id", trigger_id)?;
+    validate_id("extension id", extension_id)?;
+    command(vec![
+        "daemon".into(),
+        "trigger".into(),
+        "remove".into(),
+        trigger_id.into(),
+        "--extension-id".into(),
+        extension_id.into(),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn extension_webhooks(
+    extension_id: &str,
+) -> Result<Vec<ExtensionWebhookStatus>, String> {
+    validate_id("extension id", extension_id)?;
+    let value = parse_json(
+        &command(vec![
+            "daemon".into(),
+            "trigger".into(),
+            "list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "Daemon trigger list is not an array".to_string())?;
+    let mut result = Vec::new();
+    for row in rows {
+        let Some(config) = row.get("config") else {
+            continue;
+        };
+        let Some(target) = config.get("target") else {
+            continue;
+        };
+        if target.get("target_kind").and_then(Value::as_str) != Some("extension")
+            || target.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+        {
+            continue;
+        }
+        let trigger_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger id is missing".to_string())?;
+        let handler_id = target
+            .get("handler_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger handler is missing".to_string())?;
+        let version = target
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger version is missing".to_string())?;
+        result.push(ExtensionWebhookStatus {
+            trigger_id: trigger_id.to_string(),
+            handler_id: handler_id.to_string(),
+            version: version.to_string(),
+            enabled: row.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        });
+    }
+    result.sort_by(|left, right| left.trigger_id.cmp(&right.trigger_id));
+    Ok(result)
 }
 
 #[tauri::command]

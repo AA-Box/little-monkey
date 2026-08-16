@@ -56,7 +56,7 @@ function provider(overrides: Partial<ProviderConfig> = {}): ProviderConfig {
     label: "Anthropic",
     base_url: "https://api.anthropic.com",
     is_custom: false,
-    has_key: true,
+    has_key: true, is_extension: false,
     ...overrides,
   };
 }
@@ -136,7 +136,7 @@ describe("buildModelTargetInventory", () => {
       provider(),
       provider({ id: "openai", label: "OpenAI" }),
       provider({ id: "custom-x", label: "Custom X", is_custom: true }),
-      provider({ id: "disconnected", label: "Disconnected", has_key: false }),
+      provider({ id: "disconnected", label: "Disconnected", has_key: false, is_extension: false }),
     ];
     const inventory = buildModelTargetInventory(
       inventoryInput({

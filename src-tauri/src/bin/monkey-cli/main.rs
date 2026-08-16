@@ -24,6 +24,7 @@ mod contract_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod extensions_cli;
 mod ingress_cli;
 mod launcher;
 mod managed_model_cli;
@@ -466,6 +467,9 @@ enum Cmd {
     /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.
     #[command(subcommand)]
     Plugins(plugins_cli::PluginsCmd),
+    /// Manage sandboxed WebAssembly Component Model extensions.
+    #[command(subcommand)]
+    Extensions(extensions_cli::ExtensionsCmd),
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
@@ -1553,6 +1557,14 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());
             match data_dir {
                 Ok(data_dir) => plugins_cli::run(action, &data_dir),
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Extensions(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => extensions_cli::run(action, &data_dir).await,
                 Err(error) => Err(error),
             }
         }
