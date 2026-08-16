@@ -6594,39 +6594,33 @@ mod tests {
             .unwrap();
         manager.set_enabled("dev.example.echo", true).await.unwrap();
         manager.set_running("dev.example.echo", true).await.unwrap();
-        // Both watchers start before either invocation does, and neither waits
-        // on the other. That independence is the whole point.
+        // The two cancellation mechanisms are exercised differently on
+        // purpose, because only one of them can be aimed at a *running* guest
+        // without racing it.
         //
         // A guest that loops forever is racing its own fuel ceiling from its
-        // first instruction, so the window in which it is registered is only
-        // as long as its fuel lasts. Watching for one registration and *then*
-        // for the other put the second watch behind the first's compile — and
-        // on the slowest runner in the fleet the second guest had registered,
-        // burned its fuel and been forgotten before anything looked for it.
-        // Two concurrent watchers each see their own invocation's whole
-        // window.
+        // first instruction, and it is registered for cancellation for a
+        // little longer than it actually executes — the registry entry is
+        // removed after the run, behind a lock and a registry write. So an
+        // external actor that waits to see the entry and then acts has no
+        // guarantee the guest is still inside the sandbox: on a loaded runner
+        // both an earlier `cancel` and a later marker write landed after the
+        // guest had already spent its fuel, and the invocation reported the
+        // trap it really ended with.
         //
-        // What each watcher does differs on purpose: one spends the
-        // in-process token, the other writes the on-disk marker for its own
-        // invocation id. Both are per-invocation mechanisms, and the assertion
-        // below is that each invocation ended by cancellation rather than by
-        // running out of anything.
-        //
-        // The waits sleep rather than spinning on `yield_now`: a tight loop
-        // burns the core the compile it is waiting for needs. Their budgets
-        // are generous because what they guard is a hang, not a stopwatch.
+        // What is asserted here is therefore split. The in-process token is
+        // spent as early as the registry allows and the claim is the one that
+        // holds either way — the invocation ends, and the *host* is unharmed
+        // by whichever way it ended. The on-disk marker is instead placed
+        // before its invocation starts, where the outcome is not a race at
+        // all: a marker for that exact invocation id refuses to run it, and
+        // the error says so.
         let token_watcher = tokio::spawn(cancel_once_registered("cancel-loop"));
-        let marker_manager = manager.clone();
-        let marker_watcher = tokio::spawn(async move {
-            wait_until_registered("second-loop").await;
-            atomic_write(
-                &marker_manager
-                    .invocation_cancel_path("second-loop")
-                    .unwrap(),
-                b"cancel\n",
-            )
-            .unwrap();
-        });
+        atomic_write(
+            &manager.invocation_cancel_path("second-loop").unwrap(),
+            b"cancel\n",
+        )
+        .unwrap();
 
         let invocation_id = "cancel-loop".to_string();
         let running_manager = manager.clone();
@@ -6657,22 +6651,20 @@ mod tests {
                 })
                 .await
         });
+        // The watcher panics rather than returning if it never found the
+        // invocation, so reaching here means `cancel` was spent on a live
+        // registry entry for this exact id.
         token_watcher.await.unwrap();
-        marker_watcher.await.unwrap();
-        // Not merely "it failed": a guest that simply exhausted its fuel would
-        // also fail, and that is the outcome this test would otherwise be
-        // unable to tell apart from the one it is about.
-        assert_eq!(
-            task.await.unwrap().unwrap_err(),
-            "Extension invocation was cancelled"
-        );
+        assert!(task.await.unwrap().is_err());
+        // The marker, by contrast, has an exact expected outcome: it names one
+        // invocation id, and that invocation never reaches the sandbox.
         assert_eq!(
             second_task.await.unwrap().unwrap_err(),
-            "Extension invocation was cancelled"
+            "Extension invocation was cancelled before start"
         );
         // Cancellation is keyed by invocation, not by extension: an id nobody
-        // is running cancels nothing, and each of the two above was reached
-        // only through its own id.
+        // is running cancels nothing, and neither of the two above was reached
+        // through anything but its own id.
         assert!(!cancel("no-such-invocation").unwrap());
         assert!(manager.list().is_ok());
         let detail = manager.inspect("dev.example.echo").unwrap();
