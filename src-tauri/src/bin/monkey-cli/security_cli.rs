@@ -11,8 +11,9 @@ use little_monkey_lib::run_ledger::{
 };
 use little_monkey_lib::run_protocol::PermissionDecision;
 use little_monkey_lib::security_doctor::{
-    run_security_audit, DeviceCommandSnapshot, DeviceGrantSnapshot, FindingStatus,
-    NativeSkillSnapshot, PushPrivacySnapshot, SecurityAuditRequest, SecurityRuntimeSnapshot,
+    append_findings, run_security_audit, DaemonSecurityState, DeviceCommandSnapshot,
+    DeviceGrantSnapshot, FindingStatus, NativeSkillSnapshot, PushPrivacySnapshot,
+    SecurityAuditRequest, SecurityRuntimeSnapshot,
 };
 
 #[derive(Subcommand, Debug)]
@@ -29,6 +30,13 @@ pub enum SecurityCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Emit the half of the security audit only the daemon can see.
+    ///
+    /// Devices, messaging accounts, phone numbers and peers keep their state in
+    /// databases this binary owns. The desktop's Security Doctor reads this and
+    /// folds it into the same audit `security audit` runs, so a check added on
+    /// one side is never missing from the other.
+    DaemonState,
     /// Recompute a run's event hash chain and report whether it is intact.
     ///
     /// Detects an edited event, a deleted interior event, and a truncated tail.
@@ -173,20 +181,12 @@ fn unnamed_allowed_requests<'a>(
 /// in the library and the remote store's schema is owned by this binary. A
 /// second reader in the library would be a second copy of the schema, and the
 /// first migration would make the audit quietly wrong instead of loudly broken.
-fn collect_device_state(runtime: &mut SecurityRuntimeSnapshot) {
-    let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() else {
-        return;
-    };
-    collect_device_state_at(runtime, &paths);
-}
-
-/// The same reader against an explicit daemon root.
 ///
-/// Split out so a test can prove that opening a real Talk socket makes this
-/// production reader report a capture in flight. Asserting on a hand-built
-/// snapshot would prove only that the audit can format a struct — which is
-/// exactly how the documentation came to claim an observability the socket did
-/// not actually have.
+/// Takes an explicit daemon root so a test can prove that opening a real Talk
+/// socket makes this production reader report a capture in flight. Asserting on
+/// a hand-built snapshot would prove only that the audit can format a struct —
+/// which is exactly how the documentation came to claim an observability the
+/// socket did not actually have.
 pub(crate) fn collect_device_state_at(
     runtime: &mut SecurityRuntimeSnapshot,
     paths: &crate::daemon::store::DaemonPaths,
@@ -272,6 +272,40 @@ pub(crate) fn collect_device_state_at(
     runtime.device_state_observed = true;
 }
 
+/// The whole daemon-owned half of the audit, as one value.
+///
+/// The single place this half is produced. `monkey security audit` folds it
+/// into its own report and the desktop reads it over the typed bridge, so
+/// adding a daemon-owned check reaches both surfaces at once — before this
+/// existed the desktop panel silently ran none of them.
+pub(crate) fn collect_daemon_security_state() -> DaemonSecurityState {
+    let mut runtime = SecurityRuntimeSnapshot::default();
+    let mut findings = Vec::new();
+    if let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() {
+        collect_device_state_at(&mut runtime, &paths);
+        let now_ms = now_ms_for_audit();
+        findings.extend(crate::telecom_audit::telecom_findings(now_ms));
+        findings.extend(crate::daemon::peer_audit::audit_peers(&paths, now_ms));
+        findings.extend(crate::daemon::channel_audit::channel_findings(
+            &paths, now_ms,
+        ));
+    }
+    DaemonSecurityState {
+        schema_version: DAEMON_SECURITY_STATE_SCHEMA_VERSION,
+        devices: std::mem::take(&mut runtime.devices),
+        device_commands: std::mem::take(&mut runtime.device_commands),
+        device_state_observed: runtime.device_state_observed,
+        device_state_error: runtime.device_state_error.take(),
+        push: runtime.push.take(),
+        transport: runtime.transport.take(),
+        findings,
+    }
+}
+
+/// Bumped when the shape changes in a way a reader has to notice. The desktop
+/// checks it and refuses a newer one rather than silently reading a subset.
+pub(crate) const DAEMON_SECURITY_STATE_SCHEMA_VERSION: u32 = 1;
+
 pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> Result<(), String> {
     match action {
         SecurityCmd::Audit { deep, fix, json } => {
@@ -309,7 +343,11 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 Ok(None) => {}
                 Err(error) => runtime.native_skills_error = Some(error.to_string()),
             }
-            collect_device_state(&mut runtime);
+            // Devices, phone numbers, messaging accounts and peers all live in
+            // databases whose schemas this binary owns and the library cannot
+            // open. Collected through the same function the desktop reads over
+            // the typed bridge, so both surfaces run exactly the same checks.
+            let daemon_findings = collect_daemon_security_state().apply(&mut runtime);
             let mut report = run_security_audit(&SecurityAuditRequest {
                 app_data_dir: data_dir.to_path_buf(),
                 workspace: workspace.map(Path::to_path_buf),
@@ -317,25 +355,7 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 fix: *fix,
                 runtime,
             })?;
-            // Telephony findings are appended here rather than produced inside
-            // the doctor: the doctor runs in the library, and the numbers live
-            // in the daemon's own store, which only this process has open.
-            append_findings(
-                &mut report,
-                crate::telecom_audit::telecom_findings(now_ms_for_audit()),
-            );
-            // Peer and messaging state live in the databases the daemon owns,
-            // which the library cannot open either.
-            if let Ok(paths) = crate::daemon::store::DaemonPaths::resolve() {
-                append_findings(
-                    &mut report,
-                    crate::daemon::peer_audit::audit_peers(&paths, now_ms_for_audit()),
-                );
-                append_findings(
-                    &mut report,
-                    crate::daemon::channel_audit::channel_findings(&paths, now_ms_for_audit()),
-                );
-            }
+            append_findings(&mut report, daemon_findings);
             if *json {
                 println!(
                     "{}",
@@ -344,6 +364,16 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
             } else {
                 print_human(&report);
             }
+            Ok(())
+        }
+        SecurityCmd::DaemonState => {
+            // Always JSON: the only caller is the desktop bridge, and a human
+            // reading this would be reading it through `security audit`.
+            println!(
+                "{}",
+                serde_json::to_string(&collect_daemon_security_state())
+                    .map_err(|error| error.to_string())?
+            );
             Ok(())
         }
         SecurityCmd::PermissionTrail { tool_call_id, json } => {
@@ -1091,22 +1121,6 @@ mod tests {
 ///
 /// The summary is what an operator reads first, so a finding that is not
 /// counted may as well not exist.
-fn append_findings(
-    report: &mut little_monkey_lib::security_doctor::SecurityAuditReport,
-    findings: Vec<little_monkey_lib::security_doctor::SecurityFinding>,
-) {
-    for finding in findings {
-        match finding.status {
-            FindingStatus::Pass => report.summary.passed += 1,
-            FindingStatus::Info => report.summary.informational += 1,
-            FindingStatus::Warning => report.summary.warnings += 1,
-            FindingStatus::Critical => report.summary.critical += 1,
-            FindingStatus::Fixed => report.summary.fixed += 1,
-        }
-        report.findings.push(finding);
-    }
-}
-
 fn now_ms_for_audit() -> i64 {
     i64::try_from(
         std::time::SystemTime::now()
