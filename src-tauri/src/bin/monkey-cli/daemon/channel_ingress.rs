@@ -198,11 +198,23 @@ pub(crate) fn accept_channel_envelope_with(
 
     let stored_sender = store.channel_sender(&envelope.account_id, &envelope.sender.sender_id)?;
     let depth = inherited_reply_depth(store, envelope)?;
+    // Counted only for a sender the provider says is a machine: for everybody
+    // else the answer cannot change the decision, and this is a query.
+    let machine_streak = if envelope.sender.is_bot {
+        store.consecutive_machine_messages(
+            &envelope.account_id,
+            &envelope.conversation.conversation_id,
+            little_monkey_lib::channels::policy::MAX_AUTOMATED_REPLY_DEPTH,
+        )?
+    } else {
+        0
+    };
     let context = AccessContext {
         policy: &account.access_policy,
         sender: stored_sender.as_ref().map(sender_authorization),
         pending_pairings: store.count_pending_channel_senders(&envelope.account_id)?,
         automated_reply_depth: depth,
+        consecutive_machine_messages: machine_streak,
         now_ms,
     };
 

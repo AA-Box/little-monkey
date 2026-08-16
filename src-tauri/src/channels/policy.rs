@@ -285,6 +285,18 @@ pub struct AccessContext<'a> {
     pub pending_pairings: usize,
     /// Consecutive automated replies already made in this conversation.
     pub automated_reply_depth: u32,
+    /// How many messages in a row this conversation has taken from a machine,
+    /// with no human message in between.
+    ///
+    /// A different measurement from `automated_reply_depth`, and it exists
+    /// because that one only sees a chain the *other* side threads.
+    /// `reply_to_provider_id` is how a reply is linked to the message it
+    /// answers, and a bot on the far end is under no obligation to set it — so
+    /// two bots talking in a group with `Always` activation produce a chain of
+    /// depth zero, forever. Counted from the durable event log rather than
+    /// inferred, because the only honest source for "did a person say anything
+    /// recently" is what actually arrived.
+    pub consecutive_machine_messages: u32,
     pub now_ms: i64,
 }
 
@@ -369,6 +381,18 @@ pub fn decide_access(
     }
 
     if context.automated_reply_depth >= MAX_AUTOMATED_REPLY_DEPTH {
+        return AccessDecision::Ignore(IgnoreReason::ReplyDepthExceeded);
+    }
+
+    // The same bound, measured the other way. Telegram, Discord, Slack and an
+    // extension provider all report whether a sender is a bot, and until now
+    // nothing read it: an exchange between two bots that do not thread their
+    // replies inherits a depth of zero on every message and never converges.
+    //
+    // A person speaking resets the count, so this costs a human conversation
+    // nothing however long it runs — the budget is spent only by a stretch of
+    // machine messages with nobody in it.
+    if envelope.sender.is_bot && context.consecutive_machine_messages >= MAX_AUTOMATED_REPLY_DEPTH {
         return AccessDecision::Ignore(IgnoreReason::ReplyDepthExceeded);
     }
 
@@ -478,6 +502,7 @@ mod tests {
             sender,
             pending_pairings: 0,
             automated_reply_depth: 0,
+            consecutive_machine_messages: 0,
             now_ms: 1_000,
         }
     }
@@ -623,6 +648,60 @@ mod tests {
         assert_eq!(
             decide_access(&message, ctx, fixed_code),
             AccessDecision::Ignore(IgnoreReason::ReplyDepthExceeded)
+        );
+    }
+
+    /// The loop the reply-depth chain cannot see.
+    ///
+    /// `automated_reply_depth` is inherited through `reply_to_provider_id`, and
+    /// a bot on the far end need not thread anything — so an unthreaded
+    /// exchange between two bots arrives at depth zero on every message and
+    /// runs forever. The streak of machine messages is what bounds it, and it
+    /// is only consulted for a sender the provider itself calls a bot.
+    #[test]
+    fn an_unthreaded_bot_exchange_is_bounded_by_the_machine_streak() {
+        let policy = ChannelAccessPolicy {
+            group_activation: GroupActivation::Always,
+            ..ChannelAccessPolicy::default()
+        };
+        let mut message = envelope(ConversationKind::Group, false);
+        message.sender.is_bot = true;
+
+        // Under the ceiling, with nothing threaded, it still runs.
+        let mut ctx = context(&policy, Some(SenderAuthorization::approved()));
+        ctx.consecutive_machine_messages = MAX_AUTOMATED_REPLY_DEPTH - 1;
+        assert_eq!(ctx.automated_reply_depth, 0);
+        assert_eq!(
+            decide_access(&message, ctx, fixed_code),
+            AccessDecision::Accept
+        );
+
+        ctx.consecutive_machine_messages = MAX_AUTOMATED_REPLY_DEPTH;
+        assert_eq!(
+            decide_access(&message, ctx, fixed_code),
+            AccessDecision::Ignore(IgnoreReason::ReplyDepthExceeded)
+        );
+    }
+
+    /// A person is never rate-limited by a machine's streak.
+    ///
+    /// The budget exists to stop two programs talking to each other. Spending
+    /// it on somebody in a busy group -- where the count could be high for
+    /// reasons that have nothing to do with them -- would turn a loop guard
+    /// into a silent outage.
+    #[test]
+    fn a_person_is_never_refused_for_a_machine_streak() {
+        let policy = ChannelAccessPolicy {
+            group_activation: GroupActivation::Always,
+            ..ChannelAccessPolicy::default()
+        };
+        let message = envelope(ConversationKind::Group, false);
+        assert!(!message.sender.is_bot);
+        let mut ctx = context(&policy, Some(SenderAuthorization::approved()));
+        ctx.consecutive_machine_messages = MAX_AUTOMATED_REPLY_DEPTH * 10;
+        assert_eq!(
+            decide_access(&message, ctx, fixed_code),
+            AccessDecision::Accept
         );
     }
 

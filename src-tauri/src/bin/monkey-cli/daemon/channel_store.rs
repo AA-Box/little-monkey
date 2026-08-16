@@ -1138,6 +1138,57 @@ impl DaemonStore {
             .collect()
     }
 
+    /// How many inbound messages in a row this conversation has taken from a
+    /// machine, most recent first, stopping at the first one from a person.
+    ///
+    /// The measurement `AccessContext::consecutive_machine_messages` needs, and
+    /// it has to be read rather than inferred: the reply-depth chain only sees
+    /// an exchange the far end threads, and a bot is under no obligation to
+    /// thread anything.
+    ///
+    /// Bounded by `window` because the answer is only ever compared against a
+    /// small ceiling — once the streak is long enough to refuse, how much
+    /// longer it is does not change the decision, and scanning a whole
+    /// conversation's history to find out would.
+    pub fn consecutive_machine_messages(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        window: u32,
+    ) -> Result<u32, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT envelope_json FROM channel_events
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction='inbound'
+                 ORDER BY received_at_ms DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![account_id, conversation_id, i64::from(window)],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut streak = 0;
+        for envelope_json in rows {
+            let envelope_json = envelope_json.map_err(|error| error.to_string())?;
+            // A row we cannot read is not evidence that a person spoke, so it
+            // neither extends the streak nor resets it — it ends the scan. The
+            // conservative direction here is the shorter count: refusing a
+            // human's message because of a corrupt row would be worse than
+            // taking one more machine message.
+            let Ok(envelope) = serde_json::from_str::<ChannelEnvelope>(&envelope_json) else {
+                break;
+            };
+            if !envelope.sender.is_bot {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
+    }
+
     // -- Outbox --------------------------------------------------------------
 
     pub fn enqueue_channel_message(
@@ -2363,6 +2414,70 @@ mod tests {
             disposition: EventDisposition::Accepted,
             received_at_ms: 1_000,
         }
+    }
+
+    /// The streak counts machines back to the last person, and no further.
+    ///
+    /// Both halves are the point. Without the count, two bots that do not
+    /// thread their replies never trip the reply-depth ceiling. Without the
+    /// reset, a group that once had a run of bot messages would refuse a human
+    /// forever.
+    #[test]
+    fn the_machine_streak_stops_at_the_last_person_who_spoke() {
+        use little_monkey_lib::channels::types::{
+            ChannelConversation, ChannelEnvelope, ChannelSender,
+        };
+
+        let mut store = seeded();
+        fn record(store: &mut DaemonStore, provider_event_id: &str, is_bot: bool, at: i64) {
+            let mut sender = ChannelSender::new("someone");
+            sender.is_bot = is_bot;
+            let envelope = ChannelEnvelope {
+                account_id: "acct-1".into(),
+                kind: ChannelKind::Telegram,
+                provider_event_id: provider_event_id.into(),
+                conversation: ChannelConversation::group("conv-1"),
+                sender,
+                text: "hello".into(),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                mentions_self: false,
+                received_at_ms: at,
+                metadata: Default::default(),
+            };
+            let mut event = new_event("acct-1", provider_event_id);
+            event.envelope_json = serde_json::to_string(&envelope).expect("json");
+            event.received_at_ms = at;
+            store.record_channel_event(&event).expect("record");
+        }
+
+        record(&mut store, "evt-1", true, 1_000);
+        record(&mut store, "evt-2", true, 2_000);
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-1", 8)
+                .expect("count"),
+            2
+        );
+
+        // Somebody says something, and the budget is whole again.
+        record(&mut store, "evt-3", false, 3_000);
+        record(&mut store, "evt-4", true, 4_000);
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-1", 8)
+                .expect("count"),
+            1
+        );
+
+        // And a different conversation on the same account is unaffected: the
+        // budget is per conversation, not per account.
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-other", 8)
+                .expect("count"),
+            0
+        );
     }
 
     #[test]

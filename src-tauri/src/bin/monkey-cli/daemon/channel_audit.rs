@@ -365,11 +365,9 @@ fn recognizes_own_echo(kind: ChannelKind) -> bool {
         // A carrier does not deliver our own outbound text to the inbound
         // webhook either, and telephony's own audit covers the number.
         ChannelKind::Sms => true,
-        // signal-cli reports a linked device's own sends as a separate
-        // `sentMessage` notification, which this build's `receive` parser does
-        // not read. A single-device account never produces one; a linked one
-        // can.
-        ChannelKind::Signal => false,
+        // signal-cli reports a linked device's own sends as a sync
+        // notification rather than a `dataMessage`, and the parser reads both.
+        ChannelKind::Signal => true,
         // The guest decides what it reports and the host cannot verify it.
         ChannelKind::Extension => false,
     }
@@ -657,13 +655,16 @@ mod tests {
 
     /// The two halves of the echo finding: a provider this build cannot filter,
     /// weighted by whether the account's own settings would answer the echo.
+    ///
+    /// An extension provider is the case: what a guest reports about a sender
+    /// is the guest's word, and the host has no way to check it.
     #[test]
     fn an_echo_blind_provider_is_weighted_by_what_it_would_answer() {
         let (_root, paths) = store();
-        let mut account = account("acct-1", ChannelKind::Signal);
+        let mut account = account("acct-1", ChannelKind::Extension);
         account.non_secret_config = serde_json::json!({
-            "helper_path": "/usr/local/bin/signal-cli",
-            "account": "+15550000000",
+            "extension_id": "ext-1",
+            "capability_id": "cap-1",
         });
         seed(&paths, &account);
         let quiet = channel_findings(&paths, NOW);
@@ -685,13 +686,29 @@ mod tests {
 
     #[test]
     fn a_provider_that_filters_its_own_echo_is_not_reported() {
-        let (_root, paths) = store();
-        let mut account = account("acct-1", ChannelKind::Telegram);
-        account.access_policy.group_activation = GroupActivation::Always;
-        seed(&paths, &account);
-        assert!(!ids(&channel_findings(&paths, NOW))
-            .iter()
-            .any(|id| id.starts_with("channels.own_echo_blind")));
+        // Signal is here deliberately: its parser reads the sync notification a
+        // linked device's own send arrives as, so it belongs on this side of
+        // the line rather than the other.
+        for kind in [ChannelKind::Telegram, ChannelKind::Signal] {
+            let (root, paths) = store();
+            let helper = root.join("signal-cli");
+            std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
+            let mut account = account("acct-1", kind);
+            account.access_policy.group_activation = GroupActivation::Always;
+            if kind == ChannelKind::Signal {
+                account.non_secret_config = serde_json::json!({
+                    "helper_path": helper.to_string_lossy(),
+                    "account": "+15550000000",
+                });
+            }
+            seed(&paths, &account);
+            assert!(
+                !ids(&channel_findings(&paths, NOW))
+                    .iter()
+                    .any(|id| id.starts_with("channels.own_echo_blind")),
+                "{kind:?}"
+            );
+        }
     }
 
     /// A relative helper path is worse than a missing one: which program runs
