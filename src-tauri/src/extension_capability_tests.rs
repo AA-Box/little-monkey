@@ -146,6 +146,191 @@ async fn an_extension_embedding_provider_answers_the_normal_embedding_call() {
     assert!((vectors[0][1] - 0.8).abs() < 1e-5, "{:?}", vectors[0]);
 }
 
+/// Write one version of the golden-path fixture and return its source folder.
+fn write_versioned_fixture(
+    source_root: &Path,
+    extension_id: &str,
+    version: SemanticVersion,
+    output: &str,
+    permissions: Vec<crate::executable_extensions::PermissionDeclaration>,
+) -> std::path::PathBuf {
+    let component = component_wat(output, "");
+    let source = source_root.join(format!("{extension_id}-{version}"));
+    let mut manifest = manifest_for(extension_id, &source, &component, version);
+    manifest.capabilities[0].capability_id = "vectors".to_string();
+    manifest.capabilities[0].kind = CapabilityKind::EmbeddingProvider;
+    manifest.permissions = permissions;
+    write_manifest_bundle(&source, &component, &manifest);
+    source
+}
+
+fn embedding_spec(extension_id: &str) -> crate::knowledge_core::EmbeddingSpec {
+    crate::knowledge_core::EmbeddingSpec {
+        backend: crate::knowledge_core::EmbeddingBackend::Extension,
+        model_id_or_tag: "vectors".to_string(),
+        dim: 2,
+        query_prefix: String::new(),
+        doc_prefix: String::new(),
+        extension_id: Some(extension_id.to_string()),
+    }
+}
+
+async fn embed_one(app_data: &Path, extension_id: &str) -> Result<Vec<Vec<f32>>, String> {
+    crate::knowledge_core::embed_batch_under(
+        app_data,
+        &embedding_spec(extension_id),
+        &["one".to_string()],
+        false,
+    )
+    .await
+}
+
+/// One extension's whole life, from a packaged folder to an uninstall that
+/// survives reopening the store — every step observed through the subsystem
+/// that would use it rather than through the manager that owns it.
+///
+/// The individual operations each have their own tests. What only this test
+/// says is that they compose: that the version a native consumer answers from
+/// tracks install, update and rollback; that stopping, disabling and
+/// uninstalling each remove it from that consumer's view rather than only from
+/// the registry's; and that nothing about the removal depends on the process
+/// that performed it still being alive.
+#[tokio::test]
+async fn one_extension_walks_the_whole_lifecycle_under_its_native_consumer() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let extension_id = "dev.example.lifecycle";
+    // Distinct answers per version, so "which version answered" is a fact the
+    // consumer reports rather than something the test has to infer.
+    let v1 = write_versioned_fixture(
+        &root.0,
+        extension_id,
+        SemanticVersion::new(1, 0, 0),
+        r#"{"vectors":[[3.0,4.0]]}"#,
+        Vec::new(),
+    );
+    let v1_1 = write_versioned_fixture(
+        &root.0,
+        extension_id,
+        SemanticVersion::new(1, 1, 0),
+        r#"{"vectors":[[0.0,5.0]]}"#,
+        Vec::new(),
+    );
+    let v1_2 = write_versioned_fixture(
+        &root.0,
+        extension_id,
+        SemanticVersion::new(1, 2, 0),
+        r#"{"vectors":[[5.0,0.0]]}"#,
+        vec![crate::executable_extensions::PermissionDeclaration {
+            permission_id: "api-origin".to_string(),
+            kind: crate::executable_extensions::PermissionKind::NetworkOrigin,
+            scope: "https://api.example.com".to_string(),
+            reason: "Reach the vendor's API".to_string(),
+        }],
+    );
+
+    // Discover and inspect before anything is installed.
+    let manager = ExtensionManager::new(&app_data).unwrap();
+    let preview = manager.discover(&v1).unwrap();
+    assert!(preview.compatible);
+    assert!(preview.blockers.is_empty());
+    assert!(embed_one(&app_data, extension_id).await.is_err());
+
+    install_running_with_grants(&manager, &v1, extension_id).await;
+    let detail = manager.validate_installed(extension_id).await.unwrap();
+    assert_eq!(
+        detail.health.state,
+        crate::executable_extensions::HealthState::Healthy
+    );
+    assert!(detail.health.validated);
+    let first = embed_one(&app_data, extension_id).await.unwrap();
+    assert!((first[0][0] - 0.6).abs() < 1e-5, "{:?}", first[0]);
+
+    // An update that asks for nothing new still needs its own approval, and
+    // the consumer answers from the new version the moment it is running.
+    manager.set_running(extension_id, false).await.unwrap();
+    let same_authority = manager.preview_update(&v1_1).unwrap();
+    assert!(same_authority
+        .permission_diff
+        .as_ref()
+        .is_none_or(|diff| !diff.expands_authority));
+    manager
+        .update(
+            &v1_1,
+            crate::executable_extensions::Approval {
+                approval_digest: same_authority.approval_digest,
+                grants: Vec::new(),
+                allow_unsigned: true,
+                allow_untrusted: false,
+                allow_high_risk: true,
+            },
+        )
+        .await
+        .unwrap();
+    manager.set_running(extension_id, true).await.unwrap();
+    let updated = embed_one(&app_data, extension_id).await.unwrap();
+    assert!((updated[0][1] - 1.0).abs() < 1e-5, "{:?}", updated[0]);
+
+    // An update that asks for more authority is refused on any approval that
+    // was not taken against this exact manifest.
+    manager.set_running(extension_id, false).await.unwrap();
+    let expanded = manager.preview_update(&v1_2).unwrap();
+    let diff = expanded.permission_diff.as_ref().unwrap();
+    assert!(diff.expands_authority);
+    assert_eq!(diff.added[0].scope, "https://api.example.com");
+    let stale = manager
+        .update(
+            &v1_2,
+            crate::executable_extensions::Approval {
+                approval_digest: "0".repeat(64),
+                grants: vec![PermissionGrant {
+                    permission_id: "api-origin".to_string(),
+                    binding: None,
+                }],
+                allow_unsigned: true,
+                allow_untrusted: false,
+                allow_high_risk: true,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.contains("Approval digest"), "{stale}");
+    // The refusal changed nothing: the consumer still answers from 1.1.0.
+    manager.set_running(extension_id, true).await.unwrap();
+    assert!(
+        (embed_one(&app_data, extension_id).await.unwrap()[0][1] - 1.0).abs() < 1e-5,
+        "a refused update must not change what answers"
+    );
+
+    // Rollback returns the consumer to the previous version's answer.
+    manager.set_running(extension_id, false).await.unwrap();
+    let rolled_back = manager.rollback(extension_id).await.unwrap();
+    assert_eq!(rolled_back.active_version, "1.0.0");
+    manager.set_running(extension_id, true).await.unwrap();
+    let restored = embed_one(&app_data, extension_id).await.unwrap();
+    assert!((restored[0][0] - 0.6).abs() < 1e-5, "{:?}", restored[0]);
+
+    // Stop, disable, uninstall — each one removes it from the consumer, not
+    // merely from the registry's own listing.
+    manager.set_running(extension_id, false).await.unwrap();
+    assert!(embed_one(&app_data, extension_id).await.is_err());
+    manager.set_enabled(extension_id, false).await.unwrap();
+    assert!(embed_one(&app_data, extension_id).await.is_err());
+    manager.uninstall(extension_id).unwrap();
+    assert!(manager.list().unwrap().is_empty());
+    assert!(embed_one(&app_data, extension_id).await.is_err());
+
+    // And the removal is the store's, not this handle's.
+    let reopened = ExtensionManager::new(&app_data).unwrap();
+    assert!(reopened.list().unwrap().is_empty());
+    assert!(reopened.inspect(extension_id).is_err());
+    assert!(reopened
+        .active_capabilities(Some(CapabilityKind::EmbeddingProvider))
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn an_embedding_provider_that_answers_the_wrong_dimension_is_refused() {
     let _runtime = runtime_guard();
@@ -913,4 +1098,192 @@ async fn a_capability_of_the_wrong_kind_is_not_reachable_through_another_kinds_r
     assert!(manager
         .resolve_active_capability(CapabilityKind::Tool, "helper")
         .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Web search and web fetch
+// ---------------------------------------------------------------------------
+
+/// Points web's extension calls at a test profile for as long as it lives.
+///
+/// Web is the one consumer that resolves the extension store from the process's
+/// own app-data directory rather than being handed one, so without this a test
+/// would have to install a fixture into the developer's real profile to reach
+/// it. Restored on drop, including when an assertion panics, because the
+/// override is process-wide.
+struct WebExtensionProfile;
+
+impl WebExtensionProfile {
+    fn pointing_at(app_data: &Path) -> Self {
+        crate::web::set_web_extension_app_data_for_test(Some(app_data.to_path_buf()));
+        Self
+    }
+}
+
+impl Drop for WebExtensionProfile {
+    fn drop(&mut self) {
+        crate::web::set_web_extension_app_data_for_test(None);
+    }
+}
+
+#[tokio::test]
+async fn an_extension_web_search_provider_answers_the_normal_search_path() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.finder",
+        component_wat(
+            r#"[{"title":"A fixture result","url":"https://example.com/found","snippet":"answered by the guest"}]"#,
+            "",
+        ),
+        vec![(CapabilityKind::WebSearch, "search")],
+        Vec::new(),
+    )
+    .await;
+    let _profile = WebExtensionProfile::pointing_at(&app_data);
+
+    let settings = crate::web::WebSettings {
+        search_provider: crate::web::SearchProvider::ExecutableExtension,
+        search_extension_id: Some("dev.example.finder".to_string()),
+        search_extension_capability_id: Some("search".to_string()),
+        ..crate::web::WebSettings::default()
+    };
+    let results = crate::web::search_for_call(
+        &settings,
+        "turn-1:call-1",
+        None,
+        "anything at all".to_string(),
+        Some(3),
+    )
+    .await
+    .expect("the normal search path reaches the extension");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].url, "https://example.com/found");
+    assert_eq!(results[0].snippet, "answered by the guest");
+}
+
+#[tokio::test]
+async fn a_disabled_web_search_provider_stops_serving_the_normal_path() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.finder",
+        component_wat(r#"[]"#, ""),
+        vec![(CapabilityKind::WebSearch, "search")],
+        Vec::new(),
+    )
+    .await;
+    let _profile = WebExtensionProfile::pointing_at(&app_data);
+    manager
+        .set_enabled("dev.example.finder", false)
+        .await
+        .unwrap();
+
+    let settings = crate::web::WebSettings {
+        search_provider: crate::web::SearchProvider::ExecutableExtension,
+        search_extension_id: Some("dev.example.finder".to_string()),
+        search_extension_capability_id: Some("search".to_string()),
+        ..crate::web::WebSettings::default()
+    };
+    let error = crate::web::search_for_call(
+        &settings,
+        "turn-1:call-1",
+        None,
+        "anything at all".to_string(),
+        Some(3),
+    )
+    .await
+    .expect_err("a disabled provider serves nothing");
+    assert!(
+        error.contains("enabled") || error.contains("not installed") || error.contains("healthy"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn an_extension_web_fetch_provider_answers_the_normal_fetch_path() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    // A literal public address rather than a hostname: the fetch guard resolves
+    // hostnames, and a test that needs the resolver is a test that needs the
+    // network. The window metadata is exact on purpose — the consumer refuses
+    // any answer whose reported totals disagree with the bytes it was handed.
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.reader",
+        component_wat(
+            r#"{"url":"https://203.0.113.10/doc","final_url":"https://203.0.113.10/doc","title":"A fixture page","content_type":"text/markdown","markdown":"the guest read this","total_chars":19,"truncated":false}"#,
+            "",
+        ),
+        vec![(CapabilityKind::WebFetch, "fetch")],
+        Vec::new(),
+    )
+    .await;
+    let _profile = WebExtensionProfile::pointing_at(&app_data);
+
+    let settings = crate::web::WebSettings {
+        fetch_provider: crate::web::FetchProvider::ExecutableExtension,
+        fetch_extension_id: Some("dev.example.reader".to_string()),
+        fetch_extension_capability_id: Some("fetch".to_string()),
+        ..crate::web::WebSettings::default()
+    };
+    let fetched = crate::web::fetch_for_call(
+        &settings,
+        "turn-1:call-2",
+        "https://203.0.113.10/doc".to_string(),
+        Some(4096),
+        Some(0),
+    )
+    .await
+    .expect("the normal fetch path reaches the extension");
+
+    assert_eq!(fetched.markdown, "the guest read this");
+    assert_eq!(fetched.title.as_deref(), Some("A fixture page"));
+    assert!(!fetched.truncated);
+}
+
+#[tokio::test]
+async fn a_web_fetch_provider_that_answers_about_another_url_is_refused() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.reader",
+        component_wat(
+            r#"{"url":"https://203.0.113.99/other","final_url":"https://203.0.113.99/other","title":null,"content_type":"text/markdown","markdown":"a page nobody asked for","total_chars":23,"truncated":false}"#,
+            "",
+        ),
+        vec![(CapabilityKind::WebFetch, "fetch")],
+        Vec::new(),
+    )
+    .await;
+    let _profile = WebExtensionProfile::pointing_at(&app_data);
+
+    let settings = crate::web::WebSettings {
+        fetch_provider: crate::web::FetchProvider::ExecutableExtension,
+        fetch_extension_id: Some("dev.example.reader".to_string()),
+        fetch_extension_capability_id: Some("fetch".to_string()),
+        ..crate::web::WebSettings::default()
+    };
+    let error = crate::web::fetch_for_call(
+        &settings,
+        "turn-1:call-2",
+        "https://203.0.113.10/doc".to_string(),
+        Some(4096),
+        Some(0),
+    )
+    .await
+    .expect_err("a guest may not answer about a URL nobody requested");
+    assert!(error.contains("changed the requested URL"), "{error}");
 }

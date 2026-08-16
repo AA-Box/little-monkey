@@ -85,6 +85,12 @@ jobs:
         # which cannot run reports SKIPPED with a reason and never a pass.
         run: pnpm test:install-smoke
 
+      - name: CLI sidecar staging
+        # tauri-build copies the staged sidecar over `target/<profile>/monkey-cli`
+        # on every build, so a bootstrap placeholder that outlives a real build
+        # replaces a working CLI with a zero-byte file that cargo never rebuilds.
+        run: pnpm test:cli-sidecar
+
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
     # code — a single-OS CI job would silently never compile the arms that

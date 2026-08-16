@@ -24,6 +24,7 @@
     "a11y": "vitest run src/lib/a11yAudit.test.tsx",
     "test:install-smoke": "node --test scripts/lib/installSmoke.test.mjs",
     "test:browser-policy": "node --test scripts/lib/controllerBrowserPolicy.test.mjs",
+    "test:cli-sidecar": "node --test scripts/lib/cliSidecarPlaceholder.test.mjs",
     "install:smoke": "node scripts/install-smoke.mjs",
     "stage:runtime": "node scripts/stage-managed-runtime.mjs",
     "stage:runtime:tts": "node scripts/stage-managed-runtime.mjs llama-tts",
