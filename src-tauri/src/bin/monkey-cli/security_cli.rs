@@ -77,6 +77,19 @@ pub enum SecurityCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Produce a redacted trace of what the messaging, telephony, peer and
+    /// device subsystems have been doing, for handing to somebody else.
+    ///
+    /// Carries no message text, no transcript, no audio, no key and no
+    /// credential — those have no field to live in. Every identifier is
+    /// replaced by a token that is stable within one bundle and meaningless
+    /// outside it, so a trace stays followable without naming anybody.
+    SupportBundle {
+        /// Print the versioned machine-readable bundle. The only output there
+        /// is; the flag exists so the shape matches every other command here.
+        #[arg(long, default_value_t = true)]
+        json: bool,
+    },
     /// Show the unified subsystem event stream, and verify its hash chain.
     ///
     /// This is the stream the run-less subsystems write to — HTTP, MCP, browser,
@@ -364,6 +377,16 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
             } else {
                 print_human(&report);
             }
+            Ok(())
+        }
+        SecurityCmd::SupportBundle { json: _ } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::support_bundle_cli::collect(env!(
+                    "CARGO_PKG_VERSION"
+                )))
+                .map_err(|error| error.to_string())?
+            );
             Ok(())
         }
         SecurityCmd::DaemonState => {

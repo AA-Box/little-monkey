@@ -95,6 +95,7 @@ pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+pub mod support_bundle;
 // Operational-health diagnostics (reachability/liveness of app-owned
 // services), sibling to `security_doctor` (which audits posture, not
 // health). Self-contained: engine + thin command layer live in one file,
