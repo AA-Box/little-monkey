@@ -35,12 +35,17 @@ const READ_LIMIT: u32 = 150;
 
 /// Build the bundle.
 ///
-/// Never fails as a whole: a subsystem whose store cannot be opened contributes
-/// an *unavailable* section naming the reason, because "this could not be read"
-/// and "this had nothing in it" are different answers and a support bundle that
-/// blurs them sends somebody looking in the wrong place.
-pub(crate) fn collect(app_version: &str) -> SupportBundle {
-    let redactor = Redactor::new();
+/// A subsystem whose store cannot be opened contributes an *unavailable*
+/// section naming the reason, because "this could not be read" and "this had
+/// nothing in it" are different answers and a bundle that blurs them sends
+/// somebody looking in the wrong place. The one whole-bundle failure is a
+/// machine that cannot produce a salt — see below.
+pub(crate) fn collect(app_version: &str) -> Result<SupportBundle, String> {
+    // No redactor, no bundle. A fixed or zeroed fallback salt would turn every
+    // pseudonym into a stable global identifier for the number behind it, while
+    // the document went on claiming its identifiers were pseudonymized — which
+    // is worse than producing nothing.
+    let redactor = Redactor::new()?;
     let mut sections = std::collections::BTreeMap::new();
 
     match DaemonPaths::resolve() {
@@ -76,14 +81,14 @@ pub(crate) fn collect(app_version: &str) -> SupportBundle {
         }
     }
 
-    SupportBundle {
+    Ok(SupportBundle {
         schema_version: SUPPORT_BUNDLE_SCHEMA_VERSION,
         generated_at_ms: u64::try_from(now_ms()).unwrap_or_default(),
         app_version: app_version.to_string(),
         platform: std::env::consts::OS.to_string(),
         redaction: Default::default(),
         sections,
-    }
+    })
 }
 
 /// Inbound normalization, access, routing and the outbox, per account.
@@ -368,7 +373,7 @@ mod tests {
     }
 
     fn bundle_json(store: &DaemonStore) -> String {
-        let redactor = Redactor::new();
+        let redactor = Redactor::from_seed_for_tests("support-bundle-cli-tests");
         let sections = serde_json::json!({
             "channels": channel_section(store, &redactor),
             "telephony": telephony_section(store, &redactor),
@@ -423,7 +428,7 @@ mod tests {
     #[test]
     fn one_party_reads_as_one_party_within_a_bundle() {
         let store = seeded();
-        let redactor = Redactor::new();
+        let redactor = Redactor::from_seed_for_tests("support-bundle-cli-tests");
         let telephony = telephony_section(&store, &redactor);
         let health = telephony
             .events
@@ -446,10 +451,16 @@ mod tests {
     #[test]
     fn a_subsystem_that_cannot_be_read_is_distinguishable_from_a_quiet_one() {
         let paths = DaemonPaths::under(std::path::Path::new("/definitely/not/a/directory"));
-        let section = device_section(&paths, &Redactor::new());
+        let section = device_section(
+            &paths,
+            &Redactor::from_seed_for_tests("support-bundle-cli-tests"),
+        );
         assert!(section.unavailable.is_some(), "{section:?}");
 
-        let quiet = peer_section(&seeded(), &Redactor::new());
+        let quiet = peer_section(
+            &seeded(),
+            &Redactor::from_seed_for_tests("support-bundle-cli-tests"),
+        );
         assert!(quiet.unavailable.is_none());
         assert!(quiet.events.is_empty());
     }

@@ -384,7 +384,7 @@ pub fn run(action: &SecurityCmd, data_dir: &Path, workspace: Option<&Path>) -> R
                 "{}",
                 serde_json::to_string_pretty(&crate::support_bundle_cli::collect(env!(
                     "CARGO_PKG_VERSION"
-                )))
+                ))?)
                 .map_err(|error| error.to_string())?
             );
             Ok(())
