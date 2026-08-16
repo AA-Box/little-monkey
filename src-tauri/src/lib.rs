@@ -1714,6 +1714,8 @@ pub fn run() {
             daemon_commands::peers_forget,
             daemon_commands::peers_status,
             daemon_commands::peers_threads,
+            daemon_commands::peers_outbound,
+            daemon_commands::peers_remote_thread,
             daemon_commands::telecom_list,
             daemon_commands::telecom_add,
             daemon_commands::telecom_probe,

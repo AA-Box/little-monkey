@@ -2291,6 +2291,89 @@ CREATE INDEX peer_rejection_events_recent_idx
     ON peer_rejection_events(occurred_at_ms DESC, event_id DESC);
 "#;
 
+const DAEMON_V17: i64 = 17;
+const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-peer-artifact-provenance";
+
+/// Who handed this installation which bytes, and what this installation sent.
+///
+/// # Why a digest is not an authorization
+///
+/// The content store is content-addressed and shared with every other artifact
+/// this installation holds — a run's output, a channel attachment, a file the
+/// operator imported. "The digest resolves in `content-v1`" therefore says only
+/// that *somebody* put those bytes there, which is not a question a peer's
+/// envelope is asking. Without this table a peer that learned or guessed the
+/// SHA-256 of a local blob could reference it and have it attached to the turn
+/// its own words created, and a peer could reference content another peer
+/// uploaded. A digest is an integrity value; it is public by nature and it is
+/// not a capability.
+///
+/// `peer_artifact_receipts` is the authorization record: a row exists only
+/// because *this authenticated pairing* uploaded that content here and the
+/// bytes verified against their declared digest. It is keyed on
+/// `(peer_device_id, artifact_id)` — the pairing the signature resolved to, not
+/// anything the envelope claims — so one peer's admission is invisible to
+/// another, exactly as a thread is.
+///
+/// The row also holds the metadata the *receiver* validated at upload time.
+/// The envelope that later references the artifact does not get to restate it:
+/// an attachment is built from this row, so a peer cannot upload `build.log`
+/// and then present the same bytes as `secrets.env`.
+///
+/// # Bounded
+///
+/// An admission expires. Handing over content once must not buy permanent
+/// standing to reference it, and the bound is the envelope's own maximum life
+/// (`little_monkey_lib::peers::MAX_TTL_MS`, twenty-four hours): past that, no
+/// envelope authored while the upload was fresh could still be valid anyway.
+/// The blob itself is left to the artifact store's own retention — it may
+/// belong to a run or to local content, and this table's business is authority,
+/// not bytes.
+///
+/// # Outgoing
+///
+/// `peer_outbound_messages` is the other half the Peers screen was missing: what
+/// *this* installation sent, so an operator can follow a task they asked another
+/// installation to do without dropping to a terminal. It holds the ids this side
+/// minted plus the last state a poll observed; there is no remote enumeration
+/// route and none is wanted, so knowing which threads to ask about is exactly
+/// what this table is for.
+const DAEMON_V17_SQL: &str = r#"
+CREATE TABLE peer_artifact_receipts (
+    peer_device_id TEXT NOT NULL CHECK (length(peer_device_id) BETWEEN 1 AND 128),
+    artifact_id TEXT NOT NULL CHECK (length(artifact_id) BETWEEN 1 AND 128),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    filename TEXT CHECK (filename IS NULL OR length(filename) BETWEEN 1 AND 255),
+    media_type TEXT CHECK (media_type IS NULL OR length(media_type) BETWEEN 1 AND 255),
+    uploaded_at_ms INTEGER NOT NULL CHECK (uploaded_at_ms > 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > uploaded_at_ms),
+    PRIMARY KEY(peer_device_id, artifact_id)
+) STRICT;
+
+CREATE INDEX peer_artifact_receipts_expiry_idx
+    ON peer_artifact_receipts(expires_at_ms);
+
+CREATE INDEX peer_rejection_events_peer_idx
+    ON peer_rejection_events(peer_device_id, occurred_at_ms DESC, event_id DESC);
+
+CREATE TABLE peer_outbound_messages (
+    alias TEXT NOT NULL CHECK (length(alias) BETWEEN 1 AND 128),
+    message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128),
+    thread_id TEXT NOT NULL CHECK (length(thread_id) BETWEEN 1 AND 128),
+    correlation_id TEXT CHECK (correlation_id IS NULL OR length(correlation_id) BETWEEN 1 AND 128),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact')),
+    state TEXT NOT NULL CHECK (length(state) BETWEEN 1 AND 32),
+    result_text TEXT CHECK (result_text IS NULL OR length(result_text) <= 4096),
+    sent_at_ms INTEGER NOT NULL CHECK (sent_at_ms > 0),
+    checked_at_ms INTEGER,
+    PRIMARY KEY(alias, message_id)
+) STRICT;
+
+CREATE INDEX peer_outbound_messages_recent_idx
+    ON peer_outbound_messages(sent_at_ms DESC);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2318,12 +2401,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
     (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
     (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
+    (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V16;
+const DAEMON_LATEST: i64 = DAEMON_V17;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2418,6 +2502,68 @@ mod tests {
         assert_eq!(job.state, JobState::Running, "the row survives the upgrade");
         assert_eq!(job.hold_reason, None, "the new column reads as unset");
         assert!(store.committed_reservations().unwrap().is_empty());
+    }
+
+    /// Peer provenance arrives on a database that is already at V16 — the
+    /// shape every installation that took PR #386 is sitting on.
+    ///
+    /// The new tables are additions, so there is nothing to backfill and
+    /// nothing that could fail: what matters is that the migration applies
+    /// forward from V16 rather than only onto a fresh file, and that the
+    /// existing peer rows are still there afterwards.
+    #[test]
+    fn peer_provenance_upgrades_a_database_that_is_already_at_v16() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V16 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO peer_threads (
+                    peer_device_id, thread_id, peer_instance_id, session_key,
+                    created_at_ms, last_activity_at_ms
+                 ) VALUES ('device-1','thread-1','instance-remote','peer:device-1:thread-1',1,1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM daemon_migrations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            DAEMON_V17
+        );
+        // The pre-existing traffic is untouched, and the new tables are there.
+        let store = DaemonStore { connection };
+        assert!(store.peer_thread("device-1", "thread-1").unwrap().is_some());
+        assert!(store
+            .peer_artifact_receipt("device-1", "whatever", 1)
+            .unwrap()
+            .is_none());
+        assert!(store.outbound_peer_messages(None, 10).unwrap().is_empty());
     }
 
     /// The invocation index arrives on a database that already has outbox

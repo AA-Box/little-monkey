@@ -2358,6 +2358,51 @@ mod tests {
             granted.grants,
             vec![PeerGrantView::Message, PeerGrantView::Artifact]
         );
+
+        // What this installation sent, as `peers outbound --json` and
+        // `peers remote-thread --json` both print it.
+        let outbound: PeerOutboundResponse = parse_typed_json(
+            r#"{"messages":[{"alias":"studio","message_id":"pmsg-1","thread_id":"thread-1",
+                "correlation_id":"corr-1","kind":"task_request","state":"succeeded",
+                "result_text":"the build is red because of a bad migration",
+                "sent_at_ms":1,"checked_at_ms":9}]}"#,
+        )
+        .expect("outbound");
+        assert_eq!(outbound.messages[0].state, "succeeded");
+        assert_eq!(
+            outbound.messages[0].correlation_id.as_deref(),
+            Some("corr-1")
+        );
+        assert_eq!(outbound.messages[0].checked_at_ms, Some(9));
+
+        // A task nobody has polled for yet: no result, no check time.
+        let pending: PeerOutboundResponse = parse_typed_json(
+            r#"{"messages":[{"alias":"studio","message_id":"pmsg-2","thread_id":"thread-1",
+                "correlation_id":null,"kind":"message","state":"queued","result_text":null,
+                "sent_at_ms":2,"checked_at_ms":null}]}"#,
+        )
+        .expect("pending outbound");
+        assert_eq!(pending.messages[0].result_text, None);
+        assert_eq!(pending.messages[0].checked_at_ms, None);
+    }
+
+    /// The remote poll takes an alias and a thread id, and nothing else can be
+    /// smuggled through either of them.
+    #[test]
+    fn the_remote_thread_bridge_refuses_anything_that_is_not_an_identifier() {
+        for forged in [
+            "../../v1/remote/runs",
+            "thread-1/../node",
+            "https://elsewhere.invalid",
+            "thread 1",
+            "",
+        ] {
+            assert!(
+                validate_id("thread id", forged).is_err(),
+                "'{forged}' must not reach a peer route"
+            );
+        }
+        assert!(validate_id("thread id", "thread-9f2c4a").is_ok());
     }
 
     /// A grant the peer surface must never hand out is refused at the bridge,
@@ -2906,6 +2951,36 @@ pub struct PeerThreadsResponse {
     pub recipe: String,
 }
 
+/// One thing this installation sent to a peer, and the last thing it heard
+/// back.
+///
+/// The counterpart of [`PeerThreadView`], which is the inbound side. Both are
+/// needed: an operator who sends a task to another installation cannot see
+/// anything about it on the receiving-side listing, because it is not their
+/// thread — it is one they opened over there.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerOutboundMessageView {
+    pub alias: String,
+    pub message_id: String,
+    pub thread_id: String,
+    pub correlation_id: Option<String>,
+    pub kind: String,
+    /// What the send returned, or what a later poll of that peer's thread
+    /// reported: `queued`, `accepted`, `duplicate`, `rejected`, `succeeded`,
+    /// `failed` or `cancelled`.
+    pub state: String,
+    pub result_text: Option<String>,
+    pub sent_at_ms: i64,
+    pub checked_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerOutboundResponse {
+    pub messages: Vec<PeerOutboundMessageView>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PeerRotationResponse {
@@ -3155,6 +3230,55 @@ pub async fn peers_threads(
     args.push(limit.clamp(1, 200).to_string());
     args.push("--json".into());
     parse_typed_json(&command(args).await?)
+}
+
+/// What this installation has sent to peers, newest first.
+///
+/// Local state only: reading it contacts nobody. The remote half is
+/// [`peers_remote_thread`], which the operator asks for explicitly.
+#[tauri::command]
+pub async fn peers_outbound(
+    alias: Option<String>,
+    limit: u32,
+) -> Result<PeerOutboundResponse, String> {
+    let mut args = vec!["peers".into(), "outbound".into()];
+    if let Some(alias) = alias {
+        validate_id("peer alias", &alias)?;
+        args.push("--alias".into());
+        args.push(alias);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_typed_json(&command(args).await?)
+}
+
+/// Ask one peer about one thread this installation opened.
+///
+/// Two fixed arguments, both validated as identifiers: there is no URL, no
+/// route and no host here, so nothing React sends can reach anywhere other than
+/// a peer's own thread endpoint through the signed, certificate-pinned call the
+/// CLI already makes. The thread must be one this installation has a record of
+/// sending to, which is why there is no "list that peer's threads" command
+/// anywhere — enumerating another node's conversations is not something a peer
+/// should be able to do.
+#[tauri::command]
+pub async fn peers_remote_thread(
+    alias: String,
+    thread_id: String,
+) -> Result<PeerOutboundResponse, String> {
+    validate_id("peer alias", &alias)?;
+    validate_id("thread id", &thread_id)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "remote-thread".into(),
+            alias,
+            thread_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
 }
 
 // --- Conversation ingress -------------------------------------------------

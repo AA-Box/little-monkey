@@ -129,6 +129,51 @@ export const peersStatus = (alias: string) =>
 export const peersThreads = (peer: string | null = null, limit = 20) =>
   invoke<{ threads: PeerThread[]; recipe: string }>("peers_threads", { peer, limit });
 
+/**
+ * One thing this installation *sent* to a peer, and the last answer it got.
+ *
+ * The inbound listing above cannot show this: a task sent to another
+ * installation lives in a thread over there, not here. Nothing in this type is
+ * a route or an address — the poll is by alias and thread id, over the same
+ * signed, certificate-pinned call the CLI makes.
+ */
+export interface PeerOutboundMessage {
+  alias: string;
+  message_id: string;
+  thread_id: string;
+  correlation_id: string | null;
+  kind: string;
+  /** `queued`, `accepted`, `duplicate`, `rejected`, `succeeded`, `failed` or `cancelled`. */
+  state: string;
+  result_text: string | null;
+  sent_at_ms: number;
+  /** When this installation last asked the peer about it. */
+  checked_at_ms: number | null;
+}
+
+export const peersOutbound = (alias: string | null = null, limit = 50) =>
+  invoke<{ messages: PeerOutboundMessage[] }>("peers_outbound", { alias, limit });
+
+/** Ask one peer about one thread this installation opened. */
+export const peersRemoteThread = (alias: string, threadId: string) =>
+  invoke<{ messages: PeerOutboundMessage[] }>("peers_remote_thread", { alias, threadId });
+
+/** Whether a sent message is still waiting on the far side. */
+export function isPending(message: PeerOutboundMessage): boolean {
+  return ["queued", "accepted", "duplicate", "running"].includes(message.state);
+}
+
+/** Sent messages grouped by the thread they belong to, newest thread first. */
+export function byThread(messages: PeerOutboundMessage[]): { threadId: string; messages: PeerOutboundMessage[] }[] {
+  const threads: { threadId: string; messages: PeerOutboundMessage[] }[] = [];
+  for (const message of messages) {
+    const existing = threads.find((thread) => thread.threadId === message.thread_id);
+    if (existing) existing.messages.push(message);
+    else threads.push({ threadId: message.thread_id, messages: [message] });
+  }
+  return threads;
+}
+
 /** A fingerprint an operator can compare out of band, in readable groups.
  * Shown in full rather than truncated: a fingerprint you cannot compare
  * completely is decoration. */

@@ -809,18 +809,27 @@ impl RemoteApi {
             // grant to advertise would instead deadlock the design: a device
             // granted only `camera_capture` could never advertise a camera, so
             // the camera would never become effective.
-            ("POST", ["v1", "remote", "device", "surface"]) => {
-                self.device_surface_post(&request.body, device, now_ms)
+            //
+            // What they are *not* gated by is peer standing, which is why each
+            // one refuses a peer-only pairing outright below: a peer has no
+            // hardware here, nothing is ever queued for it, and nothing about
+            // the plane that serves a phone should answer it at all. Without
+            // that, "a peer reaches only the peer plane" would be true of the
+            // routes that happen to check a capability and false of the ones
+            // that deliberately do not.
+            ("POST", ["v1", "remote", "device", "surface"]) => refuse_peer_only(device)
+                .and_then(|_| self.device_surface_post(&request.body, device, now_ms)),
+            ("GET", ["v1", "remote", "device", "state"]) => {
+                refuse_peer_only(device).and_then(|_| self.device_state(device))
             }
-            ("GET", ["v1", "remote", "device", "state"]) => self.device_state(device),
             ("GET", ["v1", "remote", "device", "commands", "next"]) => {
-                self.device_command_lease(device, now_ms)
+                refuse_peer_only(device).and_then(|_| self.device_command_lease(device, now_ms))
             }
             // Reconciliation, never a second lease: the commands this device
             // started and never finished, so a reconnect can deliver a staged
             // result or say honestly that the outcome is unknown.
             ("GET", ["v1", "remote", "device", "commands", "recover"]) => {
-                self.device_commands_recover(device, now_ms)
+                refuse_peer_only(device).and_then(|_| self.device_commands_recover(device, now_ms))
             }
             ("GET", ["v1", "remote", "device", "commands", command_id, "control"]) => {
                 self.device_command_control(device, command_id, now_ms)
@@ -867,11 +876,14 @@ impl RemoteApi {
             // address grants nothing — a woken device still has to make an
             // ordinary signed request — and a device must always be able to
             // stop being woken.
-            ("GET", ["v1", "remote", "device", "push", "key"]) => self.device_push_key(),
-            ("POST", ["v1", "remote", "device", "push"]) => {
-                self.device_push_register(&request.body, device_id, now_ms)
+            ("GET", ["v1", "remote", "device", "push", "key"]) => {
+                refuse_peer_only(device).and_then(|_| self.device_push_key())
             }
-            ("DELETE", ["v1", "remote", "device", "push"]) => self.device_push_forget(device_id),
+            ("POST", ["v1", "remote", "device", "push"]) => refuse_peer_only(device)
+                .and_then(|_| self.device_push_register(&request.body, device_id, now_ms)),
+            ("DELETE", ["v1", "remote", "device", "push"]) => {
+                refuse_peer_only(device).and_then(|_| self.device_push_forget(device_id))
+            }
             // --- Versioned `/v1/remote/node/*` placement plane (roadmap K17).
             // A second plane beside the control plane above, sharing only this
             // transport. The control-plane routes act on runs the node already
@@ -922,7 +934,7 @@ impl RemoteApi {
                 .and_then(|_| self.peer_hello_post(device, &request.body, now_ms)),
             ("POST", ["v1", "remote", "peer", "artifacts"]) => {
                 require_capability(device, DeviceCapability::PeerArtifact)
-                    .and_then(|_| self.peer_artifact_post(device, &request.body))
+                    .and_then(|_| self.peer_artifact_post(device, &request.body, now_ms))
             }
             // Self-revocation needs no extra capability: a device may always
             // sever itself. The store path force-stops any live desktop
@@ -3383,10 +3395,23 @@ impl RemoteApi {
     /// an identifier this node trusts: the content store hashes what it
     /// actually wrote, and a mismatch is refused rather than stored under the
     /// name the sender chose.
+    ///
+    /// # This is where a peer earns the right to reference content
+    ///
+    /// The content store is shared with every other artifact on the machine, so
+    /// a blob being *in* it says nothing about who put it there. The durable
+    /// receipt written here does: it names the authenticated pairing this
+    /// request resolved to, the id and digest of what verified, the size, and
+    /// the metadata the receiver validated — and it is the only thing that lets
+    /// a later envelope name these bytes.
+    ///
+    /// It is written last, after the content passed integrity validation, so a
+    /// failed upload leaves no authorization behind.
     fn peer_artifact_post(
         &self,
         device: &DeviceRecord,
         body: &[u8],
+        now_ms: u64,
     ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
         let upload: PeerArtifactUpload = serde_json::from_slice(body)
             .map_err(|error| (400, format!("Invalid peer artifact: {error}")))?;
@@ -3409,6 +3434,18 @@ impl RemoteApi {
                 "Peer artifact content does not match its declared digest".to_string(),
             ));
         }
+        DaemonStore::open(&self.paths)
+            .map_err(internal)?
+            .record_peer_artifact_receipt(
+                &device.device_id,
+                &blob.id,
+                &blob.id,
+                blob.size,
+                upload.filename.as_deref(),
+                upload.media_type.as_deref(),
+                i64::try_from(now_ms).unwrap_or(i64::MAX),
+            )
+            .map_err(internal)?;
         let stored = PeerArtifactStored {
             artifact_id: blob.id,
             sha256: upload.sha256.to_ascii_lowercase(),
@@ -3851,6 +3888,21 @@ fn require_capability(
 /// Not [`protocol::effective_capabilities`], which additionally drops a
 /// physical capability the device's own surface cannot serve: a peer grant is
 /// never physical, and a peer has no surface to ask.
+/// Refuse a pairing whose entire standing is peer standing.
+///
+/// For the device-plane routes that are gated by authentication alone. Those
+/// routes are self-service for a paired phone — advertising a surface only ever
+/// narrows what is effective, and the queue hands out only commands already
+/// queued for that device — but a peer is not a phone: it has no hardware here,
+/// nothing is ever queued for it, and there is no reading of "peer standing" in
+/// which the plane that serves a phone is part of it.
+fn refuse_peer_only(device: &DeviceRecord) -> Result<(), (u16, String)> {
+    if crate::daemon::remote::protocol::is_peer_only(&granted_capabilities(device)) {
+        return Err((403, "A peer cannot act as a device here".to_string()));
+    }
+    Ok(())
+}
+
 fn granted_capabilities(device: &DeviceRecord) -> std::collections::BTreeSet<DeviceCapability> {
     if device.capabilities.is_empty() {
         legacy_capabilities(&device.scopes)
@@ -5364,7 +5416,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_task_request_becomes_a_turn_and_the_result_comes_back_on_the_thread() {
+    fn a_peer_task_request_becomes_a_turn_and_the_thread_shows_it_still_running() {
         let (root, api, device, secret) = peer_fixture(every_peer_grant());
         let runs = Arc::new(FakePeerRuns::default());
         let api = api.with_peer_runs(runs.clone());

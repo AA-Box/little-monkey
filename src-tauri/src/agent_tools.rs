@@ -456,3 +456,86 @@ pub fn task_tool_def() -> serde_json::Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The peer tool's whole safety story is what it *cannot* be asked to do.
+    ///
+    /// A model reading a peer's own words is being read instructions by a
+    /// stranger. It must not be possible to talk it into contacting somewhere
+    /// new, authenticating as something else, or reaching a file — so there is
+    /// no parameter for any of it, the alias is an enumeration of pairings the
+    /// operator made, and nothing else may be passed at all.
+    #[test]
+    fn the_peer_tool_can_only_name_a_pairing_the_operator_already_made() {
+        let definition = peer_message_tool_def(&["studio".to_string(), "server".to_string()]);
+        let parameters = &definition["function"]["parameters"];
+        let properties = parameters["properties"]
+            .as_object()
+            .expect("parameters are an object");
+
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["artifacts", "correlation", "peer", "task", "text", "thread"],
+            "the peer tool grew a parameter"
+        );
+        for forbidden in [
+            "host",
+            "url",
+            "endpoint",
+            "token",
+            "secret",
+            "certificate",
+            "fingerprint",
+            "path",
+            "file",
+            "workspace",
+            "model",
+            "tool",
+            "permission",
+            "permission_mode",
+            "device",
+            "phone",
+            "number",
+            "route",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "'{forbidden}' must not be a peer_message parameter"
+            );
+        }
+        // Nothing may be smuggled past the schema either.
+        assert_eq!(parameters["additionalProperties"], false);
+        // And the destination is a pairing, not a string a model composes.
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["peer"]["enum"],
+            serde_json::json!(["studio", "server"])
+        );
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["peer", "text"]),
+            "a peer message needs a destination and something to say, and nothing else"
+        );
+    }
+
+    /// An installation with no peers is not offered the tool at all, so the
+    /// alias enumeration can never be empty on a live definition.
+    #[test]
+    fn the_peer_tool_is_not_part_of_the_default_set() {
+        let definitions = tool_definitions();
+        let names: Vec<String> = definitions
+            .as_array()
+            .expect("the tool set is an array")
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !names.contains(&"peer_message".to_string()),
+            "peer_message is offered only when a peer exists"
+        );
+    }
+}

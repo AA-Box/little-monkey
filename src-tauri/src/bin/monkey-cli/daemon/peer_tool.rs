@@ -19,9 +19,10 @@ use little_monkey_lib::peers::{
     PeerArtifactRef, PeerEnvelope, PeerMessageKind, MAX_ARTIFACT_REFS, MAX_BODY_BYTES,
 };
 
+use super::peer_store::PeerOutboundMessage;
 use super::remote::protocol::DeviceCapability;
 use super::remote::store::RemoteStore;
-use super::store::DaemonPaths;
+use super::store::{DaemonPaths, DaemonStore};
 
 /// Longest text this tool will send. Well under the envelope's own byte bound,
 /// because a model writing more than this to a peer is not having a
@@ -170,6 +171,7 @@ pub(crate) async fn send_peer_message(
         serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
     )
     .await?;
+    remember_send(&paths, alias, &envelope, &response, now);
 
     Ok(serde_json::json!({
         "sent": true,
@@ -227,9 +229,147 @@ pub(crate) async fn upload_artifacts(
     Ok(refs)
 }
 
+/// Remember one thing this installation sent, so it can be followed later.
+///
+/// Best-effort on purpose: the message *was* delivered, and failing the send
+/// afterwards because a local bookkeeping row could not be written would turn a
+/// success into a retry the far side would then refuse as a duplicate.
+///
+/// This row is also the reason there is no remote "list every thread" route and
+/// no need for one. The only installation that legitimately knows which threads
+/// exist on a peer is the one that opened them, so it keeps the list itself
+/// rather than asking the peer to enumerate its conversations to whoever calls.
+pub(crate) fn remember_send(
+    paths: &DaemonPaths,
+    alias: &str,
+    envelope: &PeerEnvelope,
+    response: &serde_json::Value,
+    now_ms: i64,
+) {
+    let state = response["state"].as_str().unwrap_or("accepted");
+    // The far side answers `accepted:false` for a duplicate it had already
+    // refused; taking its word is the whole point of asking.
+    let state = if response["accepted"] == serde_json::Value::Bool(false) {
+        "rejected"
+    } else {
+        state
+    };
+    let _ = DaemonStore::open(paths).and_then(|mut store| {
+        store.record_outbound_peer_message(
+            alias,
+            &envelope.message_id,
+            &envelope.thread_id,
+            envelope.correlation_id.as_deref(),
+            envelope.kind.as_str(),
+            state,
+            now_ms,
+        )
+    });
+}
+
+/// Ask one peer about one thread this installation opened, and fold what came
+/// back into the local record.
+///
+/// Deliberately narrow. There is no route that enumerates a node's peer threads
+/// and there should not be — that would let any paired peer discover the shape
+/// of every conversation a node is having. The thread id here comes from this
+/// installation's own outbound record, so it asks only about conversations it
+/// started.
+pub(crate) async fn refresh_remote_thread(
+    paths: &DaemonPaths,
+    alias: &str,
+    thread_id: &str,
+) -> Result<Vec<PeerOutboundMessage>, String> {
+    check_peer_id(thread_id)?;
+    let response = super::remote::peer_call(
+        paths,
+        alias,
+        reqwest::Method::GET,
+        &format!("/v1/remote/peer/threads/{thread_id}"),
+        Vec::new(),
+    )
+    .await?;
+    let now = i64::try_from(super::remote::now_ms_public()?).unwrap_or(i64::MAX);
+    let mut store = DaemonStore::open(paths)?;
+    let empty = Vec::new();
+    for message in response["messages"].as_array().unwrap_or(&empty) {
+        let payload = &message["payload"];
+        match message["kind"].as_str() {
+            // A result the peer produced for something this installation asked
+            // for. `in_reply_to` is the message id this side minted.
+            Some("result") => {
+                let Some(in_reply_to) = payload["in_reply_to"].as_str() else {
+                    continue;
+                };
+                store.record_outbound_peer_result(
+                    alias,
+                    in_reply_to,
+                    payload["state"].as_str().unwrap_or("succeeded"),
+                    payload["text"].as_str(),
+                    now,
+                )?;
+            }
+            // The peer's echo of what this installation sent, which is where a
+            // refusal shows up.
+            Some(_) if message["disposition"] == "rejected" => {
+                let Some(message_id) = message["message_id"].as_str() else {
+                    continue;
+                };
+                store.record_outbound_peer_result(
+                    alias,
+                    message_id,
+                    "rejected",
+                    message["rejection"].as_str(),
+                    now,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(store
+        .outbound_peer_messages(Some(alias), 200)?
+        .into_iter()
+        .filter(|message| message.thread_id == thread_id)
+        .collect())
+}
+
+/// The identifier alphabet the peer plane uses everywhere else.
+///
+/// Checked before a thread id reaches a URL: an id is the operator's or this
+/// installation's own, but it still must not be able to become a different
+/// route by carrying a slash or a query string.
+fn check_peer_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > little_monkey_lib::peers::MAX_ID_LEN
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(format!("'{value}' is not a peer thread id"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_id_cannot_turn_into_a_different_route() {
+        for forged in [
+            "../../v1/remote/runs",
+            "thread-1/../node",
+            "thread 1",
+            "thread-1?all=true",
+            "",
+        ] {
+            assert!(
+                check_peer_id(forged).is_err(),
+                "'{forged}' must not be usable as a thread id"
+            );
+        }
+        assert!(check_peer_id("thread-abc.1:2_3").is_ok());
+    }
 
     #[tokio::test]
     async fn an_unknown_peer_is_refused_without_contacting_anything() {
