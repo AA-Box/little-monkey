@@ -181,6 +181,10 @@ interface RuntimeHubStoreState {
   installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
+  /** Fetches a published component catalog, defaulting to the one this project
+   *  publishes. Returns its entries and persists nothing — merging into the
+   *  registry stays with the caller, exactly as an imported file does. */
+  fetchComponentCatalog: (url?: string) => Promise<M3ComponentCatalogEntry[]>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
@@ -685,6 +689,24 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       try {
         const componentRegistry = await runtimeHubClient.componentReplaceRegistryEntries(entries);
         set({ componentRegistry });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    fetchComponentCatalog: async (url) => {
+      const key = "component-catalog";
+      const operationId = createM3OperationId("component-catalog");
+      begin(key, operationId);
+      try {
+        return await runtimeHubClient.componentFetchCatalog({
+          operationId,
+          timeoutMs: 30_000,
+          ...(url ? { url } : {}),
+        });
       } catch (error) {
         fail(key, error);
         throw error;

@@ -1532,6 +1532,7 @@ pub fn run() {
             m3_commands::m3_component_installed,
             m3_commands::m3_component_registry_entries,
             m3_commands::m3_component_replace_registry_entries,
+            m3_commands::m3_component_fetch_catalog,
             m3_commands::m3_component_list_registry,
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,

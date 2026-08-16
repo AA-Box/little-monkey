@@ -1490,6 +1490,29 @@ pub fn m3_component_replace_registry_entries(
         .map_err(command_error)
 }
 
+/// Fetches a component catalog and returns what it lists, without persisting
+/// any of it.
+///
+/// The caller merges the result into the local registry through
+/// [`m3_component_replace_registry_entries`] — the same path the file importer
+/// uses — so a fetched catalog and an imported file cannot end up adopted by
+/// two different rules. Defaults to the catalog this project publishes, and
+/// takes a URL so a self-hosted or air-gapped mirror is a setting rather than a
+/// rebuild.
+#[tauri::command]
+pub async fn m3_component_fetch_catalog(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    url: Option<String>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let url =
+        url.unwrap_or_else(|| crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL.to_string());
+    let result = crate::m3_runtime_hub::fetch_component_catalog(&url, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
 #[tauri::command]
 pub async fn m3_component_list_registry(
     state: tauri::State<'_, M3CommandState>,

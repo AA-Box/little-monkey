@@ -1394,6 +1394,10 @@ export const runtimeHubClient = {
   componentRegistryEntries: () => invoke<M3ComponentCatalogEntry[]>("m3_component_registry_entries"),
   componentReplaceRegistryEntries: (entries: M3ComponentCatalogEntry[]) =>
     invoke<M3ComponentCatalogEntry[]>("m3_component_replace_registry_entries", { entries }),
+  /** Fetches a published catalog. Returns what it lists; persists nothing, so
+   *  the caller still merges it into the registry like an imported file. */
+  componentFetchCatalog: (args: OperationArgs & { url?: string }) =>
+    invoke<M3ComponentCatalogEntry[]>("m3_component_fetch_catalog", args),
   componentListRegistry: (args: OperationArgs) =>
     invoke<M3ComponentCatalogEntry[]>("m3_component_list_registry", args),
   componentCheckUpdates: (args: OperationArgs) =>

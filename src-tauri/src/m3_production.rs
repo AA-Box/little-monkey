@@ -95,6 +95,16 @@ const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m3-lan"));
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
+/// The component catalog this project publishes for its own artifacts.
+///
+/// A rolling release tag whose single asset is re-uploaded in place by the MLX
+/// packaging workflow, so this URL is stable across component versions while
+/// its contents move. Shipping it is what makes a published component reachable
+/// without the user first downloading a JSON file by hand and importing it;
+/// what it lists is still only installable after the digest and, for a signed
+/// component, the pinned publisher key both check out.
+pub const DEFAULT_COMPONENT_CATALOG_URL: &str =
+    "https://github.com/AA-Box/little-monkey/releases/download/mlx-catalog/mlx-catalog.json";
 #[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
 #[cfg(target_os = "macos")]

@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import { ArchiveRestore, Download, Info, PackagePlus, RefreshCw, ShieldCheck } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArchiveRestore, CloudDownload, Download, Info, PackagePlus, RefreshCw, ShieldCheck } from "lucide-react";
 import { Button, StatusPill, type PillTone } from "../../ui";
 import type {
   M3ComponentCatalogEntry,
@@ -266,10 +266,14 @@ export function RuntimeHubComponents() {
   const refreshing = useRuntimeHubStore((state) => state.busy.components);
   const error = useRuntimeHubStore((state) => state.errors.components);
   const replaceComponentRegistry = useRuntimeHubStore((state) => state.replaceComponentRegistry);
+  const fetchComponentCatalog = useRuntimeHubStore((state) => state.fetchComponentCatalog);
   const [showInstalledOnly, setShowInstalledOnly] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
+  const [syncing, setSyncing] = useState(false);
   const catalogInput = useRef<HTMLInputElement | null>(null);
+  const syncedThisMount = useRef(false);
 
   const importCatalog = async (file: File) => {
     setImportError(null);
@@ -283,6 +287,38 @@ export function RuntimeHubComponents() {
       setImporting(false);
     }
   };
+
+  /** Merges the published catalog into the registry, the same way an imported
+   *  file is merged — the fetch replaces the file picker, not the merge rules. */
+  const syncPublishedCatalog = async () => {
+    setCatalogNotice(null);
+    setSyncing(true);
+    try {
+      const fetched = await fetchComponentCatalog();
+      // Read through the store rather than the closed-over prop: this also runs
+      // from a mount effect, where the captured registry is the empty list the
+      // panel rendered with and merging against it would drop every local entry.
+      const held = useRuntimeHubStore.getState().componentRegistry;
+      await replaceComponentRegistry(mergeRegistryEntries(held, fetched));
+    } catch (reason) {
+      // Deliberately a notice rather than an error: the registry on disk is
+      // what the list is rendered from, so an unreachable catalog costs the
+      // newest versions, not the panel. Offline is a normal state here.
+      setCatalogNotice(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Once per mount, so opening the panel is enough to see a newly published
+  // component. Guarded by a ref because React 18's strict mode mounts twice and
+  // a second fetch would race the first one's registry write.
+  useEffect(() => {
+    if (syncedThisMount.current) return;
+    syncedThisMount.current = true;
+    void syncPublishedCatalog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const checksByComponentId = new Map(componentUpdateChecks.map((check) => [check.componentId, check]));
   const notYetInstalled = componentRegistry.filter(
@@ -322,9 +358,16 @@ export function RuntimeHubComponents() {
       <section className="flex flex-col gap-3" aria-labelledby="component-registry-heading">
         <SectionHeading
           title="Known component versions"
-          description="A local, operator-editable registry of known versions — not a live upstream binary CDN. Populate it with source URLs and sha256 digests you have independently verified, or import a catalog file published alongside a component."
+          description="Versions this app knows how to install. Refreshed from the catalog this project publishes whenever this panel opens, and editable locally — add source URLs and sha256 digests you have verified yourself, or import a catalog file published alongside a component."
           action={
             <>
+              <BusyButton
+                type="button"
+                busy={syncing}
+                onClick={() => void syncPublishedCatalog()}
+              >
+                <CloudDownload size={15} aria-hidden="true" /> Check for new versions
+              </BusyButton>
               <input
                 ref={catalogInput}
                 type="file"
@@ -348,10 +391,16 @@ export function RuntimeHubComponents() {
           }
         />
         <ErrorNotice message={importError} />
+        {catalogNotice ? (
+          <p className="text-xs text-muted" role="status">
+            Showing the versions already known to this machine — the published catalog could not be
+            reached ({catalogNotice}).
+          </p>
+        ) : null}
         <p className="text-xs text-muted">
-          Importing adds a catalog&apos;s versions to this registry; it does not download or
-          install anything. Every entry is still digest-verified at install time, and a signed
-          component is still checked against its pinned publisher key.
+          Adding a catalog&apos;s versions to this registry downloads and installs nothing. Every
+          entry is still digest-verified at install time, and a signed component is still checked
+          against its pinned publisher key.
         </p>
         <label className="flex min-h-11 w-fit cursor-pointer items-center gap-2 text-xs text-muted">
           <input
