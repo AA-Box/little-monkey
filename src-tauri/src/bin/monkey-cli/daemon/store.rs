@@ -2192,6 +2192,105 @@ CREATE TABLE IF NOT EXISTS channel_conversation_refs (
 ) STRICT;
 "#;
 
+const DAEMON_V16: i64 = 16;
+const DAEMON_V16_CHECKSUM: &str = "daemon-jobs-v16-authenticated-peer-identity";
+
+/// Scope peer conversation identity to the authenticated pairing.
+///
+/// The v10 tables trusted two envelope fields too much: `thread_id` was global
+/// across every peer, and `sender_instance_id` participated in dedupe even
+/// though the signed device credential — not the envelope — is identity. The
+/// replacement keys make both guarantees depend on `peer_device_id`. Rows
+/// whose historical message owner disagrees with their thread owner are
+/// intentionally not copied; they were produced only by the old cross-peer
+/// collision and cannot be attributed safely.
+///
+/// Shape/expiry/loop refusals happen before a thread exists. Their separate,
+/// bounded table gives Security Doctor evidence without retaining peer text or
+/// an invalid unbounded identifier.
+const DAEMON_V16_SQL: &str = r#"
+DROP INDEX IF EXISTS peer_messages_job_idx;
+DROP INDEX IF EXISTS peer_messages_thread_idx;
+DROP INDEX IF EXISTS peer_threads_recent_idx;
+
+ALTER TABLE peer_messages RENAME TO peer_messages_v10;
+ALTER TABLE peer_threads RENAME TO peer_threads_v10;
+
+CREATE TABLE peer_threads (
+    peer_device_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    peer_instance_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms > 0),
+    PRIMARY KEY(peer_device_id, thread_id)
+) STRICT;
+
+INSERT INTO peer_threads (
+    peer_device_id, thread_id, peer_instance_id, session_key,
+    created_at_ms, last_activity_at_ms
+)
+SELECT peer_device_id, thread_id, peer_instance_id, session_key,
+       created_at_ms, last_activity_at_ms
+  FROM peer_threads_v10;
+
+CREATE TABLE peer_messages (
+    row_id TEXT PRIMARY KEY,
+    peer_device_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    sender_instance_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact','result')),
+    correlation_id TEXT,
+    disposition TEXT NOT NULL CHECK (disposition IN ('accepted','rejected','delivered')),
+    rejection TEXT,
+    envelope_json TEXT NOT NULL,
+    ingress_id TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    FOREIGN KEY(peer_device_id, thread_id)
+        REFERENCES peer_threads(peer_device_id, thread_id) ON DELETE CASCADE,
+    UNIQUE(peer_device_id, message_id, direction)
+) STRICT;
+
+INSERT INTO peer_messages (
+    row_id, peer_device_id, thread_id, sender_instance_id, message_id,
+    direction, kind, correlation_id, disposition, rejection, envelope_json,
+    ingress_id, job_id, created_at_ms
+)
+SELECT message.row_id, message.peer_device_id, message.thread_id,
+       message.sender_instance_id, message.message_id, message.direction,
+       message.kind, message.correlation_id, message.disposition,
+       message.rejection, message.envelope_json, message.ingress_id,
+       message.job_id, message.created_at_ms
+  FROM peer_messages_v10 AS message
+  JOIN peer_threads_v10 AS thread
+    ON thread.thread_id = message.thread_id
+   AND thread.peer_device_id = message.peer_device_id;
+
+DROP TABLE peer_messages_v10;
+DROP TABLE peer_threads_v10;
+
+CREATE INDEX peer_threads_recent_idx
+    ON peer_threads(peer_device_id, last_activity_at_ms DESC);
+CREATE INDEX peer_messages_thread_idx
+    ON peer_messages(peer_device_id, thread_id, created_at_ms);
+CREATE INDEX peer_messages_job_idx ON peer_messages(job_id);
+
+CREATE TABLE peer_rejection_events (
+    event_id TEXT PRIMARY KEY CHECK (length(event_id) BETWEEN 1 AND 64),
+    peer_device_id TEXT NOT NULL CHECK (length(peer_device_id) BETWEEN 1 AND 128),
+    message_id TEXT CHECK (message_id IS NULL OR length(message_id) BETWEEN 1 AND 128),
+    thread_id TEXT CHECK (thread_id IS NULL OR length(thread_id) BETWEEN 1 AND 128),
+    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 64),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms > 0)
+) STRICT;
+
+CREATE INDEX peer_rejection_events_recent_idx
+    ON peer_rejection_events(occurred_at_ms DESC, event_id DESC);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2218,12 +2317,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
     (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
     (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
+    (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V15;
+const DAEMON_LATEST: i64 = DAEMON_V16;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
