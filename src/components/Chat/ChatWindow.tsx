@@ -34,6 +34,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
+import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
 import { useT } from "../../lib/i18n";
 import { detectShortcutPlatform, shortcutIdForEvent } from "../../lib/shortcuts";
@@ -1586,6 +1587,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                       name={name}
                       isDir={attachment.isDir}
                       previewUrl={attachment.kind === "image" ? attachment.dataUrl : undefined}
+                      // Inline-content attachments (terminal evidence) carry a
+                      // synthetic path — nothing to reveal on disk.
+                      revealPath={attachment.content === undefined ? attachment.path : undefined}
                       onRemove={() => handleRemoveAttachment(attachment.path)}
                     />
                   );
@@ -1626,15 +1630,26 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </div>
                 )}
               </div>
-              <button
-                type="button"
-                onClick={sending ? handleStop : handleSend}
-                disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
-                aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
-                className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
-              </button>
+              <span className="group/action relative shrink-0">
+                <button
+                  type="button"
+                  onClick={sending ? handleStop : handleSend}
+                  disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
+                  aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
+                  className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
+                </button>
+                {/* The one control in the composer whose effect is worth
+                    spelling out: stopping mid-turn keeps what already
+                    streamed rather than discarding the exchange. */}
+                {sending && (
+                  <Tooltip
+                    text={t("ChatWindow.stopResponseAriaLabel")}
+                    hint={t("ChatWindow.stopResponseHint")}
+                  />
+                )}
+              </span>
             </div>
           </div>
         </div>

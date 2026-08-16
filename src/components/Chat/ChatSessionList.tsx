@@ -1,19 +1,35 @@
-import { useEffect, useState } from "react";
-import { AlertTriangle, MoreVertical, Plus } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { AlertTriangle, MessagesSquare, MoreVertical, Plus, SlidersHorizontal, Smartphone } from "lucide-react";
 
-import { sessionDisplayTitle, type ChatSession, useSessionStore } from "../../store/sessionStore";
+import { type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
 import { useT } from "../../lib/i18n";
 import { SessionMenu } from "./SessionMenu";
+import { SessionListMenu, useEnvironmentLabel } from "./SessionListMenu";
 import { usePermissionStore } from "../../store/permissionStore";
+import { useSessionListViewStore } from "../../store/sessionListViewStore";
+import { useExternalConversationStore } from "../../store/externalConversationStore";
+import { REMOTE_CONTROL_ENVIRONMENT } from "../../lib/conversationsClient";
+import {
+  buildSessionListView,
+  environmentOptions,
+  externalRow,
+  localRow,
+  type SessionRow,
+} from "./sessionListView";
 import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from "./sessionStatus";
 
 /**
  * Claude-Desktop-style session list for the left sidebar: a "New session"
- * action, then Pinned / per-group / Recents sections (each sorted
- * most-recently-active first), plus a collapsed "Archived" footer section.
- * Click a row to switch, hover for the kebab menu (rename/pin/fork/group/
- * archive/delete/"open in" — see `SessionMenu`).
+ * action, then Pinned / per-section / Recents sections, plus a collapsed
+ * "Archived" footer section. Click a row to switch, hover for the kebab menu
+ * (rename/pin/fork/group/archive/delete/"open in" — see `SessionMenu`).
+ *
+ * The list is not only this machine's: a paired phone's chat and a messaging
+ * conversation the agent is answering appear as rows too, tagged with the
+ * environment they live in and read-only (see `ExternalConversationView`).
+ * How the whole list is filtered, grouped and ordered lives in
+ * `sessionListView.ts`, behind the header's view menu.
  */
 /** Tailwind classes for each status' dot. `working` animates — a row that
  * is doing something should be the one thing moving in the sidebar. */
@@ -43,6 +59,28 @@ function StatusMarker({ status, label }: { status: SessionStatus; label: string 
   );
 }
 
+/** The marker an outside conversation carries instead of a status dot: which
+ * environment it is in, since that is the thing about it a local row can't
+ * also be. */
+function EnvironmentMarker({ environment, label }: { environment: string; label: string }) {
+  const Icon = environment === REMOTE_CONTROL_ENVIRONMENT ? Smartphone : MessagesSquare;
+  return (
+    <span role="img" aria-label={label} title={label} className="mr-1.5 inline-flex shrink-0 items-center align-middle">
+      <Icon size={12} className="text-faint" aria-hidden />
+    </span>
+  );
+}
+
+/** A list section's heading row, optionally carrying the view menu's trigger. */
+function SectionHeading({ title, action }: { title: string; action?: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2 px-3 pb-1 pt-3">
+      <h2 className="truncate text-[11px] font-semibold uppercase tracking-wider text-faint">{title}</h2>
+      {action}
+    </div>
+  );
+}
+
 export default function ChatSessionList() {
   const sessions = useSessionStore((state) => state.sessions);
   const groups = useSessionStore((state) => state.groups);
@@ -57,30 +95,84 @@ export default function ChatSessionList() {
   const renameSession = useSessionStore((state) => state.renameSession);
   const renameRequestId = useSessionStore((state) => state.renameRequestId);
   const clearRenameRequest = useSessionStore((state) => state.clearRenameRequest);
+  const conversations = useExternalConversationStore((state) => state.conversations);
+  const selectedExternal = useExternalConversationStore((state) => state.selected);
+  const selectExternal = useExternalConversationStore((state) => state.select);
+  const refreshExternal = useExternalConversationStore((state) => state.refresh);
   const { t } = useT();
+  const environmentLabel = useEnvironmentLabel();
 
   const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
   const [menuAnchor, setMenuAnchor] = useState<DOMRect | null>(null);
+  const [viewMenuAnchor, setViewMenuAnchor] = useState<DOMRect | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const prefs = useSessionListViewStore((state) => state.prefs);
 
-  const byUpdatedDesc = (a: ChatSession, b: ChatSession) => b.updatedAt - a.updatedAt;
+  // The daemon owns the outside conversations, so this list is fetched rather
+  // than subscribed to. Refreshed on mount and whenever the window comes back
+  // to the front — the moment a user is most likely to be looking for what
+  // arrived while they were elsewhere — instead of on a timer that would
+  // spawn a CLI process every few seconds forever.
+  useEffect(() => {
+    void refreshExternal();
+    const onFocus = () => void refreshExternal();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshExternal]);
 
   // Unstarted sessions (no messages yet — see `newSession`'s reset-in-place
   // logic) stay out of the sidebar entirely, same as Claude Desktop: a "New
   // session" only earns a row once the user actually sends something.
-  const started = sessions.filter((s) => s.messages.length > 0);
-  const active = started.filter((s) => !s.archived);
-  const archivedSessions = started.filter((s) => s.archived).sort(byUpdatedDesc);
-  const pinned = active.filter((s) => s.pinned).sort(byUpdatedDesc);
-  const groupedSections = groups
-    .map((group) => ({
-      group,
-      items: active.filter((s) => !s.pinned && s.groupId === group.id).sort(byUpdatedDesc),
-    }))
-    .filter((section) => section.items.length > 0);
-  const ungrouped = active.filter((s) => !s.pinned && !s.groupId).sort(byUpdatedDesc);
+  const rows = useMemo(
+    () => [
+      ...sessions
+        .filter((session) => session.messages.length > 0)
+        .map((session) =>
+          localRow(
+            session,
+            sessionStatus(
+              session,
+              runningTurns[session.id] === true,
+              turnOutcomes[session.id],
+              awaitingPermission.has(session.id),
+            ),
+          ),
+        ),
+      ...conversations.map(externalRow),
+    ],
+    // `awaitingPermission` is a fresh Set every render; the queue it derives
+    // from is the real input.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sessions, conversations, runningTurns, turnOutcomes, permissionQueue],
+  );
+
+  const environments = useMemo(() => environmentOptions(rows), [rows]);
+  const { pinned, sections, archived: archivedRows, filtered } = buildSessionListView({
+    rows,
+    groups,
+    prefs,
+    // Only read when grouping by date, and re-read on every render the store
+    // triggers — a session that ages past midnight moves buckets the next
+    // time the list re-renders, which any session activity forces.
+    now: Date.now(),
+    labels: {
+      recents: t("ChatSessionList.recentsHeading"),
+      today: t("ChatSessionList.view.today"),
+      yesterday: t("ChatSessionList.view.yesterday"),
+      lastWeek: t("ChatSessionList.view.lastWeek"),
+      older: t("ChatSessionList.view.older"),
+      noFolder: t("ChatSessionList.view.noFolder"),
+      idle: t("ChatSessionList.view.stateIdle"),
+      state: {
+        working: t("ChatSessionList.status.working"),
+        attention: t("ChatSessionList.status.attention"),
+        error: t("ChatSessionList.status.error"),
+        finished: t("ChatSessionList.status.finished"),
+      },
+    },
+  });
 
   const startRename = (session: ChatSession) => {
     setRenameValue(session.title);
@@ -109,33 +201,66 @@ export default function ChatSessionList() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renameRequestId]);
 
-  const renderRow = (session: ChatSession) => {
-    const isActive = session.id === activeSessionId;
+  const rowClass = (highlighted: boolean) =>
+    `group relative flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1 text-sm ${
+      highlighted ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"
+    }`;
+
+  const renderRow = (row: SessionRow) => {
+    if (row.kind === "external") {
+      const label = environmentLabel(row.environment);
+      const isSelected =
+        selectedExternal?.environment === row.conversation.environment &&
+        selectedExternal.id === row.conversation.id;
+      return (
+        <div
+          key={row.id}
+          role="button"
+          tabIndex={0}
+          onClick={() =>
+            selectExternal({ environment: row.conversation.environment, id: row.conversation.id })
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              selectExternal({ environment: row.conversation.environment, id: row.conversation.id });
+            }
+          }}
+          className={rowClass(isSelected)}
+        >
+          <span className="truncate">
+            <EnvironmentMarker environment={row.environment} label={label} />
+            {row.title}
+          </span>
+        </div>
+      );
+    }
+
+    const session = row.session;
+    const isActive = session.id === activeSessionId && selectedExternal === null;
     const isRenaming = renamingId === session.id;
     const isMenuOpen = menuOpenId === session.id;
-    const status = sessionStatus(
-      session,
-      runningTurns[session.id] === true,
-      turnOutcomes[session.id],
-      awaitingPermission.has(session.id),
-    );
+    const open = () => {
+      // Opening a local session takes the main pane back from whatever
+      // outside conversation was being read.
+      selectExternal(null);
+      switchSession(session.id);
+    };
 
     return (
       <div
-        key={session.id}
+        key={row.id}
         role="button"
         tabIndex={0}
-        onClick={() => !isRenaming && switchSession(session.id)}
+        onClick={() => !isRenaming && open()}
         onKeyDown={(event) => {
           if (isRenaming) return;
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            switchSession(session.id);
+            open();
           }
         }}
-        className={`group relative flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1 text-sm ${
-          isActive || isMenuOpen ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"
-        }`}
+        className={rowClass(isActive || isMenuOpen)}
       >
         {isRenaming ? (
           <input
@@ -153,8 +278,10 @@ export default function ChatSessionList() {
           />
         ) : (
           <span className={`truncate ${session.unread ? "font-semibold" : ""}`}>
-            {status && <StatusMarker status={status} label={t(`ChatSessionList.status.${status}`)} />}
-            {sessionDisplayTitle(session)}
+            {row.status && (
+              <StatusMarker status={row.status} label={t(`ChatSessionList.status.${row.status}`)} />
+            )}
+            {row.title}
           </span>
         )}
 
@@ -191,48 +318,87 @@ export default function ChatSessionList() {
     );
   };
 
+  const viewMenuButton = (
+    <button
+      type="button"
+      onClick={(event) => setViewMenuAnchor(event.currentTarget.getBoundingClientRect())}
+      aria-label={t("ChatSessionList.view.menuAriaLabel")}
+      aria-expanded={viewMenuAnchor !== null}
+      className={`shrink-0 rounded p-0.5 hover:bg-surface-2 hover:text-foreground ${
+        viewMenuAnchor || filtered ? "text-foreground" : "text-faint"
+      }`}
+    >
+      <SlidersHorizontal size={13} />
+    </button>
+  );
+
   return (
     <div>
       <div className="p-2">
-        <Button variant="secondary" size="md" onClick={() => newSession()} className="w-full justify-start">
+        <Button
+          variant="secondary"
+          size="md"
+          onClick={() => {
+            selectExternal(null);
+            newSession();
+          }}
+          className="w-full justify-start"
+        >
           <Plus size={16} className="shrink-0" />
           <span>{t("ChatSessionList.newSession")}</span>
         </Button>
       </div>
 
+      {viewMenuAnchor && (
+        <SessionListMenu
+          anchorRect={viewMenuAnchor}
+          environments={environments}
+          onClose={() => setViewMenuAnchor(null)}
+        />
+      )}
+
       {pinned.length > 0 && (
         <>
-          <h2 className="px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            {t("ChatSessionList.pinnedHeading")}
-          </h2>
+          <SectionHeading title={t("ChatSessionList.pinnedHeading")} />
           <div className="flex flex-col px-2 pb-2">{pinned.map(renderRow)}</div>
         </>
       )}
 
-      {groupedSections.map(({ group, items }) => (
-        <div key={group.id}>
-          <h2 className="px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-faint">
-            {group.name}
-          </h2>
-          <div className="flex flex-col px-2 pb-2">{items.map(renderRow)}</div>
-        </div>
-      ))}
+      {/* The view menu hangs off the first section's heading — the same row
+          it sits on in the desktop sidebar. With every section filtered away
+          there is no heading to hang it from, so an empty "Recents" one
+          carries it rather than stranding the user in a filtered list with
+          no way back. */}
+      {sections.length === 0 ? (
+        <>
+          <SectionHeading title={t("ChatSessionList.recentsHeading")} action={viewMenuButton} />
+          {filtered && (
+            <p className="px-3 pb-2 text-xs text-faint">{t("ChatSessionList.view.noMatches")}</p>
+          )}
+        </>
+      ) : (
+        sections.map((section, index) => (
+          <div key={section.id}>
+            <SectionHeading title={section.title} action={index === 0 ? viewMenuButton : undefined} />
+            {section.items.length > 0 ? (
+              <div className="flex flex-col px-2 pb-2">{section.items.map(renderRow)}</div>
+            ) : (
+              filtered && <p className="px-3 pb-2 text-xs text-faint">{t("ChatSessionList.view.noMatches")}</p>
+            )}
+          </div>
+        ))
+      )}
 
-      <h2 className="px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wider text-faint">
-        {t("ChatSessionList.recentsHeading")}
-      </h2>
-      {ungrouped.length > 0 && <div className="flex flex-col px-2 pb-2">{ungrouped.map(renderRow)}</div>}
-
-      {archivedSessions.length > 0 && (
+      {archivedRows.length > 0 && (
         <div className="px-2 pb-2">
           <button
             type="button"
             onClick={() => setArchivedOpen((prev) => !prev)}
             className="w-full px-1 pb-1 pt-2 text-left text-[11px] font-semibold uppercase tracking-wider text-faint hover:text-muted"
           >
-            {t("ChatSessionList.archivedHeading", { count: archivedSessions.length })}
+            {t("ChatSessionList.archivedHeading", { count: archivedRows.length })}
           </button>
-          {archivedOpen && <div className="flex flex-col">{archivedSessions.map(renderRow)}</div>}
+          {archivedOpen && <div className="flex flex-col">{archivedRows.map(renderRow)}</div>}
         </div>
       )}
     </div>
