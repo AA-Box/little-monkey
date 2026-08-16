@@ -2666,3 +2666,224 @@ async fn slack_reconnect_without_a_url_falls_back_to_a_fresh_open() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// The restart legs the matrix was missing
+// ---------------------------------------------------------------------------
+
+/// Slack Socket Mode across a real restart of the daemon's own state.
+///
+/// The existing Socket Mode tests prove the ACK is withheld until the insert
+/// commits, all within one process. This is the other half: the message *did*
+/// commit, the process died before the ACK went out, and Slack — which has
+/// heard nothing — reconnects and sends it again under a new envelope id.
+///
+/// The store is closed and reopened between the two lives, so what is being
+/// asserted is the durable state, not a value still sitting in memory. The
+/// second delivery must collapse onto the row the first one wrote: Slack's
+/// at-least-once redelivery is what makes an unacknowledged message safe, and
+/// the durable event id is the only thing that stops it becoming two runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_redelivery_after_a_restart_collapses_onto_the_committed_message() {
+    let paths = temp_daemon_paths();
+    let queue = FakeQueue::default();
+    {
+        let mut store = DaemonStore::open(&paths).expect("open");
+        seed_account_and_route(&mut store, "acct-sl", ChannelKind::Slack);
+        let ws = spawn_ws_fixture(vec![vec![
+            serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string(),
+        ]]);
+        let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+            (
+                200,
+                r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+            ),
+            (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+        ]);
+        let adapter = slack_adapter(&api_base);
+        let inject = ws.inject.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = inject.send(slack_event_envelope("env-a", "9000.001", "deploy please"));
+        });
+        // Everything durable happens; the ACK is a socket frame, and the
+        // process is about to die with it unsent.
+        let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW)
+            .await
+            .expect("poll");
+        assert_eq!(report.accepted, 1);
+        // CRASH: adapter, socket and store all go away together.
+    }
+
+    let mut store = DaemonStore::open(&paths).expect("reopen after restart");
+    let ws = spawn_ws_fixture(vec![vec![
+        serde_json::json!({ "type": "hello", "num_connections": 1 }).to_string(),
+    ]]);
+    let (api_base, _requests) = super::channel_adapter::test_http::serve(vec![
+        (
+            200,
+            r#"{"ok":true,"user_id":"UBOT","bot_id":"B1"}"#.to_string(),
+        ),
+        (200, format!(r#"{{"ok":true,"url":"{}"}}"#, ws.url)),
+    ]);
+    let adapter = slack_adapter(&api_base);
+    let inject = ws.inject.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // A new envelope id for the same message: exactly what Slack does when
+        // an ACK never arrived.
+        let _ = inject.send(slack_event_envelope("env-b", "9000.001", "deploy please"));
+    });
+    let report = poll_account_once(&mut store, &queue, "acct-sl", &adapter, NOW + 1)
+        .await
+        .expect("poll after restart");
+
+    assert_eq!(report.duplicates, 1, "the redelivery must collapse");
+    assert_eq!(report.accepted, 0);
+    // And the redelivery is acknowledged, so Slack stops resending it. A
+    // duplicate that is never ACKed is an infinite redelivery loop.
+    wait_for_frame(&ws.received, 20, "ACK for env-b", |_, frame| {
+        frame.get("envelope_id").and_then(Value::as_str) == Some("env-b")
+    })
+    .await;
+    assert_one_of_everything(&store, &queue, "acct-sl");
+}
+
+/// Matrix across a restart.
+///
+/// The SDK owns its own sync token, so nothing in this tree can crash between
+/// "the event arrived" and "the token advanced" — which is exactly why the
+/// durable event id has to be the thing that protects the run. A homeserver
+/// that replays a room event after a restart (the ordinary consequence of a
+/// sync token that did not advance) must not produce a second run.
+///
+/// Driven through `ingest_batch` with the envelope Matrix's own normalizer
+/// produces, and across a closed and reopened store, so what is asserted is
+/// the durable dedupe rather than an in-memory set.
+#[tokio::test]
+async fn matrix_replaying_a_room_event_after_a_restart_runs_it_once() {
+    use little_monkey_lib::channels::types::{ChannelConversation, ChannelEnvelope, ChannelSender};
+
+    let paths = temp_daemon_paths();
+    let queue = FakeQueue::default();
+    // A Matrix event id: globally unique, and the same on every replay, which
+    // is the property the whole guarantee rests on.
+    let envelope = ChannelEnvelope {
+        account_id: "acct-mx".into(),
+        kind: ChannelKind::Matrix,
+        provider_event_id: "$abcdef123456:example.org".into(),
+        conversation: ChannelConversation::direct("!room:example.org"),
+        sender: ChannelSender::new("@ada:example.org"),
+        text: "are we deploying today".into(),
+        attachments: Vec::new(),
+        reply_to_provider_id: None,
+        mentions_self: false,
+        received_at_ms: NOW,
+        metadata: Default::default(),
+    };
+
+    {
+        let mut store = DaemonStore::open(&paths).expect("open");
+        seed_account_and_route(&mut store, "acct-mx", ChannelKind::Matrix);
+        let report = ingest_batch(&mut store, &queue, std::slice::from_ref(&envelope), NOW);
+        assert_eq!(report.accepted, 1);
+        // CRASH.
+    }
+
+    let mut store = DaemonStore::open(&paths).expect("reopen after restart");
+    let report = ingest_batch(&mut store, &queue, std::slice::from_ref(&envelope), NOW + 1);
+    assert_eq!(report.duplicates, 1);
+    assert_eq!(report.accepted, 0);
+    assert_one_of_everything(&store, &queue, "acct-mx");
+}
+
+/// A spoken turn survives a restart and is not answered twice.
+///
+/// A Talk utterance becomes an ordinary durable turn keyed by
+/// `talk-<session generation>-<utterance index>`, and the queue's job id is
+/// derived from it. That key is what has to hold across a restart: the audio is
+/// gone the moment the socket dies, so the only thing standing between a
+/// re-submitted utterance and a second answer is the id.
+///
+/// The store is closed and reopened between the two submissions, so what is
+/// asserted is the durable job identity rather than an in-memory guard. Driven
+/// through `submit_conversation_turn` with the ingress `TalkTurns::submit`
+/// itself builds -- a Talk turn is not a special kind of turn, and that is the
+/// point of the test.
+#[tokio::test]
+async fn a_talk_turn_resubmitted_after_a_restart_answers_once() {
+    let paths = temp_daemon_paths();
+    let queue = FakeQueue::default();
+    // The identity the socket mints: a generation token, and this utterance's
+    // index within the session.
+    let ingress = super::mobile_chat_ingress(
+        "session-talk-1",
+        "talk-9f2c4a7b1d3e5f60-0",
+        "what is on today",
+        NOW,
+    );
+
+    let first = {
+        let mut store = DaemonStore::open(&paths).expect("open");
+        super::channel_ingress::submit_conversation_turn(&mut store, &queue, &ingress, &[], NOW)
+            .expect("first submission")
+    };
+    // CRASH: nothing of that process survives except the database.
+    let after_restart = {
+        let mut store = DaemonStore::open(&paths).expect("reopen after restart");
+        super::channel_ingress::submit_conversation_turn(
+            &mut store,
+            &queue,
+            &ingress,
+            &[],
+            NOW + 5_000,
+        )
+        .expect("resubmission after restart")
+    };
+
+    let job_of = |outcome: &super::channel_ingress::SubmitOutcome| match outcome {
+        super::channel_ingress::SubmitOutcome::Queued { job_id, .. }
+        | super::channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => job_id.clone(),
+        other => panic!("expected the turn to be queued, got {other:?}"),
+    };
+    assert_eq!(
+        job_of(&after_restart),
+        job_of(&first),
+        "the utterance's own identity is what keeps it one turn"
+    );
+    assert!(
+        matches!(
+            after_restart,
+            super::channel_ingress::SubmitOutcome::AlreadyQueued { .. }
+        ),
+        "the second submission must recognize the first: {after_restart:?}"
+    );
+
+    let store = DaemonStore::open(&paths).expect("reopen");
+    assert_eq!(
+        store.recent_ingress_turns(10).expect("turns").len(),
+        1,
+        "one utterance, one durable turn"
+    );
+    assert_eq!(distinct_runs(&queue), 1, "and one run");
+
+    // A *different* utterance in the same session is a different turn: the key
+    // must not be so coarse that it swallows the next thing somebody says.
+    let next = super::mobile_chat_ingress(
+        "session-talk-1",
+        "talk-9f2c4a7b1d3e5f60-1",
+        "and tomorrow",
+        NOW + 6_000,
+    );
+    let mut store = DaemonStore::open(&paths).expect("reopen");
+    let second = super::channel_ingress::submit_conversation_turn(
+        &mut store,
+        &queue,
+        &next,
+        &[],
+        NOW + 6_000,
+    )
+    .expect("second utterance");
+    assert_ne!(job_of(&second), job_of(&first));
+    assert_eq!(store.recent_ingress_turns(10).expect("turns").len(), 2);
+}

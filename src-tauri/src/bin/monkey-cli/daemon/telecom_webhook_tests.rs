@@ -774,3 +774,75 @@ async fn an_inbound_picture_is_acknowledged_first_and_downloaded_afterwards() {
         little_monkey_lib::channels::types::AttachmentSource::Url { .. }
     ));
 }
+
+/// A text that crashed between its event row and its turn, then arrived again.
+///
+/// The carrier's redelivery is the only thing that can repair this gap — nobody
+/// is going to send the message a second time by hand — so the rollback has to
+/// be total. A half-committed acceptance would make the redelivery look like a
+/// duplicate of something that never ran, and the text would be lost with the
+/// carrier told it arrived.
+///
+/// Every `post` here opens the daemon store from disk and closes it again, so
+/// the two lives really are two lives.
+#[tokio::test]
+async fn a_text_that_crashed_mid_acceptance_runs_exactly_once_when_the_carrier_retries() {
+    let (paths, _) = seeded(InboundCallPolicy::Reject);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551234567");
+    let carrier = carrier();
+    let (headers, body) = carrier.sign_inbound_sms("+15551234567", NUMBER, "did you get this");
+
+    // First life: the acceptance transaction rolls back after the event row
+    // and before the turn.
+    super::fail_points::arm(super::fail_points::FailPoint::AfterEventInsert);
+    let crashed = test_route::post(&paths, &path(), &headers, &body).await;
+    assert!(super::fail_points::fired());
+    assert_ne!(
+        crashed.status, 202,
+        "a text that left no durable trace must not be acknowledged, or the carrier never \
+         sends it again"
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .len(),
+        0,
+        "the rollback has to be total: a half-committed acceptance turns the carrier's retry \
+         into a duplicate of something that never ran"
+    );
+
+    // Second life: the carrier retries, and this time it commits.
+    let retried = test_route::post(&paths, &path(), &headers, &body).await;
+    assert_eq!(retried.status, 202);
+    let inbound: Vec<_> = store(&paths)
+        .recent_telecom_messages(ACCOUNT, 10)
+        .expect("recent")
+        .into_iter()
+        .filter(|message| matches!(message.direction, CallDirection::Inbound))
+        .collect();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "one text, however many attempts: {inbound:?}"
+    );
+
+    // And a third delivery of the same text -- a carrier that retried once too
+    // often -- adds nothing.
+    assert_eq!(
+        test_route::post(&paths, &path(), &headers, &body)
+            .await
+            .status,
+        202
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .into_iter()
+            .filter(|message| matches!(message.direction, CallDirection::Inbound))
+            .count(),
+        1
+    );
+}
