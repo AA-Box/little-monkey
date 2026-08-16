@@ -163,7 +163,8 @@ pub struct TelecomAccountRecord {
 }
 
 /// Which way a call was initiated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CallDirection {
     Inbound,
     Outbound,
@@ -244,6 +245,33 @@ pub struct OverdueCall {
     pub account_id: String,
     pub provider_call_id: Option<String>,
     pub breach: LimitBreach,
+}
+
+/// One recent text on a number, either direction.
+///
+/// `state` is whichever state that direction has: an inbound message's
+/// disposition from the messaging gate (`accepted`, `challenged`, `ignored`),
+/// an outbound one's outbox state (`queued`, `sent`, `failed`).
+/// `delivery_state` is the carrier's separate answer to "did it arrive?", and
+/// is `None` until a receipt lands — on a carrier or a number that sends none,
+/// it stays `None` forever, which is not the same as "not delivered".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelecomMessageRecord {
+    pub direction: CallDirection,
+    pub peer_number: String,
+    pub text: String,
+    pub state: String,
+    pub delivery_state: Option<String>,
+    pub error: Option<String>,
+    pub at_ms: i64,
+}
+
+/// How many carrier callbacks this account has refused since one last verified.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallbackRejections {
+    pub count: u32,
+    pub last_reason: Option<String>,
+    pub last_at_ms: Option<i64>,
 }
 
 /// Outcome of [`DaemonStore::record_telecom_event`].
@@ -525,6 +553,12 @@ impl DaemonStore {
     /// carrier callback must never resurrect a call this store already
     /// considers finished, because the finished state is what the approval
     /// and billing story downstream is built on.
+    ///
+    /// Refuses to move it BACKWARDS for the same reason. Carrier callbacks
+    /// arrive out of order, concurrently and more than once, so a `ringing`
+    /// landing after `in_progress` is a delayed duplicate of something already
+    /// known — see [`CallState::progress_rank`] for what a regression would
+    /// cost a call that is up and talking.
     pub fn advance_call(
         &mut self,
         call_id: &str,
@@ -552,10 +586,15 @@ impl DaemonStore {
                 "call '{call_id}' has unknown state '{current_state_token}'"
             ));
         };
-        if current_state.is_terminal() {
-            // A crashed daemon or a duplicated webhook can replay a callback
-            // after the call is already settled; changing nothing here is the
-            // correct outcome, not an error.
+        // A crashed daemon or a duplicated webhook can replay a callback after
+        // the call has already settled or already moved past that point;
+        // changing nothing is the correct outcome in both cases, not an error.
+        //
+        // A terminal state is the one thing that always applies to a call still
+        // running: a hangup may legitimately follow a ring the carrier never
+        // told us about, so it is compared by rank like everything else and
+        // wins by having the highest one.
+        if current_state.is_terminal() || state.progress_rank() <= current_state.progress_rank() {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(());
         }
@@ -791,6 +830,239 @@ impl DaemonStore {
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(result)
     }
+
+    // -- Delivery receipts ----------------------------------------------------
+
+    /// Apply a carrier's delivery receipt to the outbox row that produced the
+    /// message.
+    ///
+    /// Deliberately touches only the delivery columns. `state` stays `sent`:
+    /// the send succeeded, and letting a receipt move a row back toward the
+    /// retry machinery would turn "your carrier says the handset never got it"
+    /// into "text them again", which is a decision nobody made.
+    ///
+    /// `false` means no row matched — a receipt for a message this machine did
+    /// not send, or one whose provider id the carrier never returned. The
+    /// caller acknowledges it either way; there is nothing to retry.
+    pub fn record_delivery_receipt(
+        &mut self,
+        account_id: &str,
+        provider_message_id: &str,
+        delivered: bool,
+        error: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, String> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE channel_outbox
+                 SET delivery_state=?3, delivery_error=?4, delivered_at_ms=?5, updated_at_ms=?5
+                 WHERE account_id=?1 AND provider_message_id=?2",
+                params![
+                    account_id,
+                    provider_message_id,
+                    if delivered {
+                        "delivered"
+                    } else {
+                        "undelivered"
+                    },
+                    error,
+                    now_ms,
+                ],
+            )
+            .map_err(|error| format!("Failed to record a delivery receipt: {error}"))?;
+        Ok(changed > 0)
+    }
+
+    /// Recent texts on this number, both directions, newest first.
+    ///
+    /// Two tables because the two directions genuinely live in two places: an
+    /// inbound text is a `channel_events` row like every other provider's
+    /// message, and an outbound one is an outbox row. Merging them here rather
+    /// than in the UI keeps the ordering and the bound in one place — and the
+    /// bound matters, since this is read by a settings panel and not by
+    /// anything that pages.
+    pub fn recent_telecom_messages(
+        &self,
+        account_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TelecomMessageRecord>, String> {
+        let limit = limit.clamp(1, 200);
+        let mut messages = Vec::new();
+        let mut inbound = self
+            .connection
+            .prepare(
+                "SELECT sender_id, conversation_id, envelope_json, disposition, received_at_ms
+                 FROM channel_events
+                 WHERE account_id=?1 AND direction='inbound'
+                 ORDER BY received_at_ms DESC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = inbound
+            .query_map(params![account_id, i64::from(limit)], |row| {
+                let sender_id: Option<String> = row.get(0)?;
+                let conversation_id: String = row.get(1)?;
+                let envelope_json: String = row.get(2)?;
+                let disposition: String = row.get(3)?;
+                let received_at_ms: i64 = row.get(4)?;
+                Ok((
+                    sender_id,
+                    conversation_id,
+                    envelope_json,
+                    disposition,
+                    received_at_ms,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (sender_id, conversation_id, envelope_json, disposition, received_at_ms) =
+                row.map_err(|error| error.to_string())?;
+            let text = serde_json::from_str::<serde_json::Value>(&envelope_json)
+                .ok()
+                .and_then(|value| value.get("text")?.as_str().map(str::to_string))
+                .unwrap_or_default();
+            messages.push(TelecomMessageRecord {
+                direction: CallDirection::Inbound,
+                peer_number: sender_id.unwrap_or(conversation_id),
+                text: excerpt(&text),
+                state: disposition,
+                delivery_state: None,
+                error: None,
+                at_ms: received_at_ms,
+            });
+        }
+        let mut outbound = self
+            .connection
+            .prepare(
+                "SELECT conversation_id, payload_json, state, delivery_state, delivery_error,
+                        last_error, created_at_ms
+                 FROM channel_outbox
+                 WHERE account_id=?1
+                 ORDER BY created_at_ms DESC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = outbound
+            .query_map(params![account_id, i64::from(limit)], |row| {
+                let conversation_id: String = row.get(0)?;
+                let payload_json: String = row.get(1)?;
+                let state: String = row.get(2)?;
+                let delivery_state: Option<String> = row.get(3)?;
+                let delivery_error: Option<String> = row.get(4)?;
+                let last_error: Option<String> = row.get(5)?;
+                let created_at_ms: i64 = row.get(6)?;
+                Ok((
+                    conversation_id,
+                    payload_json,
+                    state,
+                    delivery_state,
+                    delivery_error,
+                    last_error,
+                    created_at_ms,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        for row in rows {
+            let (
+                conversation_id,
+                payload_json,
+                state,
+                delivery_state,
+                delivery_error,
+                last_error,
+                created_at_ms,
+            ) = row.map_err(|error| error.to_string())?;
+            let text = serde_json::from_str::<serde_json::Value>(&payload_json)
+                .ok()
+                .and_then(|value| value.get("text")?.as_str().map(str::to_string))
+                .unwrap_or_default();
+            messages.push(TelecomMessageRecord {
+                direction: CallDirection::Outbound,
+                peer_number: conversation_id,
+                text: excerpt(&text),
+                state,
+                delivery_state,
+                // A carrier's "never arrived" is the more specific answer, so
+                // it wins over whatever the send attempt last said.
+                error: delivery_error.or(last_error),
+                at_ms: created_at_ms,
+            });
+        }
+        messages.sort_by(|left, right| right.at_ms.cmp(&left.at_ms));
+        messages.truncate(limit as usize);
+        Ok(messages)
+    }
+
+    // -- Rejected callbacks ---------------------------------------------------
+
+    /// Count one callback this account refused at the door.
+    ///
+    /// Only the reason *code* is kept — never a header, never a byte of the
+    /// body. An unverified request is attacker-supplied, and a durable row
+    /// holding its content would be storage anybody could write. The count is
+    /// what an operator needs: a carrier posting to a URL whose signature never
+    /// verifies is almost always a callback URL that no longer matches the one
+    /// configured here, and there is no other signal that says so.
+    pub fn record_callback_rejection(
+        &mut self,
+        account_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE telecom_accounts
+                 SET rejected_callbacks = rejected_callbacks + 1,
+                     last_rejection = ?2,
+                     last_rejection_at_ms = ?3
+                 WHERE account_id=?1",
+                params![account_id, excerpt(reason), now_ms],
+            )
+            .map_err(|error| format!("Failed to record a rejected callback: {error}"))?;
+        Ok(())
+    }
+
+    /// Forget the rejections — called when a callback finally verifies, so the
+    /// count reads "since it last worked" rather than "ever".
+    pub fn clear_callback_rejections(&mut self, account_id: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE telecom_accounts
+                 SET rejected_callbacks = 0, last_rejection = NULL, last_rejection_at_ms = NULL
+                 WHERE account_id=?1 AND rejected_callbacks > 0",
+                [account_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn callback_rejections(&self, account_id: &str) -> Result<CallbackRejections, String> {
+        self.connection
+            .query_row(
+                "SELECT rejected_callbacks, last_rejection, last_rejection_at_ms
+                 FROM telecom_accounts WHERE account_id=?1",
+                [account_id],
+                |row| {
+                    Ok(CallbackRejections {
+                        count: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(u32::MAX),
+                        last_reason: row.get(1)?,
+                        last_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(Option::unwrap_or_default)
+    }
+}
+
+/// Keep a stored string short enough to read in a settings panel and small
+/// enough that nothing here becomes a place to park data.
+fn excerpt(value: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    value.chars().take(MAX_CHARS).collect::<String>() + "…"
 }
 
 fn read_telecom_account(
@@ -1128,6 +1400,59 @@ mod tests {
             .expect("late callback");
         let still_completed = store.telecom_call("call-1").expect("get").expect("present");
         assert_eq!(still_completed, completed);
+    }
+
+    /// A carrier is allowed to deliver its callbacks out of order, and a call
+    /// that is up and talking must not be walked backwards by one that took the
+    /// scenic route: the sweeper reads a call sitting in `ringing` as one still
+    /// waiting to be picked up and cuts it at `ring_timeout_s`.
+    #[test]
+    fn advance_call_ignores_out_of_order_progress() {
+        let mut store = seeded();
+        store
+            .start_call(&call("call-1", "acct-1", "idem-1", CallState::Queued))
+            .expect("start");
+
+        // call.answered arrives first: the far end picked up.
+        store
+            .advance_call("call-1", CallState::InProgress, Some("answered"), 1_200)
+            .expect("answered");
+        let answered = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(answered.state, CallState::InProgress);
+        assert_eq!(answered.started_at_ms, Some(1_200));
+
+        // The delayed call.initiated the carrier sent before it.
+        store
+            .advance_call("call-1", CallState::Queued, Some("initiated"), 1_300)
+            .expect("late initiated");
+        assert_eq!(
+            store
+                .telecom_call("call-1")
+                .expect("get")
+                .expect("present")
+                .state,
+            CallState::InProgress
+        );
+
+        // And the delayed ringing between them.
+        store
+            .advance_call("call-1", CallState::Ringing, Some("ringing"), 1_400)
+            .expect("late ringing");
+        let still_live = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(still_live.state, CallState::InProgress);
+        assert_eq!(still_live.started_at_ms, Some(1_200));
+        assert_eq!(still_live.ended_at_ms, None);
+        // Nothing about the call changed, down to the detail column.
+        assert_eq!(still_live, answered);
+
+        // Forward is still forward: a hangup lands even though the states
+        // between it and here never arrived.
+        store
+            .advance_call("call-1", CallState::Completed, Some("hangup"), 1_500)
+            .expect("hangup");
+        let ended = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(ended.state, CallState::Completed);
+        assert_eq!(ended.ended_at_ms, Some(1_500));
     }
 
     #[test]

@@ -43,9 +43,12 @@ pub struct InboundBatch {
 /// What an adapter needs to exist: the account row plus its resolved secret.
 pub struct AdapterConfig<'a> {
     pub account: &'a ChannelAccountRecord,
-    /// The credential, already read from the keychain. Empty when the account
-    /// has no `credential_ref`, which every adapter must reject in `probe`
-    /// rather than by panicking.
+    /// The credential, already read from the keychain. Empty only for the
+    /// providers [`credential_required`] answers `false` for — the ones that
+    /// hold their own keys — and every adapter must reject an empty one it did
+    /// need in `probe` rather than by panicking. Anything that verifies a
+    /// signature resolves it through [`resolve_credential`], which never hands
+    /// out an empty string at all.
     pub secret: String,
 }
 
@@ -850,6 +853,12 @@ pub fn attachment_mime(
 pub fn credential_required(account: &ChannelAccountRecord) -> bool {
     match account.kind {
         ChannelKind::Signal | ChannelKind::IMessage => false,
+        // The messaging half of a phone number holds no credential of its own:
+        // the carrier's lives on the telephony account, and texts go out
+        // through that carrier rather than through a channel adapter. Asking
+        // for one here would block an operator from enabling a number they
+        // already configured.
+        ChannelKind::Sms => false,
         ChannelKind::Irc => account
             .non_secret_config
             .get("use_sasl")
@@ -868,6 +877,35 @@ pub trait ChannelSecrets: Send + Sync {
     fn put(&self, credential_ref: &str, secret: &str) -> Result<(), String>;
     fn get(&self, credential_ref: &str) -> Result<String, String>;
     fn delete(&self, credential_ref: &str) -> Result<(), String>;
+}
+
+/// The credential an account's cryptography must use, or the reason there is
+/// none to use.
+///
+/// Every path that feeds a secret into a signature check or a token signer
+/// resolves it here, and none of them may substitute a default when the lookup
+/// comes back empty-handed. [`ChannelSecrets::put`] refuses to store an empty
+/// credential, so an empty read is never a stored one — it means the keychain
+/// entry is missing, unreadable, or was emptied out from under us.
+///
+/// Falling back to `""` there does not fail closed, it fails wide open: an HMAC
+/// verified under an empty key authenticates anyone who knows the callback URL,
+/// because they can compute the very same signature under the very same empty
+/// key. An account that cannot produce its credential must verify nothing and
+/// sign nothing.
+pub fn resolve_credential(
+    secrets: &dyn ChannelSecrets,
+    credential_ref: Option<&str>,
+) -> Result<String, String> {
+    let reference =
+        credential_ref.ok_or_else(|| "this account has no stored credential".to_string())?;
+    let secret = secrets.get(reference)?;
+    if secret.trim().is_empty() {
+        return Err(format!(
+            "the keychain entry '{reference}' holds no credential"
+        ));
+    }
+    Ok(secret)
 }
 
 /// Credentials seeded in-process for the tests that drive the production
@@ -980,6 +1018,33 @@ impl ChannelSecrets for MemoryChannelSecrets {
 #[cfg(test)]
 mod tests {
     use little_monkey_lib::channels::types::{AttachmentKind, AttachmentSource};
+
+    /// Nothing may turn a missing credential into a usable one. Each of these
+    /// is a way the keychain can come back empty-handed, and every one of them
+    /// has to stay an error: the callers feed this value straight into an HMAC,
+    /// where `""` is a key the whole internet already knows.
+    #[test]
+    fn a_credential_that_cannot_be_produced_is_never_an_empty_one() {
+        use super::{resolve_credential, ChannelSecrets, MemoryChannelSecrets};
+
+        let secrets = MemoryChannelSecrets::default();
+        secrets.put("real", "s3cret").expect("store");
+        // The store itself refuses an empty write, so a stored empty value can
+        // only arrive from outside — an entry emptied in the operator's
+        // keychain, or a keychain that answers with nothing at all.
+        secrets.put("emptied", "").expect("store");
+
+        assert_eq!(
+            resolve_credential(&secrets, Some("real")).expect("resolves"),
+            "s3cret"
+        );
+        assert!(resolve_credential(&secrets, None).is_err());
+        assert!(resolve_credential(&secrets, Some("missing")).is_err());
+        assert!(resolve_credential(&secrets, Some("emptied")).is_err());
+
+        secrets.put("blank", "   \n").expect("store");
+        assert!(resolve_credential(&secrets, Some("blank")).is_err());
+    }
 
     #[test]
     fn an_account_that_configures_nothing_gets_the_defaults() {
@@ -1244,6 +1309,17 @@ mod tests {
         for kind in [ChannelKind::Signal, ChannelKind::IMessage] {
             assert!(!credential_required(&account(kind, serde_json::json!({}))));
         }
+    }
+
+    #[test]
+    fn the_messaging_half_of_a_phone_number_holds_no_credential() {
+        // The carrier credential lives on the telephony account and texts go
+        // out through that carrier. Demanding one here would leave an operator
+        // unable to enable a number they had already finished configuring.
+        assert!(!credential_required(&account(
+            ChannelKind::Sms,
+            serde_json::json!({"from_number": "+15550001111"})
+        )));
     }
 
     #[test]

@@ -39,13 +39,15 @@ const BASE: TelecomAccount = {
     recording_enabled: false,
   },
   health: { state: "disconnected", detail: null, last_error: null, probed_at_ms: 0 },
+  callback_rejections: { count: 0, last_reason: null, last_at_ms: null },
   updated_at_ms: 0,
 };
 
-function mockAccounts(accounts: TelecomAccount[]) {
+function mockAccounts(accounts: TelecomAccount[], messages: unknown[] = []) {
   invoke.mockImplementation((command: string) => {
     if (command === "telecom_list") return Promise.resolve(accounts);
     if (command === "telecom_calls") return Promise.resolve([]);
+    if (command === "telecom_messages") return Promise.resolve(messages);
     return Promise.resolve(null);
   });
 }
@@ -116,6 +118,113 @@ describe("TelephonyPanel", () => {
       if (command === "telecom_set_credential") continue;
       expect(JSON.stringify(args ?? {})).not.toContain("super-secret-token");
     }
+  });
+
+  it("copies the callback URL rather than making the operator retype it", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    fireEvent.click(await screen.findByText("Copy"));
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("https://calls.example.test/v1/telecom/tel-1");
+    });
+  });
+
+  it("lets an operator move the callback URL when their tunnel moves", async () => {
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    fireEvent.change(await screen.findByLabelText(/Where your carrier reaches/i), {
+      target: { value: "https://new-tunnel.example.test" },
+    });
+    fireEvent.click(screen.getByText("Save URL"));
+
+    await waitFor(() => {
+      expect(
+        invoke.mock.calls.some(
+          ([command, args]) =>
+            command === "telecom_set_public_url" &&
+            (args as { url: string | null }).url === "https://new-tunnel.example.test",
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("lets a rotated carrier key be saved without deleting the number", async () => {
+    mockAccounts([{ ...BASE, kind: "telnyx", kind_label: "Telnyx" }]);
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    fireEvent.change(await screen.findByLabelText(/Update carrier settings/i), {
+      target: { value: '{"webhook_public_key": "rotated"}' },
+    });
+    fireEvent.click(screen.getByText("Save settings"));
+
+    await waitFor(() => {
+      expect(
+        invoke.mock.calls.some(
+          ([command, args]) =>
+            command === "telecom_set_public_url" &&
+            (args as { config: string | null }).config === '{"webhook_public_key": "rotated"}',
+        ),
+      ).toBe(true);
+    });
+  });
+
+  it("says when a carrier's callbacks are being refused, which nothing else shows", async () => {
+    mockAccounts([
+      {
+        ...BASE,
+        health: { state: "connected", detail: null, last_error: null, probed_at_ms: 1 },
+        callback_rejections: {
+          count: 7,
+          last_reason: "Twilio signature verification failed",
+          last_at_ms: 2,
+        },
+      },
+    ]);
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    expect(await screen.findByText(/7 callback\(s\)/)).toBeTruthy();
+    expect(screen.getByText("Twilio signature verification failed")).toBeTruthy();
+  });
+
+  it("shows a text the carrier says never arrived as more than sent", async () => {
+    mockAccounts(
+      [BASE],
+      [
+        {
+          direction: "outbound",
+          peer_number: "+15551234567",
+          text: "on my way",
+          state: "sent",
+          delivery_state: "undelivered",
+          error: "Twilio reported undelivered (error 30006)",
+          at_ms: 3,
+        },
+        {
+          direction: "inbound",
+          peer_number: "+15551234567",
+          text: "are you there",
+          state: "accepted",
+          delivery_state: null,
+          error: null,
+          at_ms: 2,
+        },
+      ],
+    );
+    render(<TelephonyPanel />);
+    fireEvent.click(await screen.findByText("+15550000000"));
+
+    expect(await screen.findByText(/on my way/)).toBeTruthy();
+    expect(screen.getByText(/are you there/)).toBeTruthy();
+    // "sent" is the send succeeding; "undelivered" is the carrier saying no
+    // handset got it, and it is the one an operator is looking for.
+    expect(screen.getByText("undelivered")).toBeTruthy();
   });
 
   it("shows the callback URL a carrier has to be pointed at", async () => {

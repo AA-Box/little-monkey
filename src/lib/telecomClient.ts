@@ -49,7 +49,31 @@ export interface TelecomAccount {
     last_error: string | null;
     probed_at_ms: number;
   };
+  /** Callbacks this account has refused since one last verified. A carrier
+   * posting to a URL whose signature never checks out has no other symptom:
+   * texts and calls simply never arrive. */
+  callback_rejections: {
+    count: number;
+    last_reason: string | null;
+    last_at_ms: number | null;
+  };
   updated_at_ms: number;
+}
+
+/** One recent text on a number, either direction. */
+export interface TelecomMessage {
+  direction: "inbound" | "outbound";
+  peer_number: string;
+  text: string;
+  /** The disposition an inbound message got from the messaging gate, or the
+   * outbox state an outbound one is in. */
+  state: string;
+  /** The carrier's separate answer to "did it arrive?". `null` until a receipt
+   * lands — and forever on a carrier that sends none, which is not the same as
+   * "not delivered". */
+  delivery_state: string | null;
+  error: string | null;
+  at_ms: number;
 }
 
 export interface TelecomCall {
@@ -160,6 +184,15 @@ export const telecomSetLimits = (
   });
 export const telecomSetGreeting = (accountId: string, text: string) =>
   invoke<void>("telecom_set_greeting", { accountId, text });
+export const telecomMessages = (accountId: string, limit = 20) =>
+  invoke<TelecomMessage[]>("telecom_messages", { accountId, limit });
+/** Point a carrier somewhere else, or update its non-secret settings. Passing
+ * neither clears the public URL. */
+export const telecomSetPublicUrl = (
+  accountId: string,
+  url: string | null,
+  config: string | null = null,
+) => invoke<void>("telecom_set_public_url", { accountId, url, config });
 export const telecomCalls = (accountId: string, limit = 20) =>
   invoke<TelecomCall[]>("telecom_calls", { accountId, limit });
 export const telecomCallbackUrl = (accountId: string) =>
@@ -172,6 +205,33 @@ export const telecomRemove = (accountId: string) => invoke<void>("telecom_remove
  * public base URL they configured. */
 export function callbackPath(accountId: string): string {
   return `/v1/telecom/${accountId}`;
+}
+
+/** Where a carrier reports what became of a message or a call, as opposed to
+ * asking what to do with a live one.
+ *
+ * Two paths because the replies differ: the answer URL is answered with the
+ * markup that connects a call, and this one with an acknowledgement. Every
+ * outbound request this app makes already carries it; an operator only needs
+ * it for their number's own status callbacks. */
+export function statusCallbackPath(accountId: string): string {
+  return `${callbackPath(accountId)}/status`;
+}
+
+/** The full URL the operator pastes into their carrier's console, or `null`
+ * when they have not configured a public base yet.
+ *
+ * The daemon rebuilds this exact string to check a Twilio or Plivo signature,
+ * so a console pointed at anything else rejects every genuine callback. */
+export function callbackUrl(account: TelecomAccount): string | null {
+  if (account.public_base_url === null) return null;
+  return `${account.public_base_url.replace(/\/$/, "")}${callbackPath(account.account_id)}`;
+}
+
+/** The status-callback URL under the operator's own public base. */
+export function statusCallbackUrl(account: TelecomAccount): string | null {
+  if (account.public_base_url === null) return null;
+  return `${account.public_base_url.replace(/\/$/, "")}${statusCallbackPath(account.account_id)}`;
 }
 
 /** Whether this account can actually hold a conversation, as opposed to only
@@ -196,5 +256,8 @@ export function setupGaps(account: TelecomAccount): string[] {
   if (account.health.state !== "connected") gaps.push("probe");
   // A number that answers without a greeting connects the caller to silence.
   if (account.inbound_policy !== "reject" && !account.greeting) gaps.push("greeting");
+  // Everything above can look right while the carrier's own console points
+  // somewhere else, and this is the only symptom of that.
+  if (account.callback_rejections.count > 0) gaps.push("callbacks_rejected");
   return gaps;
 }

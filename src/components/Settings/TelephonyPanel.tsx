@@ -2,9 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AlertTriangle,
+  Check,
+  Copy,
   ExternalLink,
   KeyRound,
+  Link2,
   Loader2,
+  MessageSquare,
   Phone,
   Plug,
   Power,
@@ -16,17 +20,22 @@ import {
   type OutboundCallApproval,
   type TelecomAccount,
   type TelecomCall,
+  type TelecomMessage,
   callbackPath,
+  callbackUrl,
+  statusCallbackUrl,
   telecomAdd,
   telecomCalls,
   telecomEnable,
   telecomList,
+  telecomMessages,
   telecomProbe,
   telecomRemove,
   telecomSetCredential,
   telecomSetGreeting,
   telecomSetLimits,
   telecomSetPolicy,
+  telecomSetPublicUrl,
 } from "../../lib/telecomClient";
 import type { ChannelHealthState } from "../../lib/channelsClient";
 import { Button } from "../ui";
@@ -50,6 +59,10 @@ export function TelephonyPanel() {
   const [accounts, setAccounts] = useState<TelecomAccount[] | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [calls, setCalls] = useState<TelecomCall[]>([]);
+  const [messages, setMessages] = useState<TelecomMessage[]>([]);
+  const [copied, setCopied] = useState(false);
+  const [publicUrl, setPublicUrl] = useState("");
+  const [config, setConfig] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -80,7 +93,12 @@ export function TelephonyPanel() {
 
   const loadCalls = useCallback(async (accountId: string) => {
     try {
-      setCalls(await telecomCalls(accountId, 20));
+      const [recentCalls, recentMessages] = await Promise.all([
+        telecomCalls(accountId, 20),
+        telecomMessages(accountId, 20),
+      ]);
+      setCalls(recentCalls);
+      setMessages(recentMessages);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -93,6 +111,9 @@ export function TelephonyPanel() {
   useEffect(() => {
     const account = accounts?.find((entry) => entry.account_id === selected);
     setGreeting(account?.greeting ?? "");
+    setPublicUrl(account?.public_base_url ?? "");
+    setConfig("");
+    setCopied(false);
   }, [selected, accounts]);
 
   const run = useCallback(
@@ -265,14 +286,105 @@ export function TelephonyPanel() {
             </p>
           )}
 
-          <p className="mt-3 border-t border-border pt-3 text-xs text-muted">
-            {t("TelephonyPanel.callbackHint")}{" "}
-            <code className="rounded bg-background px-1 py-0.5 text-xs">
-              {account.public_base_url
-                ? `${account.public_base_url.replace(/\/$/, "")}${callbackPath(account.account_id)}`
-                : callbackPath(account.account_id)}
+          <div className="mt-3 border-t border-border pt-3">
+            <p className="text-xs text-muted">{t("TelephonyPanel.callbackHint")}</p>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded bg-background px-1 py-1 text-xs">
+                {callbackUrl(account) ?? callbackPath(account.account_id)}
+              </code>
+              <Button
+                size="sm"
+                disabled={callbackUrl(account) === null}
+                onClick={() => {
+                  const url = callbackUrl(account);
+                  if (url === null) return;
+                  void navigator.clipboard.writeText(url).then(() => setCopied(true));
+                }}
+              >
+                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? t("TelephonyPanel.copied") : t("TelephonyPanel.copyCallbackUrl")}
+              </Button>
+            </div>
+            <p className="mt-2 text-xs text-muted">{t("TelephonyPanel.statusHint")}</p>
+            <code className="mt-1 block truncate rounded bg-background px-1 py-1 text-xs">
+              {statusCallbackUrl(account) ?? `${callbackPath(account.account_id)}/status`}
             </code>
-          </p>
+            {/* The URL a carrier posts to is what its signature covers, so a
+                tunnel that moved rejects every genuine callback until this is
+                fixed — which is why it is editable here and not only at setup. */}
+            <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end">
+              <label className="min-w-0 flex-1 text-xs text-muted">
+                {t("TelephonyPanel.publicUrlEdit")}
+                <input
+                  className={`${INPUT} mt-1`}
+                  value={publicUrl}
+                  onChange={(event) => setPublicUrl(event.target.value)}
+                  placeholder="https://calls.example.com"
+                />
+              </label>
+              <Button
+                size="sm"
+                disabled={busy !== null || publicUrl.trim() === (account.public_base_url ?? "")}
+                onClick={() =>
+                  void run(
+                    "publicUrl",
+                    () => telecomSetPublicUrl(account.account_id, publicUrl.trim() || null),
+                    t("TelephonyPanel.publicUrlSaved"),
+                  )
+                }
+              >
+                <Link2 size={14} />
+                {t("TelephonyPanel.savePublicUrl")}
+              </Button>
+            </div>
+            {/* A carrier rotates its published key and every callback stops
+                verifying. Without this the only fix would be deleting the
+                number and losing its history. */}
+            {guide && guide.configKeys.length > 0 && (
+              <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end">
+                <label className="min-w-0 flex-1 text-xs text-muted">
+                  {t("TelephonyPanel.settingsJsonEdit")} ({guide.configKeys.join(", ")})
+                  <input
+                    className={`${INPUT} mt-1`}
+                    value={config}
+                    onChange={(event) => setConfig(event.target.value)}
+                    placeholder={`{"${guide.configKeys[0]}": "…"}`}
+                  />
+                </label>
+                <Button
+                  size="sm"
+                  disabled={busy !== null || config.trim().length === 0}
+                  onClick={() =>
+                    void run(
+                      "config",
+                      async () => {
+                        await telecomSetPublicUrl(account.account_id, publicUrl.trim() || null, config.trim());
+                        setConfig("");
+                      },
+                      t("TelephonyPanel.settingsSaved"),
+                    )
+                  }
+                >
+                  {t("TelephonyPanel.saveSettings")}
+                </Button>
+              </div>
+            )}
+            {account.callback_rejections.count > 0 && (
+              <p className="mt-2 flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">
+                <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                <span>
+                  {t("TelephonyPanel.callbacksRejected", {
+                    count: account.callback_rejections.count,
+                  })}
+                  {account.callback_rejections.last_reason && (
+                    <span className="block text-faint">
+                      {account.callback_rejections.last_reason}
+                    </span>
+                  )}
+                </span>
+              </p>
+            )}
+          </div>
 
           <div className="mt-3 grid gap-3 border-t border-border pt-3 sm:grid-cols-2">
             <label className="text-xs text-muted">
@@ -419,6 +531,42 @@ export function TelephonyPanel() {
               ? t("TelephonyPanel.recordingHint")
               : t("TelephonyPanel.recordingUnsupported")}
           </p>
+
+          <div className="mt-3 border-t border-border pt-3">
+            <h5 className="text-xs font-semibold">{t("TelephonyPanel.recentMessages")}</h5>
+            {messages.length === 0 ? (
+              <p className="mt-1 text-xs text-muted">{t("TelephonyPanel.noMessages")}</p>
+            ) : (
+              <ul className="mt-2 flex flex-col gap-1">
+                {messages.map((message) => (
+                  <li
+                    key={`${message.direction}-${message.at_ms}-${message.peer_number}-${message.text}`}
+                    className="flex items-center justify-between gap-2 text-xs"
+                  >
+                    <span className="min-w-0 truncate">
+                      <MessageSquare size={11} className="mr-1 inline" />
+                      {message.direction === "inbound"
+                        ? t("TelephonyPanel.inbound")
+                        : t("TelephonyPanel.outbound")}{" "}
+                      {message.peer_number} — {message.text}
+                    </span>
+                    {/* A carrier's "never arrived" is a different answer from
+                        "we sent it", and the one an operator is looking for. */}
+                    <span
+                      className={
+                        message.delivery_state === "undelivered" || message.error
+                          ? "shrink-0 text-danger"
+                          : "shrink-0 text-faint"
+                      }
+                      title={message.error ?? undefined}
+                    >
+                      {message.delivery_state ?? message.state}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
 
           <div className="mt-3 border-t border-border pt-3">
             <h5 className="text-xs font-semibold">{t("TelephonyPanel.recentCalls")}</h5>
