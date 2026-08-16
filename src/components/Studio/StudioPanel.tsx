@@ -45,6 +45,7 @@ import {
   formatBytes,
   isSpeechTask,
   isVideoTask,
+  alignDimension,
   needsInitImage,
   normalizeDimension,
   normalizeVideoFrames,
@@ -164,6 +165,14 @@ function SliderField({
           value={value}
           onChange={(event) => onChange(Number(event.target.value))}
           onBlur={snap ? () => onChange(snap(value)) : undefined}
+          // Enter is how a typed size is confirmed without leaving the field.
+          onKeyDown={
+            snap
+              ? (event) => {
+                  if (event.key === "Enter") onChange(snap(value));
+                }
+              : undefined
+          }
           className="w-16 shrink-0 rounded border border-border bg-background px-1.5 py-1 text-center text-xs text-foreground"
         />
       </span>
@@ -698,8 +707,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
       // Aligned here as well as on the controls: a model may list defaults the
       // engine cannot render as given, and the form must not open on a size
       // that is not the one it would generate.
-      width: normalizeDimension(selected.defaults.width),
-      height: normalizeDimension(selected.defaults.height),
+      width: alignDimension(selected.defaults.width),
+      height: alignDimension(selected.defaults.height),
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
       sampler: selected.defaults.sampleMethod,
@@ -853,16 +862,18 @@ export function StudioPanel({ mode, railSlot }: Props) {
 
   /** The one way the canvas size is set from the controls.
    *
-   *  The engine rounds every edge up to a multiple of 32, so the form holds
-   *  the size that will really be rendered — a field reading 645 beside a
-   *  picture generated at 672 reports a canvas that never existed. */
+   *  The engine renders on a 32-pixel grid, so the form holds a size on that
+   *  grid — a field reading 645 beside a picture generated at 672 reports a
+   *  canvas that never existed. Nearest rather than up: the backend rounds up
+   *  because it has to do something with a number it is handed, but a control
+   *  knows what was asked for, and 640 is the closer answer to 645. */
   const setCanvas = (width: number, height: number) =>
     setSettings((current) =>
       current
         ? {
             ...current,
-            width: normalizeDimension(width),
-            height: normalizeDimension(height),
+            width: alignDimension(width),
+            height: alignDimension(height),
           }
         : current,
     );
@@ -1783,7 +1794,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   min={64}
                   max={2048}
                   step={32}
-                  snap={normalizeDimension}
+                  snap={alignDimension}
                   onChange={(width) => setSettings({ ...settings, width })}
                 />
                 <SliderField
@@ -1796,7 +1807,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   // canvas that will really be rendered — which is what the
                   // fields hold too, once a typed value has been committed.
                   hint={`${normalizeDimension(settings.width)}×${normalizeDimension(settings.height)}`}
-                  snap={normalizeDimension}
+                  snap={alignDimension}
                   onChange={(height) => setSettings({ ...settings, height })}
                 />
               </div>
