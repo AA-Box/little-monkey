@@ -2063,6 +2063,11 @@ fn the_outbox_drain_is_the_only_production_caller_of_adapter_send() {
             || name == "channel_tool.rs"
             || name == "channel_ingress.rs"
             || name == "channel_worker.rs"
+            // A `*_tests.rs` module exists only under `cfg(test)` and ships in
+            // no build, so a fixture row staged there is not a production
+            // producer. The invariant this guards is about what a release
+            // binary can write, and a new production module still fails here.
+            || name.ends_with("_tests.rs")
     };
     let mut offenders = Vec::new();
     let mut enqueue_offenders = Vec::new();

@@ -13,10 +13,11 @@
 //!
 //! Like Twilio's, Plivo's signature covers a URL this module is never handed
 //! directly — `verify_webhook` receives only headers, a body and a clock
-//! reading (see `mod.rs`'s trait doc). [`WEBHOOK_PATH`] is the fixed path
-//! this provider assumes the operator's Plivo application points its
-//! message/answer URLs at, combined with [`TelecomConfig::public_base_url`]
-//! (never a `Host` or `X-Forwarded-*` header).
+//! reading (see `mod.rs`'s trait doc). It is [`super::callback_path`] under
+//! [`TelecomConfig::public_base_url`] — the same function the listener routes
+//! on and the setup UI tells the operator to paste into their Plivo
+//! application, so the three cannot drift apart. The base is never a `Host` or
+//! `X-Forwarded-*` header.
 //!
 //! # Multiple signatures, any one valid
 //!
@@ -35,6 +36,7 @@ use little_monkey_lib::channels::types::{
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, SendOutcome,
 };
 
+use super::super::telecom_store::CallDirection;
 use super::{
     AnswerDocument, CallHandle, CallState, TelecomConfig, TelecomEvent, TelecomKind,
     TelecomProvider,
@@ -42,10 +44,10 @@ use super::{
 
 const API_BASE: &str = "https://api.plivo.com/v1";
 
-/// See the module doc's "Reconstructing the signed URL" section.
-const WEBHOOK_PATH: &str = "/webhooks/telephony/plivo";
-
 pub struct PlivoProvider {
+    /// This app's own id for the account, which is what its callback path is
+    /// keyed by. See the module doc's "Reconstructing the signed URL".
+    account_id: String,
     auth_id: String,
     auth_token: String,
     from_number: String,
@@ -57,6 +59,7 @@ pub struct PlivoProvider {
 impl PlivoProvider {
     pub fn new(config: TelecomConfig) -> Self {
         Self {
+            account_id: config.account_id,
             auth_id: config.carrier_account_id,
             auth_token: config.secret,
             from_number: config.from_number,
@@ -100,11 +103,21 @@ impl PlivoProvider {
         )
     }
 
-    fn webhook_url(&self) -> Result<String, String> {
+    /// The URL Plivo signed: the operator's configured base plus the exact
+    /// path this daemon served. An answer request and a hangup notice arrive on
+    /// different paths and are signed over different URLs.
+    fn signed_url(&self, path: &str) -> Result<String, String> {
         let base = self.public_base_url.as_deref().ok_or_else(|| {
             "no public base URL is configured; cannot verify a Plivo webhook signature".to_string()
         })?;
-        Ok(format!("{}{WEBHOOK_PATH}", base.trim_end_matches('/')))
+        Ok(format!("{}{path}", base.trim_end_matches('/')))
+    }
+
+    /// Where Plivo is told to report delivery reports and call lifecycle.
+    fn status_callback(&self) -> Option<String> {
+        self.public_base_url
+            .as_deref()
+            .map(|base| super::status_callback_url(base, &self.account_id))
     }
 }
 
@@ -200,6 +213,11 @@ impl TelecomProvider for PlivoProvider {
             body["media_urls"] = serde_json::json!(media_urls);
             body["type"] = serde_json::json!("mms");
         }
+        // Plivo sends a delivery report only to the URL the message names.
+        if let Some(status) = self.status_callback() {
+            body["url"] = serde_json::json!(status);
+            body["method"] = serde_json::json!("POST");
+        }
         let request = client
             .post(self.message_url())
             .basic_auth(&self.auth_id, Some(&self.auth_token))
@@ -254,7 +272,11 @@ impl TelecomProvider for PlivoProvider {
         to_number: &str,
         answer_url: &str,
         record: bool,
+        idempotency_key: &str,
     ) -> Result<CallHandle, String> {
+        // No caller-supplied dedupe key on this carrier's call API; the outbox
+        // row's own state machine is what stops a second dial.
+        let _ = idempotency_key;
         if record {
             // Plivo records with a `<Record>` element in the call flow, which
             // cannot run alongside the bidirectional stream this call needs.
@@ -266,12 +288,21 @@ impl TelecomProvider for PlivoProvider {
             );
         }
         let client = self.client()?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "from": self.from_number,
             "to": to_number,
             "answer_url": answer_url,
             "answer_method": "POST",
         });
+        // Plivo reports a call's life only to the URLs the request names.
+        // Without these the call store never learns that the phone rang, was
+        // answered, or hung up.
+        if let Some(status) = self.status_callback() {
+            body["ring_url"] = serde_json::json!(status);
+            body["ring_method"] = serde_json::json!("POST");
+            body["hangup_url"] = serde_json::json!(status);
+            body["hangup_method"] = serde_json::json!("POST");
+        }
         let request = client
             .post(self.call_url())
             .basic_auth(&self.auth_id, Some(&self.auth_token))
@@ -326,26 +357,76 @@ impl TelecomProvider for PlivoProvider {
 
     fn verify_webhook(
         &self,
+        path: &str,
         headers: &[(String, String)],
         body: &[u8],
         now_ms: i64,
     ) -> Result<TelecomEvent, String> {
-        let signature_header = header(headers, "X-Plivo-Signature-V3")
-            .ok_or_else(|| "missing X-Plivo-Signature-V3 header".to_string())?;
-        let nonce = header(headers, "X-Plivo-Signature-V3-Nonce")
-            .ok_or_else(|| "missing X-Plivo-Signature-V3-Nonce header".to_string())?;
-        let url = self.webhook_url()?;
-        let signed_message = format!("{url}{nonce}");
-        plivo_verify_any(&self.auth_token, &signed_message, signature_header)?;
+        let url = self.signed_url(path)?;
+        // A `BTreeMap` iterates in sorted key order, which is the order V3
+        // signs the parameters in.
         let params: std::collections::BTreeMap<String, String> = url::form_urlencoded::parse(body)
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
-        normalize_plivo_params(&params, now_ms)
+        let signed_message = plivo_signed_message(headers, &url, &params)?;
+        plivo_verify_any(
+            &self.auth_token,
+            &signed_message.message,
+            &signed_message.header,
+        )?;
+        normalize_plivo_params(&params, path.ends_with("/status"), now_ms)
     }
 }
 
-/// Verifies `signature_header` (`X-Plivo-Signature-V3`, possibly several
-/// comma-separated base64 signatures during a key rotation) against
+/// What a Plivo callback proves knowledge of, and the header carrying the
+/// proof.
+struct PlivoSignedMessage {
+    message: String,
+    header: String,
+}
+
+/// Build the exact string this callback's signature covers.
+///
+/// Plivo signs two ways and sends both, on different products. V3 — voice —
+/// signs the URL, then every POST parameter as `key` immediately followed by
+/// `value` in sorted key order, then the nonce. V2 — messaging — signs the URL
+/// and the nonce only. Accepting only one of them meant one of SMS and voice
+/// could never verify on the shared endpoint, and computing V3 without the
+/// parameters meant a genuine voice callback never verified at all.
+fn plivo_signed_message(
+    headers: &[(String, String)],
+    url: &str,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<PlivoSignedMessage, String> {
+    if let (Some(signature), Some(nonce)) = (
+        header(headers, "X-Plivo-Signature-V3"),
+        header(headers, "X-Plivo-Signature-V3-Nonce"),
+    ) {
+        let mut message = String::from(url);
+        for (key, value) in params {
+            message.push_str(key);
+            message.push_str(value);
+        }
+        message.push_str(nonce);
+        return Ok(PlivoSignedMessage {
+            message,
+            header: signature.to_string(),
+        });
+    }
+    if let (Some(signature), Some(nonce)) = (
+        header(headers, "X-Plivo-Signature-V2"),
+        header(headers, "X-Plivo-Signature-V2-Nonce"),
+    ) {
+        return Ok(PlivoSignedMessage {
+            message: format!("{url}{nonce}"),
+            header: signature.to_string(),
+        });
+    }
+    Err("missing X-Plivo-Signature-V3 or X-Plivo-Signature-V2 header".to_string())
+}
+
+/// Verifies `signature_header` (possibly several comma-separated base64
+/// signatures during a key rotation) against
 /// `signed_message` with `auth_token`, accepting if any candidate verifies.
 fn plivo_verify_any(
     auth_token: &str,
@@ -387,16 +468,53 @@ struct PlivoMedia {
     media_url: String,
 }
 
+/// Plivo's terminal message states, and whether each means it arrived.
+///
+/// `queued` and `sent` are Plivo saying it has the message, not that a handset
+/// does; only the states below are an answer.
+fn plivo_delivery(status: &str) -> Option<bool> {
+    match status {
+        "delivered" => Some(true),
+        "undelivered" | "failed" | "rejected" => Some(false),
+        _ => None,
+    }
+}
+
 fn normalize_plivo_params(
     params: &std::collections::BTreeMap<String, String>,
+    on_status_path: bool,
     received_at_ms: i64,
 ) -> Result<TelecomEvent, String> {
+    // A delivery report carries the same `MessageUUID` as the message it is
+    // about plus a `Status`. Checked before the inbound arm for the reason
+    // Twilio's is: an inbound text has no `Status`, and reading a report as a
+    // text would hand the agent an empty message from the person we just
+    // texted.
+    if let (Some(message_uuid), Some(status)) = (
+        params
+            .get("MessageUUID")
+            .or_else(|| params.get("ParentMessageUUID")),
+        params.get("Status"),
+    ) {
+        let Some(delivered) = plivo_delivery(status) else {
+            return Ok(TelecomEvent::Ignored);
+        };
+        return Ok(TelecomEvent::SmsStatus {
+            provider_message_id: message_uuid.clone(),
+            delivered,
+            error: (!delivered).then(|| match params.get("ErrorCode") {
+                Some(code) => format!("Plivo reported {status} (error {code})"),
+                None => format!("Plivo reported {status}"),
+            }),
+        });
+    }
     if let Some(message_uuid) = params.get("MessageUUID") {
-        let from = params
-            .get("From")
-            .cloned()
-            .ok_or_else(|| "Plivo inbound SMS is missing From".to_string())?;
-        let to = params.get("To").cloned().unwrap_or_default();
+        let from = super::normalize_e164(
+            params
+                .get("From")
+                .ok_or_else(|| "Plivo inbound SMS is missing From".to_string())?,
+        );
+        let to = super::normalize_e164(params.get("To").map(String::as_str).unwrap_or_default());
         let text = params.get("Text").cloned().unwrap_or_default();
         // MMS: Plivo posts the media as a JSON array of {content_type, media_url}
         // in `Media`. Metadata only — the bytes are fetched later under the
@@ -444,13 +562,43 @@ fn normalize_plivo_params(
         };
         return Ok(TelecomEvent::InboundSms(Box::new(envelope)));
     }
-    if let (Some(call_uuid), Some(call_status)) = (params.get("CallUUID"), params.get("CallStatus"))
-    {
-        if let Some(state) = plivo_call_status_to_state(call_status) {
+    if let Some(call_uuid) = params.get("CallUUID") {
+        let inbound = params
+            .get("Direction")
+            .is_some_and(|direction| direction.starts_with("inbound"));
+        // The answer URL asks what to do with a live call; ring and hangup URLs
+        // report what became of one. Only the path separates them, and the
+        // reply to the first is the markup that connects the audio.
+        if !on_status_path {
+            return Ok(TelecomEvent::AnswerRequest {
+                provider_call_id: call_uuid.clone(),
+                // Plivo answered the dial with a `RequestUUID` and identifies
+                // the live call by `CallUUID`. The row was written under the
+                // first, so the second has to arrive with it or the outbound
+                // call can never be found, advanced or hung up.
+                request_id: params.get("RequestUUID").cloned(),
+                direction: if inbound {
+                    CallDirection::Inbound
+                } else {
+                    CallDirection::Outbound
+                },
+                from_number: super::normalize_e164(
+                    params.get("From").map(String::as_str).unwrap_or_default(),
+                ),
+                to_number: super::normalize_e164(
+                    params.get("To").map(String::as_str).unwrap_or_default(),
+                ),
+                received_at_ms,
+            });
+        }
+        if let Some(state) = params
+            .get("CallStatus")
+            .and_then(|status| plivo_call_status_to_state(status))
+        {
             return Ok(TelecomEvent::CallProgress {
                 provider_call_id: call_uuid.clone(),
                 state,
-                detail: None,
+                detail: params.get("HangupCause").cloned(),
             });
         }
     }
@@ -470,6 +618,12 @@ struct PlivoCallResponse {
 
 #[cfg(test)]
 mod tests {
+    /// The path a carrier's answer request arrives on, which is what its
+    /// signature covers.
+    const ANSWER_PATH: &str = "/v1/telecom/acct-1";
+    /// Where a carrier reports what became of a message or a call.
+    const STATUS_PATH: &str = "/v1/telecom/acct-1/status";
+
     #[tokio::test]
     async fn plivo_refuses_to_place_a_call_it_cannot_record() {
         // Recording on Plivo needs a `<Record>` element, which cannot run
@@ -479,7 +633,12 @@ mod tests {
         let provider = provider_with_base("http://127.0.0.1:1");
 
         let error = provider
-            .place_call("+15551230000", "https://example.test/answer", true)
+            .place_call(
+                "+15551230000",
+                "https://example.test/answer",
+                true,
+                "outbox-1",
+            )
             .await
             .expect_err("refused");
 
@@ -509,10 +668,68 @@ mod tests {
         STANDARD.encode(ring::hmac::sign(&key, message.as_bytes()).as_ref())
     }
 
+    /// A fresh nonce for one signed callback.
+    ///
+    /// Plivo chooses the nonce and sends it in a header; this module only
+    /// re-signs what arrived, so nothing here depends on the value. It is
+    /// generated rather than written down anyway, because a literal reaching a
+    /// signing routine is a cryptographic constant baked into the source as far
+    /// as a scanner can tell, and telling real ones from fixtures by eye is
+    /// exactly the review that stops being done.
+    fn fresh_nonce() -> String {
+        let bytes: [u8; 16] = ring::rand::generate(&ring::rand::SystemRandom::new())
+            .expect("system randomness")
+            .expose();
+        bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+    }
+
+    /// Sign a callback the way Plivo's Voice V3 scheme does: the URL, then
+    /// every POST parameter as key immediately followed by value in sorted key
+    /// order, then the nonce.
+    ///
+    /// Written from Plivo's published algorithm rather than from this module's
+    /// verifier on purpose — a test that signs the way the code checks proves
+    /// only that the code agrees with itself, which is exactly how a verifier
+    /// that ignored the parameters passed its own suite.
+    fn signed_v3(auth_token: &str, url: &str, body: &str, nonce: &str) -> Vec<(String, String)> {
+        let mut params: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        params.sort();
+        let mut message = String::from(url);
+        for (key, value) in &params {
+            message.push_str(key);
+            message.push_str(value);
+        }
+        message.push_str(nonce);
+        vec![
+            (
+                "X-Plivo-Signature-V3".to_string(),
+                sign(auth_token, &message),
+            ),
+            ("X-Plivo-Signature-V3-Nonce".to_string(), nonce.to_string()),
+        ]
+    }
+
+    /// Sign the way Plivo's Messaging V2 scheme does: URL and nonce only.
+    fn signed_v2(auth_token: &str, url: &str, nonce: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                "X-Plivo-Signature-V2".to_string(),
+                sign(auth_token, &format!("{url}{nonce}")),
+            ),
+            ("X-Plivo-Signature-V2-Nonce".to_string(), nonce.to_string()),
+        ]
+    }
+
     #[test]
     fn a_correct_signature_verifies() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let nonce = "nonce-1";
         let signature = sign(&provider.auth_token, &format!("{url}{nonce}"));
         assert!(
@@ -523,7 +740,7 @@ mod tests {
     #[test]
     fn a_tampered_url_fails() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let nonce = "nonce-1";
         let signature = sign(&provider.auth_token, &format!("{url}{nonce}"));
         assert!(plivo_verify_any(
@@ -537,7 +754,7 @@ mod tests {
     #[test]
     fn a_tampered_nonce_fails() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let signature = sign(&provider.auth_token, &format!("{url}nonce-1"));
         assert!(
             plivo_verify_any(&provider.auth_token, &format!("{url}nonce-2"), &signature).is_err()
@@ -547,7 +764,7 @@ mod tests {
     #[test]
     fn a_wrong_key_fails() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let signature = sign("some-other-token", &format!("{url}nonce-1"));
         assert!(
             plivo_verify_any(&provider.auth_token, &format!("{url}nonce-1"), &signature).is_err()
@@ -557,7 +774,7 @@ mod tests {
     #[test]
     fn any_one_of_several_comma_separated_signatures_may_verify() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
         let message = format!("{url}nonce-1");
         let good = sign(&provider.auth_token, &message);
         let bad = sign("stale-rotated-token", &message);
@@ -568,16 +785,15 @@ mod tests {
     #[test]
     fn verify_webhook_normalizes_an_inbound_sms() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
-        let nonce = "nonce-9";
-        let signature = sign(&provider.auth_token, &format!("{url}{nonce}"));
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
         let body = "MessageUUID=msg-1&From=%2B15551230000&To=%2B15550001111&Text=hello+there";
-        let headers = vec![
-            ("X-Plivo-Signature-V3".to_string(), signature),
-            ("X-Plivo-Signature-V3-Nonce".to_string(), nonce.to_string()),
-        ];
+        // Plivo Messaging signs with V2 headers, not the V3 ones Voice uses.
+        // Requiring V3 for everything on this shared endpoint meant real
+        // inbound SMS never verified at all.
+        let headers = signed_v2(&provider.auth_token, &url, &nonce);
         let event = provider
-            .verify_webhook(&headers, body.as_bytes(), 1_700_000_000_000)
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 1_700_000_000_000)
             .expect("verifies");
         match event {
             TelecomEvent::InboundSms(envelope) => {
@@ -592,16 +808,12 @@ mod tests {
     #[test]
     fn verify_webhook_normalizes_a_call_status() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
-        let nonce = "nonce-2";
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
         let body = "CallUUID=call-1&CallStatus=completed";
-        let signature = sign(&provider.auth_token, &format!("{url}{nonce}"));
-        let headers = vec![
-            ("X-Plivo-Signature-V3".to_string(), signature),
-            ("X-Plivo-Signature-V3-Nonce".to_string(), nonce.to_string()),
-        ];
+        let headers = signed_v3(&provider.auth_token, &url, body, &nonce);
         let event = provider
-            .verify_webhook(&headers, body.as_bytes(), 0)
+            .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
             .expect("verifies");
         assert_eq!(
             event,
@@ -614,16 +826,124 @@ mod tests {
     }
 
     #[test]
+    fn a_ringing_inbound_call_is_a_call_to_answer_not_a_status_update() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
+        // Plivo sends bare digits, which is exactly why the number is
+        // normalized before it becomes a conversation id.
+        let body =
+            "CallUUID=call-9&CallStatus=ringing&Direction=inbound&From=15551230000&To=15550001111";
+        let headers = signed_v3(&provider.auth_token, &url, body, &nonce);
+
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, body.as_bytes(), 1_700_000_000_000)
+            .expect("verifies");
+
+        assert_eq!(
+            event,
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
+                provider_call_id: "call-9".to_string(),
+                from_number: "+15551230000".to_string(),
+                to_number: "+15550001111".to_string(),
+                received_at_ms: 1_700_000_000_000,
+            },
+            "a ringing inbound call has to reach the answering policy; as a \
+             CallProgress for an unknown call it would be dropped and the \
+             phone would never be picked up"
+        );
+    }
+
+    #[test]
+    fn a_delivery_report_is_not_read_as_an_inbound_text() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
+        let body =
+            "MessageUUID=msg-1&From=15550001111&To=15551230000&Status=undelivered&ErrorCode=400";
+        let headers = signed_v3(&provider.auth_token, &url, body, &nonce);
+
+        let event = provider
+            .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
+            .expect("verifies");
+
+        match event {
+            TelecomEvent::SmsStatus {
+                provider_message_id,
+                delivered,
+                error,
+            } => {
+                assert_eq!(provider_message_id, "msg-1");
+                assert!(!delivered);
+                assert!(error.expect("a reason").contains("undelivered"));
+            }
+            other => panic!("a receipt read as {other:?} would deliver an empty text to the agent"),
+        }
+    }
+
+    #[test]
+    fn a_delivered_report_says_so_and_carries_no_error() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
+        let body = "MessageUUID=msg-2&Status=delivered";
+        let headers = signed_v3(&provider.auth_token, &url, body, &nonce);
+
+        assert_eq!(
+            provider
+                .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
+                .expect("verifies"),
+            TelecomEvent::SmsStatus {
+                provider_message_id: "msg-2".to_string(),
+                delivered: true,
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_intermediate_message_state_is_not_a_delivery_answer() {
+        let provider = provider("https://ops.example.com");
+        let url = super::super::status_callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
+        // "queued" is Plivo saying it has the message, not that a handset does.
+        let body = "MessageUUID=msg-3&Status=queued";
+        let headers = signed_v3(&provider.auth_token, &url, body, &nonce);
+
+        assert_eq!(
+            provider
+                .verify_webhook(STATUS_PATH, &headers, body.as_bytes(), 0)
+                .expect("verifies"),
+            TelecomEvent::Ignored
+        );
+    }
+
+    #[test]
+    fn the_signed_url_is_the_one_the_operator_was_told_to_configure() {
+        let provider = provider("https://ops.example.com/");
+
+        assert_eq!(
+            provider
+                .signed_url(ANSWER_PATH)
+                .expect("a base is configured"),
+            "https://ops.example.com/v1/telecom/acct-1",
+            "this is the path the daemon serves and the UI publishes; a \
+             verifier that rebuilt any other one would reject every genuine \
+             callback"
+        );
+    }
+
+    #[test]
     fn verify_webhook_ignores_an_uninteresting_callback() {
         let provider = provider("https://ops.example.com");
-        let url = format!("https://ops.example.com{WEBHOOK_PATH}");
-        let nonce = "nonce-3";
-        let signature = sign(&provider.auth_token, &format!("{url}{nonce}"));
-        let headers = vec![
-            ("X-Plivo-Signature-V3".to_string(), signature),
-            ("X-Plivo-Signature-V3-Nonce".to_string(), nonce.to_string()),
-        ];
-        let event = provider.verify_webhook(&headers, b"", 0).expect("verifies");
+        let url = super::super::callback_url("https://ops.example.com", "acct-1");
+        let nonce = fresh_nonce();
+        let headers = signed_v3(&provider.auth_token, &url, "", &nonce);
+        let event = provider
+            .verify_webhook(ANSWER_PATH, &headers, b"", 0)
+            .expect("verifies");
         assert_eq!(event, TelecomEvent::Ignored);
     }
 
@@ -631,7 +951,9 @@ mod tests {
     fn verify_webhook_rejects_a_missing_nonce_header() {
         let provider = provider("https://ops.example.com");
         let headers = vec![("X-Plivo-Signature-V3".to_string(), "sig".to_string())];
-        assert!(provider.verify_webhook(&headers, b"", 0).is_err());
+        assert!(provider
+            .verify_webhook(ANSWER_PATH, &headers, b"", 0)
+            .is_err());
     }
 
     #[test]
@@ -683,6 +1005,43 @@ mod tests {
                 provider_message_id: Some("msg-abc".to_string())
             }
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_asks_plivo_for_the_delivery_report_it_will_be_sent() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) =
+            test_http::serve(vec![(202, r#"{"message_uuid":["msg-1"]}"#.to_string())]);
+        let mut provider = provider("https://ops.example.com");
+        provider.base_url = base;
+
+        provider.send_sms("+15551230000", "hi", &[], "idem-1").await;
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        assert!(
+            request.contains(r#""url":"https://ops.example.com/v1/telecom/acct-1/status""#),
+            "Plivo sends a delivery report only to the URL the message names: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_asks_plivo_for_its_ring_and_hangup_callbacks() {
+        use crate::daemon::channel_adapter::test_http;
+        let (base, requests) =
+            test_http::serve(vec![(201, r#"{"request_uuid":"req-1"}"#.to_string())]);
+        let mut provider = provider("https://ops.example.com");
+        provider.base_url = base;
+
+        provider
+            .place_call("+15551230000", "https://ops.example.com/answer", false, "k")
+            .await
+            .expect("placed");
+
+        let request = String::from_utf8(requests.recv().expect("a request")).expect("utf8");
+        // Without these the call store never learns the phone rang or hung up,
+        // and a call left open keeps billing.
+        assert!(request.contains(r#""ring_url""#), "{request}");
+        assert!(request.contains(r#""hangup_url""#), "{request}");
     }
 
     #[tokio::test]

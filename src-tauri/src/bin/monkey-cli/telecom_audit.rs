@@ -14,12 +14,19 @@
 use little_monkey_lib::security_doctor::{FindingStatus, SecurityFinding};
 
 use crate::daemon::store::{DaemonPaths, DaemonStore};
-use crate::daemon::telecom_store::{InboundCallPolicy, OutboundCallApproval, TelecomAccountRecord};
+use crate::daemon::telecom_store::{
+    CallbackRejections, InboundCallPolicy, OutboundCallApproval, TelecomAccountRecord,
+};
 use crate::daemon::telephony::{CallState, TelecomKind};
 
 /// A call still open this long after it started is reported whatever the
 /// account's own limit says: at this point the limit itself is not working.
 const STALE_CALL_MS: i64 = 4 * 60 * 60 * 1_000;
+
+/// How many refused callbacks in a row stop being noise and start being a
+/// misconfiguration. One is a probe or a stray request; several in a row with
+/// none succeeding in between is a carrier that cannot reach this machine.
+const REJECTED_CALLBACK_THRESHOLD: u32 = 3;
 
 /// Audit every configured telephony account.
 ///
@@ -54,6 +61,14 @@ pub(crate) fn telecom_findings(now_ms: i64) -> Vec<SecurityFinding> {
     }
     for account in accounts.iter().filter(|account| account.enabled) {
         findings.extend(audit_account(account));
+        // A carrier posting to a URL whose signature never verifies is the one
+        // failure with no other symptom: texts and calls simply never arrive,
+        // and every other check on this page passes. It is nearly always the
+        // callback URL — a tunnel that moved, a console pointed at the wrong
+        // path — or a credential rotated on one side only.
+        if let Ok(rejections) = store.callback_rejections(&account.account_id) {
+            findings.extend(rejected_callbacks_finding(account, &rejections));
+        }
         if let Ok(calls) = store.recent_calls(&account.account_id, 50) {
             for call in calls {
                 if matches!(call.state, CallState::InProgress)
@@ -97,6 +112,36 @@ pub(crate) fn telecom_findings(now_ms: i64) -> Vec<SecurityFinding> {
         ));
     }
     findings
+}
+
+/// A carrier whose callbacks never verify.
+///
+/// The one failure with no other symptom: texts and calls simply never arrive,
+/// and every other check on this page passes. It is nearly always the callback
+/// URL — a tunnel that moved, a console pointed at the wrong path — or a
+/// credential rotated on one side only.
+fn rejected_callbacks_finding(
+    account: &TelecomAccountRecord,
+    rejections: &CallbackRejections,
+) -> Option<SecurityFinding> {
+    if rejections.count < REJECTED_CALLBACK_THRESHOLD {
+        return None;
+    }
+    Some(f(
+        &format!("telephony.rejected_callbacks.{}", account.account_id),
+        "A carrier's callbacks are all being refused",
+        &format!(
+            "{} callback(s) to {} have failed verification since one last succeeded: {}",
+            rejections.count,
+            account.from_number,
+            rejections
+                .last_reason
+                .as_deref()
+                .unwrap_or("no reason recorded")
+        ),
+        FindingStatus::Critical,
+        Some("Check that the URL in your carrier's console is exactly the callback URL shown in Settings > Phone and SMS, and that the credential there matches the one saved here."),
+    ))
 }
 
 fn audit_account(account: &TelecomAccountRecord) -> Vec<SecurityFinding> {
@@ -231,7 +276,7 @@ fn f(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::telecom_store::CallLimits;
+    use crate::daemon::telecom_store::{CallLimits, CallbackRejections};
     use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
 
     const NOW: i64 = 1_700_000_000_000;
@@ -350,6 +395,44 @@ mod tests {
             .expect("reported");
         assert_eq!(finding.status, FindingStatus::Info);
         assert!(finding.detail.contains("require"));
+    }
+
+    #[test]
+    fn callbacks_that_never_verify_are_reported_once_they_stop_being_noise() {
+        let account = account();
+        // One stray unsigned request is not a misconfiguration.
+        assert_eq!(
+            rejected_callbacks_finding(
+                &account,
+                &CallbackRejections {
+                    count: 1,
+                    last_reason: Some("missing X-Twilio-Signature header".into()),
+                    last_at_ms: Some(1),
+                }
+            ),
+            None
+        );
+
+        let finding = rejected_callbacks_finding(
+            &account,
+            &CallbackRejections {
+                count: 9,
+                last_reason: Some("Twilio signature verification failed".into()),
+                last_at_ms: Some(1),
+            },
+        )
+        .expect("a carrier that cannot reach this machine is worth saying out loud");
+
+        assert_eq!(finding.status, FindingStatus::Critical);
+        assert!(finding.detail.contains("9 callback"));
+        // The reason names what to fix; without it the operator sees a number
+        // that looks configured and simply never rings.
+        assert!(finding.detail.contains("signature verification failed"));
+        assert!(finding
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("console"));
     }
 
     #[test]
