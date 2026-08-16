@@ -10,8 +10,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  alignDimension,
   availableConditioning,
   formatLaunchArgs,
+  normalizeDimension,
   parseLaunchArgs,
   engineSupports,
   CONDITIONING_SLOTS,
@@ -240,5 +242,29 @@ describe("launch arg round trip", () => {
     const args = setLaunchArg([], "--embd-dir", "/Users/me/My Embeddings");
     expect(parseLaunchArgs(formatLaunchArgs(args))).toEqual(args);
     expect(launchArgValue(args, "--embd-dir")).toBe("/Users/me/My Embeddings");
+  });
+});
+
+/** The controls answer a size with the nearest one the engine can render, and
+ *  never with one the backend would then round again — which is what keeps the
+ *  number in the field and the size of the picture the same number. */
+describe("alignDimension", () => {
+  it("takes a size to the nearest edge of the grid", () => {
+    expect(alignDimension(645)).toBe(640);
+    expect(alignDimension(890)).toBe(896);
+    expect(alignDimension(1024)).toBe(1024);
+  });
+
+  it("never lands on a size the backend would round further", () => {
+    for (let value = 32; value <= 4096; value += 7) {
+      const aligned = alignDimension(value);
+      expect(normalizeDimension(aligned)).toBe(aligned);
+    }
+  });
+
+  it("stays inside the engine's limits", () => {
+    expect(alignDimension(0)).toBe(32);
+    expect(alignDimension(-4)).toBe(32);
+    expect(alignDimension(99_999)).toBe(4096);
   });
 });
