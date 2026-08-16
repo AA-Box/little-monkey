@@ -243,6 +243,14 @@ All meaningful effects go through the declared host brokers. Three consecutive
 runtime failures trigger protective disable; validation, trust and approval
 errors do not count as guest crashes.
 
+An invocation that stops early names the ceiling that stopped it: a spent fuel
+budget, the wall clock, an ordinary trap, and cancellation each report their
+own error. Cancellation is the one that is not a failure — it leaves the trap
+and consecutive-failure counters alone — so the distinction decides whether a
+run counts towards protective disable. Cancellation itself works either from
+in-process (the Stop button) or from a marker file another process writes, and
+either one interrupts a guest that is already executing.
+
 Secrets remain in the OS keychain and are applied by the host. Workspace roots
 are host-only bindings. Artifact IDs are content digests. HTTP uses exact
 origins and refuses a redirect to a different origin. Model and device access

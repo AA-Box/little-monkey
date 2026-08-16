@@ -860,12 +860,33 @@ fn extension_search_call(
     }))
 }
 
+/// Where web's extension calls look for the installed extension store.
+///
+/// Production has exactly one answer, the active profile's data directory.
+/// Tests need another, because installing a real component into the developer's
+/// own profile to prove a search reaches it is not something a test may do.
+#[cfg(test)]
+static WEB_EXTENSION_APP_DATA: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_web_extension_app_data_for_test(app_data: Option<PathBuf>) {
+    *WEB_EXTENSION_APP_DATA.lock().unwrap() = app_data;
+}
+
+fn web_extension_app_data() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(app_data) = WEB_EXTENSION_APP_DATA.lock().unwrap().clone() {
+        return Ok(app_data);
+    }
+    crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())
+}
+
 async fn invoke_web_extension(
     kind: CapabilityKind,
     call: WebExtensionCall,
 ) -> Result<String, String> {
-    let app_data = crate::app_paths::data_dir()
-        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
+    let app_data = web_extension_app_data()?;
     let mut cancellation = ExtensionCancellationGuard::new(call.invocation_id.clone());
     let result = ExtensionManager::new(app_data)?
         .invoke_owned_active_capability(
