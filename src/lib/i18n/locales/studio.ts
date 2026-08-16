@@ -298,6 +298,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.aspect.portrait": "Portrait",
   "Studio.aspect.landscape": "Landscape",
   "Studio.aspect.square": "Square",
+  "Studio.aspect.original": "Original size of the source image",
   "Studio.width": "Width",
   "Studio.height": "Height",
   "Studio.steps": "Sampling steps",
