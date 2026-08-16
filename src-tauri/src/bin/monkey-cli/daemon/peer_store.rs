@@ -136,6 +136,26 @@ pub struct PeerRejectionEvent {
 /// own pairing list bounds in turn.
 pub const MAX_PEER_REJECTION_EVENTS_PER_PEER: u32 = 200;
 
+/// Rejection events kept across every pairing.
+///
+/// The per-peer bound alone leaves the table's real size to the pairing count,
+/// which is an operator's decision rather than a bound this code enforces. This
+/// is the one the table itself has: whatever the pairing list does, the oldest
+/// refusals beyond this many are dropped. Set well above per-peer × a plausible
+/// pairing list, so it is the backstop and the per-peer bound stays the rule
+/// that decides whose evidence is kept.
+pub const MAX_PEER_REJECTION_EVENTS_TOTAL: u32 = 5_000;
+
+/// Artifact admissions kept per pairing, and across all of them.
+///
+/// Expiry alone is not retention: an admission stops *authorizing* anything
+/// after [`PEER_ARTIFACT_ADMISSION_TTL_MS`], but the row outlives it, so a peer
+/// uploading unique content in a loop grows the table for as long as it cares
+/// to. Expired rows are pruned on the next upload and these bound what is left,
+/// which is at most one pairing's working set of live admissions.
+pub const MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER: u32 = 500;
+pub const MAX_PEER_ARTIFACT_RECEIPTS_TOTAL: u32 = 5_000;
+
 /// How long an uploaded artifact stays referenceable by the peer that uploaded
 /// it.
 ///
@@ -318,6 +338,18 @@ impl DaemonStore {
                          LIMIT ?2
                     )",
                 params![peer_device_id, MAX_PEER_REJECTION_EVENTS_PER_PEER],
+            )
+            .map_err(|error| format!("Failed to bound the peer refusal table: {error}"))?;
+        // And the bound the table has regardless of how many pairings exist.
+        transaction
+            .execute(
+                "DELETE FROM peer_rejection_events
+                  WHERE event_id NOT IN (
+                        SELECT event_id FROM peer_rejection_events
+                         ORDER BY occurred_at_ms DESC, event_id DESC
+                         LIMIT ?1
+                    )",
+                params![MAX_PEER_REJECTION_EVENTS_TOTAL],
             )
             .map_err(|error| format!("Failed to bound the peer refusal table: {error}"))?;
         transaction.commit().map_err(|error| error.to_string())?;
@@ -629,6 +661,13 @@ impl DaemonStore {
     /// Re-uploading the same content refreshes the admission rather than
     /// failing: a peer that hands the bytes over again is doing the one thing
     /// that legitimately renews standing to reference them.
+    ///
+    /// Every upload also prunes: admissions that have expired are deleted
+    /// outright, and what remains is trimmed to
+    /// [`MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER`] and
+    /// [`MAX_PEER_ARTIFACT_RECEIPTS_TOTAL`]. A row that no longer authorizes
+    /// anything is not evidence of anything either, and the alternative is a
+    /// table a peer can grow forever one unique blob at a time.
     #[allow(clippy::too_many_arguments)]
     pub fn record_peer_artifact_receipt(
         &mut self,
@@ -642,7 +681,11 @@ impl DaemonStore {
     ) -> Result<PeerArtifactReceipt, String> {
         let uploaded_at_ms = now_ms.max(1);
         let expires_at_ms = uploaded_at_ms.saturating_add(PEER_ARTIFACT_ADMISSION_TTL_MS);
-        self.connection
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        transaction
             .execute(
                 "INSERT INTO peer_artifact_receipts (
                     peer_device_id, artifact_id, sha256, size_bytes, filename, media_type,
@@ -667,6 +710,40 @@ impl DaemonStore {
                 ],
             )
             .map_err(|error| format!("Failed to record the peer artifact: {error}"))?;
+        // Expired first — those authorize nothing and are the ones that
+        // accumulate — then the caps, which only ever bite on live admissions.
+        // The row just written is the newest, so no prune can drop it.
+        transaction
+            .execute(
+                "DELETE FROM peer_artifact_receipts WHERE expires_at_ms <= ?1",
+                params![uploaded_at_ms],
+            )
+            .map_err(|error| format!("Failed to prune expired peer artifacts: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM peer_artifact_receipts
+                  WHERE peer_device_id = ?1
+                    AND artifact_id NOT IN (
+                        SELECT artifact_id FROM peer_artifact_receipts
+                         WHERE peer_device_id = ?1
+                         ORDER BY uploaded_at_ms DESC, artifact_id DESC
+                         LIMIT ?2
+                    )",
+                params![peer_device_id, MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER],
+            )
+            .map_err(|error| format!("Failed to bound the peer artifact table: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM peer_artifact_receipts
+                  WHERE rowid NOT IN (
+                        SELECT rowid FROM peer_artifact_receipts
+                         ORDER BY uploaded_at_ms DESC, rowid DESC
+                         LIMIT ?1
+                    )",
+                params![MAX_PEER_ARTIFACT_RECEIPTS_TOTAL],
+            )
+            .map_err(|error| format!("Failed to bound the peer artifact table: {error}"))?;
+        transaction.commit().map_err(|error| error.to_string())?;
         Ok(PeerArtifactReceipt {
             peer_device_id: peer_device_id.to_string(),
             artifact_id: artifact_id.to_string(),
@@ -732,9 +809,11 @@ impl DaemonStore {
 
     /// Note that this installation sent something to a peer.
     ///
-    /// Written after the call was answered, so a row means the far side took
-    /// it. Re-sending the same message id updates the state rather than
-    /// duplicating the row.
+    /// Written *before* the call goes out, as `pending`, and updated with what
+    /// the far side answered — so a row means this side asked, not that the
+    /// peer took it. See `peer_tool::deliver_envelope` for why that order is
+    /// the one that survives a crash. Re-sending the same message id updates
+    /// the state rather than duplicating the row.
     #[allow(clippy::too_many_arguments)]
     pub fn record_outbound_peer_message(
         &mut self,
@@ -1226,6 +1305,121 @@ mod tests {
                 .unwrap(),
             MAX_PEER_REJECTION_EVENTS_PER_PEER
         );
+    }
+
+    /// Per-peer fairness bounds who gets evicted; this bounds the table.
+    #[test]
+    fn refusals_are_bounded_across_every_pairing_too() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        // Enough pairings that the per-peer bound alone would allow more rows
+        // than the global one: 40 × 200 = 8000 against a 5000 ceiling. Seeded
+        // straight into the table rather than through 8000 API calls, each of
+        // which would re-run both prunes — the prune under test is the one the
+        // single recorded event below triggers.
+        let pairings = (MAX_PEER_REJECTION_EVENTS_TOTAL / MAX_PEER_REJECTION_EVENTS_PER_PEER) + 15;
+        let transaction = store.connection.transaction().expect("seed");
+        for peer in 0..pairings {
+            for index in 0..MAX_PEER_REJECTION_EVENTS_PER_PEER {
+                let sequence = peer * MAX_PEER_REJECTION_EVENTS_PER_PEER + index;
+                transaction
+                    .execute(
+                        "INSERT INTO peer_rejection_events (
+                            event_id, peer_device_id, message_id, thread_id, reason, occurred_at_ms
+                         ) VALUES (?1, ?2, NULL, NULL, 'origin_loop', ?3)",
+                        params![
+                            format!("prej-seed-{sequence}"),
+                            format!("device-{peer}"),
+                            NOW + i64::from(sequence),
+                        ],
+                    )
+                    .expect("seed");
+            }
+        }
+        transaction.commit().expect("seed");
+        assert_eq!(
+            store.peer_rejection_event_count(None).unwrap(),
+            pairings * MAX_PEER_REJECTION_EVENTS_PER_PEER
+        );
+
+        store
+            .record_peer_rejection_event(
+                "device-0",
+                None,
+                None,
+                PeerRejection::OriginLoop,
+                NOW + 1_000_000,
+            )
+            .expect("record");
+
+        assert_eq!(
+            store.peer_rejection_event_count(None).unwrap(),
+            MAX_PEER_REJECTION_EVENTS_TOTAL,
+            "the table's own bound has to hold however many pairings exist"
+        );
+    }
+
+    /// An admission that authorizes nothing is not kept as though it did.
+    #[test]
+    fn expired_admissions_are_pruned_by_the_next_upload() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let stale = "a".repeat(64);
+        store
+            .record_peer_artifact_receipt("device-1", &stale, &stale, 4, None, None, NOW)
+            .expect("admit");
+        assert_eq!(store.peer_artifact_receipts(None, 10).unwrap().len(), 1);
+
+        // One upload after the first has expired. Nothing is scanning in the
+        // background; the write path is what does the pruning.
+        let later = NOW + PEER_ARTIFACT_ADMISSION_TTL_MS + 1;
+        let fresh = "b".repeat(64);
+        store
+            .record_peer_artifact_receipt("device-1", &fresh, &fresh, 4, None, None, later)
+            .expect("admit");
+
+        let remaining = store.peer_artifact_receipts(None, 10).expect("read");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the expired row is gone from disk, not merely filtered out of reads"
+        );
+        assert_eq!(remaining[0].artifact_id, fresh);
+    }
+
+    /// Unique content in a loop is the case expiry alone does not answer, since
+    /// every upload can be inside its own window.
+    #[test]
+    fn live_admissions_are_bounded_per_pairing() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let over = MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER + 25;
+        for index in 0..over {
+            let digest = format!("{index:064x}");
+            store
+                .record_peer_artifact_receipt(
+                    "device-1",
+                    &digest,
+                    &digest,
+                    4,
+                    None,
+                    None,
+                    NOW + i64::from(index),
+                )
+                .expect("admit");
+        }
+
+        assert_eq!(
+            store
+                .peer_artifact_receipts(Some("device-1"), MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER + 100)
+                .unwrap()
+                .len() as u32,
+            MAX_PEER_ARTIFACT_RECEIPTS_PER_PEER
+        );
+        // The newest survive, so the admissions a peer is actually using are
+        // the ones still standing.
+        let newest = format!("{:064x}", over - 1);
+        assert!(store
+            .peer_artifact_receipt("device-1", &newest, NOW + i64::from(over))
+            .unwrap()
+            .is_some());
     }
 
     #[test]

@@ -3421,19 +3421,24 @@ impl RemoteApi {
             &upload.content_base64,
         )
         .map_err(|_| (400, "Peer artifact content is not valid base64".to_string()))?;
-        let store = crate::daemon::peer_ingress::peer_content_store(&self.paths)
-            .map_err(|error| (500, error))?;
-        let blob = store
-            .put(&bytes)
-            .map_err(|error| (400, format!("Could not store the peer artifact: {error}")))?;
-        // The store is content-addressed, so the id it returns *is* the digest
-        // of what was written. Comparing it to the claim is the whole check.
-        if blob.id != upload.sha256.to_ascii_lowercase() {
+        // Digest first, store second. The content store is content-addressed,
+        // so writing and then comparing ids would detect the mismatch just as
+        // well — but only after publishing the bytes into a store shared with
+        // runs, channels and the operator's own imports. A peer whose upload is
+        // refused must leave nothing behind, not an unreferenced blob it can
+        // keep adding to.
+        let digest = crate::durable_run::sha256_hex(&bytes);
+        if digest != upload.sha256.to_ascii_lowercase() {
             return Err((
                 400,
                 "Peer artifact content does not match its declared digest".to_string(),
             ));
         }
+        let store = crate::daemon::peer_ingress::peer_content_store(&self.paths)
+            .map_err(|error| (500, error))?;
+        let blob = store
+            .put(&bytes)
+            .map_err(|error| (400, format!("Could not store the peer artifact: {error}")))?;
         DaemonStore::open(&self.paths)
             .map_err(internal)?
             .record_peer_artifact_receipt(

@@ -724,15 +724,8 @@ async fn send(
         .validate_for_send(now)
         .map_err(|rejection| rejection.message().to_string())?;
 
-    let response = crate::daemon::remote::peer_call(
-        &paths,
-        alias,
-        reqwest::Method::POST,
-        "/v1/remote/peer/messages",
-        serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
-    )
-    .await?;
-    crate::daemon::peer_tool::remember_send(&paths, alias, &envelope, &response, now);
+    let response =
+        crate::daemon::peer_tool::deliver_envelope(&paths, alias, &envelope, now).await?;
     if json {
         println!("{response}");
         return Ok(());

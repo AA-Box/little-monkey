@@ -863,14 +863,23 @@ fn content_is_handed_over_before_it_is_referenced() {
     assert_eq!(store.read(&digest).unwrap(), bytes);
 }
 
+/// A refused upload leaves nothing behind — neither an admission nor bytes.
+///
+/// The digest is checked before the content store is touched, which is the
+/// difference between refusing an upload and publishing it into a store shared
+/// with runs, channels and the operator's own imports before noticing. A peer
+/// that cannot be believed must not be able to fill that store one rejected
+/// upload at a time.
 #[test]
 fn content_that_does_not_match_its_declared_digest_is_refused() {
     let (_alice, bob, pairing) = two_nodes(every_grant());
     use base64::Engine as _;
+    let bytes = b"not what was claimed";
+    let real_digest = super::remote::protocol::sha256_hex(bytes);
     let upload = PeerArtifactUpload {
         protocol_version: REMOTE_PROTOCOL_VERSION,
         sha256: "b".repeat(64),
-        content_base64: base64::engine::general_purpose::STANDARD.encode(b"not what was claimed"),
+        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         filename: None,
         media_type: None,
     };
@@ -883,6 +892,20 @@ fn content_that_does_not_match_its_declared_digest_is_refused() {
         NOW + 100,
     );
     assert_eq!(response.status, 400);
+
+    let store = super::peer_ingress::peer_content_store(&bob.paths).unwrap();
+    assert!(
+        store.read(&real_digest).is_err(),
+        "refused bytes must not be published under their true digest either"
+    );
+    assert!(
+        super::store::DaemonStore::open(&bob.paths)
+            .unwrap()
+            .peer_artifact_receipts(None, 10)
+            .unwrap()
+            .is_empty(),
+        "and must not be admitted"
+    );
 }
 
 #[test]
