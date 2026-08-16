@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component as PathComponent, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -63,6 +63,23 @@ pub const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 pub const PROTECTIVE_DISABLE_FAILURES: u32 = 3;
 pub const MAX_STORED_INVOCATIONS: usize = 256;
+
+/// What an invocation reports when something outside the guest ended it.
+///
+/// Named because three separate places have to agree on it exactly:
+/// [`ExtensionManager::invoke`] returns it, `record_invocation_failure` reads
+/// it to keep a cancellation off the failure counters, and the tests assert on
+/// it to tell "cancelled" apart from every other way a run can stop.
+pub const CANCELLED_ERROR: &str = "Extension invocation was cancelled";
+/// What an invocation reports when the guest spent its whole fuel budget.
+///
+/// Distinct from [`CANCELLED_ERROR`] and from a plain trap on purpose: fuel is
+/// the guest's own ceiling, and rewriting it as anything else would both
+/// mislead the reader of the log and let a real runaway be forgiven as an
+/// interruption.
+pub const FUEL_EXHAUSTED_ERROR: &str = "Component exhausted its fuel budget";
+/// What an invocation reports when the wall clock, not the guest, ended it.
+pub const TIMEOUT_ERROR: &str = "Component exceeded its wall-clock timeout";
 const REGISTRY_SCHEMA_VERSION: u32 = 1;
 const KEYCHAIN_SERVICE_BASE: &str = "com.littlemonkey.extensions";
 
@@ -832,6 +849,9 @@ pub struct ExtensionManager {
     artifact_root: PathBuf,
     engine: Engine,
     model_hub: Option<Arc<crate::m3_runtime_hub::M3RuntimeHub>>,
+    /// The per-invocation fuel ceiling. Always [`DEFAULT_FUEL`] in production —
+    /// only [`ExtensionManager::with_fuel`], which exists for tests, moves it.
+    fuel: u64,
 }
 
 impl ExtensionManager {
@@ -855,7 +875,28 @@ impl ExtensionManager {
                 Err(error) => return Err(error.clone()),
             },
             model_hub: None,
+            fuel: DEFAULT_FUEL,
         })
+    }
+
+    /// Run guests with a fuel ceiling other than [`DEFAULT_FUEL`].
+    ///
+    /// Test-only, because a fuel budget is a security control: production has
+    /// exactly one, and it is the constant above.
+    ///
+    /// What it buys a test is a run whose *end* is unambiguous. A guest that
+    /// loops is racing its fuel ceiling from its first instruction, so a test
+    /// that wants to stop such a guest from outside — and then claim that is
+    /// why it stopped — is racing that ceiling too. Raising the budget far past
+    /// what the window needs removes the race in one direction; lowering it far
+    /// below removes it in the other, for a test that wants the ceiling itself.
+    /// Neither changes what production runs, and neither disables the wall
+    /// clock, which still ends any run this budget cannot.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_fuel(mut self, fuel: u64) -> Self {
+        self.fuel = fuel;
+        self
     }
 
     #[must_use]
@@ -2836,7 +2877,7 @@ impl bindings::little_monkey::extension::host::Host for RuntimeHost {
         }
         let response = tokio::select! {
             _ = self.cancellation.cancelled() => {
-                return Err("Extension invocation was cancelled".to_string());
+                return Err(CANCELLED_ERROR.to_string());
             }
             response = crate::egress::send(builder) => response
                 .map_err(|error| format!("Brokered HTTP request failed: {error}"))?,
@@ -2865,7 +2906,7 @@ impl bindings::little_monkey::extension::host::Host for RuntimeHost {
         loop {
             let chunk = tokio::select! {
                 _ = self.cancellation.cancelled() => {
-                    return Err("Extension invocation was cancelled".to_string());
+                    return Err(CANCELLED_ERROR.to_string());
                 }
                 chunk = stream.next() => chunk,
             };
@@ -3607,23 +3648,35 @@ impl ExtensionManager {
         let started = std::time::Instant::now();
         let cancellation = host.cancellation.clone();
         let deadline_reached = Arc::new(AtomicBool::new(false));
+        let ending = Ending::running();
         let engine = self.engine.clone();
         let timer_token = cancellation.clone();
         let timer_deadline = deadline_reached.clone();
+        let timer_ending = ending.clone();
         let cancellation_markers = host.cancellation_markers.clone();
         let timer = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS);
             loop {
                 if cancellation_markers.iter().any(|path| path.exists()) {
-                    timer_token.cancel();
+                    if timer_ending.claim(Ending::CANCELLED) {
+                        timer_token.cancel();
+                    }
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    timer_deadline.store(true, Ordering::Release);
+                    if timer_ending.claim(Ending::TIMED_OUT) {
+                        timer_deadline.store(true, Ordering::Release);
+                    }
                     break;
                 }
                 tokio::select! {
-                    _ = timer_token.cancelled() => break,
+                    // An in-process cancel reaches the guest through the same
+                    // token, so this is where that one is claimed. Losing the
+                    // claim means the guest had already ended when it landed.
+                    _ = timer_token.cancelled() => {
+                        timer_ending.claim(Ending::CANCELLED);
+                        break;
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {},
                 }
             }
@@ -3642,7 +3695,7 @@ impl ExtensionManager {
             Ok(component) if !cancellation.is_cancelled() => component,
             Ok(_) => {
                 timer.abort();
-                return Err("Extension invocation was cancelled".to_string());
+                return Err(CANCELLED_ERROR.to_string());
             }
             Err(error) => {
                 timer.abort();
@@ -3651,7 +3704,7 @@ impl ExtensionManager {
         };
         if deadline_reached.load(Ordering::Acquire) {
             timer.abort();
-            return Err("Component exceeded its wall-clock timeout".to_string());
+            return Err(TIMEOUT_ERROR.to_string());
         }
         let mut linker = Linker::<RuntimeHost>::new(&self.engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
@@ -3664,11 +3717,12 @@ impl ExtensionManager {
         let mut store = Store::new(&self.engine, host);
         store.limiter(|host| &mut host.limits);
         store
-            .set_fuel(DEFAULT_FUEL)
+            .set_fuel(self.fuel)
             .map_err(|error| format!("Cannot set extension fuel: {error}"))?;
         store
             .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
             .map_err(|error| format!("Cannot configure extension fuel yielding: {error}"))?;
+        let trap_deadline = deadline_reached.clone();
         let epoch_deadline = deadline_reached.clone();
         let epoch_cancellation = cancellation.clone();
         store.epoch_deadline_callback(move |_| {
@@ -3683,39 +3737,45 @@ impl ExtensionManager {
         store.set_epoch_deadline(1);
         let remaining_ms = DEFAULT_TIMEOUT_MS
             .saturating_sub(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
-        let mut outcome = tokio::time::timeout(
+        let guest_ending = ending.clone();
+        let outcome = tokio::time::timeout(
             Duration::from_millis(remaining_ms.saturating_add(1_000)),
             async {
-                let instance =
-                    bindings::Extension::instantiate_async(&mut store, &component, &linker)
-                        .await
-                        .map_err(|error| format!("Component instantiation failed: {error}"))?;
-                match call {
-                    Some((capability_id, input_json)) => instance
-                        .little_monkey_extension_guest()
-                        .call_run(&mut store, capability_id, input_json)
-                        .await
-                        .map_err(|error| format!("Component trapped: {error}"))?,
-                    None => Ok(String::new()),
+                // Every path out of the guest claims the ending in its first
+                // statement, so anything the watcher observes from that instant
+                // on is late by construction. Nothing downstream consults a
+                // marker or a flag again.
+                let instantiated =
+                    bindings::Extension::instantiate_async(&mut store, &component, &linker).await;
+                let instance = match instantiated {
+                    Ok(instance) => instance,
+                    Err(error) => {
+                        guest_ending.claim(Ending::FINISHED);
+                        return Err(format!("Component instantiation failed: {error}"));
+                    }
+                };
+                let Some((capability_id, input_json)) = call else {
+                    guest_ending.claim(Ending::FINISHED);
+                    return Ok(String::new());
+                };
+                let answer = instance
+                    .little_monkey_extension_guest()
+                    .call_run(&mut store, capability_id, input_json)
+                    .await;
+                let interrupted_by_deadline = trap_deadline.load(Ordering::Acquire);
+                guest_ending.claim(Ending::FINISHED);
+                match answer {
+                    Ok(answer) => answer,
+                    Err(error) => Err(classify_guest_stop(&error, interrupted_by_deadline)),
                 }
             },
         )
         .await
-        .unwrap_or_else(|_| Err("Component exceeded its wall-clock timeout".to_string()));
+        .unwrap_or_else(|_| Err(TIMEOUT_ERROR.to_string()));
         timer.abort();
-        if cancellation.is_cancelled()
-            || store
-                .data()
-                .cancellation_markers
-                .iter()
-                .any(|path| path.exists())
-        {
-            outcome = Err("Extension invocation was cancelled".to_string());
-        } else if deadline_reached.load(Ordering::Acquire) {
-            outcome = Err("Component exceeded its wall-clock timeout".to_string());
-        }
+        let outcome = settle_outcome(outcome, ending.observed());
         let remaining = store.get_fuel().unwrap_or(0);
-        let fuel_consumed = DEFAULT_FUEL.saturating_sub(remaining);
+        let fuel_consumed = self.fuel.saturating_sub(remaining);
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         Ok(RuntimeExecution {
             outcome,
@@ -4256,8 +4316,86 @@ fn remember_invocation(
     }
 }
 
+/// Which of the three things that can end one invocation got there first.
+///
+/// The question this answers is not "was a cancellation ever requested" but
+/// "was one requested *while the guest was still running*". Those differ by a
+/// hair of wall clock and by everything else: a marker that appears after a
+/// guest has already trapped stopped nothing, and recording it as a
+/// cancellation would erase a real trap from the counters that protectively
+/// disable a misbehaving extension.
+///
+/// A single compare-and-exchange settles it. The watcher claims when it sees a
+/// marker, a cancelled token or the wall-clock deadline; the execution claims
+/// in the first statement after the guest returns control. Exactly one of them
+/// wins, and the loser's observation is late by construction.
+#[derive(Clone)]
+struct Ending(Arc<AtomicU8>);
+
+impl Ending {
+    const RUNNING: u8 = 0;
+    const FINISHED: u8 = 1;
+    const CANCELLED: u8 = 2;
+    const TIMED_OUT: u8 = 3;
+
+    fn running() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::RUNNING)))
+    }
+
+    /// Try to be the one that ended this invocation. `true` if this claim won.
+    fn claim(&self, ending: u8) -> bool {
+        self.0
+            .compare_exchange(Self::RUNNING, ending, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn observed(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Decide what an invocation reports, given what it produced and what ended it.
+///
+/// The rule is that execution's own answer stands. Wasmtime is the only thing
+/// that knows whether a guest trapped, spent its fuel or took an interrupt, and
+/// `classify_guest_stop` has already named that; an external ending never
+/// rewrites it. What an external ending does decide is the case execution left
+/// open — a guest that answered anyway, either because it swallowed a cancelled
+/// host call or because it finished in the instant after something outside it
+/// had already committed to stopping it. That answer is not delivered.
+fn settle_outcome(outcome: Result<String, String>, ending: u8) -> Result<String, String> {
+    match (outcome, ending) {
+        (Ok(_), Ending::CANCELLED) => Err(CANCELLED_ERROR.to_string()),
+        (Ok(_), Ending::TIMED_OUT) => Err(TIMEOUT_ERROR.to_string()),
+        (outcome, _) => outcome,
+    }
+}
+
+/// Name the reason a guest stopped from the trap it stopped with.
+///
+/// Wasmtime reports both of this runtime's ceilings as traps, and a caller that
+/// only saw "the component trapped" could not tell a runaway that spent its own
+/// fuel from one that an outside actor interrupted. The distinction is load
+/// bearing twice over: `record_invocation_failure` counts traps towards a
+/// protective disable but exempts cancellations, and the cancellation tests
+/// assert that an invocation ended for the reason they caused and not for one
+/// that happened to arrive first.
+///
+/// An epoch interrupt says only that something outside the guest cut in, not
+/// which something. The wall clock records itself in the deadline flag before
+/// it increments the epoch, so an interrupt seen with that flag clear is the
+/// cancellation path.
+fn classify_guest_stop(error: &wasmtime::Error, deadline_reached: bool) -> String {
+    match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => FUEL_EXHAUSTED_ERROR.to_string(),
+        Some(wasmtime::Trap::Interrupt) if deadline_reached => TIMEOUT_ERROR.to_string(),
+        Some(wasmtime::Trap::Interrupt) => CANCELLED_ERROR.to_string(),
+        _ => format!("Component trapped: {error}"),
+    }
+}
+
 fn record_invocation_failure(record: &mut InstalledRecord, error: &str, invocation_id: &str) {
-    if error == "Extension invocation was cancelled" {
+    if error == CANCELLED_ERROR {
         push_log(record, "info", error, Some(invocation_id));
         return;
     }
@@ -5564,6 +5702,22 @@ pub(crate) mod test_fixtures {
         prefix: &str,
         suffix: &str,
     ) -> Vec<u8> {
+        component_wat_writing_artifact_then(artifact, prefix, suffix, "")
+    }
+
+    /// [`component_wat_writing_artifact`] with `tail` executed *after* the
+    /// artifact is written and before the guest answers.
+    ///
+    /// The order is the whole point. A guest whose tail never returns has
+    /// already made a change the host can see from outside the sandbox by the
+    /// time it gets there, so a test can wait for that change and know the
+    /// guest is inside the sandbox right now rather than hoping it is.
+    pub(crate) fn component_wat_writing_artifact_then(
+        artifact: &[u8],
+        prefix: &str,
+        suffix: &str,
+        tail: &str,
+    ) -> Vec<u8> {
         wat::parse_str(format!(
             r#"(component
               (import "little-monkey:extension/host@1.0.0" (instance $host
@@ -5613,6 +5767,8 @@ pub(crate) mod test_fixtures {
                   i32.const 4104
                   i32.load
                   local.set $id_len
+                  ;; anything the caller wants running after the host saw us
+                  {tail}
                   ;; prefix
                   i32.const 8192
                   i32.const 2048
@@ -5668,6 +5824,7 @@ pub(crate) mod test_fixtures {
             prefix_len = prefix.len(),
             suffix = escape(suffix.as_bytes()),
             suffix_len = suffix.len(),
+            tail = tail,
         ))
         .unwrap()
     }
@@ -6518,6 +6675,23 @@ mod tests {
         assert_eq!(host.logs.len(), 6);
     }
 
+    /// Block until the guest has written `artifact_id` through the host.
+    ///
+    /// This is the only signal in the suite that reports *guest instructions
+    /// executed* rather than "the host got as far as scheduling one". The store
+    /// is content addressed, so the id is known before the run starts and a
+    /// hit cannot be anything but this fixture's own write.
+    async fn wait_until_written(store: &ArtifactStore, artifact_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !store.exists(artifact_id).unwrap() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no guest ever wrote '{artifact_id}'"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     /// Block until `invocation_id` has registered for cancellation.
     ///
     /// Its guest has to be compiled and instantiated first, which is the
@@ -6595,8 +6769,8 @@ mod tests {
         manager.set_enabled("dev.example.echo", true).await.unwrap();
         manager.set_running("dev.example.echo", true).await.unwrap();
         // The two cancellation mechanisms are exercised differently on
-        // purpose, because only one of them can be aimed at a *running* guest
-        // without racing it.
+        // purpose, because at this fixture's production fuel budget only one
+        // of them can be aimed at a *running* guest without racing it.
         //
         // A guest that loops forever is racing its own fuel ceiling from its
         // first instruction, and it is registered for cancellation for a
@@ -6605,8 +6779,7 @@ mod tests {
         // external actor that waits to see the entry and then acts has no
         // guarantee the guest is still inside the sandbox: on a loaded runner
         // both an earlier `cancel` and a later marker write landed after the
-        // guest had already spent its fuel, and the invocation reported the
-        // trap it really ended with.
+        // guest had already spent its fuel.
         //
         // What is asserted here is therefore split. The in-process token is
         // spent as early as the registry allows and the claim is the one that
@@ -6615,6 +6788,11 @@ mod tests {
         // before its invocation starts, where the outcome is not a race at
         // all: a marker for that exact invocation id refuses to run it, and
         // the error says so.
+        //
+        // The remaining case — a marker written while a guest is provably
+        // mid-flight — needs a guest that reports its own start and a budget
+        // it cannot burn through, and is
+        // `an_on_disk_marker_stops_a_guest_that_has_already_executed` below.
         let token_watcher = tokio::spawn(cancel_once_registered("cancel-loop"));
         atomic_write(
             &manager.invocation_cancel_path("second-loop").unwrap(),
@@ -6702,6 +6880,406 @@ mod tests {
             HealthState::Stopped
         );
         manager.uninstall("dev.example.echo").unwrap();
+    }
+
+    /// A fuel ceiling a looping guest cannot reach inside a test's window.
+    ///
+    /// A thousand times the production budget. The point is not the number but
+    /// what it removes: with it, "the guest ran out of fuel" and "the test
+    /// stopped the guest" are separated by three orders of magnitude of work
+    /// rather than by whichever happened first on a loaded machine. Nothing
+    /// else is relaxed — the same wall clock still ends the run, and it ends it
+    /// with its own distinct error, so a budget that somehow *was* reached
+    /// cannot be mistaken for the cancellation this test is about.
+    const FUEL_A_TEST_WINDOW_CANNOT_BURN: u64 = DEFAULT_FUEL * 1_000;
+
+    /// A fuel ceiling a looping guest reaches immediately.
+    ///
+    /// Deliberately far below production so the runaway ends in well under a
+    /// second on the slowest runner, while still leaving instantiation — which
+    /// spends fuel too — orders of magnitude of headroom.
+    const FUEL_A_RUNAWAY_BURNS_AT_ONCE: u64 = 2_000_000;
+
+    /// Install a fixture whose guest writes `evidence` through the host's own
+    /// `artifact-write` import and then never returns.
+    ///
+    /// Both halves matter. The write is a host-observable effect that only
+    /// executing guest instructions can produce, and the loop after it means
+    /// the guest is still inside the sandbox when a test sees that effect.
+    async fn install_guest_that_signals_then_never_returns(
+        manager: &ExtensionManager,
+        root: &Path,
+        extension_id: &str,
+        capability_id: &str,
+        evidence: &[u8],
+    ) {
+        let component =
+            component_wat_writing_artifact_then(evidence, "", "", "(loop $forever (br $forever))");
+        let source = root.join(extension_id);
+        let mut value = manifest_for(
+            extension_id,
+            &source,
+            &component,
+            SemanticVersion::new(1, 0, 0),
+        );
+        // Capability ids are owned across the whole registry, so fixtures that
+        // are installed side by side cannot share the manifest helper's one.
+        value.capabilities[0].capability_id = capability_id.to_string();
+        value.permissions = vec![PermissionDeclaration {
+            permission_id: "artifact-write".to_string(),
+            kind: PermissionKind::ArtifactWrite,
+            scope: "content_v1".to_string(),
+            reason: "Reports that the guest is executing".to_string(),
+        }];
+        write_manifest_bundle(&source, &component, &value);
+        let preview = manager.discover(&source).unwrap();
+        manager
+            .install(
+                &source,
+                Approval {
+                    approval_digest: preview.approval_digest,
+                    grants: vec![PermissionGrant {
+                        permission_id: "artifact-write".to_string(),
+                        binding: None,
+                    }],
+                    allow_unsigned: true,
+                    allow_untrusted: false,
+                    allow_high_risk: true,
+                },
+            )
+            .await
+            .unwrap();
+        manager.set_enabled(extension_id, true).await.unwrap();
+        manager.set_running(extension_id, true).await.unwrap();
+    }
+
+    fn loop_invocation(
+        extension_id: &str,
+        capability_id: &str,
+        invocation_id: &str,
+    ) -> InvocationRequest {
+        InvocationRequest {
+            extension_id: extension_id.to_string(),
+            capability_id: capability_id.to_string(),
+            input_json: "{}".to_string(),
+            invocation_id: Some(invocation_id.to_string()),
+            input_artifact_ids: Vec::new(),
+            expected_kind: None,
+            expected_version: None,
+        }
+    }
+
+    /// A guest that spends its own budget says so, and is counted as a trap.
+    ///
+    /// This is the other half of the mid-flight cancellation test below: that
+    /// one asserts an invocation ended in cancellation and *not* in fuel, which
+    /// is worth nothing unless fuel exhaustion is something this runtime can
+    /// actually report under its own name.
+    #[tokio::test]
+    async fn a_runaway_guest_ends_on_its_own_fuel_budget() {
+        let _runtime = runtime_guard();
+        let root = TestRoot::new();
+        let app_data = root.0.join("app-data");
+        let source = write_bundle(
+            &root.0,
+            "runaway",
+            &component_wat(r#"{"never":true}"#, "(loop $forever (br $forever))"),
+            SemanticVersion::new(1, 0, 0),
+        );
+        let manager = ExtensionManager::new(&app_data)
+            .unwrap()
+            .with_fuel(FUEL_A_RUNAWAY_BURNS_AT_ONCE);
+        let preview = manager.discover(&source).unwrap();
+        manager
+            .install(
+                &source,
+                Approval {
+                    approval_digest: preview.approval_digest,
+                    grants: Vec::new(),
+                    allow_unsigned: true,
+                    allow_untrusted: false,
+                    allow_high_risk: false,
+                },
+            )
+            .await
+            .unwrap();
+        manager.set_enabled("dev.example.echo", true).await.unwrap();
+        manager.set_running("dev.example.echo", true).await.unwrap();
+
+        assert_eq!(
+            manager
+                .invoke(loop_invocation("dev.example.echo", "echo", "runaway-1"))
+                .await
+                .unwrap_err(),
+            FUEL_EXHAUSTED_ERROR
+        );
+        let detail = manager.inspect("dev.example.echo").unwrap();
+        assert_eq!(detail.health.trap_count, 1);
+        assert_eq!(detail.health.consecutive_failures, 1);
+        assert_eq!(detail.health.state, HealthState::Degraded);
+    }
+
+    /// A record with nothing on it but the counters this asserts about.
+    fn fixture_record() -> InstalledRecord {
+        InstalledRecord {
+            extension_id: "dev.example.echo".to_string(),
+            active_version: "1.0.0".to_string(),
+            previous_version: None,
+            versions: BTreeMap::new(),
+            config: BTreeMap::new(),
+            configured_secret_slots: BTreeSet::new(),
+            health: RuntimeHealth::default(),
+            logs: Vec::new(),
+            private_state: BTreeMap::new(),
+            last_tool_result: None,
+            last_events: Vec::new(),
+            completed_invocations: BTreeMap::new(),
+            active_invocations: BTreeMap::new(),
+        }
+    }
+
+    /// What a run reports is what execution produced, whatever a marker that
+    /// arrived afterwards says.
+    ///
+    /// The accounting is the reason this matters rather than the wording.
+    /// `record_invocation_failure` exempts a cancellation from the failure and
+    /// trap counters, which is right — a user pressing Stop is not a
+    /// misbehaving extension. So a marker allowed to relabel a *trap* as a
+    /// cancellation erases that trap from the count that protectively disables
+    /// an extension after three of them, and one allowed to relabel a
+    /// wall-clock timeout does the same. Both are asserted here on the counters
+    /// themselves, not only on the sentence.
+    ///
+    /// The Ok cases are the other half of the rule: execution left the question
+    /// open — the guest answered anyway, having swallowed a cancelled host call
+    /// or finished in the instant after something outside it had committed to
+    /// stopping it — and there the external ending decides, because a caller
+    /// who cancelled is not owed a result.
+    #[test]
+    fn an_ending_never_rewrites_what_execution_itself_produced() {
+        let trapped = || Err("Component trapped: wasm `unreachable`".to_string());
+        for ending in [Ending::CANCELLED, Ending::TIMED_OUT, Ending::FINISHED] {
+            assert_eq!(settle_outcome(trapped(), ending), trapped());
+            assert_eq!(
+                settle_outcome(Err(TIMEOUT_ERROR.into()), ending),
+                Err(TIMEOUT_ERROR.into())
+            );
+            assert_eq!(
+                settle_outcome(Err(FUEL_EXHAUSTED_ERROR.into()), ending),
+                Err(FUEL_EXHAUSTED_ERROR.into())
+            );
+            assert_eq!(
+                settle_outcome(Err(CANCELLED_ERROR.into()), ending),
+                Err(CANCELLED_ERROR.into())
+            );
+            // A guest's own error is its own answer too.
+            assert_eq!(
+                settle_outcome(Err("the guest said no".into()), ending),
+                Err("the guest said no".into())
+            );
+        }
+        // Only an answer execution left standing can be overridden.
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::CANCELLED),
+            Err(CANCELLED_ERROR.into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::TIMED_OUT),
+            Err(TIMEOUT_ERROR.into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::FINISHED),
+            Ok("{}".into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::RUNNING),
+            Ok("{}".into())
+        );
+
+        // And the accounting that follows from each, on a real record.
+        let mut record = fixture_record();
+        record_invocation_failure(
+            &mut record,
+            &settle_outcome(trapped(), Ending::CANCELLED).unwrap_err(),
+            "late-marker-trap",
+        );
+        assert_eq!(record.health.trap_count, 1);
+        assert_eq!(record.health.consecutive_failures, 1);
+        record_invocation_failure(
+            &mut record,
+            &settle_outcome(Err(TIMEOUT_ERROR.into()), Ending::CANCELLED).unwrap_err(),
+            "late-marker-timeout",
+        );
+        assert_eq!(record.health.trap_count, 2);
+        assert_eq!(record.health.consecutive_failures, 2);
+        // The contrast: a cancellation that really did stop a running guest
+        // touches neither counter.
+        record_invocation_failure(&mut record, CANCELLED_ERROR, "real-cancellation");
+        assert_eq!(record.health.trap_count, 2);
+        assert_eq!(record.health.consecutive_failures, 2);
+    }
+
+    /// Exactly one claim on an ending can win, whichever order they arrive in.
+    #[test]
+    fn only_the_first_claim_on_an_ending_wins() {
+        let ending = Ending::running();
+        assert_eq!(ending.observed(), Ending::RUNNING);
+        assert!(ending.claim(Ending::FINISHED));
+        assert!(!ending.claim(Ending::CANCELLED));
+        assert!(!ending.claim(Ending::TIMED_OUT));
+        assert_eq!(ending.observed(), Ending::FINISHED);
+
+        let raced = Ending::running();
+        assert!(raced.claim(Ending::CANCELLED));
+        assert!(!raced.claim(Ending::FINISHED));
+        assert_eq!(raced.observed(), Ending::CANCELLED);
+    }
+
+    /// The gap this suite used to have: an on-disk marker stopping a guest that
+    /// was **already executing inside the sandbox**.
+    ///
+    /// Every step is ordered so the claim cannot be satisfied by accident:
+    ///
+    /// 1. each guest writes a known artifact through the host's own import, so
+    ///    the store answering `exists` means that guest's instructions ran;
+    /// 2. only *after* observing that does the test write the marker, so the
+    ///    guest provably executed before the marker existed;
+    /// 3. the guest between those two points is an infinite loop, so it cannot
+    ///    have finished on its own;
+    /// 4. the assertion is equality with [`CANCELLED_ERROR`], which the runtime
+    ///    now reports only for an epoch interrupt taken with the wall-clock
+    ///    deadline unset, or for a cancel that landed on a guest which had not
+    ///    already spent its fuel. Exhausted fuel, the wall clock, an ordinary
+    ///    trap and a pre-start refusal each have their own distinct message;
+    /// 5. the fuel ceiling is raised so far past the window that exhaustion is
+    ///    not a plausible outcome to begin with — and if it happened anyway,
+    ///    step 4 would fail rather than pass.
+    ///
+    /// The second invocation carries the rest of the marker contract: a marker
+    /// names one invocation, so a marker for another id — or for no id at all —
+    /// leaves it running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_on_disk_marker_stops_a_guest_that_has_already_executed() {
+        let _runtime = runtime_guard();
+        let root = TestRoot::new();
+        let app_data = root.0.join("app-data");
+        let manager = ExtensionManager::new(&app_data)
+            .unwrap()
+            .with_fuel(FUEL_A_TEST_WINDOW_CANNOT_BURN);
+        let alpha_evidence = b"alpha reached the host";
+        let beta_evidence = b"beta reached the host";
+        install_guest_that_signals_then_never_returns(
+            &manager,
+            &root.0,
+            "dev.example.alpha",
+            "alpha",
+            alpha_evidence,
+        )
+        .await;
+        install_guest_that_signals_then_never_returns(
+            &manager,
+            &root.0,
+            "dev.example.beta",
+            "beta",
+            beta_evidence,
+        )
+        .await;
+        let plain = write_bundle(
+            &root.0,
+            "plain",
+            &component_wat(r#"{"ok":true}"#, ""),
+            SemanticVersion::new(1, 0, 0),
+        );
+        install_running(&manager, &plain, "dev.example.echo").await;
+        let store = ArtifactStore::with_max_blob_size(
+            &manager.artifact_root,
+            MAX_ARTIFACT_READ_BYTES as u64,
+        )
+        .unwrap();
+
+        let alpha_manager = manager.clone();
+        let alpha = tokio::spawn(async move {
+            alpha_manager
+                .invoke(loop_invocation(
+                    "dev.example.alpha",
+                    "alpha",
+                    "marker-alpha",
+                ))
+                .await
+        });
+        let beta_manager = manager.clone();
+        let beta = tokio::spawn(async move {
+            beta_manager
+                .invoke(loop_invocation("dev.example.beta", "beta", "marker-beta"))
+                .await
+        });
+        wait_until_written(&store, &sha256_bytes(alpha_evidence)).await;
+        wait_until_written(&store, &sha256_bytes(beta_evidence)).await;
+
+        // A marker naming an invocation nobody is running stops nothing.
+        atomic_write(
+            &manager.invocation_cancel_path("marker-nobody").unwrap(),
+            b"cancel\n",
+        )
+        .unwrap();
+        // Now the one that names a guest which is, at this moment, executing.
+        atomic_write(
+            &manager.invocation_cancel_path("marker-alpha").unwrap(),
+            b"cancel\n",
+        )
+        .unwrap();
+        assert_eq!(
+            alpha.await.unwrap().unwrap_err(),
+            CANCELLED_ERROR,
+            "logs: {:?}",
+            manager.logs("dev.example.alpha", 50).unwrap()
+        );
+        // Marker isolation: the other guest was never named, so it is still
+        // inside the sandbox with its own registry entry.
+        assert!(CANCELLATIONS.lock().unwrap().contains_key("marker-beta"));
+        assert!(!beta.is_finished());
+        atomic_write(
+            &manager.invocation_cancel_path("marker-beta").unwrap(),
+            b"cancel\n",
+        )
+        .unwrap();
+        assert_eq!(beta.await.unwrap().unwrap_err(), CANCELLED_ERROR);
+
+        // A cancelled invocation is not a crashed one, and it leaves nothing
+        // behind that could cancel the next one.
+        for extension_id in ["dev.example.alpha", "dev.example.beta"] {
+            let detail = manager.inspect(extension_id).unwrap();
+            assert_eq!(
+                detail.health.state,
+                HealthState::Healthy,
+                "logs: {:?}",
+                manager.logs(extension_id, 50).unwrap()
+            );
+            assert_eq!(detail.health.consecutive_failures, 0);
+            assert_eq!(detail.health.trap_count, 0);
+        }
+        assert!(!manager
+            .invocation_cancel_path("marker-alpha")
+            .unwrap()
+            .exists());
+        assert!(!manager
+            .invocation_cancel_path("marker-beta")
+            .unwrap()
+            .exists());
+        assert!(CANCELLATIONS.lock().unwrap().is_empty());
+        assert_eq!(manager.list().unwrap().len(), 3);
+        assert_eq!(
+            manager
+                .invoke(loop_invocation(
+                    "dev.example.echo",
+                    "echo",
+                    "after-cancellation"
+                ))
+                .await
+                .unwrap()
+                .output_json,
+            r#"{"ok":true}"#
+        );
     }
 
     #[tokio::test]

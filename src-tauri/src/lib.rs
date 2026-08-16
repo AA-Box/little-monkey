@@ -1682,6 +1682,8 @@ pub fn run() {
             extension_commands::extensions_webhooks,
             extension_commands::extensions_register_webhook,
             extension_commands::extensions_remove_webhook,
+            daemon_commands::conversations_list,
+            daemon_commands::conversations_show,
             daemon_commands::channels_list,
             daemon_commands::channels_add,
             daemon_commands::channels_probe,
