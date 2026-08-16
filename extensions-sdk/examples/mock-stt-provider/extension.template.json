@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "extension_id": "dev.little-monkey.examples.mock-stt-provider",
+  "version": "1.0.0",
+  "display_name": "Example: Mock STT Provider",
+  "description": "A deterministic speech-to-text fixture that reads only invocation artifacts.",
+  "host_api": {
+    "minimum": "1.0.0",
+    "maximum_exclusive": "2.0.0"
+  },
+  "component": {
+    "path": "component.wasm",
+    "sha256": "__COMPONENT_SHA256__"
+  },
+  "capabilities": [
+    {
+      "capability_id": "transcribe",
+      "kind": "stt",
+      "display_name": "Mock transcription",
+      "description": "Returns a deterministic transcript for an input artifact.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact_id"],
+        "properties": {
+          "artifact_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "language": { "type": ["string", "null"], "maxLength": 32 }
+        }
+      }
+    }
+  ],
+  "permissions": [
+    {
+      "permission_id": "read-invocation-audio",
+      "kind": "artifact_read",
+      "scope": "invocation_inputs",
+      "reason": "Read only artifacts explicitly attached to this invocation."
+    }
+  ],
+  "config_schema": [
+    {
+      "key": "default-language",
+      "label": "Default language",
+      "description": "Language tag used when an invocation does not specify one.",
+      "kind": "select",
+      "required": false,
+      "default": "und",
+      "options": ["und", "en", "es", "fr", "de", "sv"],
+      "minimum": null,
+      "maximum": null
+    }
+  ],
+  "secret_slots": [],
+  "dependencies": [],
+  "compatibility": {
+    "minimum_app_version": "1.3.0",
+    "maximum_app_version_exclusive": null,
+    "platforms": ["linux", "macos", "windows"],
+    "architectures": ["aarch64", "x86_64"]
+  },
+  "publisher": "Little Monkey Examples",
+  "provenance": {
+    "publisher": "Little Monkey Examples",
+    "source": {
+      "local_folder": { "canonical_path": "__SOURCE_PATH__" }
+    },
+    "source_revision": "__SOURCE_REVISION__",
+    "build_reproducible": false
+  },
+  "signature": null,
+  "checksums": {
+    "component.wasm": "__COMPONENT_SHA256__"
+  }
+}

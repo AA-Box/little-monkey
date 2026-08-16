@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "extension_id": "dev.little-monkey.examples.mock-channel",
+  "version": "1.0.0",
+  "display_name": "Example: Mock Channel",
+  "description": "A complete offline messaging provider: probe, poll, send and durable webhook normalization.",
+  "host_api": {
+    "minimum": "1.0.0",
+    "maximum_exclusive": "2.0.0"
+  },
+  "component": {
+    "path": "component.wasm",
+    "sha256": "__COMPONENT_SHA256__"
+  },
+  "capabilities": [
+    {
+      "capability_id": "room",
+      "kind": "channel",
+      "display_name": "Mock room",
+      "description": "Probes, polls, sends, and normalizes durable webhook deliveries into channel messages.",
+      "input_schema": {
+        "type": "object",
+        "description": "Either a channel operation (probe/poll/send) or a durable webhook delivery.",
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "probe",
+              "poll",
+              "send"
+            ]
+          },
+          "account_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 1024
+          },
+          "conversation_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 160
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 16000
+          },
+          "idempotency_key": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "delivery_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "received_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "payload": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ],
+  "permissions": [
+    {
+      "permission_id": "receive-signed-webhook",
+      "kind": "webhook_receive",
+      "scope": "room",
+      "reason": "Normalize authenticated webhook deliveries into channel messages."
+    }
+  ],
+  "config_schema": [],
+  "secret_slots": [],
+  "dependencies": [],
+  "compatibility": {
+    "minimum_app_version": "1.3.0",
+    "maximum_app_version_exclusive": null,
+    "platforms": [
+      "linux",
+      "macos",
+      "windows"
+    ],
+    "architectures": [
+      "aarch64",
+      "x86_64"
+    ]
+  },
+  "publisher": "Little Monkey Examples",
+  "provenance": {
+    "publisher": "Little Monkey Examples",
+    "source": {
+      "local_folder": {
+        "canonical_path": "__SOURCE_PATH__"
+      }
+    },
+    "source_revision": "__SOURCE_REVISION__",
+    "build_reproducible": false
+  },
+  "signature": null,
+  "checksums": {
+    "component.wasm": "__COMPONENT_SHA256__"
+  }
+}

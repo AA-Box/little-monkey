@@ -17,6 +17,10 @@ import type { RoutingDecision } from './modelRouting';
 import type { ChatMessage, StreamEvent, ToolCall, ToolDef } from './llamaClient';
 import { streamProviderChat } from './providerClient';
 import { formatMcpCallToolResult, resolveMcpToolName, type McpCallToolResult, type McpToolRegistry } from './mcpTools';
+import {
+  invokeExecutableExtensionTool,
+  type ExtensionToolRegistry,
+} from './executableExtensionTools';
 import { classifyExternalTool } from './checkpointReconciliation';
 import { recordRequest } from './rateLimitTracker';
 import { useUsageStore } from '../store/usageStore';
@@ -264,11 +268,28 @@ const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetc
  * Exported for `toolsForMode` and the logic tests.
  */
 export function isBlockedInPlanMode(name: string): boolean {
-  return PERMISSION_GATED_TOOLS.has(name) || name === 'shell_kill' || name.startsWith('mcp__');
+  return PERMISSION_GATED_TOOLS.has(name) || name === 'shell_kill' || name.startsWith('mcp__') || name.startsWith('ext__');
 }
 
 function isPermissionGatedTool(name: string): boolean {
-  return PERMISSION_GATED_TOOLS.has(name) || name.startsWith('mcp__');
+  return PERMISSION_GATED_TOOLS.has(name) || name.startsWith('mcp__') || name.startsWith('ext__');
+}
+
+async function extensionInvocationId(
+  turnOrRunId: string,
+  providerToolCallId: string,
+  binding: { extensionId: string; capabilityId: string; version: string },
+): Promise<string> {
+  const identity = JSON.stringify([
+    turnOrRunId,
+    providerToolCallId,
+    binding.extensionId,
+    binding.capabilityId,
+    binding.version,
+  ]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `ext-inv-${hex}`;
 }
 
 /** Per-call context `RESERVED_ARGS`' `resolve` functions read from — one
@@ -554,7 +575,8 @@ export async function executeToolCall(
   chatSessionId?: string,
   // Managed agent-worktree root for this call's fs/shell resolution — see
   // `executeToolCallInner`'s param of the same name.
-  workspaceRootOverride?: string
+  workspaceRootOverride?: string,
+  extensionRegistry?: ExtensionToolRegistry,
 ): Promise<string> {
   const name = toolCall.function.name;
   const sessionId = chatSessionId ?? subagent?.sessionId;
@@ -596,6 +618,7 @@ export async function executeToolCall(
     skill,
     chatSessionId,
     workspaceRootOverride,
+    extensionRegistry,
   );
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
@@ -643,7 +666,8 @@ async function executeToolCallInner(
   // call rather than via any global state, so concurrent isolated agents can
   // never race each other's roots. See the `workspace_root_override`
   // RESERVED_ARGS entry for the trust story.
-  workspaceRootOverride?: string
+  workspaceRootOverride?: string,
+  extensionRegistry?: ExtensionToolRegistry,
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -1005,10 +1029,27 @@ async function executeToolCallInner(
       : invoke('background_shell_kill', { id }).then(stringifyToolResult, stringifyToolError);
   }
 
+  const extensionBinding = extensionRegistry?.get(name);
+  const durableExtensionInvocationId = extensionBinding
+    ? await extensionInvocationId(turnId, toolCall.id, extensionBinding)
+    : undefined;
   const invocation = name.startsWith('mcp__')
     ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
-    : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
-  return raceInvocationWithStop(invocation, turnId, signal);
+    : name.startsWith('ext__')
+      ? invokeExecutableExtensionTool(
+          name,
+          args,
+          durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
+          extensionRegistry ?? new Map(),
+        )
+          .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
+      : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+  return raceInvocationWithStop(
+    invocation,
+    turnId,
+    signal,
+    name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
+  );
 }
 
 /** Races an in-flight tool `invoke` against the Stop button: on abort, the
@@ -1023,7 +1064,8 @@ async function executeToolCallInner(
 async function raceInvocationWithStop(
   invocation: Promise<string>,
   turnId: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  extensionInvocationId?: string,
 ): Promise<string> {
   if (!signal) return invocation;
 
@@ -1031,6 +1073,9 @@ async function raceInvocationWithStop(
   if (raced !== null) return raced;
 
   void invoke('tools_cancel_running', { turnId }).catch(() => {});
+  if (extensionInvocationId) {
+    void invoke('extensions_cancel', { invocationId: extensionInvocationId }).catch(() => {});
+  }
   return CANCELLED_TOOL_RESULT;
 }
 

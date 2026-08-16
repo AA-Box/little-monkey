@@ -41,6 +41,7 @@ const MIC_TEST_MS = 3_000;
 const BACKEND_LABEL: Record<TranscriptionBackendKind, string> = {
   local_whisper: 'local whisper.cpp on this machine',
   provider: 'a BYOK provider',
+  executable_extension: 'a sandboxed executable extension',
 };
 
 export interface VoiceSettingsSectionProps {

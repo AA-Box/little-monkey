@@ -8,6 +8,7 @@
 //! once, which is why a new provider cannot bring its own security posture.
 
 pub(crate) mod discord;
+pub(crate) mod extension;
 pub(crate) mod google_chat;
 pub(crate) mod imessage;
 pub(crate) mod irc;
@@ -45,6 +46,10 @@ pub(crate) fn sends_attachments(kind: ChannelKind) -> bool {
             | ChannelKind::Mattermost
             | ChannelKind::Matrix
             | ChannelKind::Signal
+            // The extension adapter hands the outbound artifact to the guest
+            // under an exact read grant and downloads an inbound URL through
+            // the host's own hardened client, so both halves are implemented.
+            | ChannelKind::Extension
     )
 }
 
@@ -172,6 +177,14 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         optional("webhook_public_key", ConfigFieldKind::Text),
         optional("session_scope", ConfigFieldKind::Text),
     ];
+    // Which extension speaks for this account, and which of its channel
+    // capabilities. Both required: an account that named only the capability
+    // would resolve to whichever extension declares that id today, which is
+    // exactly the ambiguity every other extension-backed provider refuses.
+    const EXTENSION: &[ConfigField] = &[
+        required("extension_id", ConfigFieldKind::Text),
+        required("capability_id", ConfigFieldKind::Text),
+    ];
     match kind {
         // Secret-only providers: the token carries everything.
         ChannelKind::Telegram | ChannelKind::Discord | ChannelKind::Slack | ChannelKind::Line => {
@@ -186,7 +199,25 @@ pub(crate) fn config_fields(kind: ChannelKind) -> &'static [ConfigField] {
         ChannelKind::Teams => TEAMS,
         ChannelKind::GoogleChat => GOOGLE_CHAT,
         ChannelKind::Sms => SMS,
+        ChannelKind::Extension => EXTENSION,
     }
+}
+
+/// Extra checks a provider needs beyond its declared field list.
+///
+/// Only the extension kind has any: its two required fields name an
+/// installation and a capability, and both have to be identifiers the runtime
+/// will actually accept later. Validating that here means a typo is refused
+/// when the account is written rather than surfacing as a probe failure with
+/// no hint why.
+fn validate_kind_specific_config(
+    kind: ChannelKind,
+    config: &serde_json::Value,
+) -> Result<(), String> {
+    if kind == ChannelKind::Extension {
+        extension::binding_from_config(config)?;
+    }
+    Ok(())
 }
 
 /// Check a non-secret configuration object against what the provider's
@@ -231,6 +262,21 @@ pub(crate) fn validate_non_secret_config(
                     return Err(format!("'{key}' must be {}.", field.kind.describe()));
                 }
             }
+            None if kind == ChannelKind::Extension => {
+                // An extension provider's own settings are its business: the
+                // guest reads them and the host never interprets them, so
+                // refusing an unknown key here would make every provider need
+                // a code change in this file to have a setting at all. What is
+                // enforced instead is the bound and the shape.
+                if key.len() > 128
+                    || serde_json::to_string(value)
+                        .map(|text| text.len())
+                        .unwrap_or(usize::MAX)
+                        > 8 * 1024
+                {
+                    return Err(format!("'{key}' exceeds the extension setting limits."));
+                }
+            }
             None => {
                 let mut known_keys: Vec<&str> = fields
                     .iter()
@@ -246,7 +292,7 @@ pub(crate) fn validate_non_secret_config(
             }
         }
     }
-    Ok(())
+    validate_kind_specific_config(kind, config)
 }
 
 /// Build the adapter an account's provider needs.
@@ -277,6 +323,7 @@ pub(crate) fn build_adapter(
         ChannelKind::Sms => {
             return Err("An SMS account is built from its telephony account".to_string())
         }
+        ChannelKind::Extension => Arc::new(extension::ExtensionChannelAdapter::new(config, state)?),
     })
 }
 

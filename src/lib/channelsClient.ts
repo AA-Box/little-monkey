@@ -277,6 +277,21 @@ export const PROVIDER_GUIDES: ProviderGuide[] = [
       { key: "session_scope", label: "Session scope (optional)", type: "text", placeholder: "conversation", hint: "Which durable session a text thread maps onto." },
     ],
   },
+  {
+    // One entry for every extension-backed provider, because the persisted
+    // kind is a *kind*: which installation and which of its channel
+    // capabilities an account belongs to is the account's own configuration,
+    // validated on write and re-resolved on every use.
+    kind: "extension", label: "Executable extension", transport: "long_poll",
+    credentialLabel: "None here — the extension holds its own credentials in its declared secret slots",
+    credentialOptional: true,
+    whereToGetIt: "Install a channel extension under Settings > Extensions, grant it the origins it asks for, fill in its secret slots, then name it here.",
+    docsUrl: "https://github.com/sarollahi/little-monkey/blob/develop/docs/executable-extensions.md",
+    configFields: [
+      { key: "extension_id", label: "Extension", type: "text", required: true, placeholder: "dev.example.chat", hint: "The installed extension that speaks for this account. Both this and the capability are required: naming only the capability would resolve to whichever extension declares that id today." },
+      { key: "capability_id", label: "Channel capability", type: "text", required: true, placeholder: "room", hint: "Which of that extension's declared channel capabilities this account uses." },
+    ],
+  },
 ];
 
 /** Keys every account accepts regardless of provider: the per-account

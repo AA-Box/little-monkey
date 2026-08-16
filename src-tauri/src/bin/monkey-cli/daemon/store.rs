@@ -28,6 +28,20 @@ pub struct DaemonPaths {
 }
 
 impl DaemonPaths {
+    /// The profile data directory these paths sit under — `root`'s parent.
+    ///
+    /// Several subsystems the daemon reaches into (the companion's voice
+    /// configuration, the shared artifact store, the extension registry) live
+    /// beside `daemon/`, not inside it. Handing them `root` produces a second,
+    /// empty copy of that state under `daemon/` that nothing else ever reads,
+    /// which is a silent wrong answer rather than an error, so the resolution
+    /// lives here once instead of at each call site.
+    pub fn app_data(&self) -> Result<&Path, String> {
+        self.root
+            .parent()
+            .ok_or_else(|| "Daemon root has no app-data parent".to_string())
+    }
+
     pub fn resolve() -> Result<Self, String> {
         let app_data = crate::app_data_dir()
             .ok_or_else(|| "Could not resolve the app data directory".to_string())?;

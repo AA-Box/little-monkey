@@ -31,6 +31,7 @@ import {
 } from "./turnEngine";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
+import type { ExtensionToolRegistry } from "./executableExtensionTools";
 import type { StreamEvent, ToolCall, ToolDef } from "./llamaClient";
 import type { SlashSkill } from "./skills";
 import { useUsageStore } from "../store/usageStore";
@@ -1221,6 +1222,73 @@ describe("executeToolCall / user hooks", () => {
     await executeToolCall(call("read_file", { path: "a.txt" }), null, "turn-1", emptyMcpRegistry);
 
     expect(invokeMock.mock.calls.some(([name]) => name === "hook_exec")).toBe(false);
+  });
+});
+
+describe("executeToolCall / extension invocation identity", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    usePermissionStore.setState({ mode: "manual" });
+    invokeMock.mockImplementation(async (command: string, payload: { request?: { invocation_id?: string } }) => {
+      if (command !== "extensions_invoke" || !payload.request?.invocation_id) {
+        throw new Error(`unexpected invoke: ${command}`);
+      }
+      return {
+        invocation_id: payload.request.invocation_id,
+        output_json: "{}",
+        duration_ms: 1,
+        fuel_consumed: 1,
+        emitted_events: [],
+        tool_result: "ok",
+      };
+    });
+  });
+
+  it("binds the durable id to the run, provider call, and immutable extension binding", async () => {
+    const toolName = "ext__weather__forecast_now";
+    const registry = (extensionId: string): ExtensionToolRegistry => new Map([
+      [
+        toolName,
+        {
+          extensionId,
+          capabilityId: "forecast.now",
+          kind: "tool",
+          version: "1.0.0",
+        },
+      ],
+    ]);
+    const run = (runId: string, providerCallId: string, bindings: ExtensionToolRegistry) =>
+      executeToolCall(
+        { id: providerCallId, type: "function", function: { name: toolName, arguments: "{}" } },
+        null,
+        runId,
+        emptyMcpRegistry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        bindings,
+      );
+
+    await run("run-1", "provider-call-1", registry("dev.example.weather"));
+    await run("run-1", "provider-call-1", registry("dev.example.weather"));
+    await run("run-2", "provider-call-1", registry("dev.example.weather"));
+    await run("run-1", "provider-call-2", registry("dev.example.weather"));
+    await run("run-1", "provider-call-1", registry("dev.example.weather-alt"));
+
+    const ids = invokeMock.mock.calls.map(([, payload]) =>
+      (payload as { request: { invocation_id: string } }).request.invocation_id
+    );
+    expect(ids[0]).toBe(ids[1]);
+    expect(new Set([ids[0], ids[2], ids[3], ids[4]])).toHaveLength(4);
+    for (const id of ids) {
+      expect(id).toMatch(/^ext-inv-[0-9a-f]{64}$/);
+      expect(id.length).toBeLessThanOrEqual(160);
+    }
   });
 });
 

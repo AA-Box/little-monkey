@@ -4,6 +4,7 @@ import {
   BarChart3,
   BookOpen,
   Bot,
+  Blocks,
   Boxes,
   Brain,
   Cloud,
@@ -62,6 +63,7 @@ import { ScheduledTasksPanel } from "./ScheduledTasksPanel";
 import { UsagePanel } from "./UsagePanel";
 import { PortabilityPanel } from "./PortabilityPanel";
 import { EcosystemPanel } from "./EcosystemPanel";
+import { ExecutableExtensionsPanel } from "./ExecutableExtensionsPanel";
 import { RuntimeHubPanel } from "./RuntimeHubPanel";
 import { BrowserVerificationPanel } from "./BrowserVerificationPanel";
 import { BackgroundAgentsPanel } from "./BackgroundAgentsPanel";
@@ -101,7 +103,7 @@ interface SettingsModalProps {
   initialTabRequest?: number;
 }
 
-type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
+type StaticSettingsTab = "local" | "ollama" | "providers" | "automation" | "rules" | "memorystudio" | "connectors" | "prompts" | "apiserver" | "knowledge" | "shortcuts" | "usage" | "tasks" | "portability" | "extensions" | "ecosystem" | "runtimehub" | "browser" | "gitdelivery" | "triage" | "background" | "channels" | "telephony" | "peers" | "companion" | "security" | "privacy" | "diagnostics" | "appearance" | "desktopcontrol" | "team" | "profiles" | "approvalchains" | "localapps" | "comparelab" | "resources" | "updates";
 export type SettingsTab = StaticSettingsTab | ProviderSettingsTab;
 
 const ICONS: Record<StaticSettingsTab, LucideIcon> = {
@@ -119,6 +121,7 @@ const ICONS: Record<StaticSettingsTab, LucideIcon> = {
   usage: BarChart3,
   tasks: ListChecks,
   portability: HardDrive,
+  extensions: Blocks,
   ecosystem: Boxes,
   runtimehub: Gauge,
   browser: MonitorCheck,
@@ -147,7 +150,7 @@ const GROUPS: { labelKey: string; ids: StaticSettingsTab[] }[] = [
   { labelKey: "SettingsModal.groupApplication", ids: ["appearance", "updates", "security", "privacy", "diagnostics", "approvalchains", "profiles", "team", "companion", "desktopcontrol", "shortcuts", "usage", "resources", "portability"] },
   { labelKey: "SettingsModal.groupModels", ids: ["runtimehub", "local", "ollama", "providers", "comparelab"] },
   { labelKey: "SettingsModal.groupWorkspace", ids: ["knowledge", "automation", "rules", "memorystudio", "tasks", "localapps"] },
-  { labelKey: "SettingsModal.groupIntegrations", ids: ["ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
+  { labelKey: "SettingsModal.groupIntegrations", ids: ["extensions", "ecosystem", "browser", "gitdelivery", "triage", "background", "connectors", "channels", "telephony", "peers", "prompts", "apiserver"] },
 ];
 
 const LABEL_KEYS: Record<StaticSettingsTab, string> = {
@@ -165,6 +168,7 @@ const LABEL_KEYS: Record<StaticSettingsTab, string> = {
   usage: "SettingsModal.tabUsage",
   tasks: "SettingsModal.tabTasks",
   portability: "SettingsModal.tabPortability",
+  extensions: "SettingsModal.tabExecutableExtensions",
   ecosystem: "SettingsModal.tabEcosystem",
   runtimehub: "SettingsModal.tabRuntimeHub",
   browser: "SettingsModal.tabBrowserVerification",
@@ -456,6 +460,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
               {tab === "tasks" && <ScheduledTasksPanel />}
               {tab === "localapps" && <LocalAppsPanel />}
               {tab === "portability" && <PortabilityPanel />}
+              {tab === "extensions" && <ExecutableExtensionsPanel />}
               {tab === "ecosystem" && <EcosystemPanel />}
               {tab === "runtimehub" && <RuntimeHubPanel />}
               {tab === "browser" && <BrowserVerificationPanel />}

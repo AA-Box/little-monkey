@@ -280,6 +280,9 @@ fn capability_token(capability: DeviceCapability) -> String {
 /// database simply has no capable device, and a turn must not be blocked by
 /// asking.
 pub fn any_device_is_capable() -> bool {
+    if any_extension_device_provider() {
+        return true;
+    }
     let Ok(paths) = DaemonPaths::resolve() else {
         return false;
     };
@@ -302,6 +305,369 @@ pub fn any_device_is_capable() -> bool {
         })
 }
 
+// --- executable-extension device providers -----------------------------------
+//
+// A paired phone is not the only thing that can hold a camera or a speaker. An
+// extension may contribute its own devices — a lab instrument, a smart-home
+// bridge, a second machine on the desk — and they route through this same
+// module rather than a parallel one, so the permission prompt, the argument
+// validation, the action vocabulary and the shape of the result are identical
+// whichever kind of device answered.
+//
+// The device id is namespaced with the owning extension and capability. That
+// is not decoration: it is what makes it structurally impossible for one
+// extension to name a device belonging to another, or to collide with a
+// paired device's id.
+
+/// Prefix marking a device id as belonging to an extension provider.
+pub const EXTENSION_DEVICE_PREFIX: &str = "ext:";
+/// How many devices one provider may advertise.
+const MAX_EXTENSION_DEVICES: usize = 128;
+
+/// One device an extension provider currently offers.
+#[derive(Debug, Clone)]
+pub struct ExtensionDevice {
+    pub device_id: String,
+    pub device_name: String,
+    pub extension_id: String,
+    pub capability_id: String,
+    pub actions: BTreeSet<DeviceCapability>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExtensionDeviceList {
+    #[serde(default)]
+    devices: Vec<ExtensionDeviceEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExtensionDeviceEntry {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    actions: Vec<String>,
+}
+
+/// Split a namespaced device id back into owner, capability and the device's
+/// own id. `None` for every id that is not an extension device.
+pub fn extension_device_target(device_id: &str) -> Option<(String, String, String)> {
+    let rest = device_id.strip_prefix(EXTENSION_DEVICE_PREFIX)?;
+    let mut parts = rest.splitn(3, ':');
+    let extension_id = parts.next()?;
+    let capability_id = parts.next()?;
+    let local_id = parts.next()?;
+    if extension_id.is_empty() || capability_id.is_empty() || local_id.is_empty() {
+        return None;
+    }
+    Some((
+        extension_id.to_string(),
+        capability_id.to_string(),
+        local_id.to_string(),
+    ))
+}
+
+fn extension_manager(
+    app_data: &std::path::Path,
+) -> Result<little_monkey_lib::executable_extensions::ExtensionManager, String> {
+    little_monkey_lib::executable_extensions::ExtensionManager::new(app_data)
+}
+
+fn ambient_app_data() -> Option<std::path::PathBuf> {
+    little_monkey_lib::app_paths::data_dir()
+}
+
+/// Ask every healthy device-provider extension what devices it currently has.
+///
+/// Discovery is live rather than cached: a device that has gone away, or an
+/// extension that has been disabled, stops being a candidate immediately, and
+/// that is the whole point of routing through the registry instead of a
+/// remembered list.
+pub async fn extension_devices(app_data: &std::path::Path) -> Result<Vec<ExtensionDevice>, String> {
+    let manager = match extension_manager(app_data) {
+        Ok(manager) => manager,
+        // No extension store at all is "no extension devices", not an error:
+        // the paired-device path must still work on a machine that has never
+        // installed one.
+        Err(_) => return Ok(Vec::new()),
+    };
+    let capabilities = manager
+        .active_capabilities(Some(
+            little_monkey_lib::executable_extensions::CapabilityKind::DeviceProvider,
+        ))
+        .unwrap_or_default();
+    let mut devices = Vec::new();
+    for capability in capabilities {
+        if capability.extension_id.contains(':') || capability.capability_id.contains(':') {
+            continue;
+        }
+        let result = manager
+            .invoke_owned_active_capability(
+                little_monkey_lib::executable_extensions::CapabilityKind::DeviceProvider,
+                &capability.extension_id,
+                &capability.capability_id,
+                serde_json::json!({ "query": "devices" }).to_string(),
+                None,
+                Vec::new(),
+            )
+            .await;
+        // One broken provider must not take the rest of them — or the paired
+        // devices — down with it. It simply contributes nothing.
+        let Ok(result) = result else { continue };
+        let Ok(listed) = serde_json::from_str::<ExtensionDeviceList>(&result.output_json) else {
+            continue;
+        };
+        for entry in listed.devices.into_iter().take(MAX_EXTENSION_DEVICES) {
+            if validate_id(&entry.id).is_err() || entry.id.contains(':') {
+                continue;
+            }
+            let actions: BTreeSet<DeviceCapability> = entry
+                .actions
+                .iter()
+                .filter_map(|action| capability_for_action(action).ok())
+                .collect();
+            if actions.is_empty() {
+                continue;
+            }
+            let name = entry
+                .name
+                .filter(|name| !name.trim().is_empty() && name.len() <= 128)
+                .unwrap_or_else(|| entry.id.clone());
+            devices.push(ExtensionDevice {
+                device_id: format!(
+                    "{EXTENSION_DEVICE_PREFIX}{}:{}:{}",
+                    capability.extension_id, capability.capability_id, entry.id
+                ),
+                device_name: name,
+                extension_id: capability.extension_id.clone(),
+                capability_id: capability.capability_id.clone(),
+                actions,
+            });
+        }
+    }
+    Ok(devices)
+}
+
+/// Whether any installed extension contributes device actions at all.
+///
+/// Answered from the registry rather than by invoking every provider: this
+/// gates whether the `device_action` tool is offered on a turn, and paying a
+/// sandbox start-up per turn to find out would be a poor trade for a question
+/// whose answer is "is such a provider installed and healthy".
+pub fn any_extension_device_provider() -> bool {
+    ambient_app_data()
+        .ok_or_else(|| "no app data".to_string())
+        .and_then(extension_manager_owned)
+        .and_then(|manager| {
+            manager.active_capabilities(Some(
+                little_monkey_lib::executable_extensions::CapabilityKind::DeviceProvider,
+            ))
+        })
+        .is_ok_and(|capabilities| !capabilities.is_empty())
+}
+
+fn extension_manager_owned(
+    app_data: std::path::PathBuf,
+) -> Result<little_monkey_lib::executable_extensions::ExtensionManager, String> {
+    extension_manager(&app_data)
+}
+
+/// The content id of `arguments`' artifact, if it names one, or `None` if this
+/// action carries no artifact at all.
+///
+/// The lookup is `artifact_id AND run_id` against the run ledger — the same
+/// pair the signed artifact route resolves for a paired device, and the same
+/// refusal when the artifact belongs to some other run. Nothing here trusts
+/// the caller's id beyond using it as a key: what comes back is the content
+/// digest the ledger recorded, which is what the artifact store is keyed on
+/// and what the invocation grant names.
+fn resolve_run_artifact(
+    paths: &DaemonPaths,
+    arguments: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let (Some(artifact_id), Some(run_id)) = (
+        arguments.get("artifact_id").and_then(|v| v.as_str()),
+        arguments.get("run_id").and_then(|v| v.as_str()),
+    ) else {
+        return Ok(None);
+    };
+    let connection = rusqlite::Connection::open(&paths.ledger_db)
+        .map_err(|error| format!("Could not open the run ledger: {error}"))?;
+    connection
+        .query_row(
+            "SELECT content_sha256 FROM artifacts WHERE artifact_id=?1 AND run_id=?2",
+            rusqlite::params![artifact_id, run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                format!("Artifact '{artifact_id}' is not linked to run '{run_id}'")
+            }
+            other => format!("Could not resolve the artifact to play: {other}"),
+        })
+}
+
+/// Run one action on an extension-provided device.
+///
+/// The action reaches the guest as a capability token the host resolved, never
+/// as a free string the model wrote: an undeclared action cannot be smuggled
+/// through, and a device the provider did not advertise is refused before the
+/// sandbox is even started.
+async fn dispatch_extension(
+    paths: &DaemonPaths,
+    request: &DeviceActionRequest,
+    device: &ExtensionDevice,
+    now_ms: u64,
+) -> Result<DeviceCommandRecord, String> {
+    let app_data = paths.app_data()?.to_path_buf();
+    if !device.actions.contains(&request.capability) {
+        return Err(format!(
+            "Device '{}' does not advertise '{}'",
+            device.device_id,
+            capability_token(request.capability)
+        ));
+    }
+    let mut arguments = validate_arguments(request.capability, &request.arguments)?;
+    // A paired phone fetches a stored artifact for itself over the signed
+    // route, under the run it was granted. A guest has no route to fetch over,
+    // so the host does the same resolution here and hands the bytes across as
+    // an explicit invocation grant. The run link is the authority in both
+    // cases: an artifact that is not this run's resolves to nothing, and the
+    // id the guest is given is the content id the host looked up rather than
+    // the one the caller wrote.
+    let granted_artifact_ids = match resolve_run_artifact(paths, &arguments)? {
+        Some(content_sha256) => {
+            let object = arguments
+                .as_object_mut()
+                .ok_or_else(|| "Device arguments are not an object".to_string())?;
+            object.remove("run_id");
+            object.insert(
+                "artifact_id".to_string(),
+                serde_json::Value::String(content_sha256.clone()),
+            );
+            vec![content_sha256]
+        }
+        None => Vec::new(),
+    };
+    let (_, _, local_id) = extension_device_target(&device.device_id)
+        .ok_or_else(|| "Extension device id is malformed".to_string())?;
+    let input_json = serde_json::json!({
+        "query": "action",
+        "device_id": local_id,
+        "action": capability_token(request.capability),
+        "arguments": arguments,
+    })
+    .to_string();
+    let manager = extension_manager(&app_data)?;
+    // The same at-most-once identity a paired device's command carries, spent
+    // through the extension runtime's own durable invocation ledger: a retried
+    // tool call with the same invocation identity replays the cached result
+    // rather than running the action a second time. Without one — an operator
+    // driving this by hand — each call is its own action, which is what the
+    // caller asked for.
+    let command_id = match request.invocation_id.as_deref() {
+        Some(invocation_id) => format!(
+            "xdevice-{}",
+            &little_monkey_lib::executable_extensions::stable_invocation_suffix(&[
+                invocation_id,
+                &device.device_id,
+                capability_token(request.capability).as_str(),
+            ])
+        ),
+        None => format!("xdevice-{}", uuid::Uuid::new_v4().simple()),
+    };
+    let result = manager
+        .invoke_owned_active_capability(
+            little_monkey_lib::executable_extensions::CapabilityKind::DeviceProvider,
+            &device.extension_id,
+            &device.capability_id,
+            input_json,
+            Some(command_id.clone()),
+            granted_artifact_ids,
+        )
+        .await?;
+    let output: serde_json::Value = serde_json::from_str(&result.output_json)
+        .map_err(|error| format!("The device extension returned invalid output: {error}"))?;
+    let error = output
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    // An artifact a provider returns has to be one it wrote during this same
+    // invocation, for the same reason every other consumer checks: naming a
+    // content-addressed id proves nothing about who owns the content.
+    let artifact = match output.get("artifact_id").and_then(|value| value.as_str()) {
+        Some(artifact_id)
+            if result
+                .written_artifact_ids
+                .iter()
+                .any(|id| id == artifact_id) =>
+        {
+            Some(super::store::DeviceArtifact {
+                sha256: artifact_id.to_string(),
+                bytes: output
+                    .get("artifact_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                media_type: output
+                    .get("media_type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string(),
+            })
+        }
+        Some(_) => {
+            return Err(
+                "The device extension named an artifact it did not write; result refused"
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
+    let terminal_digest = {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(result.output_json.as_bytes());
+        format!("{:x}", digest.finalize())
+    };
+    Ok(DeviceCommandRecord {
+        command_id: command_id.clone(),
+        device_id: device.device_id.clone(),
+        capability: request.capability,
+        arguments,
+        arguments_sha256: String::new(),
+        source_run_id: request.source_run_id.clone(),
+        source_session_id: request.source_session_id.clone(),
+        source_tool_call_id: request.source_tool_call_id.clone(),
+        state: if error.is_some() {
+            DeviceCommandState::Failed
+        } else {
+            DeviceCommandState::Succeeded
+        },
+        attempt: 1,
+        cancel_requested: false,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(DEFAULT_COMMAND_TTL_MS),
+        lease_expires_at_ms: None,
+        started_at_ms: Some(now_ms),
+        completed_at_ms: Some(now_ms),
+        result: output.get("result").cloned(),
+        artifact,
+        error,
+        // The sandbox invocation *is* the execution the host authorized: there
+        // is no separate runner lease to hand out, because nothing left this
+        // machine to be leased.
+        execution_id: Some(command_id.clone()),
+        // This command reached a terminal state inside this call, so its
+        // report is the only one there will ever be. Recording its digest
+        // keeps the column's meaning — "the terminal report already accepted"
+        // — true for extension devices as well as paired ones.
+        terminal_sha256: Some(terminal_digest),
+        invocation_id: request.invocation_id.clone(),
+    })
+}
+
 /// Queues one command and waits for the device to finish it.
 ///
 /// Returns as soon as the command reaches a terminal state. On timeout the
@@ -312,10 +678,74 @@ pub async fn dispatch(
     request: &DeviceActionRequest,
     now_ms: u64,
 ) -> Result<DeviceCommandRecord, String> {
+    // Extension-provided devices are resolved first, because their ids are the
+    // only ones that can be recognised without touching the pairing database
+    // and because an unnamed action has to see both kinds before it can say
+    // whether the choice was ambiguous.
+    let app_data = paths.app_data()?.to_path_buf();
+    let extension_candidates: Vec<ExtensionDevice> = extension_devices(&app_data)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|device| device.actions.contains(&request.capability))
+        .collect();
+    if let Some(requested) = request.device_id.as_deref() {
+        if extension_device_target(requested).is_some() {
+            let device = extension_candidates
+                .iter()
+                .find(|device| device.device_id == requested)
+                .ok_or_else(|| {
+                    format!(
+                        "Device '{requested}' cannot do this: no healthy extension provider \
+                         advertises that device with this action."
+                    )
+                })?;
+            return dispatch_extension(paths, request, device, now_ms).await;
+        }
+    }
     let arguments = validate_arguments(request.capability, &request.arguments)?;
     let wait_ms = request.wait_ms.clamp(1_000, MAX_WAIT_MS);
     let mut store = RemoteStore::open(&paths.root)?;
-    let device_id = resolve_target(&store, request.capability, request.device_id.as_deref())?;
+    let device_id = match resolve_target(&store, request.capability, request.device_id.as_deref()) {
+        Ok(device_id) if request.device_id.is_some() || extension_candidates.is_empty() => {
+            device_id
+        }
+        // One paired device and one extension device can both do this, and the
+        // caller named neither. Guessing is worse than asking: an agent
+        // photographing whichever sorted first is the outcome this refuses.
+        Ok(device_id) => {
+            return Err(format!(
+                "{} devices can do this — name one with 'device_id': {}",
+                extension_candidates.len() + 1,
+                std::iter::once(device_id)
+                    .chain(
+                        extension_candidates
+                            .iter()
+                            .map(|device| format!("{} ({})", device.device_id, device.device_name)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+        Err(error) => match extension_candidates.len() {
+            0 => return Err(error),
+            1 => {
+                let device = extension_candidates.first().expect("length checked");
+                return dispatch_extension(paths, request, device, now_ms).await;
+            }
+            _ => {
+                return Err(format!(
+                    "{} extension devices can do this — name one with 'device_id': {}",
+                    extension_candidates.len(),
+                    extension_candidates
+                        .iter()
+                        .map(|device| format!("{} ({})", device.device_id, device.device_name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        },
+    };
     // Playing a stored artifact means the device fetches it over the ordinary
     // signed artifact route, under the run scope it was already paired with.
     // Refused here rather than left to fail on the phone, because "the speaker

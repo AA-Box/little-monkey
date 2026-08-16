@@ -244,7 +244,7 @@ pnpm test            # front-end suite
 pnpm test:rust       # Rust suite, all targets
 ```
 
-Extension tests, the opt-in checks that need real models or hardware, and the project layout are in **[Setup and development](docs/setup.md)**.
+Extension tests, the opt-in checks that need real models or hardware, and the project layout are in **[Setup and development](docs/setup.md)**. Authors of sandboxed Component Model integrations should start with **[Executable extensions](docs/executable-extensions.md)** and the **[Rust SDK examples](extensions-sdk/README.md)**.
 
 ## Contributing
 

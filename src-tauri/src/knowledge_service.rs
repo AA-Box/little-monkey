@@ -383,6 +383,21 @@ pub enum ConnectorConfig {
         connector_account_id: String,
         project_key: String,
     },
+    /// Documents supplied by a sandboxed executable extension's connector
+    /// capability. `connector_account_id` names a catalog account of
+    /// `ConnectorProvider::Extension`, which is what records *which*
+    /// installation's capability this source is bound to; `scope` is the
+    /// extension-defined selector the user configured (a folder, a space, a
+    /// board — whatever that connector's own terms are), passed through
+    /// untouched and never interpreted here. Cursor = whatever opaque cursor
+    /// the extension returns, so a connector that can sync incrementally
+    /// does, and one that cannot falls back to the generic content-hash
+    /// cursor like every other kind.
+    ExtensionSource {
+        connector_account_id: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
 }
 
 // --- Non-goals (see the ROADMAP "External Knowledge Sync Pipelines" entry
@@ -1071,6 +1086,23 @@ fn validate_connector(connector: &ConnectorConfig) -> Result<(), String> {
             if account.provider != connectors::ConnectorProvider::Jira {
                 return Err("The selected connector account is not a Jira account".to_string());
             }
+        }
+        ConnectorConfig::ExtensionSource {
+            connector_account_id,
+            scope,
+        } => {
+            if let Some(scope) = scope {
+                if scope.len() > MAX_EXTENSION_CONNECTOR_SCOPE_BYTES {
+                    return Err(format!(
+                        "An extension connector scope may not exceed {MAX_EXTENSION_CONNECTOR_SCOPE_BYTES} bytes"
+                    ));
+                }
+            }
+            let account = connectors::account_by_id(connector_account_id)?;
+            // Resolving the target here is what refuses a source bound to an
+            // account whose extension has since been uninstalled, rather than
+            // letting the first refresh be where that is discovered.
+            connectors::extension_connector_target(&account)?;
         }
     }
     Ok(())
@@ -2325,6 +2357,15 @@ fn pipeline_embedding(stack: &KnowledgeStack) -> PipelineEmbeddingSpec {
         provider_id: match stack.embedding.backend {
             EmbeddingBackend::Llama => "local.llama-cpp".to_string(),
             EmbeddingBackend::Ollama => "local.ollama".to_string(),
+            // The owning extension is part of the provider identity, not a
+            // detail beside it: vectors from two publishers' providers are
+            // different embedding spaces even when both answer to the same
+            // capability id, so a change of owner has to invalidate the
+            // generation exactly the way a change of model does.
+            EmbeddingBackend::Extension => format!(
+                "extension.{}",
+                stack.embedding.extension_id.as_deref().unwrap_or("unknown")
+            ),
         },
         model_id: stack.embedding.model_id_or_tag.clone(),
         dimension: stack.embedding.dim as usize,
@@ -2598,6 +2639,20 @@ async fn collect_source_objects(
             )
             .await
         }
+        ConnectorConfig::ExtensionSource {
+            connector_account_id,
+            scope,
+        } => {
+            collect_extension_source(
+                app_data,
+                source,
+                connector_account_id,
+                scope.as_deref(),
+                limits,
+                cancel,
+            )
+            .await
+        }
         ConnectorConfig::Url {
             url,
             allowed_origin,
@@ -2678,6 +2733,226 @@ async fn collect_source_objects(
 // registered OAuth app, out of scope for this build); GitLab is a stretch
 // left for later, not implemented in this pass.
 // =============================================================================
+
+// --- executable-extension connector ------------------------------------------
+
+/// How long a user-supplied scope selector may be.
+const MAX_EXTENSION_CONNECTOR_SCOPE_BYTES: usize = 4 * 1024;
+/// How many documents one extension connector may list per refresh. The
+/// pipeline has its own `max_objects_per_source`; this is the bound on the
+/// *listing* itself, checked before any of it is turned into objects.
+const MAX_EXTENSION_CONNECTOR_DOCUMENTS: usize = 5_000;
+/// How many list pages one refresh will follow. Bounds a connector that
+/// always returns a cursor.
+const MAX_EXTENSION_CONNECTOR_PAGES: u32 = 512;
+
+#[derive(Deserialize)]
+struct ExtensionConnectorPage {
+    #[serde(default)]
+    documents: Vec<ExtensionConnectorDocument>,
+    /// Opaque page cursor. Present means "call again with this".
+    #[serde(default)]
+    next_page: Option<String>,
+    /// Opaque incremental cursor for the *next refresh*, stored on the source
+    /// exactly like a commit SHA or an ETag map is.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExtensionConnectorDocument {
+    id: String,
+    #[serde(default)]
+    canonical_uri: Option<String>,
+    #[serde(default)]
+    media_type: Option<String>,
+    #[serde(default)]
+    modified_unix_ms: Option<u64>,
+    /// The document body, as an artifact the extension wrote during this same
+    /// invocation. An artifact id rather than inline bytes because a
+    /// connector's whole job is to move documents, and the artifact store is
+    /// where bounded, hashed, host-owned bytes already live.
+    artifact_id: String,
+}
+
+/// Collect one extension connector's current document set.
+///
+/// The extension is asked for pages of documents; the host reads each body
+/// out of the artifact store *only* after checking the extension really wrote
+/// that artifact during this invocation. Everything else — the cache, the
+/// object shape, the cursor semantics — is the same machinery every other
+/// connector kind goes through, which is the point: an extension connector is
+/// not a second sync pipeline.
+async fn collect_extension_source(
+    app_data: &Path,
+    source: &KnowledgeSource,
+    connector_account_id: &str,
+    scope: Option<&str>,
+    limits: &PipelineLimits,
+    cancel: &CancellationToken,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let account = connectors::account_by_id_under(app_data, connector_account_id)?;
+    let (extension_id, capability_id) = connectors::extension_connector_target(&account)?;
+    let manager = crate::executable_extensions::ExtensionManager::new(app_data)?;
+    let artifacts = crate::artifact_store::ArtifactStore::with_max_blob_size(
+        app_data.join("content-v1"),
+        limits.max_file_bytes,
+    )
+    .map_err(|error| format!("Cannot open the artifact store: {error}"))?;
+    let manager = manager.with_artifact_root(artifacts.root())?;
+    let cache_dir = connector_cache_dir(app_data, &source.id)?;
+
+    let mut objects: Vec<SourceObject> = Vec::new();
+    let mut next_page: Option<String> = None;
+    let mut next_cursor: Option<String> = None;
+    let mut pages = 0u32;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(PipelineError::Cancelled.to_string());
+        }
+        let input_json = serde_json::json!({
+            "query": "documents",
+            "scope": scope,
+            "cursor": source.cursor,
+            "page": next_page,
+        })
+        .to_string();
+        let result = manager
+            .invoke_owned_active_capability(
+                crate::executable_extensions::CapabilityKind::Connector,
+                &extension_id,
+                &capability_id,
+                input_json,
+                None,
+                Vec::new(),
+            )
+            .await?;
+        let written: BTreeSet<String> = result.written_artifact_ids.iter().cloned().collect();
+        let page: ExtensionConnectorPage =
+            serde_json::from_str(&result.output_json).map_err(|error| {
+                format!("{extension_id} returned an unusable document page: {error}")
+            })?;
+        if page.documents.len() > MAX_EXTENSION_CONNECTOR_DOCUMENTS {
+            return Err(format!(
+                "{extension_id} listed more than {MAX_EXTENSION_CONNECTOR_DOCUMENTS} documents in one page"
+            ));
+        }
+        if page.cursor.is_some() {
+            next_cursor = page.cursor;
+        }
+        for document in page.documents {
+            validate_id("connector document id", &document.id)?;
+            if !written.contains(&document.artifact_id) {
+                return Err(format!(
+                    "{extension_id} named an artifact it did not write for document '{}'",
+                    document.id
+                ));
+            }
+            let bytes = artifacts
+                .read(&document.artifact_id)
+                .map_err(|error| format!("Cannot read connector document bytes: {error}"))?;
+            if bytes.len() as u64 > limits.max_file_bytes {
+                continue;
+            }
+            let object_id = format!("extension-{}", document.id);
+            let canonical_uri = document.canonical_uri.unwrap_or_else(|| {
+                format!("extension://{extension_id}/{capability_id}/{}", document.id)
+            });
+            if canonical_uri.len() > 32_768 {
+                return Err("A connector document URI exceeds its limit".to_string());
+            }
+            connector_cache_write(&cache_dir, &object_id, &bytes)?;
+            objects.push(source_object_from_bytes(
+                &source.id,
+                &object_id,
+                canonical_uri,
+                document
+                    .media_type
+                    .unwrap_or_else(|| "text/plain".to_string()),
+                bytes,
+                None,
+                document.modified_unix_ms,
+            ));
+            if objects.len() > limits.max_objects_per_source {
+                break;
+            }
+        }
+        pages = pages.saturating_add(1);
+        next_page = page.next_page;
+        if next_page.is_none()
+            || pages >= MAX_EXTENSION_CONNECTOR_PAGES
+            || objects.len() > limits.max_objects_per_source
+        {
+            break;
+        }
+    }
+
+    // Objects the extension's incremental cursor said were unchanged are
+    // replayed from the same on-disk cache every other connector uses, so a
+    // skipped fetch still reaches the chunker with the right bytes.
+    let refreshed: BTreeSet<String> = objects
+        .iter()
+        .map(|object| object.metadata.object_id.clone())
+        .collect();
+    for previous in &source.objects {
+        if refreshed.contains(&previous.object_id) {
+            continue;
+        }
+        if let Some(bytes) = connector_cache_read(&cache_dir, &previous.object_id) {
+            objects.push(source_object_from_bytes(
+                &source.id,
+                &previous.object_id,
+                previous.canonical_uri.clone(),
+                // The catalog does not remember a media type per object, so
+                // a replayed body is described the same way every other
+                // connector describes its cached replays.
+                "text/plain".to_string(),
+                bytes,
+                None,
+                previous.modified_unix_ms,
+            ));
+        }
+    }
+    Ok((objects, next_cursor))
+}
+
+/// Drive [`collect_extension_source`] the way [`collect_source_objects`] does,
+/// with the default limits and no cancellation.
+///
+/// A shim rather than a second implementation: the collector, its ownership
+/// checks and its cursor handling are the ones production runs. What this
+/// saves the caller is assembling a `KnowledgeSource` row and a
+/// `PipelineLimits` by hand for a source that has never been refreshed.
+#[cfg(test)]
+pub(crate) async fn collect_extension_source_for_test(
+    app_data: &Path,
+    connector_account_id: &str,
+    scope: Option<&str>,
+) -> Result<(Vec<SourceObject>, Option<String>), String> {
+    let source = KnowledgeSource {
+        id: "src-fixture".to_string(),
+        stack_id: "stack-fixture".to_string(),
+        label: "Fixture".to_string(),
+        connector: ConnectorConfig::ExtensionSource {
+            connector_account_id: connector_account_id.to_string(),
+            scope: scope.map(str::to_string),
+        },
+        enabled: true,
+        cursor: None,
+        checkpoint: None,
+        last_refresh_at_ms: None,
+        last_error: None,
+        objects: Vec::new(),
+        retries: Vec::new(),
+    };
+    collect_source_objects(
+        app_data,
+        &source,
+        &PipelineLimits::default(),
+        &CancellationToken::new(),
+    )
+    .await
+}
 
 // --- shared: local object-content cache --------------------------------------
 //
@@ -5406,6 +5681,7 @@ mod tests {
                 dim: 8,
                 query_prefix: String::new(),
                 doc_prefix: String::new(),
+                extension_id: None,
             },
         )
         .unwrap();
@@ -5544,6 +5820,7 @@ mod tests {
                 dim: 8,
                 query_prefix: String::new(),
                 doc_prefix: String::new(),
+                extension_id: None,
             },
         )
         .unwrap();

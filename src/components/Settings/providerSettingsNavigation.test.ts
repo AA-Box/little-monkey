@@ -19,7 +19,7 @@ function provider(
     label,
     base_url: `https://${id}.example/v1`,
     is_custom: isCustom,
-    has_key: hasKey,
+    has_key: hasKey, is_extension: false
   };
 }
 
