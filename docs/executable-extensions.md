@@ -284,6 +284,14 @@ Two shapes recur throughout, and both are load-bearing:
   owns the content. Every consumer that reads audio, a document or an
   attachment out of an extension's answer checks the id against the set of
   artifacts the host recorded *that invocation* writing.
+- **Naming an artifact is not being granted it.** The reverse direction has the
+  same rule. An id inside the JSON a guest receives — an event, a message, a
+  device request, a model reply — tells the guest which of its grants to read
+  and confers nothing. Authority is attached separately, in code, by the host
+  subsystem that created the bytes: a session step carries the grants its
+  trusted call site listed beside the event, and a device asked to play a
+  stored clip gets the content the run ledger links to that run, not the id
+  the caller wrote. Nothing derives a grant from parsing JSON.
 
 ### Tool
 
@@ -386,6 +394,11 @@ with `{sample_rate, encoding, first_event}` and driven with:
 - `{kind: "agent_text", text}` → an `audio` event naming an artifact the guest
   wrote this step
 
+The caller's clip is published by the host and granted to that one step, so a
+capability declaring `artifact_read` over `invocation_inputs` reads the PCM and
+nothing else. The grant is attached beside the event rather than derived from
+it: the same event with no grant is refused at `artifact-read`.
+
 The session is closed when the call ends. Updating, disabling or uninstalling
 the extension mid-call fails the call rather than handing the rest of the
 conversation to different code.
@@ -410,6 +423,12 @@ action resolved by the host from a validated capability, never taken as a free
 string — answering `{result?, artifact_id?, media_type?, error?}`. An
 undeclared action or an unadvertised device is refused before the sandbox
 starts.
+
+`audio_playback` may name a stored clip. The host resolves it against the run
+that owns it — the same link the signed artifact route checks for a paired
+phone — and the guest receives that content's id, already granted for this
+invocation, with no `run_id` beside it. A clip the ledger does not tie to that
+run reaches no sandbox at all.
 
 ### Connector
 
