@@ -584,6 +584,45 @@ mod tests {
             "one media type, fixed at construction, is what keeps hello and audio in agreement"
         );
 
+        // The client names its own utterances, and the runner refuses a closing
+        // audio frame that does not.
+        //
+        // This assertion exists because the two sides were changed apart: the
+        // runner started requiring `utterance_id` while the shipped module still
+        // built audio frames without one, so every closing frame was rejected
+        // and foreground Talk stopped working entirely. Nothing failed —
+        // `mobileTalkProtocol.test.ts` drove a client that agreed with itself,
+        // and the Rust tests drove a server that agreed with itself. Only a
+        // check that reads both can see them disagree.
+        //
+        // Proved for real, not by string matching alone: the frame this module
+        // builds is parsed and validated below by the runner's own
+        // `TalkClientFrame`.
+        assert!(
+            protocol.contains("utterance_id: utteranceId,"),
+            "the closing audio frame must carry the device's own name for the utterance"
+        );
+
+        let closing = serde_json::json!({
+            "protocol_version": crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION,
+            "session_id": "session-one",
+            // The same fixture value `mobileTalkProtocol.test.ts` uses: 18
+            // random bytes as base64url, which is what a real ticket mints.
+            "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+            "frame_sequence": 2,
+            "type": "audio",
+            "audio_sequence": 1,
+            "media_type": "audio/webm;codecs=opus",
+            "audio_base64": "AAECAwQ=",
+            "last": true,
+            "utterance_id": "utt-abc123",
+        });
+        let frame: crate::daemon::remote::protocol::TalkClientFrame =
+            serde_json::from_value(closing).expect("the client's closing frame must parse");
+        frame
+            .validate()
+            .expect("the client's closing frame must satisfy the runner's own validation");
+
         // Local detection, and only a finished utterance leaves the device.
         assert!(protocol.contains("export function createTalkDetector("));
         assert!(protocol.contains("noiseFloor = noiseFloor * 0.96"));

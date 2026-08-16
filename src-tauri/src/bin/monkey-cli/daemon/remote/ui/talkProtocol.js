@@ -130,6 +130,40 @@ export function clampTalkChannels(value) {
   return Math.min(2, Math.max(1, Math.round(value)));
 }
 
+/** The runner's own bound and character set for an utterance id. */
+export const MAX_TALK_UTTERANCE_ID_CHARS = 128;
+
+/**
+ * A name for one utterance, in the only alphabet the runner accepts.
+ *
+ * Alphanumerics, `-` and `_`, bounded. Anything else is replaced rather than
+ * refused: this value is generated on this side, so an unusable one is a bug
+ * here, and turning it into a refusal would silence a conversation over a
+ * character.
+ */
+export function normalizeUtteranceId(value) {
+  const cleaned = String(value || "").replace(/[^A-Za-z0-9_-]/gu, "-");
+  const bounded = cleaned.slice(0, MAX_TALK_UTTERANCE_ID_CHARS);
+  return bounded || "utterance";
+}
+
+/**
+ * A fresh name, from the browser's CSPRNG.
+ *
+ * Random rather than a counter: a counter restarts with the page, and two
+ * utterances that collide are two different things somebody said arriving as
+ * one turn.
+ */
+function defaultUtteranceId() {
+  const bytes = globalThis.crypto?.getRandomValues?.(new Uint8Array(12));
+  if (!bytes) {
+    throw new Error("This browser has no secure random source, so Talk cannot name an utterance");
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `utt-${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "")}`;
+}
+
 function boundedSpan(value) {
   if (!Number.isFinite(value)) return undefined;
   return Math.min(MAX_TALK_LATENCY_MS, Math.max(0, Math.round(value)));
@@ -143,8 +177,19 @@ function boundedSpan(value) {
  * increments it, `audio_sequence` counts only audio frames. The media type is
  * fixed at construction and reused for the hello and for every audio frame —
  * they are the same value by construction rather than by agreement.
+ *
+ * It owns the utterance id for the same reason. The runner queues a spoken turn
+ * under that id and refuses a closing audio frame without one, because nothing
+ * on its side survives a restart: the session generation is minted fresh with
+ * every ticket and the audio counter restarts with it. So the name for one
+ * utterance has to come from here, and it has to be the same name on every
+ * attempt to send that utterance — which is why it is minted once, held across
+ * the chunks, and only rotated when a closing frame has actually gone out.
+ *
+ * `randomId` is injected so a test can pin what is generated; production passes
+ * a CSPRNG-backed token.
  */
-export function createTalkFrames({ sessionId, sessionGeneration, mediaType, sampleRateHz, channels }) {
+export function createTalkFrames({ sessionId, sessionGeneration, mediaType, sampleRateHz, channels, randomId }) {
   const media = normalizeTalkMediaType(mediaType);
   if (!media) {
     throw new Error(`This browser records in ${String(mediaType || "an unknown container")}, which Talk cannot transcribe`);
@@ -154,6 +199,11 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
   let frameSequence = 0;
   let audioSequence = 0;
   let greeted = false;
+  // The device's own name for the utterance being sent. Minted lazily on the
+  // first chunk of one and cleared after its closing frame, so every chunk of
+  // one utterance carries the same name and the next utterance gets its own.
+  const mintId = typeof randomId === "function" ? randomId : defaultUtteranceId;
+  let utteranceId = null;
 
   const envelope = (kind) => {
     frameSequence += 1;
@@ -195,7 +245,14 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
         channels: channelCount,
       });
     },
-    audio({ audioBase64, last = false }) {
+    /**
+     * One chunk of the current utterance.
+     *
+     * `utteranceId` overrides the generated name, which is what a caller that
+     * re-sends a recording the runner never answered must pass: the same
+     * recording has to arrive under the same name or it becomes a second turn.
+     */
+    audio({ audioBase64, last = false, utteranceId: override }) {
       requireGreeted("audio");
       const payload = String(audioBase64 || "");
       if (payload.length === 0) throw new Error("A Talk audio frame carries no audio");
@@ -203,13 +260,24 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
         throw new Error("That audio is larger than one Talk frame may carry — split it first");
       }
       audioSequence += 1;
-      return envelope({
+      if (override) utteranceId = normalizeUtteranceId(override);
+      if (!utteranceId) utteranceId = normalizeUtteranceId(mintId());
+      const closing = Boolean(last);
+      const frame = envelope({
         type: "audio",
         audio_sequence: audioSequence,
         media_type: media,
         audio_base64: payload,
-        last: Boolean(last),
+        last: closing,
+        // Sent on every chunk rather than only the last: the runner reads it
+        // from the closing frame, and a device that loses track of which chunk
+        // is last still labels them all consistently.
+        utterance_id: utteranceId,
       });
+      // Rotated only after the closing frame is built, so the whole utterance
+      // shares one name and the next one cannot inherit it.
+      if (closing) utteranceId = null;
+      return frame;
     },
     interrupt(reason) {
       requireGreeted("interrupt");
