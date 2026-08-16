@@ -11,18 +11,10 @@
  * as "a token is saved, so presumably fine".
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const invoke = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (...args: unknown[]) => invoke(...args),
-}));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 import { ChannelsPanel } from "./ChannelsPanel";
@@ -40,19 +32,12 @@ const BASE: ChannelAccount = {
   enabled: false,
   has_credential: false,
   credential_required: false,
-  access_policy: {
-    direct: "pairing",
-    group: "allow_list",
-    group_activation: "mention_only",
-  },
+  access_policy: { direct: "pairing", group: "allow_list", group_activation: "mention_only" },
   health: "disconnected",
   health_detail: null,
   last_error: null,
   last_probe_at_ms: 0,
-  non_secret_config: {
-    helper_path: "/usr/local/bin/signal-cli",
-    account: "+15550000000",
-  },
+  non_secret_config: { helper_path: "/usr/local/bin/signal-cli", account: "+15550000000" },
   created_at_ms: 0,
   callback_rejections: { count: 0, last_reason: null, last_at_ms: null },
   updated_at_ms: 0,
@@ -82,13 +67,10 @@ function mockChannels(options: {
   invoke.mockImplementation((command: string, args: unknown) => {
     const custom = options.onCommand?.(command, args);
     if (custom !== undefined) return custom;
-    if (command === "channels_list")
-      return Promise.resolve({ accounts: options.accounts });
-    if (command === "channels_routes")
-      return Promise.resolve({ routes: options.routes ?? [ROUTE] });
+    if (command === "channels_list") return Promise.resolve({ accounts: options.accounts });
+    if (command === "channels_routes") return Promise.resolve({ routes: options.routes ?? [ROUTE] });
     if (command === "channels_senders") return Promise.resolve({ pending: [] });
-    if (command === "channels_events")
-      return Promise.resolve({ events: options.events ?? [] });
+    if (command === "channels_events") return Promise.resolve({ events: options.events ?? [] });
     if (command === "channels_callback_url") {
       return Promise.resolve(
         options.callback ?? {
@@ -122,11 +104,7 @@ describe("ChannelsPanel", () => {
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Family Signal"));
 
-    await waitFor(() =>
-      expect(
-        screen.getByText(/helper you installed holds the account/),
-      ).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/helper you installed holds the account/)).toBeTruthy());
     expect(screen.queryByText("Save credential")).toBeNull();
     // And it must not claim a credential is missing, which is what the
     // generic warning would have said.
@@ -144,19 +122,14 @@ describe("ChannelsPanel", () => {
         health: "degraded",
         health_detail: "@you:example.org · 3 encrypted events skipped",
         last_error: "sync timed out",
-        non_secret_config: {
-          homeserver_url: "https://matrix.example.org",
-          user_id: "@you:example.org",
-        },
+        non_secret_config: { homeserver_url: "https://matrix.example.org", user_id: "@you:example.org" },
       },
     ]);
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Home Matrix"));
 
     await waitFor(() =>
-      expect(
-        screen.getByText("@you:example.org · 3 encrypted events skipped"),
-      ).toBeTruthy(),
+      expect(screen.getByText("@you:example.org · 3 encrypted events skipped")).toBeTruthy(),
     );
     expect(screen.getByText("sync timed out")).toBeTruthy();
     // The homeserver it is configured against is shown by its label, so the
@@ -169,24 +142,12 @@ describe("ChannelsPanel", () => {
     render(<ChannelsPanel />);
     await screen.findByText("Family Signal");
 
-    fireEvent.change(screen.getByLabelText("Provider"), {
-      target: { value: "irc" },
-    });
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "Libera" },
-    });
-    fireEvent.change(screen.getByLabelText(/^Server/), {
-      target: { value: "irc.libera.chat" },
-    });
-    fireEvent.change(screen.getByLabelText(/^Port/), {
-      target: { value: "6697" },
-    });
-    fireEvent.change(screen.getByLabelText(/^Nickname/), {
-      target: { value: "monkey" },
-    });
-    fireEvent.change(screen.getByLabelText("Channels to join"), {
-      target: { value: "#one, #two" },
-    });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "irc" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Libera" } });
+    fireEvent.change(screen.getByLabelText(/^Server/), { target: { value: "irc.libera.chat" } });
+    fireEvent.change(screen.getByLabelText(/^Port/), { target: { value: "6697" } });
+    fireEvent.change(screen.getByLabelText(/^Nickname/), { target: { value: "monkey" } });
+    fireEvent.change(screen.getByLabelText("Channels to join"), { target: { value: "#one, #two" } });
     fireEvent.click(screen.getByText("Add account"));
 
     await waitFor(() =>
@@ -207,12 +168,8 @@ describe("ChannelsPanel", () => {
     render(<ChannelsPanel />);
     await screen.findByText("Family Signal");
 
-    fireEvent.change(screen.getByLabelText("Provider"), {
-      target: { value: "mattermost" },
-    });
-    fireEvent.change(screen.getByLabelText("Name"), {
-      target: { value: "Work" },
-    });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "mattermost" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Work" } });
     // The server URL is what the adapter refuses to build without, so the form
     // says so here rather than letting the daemon fail after the fact.
     expect(screen.getByText(/Still needed:/)).toBeTruthy();
@@ -224,9 +181,7 @@ describe("ChannelsPanel", () => {
     render(<ChannelsPanel />);
     await screen.findByText("Family Signal");
 
-    fireEvent.change(screen.getByLabelText("Provider"), {
-      target: { value: "imessage" },
-    });
+    fireEvent.change(screen.getByLabelText("Provider"), { target: { value: "imessage" } });
     expect(screen.getByText(/macOS only/)).toBeTruthy();
   });
 
@@ -241,10 +196,7 @@ describe("ChannelsPanel", () => {
         health: "connected",
         // A per-account attachment knob set from the terminal: the panel now
         // has a typed input for it, and an unrelated edit must carry it over.
-        non_secret_config: {
-          base_url: "https://old.example.com",
-          max_attachment_bytes: 2048,
-        },
+        non_secret_config: { base_url: "https://old.example.com", max_attachment_bytes: 2048 },
       },
     ]);
     render(<ChannelsPanel />);
@@ -261,10 +213,7 @@ describe("ChannelsPanel", () => {
         accountId: "chan-1",
         // The already-configured limit survives a wholesale replacement, and
         // no secret travels in either direction.
-        config: JSON.stringify({
-          base_url: "https://new.example.com",
-          max_attachment_bytes: 2048,
-        }),
+        config: JSON.stringify({ base_url: "https://new.example.com", max_attachment_bytes: 2048 }),
         label: "Work",
       }),
     );
@@ -295,10 +244,7 @@ describe("ChannelsPanel", () => {
         accountId: "chan-1",
         // Typed by the field's declared kind: the daemon parses a number, so
         // a number is what travels.
-        config: JSON.stringify({
-          base_url: "https://chat.example.com",
-          max_attachment_bytes: 1048576,
-        }),
+        config: JSON.stringify({ base_url: "https://chat.example.com", max_attachment_bytes: 1048576 }),
         label: "Work",
       }),
     );
@@ -306,14 +252,7 @@ describe("ChannelsPanel", () => {
 
   it("shows a webhook provider's complete callback URL, as the daemon composed it", async () => {
     mockChannels({
-      accounts: [
-        {
-          ...BASE,
-          kind: "whatsapp",
-          label: "Support",
-          credential_required: true,
-        },
-      ],
+      accounts: [{ ...BASE, kind: "whatsapp", label: "Support", credential_required: true }],
       callback: {
         account_id: "chan-1",
         configured: true,
@@ -325,30 +264,19 @@ describe("ChannelsPanel", () => {
     fireEvent.click(await screen.findByText("Support"));
 
     await waitFor(() =>
-      expect(
-        screen.getByText("https://hooks.example.com/v1/channels/chan-1"),
-      ).toBeTruthy(),
+      expect(screen.getByText("https://hooks.example.com/v1/channels/chan-1")).toBeTruthy(),
     );
     expect(screen.getByText("Copy")).toBeTruthy();
   });
 
   it("says plainly when no public URL is configured instead of showing half of one", async () => {
     mockChannels({
-      accounts: [
-        {
-          ...BASE,
-          kind: "whatsapp",
-          label: "Support",
-          credential_required: true,
-        },
-      ],
+      accounts: [{ ...BASE, kind: "whatsapp", label: "Support", credential_required: true }],
     });
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Support"));
 
-    await waitFor(() =>
-      expect(screen.getByText(/No public URL is configured/)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/No public URL is configured/)).toBeTruthy());
     fireEvent.change(screen.getByLabelText("Public base URL"), {
       target: { value: "https://hooks.example.com" },
     });
@@ -385,26 +313,14 @@ describe("route management", () => {
     expect(await screen.findByText("Everything")).toBeTruthy();
 
     fireEvent.click(screen.getByText("Add route"));
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "triage" },
-    });
-    fireEvent.change(screen.getByLabelText("Applies to"), {
-      target: { value: "sender" },
-    });
-    fireEvent.change(await screen.findByLabelText("Account"), {
-      target: { value: "chan-1" },
-    });
-    fireEvent.change(await screen.findByLabelText("Conversation"), {
-      target: { value: "conv-7" },
-    });
-    fireEvent.change(screen.getByLabelText("Sender"), {
-      target: { value: "+15550000000" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
+    fireEvent.change(screen.getByLabelText("Applies to"), { target: { value: "sender" } });
+    fireEvent.change(await screen.findByLabelText("Account"), { target: { value: "chan-1" } });
+    fireEvent.change(await screen.findByLabelText("Conversation"), { target: { value: "conv-7" } });
+    fireEvent.change(screen.getByLabelText("Sender"), { target: { value: "+15550000000" } });
     // The sender rung is account + conversation + thread + sender, all four:
     // the daemon refuses anything less, so the form cannot submit it either.
-    fireEvent.change(screen.getByLabelText("Thread"), {
-      target: { value: "thread-2" },
-    });
+    fireEvent.change(screen.getByLabelText("Thread"), { target: { value: "thread-2" } });
     fireEvent.click(screen.getByText("Save route"));
 
     await waitFor(() =>
@@ -433,31 +349,21 @@ describe("route management", () => {
     });
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Add route"));
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "chat" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "chat" } });
     fireEvent.click(screen.getByText("Save route"));
 
-    await waitFor(() =>
-      expect(screen.getByText(/already owns this scope/)).toBeTruthy(),
-    );
+    await waitFor(() => expect(screen.getByText(/already owns this scope/)).toBeTruthy());
   });
 
   it("sends a route's parameters exactly as typed, one name=value each", async () => {
     mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Add route"));
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "triage" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
 
     fireEvent.click(screen.getByText("Add parameter"));
-    fireEvent.change(screen.getByLabelText("Parameter"), {
-      target: { value: "focus" },
-    });
-    fireEvent.change(screen.getByLabelText("Value"), {
-      target: { value: "deps" },
-    });
+    fireEvent.change(screen.getByLabelText("Parameter"), { target: { value: "focus" } });
+    fireEvent.change(screen.getByLabelText("Value"), { target: { value: "deps" } });
     fireEvent.click(screen.getByText("Save route"));
 
     await waitFor(() =>
@@ -472,42 +378,28 @@ describe("route management", () => {
     mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Add route"));
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "triage" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
 
     fireEvent.click(screen.getByText("Add parameter"));
-    expect(
-      await screen.findByText("Every parameter needs a name."),
-    ).toBeTruthy();
+    expect(await screen.findByText("Every parameter needs a name.")).toBeTruthy();
     fireEvent.click(screen.getByText("Save route"));
-    expect(invoke).not.toHaveBeenCalledWith(
-      "channels_add_route",
-      expect.anything(),
-    );
+    expect(invoke).not.toHaveBeenCalledWith("channels_add_route", expect.anything());
   });
 
   it("refuses two parameters with the same name instead of silently keeping one", async () => {
     mockChannels({ accounts: [{ ...BASE, label: "Family Signal" }] });
     render(<ChannelsPanel />);
     fireEvent.click(await screen.findByText("Add route"));
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "triage" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "triage" } });
 
     fireEvent.click(screen.getByText("Add parameter"));
     fireEvent.click(screen.getByText("Add parameter"));
     const names = screen.getAllByLabelText("Parameter");
     fireEvent.change(names[0], { target: { value: "focus" } });
     fireEvent.change(names[1], { target: { value: "focus" } });
-    expect(
-      await screen.findByText("Two parameters have the same name."),
-    ).toBeTruthy();
+    expect(await screen.findByText("Two parameters have the same name.")).toBeTruthy();
     fireEvent.click(screen.getByText("Save route"));
-    expect(invoke).not.toHaveBeenCalledWith(
-      "channels_add_route",
-      expect.anything(),
-    );
+    expect(invoke).not.toHaveBeenCalledWith("channels_add_route", expect.anything());
   });
 
   it("loads an existing route's parameters and carries them through an unrelated edit", async () => {
@@ -526,17 +418,12 @@ describe("route management", () => {
     fireEvent.click(screen.getAllByText("Edit")[0]);
     // Both stored parameters are on screen, loaded from the route.
     const names = screen.getAllByLabelText("Parameter") as HTMLInputElement[];
-    expect(names.map((input) => input.value).sort()).toEqual([
-      "depth",
-      "focus",
-    ]);
+    expect(names.map((input) => input.value).sort()).toEqual(["depth", "focus"]);
 
     // An edit that never touches the parameters still sends them all back:
     // the daemon replaces the target wholesale, so what the form forgets
     // would be gone.
-    fireEvent.change(screen.getByLabelText("Task"), {
-      target: { value: "chat-2" },
-    });
+    fireEvent.change(screen.getByLabelText("Task"), { target: { value: "chat-2" } });
     fireEvent.click(screen.getByText("Save route"));
     await waitFor(() =>
       expect(invoke).toHaveBeenCalledWith("channels_update_route", {
@@ -593,16 +480,6 @@ describe("route management", () => {
   });
 });
 
-/**
- * The states Task 11's UI pass names, asserted rather than assumed.
- *
- * Each of these is a distinct thing an operator has to be able to tell apart on
- * one page: nothing configured, still loading, working, impaired, impossible on
- * this machine, waiting on the operator, and broken in a way they can act on.
- * They are listed together because the failure mode is not a missing state — it
- * is two states that render the same, and that is only visible when they are
- * compared side by side.
- */
 describe("ChannelsPanel state matrix", () => {
   it("says there is nothing configured rather than showing an empty list", async () => {
     mockAccounts([]);

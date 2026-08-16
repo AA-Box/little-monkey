@@ -104,16 +104,13 @@ export const en: Record<string, string> = {
   "AppMenu.evidenceBoard": "Evidence Board",
   "AppMenu.goldenDatasetBuilder": "Golden Dataset Builder",
   "EvidenceBoard.title": "Evidence Board",
-  "EvidenceBoard.subtitle":
-    "Audit a report claim by claim, with grounded evidence, instead of trusting one summary",
+  "EvidenceBoard.subtitle": "Audit a report claim by claim, with grounded evidence, instead of trusting one summary",
   "EvidenceBoard.close": "Close Evidence Board",
   "EvidenceBoard.selectBoard": "Select a board…",
   "EvidenceBoard.useThisChat": "Use this chat",
   "EvidenceBoard.newPastedBoard": "Paste a report",
-  "EvidenceBoard.pastedBoardNamePlaceholder":
-    'Board name (e.g. "Vendor incident report")',
-  "EvidenceBoard.pastedTextPlaceholder":
-    "Paste the report, spec, or doc text to extract claims from…",
+  "EvidenceBoard.pastedBoardNamePlaceholder": "Board name (e.g. \"Vendor incident report\")",
+  "EvidenceBoard.pastedTextPlaceholder": "Paste the report, spec, or doc text to extract claims from…",
   "EvidenceBoard.createBoard": "Create board",
   "EvidenceBoard.cancel": "Cancel",
   "EvidenceBoard.reExtract": "Extract claims",
@@ -121,23 +118,20 @@ export const en: Record<string, string> = {
   "EvidenceBoard.deleteBoard": "Delete board",
   "EvidenceBoard.deleteClaim": "Delete claim",
   "EvidenceBoard.noBoards": "No board selected",
-  "EvidenceBoard.noBoardsHint":
-    "Use the current chat or paste a report above to create a board, then extract claims.",
+  "EvidenceBoard.noBoardsHint": "Use the current chat or paste a report above to create a board, then extract claims.",
   "EvidenceBoard.sourceSession": "Chat",
   "EvidenceBoard.sourcePasted": "Pasted",
   "EvidenceBoard.sourceTruncatedNotice": "Source truncated for extraction",
   "EvidenceBoard.claimsCount": "{{count}} claim(s)",
   "EvidenceBoard.noClaimsYet": "No claims extracted yet",
-  "EvidenceBoard.noClaimsHint":
-    'Click "Extract claims" above to pull discrete, checkable claims out of this source.',
+  "EvidenceBoard.noClaimsHint": "Click \"Extract claims\" above to pull discrete, checkable claims out of this source.",
   "EvidenceBoard.confidence.high": "High confidence",
   "EvidenceBoard.confidence.medium": "Medium confidence",
   "EvidenceBoard.confidence.low": "Low confidence",
   "EvidenceBoard.unresolvedBadge": "Unresolved",
   "EvidenceBoard.supportingEvidence": "Supporting evidence",
   "EvidenceBoard.conflictingEvidence": "Conflicting evidence",
-  "EvidenceBoard.noSupportingEvidence":
-    "No supporting quote found in the source.",
+  "EvidenceBoard.noSupportingEvidence": "No supporting quote found in the source.",
   "EvidenceBoard.noConflictingEvidence": "No conflicting evidence found.",
   "EvidenceBoard.unresolvedQuestionLabel": "Open question",
   "EvidenceBoard.ownerLabel": "Owner",
@@ -151,24 +145,19 @@ export const en: Record<string, string> = {
   "EvidenceBoard.dismiss": "Dismiss",
   "AppMenu.debate": "Debate",
   "Debate.title": "Multi-Agent Debate",
-  "Debate.subtitle":
-    "Six independent agents argue a decision, then a synthesis preserves every objection.",
+  "Debate.subtitle": "Six independent agents argue a decision, then a synthesis preserves every objection.",
   "Debate.close": "Close",
   "Debate.history": "Past debates",
   "Debate.historyEmpty": "No debates yet.",
   "Debate.questionLabel": "Decision question",
-  "Debate.questionPlaceholder":
-    "e.g. Should we store sessions in Redis or Postgres?",
-  "Debate.roleListHint":
-    "Proposer, Critic, Security, Reliability, Cost, and User Advocate each answer independently.",
+  "Debate.questionPlaceholder": "e.g. Should we store sessions in Redis or Postgres?",
+  "Debate.roleListHint": "Proposer, Critic, Security, Reliability, Cost, and User Advocate each answer independently.",
   "Debate.runButton": "Run debate",
   "Debate.emptyStateTitle": "No debate yet",
-  "Debate.emptyStateBody":
-    "Ask a decision question. Six roles will each form an independent position before a final synthesis weighs their objections against each other.",
+  "Debate.emptyStateBody": "Ask a decision question. Six roles will each form an independent position before a final synthesis weighs their objections against each other.",
   "Debate.cancelButton": "Cancel",
   "Debate.synthesisTitle": "Synthesis",
-  "Debate.rawFallbackNotice":
-    "The synthesis reply didn't match the expected structure, so it's shown here as-is.",
+  "Debate.rawFallbackNotice": "The synthesis reply didn't match the expected structure, so it's shown here as-is.",
   "Debate.recommendationLabel": "Recommendation",
   "Debate.objectionsAddressedLabel": "Objections addressed",
   "Debate.objectionPrefix": "Objection:",
@@ -198,13 +187,11 @@ export const en: Record<string, string> = {
   "ComparePicker.compareLabel": "Compare",
   "ComparePicker.compareCountLabel": "Compare {{count}}",
   "ComparePicker.title": "Compare models",
-  "ComparePicker.description":
-    "Send one frozen prompt to 2–4 explicit models. Tools are disabled.",
+  "ComparePicker.description": "Send one frozen prompt to 2–4 explicit models. Tools are disabled.",
   "ComparePicker.searchLabel": "Search models",
   "ComparePicker.searchPlaceholder": "Search models or providers…",
   "ComparePicker.noResultsTitle": "No models found",
-  "ComparePicker.noResultsDescription":
-    "Try a different search or connect another model provider.",
+  "ComparePicker.noResultsDescription": "Try a different search or connect another model provider.",
   "ComparePicker.localSectionLabel": "Local llama.cpp",
   "ComparePicker.ollamaSectionLabel": "Ollama",
   "ComparePicker.unavailableBadge": "Unavailable",
@@ -216,16 +203,12 @@ export const en: Record<string, string> = {
   "ComparePicker.normalChatAction": "Normal chat",
   "ComparePicker.cancelAction": "Cancel",
   "ComparePicker.applyAction": "Apply",
-  "ComparePicker.memoryEstimateTitle":
-    "Estimated resident memory, including runtime overhead.",
+  "ComparePicker.memoryEstimateTitle": "Estimated resident memory, including runtime overhead.",
   "ComparePicker.memoryEstimate": "~{{amount}} memory",
-  "ComparePicker.memoryChecking":
-    "Checking available memory before choosing a launch strategy…",
-  "ComparePicker.memoryQueued":
-    "Local branches will queue (~{{estimate}} estimated; {{available}} available). Remote branches still run together.",
+  "ComparePicker.memoryChecking": "Checking available memory before choosing a launch strategy…",
+  "ComparePicker.memoryQueued": "Local branches will queue (~{{estimate}} estimated; {{available}} available). Remote branches still run together.",
   "ComparePicker.memoryUnknown": "unknown",
-  "ComparePicker.memoryConcurrent":
-    "Local branches can run together (~{{estimate}} estimated; {{available}} available).",
+  "ComparePicker.memoryConcurrent": "Local branches can run together (~{{estimate}} estimated; {{available}} available).",
   "CompareView.title": "Model comparison",
   "CompareView.readOnlyBadge": "Read-only · tools off",
   "CompareView.tokens": "{{count}} tokens",
@@ -241,11 +224,9 @@ export const en: Record<string, string> = {
   "CompareView.openBranch": "Open {{model}} branch",
   "CompareView.stopAll": "Stop {{count}}",
   "CompareView.missing": "This saved comparison is incomplete.",
-  "CompareView.memoryQueue":
-    "Local branches are running one at a time to protect system memory (~{{estimate}} estimated; {{available}} available). Remote branches are unaffected.",
+  "CompareView.memoryQueue": "Local branches are running one at a time to protect system memory (~{{estimate}} estimated; {{available}} available). Remote branches are unaffected.",
   "CompareView.synthesisTitle": "Synthesis",
-  "CompareView.synthesisDescription":
-    "Combine completed answers with a selected model. Tools stay off.",
+  "CompareView.synthesisDescription": "Combine completed answers with a selected model. Tools stay off.",
   "CompareView.synthesisModel": "Model",
   "CompareView.synthesisStatus.idle": "Ready",
   "CompareView.synthesisStatus.running": "Running",
@@ -257,10 +238,8 @@ export const en: Record<string, string> = {
   "CompareView.retrySynthesis": "Retry frozen",
   "CompareView.synthesize": "Synthesize",
   "CompareView.synthesizeAgain": "Synthesize current",
-  "CompareView.synthesisDisabled":
-    "Wait for every branch and complete at least two answers.",
-  "CompareView.synthesisStale":
-    "A source branch was retried. This synthesis still shows the frozen earlier answers; synthesize current results to refresh it.",
+  "CompareView.synthesisDisabled": "Wait for every branch and complete at least two answers.",
+  "CompareView.synthesisStale": "A source branch was retried. This synthesis still shows the frozen earlier answers; synthesize current results to refresh it.",
   "CompareView.synthesisSources": "Frozen synthesis sources",
   "CompareView.synthesisRunning": "Comparing the frozen branch answers…",
   "CompareView.synthesisEmpty": "No synthesis text was returned.",
@@ -284,8 +263,7 @@ export const en: Record<string, string> = {
   "App.diffRefresh": "Refresh",
   "App.diffOldTitleOpened": "opened",
   "App.diffNewTitleCurrent": "current",
-  "App.diffEmptyStateHint":
-    "Select a file in the tree above to preview changes the agent makes to it.",
+  "App.diffEmptyStateHint": "Select a file in the tree above to preview changes the agent makes to it.",
   "App.openTerminal": "Open integrated terminal",
   "App.closeTerminal": "Close integrated terminal",
   "App.openBrowser": "Open in-app browser",
@@ -309,8 +287,7 @@ export const en: Record<string, string> = {
   "BrowserPane.resize": "Resize browser pane",
   "BrowserPane.dismiss": "Dismiss",
   "BrowserPane.startHint": "Search or enter a URL to get started",
-  "BrowserPane.desktopOnly":
-    "The in-app browser is only available in the desktop app.",
+  "BrowserPane.desktopOnly": "The in-app browser is only available in the desktop app.",
   "TerminalPanel.title": "Integrated terminal",
   "TerminalPanel.tabLabel": "Terminal {{count}}",
   "TerminalPanel.closeTab": "Close terminal tab",
@@ -353,39 +330,27 @@ export const en: Record<string, string> = {
   "ReviewPanel.loading": "Loading review…",
   "ReviewPanel.desktopOnly": "Review is available in the desktop app.",
   "ReviewPanel.coverageTitle": "Criteria coverage",
-  "ReviewPanel.coverageHint":
-    "Acceptance criteria for this change, one per line.",
-  "ReviewPanel.coveragePlaceholder":
-    "Rate limit rejects the 11th request in a minute\nThe limit is configurable per account",
+  "ReviewPanel.coverageHint": "Acceptance criteria for this change, one per line.",
+  "ReviewPanel.coveragePlaceholder": "Rate limit rejects the 11th request in a minute\nThe limit is configurable per account",
   "ReviewPanel.coverageRun": "Check coverage",
   "ReviewPanel.coverageRunning": "Checking…",
-  "ReviewPanel.coverageNeedsCriteria":
-    "Add at least one acceptance criterion first.",
+  "ReviewPanel.coverageNeedsCriteria": "Add at least one acceptance criterion first.",
   "ReviewPanel.coverageModel": "Mapped by {{model}}",
-  "ReviewPanel.coverageStale":
-    "The diff changed after this report was made — re-check to map the current one.",
+  "ReviewPanel.coverageStale": "The diff changed after this report was made — re-check to map the current one.",
   "ReviewPanel.coverageUncovered": "{{count}} of {{total}} not covered",
   "ReviewPanel.coverageAllCovered": "All {{total}} covered",
   "ReviewPanel.coverageComputedHeading": "Computed from git",
-  "ReviewPanel.coverageComputedSummary":
-    "{{files}} files · {{hunks}} citable hunks · +{{added}}/-{{removed}} · digest {{digest}}",
-  "ReviewPanel.coverageUncitable":
-    "No content to cite (binary or oversized): {{paths}}",
-  "ReviewPanel.coverageUncitedHunks":
-    "{{count}} changed hunks no covered criterion accounts for.",
-  "ReviewPanel.coverageTruncated":
-    'This diff is too large to map in one pass, so the facts above are an incomplete view of it — treat every "not covered" here as unproven.',
-  "ReviewPanel.coverageClaimsHeading":
-    "Model claims, checked against the facts above",
+  "ReviewPanel.coverageComputedSummary": "{{files}} files · {{hunks}} citable hunks · +{{added}}/-{{removed}} · digest {{digest}}",
+  "ReviewPanel.coverageUncitable": "No content to cite (binary or oversized): {{paths}}",
+  "ReviewPanel.coverageUncitedHunks": "{{count}} changed hunks no covered criterion accounts for.",
+  "ReviewPanel.coverageTruncated": "This diff is too large to map in one pass, so the facts above are an incomplete view of it — treat every \"not covered\" here as unproven.",
+  "ReviewPanel.coverageClaimsHeading": "Model claims, checked against the facts above",
   "ReviewPanel.coverageVerdict_covered": "covered",
   "ReviewPanel.coverageVerdict_partial": "partial",
   "ReviewPanel.coverageVerdict_uncovered": "not covered",
-  "ReviewPanel.coverageRejectedNote":
-    "Cited {{ids}}, which this diff does not contain — claim discarded.",
-  "ReviewPanel.coverageUnsupportedNote":
-    "Claimed coverage without citing a real hunk — not counted as covered.",
-  "ReviewPanel.coverageNoClaimNote":
-    "The model said nothing about this criterion.",
+  "ReviewPanel.coverageRejectedNote": "Cited {{ids}}, which this diff does not contain — claim discarded.",
+  "ReviewPanel.coverageUnsupportedNote": "Claimed coverage without citing a real hunk — not counted as covered.",
+  "ReviewPanel.coverageNoClaimNote": "The model said nothing about this criterion.",
   "App.rightPanelWorkspace": "Files",
   "App.rightPanelTerminal": "Terminal",
   "App.rightPanelBrowser": "Browser",
@@ -399,8 +364,7 @@ export const en: Record<string, string> = {
   "TerminalPanel.dockRight": "Dock terminal to the right side",
   "TerminalPanel.dockBottom": "Dock terminal to the bottom",
   "TerminalPanel.emptyTitle": "No terminal session",
-  "TerminalPanel.emptyDescription":
-    "Start a real workspace-scoped shell. It opens instantly — commands you type here run as you, without approval prompts.",
+  "TerminalPanel.emptyDescription": "Start a real workspace-scoped shell. It opens instantly — commands you type here run as you, without approval prompts.",
   "TerminalPanel.startTerminal": "Start terminal",
   "TerminalPanel.status.running": "Running",
   "TerminalPanel.status.exited": "Exited",
@@ -414,52 +378,41 @@ export const en: Record<string, string> = {
   "TerminalPanel.nextMatch": "Next match",
   "TerminalPanel.closeSearch": "Close output search",
   "TerminalPanel.history": "Command history",
-  "TerminalPanel.historyHint":
-    "Workspace-scoped history omits edited, pasted, and secret-shaped input it cannot safely reconstruct.",
-  "TerminalPanel.historyEmpty":
-    "No safe commands have been recorded for this workspace yet.",
+  "TerminalPanel.historyHint": "Workspace-scoped history omits edited, pasted, and secret-shaped input it cannot safely reconstruct.",
+  "TerminalPanel.historyEmpty": "No safe commands have been recorded for this workspace yet.",
   "TerminalPanel.insertCommand": "Insert",
   "TerminalPanel.runCommand": "Run now",
   "TerminalPanel.interrupt": "Interrupt",
-  "TerminalPanel.interruptDescription":
-    "Send Ctrl+C without closing the terminal",
+  "TerminalPanel.interruptDescription": "Send Ctrl+C without closing the terminal",
   "TerminalPanel.kill": "Kill",
   "TerminalPanel.killConfirmTitle": "Kill this terminal?",
-  "TerminalPanel.killConfirmDescription":
-    "This stops the shell and its child processes. Unsaved interactive state will be lost.",
+  "TerminalPanel.killConfirmDescription": "This stops the shell and its child processes. Unsaved interactive state will be lost.",
   "TerminalPanel.closeConfirmTitle": "Close this running terminal?",
-  "TerminalPanel.closeConfirmDescription":
-    "Closing a running tab kills its shell and child processes. Unsaved interactive state will be lost.",
+  "TerminalPanel.closeConfirmDescription": "Closing a running tab kills its shell and child processes. Unsaved interactive state will be lost.",
   "TerminalPanel.runConfirmTitle": "Run this command now?",
-  "TerminalPanel.runConfirmDescription":
-    "The command will be sent exactly as shown. Continue only if the terminal is at a shell prompt.",
+  "TerminalPanel.runConfirmDescription": "The command will be sent exactly as shown. Continue only if the terminal is at a shell prompt.",
   "TerminalPanel.confirmKill": "Kill terminal",
   "TerminalPanel.confirmClose": "Close and kill",
   "TerminalPanel.confirmRun": "Run command",
   "TerminalPanel.working": "Working…",
   "TerminalPanel.restart": "Restart",
   "TerminalPanel.attach": "Attach",
-  "TerminalPanel.outputTruncated":
-    "Older output was discarded to keep this terminal responsive.",
+  "TerminalPanel.outputTruncated": "Older output was discarded to keep this terminal responsive.",
   "TerminalPanel.outputLabel": "Terminal output",
   "TerminalPanel.awaitingOutput": "Waiting for shell output…",
   "TerminalPanel.commandPlaceholder": "Enter a command (approval required)",
   "TerminalPanel.restartToContinue": "Restart this terminal to continue",
   "TerminalPanel.commandLabel": "Terminal command",
   "TerminalPanel.run": "Run",
-  "TerminalPanel.attachedNotice":
-    "Terminal evidence added to the active chat draft.",
+  "TerminalPanel.attachedNotice": "Terminal evidence added to the active chat draft.",
   "TerminalPanel.approvalTitle": "Review terminal context",
-  "TerminalPanel.approvalDescription":
-    "Only attach this output if you want it included as untrusted evidence in the next model turn. Nothing is sent until you submit the chat draft.",
-  "TerminalPanel.evidenceTruncated":
-    "This preview is bounded; earlier output is not included.",
+  "TerminalPanel.approvalDescription": "Only attach this output if you want it included as untrusted evidence in the next model turn. Nothing is sent until you submit the chat draft.",
+  "TerminalPanel.evidenceTruncated": "This preview is bounded; earlier output is not included.",
   "TerminalPanel.cancel": "Cancel",
   "TerminalPanel.confirmAttach": "Attach to chat",
   "TerminalPanel.defaultPrompt": "Review the attached terminal evidence.",
   "ErrorBoundary.title": "Something went wrong",
-  "ErrorBoundary.description":
-    "An unexpected error occurred in this part of the app. Reloading usually fixes it.",
+  "ErrorBoundary.description": "An unexpected error occurred in this part of the app. Reloading usually fixes it.",
   "ErrorBoundary.reload": "Reload app",
   "ArtifactPane.previewTab": "Preview",
   "ArtifactPane.codeTab": "Code",
@@ -472,13 +425,11 @@ export const en: Record<string, string> = {
   "ArtifactPane.scriptsDisabledNotice": "Scripts are disabled in previews.",
   "ArtifactPane.mermaidRendering": "Rendering diagram…",
   "ArtifactPane.mermaidRenderError": "Couldn't render this diagram: {{error}}",
-  "ArtifactPane.noLongerAvailable":
-    "This artifact is no longer available in the conversation.",
+  "ArtifactPane.noLongerAvailable": "This artifact is no longer available in the conversation.",
   "ArtifactPane.renderError": "Couldn't render this artifact.",
   "ArtifactPane.saveError": "Couldn't save: {{error}}",
   "ArtifactPane.untitledArtifact": "Artifact {{n}}",
-  "ArtifactPane.interactivePreviewUnavailable":
-    "Interactive preview unavailable ({{error}}) — showing a static preview instead.",
+  "ArtifactPane.interactivePreviewUnavailable": "Interactive preview unavailable ({{error}}) — showing a static preview instead.",
   "ArtifactPane.openInBrowser": "Open in browser",
   "ArtifactPane.openInBrowserError": "Couldn't open in browser: {{error}}",
   "AttachMenu.addAttachmentAriaLabel": "Add attachment",
@@ -523,12 +474,10 @@ export const en: Record<string, string> = {
   "ChatSessionList.view.stateIdle": "Idle",
   "ChatSessionList.view.noMatches": "No sessions match this filter.",
   "ExternalConversation.loading": "Loading this conversation…",
-  "ExternalConversation.empty":
-    "Nothing has been said in this conversation yet.",
+  "ExternalConversation.empty": "Nothing has been said in this conversation yet.",
   "ExternalConversation.refresh": "Reload this conversation",
   "ExternalConversation.subtitleWithAccount": "{{environment}} · {{account}}",
-  "ExternalConversation.readOnlyNotice":
-    "This conversation happens on {{environment}}. Replies are sent there by the agent, under the routing you configured.",
+  "ExternalConversation.readOnlyNotice": "This conversation happens on {{environment}}. Replies are sent there by the agent, under the routing you configured.",
   "SessionMenu.openIn": "Open in",
   "SessionMenu.splitView": "Split view",
   "SessionMenu.newWindow": "New window",
@@ -551,26 +500,21 @@ export const en: Record<string, string> = {
   "SessionMenu.delete": "Delete",
   "ChatWindow.inputPlaceholder": "Describe a task or ask a question",
   "ChatWindow.stopResponseAriaLabel": "Stop response",
-  "ChatWindow.stopResponseHint":
-    "Interrupts the current step. Everything already streamed stays in the transcript.",
+  "ChatWindow.stopResponseHint": "Interrupts the current step. Everything already streamed stays in the transcript.",
   "ChatWindow.sendMessageAriaLabel": "Send message",
   "ChatWindow.retryButton": "Retry",
-  "ChatWindow.executionServiceDown":
-    "Little Monkey's execution service couldn't start, so this message wasn't sent.",
+  "ChatWindow.executionServiceDown": "Little Monkey's execution service couldn't start, so this message wasn't sent.",
   "ChatWindow.repairServiceButton": "Repair service",
   "ChatWindow.repairingService": "Repairing…",
   "ChatWindow.persistErrorBanner": "Failed to save chat history: {{error}}",
   "ContextUsageIndicator.zeroTokens": "0 tokens",
   "ContextUsageIndicator.percentUsed": "{{percent}}%",
   "ContextUsageIndicator.tokensCount": "{{count}} tokens",
-  "ContextUsageIndicator.contextWindowUsageAriaLabel":
-    "Context window usage: {{label}}",
+  "ContextUsageIndicator.contextWindowUsageAriaLabel": "Context window usage: {{label}}",
   "ContextUsageIndicator.contextWindowHeading": "Context window",
   "ContextUsageIndicator.noMessagesYet": "No messages sent yet this session.",
-  "ContextUsageIndicator.tokensUsageDetail":
-    "{{used}} / {{limit}} tokens ({{percent}}%)",
-  "ContextUsageIndicator.tokensUsedLimitUnknown":
-    "{{count}} tokens used - context limit unknown for this model",
+  "ContextUsageIndicator.tokensUsageDetail": "{{used}} / {{limit}} tokens ({{percent}}%)",
+  "ContextUsageIndicator.tokensUsedLimitUnknown": "{{count}} tokens used - context limit unknown for this model",
   "CheckpointTimeline.openAriaLabel": "Checkpoint history",
   "CheckpointTimeline.heading": "Checkpoints",
   "CheckpointTimeline.loading": "Loading checkpoints…",
@@ -580,40 +524,31 @@ export const en: Record<string, string> = {
   "CheckpointTimeline.shellRanBadge": "shell ran",
   "CheckpointTimeline.restoreToHereButton": "Restore to here",
   "CheckpointTimeline.restoringToHere": "Restoring…",
-  "CheckpointTimeline.restoreToHereBlockedShell":
-    "Unavailable — a shell command ran during one of these turns, so file restore can't fully undo it",
-  "CheckpointTimeline.restoreToHereBlockedPruned":
-    "Unavailable — an in-between checkpoint was pruned from disk, so file restore can't fully cover this span",
+  "CheckpointTimeline.restoreToHereBlockedShell": "Unavailable — a shell command ran during one of these turns, so file restore can't fully undo it",
+  "CheckpointTimeline.restoreToHereBlockedPruned": "Unavailable — an in-between checkpoint was pruned from disk, so file restore can't fully cover this span",
   "CheckpointTimeline.restoreToHereFailed": "Restore to here failed: {{error}}",
   "CheckpointTimeline.justNow": "Just now",
   "CheckpointTimeline.minutesAgo": "{{count}} minute(s) ago",
   "CheckpointTimeline.hoursAgo": "{{count}} hour(s) ago",
   "CheckpointTimeline.daysAgo": "{{count}} day(s) ago",
   "CheckpointTimeline.previewButton": "Preview",
-  "CheckpointPreview.subtitle":
-    "Preview and rollback simulation — nothing is restored until you confirm below.",
+  "CheckpointPreview.subtitle": "Preview and rollback simulation — nothing is restored until you confirm below.",
   "CheckpointPreview.closeAriaLabel": "Close preview",
   "CheckpointPreview.loading": "Loading preview…",
-  "CheckpointPreview.binaryFile":
-    "Binary file — content preview not available.",
-  "CheckpointPreview.diffUnavailable":
-    "This file's before/after content isn't available for diffing.",
-  "CheckpointPreview.diffTooLarge":
-    "This file is too large to display a line-by-line diff.",
+  "CheckpointPreview.binaryFile": "Binary file — content preview not available.",
+  "CheckpointPreview.diffUnavailable": "This file's before/after content isn't available for diffing.",
+  "CheckpointPreview.diffTooLarge": "This file is too large to display a line-by-line diff.",
   "CheckpointPreview.noTextChange": "No text differences.",
   "CheckpointPreview.diffMoreLines": "… {{count}} more line(s) not shown",
-  "CheckpointPreview.afterSourceLiveTooltip":
-    "This checkpoint predates exact after-snapshots — shown content reflects the current file, which may include later edits.",
+  "CheckpointPreview.afterSourceLiveTooltip": "This checkpoint predates exact after-snapshots — shown content reflects the current file, which may include later edits.",
   "CheckpointPreview.status.added": "Added",
   "CheckpointPreview.status.modified": "Modified",
   "CheckpointPreview.status.deleted": "Deleted",
   "CheckpointPreview.status.unchanged": "Unchanged",
   "CheckpointPreview.status.unknown": "Unknown",
   "CheckpointPreview.needsReconciliationTitle": "Needs reconciliation",
-  "CheckpointPreview.needsReconciliationBody":
-    "This turn had effects outside the workspace files. Restoring files below will NOT undo them — they must be reconciled manually.",
-  "CheckpointPreview.shellOnlyCaveat":
-    "A shell command ran during this turn; its side effects can't be automatically reversed.",
+  "CheckpointPreview.needsReconciliationBody": "This turn had effects outside the workspace files. Restoring files below will NOT undo them — they must be reconciled manually.",
+  "CheckpointPreview.shellOnlyCaveat": "A shell command ran during this turn; its side effects can't be automatically reversed.",
   "CheckpointPreview.filesHeading": "Files ({{count}})",
   "CheckpointPreview.artifactsHeading": "Artifacts ({{count}})",
   "CheckpointPreview.imagesHeading": "Screenshots / images ({{count}})",
@@ -622,40 +557,33 @@ export const en: Record<string, string> = {
   "CheckpointPreview.verifyPassed": "Passed",
   "CheckpointPreview.verifyFailed": "Failed",
   "CheckpointPreview.conversationHeading": "Conversation",
-  "CheckpointPreview.conversationAvailable":
-    "Rewinding the conversation to just before this turn is available.",
+  "CheckpointPreview.conversationAvailable": "Rewinding the conversation to just before this turn is available.",
   "CheckpointPreview.simulationHeading": "Rollback simulation",
   "CheckpointPreview.effectKind.shell": "A shell command ran",
   "CheckpointPreview.effectKind.network": "A network request was sent",
   "CheckpointPreview.effectKind.mcp-tool": "An MCP server tool was called",
   "CheckpointPreview.effectKind.memory": "A fact was remembered",
-  "CheckpointPreview.effectKind.task-suggestion":
-    "A follow-up task was proposed",
+  "CheckpointPreview.effectKind.task-suggestion": "A follow-up task was proposed",
   "CheckpointPreview.willUndo": "reverting will {{action}}",
-  "CheckpointPreview.effectUnconfirmed":
-    "(this app never saw it finish, so it may or may not have happened)",
-  "CheckpointPreview.simulationAlreadyReverted":
-    "This checkpoint has already been reverted — nothing further would change.",
-  "CheckpointPreview.simulationNothingToDo":
-    "Nothing recorded for this checkpoint yet.",
+  "CheckpointPreview.effectUnconfirmed": "(this app never saw it finish, so it may or may not have happened)",
+  "CheckpointPreview.simulationAlreadyReverted": "This checkpoint has already been reverted — nothing further would change.",
+  "CheckpointPreview.simulationNothingToDo": "Nothing recorded for this checkpoint yet.",
   "CheckpointPreview.restoreAction.restore": "Will restore",
   "CheckpointPreview.restoreAction.delete": "Will delete",
   "CheckpointPreview.restoreAction.noOp": "No change",
-  "CheckpointPreview.driftedTooltip":
-    "The live file no longer matches what this turn produced — something else changed it since. Restoring will also discard that later change.",
+  "CheckpointPreview.driftedTooltip": "The live file no longer matches what this turn produced — something else changed it since. Restoring will also discard that later change.",
   "CheckpointPreview.cancelButton": "Cancel",
   "CheckpointPreview.restoreFailed": "Restore failed: {{error}}",
   "CheckpointCompare.openButton": "Compare",
   "CheckpointCompare.title": "Compare checkpoints",
   "CheckpointCompare.checkpointALabel": "Checkpoint A",
   "CheckpointCompare.checkpointBLabel": "Checkpoint B",
-  "CheckpointCompare.comparingLabel": 'Comparing "{{a}}" against "{{b}}"',
+  "CheckpointCompare.comparingLabel": "Comparing \"{{a}}\" against \"{{b}}\"",
   "CheckpointCompare.noFiles": "Neither checkpoint touched any files.",
   "CheckpointCompare.presenceBoth": "In both",
   "CheckpointCompare.presenceOnlyA": "Only in A",
   "CheckpointCompare.presenceOnlyB": "Only in B",
-  "CheckpointCompare.diffUnavailable":
-    "This file's content isn't available from one or both checkpoints for a direct comparison.",
+  "CheckpointCompare.diffUnavailable": "This file's content isn't available from one or both checkpoints for a direct comparison.",
   "CheckpointCompare.identical": "No differences between the two checkpoints.",
   "EffortSelector.panelTitle": "Effort",
   "EffortSelector.levelDefault": "Default",
@@ -665,20 +593,13 @@ export const en: Record<string, string> = {
   "EffortSelector.levelExtra": "Extra",
   "EffortSelector.levelMax": "Max",
   "EffortSelector.levelUltracode": "Ultracode",
-  "EffortSelector.effortDescription":
-    "Leaves the choice to the provider. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.descLow":
-    "Fastest, cheapest reasoning for this model. Best for simple requests. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.descMedium":
-    "Balanced reasoning depth and speed for this model. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.descHigh":
-    "More thorough reasoning than Medium. Slower and uses more of your limits. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.descExtra":
-    "Very thorough reasoning, slower still and heavier on your limits. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.descMax":
-    "Maximum reasoning depth for this model. Slowest and heaviest on your limits. Applies to this model wherever it's used, not just this chat.",
-  "EffortSelector.ultracodeDescription":
-    "The active model orchestrates a team of subagents for every substantive request — fanning out research and implementation subtasks in parallel and adversarially verifying its own findings before answering. Most thorough, slowest, and heaviest on your limits. Applies to this chat only — new chats start without it.",
+  "EffortSelector.effortDescription": "Leaves the choice to the provider. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.descLow": "Fastest, cheapest reasoning for this model. Best for simple requests. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.descMedium": "Balanced reasoning depth and speed for this model. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.descHigh": "More thorough reasoning than Medium. Slower and uses more of your limits. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.descExtra": "Very thorough reasoning, slower still and heavier on your limits. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.descMax": "Maximum reasoning depth for this model. Slowest and heaviest on your limits. Applies to this model wherever it's used, not just this chat.",
+  "EffortSelector.ultracodeDescription": "The active model orchestrates a team of subagents for every substantive request — fanning out research and implementation subtasks in parallel and adversarially verifying its own findings before answering. Most thorough, slowest, and heaviest on your limits. Applies to this chat only — new chats start without it.",
   "EffortSelector.fasterLabel": "Faster",
   "EffortSelector.smarterLabel": "Smarter",
   "EffortSelector.effortLevelAriaLabel": "Effort level",
@@ -686,19 +607,16 @@ export const en: Record<string, string> = {
   "MessageBubble.cancelButton": "Cancel",
   "MessageBubble.saveAndSubmitButton": "Save & submit",
   "MessageBubble.editMessageAriaLabel": "Edit message",
-  "MessageBubble.editMessageHint":
-    "Resends from here — every message after this one is replaced.",
+  "MessageBubble.editMessageHint": "Resends from here — every message after this one is replaced.",
   "MessageBubble.attachedImageAlt": "Attached",
   "MessageBubble.previewButton": "Preview",
   "MessageBubble.copyButton": "Copy code",
   "MessageBubble.copiedLabel": "Copied",
   "MessageBubble.copyMessage": "Copy message",
   "MessageBubble.startSideTask": "Start side task from this message",
-  "MessageBubble.startSideTaskHint":
-    "Opens the side-task composer seeded with this message. Nothing runs until you start it.",
+  "MessageBubble.startSideTaskHint": "Opens the side-task composer seeded with this message. Nothing runs until you start it.",
   "MessageBubble.pinChapter": "Pin as chapter",
-  "MessageBubble.pinChapterHint":
-    "Adds this answer to the conversation's chapter list for jumping back to.",
+  "MessageBubble.pinChapterHint": "Adds this answer to the conversation's chapter list for jumping back to.",
   "MessageBubble.unpinChapter": "Unpin chapter",
   "MessageBubble.readAloud": "Read aloud",
   "MessageBubble.stopReading": "Stop reading",
@@ -706,8 +624,7 @@ export const en: Record<string, string> = {
   "WorkspaceImage.error": "Image unavailable: {{error}}",
   "WorkspaceImage.generatedAlt": "Generated image",
   "GeneratedImage.generatingLabel": "Creating image",
-  "GeneratedImage.generatingDetail":
-    "Generating a more detailed image — hang tight.",
+  "GeneratedImage.generatingDetail": "Generating a more detailed image — hang tight.",
   "GeneratedImage.renderingPng": "Rendering PNG",
   "GeneratedImage.failed": "Image generation failed",
   "GeneratedImage.editButton": "Edit",
@@ -717,10 +634,8 @@ export const en: Record<string, string> = {
   "GeneratedImage.copied": "Image copied",
   "GeneratedImage.saved": "PNG saved",
   "GeneratedImage.readyAs": "Ready to download as {{name}}",
-  "GeneratedImage.clipboardUnavailable":
-    "Image copying is not available on this system.",
-  "GeneratedImage.desktopOnly":
-    "Generated images can only be edited in the desktop app.",
+  "GeneratedImage.clipboardUnavailable": "Image copying is not available on this system.",
+  "GeneratedImage.desktopOnly": "Generated images can only be edited in the desktop app.",
   "GeneratedImage.editPrompt": "Edit this image: ",
   "MessageList.argumentsLabel": "Arguments",
   "MessageList.resultLabel": "Result",
@@ -737,12 +652,9 @@ export const en: Record<string, string> = {
   "MessageList.checkpointRestoreFiles": "Restore files",
   "MessageList.checkpointRewindConversation": "Rewind conversation",
   "MessageList.checkpointRestoreBoth": "Restore both",
-  "MessageList.checkpointRewindBlockedTurnRunning":
-    "Unavailable while a reply is in progress",
-  "MessageList.checkpointRewindUnavailable":
-    "The conversation has changed — only files can be restored",
-  "MessageList.checkpointShellRanCaveat":
-    "Shell command ran; file restore may not undo everything",
+  "MessageList.checkpointRewindBlockedTurnRunning": "Unavailable while a reply is in progress",
+  "MessageList.checkpointRewindUnavailable": "The conversation has changed — only files can be restored",
+  "MessageList.checkpointShellRanCaveat": "Shell command ran; file restore may not undo everything",
   "MessageList.memoryRemembered": "Remembered: {{text}}",
   "MessageList.memoryForgetButton": "Forget",
   "MessageList.memoryForgetting": "Forgetting…",
@@ -758,8 +670,7 @@ export const en: Record<string, string> = {
   "MessageList.learningReview": "Review candidate",
   "MessageList.sourcesHeading": "{{count}} source(s)",
   "MessageList.recipeStarted": "Started from recipe: {{name}}",
-  "MessageList.recipeStartedFromLocalApp":
-    'Started from recipe: {{name}} · via Local App "{{appName}}"',
+  "MessageList.recipeStartedFromLocalApp": "Started from recipe: {{name}} · via Local App \"{{appName}}\"",
   "MessageList.turnStatusThinking": "thinking…",
   "MessageList.turnStatusStillThinking": "still thinking…",
   "MessageList.turnStatusTokens": "{{count}} tokens",
@@ -809,12 +720,9 @@ export const en: Record<string, string> = {
   "ProcessesPanel.enforcementUnavailable": "Unavailable",
   "ProcessesPanel.enforcementNotApplicable": "Not applicable",
   "ProcessesPanel.originClassDefault": "The default for this kind.",
-  "ProcessesPanel.originCallerOverride":
-    "Tightened by the caller, below the {{classDefault}} default.",
-  "ProcessesPanel.originCallerSupplied":
-    "Set by the caller; this kind declares no default.",
-  "ProcessesPanel.originUnrecorded":
-    "Recorded before this kind had a default, so the number it ran under is unknown.",
+  "ProcessesPanel.originCallerOverride": "Tightened by the caller, below the {{classDefault}} default.",
+  "ProcessesPanel.originCallerSupplied": "Set by the caller; this kind declares no default.",
+  "ProcessesPanel.originUnrecorded": "Recorded before this kind had a default, so the number it ran under is unknown.",
   "ProcessesPanel.usageObserved": "Used: {{observed}}",
   "ProcessesPanel.stateContainmentLost": "Containment lost",
   "ProcessesPanel.kindVerifyCommand": "Verify command",
@@ -822,8 +730,7 @@ export const en: Record<string, string> = {
   "ProcessesPanel.kindSandboxRun": "Sandbox run",
   "ProcessesPanel.usageCurrentAndPeak": "Now {{current}} · peak {{peak}}",
   "ProcessesPanel.usageNotMeasured": "not measured",
-  "ProcessesPanel.resourceBackendUnrecorded":
-    "This process recorded no enforcement mechanism, so what held it cannot be stated.",
+  "ProcessesPanel.resourceBackendUnrecorded": "This process recorded no enforcement mechanism, so what held it cannot be stated.",
   "ProcessesPanel.resourceScope": "Containment: {{scope}}",
   "ProcessesPanel.usageUnavailable": "Not measured: {{reason}}",
   "ProcessesPanel.breachTitle": "{{limit}} limit exceeded",
@@ -831,39 +738,27 @@ export const en: Record<string, string> = {
   "ProcessesPanel.breachObserved": "Observed: {{observed}}",
   "ProcessesPanel.breachBackend": "Enforcement: {{level}} ({{backend}})",
   "ProcessesPanel.breachEvidence": "Evidence: {{evidence}}",
-  "ProcessesPanel.breachHeldAtCap":
-    "The two numbers are equal because the kernel refused the work rather than letting the measurement pass the cap.",
+  "ProcessesPanel.breachHeldAtCap": "The two numbers are equal because the kernel refused the work rather than letting the measurement pass the cap.",
   "ResourceLedgerPanel.title": "Resource ledger and scheduling decisions",
-  "ResourceLedgerPanel.description":
-    "What each process actually consumed, and why the scheduler chose what it chose. Every number here is either a real measurement or an explained gap — nothing unmeasured is reported as zero.",
+  "ResourceLedgerPanel.description": "What each process actually consumed, and why the scheduler chose what it chose. Every number here is either a real measurement or an explained gap — nothing unmeasured is reported as zero.",
   "ResourceLedgerPanel.tabUsage": "Per-process usage",
   "ResourceLedgerPanel.tabDecisions": "Scheduler decisions",
   "ResourceLedgerPanel.refresh": "Refresh",
-  "ResourceLedgerPanel.closedOnly":
-    "Exited processes only (a live process has no closed-out row)",
-  "ResourceLedgerPanel.unavailableExplainer":
-    "A missing measurement is shown as unavailable with the reason it is missing. It is never shown as 0, never summed as 0, and never drawn as an idle process.",
+  "ResourceLedgerPanel.closedOnly": "Exited processes only (a live process has no closed-out row)",
+  "ResourceLedgerPanel.unavailableExplainer": "A missing measurement is shown as unavailable with the reason it is missing. It is never shown as 0, never summed as 0, and never drawn as an idle process.",
   "ResourceLedgerPanel.unavailableWithReason": "unavailable — {{reason}}",
-  "ResourceLedgerPanel.unavailableWithoutReason":
-    "unavailable, and the ledger recorded no reason",
-  "ResourceLedgerPanel.rowUnavailableCount":
-    "{{count}} of {{total}} measurements unavailable",
+  "ResourceLedgerPanel.unavailableWithoutReason": "unavailable, and the ledger recorded no reason",
+  "ResourceLedgerPanel.rowUnavailableCount": "{{count}} of {{total}} measurements unavailable",
   "ResourceLedgerPanel.totalsHeading": "Totals across {{rows}} ledger rows",
-  "ResourceLedgerPanel.totalsPartialWarning":
-    "{{fields}} totals could not read every row. Each says how many rows it covers.",
-  "ResourceLedgerPanel.totalUnmeasured":
-    "no row measured this, so there is no total",
-  "ResourceLedgerPanel.totalCoverage":
-    "measured on {{measured}} of {{rows}} rows",
+  "ResourceLedgerPanel.totalsPartialWarning": "{{fields}} totals could not read every row. Each says how many rows it covers.",
+  "ResourceLedgerPanel.totalUnmeasured": "no row measured this, so there is no total",
+  "ResourceLedgerPanel.totalCoverage": "measured on {{measured}} of {{rows}} rows",
   "ResourceLedgerPanel.destinationsLabel": "Reached",
   "ResourceLedgerPanel.destinationRequests": "{{count}} requests",
-  "ResourceLedgerPanel.destinationsDropped":
-    "{{count}} more requests went to destinations past the recording limit, so they are counted here but not named.",
-  "ResourceLedgerPanel.contextReuseLabel":
-    "Prompt cache, as the runtime measured it",
+  "ResourceLedgerPanel.destinationsDropped": "{{count}} more requests went to destinations past the recording limit, so they are counted here but not named.",
+  "ResourceLedgerPanel.contextReuseLabel": "Prompt cache, as the runtime measured it",
   "ResourceLedgerPanel.contextReuseHitRate": "{{percent}}% reused",
-  "ResourceLedgerPanel.contextReuseTokens":
-    "{{reused}} tokens saved, {{evaluated}} evaluated",
+  "ResourceLedgerPanel.contextReuseTokens": "{{reused}} tokens saved, {{evaluated}} evaluated",
   "ResourceLedgerPanel.foldSum": "sum",
   "ResourceLedgerPanel.foldMax": "peak, not a sum",
   "ResourceLedgerPanel.emptyUsage": "No ledger rows yet.",
@@ -898,20 +793,15 @@ export const en: Record<string, string> = {
   "ResourceLedgerPanel.kind_verify_command": "Verify command",
   "ResourceLedgerPanel.kind_hook_command": "Hook",
   "ResourceLedgerPanel.kind_sandbox_run": "Sandbox run",
-  "ResourceLedgerPanel.decisionsExplainer":
-    "Newest first, bounded to the daemon's most recent 512 decisions. Each row cites the measurement that decided it, with that reading's own observation time.",
-  "ResourceLedgerPanel.decisionsUnavailableHint":
-    "The decision log is reachable through the CLI (monkey daemon decisions --json); the desktop command that reads it is not wired up yet.",
+  "ResourceLedgerPanel.decisionsExplainer": "Newest first, bounded to the daemon's most recent 512 decisions. Each row cites the measurement that decided it, with that reading's own observation time.",
+  "ResourceLedgerPanel.decisionsUnavailableHint": "The decision log is reachable through the CLI (monkey daemon decisions --json); the desktop command that reads it is not wired up yet.",
   "ResourceLedgerPanel.emptyDecisions": "No scheduling decisions recorded yet.",
   "ResourceLedgerPanel.decidingMeasurement": "Decided by this measurement",
   "ResourceLedgerPanel.measuredValueMissing": "no value recorded",
-  "ResourceLedgerPanel.observedAt":
-    "Reading observed at {{at}} (not when this decision was written)",
-  "ResourceLedgerPanel.observedAtMissing":
-    "The reading's observation time was not recorded",
+  "ResourceLedgerPanel.observedAt": "Reading observed at {{at}} (not when this decision was written)",
+  "ResourceLedgerPanel.observedAtMissing": "The reading's observation time was not recorded",
   "ResourceLedgerPanel.classPlain": "class {{effective}}",
-  "ResourceLedgerPanel.classPromoted":
-    "class {{declared}}, aged up to {{effective}}",
+  "ResourceLedgerPanel.classPromoted": "class {{declared}}, aged up to {{effective}}",
   "ResourceLedgerPanel.passedOver": "chosen over {{jobs}}",
   "ResourceLedgerPanel.outcomeAdmitted": "Admitted",
   "ResourceLedgerPanel.outcomeHeld": "Held",
@@ -923,28 +813,23 @@ export const en: Record<string, string> = {
   "BackgroundAgentsPanel.backpressureAccepting": "Accepting",
   "BackgroundAgentsPanel.backpressureSlow": "Slow down",
   "BackgroundAgentsPanel.backpressureClosed": "Closed",
-  "BackgroundAgentsPanel.backpressureFallbackDetail":
-    "The daemon is not accepting work right now.",
-  "BackgroundAgentsPanel.backpressureRetryHint":
-    "Try again in about {{seconds}}s.",
-  "BackgroundAgentsPanel.backpressureQueueAnywayConfirm":
-    "{{detail}}\n\nQueue this job anyway?",
+  "BackgroundAgentsPanel.backpressureFallbackDetail": "The daemon is not accepting work right now.",
+  "BackgroundAgentsPanel.backpressureRetryHint": "Try again in about {{seconds}}s.",
+  "BackgroundAgentsPanel.backpressureQueueAnywayConfirm": "{{detail}}\n\nQueue this job anyway?",
   "BackgroundTasksPanel.closeAriaLabel": "Close background tasks panel",
-  "BackgroundTasksPanel.emptyState":
-    "Background commands and agent runs appear here",
+  "BackgroundTasksPanel.emptyState": "Background commands and agent runs appear here",
   "BackgroundTasksPanel.runningHeading": "Running",
   "BackgroundTasksPanel.finishedHeading": "Finished",
   "BackgroundTasksPanel.clearButton": "Clear",
-  "BackgroundTasksPanel.stopAriaLabel": 'Stop "{{name}}"',
+  "BackgroundTasksPanel.stopAriaLabel": "Stop \"{{name}}\"",
   "BackgroundTasksPanel.steerPlaceholder": "Send a message to this agent…",
-  "BackgroundTasksPanel.steerSendAriaLabel": 'Send message to "{{name}}"',
+  "BackgroundTasksPanel.steerSendAriaLabel": "Send message to \"{{name}}\"",
   "BackgroundTasksPanel.shellKindLabel": "Shell",
   "BackgroundTasksPanel.agentKindLabel": "Agent",
   "BackgroundTasksPanel.exitCode": "exit {{code}}",
   "BackgroundTasksPanel.viewOutput": "View output",
   "BackgroundTasksPanel.hideOutput": "Hide output",
-  "BackgroundTasksPanel.outputTruncated":
-    "Earlier output dropped — showing the retained tail.",
+  "BackgroundTasksPanel.outputTruncated": "Earlier output dropped — showing the retained tail.",
   "BackgroundTasksPanel.viewTranscript": "View transcript",
   "BackgroundTasksPanel.hideTranscript": "Hide transcript",
   "BackgroundTasksPanel.tokenUsage": "{{count}} tokens",
@@ -963,12 +848,10 @@ export const en: Record<string, string> = {
   "BackgroundTasksPanel.workflowKindLabel": "Workflow",
   "BackgroundTasksPanel.savedWorkflowsHeading": "Saved workflows",
   "BackgroundTasksPanel.saveWorkflowButton": "Save workflow",
-  "BackgroundTasksPanel.savedWorkflowShape":
-    "{{phases}} phases · {{agents}} agents",
+  "BackgroundTasksPanel.savedWorkflowShape": "{{phases}} phases · {{agents}} agents",
   "BackgroundTasksPanel.savedWorkflowLastRun": "Last run {{when}}",
   "BackgroundTasksPanel.savedWorkflowNeverRun": "Not run yet",
-  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel":
-    'Delete saved workflow "{{name}}"',
+  "BackgroundTasksPanel.savedWorkflowDeleteAriaLabel": "Delete saved workflow \"{{name}}\"",
   "BackgroundTasksPanel.phaseQueued": "Queued",
   "BackgroundTasksPanel.stopAllAriaLabel": "Stop all running agents",
   "BackgroundTasksPanel.tableAgentHeader": "Agent",
@@ -978,8 +861,7 @@ export const en: Record<string, string> = {
   "SideChatPanel.title": "Side chat",
   "SideChatPanel.clearAriaLabel": "Clear side chat",
   "SideChatPanel.closeAriaLabel": "Close side chat",
-  "SideChatPanel.emptyState":
-    "Ask a quick question — it won't be added to the conversation.",
+  "SideChatPanel.emptyState": "Ask a quick question — it won't be added to the conversation.",
   "SideChatPanel.followUpPlaceholder": "Follow up…",
   "SubagentGroupCard.title": "{{count}} parallel agents",
   "SubagentGroupCard.tokenUsage": "{{count}} tokens",
@@ -1003,27 +885,20 @@ export const en: Record<string, string> = {
   "SubagentRow.reportLabel": "Report",
   "SubagentRow.tokenUsage": "{{count}} tokens",
   "MessageList.emptyStateTitle": "Nothing here yet",
-  "MessageList.emptyStateDescription":
-    "Ask Little Monkey to explain, write, or fix something in your workspace to get started.",
+  "MessageList.emptyStateDescription": "Ask Little Monkey to explain, write, or fix something in your workspace to get started.",
   "ModeSelector.modeManualLabel": "Manual",
   "ModeSelector.modeManualDescription": "Ask before every file edit or command",
   "ModeSelector.modeAcceptEditsLabel": "Accept Edits",
-  "ModeSelector.modeAcceptEditsDescription":
-    "Auto-approve file edits, still ask before running commands or touching sensitive paths",
+  "ModeSelector.modeAcceptEditsDescription": "Auto-approve file edits, still ask before running commands or touching sensitive paths",
   "ModeSelector.modeSmartLabel": "Smart",
-  "ModeSelector.modeSmartDescription":
-    "Auto-approve low-risk file edits, everything else asks",
+  "ModeSelector.modeSmartDescription": "Auto-approve low-risk file edits, everything else asks",
   "ModeSelector.modePlanLabel": "Plan",
-  "ModeSelector.modePlanDescription":
-    "Read-only - describe changes instead of making them",
+  "ModeSelector.modePlanDescription": "Read-only - describe changes instead of making them",
   "ModeSelector.modeAutoLabel": "Auto",
-  "ModeSelector.modeAutoDescription":
-    "Auto-approve file edits, shell commands and sensitive paths always ask",
+  "ModeSelector.modeAutoDescription": "Auto-approve file edits, shell commands and sensitive paths always ask",
   "ModeSelector.modeBypassLabel": "Bypass",
-  "ModeSelector.modeBypassDescription":
-    "Auto-approve everything, no exceptions - disables all safety prompts",
-  "ModeSelector.bypassConfirmWarning":
-    "This disables every permission prompt, including for running shell commands. The model will be able to read, write, and execute anything on your system without asking. Are you sure?",
+  "ModeSelector.modeBypassDescription": "Auto-approve everything, no exceptions - disables all safety prompts",
+  "ModeSelector.bypassConfirmWarning": "This disables every permission prompt, including for running shell commands. The model will be able to read, write, and execute anything on your system without asking. Are you sure?",
   "ModeSelector.cancelButton": "Cancel",
   "ModeSelector.confirmBypassButton": "Yes, disable all prompts",
   "PlanCard.approveButton": "Approve & start acting",
@@ -1032,44 +907,33 @@ export const en: Record<string, string> = {
   "PlanCard.approvedStatus": "Approved — acting now",
   "PlanCard.dismissedStatus": "Still planning",
   "PlanCard.openQuestionsLabel": "Open questions",
-  "PlanCard.approveDisabledTurnRunning":
-    "Unavailable while a reply is in progress",
+  "PlanCard.approveDisabledTurnRunning": "Unavailable while a reply is in progress",
   "PlanCard.approveFailed": "Approve failed: {{error}}",
   "ModelSwitcher.noModel": "No model",
   "ModelSwitcher.localSectionLabel": "Local",
-  "ModelSwitcher.noLocalModelsInstalled":
-    "None installed — add one in Settings",
+  "ModelSwitcher.noLocalModelsInstalled": "None installed — add one in Settings",
   "ModelSwitcher.ollamaSectionLabel": "Ollama",
   "ModelSwitcher.noOllamaModelsPulled": "None pulled — add one in Settings",
   "ModelSwitcher.cloudBadge": "CLOUD",
   "ModelSwitcher.cloudSectionLabel": "Cloud",
-  "ModelSwitcher.noCloudModelsConfigured":
-    "None configured — add an API key in Settings",
-  "ModelSwitcher.noCloudModelsSelected":
-    "No models selected — choose models in Settings",
+  "ModelSwitcher.noCloudModelsConfigured": "None configured — add an API key in Settings",
+  "ModelSwitcher.noCloudModelsSelected": "No models selected — choose models in Settings",
   "ModelSwitcher.retiredBadge": "Retired",
-  "ModelSwitcher.retiredTooltipWithReplacement":
-    "{{reason}} Suggested replacement: {{replacement}}.",
-  "ModelSwitcher.retiredTooltipNoReplacement":
-    "{{reason}} Migration path: {{note}}.",
-  "AddCustomModelForm.openGgufDescription":
-    "Open a `.gguf` file already on your computer",
+  "ModelSwitcher.retiredTooltipWithReplacement": "{{reason}} Suggested replacement: {{replacement}}.",
+  "ModelSwitcher.retiredTooltipNoReplacement": "{{reason}} Migration path: {{note}}.",
+  "AddCustomModelForm.openGgufDescription": "Open a `.gguf` file already on your computer",
   "AddCustomModelForm.openingButton": "Opening…",
   "AddCustomModelForm.openModelFileButton": "Open model file…",
-  "AddCustomModelForm.referenceDescription":
-    "Install from an Ollama tag or a Hugging Face model reference. Ollama does not need to be installed.",
-  "AddCustomModelForm.publicSingleFileOnly":
-    "Only public, single-file GGUF models are supported right now. Private or gated repositories and split GGUF files are not supported.",
+  "AddCustomModelForm.referenceDescription": "Install from an Ollama tag or a Hugging Face model reference. Ollama does not need to be installed.",
+  "AddCustomModelForm.publicSingleFileOnly": "Only public, single-file GGUF models are supported right now. Private or gated repositories and split GGUF files are not supported.",
   "AddCustomModelForm.referenceLabel": "Model reference",
-  "AddCustomModelForm.referencePlaceholder":
-    "llama3.2:3b or hf.co/org/repo:Q4_K_M",
+  "AddCustomModelForm.referencePlaceholder": "llama3.2:3b or hf.co/org/repo:Q4_K_M",
   "AddCustomModelForm.resolvingButton": "Resolving…",
   "AddCustomModelForm.resolveButton": "Resolve",
   "AddCustomModelForm.examplesLabel": "Examples:",
   "AddCustomModelForm.installProgress": "{{downloaded}} / {{total}} ({{pct}}%)",
   "AddCustomModelForm.preparingInstall": "Preparing download…",
-  "AddCustomModelForm.installedMessage":
-    "{{name}} is installed and ready to start.",
+  "AddCustomModelForm.installedMessage": "{{name}} is installed and ready to start.",
   "AddCustomModelForm.installingButton": "Installing…",
   "AddCustomModelForm.installedButton": "Installed",
   "AddCustomModelForm.installButton": "Install",
@@ -1087,8 +951,7 @@ export const en: Record<string, string> = {
   "ModelCard.statusError": "Error",
   "ModelCard.statusSelected": "Selected",
   "ModelCard.toolCallingBadge": "Tool calling",
-  "ModelCard.startFailedMessage":
-    "llama-server failed to start. Check the install and try again.",
+  "ModelCard.startFailedMessage": "llama-server failed to start. Check the install and try again.",
   "ModelCard.downloadProgressLabel": "{{downloaded}} / {{total}} ({{pct}}%)",
   "ModelCard.pullButton": "Pull",
   "ModelCard.cancelDownloadAriaLabel": "Cancel download",
@@ -1100,33 +963,27 @@ export const en: Record<string, string> = {
   "ModelManager.stopModelBeforeDelete": "Stop the model before deleting it.",
   "ModelManager.removeVerb": "Remove",
   "ModelManager.deleteVerb": "Delete",
-  "ModelManager.confirmRemoveDetail":
-    "This only forgets it here — the file on disk is untouched.",
-  "ModelManager.confirmDeleteDetail":
-    "This removes the downloaded weights from disk.",
-  "ModelManager.confirmDeleteModel": '{{verb}} "{{name}}"? {{detail}}',
+  "ModelManager.confirmRemoveDetail": "This only forgets it here — the file on disk is untouched.",
+  "ModelManager.confirmDeleteDetail": "This removes the downloaded weights from disk.",
+  "ModelManager.confirmDeleteModel": "{{verb}} \"{{name}}\"? {{detail}}",
   "ModelManager.deleteFailed": "Failed to {{verb}} model: {{error}}",
   "ModelManager.noModelsAvailable": "No models available.",
   "ModelManager.customLocalModels": "Custom local models",
   "ModelManager.addCustomModel": "Add a custom model",
   "ModelManager.embeddingsToggleLabel": "Start with embeddings support",
-  "ModelManager.embeddingsToggleDescription":
-    "Launches llama-server with --embeddings, so the local API server can serve POST /v1/embeddings for this model. Restart the model to apply.",
-  "ModelfileStudio.description":
-    "Author, preview, and validate a full Modelfile before it's installed into Ollama's model library",
+  "ModelManager.embeddingsToggleDescription": "Launches llama-server with --embeddings, so the local API server can serve POST /v1/embeddings for this model. Restart the model to apply.",
+  "ModelfileStudio.description": "Author, preview, and validate a full Modelfile before it's installed into Ollama's model library",
   "ModelfileStudio.addFromFileButton": "FROM file…",
   "ModelfileStudio.addFromFolderButton": "FROM folder…",
   "ModelfileStudio.addSystemFileButton": "SYSTEM from file…",
   "ModelfileStudio.addLicenseFileButton": "LICENSE from file…",
   "ModelfileStudio.shortNamePlaceholder": "model name",
-  "ModelfileStudio.textareaPlaceholder":
-    'FROM llama3.2:latest\nPARAMETER temperature 0.7\nSYSTEM """You are a terse assistant."""',
+  "ModelfileStudio.textareaPlaceholder": "FROM llama3.2:latest\nPARAMETER temperature 0.7\nSYSTEM \"\"\"You are a terse assistant.\"\"\"",
   "ModelfileStudio.validateButton": "Preview & Validate",
   "ModelfileStudio.validatingButton": "Validating…",
   "ModelfileStudio.createButton": "Create Model",
   "ModelfileStudio.creatingButton": "Creating…",
-  "ModelfileStudio.staleValidationHint":
-    "Edited since the last preview — validate again before creating",
+  "ModelfileStudio.staleValidationHint": "Edited since the last preview — validate again before creating",
   "ModelfileStudio.fromLabel": "FROM: {{value}}",
   "ModelfileStudio.requiresLabel": "Requires Ollama {{version}}+",
   "ModelfileStudio.templateLabel": "Template",
@@ -1135,21 +992,19 @@ export const en: Record<string, string> = {
   "ModelfileStudio.parametersCountLabel": "Parameters ({{count}})",
   "ModelfileStudio.adaptersCountLabel": "Adapters ({{count}})",
   "ModelfileStudio.messagesCountLabel": "Messages ({{count}})",
-  "ModelfileStudio.createdMessage": 'Created "{{name}}" — check the list above',
+  "ModelfileStudio.createdMessage": "Created \"{{name}}\" — check the list above",
   "ModelfileStudio.format.gguf": "GGUF file",
   "ModelfileStudio.format.safetensorsFile": "Safetensors file",
   "ModelfileStudio.format.safetensorsDirectory": "Safetensors directory",
   "ModelfileStudio.format.existingModelReference": "Existing model reference",
-  "OllamaImportForm.description":
-    "Import a local GGUF file or Safetensors folder into Ollama",
+  "OllamaImportForm.description": "Import a local GGUF file or Safetensors folder into Ollama",
   "OllamaImportForm.pickGgufButton": "GGUF file…",
   "OllamaImportForm.pickSafetensorsButton": "Safetensors folder…",
   "OllamaImportForm.namePlaceholder": "model name",
   "OllamaImportForm.importingButton": "Importing…",
   "OllamaImportForm.importButton": "Import",
   "OllamaModelList.emptyState": "No models pulled yet — pull one below.",
-  "OllamaModelList.confirmRemove":
-    'Remove "{{name}}"? This deletes it from Ollama\'s local store.',
+  "OllamaModelList.confirmRemove": "Remove \"{{name}}\"? This deletes it from Ollama's local store.",
   "OllamaModelList.removeFailed": "Failed to remove model: {{error}}",
   "OllamaModelList.cloudBadge": "CLOUD",
   "OllamaPanel.statusConnected": "Connected",
@@ -1160,65 +1015,51 @@ export const en: Record<string, string> = {
   "OllamaPanel.signedInAs": "Signed in as {{user}}",
   "OllamaPanel.signingInButton": "Signing in…",
   "OllamaPanel.signInButton": "Sign in to ollama.com",
-  "OllamaPanel.notFoundMessage":
-    "Ollama not found — install it from ollama.com",
+  "OllamaPanel.notFoundMessage": "Ollama not found — install it from ollama.com",
   "OllamaPanel.addModelLabel": "Add a model",
   "OllamaPanel.modelfileStudioLabel": "Modelfile Studio",
   "OllamaPullForm.tagInputPlaceholder": "e.g. gpt-oss:120b-cloud",
   "OllamaPullForm.pullButton": "Pull",
   "OllamaPullForm.cancelButton": "Cancel",
-  "OllamaPullForm.examplesHint":
-    "Examples — browse more at ollama.com/search?c=cloud",
+  "OllamaPullForm.examplesHint": "Examples — browse more at ollama.com/search?c=cloud",
   "OllamaPullForm.signInButton": "Sign in to ollama.com",
-  "ProviderModelList.noCloudModelsEmptyState":
-    "No cloud models yet — add an API key in Settings.",
+  "ProviderModelList.noCloudModelsEmptyState": "No cloud models yet — add an API key in Settings.",
   "AddCustomProviderForm.heading": "Add custom provider",
   "AddCustomProviderForm.labelPlaceholder": "Label — e.g. Groq",
   "AddCustomProviderForm.baseUrlPlaceholder": "https://api.groq.com/openai/v1",
   "AddCustomProviderForm.addingButton": "Adding…",
   "AddCustomProviderForm.addButton": "Add",
-  "AddCustomProviderForm.helpText":
-    "Any OpenAI-compatible base URL — the app appends /chat/completions and /models.",
+  "AddCustomProviderForm.helpText": "Any OpenAI-compatible base URL — the app appends /chat/completions and /models.",
   "AutomationPanel.reliabilityHeading": "Reliability",
   "AutomationPanel.hooksHeading": "Hooks",
-  "AutomationPanel.hooksDescription":
-    'Shell commands that run on agent lifecycle events. A PreToolUse hook can block the tool call (non-zero exit, or {"decision":"deny"} on stdout); UserPromptSubmit output is added to the turn\'s context. 10-second timeout, no permission prompt.',
+  "AutomationPanel.hooksDescription": "Shell commands that run on agent lifecycle events. A PreToolUse hook can block the tool call (non-zero exit, or {\"decision\":\"deny\"} on stdout); UserPromptSubmit output is added to the turn's context. 10-second timeout, no permission prompt.",
   "AutomationPanel.hookEventLabel": "Event",
   "AutomationPanel.hookMatcherPlaceholder": "Tool matcher (regex, optional)",
   "AutomationPanel.hookCommandPlaceholder": "Shell command",
   "AutomationPanel.hookAddButton": "Add hook",
-  "AutomationPanel.hookDeleteAriaLabel": 'Delete hook "{{command}}"',
+  "AutomationPanel.hookDeleteAriaLabel": "Delete hook \"{{command}}\"",
   "AutomationPanel.autoFailoverLabel": "Auto-failover between providers",
-  "AutomationPanel.autoFailoverDescription":
-    "If a cloud provider errors before responding, automatically retry with another configured provider instead of failing the turn.",
-  "AutomationPanel.autoVisionSwitchLabel":
-    "Auto-switch to a vision model for images",
-  "AutomationPanel.autoVisionSwitchDescription":
-    "When you attach an image and the active model can't see, automatically switch to one that can.",
+  "AutomationPanel.autoFailoverDescription": "If a cloud provider errors before responding, automatically retry with another configured provider instead of failing the turn.",
+  "AutomationPanel.autoVisionSwitchLabel": "Auto-switch to a vision model for images",
+  "AutomationPanel.autoVisionSwitchDescription": "When you attach an image and the active model can't see, automatically switch to one that can.",
   "AutomationPanel.contextManagementHeading": "Context management",
   "AutomationPanel.autoCompactLabel": "Auto-compact context window",
-  "AutomationPanel.autoCompactDescription":
-    "Once the conversation crosses the threshold below, compact the oldest messages so the model doesn't run out of context.",
+  "AutomationPanel.autoCompactDescription": "Once the conversation crosses the threshold below, compact the oldest messages so the model doesn't run out of context.",
   "AutomationPanel.triggerThresholdLabel": "Trigger threshold",
   "AutomationPanel.percentOfContextWindow": "% of context window",
   "AutomationPanel.strategyLabel": "Strategy",
   "AutomationPanel.strategySummarizeLabel": "Summarize",
-  "AutomationPanel.strategySummarizeDescription":
-    "Costs one extra model call when it fires, but keeps the gist of what was dropped.",
+  "AutomationPanel.strategySummarizeDescription": "Costs one extra model call when it fires, but keeps the gist of what was dropped.",
   "AutomationPanel.strategyTrimLabel": "Trim oldest",
-  "AutomationPanel.strategyTrimDescription":
-    "Instant and free, but the dropped messages are gone for good.",
+  "AutomationPanel.strategyTrimDescription": "Instant and free, but the dropped messages are gone for good.",
   "AutomationPanel.rateLimitWarningsHeading": "Rate-limit warnings",
-  "AutomationPanel.rateLimitWarningsIntro":
-    "Never assumed — enter a provider's actual free-tier limit yourself (check their docs; these change) and this warns as you approach it.",
+  "AutomationPanel.rateLimitWarningsIntro": "Never assumed — enter a provider's actual free-tier limit yourself (check their docs; these change) and this warns as you approach it.",
   "AutomationPanel.warnNearRateLimitsLabel": "Warn near configured rate limits",
-  "AutomationPanel.connectProviderEmptyState":
-    'Connect a provider (in the "AI Providers" tab) to configure its rate limit.',
+  "AutomationPanel.connectProviderEmptyState": "Connect a provider (in the \"AI Providers\" tab) to configure its rate limit.",
   "AutomationPanel.reqPerMinPlaceholder": "req/min",
   "AutomationPanel.reqPerDayPlaceholder": "req/day",
   "AutomationPanel.dispatchPolicyHeading": "Dispatch policies",
-  "AutomationPanel.dispatchPolicyIntro":
-    "Named rules deciding which of your configured models runs a piece of work. Evaluated top to bottom — the first enabled policy covering a task class wins, so reorder to change precedence. A policy only ever picks from models you have already configured, and never overrides the Privacy Firewall or a permission.",
+  "AutomationPanel.dispatchPolicyIntro": "Named rules deciding which of your configured models runs a piece of work. Evaluated top to bottom — the first enabled policy covering a task class wins, so reorder to change precedence. A policy only ever picks from models you have already configured, and never overrides the Privacy Firewall or a permission.",
   "AutomationPanel.dispatchLastDecisionLabel": "Last decision",
   "AutomationPanel.dispatchEnabledBadge": "ENABLED",
   "AutomationPanel.dispatchDisabledBadge": "DISABLED",
@@ -1236,20 +1077,17 @@ export const en: Record<string, string> = {
   "AutomationPanel.dispatchSensitivityLabel": "Data sensitivity",
   "AutomationPanel.dispatchSensitivityAny": "Any model",
   "AutomationPanel.dispatchSensitivityLocalOnly": "Stays on this machine",
-  "AutomationPanel.dispatchRequiresToolsLabel":
-    "Only models that can call tools",
+  "AutomationPanel.dispatchRequiresToolsLabel": "Only models that can call tools",
   "AutomationPanel.dispatchMaxInputLabel": "Max input $/M tokens",
   "AutomationPanel.dispatchMaxOutputLabel": "Max output $/M tokens",
   "AutomationPanel.dispatchMaxTtftLabel": "Max time to first token (ms)",
   "AutomationPanel.dispatchNoCeilingPlaceholder": "no limit",
-  "AutomationPanel.dispatchMeasuredLatencyNote":
-    "Cost ceilings use the rates you entered in Settings → Usage. The latency ceiling uses time-to-first-token measured on this machine; a model with no measurement yet is never excluded by it.",
+  "AutomationPanel.dispatchMeasuredLatencyNote": "Cost ceilings use the rates you entered in Settings → Usage. The latency ceiling uses time-to-first-token measured on this machine; a model with no measurement yet is never excluded by it.",
   "AutomationPanel.dispatchPreferredLabel": "Preferred models, in order",
   "AutomationPanel.dispatchAddPreferredOption": "Add a preferred model…",
   "AutomationPanel.dispatchAddPolicyButton": "Add policy",
   "AutomationPanel.visionOverridesHeading": "Vision model overrides",
-  "AutomationPanel.visionOverridesIntro":
-    'Cloud provider models are classified by name pattern (best guess — shown as a VISION badge in "AI Providers"). Correct one here if it\'s wrong.',
+  "AutomationPanel.visionOverridesIntro": "Cloud provider models are classified by name pattern (best guess — shown as a VISION badge in \"AI Providers\"). Correct one here if it's wrong.",
   "AutomationPanel.providerPlaceholderOption": "Provider…",
   "AutomationPanel.modelPlaceholderOption": "Model…",
   "AutomationPanel.markVisionButton": "Mark vision",
@@ -1259,15 +1097,11 @@ export const en: Record<string, string> = {
   "AutomationPanel.clearButton": "Clear",
   "AutomationPanel.verifyHeading": "Verification",
   "AutomationPanel.verifyEnabledLabel": "Run verification after edits",
-  "AutomationPanel.verifyEnabledDescription":
-    'After a reply that changes files, automatically run this workspace\'s enabled commands below and show the results. A failing command can also be fed back to the model to fix — see "Feedback rounds" below.',
+  "AutomationPanel.verifyEnabledDescription": "After a reply that changes files, automatically run this workspace's enabled commands below and show the results. A failing command can also be fed back to the model to fix — see \"Feedback rounds\" below.",
   "AutomationPanel.verifyMaxRoundsLabel": "Feedback rounds",
-  "AutomationPanel.verifyMaxRoundsDescription":
-    "If a command fails, feed its output back to the model up to this many times so it can try to fix the problem. 0 means report-only — failures are shown but never fed back.",
-  "AutomationPanel.verifyNoWorkspaceOpen":
-    "Open a workspace folder to configure verification commands.",
-  "AutomationPanel.verifyEmptyState":
-    "No verification commands configured yet.",
+  "AutomationPanel.verifyMaxRoundsDescription": "If a command fails, feed its output back to the model up to this many times so it can try to fix the problem. 0 means report-only — failures are shown but never fed back.",
+  "AutomationPanel.verifyNoWorkspaceOpen": "Open a workspace folder to configure verification commands.",
+  "AutomationPanel.verifyEmptyState": "No verification commands configured yet.",
   "AutomationPanel.verifyAddCommandButton": "Add command",
   "AutomationPanel.verifyLabelPlaceholder": "Label",
   "AutomationPanel.verifyCommandPlaceholder": "Shell command",
@@ -1280,45 +1114,32 @@ export const en: Record<string, string> = {
   "AutomationPanel.verifyEnabledAriaLabel": "Enable {{label}}",
   "AutomationPanel.verifyDeleteAriaLabel": "Delete {{label}}",
   "AutomationPanel.riskAnnotationsHeading": "Risk annotations",
-  "AutomationPanel.riskAnnotationsLabel":
-    "Show AI risk badges on permission prompts",
-  "AutomationPanel.riskAnnotationsDescription":
-    "Ask the model to rate each file edit or shell command as low/medium/high risk and show it on the permission prompt. Costs one extra model call per mutating tool call. Advisory only — it never changes what gets auto-approved.",
+  "AutomationPanel.riskAnnotationsLabel": "Show AI risk badges on permission prompts",
+  "AutomationPanel.riskAnnotationsDescription": "Ask the model to rate each file edit or shell command as low/medium/high risk and show it on the permission prompt. Costs one extra model call per mutating tool call. Advisory only — it never changes what gets auto-approved.",
   "AutomationPanel.artifactsHeading": "Artifacts",
-  "AutomationPanel.artifactScriptsEnabledLabel":
-    "Allow scripts in interactive previews",
-  "AutomationPanel.artifactScriptsEnabledDescription":
-    "When an HTML artifact contains a script, run it in a fully isolated, sandboxed frame with no network, storage, or app access. Turn this off to always show a static preview instead, where scripts never run.",
+  "AutomationPanel.artifactScriptsEnabledLabel": "Allow scripts in interactive previews",
+  "AutomationPanel.artifactScriptsEnabledDescription": "When an HTML artifact contains a script, run it in a fully isolated, sandboxed frame with no network, storage, or app access. Turn this off to always show a static preview instead, where scripts never run.",
   "AutomationPanel.artifactAutoPreviewLabel": "Auto-preview new artifacts",
-  "AutomationPanel.artifactAutoPreviewDescription":
-    "When a turn finishes and produces a previewable HTML, SVG, or Mermaid block, automatically open the newest one in the artifact pane.",
+  "AutomationPanel.artifactAutoPreviewDescription": "When a turn finishes and produces a previewable HTML, SVG, or Mermaid block, automatically open the newest one in the artifact pane.",
   "AutomationPanel.subagentsHeading": "Subagents",
   "AutomationPanel.subagentsEnabledLabel": "Allow delegating to subagents",
-  "AutomationPanel.subagentsEnabledDescription":
-    "Let the model delegate a scoped subtask (e.g. broad exploration, or an independent code change) to a subagent with its own isolated tool-calling loop. Only a final report is returned to the conversation, keeping exploration noise out of your context.",
+  "AutomationPanel.subagentsEnabledDescription": "Let the model delegate a scoped subtask (e.g. broad exploration, or an independent code change) to a subagent with its own isolated tool-calling loop. Only a final report is returned to the conversation, keeping exploration noise out of your context.",
   "AutomationPanel.maxConcurrentSubagentsLabel": "Max concurrent subagents",
-  "AutomationPanel.maxConcurrentSubagentsDescription":
-    "How many delegated subtasks can run at the same time within one turn. Extra task calls wait their turn; everything else in the turn stays sequential either way.",
-  "AutomationPanel.subagentModelOverrideIntro":
-    "Optional: run subagents of a given profile on a different provider model than the parent conversation — e.g. a cheap, fast model for read-only exploration. Leave unset to use the parent's own model.",
+  "AutomationPanel.maxConcurrentSubagentsDescription": "How many delegated subtasks can run at the same time within one turn. Extra task calls wait their turn; everything else in the turn stays sequential either way.",
+  "AutomationPanel.subagentModelOverrideIntro": "Optional: run subagents of a given profile on a different provider model than the parent conversation — e.g. a cheap, fast model for read-only exploration. Leave unset to use the parent's own model.",
   "AutomationPanel.subagentModelOverrideExploreLabel": "Explore profile",
   "AutomationPanel.subagentModelOverrideCodeLabel": "Code profile",
   "AutomationPanel.subagentModelOverrideDefaultBadge": "Same as parent",
-  "AutomationPanel.customAgentsIntro":
-    "Custom agents from .monkey/agents/*.md in the open workspace — each becomes an extra profile the task and workflow tools accept.",
+  "AutomationPanel.customAgentsIntro": "Custom agents from .monkey/agents/*.md in the open workspace — each becomes an extra profile the task and workflow tools accept.",
   "AutomationPanel.customAgentsRefreshButton": "Refresh",
   "AutomationPanel.customAgentsLoading": "Scanning .monkey/agents…",
-  "AutomationPanel.customAgentsEmpty":
-    "No custom agents found. Add a markdown file with name, description, and tools frontmatter to .monkey/agents/ in your workspace.",
+  "AutomationPanel.customAgentsEmpty": "No custom agents found. Add a markdown file with name, description, and tools frontmatter to .monkey/agents/ in your workspace.",
   "AutomationPanel.skillsHeading": "Skills",
-  "AutomationPanel.skillAutoInvokeEnabledLabel":
-    "Let the model auto-invoke skills",
-  "AutomationPanel.skillAutoInvokeEnabledDescription":
-    "Let the model invoke an installed skill on its own, when it matches the request, in addition to explicitly typing /command. Off by default. Explicit /command invocation always works either way.",
+  "AutomationPanel.skillAutoInvokeEnabledLabel": "Let the model auto-invoke skills",
+  "AutomationPanel.skillAutoInvokeEnabledDescription": "Let the model invoke an installed skill on its own, when it matches the request, in addition to explicitly typing /command. Off by default. Explicit /command invocation always works either way.",
   "AutomationPanel.checkpointsHeading": "Checkpoints",
   "AutomationPanel.checkpointRetentionLabel": "Keep last",
-  "AutomationPanel.checkpointRetentionDescription":
-    "How many recent checkpoints to keep on disk before the oldest are pruned. Applies the next time a checkpoint is created.",
+  "AutomationPanel.checkpointRetentionDescription": "How many recent checkpoints to keep on disk before the oldest are pruned. Applies the next time a checkpoint is created.",
   "AutomationPanel.checkpointRetentionUnit": "checkpoints",
   "AutomationPanel.processWallBudgetHeading": "Runaway protection",
   "AutomationPanel.processWallBudgetIntro":
@@ -1333,17 +1154,13 @@ export const en: Record<string, string> = {
   "ProviderCard.connected": "Connected",
   "KnowledgePanel.backendExtension": "Extension",
   "KnowledgePanel.selectEmbeddingExtension": "Select an embedding capability",
-  "KnowledgePanel.selectEmbeddingExtensionError":
-    "Choose a healthy embedding extension first.",
+  "KnowledgePanel.selectEmbeddingExtensionError": "Choose a healthy embedding extension first.",
   "KnowledgePanel.embeddingDimension": "Vector dimension",
-  "KnowledgePanel.embeddingDimensionError":
-    "Vector dimension must be between 1 and 65536.",
+  "KnowledgePanel.embeddingDimensionError": "Vector dimension must be between 1 and 65536.",
   "ProviderCard.custom": "Custom",
   "ProviderCard.extension": "Extension",
-  "ProviderCard.extensionEndpoint":
-    "Reached from inside the extension's sandbox",
-  "ProviderCard.extensionCredentials":
-    "Credentials live on this extension's secret slots, under Settings > Extensions.",
+  "ProviderCard.extensionEndpoint": "Reached from inside the extension's sandbox",
+  "ProviderCard.extensionCredentials": "Credentials live on this extension's secret slots, under Settings > Extensions.",
   "ProviderCard.remove": "Remove",
   "ProviderCard.apiKeyPlaceholder": "API key",
   "ProviderCard.saving": "Saving…",
@@ -1354,23 +1171,17 @@ export const en: Record<string, string> = {
   "ProviderCard.refreshModelsWithCount": "Refresh models ({{count}})",
   "ProviderCard.removeKey": "Remove key",
   "ProviderCard.filterModelsPlaceholder": "Filter {{count}} models…",
-  "ProviderCard.noModelsMatch": 'No models match "{{filter}}".',
+  "ProviderCard.noModelsMatch": "No models match \"{{filter}}\".",
   "ProviderCard.vision": "VISION",
   "ProviderCard.retired": "RETIRED",
-  "ProviderCard.retiredTooltipWithReplacement":
-    "{{reason}} Suggested replacement: {{replacement}}.",
-  "ProviderCard.retiredTooltipNoReplacement":
-    "{{reason}} Migration path: {{note}}.",
+  "ProviderCard.retiredTooltipWithReplacement": "{{reason}} Suggested replacement: {{replacement}}.",
+  "ProviderCard.retiredTooltipNoReplacement": "{{reason}} Migration path: {{note}}.",
   "ProviderCard.confirmRemoveKey": "Remove the saved API key for {{label}}?",
-  "ProviderCard.confirmRemoveProvider":
-    'Remove "{{label}}"? This deletes its saved key too.',
-  "OpenRouterModelsPanel.description":
-    "Choose which {{provider}} models appear in model pickers.",
+  "ProviderCard.confirmRemoveProvider": "Remove \"{{label}}\"? This deletes its saved key too.",
+  "OpenRouterModelsPanel.description": "Choose which {{provider}} models appear in model pickers.",
   "OpenRouterModelsPanel.showAllToggle": "Show all models",
-  "OpenRouterModelsPanel.showAllDescription":
-    "Check to select every available model; uncheck to clear the selection.",
-  "OpenRouterModelsPanel.noModelsLoaded":
-    "No models loaded yet — try again from the AI Providers tab.",
+  "OpenRouterModelsPanel.showAllDescription": "Check to select every available model; uncheck to clear the selection.",
+  "OpenRouterModelsPanel.noModelsLoaded": "No models loaded yet — try again from the AI Providers tab.",
   "OpenRouterModelsPanel.clearSelection": "Clear selection",
   "OpenRouterModelsPanel.selectedCount": "{{selected}} of {{total}} selected",
   "SettingsModal.tabLocalModels": "Local Models",
@@ -1384,61 +1195,46 @@ export const en: Record<string, string> = {
   "SettingsModal.tabPeers": "Peers",
   "PeersPanel.loading": "Loading peers…",
   "PeersPanel.title": "Peers",
-  "PeersPanel.intro":
-    "Pair this installation with another Little Monkey so the two can exchange messages and task requests. Pairing proves who a peer is; what it may ask for is a separate set of grants below.",
+  "PeersPanel.intro": "Pair this installation with another Little Monkey so the two can exchange messages and task requests. Pairing proves who a peer is; what it may ask for is a separate set of grants below.",
   "PeersPanel.grantsLegend": "What this peer may do",
   "PeersPanel.grantMessage": "Send messages",
-  "PeersPanel.grantMessageDetail":
-    "Text arrives as a conversation turn here and runs under this installation's own recipe and permissions.",
+  "PeersPanel.grantMessageDetail": "Text arrives as a conversation turn here and runs under this installation's own recipe and permissions.",
   "PeersPanel.grantTask": "Request work",
-  "PeersPanel.grantTaskDetail":
-    "The peer may ask for something to be done and read the result. It still cannot choose the model, the workspace or the permissions.",
+  "PeersPanel.grantTaskDetail": "The peer may ask for something to be done and read the result. It still cannot choose the model, the workspace or the permissions.",
   "PeersPanel.grantArtifact": "Attach artifacts",
-  "PeersPanel.grantArtifactDetail":
-    "The peer may reference files it holds. They are fetched through the artifact store, never from a path it names.",
+  "PeersPanel.grantArtifactDetail": "The peer may reference files it holds. They are fetched through the artifact store, never from a path it names.",
   "PeersPanel.grantsNone": "nothing",
   "PeersPanel.inviteTitle": "Invite a peer",
-  "PeersPanel.inviteDetail":
-    "Writes a one-time invitation file that grants peer standing and nothing else — no runs, no approvals, no desktop control.",
-  "PeersPanel.inviteLabelPlaceholder":
-    "Name for this peer, e.g. Studio desktop",
-  "PeersPanel.inviteOutputPlaceholder":
-    "Where to write the invitation, e.g. /Users/you/peer-invite.json",
+  "PeersPanel.inviteDetail": "Writes a one-time invitation file that grants peer standing and nothing else — no runs, no approvals, no desktop control.",
+  "PeersPanel.inviteLabelPlaceholder": "Name for this peer, e.g. Studio desktop",
+  "PeersPanel.inviteOutputPlaceholder": "Where to write the invitation, e.g. /Users/you/peer-invite.json",
   "PeersPanel.inviteAction": "Write invitation",
-  "PeersPanel.inviteWritten":
-    "Invitation written to {{path}}. It expires in an hour and can be used once.",
-  "PeersPanel.inviteTransfer":
-    "Transfer the file securely. Anyone who has it before it expires can pair as this peer.",
+  "PeersPanel.inviteWritten": "Invitation written to {{path}}. It expires in an hour and can be used once.",
+  "PeersPanel.inviteTransfer": "Transfer the file securely. Anyone who has it before it expires can pair as this peer.",
   "PeersPanel.acceptTitle": "Accept an invitation",
-  "PeersPanel.acceptDetail":
-    "Takes up an invitation another installation gave you, so this one can talk to it. Pairing in this direction does not let that installation talk back — it invites you for that.",
+  "PeersPanel.acceptDetail": "Takes up an invitation another installation gave you, so this one can talk to it. Pairing in this direction does not let that installation talk back — it invites you for that.",
   "PeersPanel.acceptFilePlaceholder": "Path to the invitation file",
   "PeersPanel.acceptAliasPlaceholder": "Local name for the peer, e.g. studio",
   "PeersPanel.acceptAction": "Accept invitation",
-  "PeersPanel.acceptDone":
-    "Paired with {{alias}}. Certificate fingerprint {{fingerprint}} — compare it with the other installation before sending anything sensitive.",
+  "PeersPanel.acceptDone": "Paired with {{alias}}. Certificate fingerprint {{fingerprint}} — compare it with the other installation before sending anything sensitive.",
   "PeersPanel.inboundTitle": "Peers that can reach this installation",
   "PeersPanel.inboundEmpty": "No peer is paired into this installation yet.",
   "PeersPanel.outboundTitle": "Peers this installation can reach",
-  "PeersPanel.outboundEmpty":
-    "This installation has not accepted any peer invitation yet.",
+  "PeersPanel.outboundEmpty": "This installation has not accepted any peer invitation yet.",
   "PeersPanel.outboundGrants": "They allow this installation to: {{grants}}",
   "PeersPanel.standingPeerOnly": "Paired as a peer only",
   "PeersPanel.standingMixed": "Paired, and also a controller device",
   "PeersPanel.standingNoGrants": "Paired, may not ask for anything",
   "PeersPanel.standingRevoked": "Revoked",
-  "PeersPanel.mixedPairing":
-    "This credential is also a controller or companion device, so it can do more here than a peer can. Revoke it in Companion if that is not what you want.",
+  "PeersPanel.mixedPairing": "This credential is also a controller or companion device, so it can do more here than a peer can. Revoke it in Companion if that is not what you want.",
   "PeersPanel.showThreads": "Recent threads",
   "PeersPanel.threadsEmpty": "This peer has not opened a thread here.",
   "PeersPanel.threadSummary": "{{count}} message(s)",
   "PeersPanel.threadHasRejection": "something was refused",
   "PeersPanel.grantsSaved": "Updated what {{label}} may ask for.",
-  "PeersPanel.grantsCleared":
-    "{{label}} is still paired but may no longer ask for anything.",
+  "PeersPanel.grantsCleared": "{{label}} is still paired but may no longer ask for anything.",
   "PeersPanel.revoke": "Revoke",
-  "PeersPanel.revokeConfirm":
-    "Revoking severs the pairing and deletes its threads.",
+  "PeersPanel.revokeConfirm": "Revoking severs the pairing and deletes its threads.",
   "PeersPanel.revokeConfirmAction": "Revoke peer",
   "PeersPanel.revokeConfirmGroup": "Confirm revoking {{label}}",
   "PeersPanel.revoked": "Revoked {{label}} and removed its threads.",
@@ -1470,24 +1266,19 @@ export const en: Record<string, string> = {
   "PeersPanel.refreshPeerStatusLabel": "Check whether {{alias}} is reachable",
   "PeersPanel.statusChecked": "{{alias}}: {{presence}}.",
   "PeersPanel.rotate": "Rotate key",
-  "PeersPanel.rotated":
-    "Rotated {{label}} to key generation {{generation}}. Give {{path}} to that peer securely — its old key stopped working immediately.",
+  "PeersPanel.rotated": "Rotated {{label}} to key generation {{generation}}. Give {{path}} to that peer securely — its old key stopped working immediately.",
   "PeersPanel.acceptRotation": "Accept new key",
-  "PeersPanel.rotationAccepted":
-    "{{alias}} now uses key generation {{generation}}. Certificate fingerprint {{fingerprint}}.",
+  "PeersPanel.rotationAccepted": "{{alias}} now uses key generation {{generation}}. Certificate fingerprint {{fingerprint}}.",
   "PeersPanel.clear": "Clear history",
-  "PeersPanel.clearConfirm":
-    "Clearing removes this peer's threads here. A revoked pairing also loses its leftover grants.",
+  "PeersPanel.clearConfirm": "Clearing removes this peer's threads here. A revoked pairing also loses its leftover grants.",
   "PeersPanel.clearConfirmAction": "Clear",
   "PeersPanel.clearConfirmGroup": "Confirm clearing {{label}}",
   "PeersPanel.cleared": "Cleared {{count}} thread(s) for {{label}}.",
   "PeersPanel.forget": "Forget",
-  "PeersPanel.forgetConfirm":
-    "Forgetting deletes this peer's address and key here. Revoking your access over there is that peer's own decision.",
+  "PeersPanel.forgetConfirm": "Forgetting deletes this peer's address and key here. Revoking your access over there is that peer's own decision.",
   "PeersPanel.forgetConfirmAction": "Forget peer",
   "PeersPanel.forgetConfirmGroup": "Confirm forgetting {{alias}}",
-  "PeersPanel.forgotten":
-    "Forgot {{alias}}. This installation can no longer reach it.",
+  "PeersPanel.forgotten": "Forgot {{alias}}. This installation can no longer reach it.",
   "PeersPanel.threadLastActivity": "Last activity {{time}}",
   "PeersPanel.recentMessages": "Recent messages",
   "PeersPanel.messagesEmpty": "Nothing in this thread yet.",
@@ -1504,8 +1295,7 @@ export const en: Record<string, string> = {
   "PeersPanel.statusRejected": "Refused",
   "PeersPanel.statusDelivered": "Delivered",
   "PeersPanel.showSent": "What you sent ({{count}})",
-  "PeersPanel.sentEmpty":
-    "This installation has not sent anything to this peer yet.",
+  "PeersPanel.sentEmpty": "This installation has not sent anything to this peer yet.",
   "PeersPanel.sentMessages": "Messages sent to this peer",
   "PeersPanel.sentAt": "sent {{time}}",
   "PeersPanel.sentPending": "Waiting on the peer",
@@ -1516,18 +1306,14 @@ export const en: Record<string, string> = {
   "PeersPanel.sentDuplicate": "Already delivered",
   "PeersPanel.sentRefresh": "Ask for the result",
   "PeersPanel.sentRefreshLabel": "Ask {{alias}} about thread {{thread}}",
-  "PeersPanel.sentRefreshed":
-    "Asked about {{thread}}: {{count}} message(s) known.",
+  "PeersPanel.sentRefreshed": "Asked about {{thread}}: {{count}} message(s) known.",
   "PeersPanel.sentNeverChecked": "Nothing has been asked about this yet.",
   "ChannelsPanel.loading": "Loading messaging channels…",
   "ChannelsPanel.title": "Messaging channels",
-  "ChannelsPanel.intro":
-    "Connect your own messaging accounts so people can reach Little Monkey where they already talk. Each account uses credentials you supply; nothing is shared with anyone else.",
-  "ChannelsPanel.noRoutes":
-    "No route is configured yet, so accepted messages have nothing to run. Add one below.",
+  "ChannelsPanel.intro": "Connect your own messaging accounts so people can reach Little Monkey where they already talk. Each account uses credentials you supply; nothing is shared with anyone else.",
+  "ChannelsPanel.noRoutes": "No route is configured yet, so accepted messages have nothing to run. Add one below.",
   "ChannelsPanel.accounts": "Accounts",
-  "ChannelsPanel.empty":
-    "No accounts yet. Add one below to start receiving messages.",
+  "ChannelsPanel.empty": "No accounts yet. Add one below to start receiving messages.",
   "ChannelsPanel.disabled": "Disabled",
   "ChannelsPanel.health_unconfigured": "Not set up",
   "ChannelsPanel.health_disconnected": "Not checked yet",
@@ -1537,14 +1323,11 @@ export const en: Record<string, string> = {
   "ChannelsPanel.health_unsupported": "Not supported here",
   "ChannelsPanel.health_error": "Error",
   "ChannelsPanel.transport": "Receives messages by",
-  "ChannelsPanel.transport_long_poll":
-    "polling the provider (no public URL needed)",
+  "ChannelsPanel.transport_long_poll": "polling the provider (no public URL needed)",
   "ChannelsPanel.transport_socket": "an open connection (no public URL needed)",
-  "ChannelsPanel.transport_webhook":
-    "the provider calling you (a public callback URL is required)",
+  "ChannelsPanel.transport_webhook": "the provider calling you (a public callback URL is required)",
   "ChannelsPanel.transport_helper": "a helper app you install yourself",
-  "ChannelsPanel.needsCredential":
-    "No credential saved yet, so this account cannot connect.",
+  "ChannelsPanel.needsCredential": "No credential saved yet, so this account cannot connect.",
   "ChannelsPanel.callbacksRejected":
     "{{count}} delivery attempt(s) have failed verification since one last succeeded. Check that the callback URL in the provider's console matches the one shown here, and that its signing secret matches the credential saved here.",
   "ChannelsPanel.testConnection": "Test connection",
@@ -1554,13 +1337,10 @@ export const en: Record<string, string> = {
   "ChannelsPanel.removed": "Account and its stored credential removed.",
   "ChannelsPanel.credential": "Credential",
   "ChannelsPanel.saveCredential": "Save credential",
-  "ChannelsPanel.credentialSaved":
-    "Credential saved to your keychain. Test the connection to confirm it works.",
+  "ChannelsPanel.credentialSaved": "Credential saved to your keychain. Test the connection to confirm it works.",
   "ChannelsPanel.setupInstructions": "Open setup instructions",
-  "ChannelsPanel.callbackHint":
-    "Point the provider's webhook at this exact URL:",
-  "ChannelsPanel.callbackVerifyHint":
-    "Save the verify token here first. Meta checks it once, by calling this URL, before it will accept the webhook.",
+  "ChannelsPanel.callbackHint": "Point the provider's webhook at this exact URL:",
+  "ChannelsPanel.callbackVerifyHint": "Save the verify token here first. Meta checks it once, by calling this URL, before it will accept the webhook.",
   "ChannelsPanel.dmPolicy": "Direct messages",
   "ChannelsPanel.groupPolicy": "Groups and channels",
   "ChannelsPanel.activation": "Reply in groups",
@@ -1575,10 +1355,8 @@ export const en: Record<string, string> = {
   "ChannelsPanel.noPendingSenders": "Nobody is waiting for approval.",
   "ChannelsPanel.approve": "Approve",
   "ChannelsPanel.block": "Block",
-  "ChannelsPanel.senderApproved":
-    "Approved. This sender can now send messages, and nothing else.",
-  "ChannelsPanel.approvalScope":
-    "Approving a sender lets them send messages. It does not grant access to your files, tools, devices or phone.",
+  "ChannelsPanel.senderApproved": "Approved. This sender can now send messages, and nothing else.",
+  "ChannelsPanel.approvalScope": "Approving a sender lets them send messages. It does not grant access to your files, tools, devices or phone.",
   "ChannelsPanel.activity": "Recent activity",
   "ChannelsPanel.noActivity": "No messages recorded yet.",
   "ChannelsPanel.refresh": "Refresh",
@@ -1586,23 +1364,18 @@ export const en: Record<string, string> = {
   "ChannelsPanel.provider": "Provider",
   "ChannelsPanel.label": "Name",
   "ChannelsPanel.labelPlaceholder": "Support inbox",
-  "ChannelsPanel.noCredentialNeeded":
-    "This provider needs no credential here: the helper you installed holds the account.",
+  "ChannelsPanel.noCredentialNeeded": "This provider needs no credential here: the helper you installed holds the account.",
   "ChannelsPanel.yes": "Yes",
   "ChannelsPanel.no": "No",
-  "ChannelsPanel.macOnly":
-    "iMessage works on macOS only. On any other system this account reports that it is not supported rather than pretending to connect.",
+  "ChannelsPanel.macOnly": "iMessage works on macOS only. On any other system this account reports that it is not supported rather than pretending to connect.",
   "ChannelsPanel.missingSettings": "Still needed:",
-  "ChannelsPanel.addHint":
-    "The account starts disabled. Add its credential, test the connection, then enable it.",
+  "ChannelsPanel.addHint": "The account starts disabled. Add its credential, test the connection, then enable it.",
   "ChannelsPanel.add": "Add account",
   "ChannelsPanel.added": "Account added. Save its credential next.",
   "ChannelsPanel.routes": "Routes",
-  "ChannelsPanel.routesIntro":
-    "A route decides which task an incoming message runs as. Without one, messages are recorded but nothing runs.",
+  "ChannelsPanel.routesIntro": "A route decides which task an incoming message runs as. Without one, messages are recorded but nothing runs.",
   "IngressTurns.title": "Conversation turns",
-  "IngressTurns.intro":
-    "Everything that asked Little Monkey to do something, whichever way it arrived, and the run it became. Identifiers and status only — never what was said.",
+  "IngressTurns.intro": "Everything that asked Little Monkey to do something, whichever way it arrived, and the run it became. Identifiers and status only — never what was said.",
   "IngressTurns.filter": "Filter by origin",
   "IngressTurns.allSources": "All origins",
   "IngressTurns.refresh": "Refresh",
@@ -1632,10 +1405,8 @@ export const en: Record<string, string> = {
   "ChannelsPanel.scopeGlobal": "Every account",
   "ChannelsPanel.addRoute": "Add route",
   "ChannelsPanel.routeAdded": "Route added.",
-  "ChannelsPanel.routesLadder":
-    "The most specific route wins: one sender beats one thread, a thread beats its conversation, and so on down to the default for everything. Two routes that are equally specific and could both match are refused.",
-  "ChannelsPanel.noRoutesYet":
-    "No routes yet. Messages are recorded, but nothing runs until you add one.",
+  "ChannelsPanel.routesLadder": "The most specific route wins: one sender beats one thread, a thread beats its conversation, and so on down to the default for everything. Two routes that are equally specific and could both match are refused.",
+  "ChannelsPanel.noRoutesYet": "No routes yet. Messages are recorded, but nothing runs until you add one.",
   "ChannelsPanel.editRoute": "Edit",
   "ChannelsPanel.saveRoute": "Save route",
   "ChannelsPanel.routeDisabled": "Off",
@@ -1655,8 +1426,7 @@ export const en: Record<string, string> = {
   "ChannelsPanel.account": "Account",
   "ChannelsPanel.chooseAccount": "Choose an account…",
   "ChannelsPanel.conversation": "Conversation",
-  "ChannelsPanel.conversationPlaceholder":
-    "Pick one this account has seen, or type the id",
+  "ChannelsPanel.conversationPlaceholder": "Pick one this account has seen, or type the id",
   "ChannelsPanel.thread": "Thread",
   "ChannelsPanel.sender": "Sender",
   "ChannelsPanel.repository": "Workspace",
@@ -1669,42 +1439,33 @@ export const en: Record<string, string> = {
   "ChannelsPanel.priority": "Queue priority",
   "ChannelsPanel.routeReply": "May reply to the conversation",
   "ChannelsPanel.routeEnabled": "Route is on",
-  "ChannelsPanel.routeReplyHint":
-    "A route that may not reply still runs the task; it just files the result instead of answering. Sending anywhere else needs its own grant on the task.",
+  "ChannelsPanel.routeReplyHint": "A route that may not reply still runs the task; it just files the result instead of answering. Sending anywhere else needs its own grant on the task.",
   "ChannelsPanel.routeParams": "Task parameters",
   "ChannelsPanel.paramName": "Parameter",
   "ChannelsPanel.paramValue": "Value",
   "ChannelsPanel.addParam": "Add parameter",
   "ChannelsPanel.removeParam": "Remove parameter",
   "ChannelsPanel.paramError_empty_name": "Every parameter needs a name.",
-  "ChannelsPanel.paramError_invalid_name":
-    "A parameter name cannot contain '='.",
-  "ChannelsPanel.paramError_duplicate_name":
-    "Two parameters have the same name.",
+  "ChannelsPanel.paramError_invalid_name": "A parameter name cannot contain '='.",
+  "ChannelsPanel.paramError_duplicate_name": "Two parameters have the same name.",
   "ChannelsPanel.advancedSettings": "Advanced: attachment limits",
   "ChannelsPanel.settings": "Provider settings",
   "ChannelsPanel.editSettings": "Edit settings",
   "ChannelsPanel.saveSettings": "Save settings",
-  "ChannelsPanel.settingsSaved":
-    "Settings saved. The connection is unverified until you test it again.",
-  "ChannelsPanel.settingsReprobeHint":
-    "Changing these marks the connection unverified rather than claiming it still works. Credentials are untouched — they are never shown here.",
+  "ChannelsPanel.settingsSaved": "Settings saved. The connection is unverified until you test it again.",
+  "ChannelsPanel.settingsReprobeHint": "Changing these marks the connection unverified rather than claiming it still works. Credentials are untouched — they are never shown here.",
   "ChannelsPanel.copy": "Copy",
-  "ChannelsPanel.callbackUnconfigured":
-    "No public URL is configured, so this provider cannot reach you yet.",
+  "ChannelsPanel.callbackUnconfigured": "No public URL is configured, so this provider cannot reach you yet.",
   "ChannelsPanel.callbackPathIs": "The path the daemon listens on is",
   "ChannelsPanel.publicBaseUrl": "Public base URL",
   "ChannelsPanel.publicBaseUrlSaved": "Public base URL saved.",
   "ChannelsPanel.savePublicBaseUrl": "Save",
-  "ChannelsPanel.publicBaseUrlHint":
-    "The address your tunnel or reverse proxy answers on, without a path. Little Monkey still listens only on this machine; this is what it tells providers to call.",
+  "ChannelsPanel.publicBaseUrlHint": "The address your tunnel or reverse proxy answers on, without a path. Little Monkey still listens only on this machine; this is what it tells providers to call.",
   "SettingsModal.tabTelephony": "Phone and SMS",
   "TelephonyPanel.loading": "Loading phone numbers…",
   "TelephonyPanel.title": "Phone and SMS",
-  "TelephonyPanel.intro":
-    "Connect your own carrier account so Little Monkey can text and take calls on a number you own. Texts arrive as ordinary messages; a call becomes a spoken conversation using your own speech settings.",
-  "TelephonyPanel.chargeWarning":
-    "Calls and texts are billed by your carrier, not by this app. The limits below bound what a call can cost.",
+  "TelephonyPanel.intro": "Connect your own carrier account so Little Monkey can text and take calls on a number you own. Texts arrive as ordinary messages; a call becomes a spoken conversation using your own speech settings.",
+  "TelephonyPanel.chargeWarning": "Calls and texts are billed by your carrier, not by this app. The limits below bound what a call can cost.",
   "TelephonyPanel.numbers": "Numbers",
   "TelephonyPanel.empty": "No numbers yet. Add one below.",
   "TelephonyPanel.disabled": "Disabled",
@@ -1715,10 +1476,8 @@ export const en: Record<string, string> = {
   "TelephonyPanel.health_degraded": "Degraded",
   "TelephonyPanel.health_unsupported": "Not supported here",
   "TelephonyPanel.health_error": "Error",
-  "TelephonyPanel.needsCredential":
-    "No carrier credential saved yet, so this number cannot send or receive.",
-  "TelephonyPanel.needsPublicUrl":
-    "No public URL configured, so your carrier has nowhere to deliver texts or calls.",
+  "TelephonyPanel.needsCredential": "No carrier credential saved yet, so this number cannot send or receive.",
+  "TelephonyPanel.needsPublicUrl": "No public URL configured, so your carrier has nowhere to deliver texts or calls.",
   "TelephonyPanel.testConnection": "Test connection",
   "TelephonyPanel.enable": "Enable",
   "TelephonyPanel.disable": "Disable",
@@ -1726,11 +1485,9 @@ export const en: Record<string, string> = {
   "TelephonyPanel.removed": "Number and its stored credential removed.",
   "TelephonyPanel.credential": "Carrier credential",
   "TelephonyPanel.saveCredential": "Save credential",
-  "TelephonyPanel.credentialSaved":
-    "Credential saved to your keychain. Test the connection to confirm it works.",
+  "TelephonyPanel.credentialSaved": "Credential saved to your keychain. Test the connection to confirm it works.",
   "TelephonyPanel.setupInstructions": "Open carrier documentation",
-  "TelephonyPanel.callbackHint":
-    "Point your carrier's messaging and voice webhooks at",
+  "TelephonyPanel.callbackHint": "Point your carrier's messaging and voice webhooks at",
   "TelephonyPanel.inboundPolicy": "When this number rings",
   "TelephonyPanel.inbound_reject": "Do not answer",
   "TelephonyPanel.inbound_voicemail": "Take a message",
@@ -1739,37 +1496,29 @@ export const en: Record<string, string> = {
   "TelephonyPanel.outbound_never": "Never",
   "TelephonyPanel.outbound_approval": "Ask me every time",
   "TelephonyPanel.outbound_allow": "Allowed without asking",
-  "TelephonyPanel.policyScope":
-    "Answering the phone and calling out are separate permissions. Allowing one does not allow the other.",
+  "TelephonyPanel.policyScope": "Answering the phone and calling out are separate permissions. Allowing one does not allow the other.",
   "TelephonyPanel.greeting": "What to say when a call connects",
   "TelephonyPanel.greetingPlaceholder": "Support line, how can I help?",
   "TelephonyPanel.saveGreeting": "Save greeting",
-  "TelephonyPanel.greetingSaved":
-    "Greeting saved. Answered calls will open with it.",
-  "TelephonyPanel.noGreeting":
-    "This number answers calls but says nothing first, so the caller hears silence.",
-  "TelephonyPanel.recordingUnsupported":
-    "This carrier cannot record a call it is also streaming, so recording stays off.",
+  "TelephonyPanel.greetingSaved": "Greeting saved. Answered calls will open with it.",
+  "TelephonyPanel.noGreeting": "This number answers calls but says nothing first, so the caller hears silence.",
+  "TelephonyPanel.recordingUnsupported": "This carrier cannot record a call it is also streaming, so recording stays off.",
   "TelephonyPanel.maxConcurrent": "Calls at once",
   "TelephonyPanel.ringTimeout": "Ring timeout (seconds)",
   "TelephonyPanel.maxDuration": "Longest call (seconds)",
   "TelephonyPanel.recording": "Record calls",
-  "TelephonyPanel.recordingHint":
-    "Off by default. Recording a person may require their consent where you live.",
+  "TelephonyPanel.recordingHint": "Off by default. Recording a person may require their consent where you live.",
   "TelephonyPanel.publicUrlEdit": "Where your carrier reaches this number",
-  "TelephonyPanel.statusHint":
-    "Delivery reports and call status. Set automatically for anything this app sends; point your number's own status callback here too.",
+  "TelephonyPanel.statusHint": "Delivery reports and call status. Set automatically for anything this app sends; point your number's own status callback here too.",
   "TelephonyPanel.copyCallbackUrl": "Copy",
   "TelephonyPanel.copied": "Copied",
   "TelephonyPanel.savePublicUrl": "Save URL",
-  "TelephonyPanel.publicUrlSaved":
-    "Callback URL saved. Test the connection, then update your carrier's console to match.",
+  "TelephonyPanel.publicUrlSaved": "Callback URL saved. Test the connection, then update your carrier's console to match.",
   "TelephonyPanel.callbacksRejected":
     "{{count}} callback(s) from your carrier were refused because their signature did not verify. Check that the URL in your carrier's console is exactly the one above and that the saved credential still matches.",
   "TelephonyPanel.settingsJsonEdit": "Update carrier settings (JSON)",
   "TelephonyPanel.saveSettings": "Save settings",
-  "TelephonyPanel.settingsSaved":
-    "Carrier settings saved. Test the connection to verify them.",
+  "TelephonyPanel.settingsSaved": "Carrier settings saved. Test the connection to verify them.",
   "TelephonyPanel.recentMessages": "Recent texts",
   "TelephonyPanel.noMessages": "No texts yet.",
   "TelephonyPanel.recentCalls": "Recent calls",
@@ -1784,8 +1533,7 @@ export const en: Record<string, string> = {
   "TelephonyPanel.fromNumber": "Your number",
   "TelephonyPanel.publicUrl": "Your public URL",
   "TelephonyPanel.settingsJson": "Carrier settings (JSON)",
-  "TelephonyPanel.addHint":
-    "The number starts disabled, with calls refused in both directions. Save its credential, test the connection, then choose what it may do.",
+  "TelephonyPanel.addHint": "The number starts disabled, with calls refused in both directions. Save its credential, test the connection, then choose what it may do.",
   "TelephonyPanel.add": "Add number",
   "TelephonyPanel.added": "Number added. Save its carrier credential next.",
   "SettingsModal.title": "Settings",
@@ -1801,22 +1549,16 @@ export const en: Record<string, string> = {
   "SettingsModal.tabTasks": "Tasks",
   "SettingsModal.tabAppearance": "Appearance",
   "AppearancePanel.scopeTitle": "Where these settings apply",
-  "AppearancePanel.scopeDescription":
-    "Device defaults stay on this device. A workspace override is stored locally and follows the active primary workspace.",
+  "AppearancePanel.scopeDescription": "Device defaults stay on this device. A workspace override is stored locally and follows the active primary workspace.",
   "AppearancePanel.scopeDevice": "Device default",
-  "AppearancePanel.scopeDeviceDescription":
-    "Used everywhere without an override.",
+  "AppearancePanel.scopeDeviceDescription": "Used everywhere without an override.",
   "AppearancePanel.scopeWorkspace": "This workspace",
-  "AppearancePanel.scopeWorkspaceDescription":
-    "Override the device default for {{workspace}}.",
-  "AppearancePanel.scopeWorkspaceUnavailable":
-    "Open a primary workspace to enable overrides.",
+  "AppearancePanel.scopeWorkspaceDescription": "Override the device default for {{workspace}}.",
+  "AppearancePanel.scopeWorkspaceUnavailable": "Open a primary workspace to enable overrides.",
   "AppearancePanel.workspaceOverrideLabel": "Use a workspace override",
-  "AppearancePanel.workspaceOverrideDescription":
-    "Turn this off, then Apply, to return this workspace to the device default.",
+  "AppearancePanel.workspaceOverrideDescription": "Turn this off, then Apply, to return this workspace to the device default.",
   "AppearancePanel.themeTitle": "Theme",
-  "AppearancePanel.themeDescription":
-    "Choose how Little Monkey resolves light and dark mode.",
+  "AppearancePanel.themeDescription": "Choose how Little Monkey resolves light and dark mode.",
   "AppearancePanel.themeSystem": "System",
   "AppearancePanel.themeSystemDescription": "Follow this device.",
   "AppearancePanel.themeLight": "Light",
@@ -1824,8 +1566,7 @@ export const en: Record<string, string> = {
   "AppearancePanel.themeDark": "Dark",
   "AppearancePanel.themeDarkDescription": "Low-light surfaces.",
   "AppearancePanel.accentTitle": "Accent color",
-  "AppearancePanel.accentDescription":
-    "Used for selected states, focus rings, and primary actions.",
+  "AppearancePanel.accentDescription": "Used for selected states, focus rings, and primary actions.",
   "AppearancePanel.accentDefault": "Monkey",
   "AppearancePanel.accentIndigo": "Indigo",
   "AppearancePanel.accentBlue": "Blue",
@@ -1841,15 +1582,13 @@ export const en: Record<string, string> = {
   "AppearancePanel.textLarge": "Large",
   "AppearancePanel.textLargeDescription": "More readable.",
   "AppearancePanel.typographyTitle": "Typography",
-  "AppearancePanel.typographyDescription":
-    "Tune interface text and keep code blocks readable independently.",
+  "AppearancePanel.typographyDescription": "Tune interface text and keep code blocks readable independently.",
   "AppearancePanel.codeFontLabel": "Code font size",
   "AppearancePanel.codeFontSmall": "Small · 12 px",
   "AppearancePanel.codeFontMedium": "Default · 14 px",
   "AppearancePanel.codeFontLarge": "Large · 16 px",
   "AppearancePanel.layoutTitle": "Layout and conversations",
-  "AppearancePanel.layoutDescription":
-    "Adjust information density, the session sidebar, and message presentation.",
+  "AppearancePanel.layoutDescription": "Adjust information density, the session sidebar, and message presentation.",
   "AppearancePanel.densityLabel": "UI density",
   "AppearancePanel.densityCompact": "Compact",
   "AppearancePanel.densityComfortable": "Comfortable",
@@ -1863,61 +1602,49 @@ export const en: Record<string, string> = {
   "AppearancePanel.bubblesFlat": "Flat messages",
   "AppearancePanel.bubblesCompact": "Compact messages",
   "AppearancePanel.motionTitle": "Motion",
-  "AppearancePanel.motionDescription":
-    "Controls transitions and animated feedback.",
+  "AppearancePanel.motionDescription": "Controls transitions and animated feedback.",
   "AppearancePanel.motionSystem": "System",
   "AppearancePanel.motionSystemDescription": "Use OS preference.",
   "AppearancePanel.motionReduced": "Reduced",
   "AppearancePanel.motionReducedDescription": "Minimize motion.",
   "AppearancePanel.contrastTitle": "Contrast",
   "AppearancePanel.highContrastLabel": "High contrast",
-  "AppearancePanel.highContrastDescription":
-    "Strengthens borders and secondary text.",
+  "AppearancePanel.highContrastDescription": "Strengthens borders and secondary text.",
   "AppearancePanel.accessibilityTitle": "Accessibility",
-  "AppearancePanel.accessibilityDescription":
-    "Presets are a starting point; every setting remains independently adjustable.",
+  "AppearancePanel.accessibilityDescription": "Presets are a starting point; every setting remains independently adjustable.",
   "AppearancePanel.focusLabel": "Keyboard focus visibility",
   "AppearancePanel.focusStandard": "Standard ring",
   "AppearancePanel.focusEnhanced": "Enhanced ring",
   "AppearancePanel.presetLowVision": "Low vision",
-  "AppearancePanel.presetLowVisionDescription":
-    "Larger text, code, spacing, contrast, and focus.",
+  "AppearancePanel.presetLowVisionDescription": "Larger text, code, spacing, contrast, and focus.",
   "AppearancePanel.presetKeyboard": "Keyboard clarity",
-  "AppearancePanel.presetKeyboardDescription":
-    "High contrast with enhanced focus rings.",
+  "AppearancePanel.presetKeyboardDescription": "High contrast with enhanced focus rings.",
   "AppearancePanel.presetReducedMotion": "Motion sensitive",
-  "AppearancePanel.presetReducedMotionDescription":
-    "Reduced motion with enhanced focus.",
+  "AppearancePanel.presetReducedMotionDescription": "Reduced motion with enhanced focus.",
   "AppearancePanel.profilesTitle": "Appearance profiles",
-  "AppearancePanel.profilesDescription":
-    "Import a validated JSON profile into this draft, or export the current draft without workspace paths.",
+  "AppearancePanel.profilesDescription": "Import a validated JSON profile into this draft, or export the current draft without workspace paths.",
   "AppearancePanel.importButton": "Import profile",
   "AppearancePanel.exportButton": "Export draft",
   "AppearancePanel.previewTitle": "Preview",
-  "AppearancePanel.previewDescription":
-    "Edits preview live across the app. Apply persists them; Cancel restores the committed profile.",
+  "AppearancePanel.previewDescription": "Edits preview live across the app. Apply persists them; Cancel restores the committed profile.",
   "AppearancePanel.previewDark": "Dark",
   "AppearancePanel.previewLight": "Light",
   "AppearancePanel.previewWorkspace": "Workspace",
   "AppearancePanel.previewSubline": "Ready for a local model run",
-  "AppearancePanel.previewAssistant":
-    "I checked the workspace and found a safe path forward.",
+  "AppearancePanel.previewAssistant": "I checked the workspace and found a safe path forward.",
   "AppearancePanel.previewUser": "Show me the change.",
   "AppearancePanel.previewSecondary": "Details",
   "AppearancePanel.previewPrimary": "Run",
   "AppearancePanel.unsavedStatus": "Previewing unapplied changes",
   "AppearancePanel.savedDraftStatus": "Matches the committed profile",
   "AppearancePanel.savedStatus": "Appearance saved on this device.",
-  "AppearancePanel.cancelledStatus":
-    "Preview cancelled; committed appearance restored.",
-  "AppearancePanel.importedStatus":
-    "Profile loaded into the preview. Apply to save it.",
+  "AppearancePanel.cancelledStatus": "Preview cancelled; committed appearance restored.",
+  "AppearancePanel.importedStatus": "Profile loaded into the preview. Apply to save it.",
   "AppearancePanel.exportedStatus": "Appearance profile exported.",
   "AppearancePanel.profileError": "Profile could not be used: {{error}}",
   "AppearancePanel.cancelButton": "Cancel changes",
   "AppearancePanel.applyButton": "Apply",
-  "KeyboardShortcutsPanel.description":
-    "Select any shortcut to change it. Application commands work anywhere in Little Monkey; the others are active only in their matching area.",
+  "KeyboardShortcutsPanel.description": "Select any shortcut to change it. Application commands work anywhere in Little Monkey; the others are active only in their matching area.",
   "KeyboardShortcutsPanel.platformContext": "{{platform}} shortcuts",
   "KeyboardShortcutsPanel.platformMacos": "macOS",
   "KeyboardShortcutsPanel.platformWindows": "Windows",
@@ -1928,132 +1655,84 @@ export const en: Record<string, string> = {
   "KeyboardShortcutsPanel.resultCount": "{{count}} shortcuts shown.",
   "KeyboardShortcutsPanel.orSeparator": "or",
   "KeyboardShortcutsPanel.modifiedBadge": "Modified",
-  "KeyboardShortcutsPanel.editBindingAriaLabel":
-    "Change shortcut {{shortcut}} for {{action}}",
+  "KeyboardShortcutsPanel.editBindingAriaLabel": "Change shortcut {{shortcut}} for {{action}}",
   "KeyboardShortcutsPanel.addBindingButton": "Add shortcut",
-  "KeyboardShortcutsPanel.addBindingAriaLabel":
-    "Add another shortcut for {{action}}",
-  "KeyboardShortcutsPanel.removeBindingAriaLabel":
-    "Remove {{shortcut}} from {{action}}",
+  "KeyboardShortcutsPanel.addBindingAriaLabel": "Add another shortcut for {{action}}",
+  "KeyboardShortcutsPanel.removeBindingAriaLabel": "Remove {{shortcut}} from {{action}}",
   "KeyboardShortcutsPanel.resetShortcutButton": "Reset",
-  "KeyboardShortcutsPanel.resetShortcutAriaLabel":
-    "Reset {{action}} to its default shortcuts",
+  "KeyboardShortcutsPanel.resetShortcutAriaLabel": "Reset {{action}} to its default shortcuts",
   "KeyboardShortcutsPanel.resetAllButton": "Reset all",
-  "KeyboardShortcutsPanel.resetAllConfirm":
-    "Reset all keyboard shortcuts to their defaults?",
+  "KeyboardShortcutsPanel.resetAllConfirm": "Reset all keyboard shortcuts to their defaults?",
   "KeyboardShortcutsPanel.recordButton": "Record shortcut",
-  "KeyboardShortcutsPanel.recorderAriaLabel":
-    "Record a new shortcut for {{action}}",
+  "KeyboardShortcutsPanel.recorderAriaLabel": "Record a new shortcut for {{action}}",
   "KeyboardShortcutsPanel.listeningStatus": "Listening… Press a shortcut.",
-  "KeyboardShortcutsPanel.listeningInstructions":
-    "Hold any modifiers, then press a letter, number, or function key. Nothing changes until you save.",
+  "KeyboardShortcutsPanel.listeningInstructions": "Hold any modifiers, then press a letter, number, or function key. Nothing changes until you save.",
   "KeyboardShortcutsPanel.draftLabel": "New shortcut",
   "KeyboardShortcutsPanel.draftAriaLabel": "New shortcut: {{shortcut}}",
   "KeyboardShortcutsPanel.saveButton": "Save",
   "KeyboardShortcutsPanel.cancelButton": "Cancel",
   "KeyboardShortcutsPanel.tryAgainButton": "Try again",
   "KeyboardShortcutsPanel.modifierOnlyError": "Add a non-modifier key.",
-  "KeyboardShortcutsPanel.invalidKeyError":
-    "That key can't be used as a shortcut.",
-  "KeyboardShortcutsPanel.globalNeedsModifierError":
-    "Application shortcuts must include a modifier key.",
-  "KeyboardShortcutsPanel.typingKeyError":
-    "Composer and suggestion shortcuts can't replace a normal typing key.",
-  "KeyboardShortcutsPanel.reservedShortcutError":
-    "{{shortcut}} is reserved by the system.",
-  "KeyboardShortcutsPanel.conflictError":
-    "{{shortcut}} is already assigned to {{action}}.",
-  "KeyboardShortcutsPanel.duplicateError":
-    "That shortcut is already assigned to this action.",
-  "KeyboardShortcutsPanel.maxBindingsError":
-    "An action can have up to four shortcuts.",
-  "KeyboardShortcutsPanel.lastBindingError":
-    "Each action must keep at least one shortcut.",
+  "KeyboardShortcutsPanel.invalidKeyError": "That key can't be used as a shortcut.",
+  "KeyboardShortcutsPanel.globalNeedsModifierError": "Application shortcuts must include a modifier key.",
+  "KeyboardShortcutsPanel.typingKeyError": "Composer and suggestion shortcuts can't replace a normal typing key.",
+  "KeyboardShortcutsPanel.reservedShortcutError": "{{shortcut}} is reserved by the system.",
+  "KeyboardShortcutsPanel.conflictError": "{{shortcut}} is already assigned to {{action}}.",
+  "KeyboardShortcutsPanel.duplicateError": "That shortcut is already assigned to this action.",
+  "KeyboardShortcutsPanel.maxBindingsError": "An action can have up to four shortcuts.",
+  "KeyboardShortcutsPanel.lastBindingError": "Each action must keep at least one shortcut.",
   "KeyboardShortcutsPanel.savedStatus": "{{shortcut}} saved for {{action}}.",
-  "KeyboardShortcutsPanel.removedStatus":
-    "{{shortcut}} removed from {{action}}.",
+  "KeyboardShortcutsPanel.removedStatus": "{{shortcut}} removed from {{action}}.",
   "KeyboardShortcutsPanel.resetStatus": "{{action}} reset to its defaults.",
-  "KeyboardShortcutsPanel.resetAllStatus":
-    "All shortcuts reset to their defaults.",
+  "KeyboardShortcutsPanel.resetAllStatus": "All shortcuts reset to their defaults.",
   "KeyboardShortcutsPanel.groupApplication": "Application",
   "KeyboardShortcutsPanel.groupComposer": "Composer",
   "KeyboardShortcutsPanel.groupSuggestions": "Mentions and slash commands",
   "KeyboardShortcutsPanel.groupSessionMenu": "Session menu",
   "KeyboardShortcutsPanel.newSessionDescription": "Start a new conversation.",
-  "KeyboardShortcutsPanel.openSettingsDescription":
-    "Open Little Monkey settings.",
-  "KeyboardShortcutsPanel.openShortcutsDescription":
-    "Open this keyboard-shortcuts page.",
+  "KeyboardShortcutsPanel.openSettingsDescription": "Open Little Monkey settings.",
+  "KeyboardShortcutsPanel.openShortcutsDescription": "Open this keyboard-shortcuts page.",
   "KeyboardShortcutsPanel.toggleWorkspacePanel": "Toggle workspace panel",
-  "KeyboardShortcutsPanel.toggleWorkspacePanelDescription":
-    "Show or hide the file and diff panel.",
-  "KeyboardShortcutsPanel.openReviewDescription":
-    "Show the workspace files and diff in the right sidebar.",
-  "KeyboardShortcutsPanel.openDiffPanelDescription":
-    "Show the working-tree diff of one file at a time in the right sidebar.",
-  "KeyboardShortcutsPanel.openProcessesPanelDescription":
-    "Show everything this app is currently running in the right sidebar.",
-  "KeyboardShortcutsPanel.toggleRightSidebarDescription":
-    "Open or close the right sidebar.",
-  "KeyboardShortcutsPanel.openTerminalDescription":
-    "Show or hide the integrated terminal.",
-  "KeyboardShortcutsPanel.openBrowserDescription":
-    "Open the browser workbench.",
-  "KeyboardShortcutsPanel.openBrowserTabDescription":
-    "Show the browser workbench as a right sidebar tab.",
-  "KeyboardShortcutsPanel.openFilesDescription":
-    "Show the workspace files and diff in the right sidebar.",
-  "KeyboardShortcutsPanel.openBackgroundTasksDescription":
-    "Show background shell commands and agent runs in the right sidebar.",
-  "KeyboardShortcutsPanel.openSideTaskPaneDescription":
-    "Show the side-task pane next to the chat.",
+  "KeyboardShortcutsPanel.toggleWorkspacePanelDescription": "Show or hide the file and diff panel.",
+  "KeyboardShortcutsPanel.openReviewDescription": "Show the workspace files and diff in the right sidebar.",
+  "KeyboardShortcutsPanel.openDiffPanelDescription": "Show the working-tree diff of one file at a time in the right sidebar.",
+  "KeyboardShortcutsPanel.openProcessesPanelDescription": "Show everything this app is currently running in the right sidebar.",
+  "KeyboardShortcutsPanel.toggleRightSidebarDescription": "Open or close the right sidebar.",
+  "KeyboardShortcutsPanel.openTerminalDescription": "Show or hide the integrated terminal.",
+  "KeyboardShortcutsPanel.openBrowserDescription": "Open the browser workbench.",
+  "KeyboardShortcutsPanel.openBrowserTabDescription": "Show the browser workbench as a right sidebar tab.",
+  "KeyboardShortcutsPanel.openFilesDescription": "Show the workspace files and diff in the right sidebar.",
+  "KeyboardShortcutsPanel.openBackgroundTasksDescription": "Show background shell commands and agent runs in the right sidebar.",
+  "KeyboardShortcutsPanel.openSideTaskPaneDescription": "Show the side-task pane next to the chat.",
   "KeyboardShortcutsPanel.sendMessage": "Send message",
-  "KeyboardShortcutsPanel.sendMessageDescription":
-    "Send the current composer message.",
+  "KeyboardShortcutsPanel.sendMessageDescription": "Send the current composer message.",
   "KeyboardShortcutsPanel.insertLineBreak": "Insert line break",
-  "KeyboardShortcutsPanel.insertLineBreakDescription":
-    "Add a new line without sending the message.",
+  "KeyboardShortcutsPanel.insertLineBreakDescription": "Add a new line without sending the message.",
   "KeyboardShortcutsPanel.nextSuggestion": "Next suggestion",
-  "KeyboardShortcutsPanel.nextSuggestionDescription":
-    "Move to the next mention or slash-command result.",
+  "KeyboardShortcutsPanel.nextSuggestionDescription": "Move to the next mention or slash-command result.",
   "KeyboardShortcutsPanel.previousSuggestion": "Previous suggestion",
-  "KeyboardShortcutsPanel.previousSuggestionDescription":
-    "Move to the previous mention or slash-command result.",
+  "KeyboardShortcutsPanel.previousSuggestionDescription": "Move to the previous mention or slash-command result.",
   "KeyboardShortcutsPanel.chooseSuggestion": "Choose suggestion",
-  "KeyboardShortcutsPanel.chooseSuggestionDescription":
-    "Insert the selected mention or slash command.",
+  "KeyboardShortcutsPanel.chooseSuggestionDescription": "Insert the selected mention or slash command.",
   "KeyboardShortcutsPanel.closeSuggestions": "Close suggestions",
-  "KeyboardShortcutsPanel.closeSuggestionsDescription":
-    "Dismiss the active suggestion list.",
-  "KeyboardShortcutsPanel.sessionOpenSplitDescription":
-    "Open the selected session beside the current session.",
-  "KeyboardShortcutsPanel.sessionOpenWindowDescription":
-    "Open the selected session in another window.",
-  "KeyboardShortcutsPanel.sessionOpenCursorDescription":
-    "Open the session workspace in Cursor.",
-  "KeyboardShortcutsPanel.sessionOpenVsCodeDescription":
-    "Open the session workspace in VS Code.",
+  "KeyboardShortcutsPanel.closeSuggestionsDescription": "Dismiss the active suggestion list.",
+  "KeyboardShortcutsPanel.sessionOpenSplitDescription": "Open the selected session beside the current session.",
+  "KeyboardShortcutsPanel.sessionOpenWindowDescription": "Open the selected session in another window.",
+  "KeyboardShortcutsPanel.sessionOpenCursorDescription": "Open the session workspace in Cursor.",
+  "KeyboardShortcutsPanel.sessionOpenVsCodeDescription": "Open the session workspace in VS Code.",
   "KeyboardShortcutsPanel.revealInFileManager": "Reveal in file manager",
-  "KeyboardShortcutsPanel.sessionRevealFinderDescription":
-    "Reveal the session workspace in the system file manager.",
+  "KeyboardShortcutsPanel.sessionRevealFinderDescription": "Reveal the session workspace in the system file manager.",
   "KeyboardShortcutsPanel.togglePin": "Toggle pin",
-  "KeyboardShortcutsPanel.togglePinDescription":
-    "Pin or unpin the selected session.",
+  "KeyboardShortcutsPanel.togglePinDescription": "Pin or unpin the selected session.",
   "KeyboardShortcutsPanel.toggleUnread": "Toggle unread",
-  "KeyboardShortcutsPanel.toggleUnreadDescription":
-    "Mark the selected session as read or unread.",
-  "KeyboardShortcutsPanel.sessionRenameDescription":
-    "Rename the selected session.",
-  "KeyboardShortcutsPanel.sessionForkDescription":
-    "Fork the selected session into a new conversation.",
+  "KeyboardShortcutsPanel.toggleUnreadDescription": "Mark the selected session as read or unread.",
+  "KeyboardShortcutsPanel.sessionRenameDescription": "Rename the selected session.",
+  "KeyboardShortcutsPanel.sessionForkDescription": "Fork the selected session into a new conversation.",
   "KeyboardShortcutsPanel.archiveOrRestore": "Archive or restore",
-  "KeyboardShortcutsPanel.sessionArchiveDescription":
-    "Archive or restore the selected session.",
-  "KeyboardShortcutsPanel.sessionDeleteDescription":
-    "Permanently delete the selected session.",
+  "KeyboardShortcutsPanel.sessionArchiveDescription": "Archive or restore the selected session.",
+  "KeyboardShortcutsPanel.sessionDeleteDescription": "Permanently delete the selected session.",
   "KeyboardShortcutsPanel.closeSessionMenu": "Close session menu",
-  "KeyboardShortcutsPanel.closeSessionMenuDescription":
-    "Dismiss the open session menu.",
+  "KeyboardShortcutsPanel.closeSessionMenuDescription": "Dismiss the open session menu.",
   "DiffViewer.diffHeaderTitle": "{{oldTitle}} → {{newTitle}}",
   "DiffViewer.noDifferences": "No differences.",
   "FileTree.filesHeaderFallback": "Files",
@@ -2065,29 +1744,23 @@ export const en: Record<string, string> = {
   "FileTree.workspaceEmpty": "Workspace is empty.",
   "FileTree.closeButton": "Close",
   "FileTree.loadingPreview": "Loading preview…",
-  "FileTree.previewTruncated":
-    "Preview truncated — file is larger than {{maxSize}}.",
+  "FileTree.previewTruncated": "Preview truncated — file is larger than {{maxSize}}.",
   "PermissionModal.title": "Permission request",
   "PermissionModal.wantsToRunTool": "Little Monkey wants to run",
-  "PermissionModal.shellAlwaysConfirmText":
-    "Shell commands always require confirmation and can't be pre-approved for the session.",
+  "PermissionModal.shellAlwaysConfirmText": "Shell commands always require confirmation and can't be pre-approved for the session.",
   "PermissionModal.riskLowBadge": "Low risk",
   "PermissionModal.riskMediumBadge": "Medium risk",
   "PermissionModal.riskHighBadge": "High risk",
   "PermissionModal.riskReasonLabel": "Why:",
-  "PermissionModal.riskFlooredText":
-    "Sensitive path — always requires confirmation",
-  "PermissionModal.subagentAttribution":
-    'Requested by subagent "{{description}}"',
-  "PermissionModal.fromOtherConversation": 'From "{{title}}"',
+  "PermissionModal.riskFlooredText": "Sensitive path — always requires confirmation",
+  "PermissionModal.subagentAttribution": "Requested by subagent \"{{description}}\"",
+  "PermissionModal.fromOtherConversation": "From \"{{title}}\"",
   "PermissionModal.denyButton": "Deny",
   "PermissionModal.allowOnceButton": "Allow Once",
   "PermissionModal.allowForSessionButton": "Allow for Session",
-  "SessionGrantBanner.unattendedAccessGranted":
-    "Unattended access granted for this session:",
+  "SessionGrantBanner.unattendedAccessGranted": "Unattended access granted for this session:",
   "SessionGrantBanner.dismissAriaLabel": "Dismiss",
-  "WorkspaceBar.workspaceLockedTitle":
-    "Workspace locked once the chat has started",
+  "WorkspaceBar.workspaceLockedTitle": "Workspace locked once the chat has started",
   "WorkspaceBar.openLabel": "Open",
   "WorkspaceBar.recentHeading": "Recent",
   "WorkspaceBar.noRecentWorkspaces": "No recent workspaces",
@@ -2116,20 +1789,14 @@ export const en: Record<string, string> = {
   "ModelListRow.removeAriaLabel": "Remove {{title}}",
   "RulesMemoryPanel.globalHeading": "Global rules",
   "RulesMemoryPanel.globalFileLabel": "MONKEY.md (global)",
-  "RulesMemoryPanel.globalDescription":
-    "Applied to every project on this device. Stored locally — never committed to a repo.",
-  "RulesMemoryPanel.globalPlaceholder":
-    "Instructions that should apply to every project, e.g. your preferred tone or code style.",
+  "RulesMemoryPanel.globalDescription": "Applied to every project on this device. Stored locally — never committed to a repo.",
+  "RulesMemoryPanel.globalPlaceholder": "Instructions that should apply to every project, e.g. your preferred tone or code style.",
   "RulesMemoryPanel.projectHeading": "Project rules (MONKEY.md)",
-  "RulesMemoryPanel.projectDescription":
-    "Committed alongside your code, like CLAUDE.md — every attached folder can have its own.",
-  "RulesMemoryPanel.projectPlaceholder":
-    "Instructions specific to this project, e.g. build commands or architectural conventions.",
-  "RulesMemoryPanel.noWorkspaceOpen":
-    "Open a project folder to edit its MONKEY.md.",
+  "RulesMemoryPanel.projectDescription": "Committed alongside your code, like CLAUDE.md — every attached folder can have its own.",
+  "RulesMemoryPanel.projectPlaceholder": "Instructions specific to this project, e.g. build commands or architectural conventions.",
+  "RulesMemoryPanel.noWorkspaceOpen": "Open a project folder to edit its MONKEY.md.",
   "RulesMemoryPanel.charCount": "{{count}} / {{max}} characters",
-  "RulesMemoryPanel.truncatedWarning":
-    "This file is longer than the 16,000-character limit — the part beyond it is not sent to the model.",
+  "RulesMemoryPanel.truncatedWarning": "This file is longer than the 16,000-character limit — the part beyond it is not sent to the model.",
   "RulesMemoryPanel.saveButton": "Save",
   "RulesMemoryPanel.historyButton": "History",
   "RulesMemoryPanel.createButton": "Create MONKEY.md",
@@ -2137,13 +1804,10 @@ export const en: Record<string, string> = {
   "RulesMemoryPanel.savedStatus": "Saved",
   "RulesMemoryPanel.saveErrorPrefix": "Failed to save: {{error}}",
   "RulesMemoryPanel.memoryHeading": "Remembered facts",
-  "RulesMemoryPanel.memoryStudioPointer":
-    "This list covers only the current project plus global facts. For every memory across every project — including disabled ones, plus import/export — open the Memory Studio tab.",
+  "RulesMemoryPanel.memoryStudioPointer": "This list covers only the current project plus global facts. For every memory across every project — including disabled ones, plus import/export — open the Memory Studio tab.",
   "RulesMemoryPanel.memoryToggleLabel": "Let the agent remember facts",
-  "RulesMemoryPanel.memoryToggleDescription":
-    "When off, the agent can't save new facts with the remember tool. Existing facts still apply — this isn't amnesia.",
-  "RulesMemoryPanel.memoryNoWorkspaceOpen":
-    "Open a project folder to add or clear project-specific facts.",
+  "RulesMemoryPanel.memoryToggleDescription": "When off, the agent can't save new facts with the remember tool. Existing facts still apply — this isn't amnesia.",
+  "RulesMemoryPanel.memoryNoWorkspaceOpen": "Open a project folder to add or clear project-specific facts.",
   "RulesMemoryPanel.memoryEmpty": "No facts remembered yet.",
   "RulesMemoryPanel.memorySourceAgent": "agent",
   "RulesMemoryPanel.memorySourceUser": "user",
@@ -2153,45 +1817,35 @@ export const en: Record<string, string> = {
   "RulesMemoryPanel.memoryDeleteButton": "Delete",
   "RulesMemoryPanel.memoryDeletingButton": "Deleting…",
   "RulesMemoryPanel.memoryClearAllButton": "Clear all",
-  "RulesMemoryPanel.memoryClearConfirmPrompt":
-    "Delete all {{count}} remembered facts? This can't be undone.",
+  "RulesMemoryPanel.memoryClearConfirmPrompt": "Delete all {{count}} remembered facts? This can't be undone.",
   "RulesMemoryPanel.memoryClearConfirmButton": "Yes, clear all",
   "RulesMemoryPanel.memoryClearCancelButton": "Cancel",
   "RulesMemoryPanel.memoryClearingButton": "Clearing…",
-  "RulesMemoryPanel.memoryAddPlaceholder":
-    "Add a fact manually, e.g. a preference or convention…",
+  "RulesMemoryPanel.memoryAddPlaceholder": "Add a fact manually, e.g. a preference or convention…",
   "RulesMemoryPanel.memoryAddButton": "Add fact",
   "RulesMemoryPanel.memoryAddingButton": "Adding…",
   "RulesMemoryPanel.memoryErrorPrefix": "Error: {{error}}",
-  "MemoryStudioPanel.intro":
-    "Every durable memory this app has stored, across every project and the global scope — inspect, edit, disable, delete, import, and export them here.",
-  "MemoryStudioPanel.honestyNote":
-    'This app\'s memory store only has two real scopes: "global" (applies to every project) and "project" (one workspace root). There is no separate workspace/user/device/connector scope, no confidence score, no pin/auto-expiry, and no "last used" timestamp to show — none of those exist in the underlying store, so they are left out rather than faked. "Why do you know this?" links from chat answers also aren\'t available yet: chat responses don\'t currently cite which memory (if any) they drew on.',
+  "MemoryStudioPanel.intro": "Every durable memory this app has stored, across every project and the global scope — inspect, edit, disable, delete, import, and export them here.",
+  "MemoryStudioPanel.honestyNote": "This app's memory store only has two real scopes: \"global\" (applies to every project) and \"project\" (one workspace root). There is no separate workspace/user/device/connector scope, no confidence score, no pin/auto-expiry, and no \"last used\" timestamp to show — none of those exist in the underlying store, so they are left out rather than faked. \"Why do you know this?\" links from chat answers also aren't available yet: chat responses don't currently cite which memory (if any) they drew on.",
   "MemoryStudioPanel.filterAll": "All",
   "MemoryStudioPanel.filterGlobal": "Global",
   "MemoryStudioPanel.filterProject": "Project",
   "MemoryStudioPanel.searchPlaceholder": "Search memory text…",
   "MemoryStudioPanel.refreshButton": "Refresh",
-  "MemoryStudioPanel.redactToggleLabel":
-    "Redact secret-shaped values on export",
-  "MemoryStudioPanel.redactWarning":
-    "Off: the exported file will contain your memories' original text, including anything secret-shaped.",
+  "MemoryStudioPanel.redactToggleLabel": "Redact secret-shaped values on export",
+  "MemoryStudioPanel.redactWarning": "Off: the exported file will contain your memories' original text, including anything secret-shaped.",
   "MemoryStudioPanel.exportButton": "Export",
   "MemoryStudioPanel.exportingButton": "Exporting…",
   "MemoryStudioPanel.exportComplete": "Exported {{count}} memories.",
-  "MemoryStudioPanel.exportCompleteRedacted":
-    "Exported {{count}} memories ({{redacted}} had secret-shaped text redacted).",
+  "MemoryStudioPanel.exportCompleteRedacted": "Exported {{count}} memories ({{redacted}} had secret-shaped text redacted).",
   "MemoryStudioPanel.importButton": "Import",
   "MemoryStudioPanel.importingButton": "Importing…",
-  "MemoryStudioPanel.importComplete":
-    "Imported {{added}} memories ({{skipped}} already present, skipped).",
-  "MemoryStudioPanel.importPartial":
-    "Imported {{added}}, skipped {{skipped}} duplicate(s). Errors: {{errors}}",
+  "MemoryStudioPanel.importComplete": "Imported {{added}} memories ({{skipped}} already present, skipped).",
+  "MemoryStudioPanel.importPartial": "Imported {{added}}, skipped {{skipped}} duplicate(s). Errors: {{errors}}",
   "MemoryStudioPanel.loading": "Loading memories…",
   "MemoryStudioPanel.empty": "No memories stored yet.",
   "MemoryStudioPanel.noMatches": "No memories match this filter.",
-  "MemoryStudioPanel.globalSectionHeading":
-    "Global — applies to every project ({{count}})",
+  "MemoryStudioPanel.globalSectionHeading": "Global — applies to every project ({{count}})",
   "MemoryStudioPanel.projectSectionHeading": "{{name}} ({{count}})",
   "MemoryStudioPanel.sourceAgent": "agent",
   "MemoryStudioPanel.sourceUser": "user",
@@ -2211,12 +1865,9 @@ export const en: Record<string, string> = {
   "MemoryStudioPanel.confirmDeleteButton": "Confirm delete",
   "MemoryStudioPanel.charCount": "{{count}} / {{max}} characters",
   "MemoryStudioPanel.errorPrefix": "Error: {{error}}",
-  "McpPanel.description":
-    "Connect external MCP (Model Context Protocol) servers — their tools merge into the agent's tool set, gated by the same permission prompts as built-in tools.",
-  "McpPanel.sideEffectsNotice":
-    "MCP tool calls are not checkpointed — reverting to an earlier checkpoint won't undo anything an MCP server's tool did (same as Run Shell).",
-  "McpPanel.toolCountWarning":
-    "{{count}} tools are currently offered to the model across connected servers — consider narrowing servers' tool allowlists to keep prompts lean.",
+  "McpPanel.description": "Connect external MCP (Model Context Protocol) servers — their tools merge into the agent's tool set, gated by the same permission prompts as built-in tools.",
+  "McpPanel.sideEffectsNotice": "MCP tool calls are not checkpointed — reverting to an earlier checkpoint won't undo anything an MCP server's tool did (same as Run Shell).",
+  "McpPanel.toolCountWarning": "{{count}} tools are currently offered to the model across connected servers — consider narrowing servers' tool allowlists to keep prompts lean.",
   "McpPanel.emptyState": "No MCP servers configured yet. Add one below.",
   "McpPanel.historyHeading": "Server history",
   "McpPanel.historyDescription":
@@ -2227,8 +1878,7 @@ export const en: Record<string, string> = {
   "McpPanel.status_error": "Error",
   "McpPanel.status_disconnected": "Disconnected",
   "McpPanel.needsAuthPill": "Needs auth",
-  "McpPanel.needsAuthPillTitle":
-    "This server reported an authentication failure and has no saved credentials. Open Connection settings to connect via OAuth or save a bearer token.",
+  "McpPanel.needsAuthPillTitle": "This server reported an authentication failure and has no saved credentials. Open Connection settings to connect via OAuth or save a bearer token.",
   "McpPanel.enableToggleAriaLabel": "Enable {{label}}",
   "McpPanel.reconnectButton": "Reconnect",
   "McpPanel.removeButton": "Remove",
@@ -2236,8 +1886,7 @@ export const en: Record<string, string> = {
   "McpPanel.removeConfirmButton": "Yes, remove",
   "McpPanel.removingButton": "Removing…",
   "McpPanel.toolsDisclosure": "Tools ({{count}})",
-  "McpPanel.noToolsCached":
-    "No tools cached yet — connect the server to see what it offers.",
+  "McpPanel.noToolsCached": "No tools cached yet — connect the server to see what it offers.",
   "McpPanel.connectionSettingsDisclosure": "Connection settings",
   "McpPanel.timeoutLabel": "Timeout (s)",
   "McpPanel.timeoutPlaceholder": "60",
@@ -2250,27 +1899,19 @@ export const en: Record<string, string> = {
   "McpPanel.tokenSaveButton": "Save token",
   "McpPanel.tokenSavingButton": "Saving…",
   "McpPanel.appConnectorsHeading": "Connector starter templates",
-  "McpPanel.appConnectorsDescription":
-    "Prefill a reviewed MCP transport shape, then supply and verify the authentication method your app account supports before connecting.",
+  "McpPanel.appConnectorsDescription": "Prefill a reviewed MCP transport shape, then supply and verify the authentication method your app account supports before connecting.",
   "McpPanel.templateLocalBadge": "Local stdio",
   "McpPanel.templateRemoteBadge": "Remote HTTP",
   "McpPanel.templateGitHubLabel": "GitHub",
-  "McpPanel.templateGitHubDescription":
-    "Read repos, issues, pull requests, and Actions through GitHub's official MCP server.",
-  "McpPanel.templateGitHubDetail":
-    "Uses the official Docker image in read-only mode by default. Keep the PAT out of saved config by exposing GITHUB_PERSONAL_ACCESS_TOKEN in the app process environment before connecting.",
+  "McpPanel.templateGitHubDescription": "Read repos, issues, pull requests, and Actions through GitHub's official MCP server.",
+  "McpPanel.templateGitHubDetail": "Uses the official Docker image in read-only mode by default. Keep the PAT out of saved config by exposing GITHUB_PERSONAL_ACCESS_TOKEN in the app process environment before connecting.",
   "McpPanel.templateCustomHttpLabel": "Custom app",
-  "McpPanel.templateCustomHttpDescription":
-    "Connect any app or homelab service that exposes a streamable HTTP MCP endpoint.",
-  "McpPanel.templateCustomHttpDetail":
-    "Good for internal tools, private APIs, and self-hosted connector gateways.",
+  "McpPanel.templateCustomHttpDescription": "Connect any app or homelab service that exposes a streamable HTTP MCP endpoint.",
+  "McpPanel.templateCustomHttpDetail": "Good for internal tools, private APIs, and self-hosted connector gateways.",
   "McpPanel.templateAppleScriptLabel": "macOS Control (AppleScript)",
-  "McpPanel.templateAppleScriptDescription":
-    "Run AppleScript on this Mac through a bundled local server — control Finder, Mail, System Events GUI scripting, or any other scriptable app.",
-  "McpPanel.templateAppleScriptDetail":
-    "macOS only. Treat every call the same as Run Shell: the script text is fully trusted and can do anything a signed-in user could do, including driving other apps' UIs via System Events or running shell commands through “do shell script”. Requires Node.js on PATH; no npm install needed — the server's source ships inside Little Monkey itself.",
-  "McpPanel.templateAppleScriptStagingError":
-    "Could not prepare the bundled AppleScript server: {{error}}",
+  "McpPanel.templateAppleScriptDescription": "Run AppleScript on this Mac through a bundled local server — control Finder, Mail, System Events GUI scripting, or any other scriptable app.",
+  "McpPanel.templateAppleScriptDetail": "macOS only. Treat every call the same as Run Shell: the script text is fully trusted and can do anything a signed-in user could do, including driving other apps' UIs via System Events or running shell commands through “do shell script”. Requires Node.js on PATH; no npm install needed — the server's source ships inside Little Monkey itself.",
+  "McpPanel.templateAppleScriptStagingError": "Could not prepare the bundled AppleScript server: {{error}}",
   "McpPanel.useTemplateButton": "Use template",
   "McpPanel.useTemplatePreparingButton": "Preparing…",
   "McpPanel.oauthSectionHeading": "OAuth",
@@ -2285,13 +1926,10 @@ export const en: Record<string, string> = {
   "McpPanel.oauthDisconnectingButton": "Disconnecting…",
   "McpPanel.oauthContinueButton": "Continue",
   "McpPanel.oauthRetryButton": "Retry",
-  "McpPanel.oauthClientIdPlaceholder":
-    "OAuth client ID from your own app registration",
-  "McpPanel.oauthClientSecretPlaceholder":
-    "Client secret (required for confidential clients)",
+  "McpPanel.oauthClientIdPlaceholder": "OAuth client ID from your own app registration",
+  "McpPanel.oauthClientSecretPlaceholder": "Client secret (required for confidential clients)",
   "McpPanel.oauthRedirectUriLabel": "Redirect URI to register:",
-  "McpPanel.oauthClientIdHint":
-    "Paste an OAuth client you register yourself, then press Continue — the browser sign-in opens after that. Confidential clients require both ID and secret. Slack may omit the secret only for a public client with PKCE explicitly enabled. Google: Cloud console → Credentials → Create OAuth client ID → Desktop app, then paste ID + secret (also enable the provider's API and add yourself as a Test user). If your provider asks for a redirect URI, register the one above — it never changes. Saved to your keychain, so this is one-time; full steps in docs/byo-oauth-clients.md.",
+  "McpPanel.oauthClientIdHint": "Paste an OAuth client you register yourself, then press Continue — the browser sign-in opens after that. Confidential clients require both ID and secret. Slack may omit the secret only for a public client with PKCE explicitly enabled. Google: Cloud console → Credentials → Create OAuth client ID → Desktop app, then paste ID + secret (also enable the provider's API and add yourself as a Test user). If your provider asks for a redirect URI, register the one above — it never changes. Saved to your keychain, so this is one-time; full steps in docs/byo-oauth-clients.md.",
   "McpPanel.oauthPhase_discovering": "Discovering OAuth server…",
   "McpPanel.oauthPhase_needs_client_id": "Your OAuth client ID needed",
   "McpPanel.oauthPhase_opening_browser": "Opening browser…",
@@ -2300,13 +1938,10 @@ export const en: Record<string, string> = {
   "McpPanel.oauthPhase_connected": "Connected",
   "McpPanel.oauthPhase_error": "Failed",
   "McpPanel.oauthPhase_cancelled": "Cancelled",
-  "ConnectorsPanel.description":
-    "Connect GitHub, Slack, Notion, Jira/Confluence, and S3/R2 without hand-editing raw MCP config. Every credential is verified live before it's saved, and stored in your OS keychain only.",
-  "ConnectorsPanel.nonGoalNotice":
-    "Little Monkey ships no OAuth client credentials of its own — it's open source, so anything baked in would be readable by anyone. Providers that register clients automatically connect in one click; the rest (Google, Slack) connect with an OAuth app you register yourself, once.",
+  "ConnectorsPanel.description": "Connect GitHub, Slack, Notion, Jira/Confluence, and S3/R2 without hand-editing raw MCP config. Every credential is verified live before it's saved, and stored in your OS keychain only.",
+  "ConnectorsPanel.nonGoalNotice": "Little Monkey ships no OAuth client credentials of its own — it's open source, so anything baked in would be readable by anyone. Providers that register clients automatically connect in one click; the rest (Google, Slack) connect with an OAuth app you register yourself, once.",
   "ConnectorsPanel.appConnectorsHeading": "App connectors",
-  "ConnectorsPanel.appConnectorsDescription":
-    "Browse and connect popular apps with your web login — no tokens to copy or manage.",
+  "ConnectorsPanel.appConnectorsDescription": "Browse and connect popular apps with your web login — no tokens to copy or manage.",
   "ConnectorsPanel.appSearchPlaceholder": "Search connectors…",
   "ConnectorsPanel.appFilterByButton": "Filter by",
   "ConnectorsPanel.appSortByButton": "Sort by",
@@ -2323,23 +1958,17 @@ export const en: Record<string, string> = {
   "ConnectorsPanel.appConnectedLabel": "Connected",
   "ConnectorsPanel.appDisconnectButton": "Disconnect",
   "ConnectorsPanel.appDisconnectingButton": "Disconnecting…",
-  "ConnectorsPanel.appUrlPlaceholder":
-    "Paste this app's MCP URL (one-time setup)",
+  "ConnectorsPanel.appUrlPlaceholder": "Paste this app's MCP URL (one-time setup)",
   "ConnectorsPanel.appUrlSaveConnectButton": "Save & Connect",
-  "ConnectorsPanel.appClientIdPlaceholder":
-    "OAuth client ID from your own app registration",
-  "ConnectorsPanel.appClientSecretPlaceholder":
-    "Client secret (required for confidential clients)",
+  "ConnectorsPanel.appClientIdPlaceholder": "OAuth client ID from your own app registration",
+  "ConnectorsPanel.appClientSecretPlaceholder": "Client secret (required for confidential clients)",
   "ConnectorsPanel.appContinueButton": "Continue",
   "ConnectorsPanel.appRetryButton": "Retry",
   "ConnectorsPanel.appRedirectUriLabel": "Redirect URI to register:",
-  "ConnectorsPanel.appClientIdHint":
-    "One-time setup — saved in your keychain after you connect, so future reconnects are one click. Confidential clients require the secret. A Slack public client may leave it blank only when PKCE is explicitly enabled. Setup steps: docs/byo-oauth-clients.md.",
-  "ConnectorsPanel.appByoClientHint":
-    "Needs an OAuth app you register yourself. Connect asks for its client ID and, for confidential clients, its secret. Slack can omit the secret only when configured as a public client with PKCE enabled.",
+  "ConnectorsPanel.appClientIdHint": "One-time setup — saved in your keychain after you connect, so future reconnects are one click. Confidential clients require the secret. A Slack public client may leave it blank only when PKCE is explicitly enabled. Setup steps: docs/byo-oauth-clients.md.",
+  "ConnectorsPanel.appByoClientHint": "Needs an OAuth app you register yourself. Connect asks for its client ID and, for confidential clients, its secret. Slack can omit the secret only when configured as a public client with PKCE enabled.",
   "ConnectorsPanel.appOauthPhase_discovering": "Discovering OAuth server…",
-  "ConnectorsPanel.appOauthPhase_needs_client_id":
-    "Your OAuth client ID needed",
+  "ConnectorsPanel.appOauthPhase_needs_client_id": "Your OAuth client ID needed",
   "ConnectorsPanel.appOauthPhase_opening_browser": "Opening browser…",
   "ConnectorsPanel.appOauthPhase_waiting_for_browser": "Waiting for browser…",
   "ConnectorsPanel.appOauthPhase_exchanging_token": "Finishing sign-in…",
@@ -2358,92 +1987,66 @@ export const en: Record<string, string> = {
   "ConnectorsPanel.categoryLegalDocs": "Legal & documents",
   "ConnectorsPanel.categoryOther": "Other",
   "ConnectorsPanel.appSlackLabel": "Slack",
-  "ConnectorsPanel.appSlackDescription":
-    "Search Slack context, read conversations, and send messages.",
+  "ConnectorsPanel.appSlackDescription": "Search Slack context, read conversations, and send messages.",
   "ConnectorsPanel.appAtlassianLabel": "Atlassian",
-  "ConnectorsPanel.appAtlassianDescription":
-    "Connect Jira, Confluence, Jira Service Management, Bitbucket, and Compass.",
+  "ConnectorsPanel.appAtlassianDescription": "Connect Jira, Confluence, Jira Service Management, Bitbucket, and Compass.",
   "ConnectorsPanel.appGoogleDriveLabel": "Google Drive",
-  "ConnectorsPanel.appGoogleDriveDescription":
-    "Search, read, and organize your Google Drive files.",
+  "ConnectorsPanel.appGoogleDriveDescription": "Search, read, and organize your Google Drive files.",
   "ConnectorsPanel.appGmailLabel": "Gmail",
-  "ConnectorsPanel.appGmailDescription":
-    "Search, read, label, and draft email in Gmail.",
+  "ConnectorsPanel.appGmailDescription": "Search, read, label, and draft email in Gmail.",
   "ConnectorsPanel.appFigmaLabel": "Figma",
-  "ConnectorsPanel.appFigmaDescription":
-    "Read Figma file structure, components, and Dev Mode inspection data. Uses the local Dev Mode MCP Server (Figma's hosted remote server only accepts an allowlist of clients we're not on) — requires the Figma desktop app running with Dev Mode MCP Server turned on.",
+  "ConnectorsPanel.appFigmaDescription": "Read Figma file structure, components, and Dev Mode inspection data. Uses the local Dev Mode MCP Server (Figma's hosted remote server only accepts an allowlist of clients we're not on) — requires the Figma desktop app running with Dev Mode MCP Server turned on.",
   "ConnectorsPanel.appNotionLabel": "Notion",
-  "ConnectorsPanel.appNotionDescription":
-    "Search and read Notion pages, databases, and workspace content.",
+  "ConnectorsPanel.appNotionDescription": "Search and read Notion pages, databases, and workspace content.",
   "ConnectorsPanel.appLinearLabel": "Linear",
-  "ConnectorsPanel.appLinearDescription":
-    "Read and update Linear issues, projects, and cycles.",
+  "ConnectorsPanel.appLinearDescription": "Read and update Linear issues, projects, and cycles.",
   "ConnectorsPanel.appAsanaLabel": "Asana",
-  "ConnectorsPanel.appAsanaDescription":
-    "Read and manage Asana tasks, projects, and workspaces.",
+  "ConnectorsPanel.appAsanaDescription": "Read and manage Asana tasks, projects, and workspaces.",
   "ConnectorsPanel.appBoxLabel": "Box",
-  "ConnectorsPanel.appBoxDescription":
-    "Search, read, and organize files stored in Box.",
+  "ConnectorsPanel.appBoxDescription": "Search, read, and organize files stored in Box.",
   "ConnectorsPanel.appDropboxLabel": "Dropbox",
-  "ConnectorsPanel.appDropboxDescription":
-    "Search, read, and organize files stored in Dropbox.",
+  "ConnectorsPanel.appDropboxDescription": "Search, read, and organize files stored in Dropbox.",
   "ConnectorsPanel.appSquareLabel": "Square",
-  "ConnectorsPanel.appSquareDescription":
-    "Read orders, catalog, and payment data from Square. Square only accepts an allowlist of MCP clients, so connecting may be refused until this app is approved.",
+  "ConnectorsPanel.appSquareDescription": "Read orders, catalog, and payment data from Square. Square only accepts an allowlist of MCP clients, so connecting may be refused until this app is approved.",
   "ConnectorsPanel.appStripeLabel": "Stripe",
-  "ConnectorsPanel.appStripeDescription":
-    "Read and manage customers, charges, and subscriptions in Stripe.",
+  "ConnectorsPanel.appStripeDescription": "Read and manage customers, charges, and subscriptions in Stripe.",
   "ConnectorsPanel.appPaypalLabel": "PayPal",
-  "ConnectorsPanel.appPaypalDescription":
-    "Read transactions, invoices, and payouts from PayPal.",
+  "ConnectorsPanel.appPaypalDescription": "Read transactions, invoices, and payouts from PayPal.",
   "ConnectorsPanel.appQuickbooksLabel": "QuickBooks",
-  "ConnectorsPanel.appQuickbooksDescription":
-    "Read invoices, expenses, and accounts from QuickBooks Online.",
+  "ConnectorsPanel.appQuickbooksDescription": "Read invoices, expenses, and accounts from QuickBooks Online.",
   "ConnectorsPanel.appPosthogLabel": "PostHog",
-  "ConnectorsPanel.appPosthogDescription":
-    "Query product analytics, feature flags, and session data.",
+  "ConnectorsPanel.appPosthogDescription": "Query product analytics, feature flags, and session data.",
   "ConnectorsPanel.appHubspotLabel": "HubSpot",
-  "ConnectorsPanel.appHubspotDescription":
-    "Read and update contacts, deals, and companies in HubSpot.",
+  "ConnectorsPanel.appHubspotDescription": "Read and update contacts, deals, and companies in HubSpot.",
   "ConnectorsPanel.appDocusignLabel": "DocuSign",
-  "ConnectorsPanel.appDocusignDescription":
-    "Send, track, and manage envelopes and signatures.",
+  "ConnectorsPanel.appDocusignDescription": "Send, track, and manage envelopes and signatures.",
   "ConnectorsPanel.appEgnyteLabel": "Egnyte",
-  "ConnectorsPanel.appEgnyteDescription":
-    "Search, read, and organize files stored in Egnyte.",
+  "ConnectorsPanel.appEgnyteDescription": "Search, read, and organize files stored in Egnyte.",
   "ConnectorsPanel.connectHeading": "Connect a new account",
   "ConnectorsPanel.providerGithub": "GitHub",
   "ConnectorsPanel.providerSlack": "Slack",
   "ConnectorsPanel.providerNotion": "Notion",
   "ConnectorsPanel.providerJira": "Jira / Confluence",
   "ConnectorsPanel.providerS3": "S3 / R2",
-  "ConnectorsPanel.githubCopy":
-    "Uses your existing gh CLI login — no token pasted here. Run `gh auth login` first if you haven't already.",
+  "ConnectorsPanel.githubCopy": "Uses your existing gh CLI login — no token pasted here. Run `gh auth login` first if you haven't already.",
   "ConnectorsPanel.githubConnectButton": "Connect via gh CLI",
   "ConnectorsPanel.githubConnectedAs": "Connected as {{login}}",
   "ConnectorsPanel.connectingButton": "Connecting…",
-  "ConnectorsPanel.slackCopy":
-    "Bot token — can read channels/messages you invite it to and post messages. Stored in your OS keychain only.",
-  "ConnectorsPanel.notionCopy":
-    "Integration token — can read pages and comments shared with the integration. Stored in your OS keychain only.",
-  "ConnectorsPanel.jiraCopy":
-    "API token — can read issues, comments, and Confluence pages your account can see. Stored in your OS keychain only.",
-  "ConnectorsPanel.s3Copy":
-    "Access key + secret key — read-only bucket access, used only to verify the bucket exists and is reachable. Secret key stored in your OS keychain only.",
+  "ConnectorsPanel.slackCopy": "Bot token — can read channels/messages you invite it to and post messages. Stored in your OS keychain only.",
+  "ConnectorsPanel.notionCopy": "Integration token — can read pages and comments shared with the integration. Stored in your OS keychain only.",
+  "ConnectorsPanel.jiraCopy": "API token — can read issues, comments, and Confluence pages your account can see. Stored in your OS keychain only.",
+  "ConnectorsPanel.s3Copy": "Access key + secret key — read-only bucket access, used only to verify the bucket exists and is reachable. Secret key stored in your OS keychain only.",
   "ConnectorsPanel.slackTokenPlaceholder": "Bot token (xoxb-…)",
-  "ConnectorsPanel.notionTokenPlaceholder":
-    "Internal integration token (ntn_… / secret_…)",
+  "ConnectorsPanel.notionTokenPlaceholder": "Internal integration token (ntn_… / secret_…)",
   "ConnectorsPanel.jiraTokenPlaceholder": "API token",
-  "ConnectorsPanel.labelPlaceholder": 'Label, e.g. "Team workspace"',
+  "ConnectorsPanel.labelPlaceholder": "Label, e.g. \"Team workspace\"",
   "ConnectorsPanel.jiraEmailPlaceholder": "Account email",
-  "ConnectorsPanel.jiraSiteUrlPlaceholder":
-    "Site URL, e.g. https://acme.atlassian.net",
+  "ConnectorsPanel.jiraSiteUrlPlaceholder": "Site URL, e.g. https://acme.atlassian.net",
   "ConnectorsPanel.cancelButton": "Cancel",
   "ConnectorsPanel.verifyingButton": "Verifying…",
   "ConnectorsPanel.verifyAndSaveButton": "Verify & save",
   "ConnectorsPanel.connectButton": "Connect",
-  "ConnectorsPanel.s3EndpointPlaceholder":
-    "Endpoint, e.g. https://s3.us-east-1.amazonaws.com",
+  "ConnectorsPanel.s3EndpointPlaceholder": "Endpoint, e.g. https://s3.us-east-1.amazonaws.com",
   "ConnectorsPanel.s3BucketPlaceholder": "Bucket name",
   "ConnectorsPanel.s3RegionPlaceholder": "Region",
   "ConnectorsPanel.s3AccessKeyPlaceholder": "Access key",
@@ -2461,44 +2064,36 @@ export const en: Record<string, string> = {
   "ConnectorsPanel.removeButton": "Remove",
   "ConnectorsPanel.lastVerifiedLabel": "Last verified {{date}}",
   "ConnectorsPanel.auditHeading": "Audit export",
-  "ConnectorsPanel.auditDescription":
-    "A redacted report — id, provider, label, scopes, and verification history. Never includes a token or keychain reference.",
+  "ConnectorsPanel.auditDescription": "A redacted report — id, provider, label, scopes, and verification history. Never includes a token or keychain reference.",
   "ConnectorsPanel.mcpServersHeading": "MCP servers",
-  "ConnectorsPanel.mcpServersDescription":
-    "Raw Model Context Protocol connections — local processes or custom HTTP endpoints, with per-tool allowlisting, timeouts, and manual bearer tokens. The app connectors above use this same mechanism under the hood.",
+  "ConnectorsPanel.mcpServersDescription": "Raw Model Context Protocol connections — local processes or custom HTTP endpoints, with per-tool allowlisting, timeouts, and manual bearer tokens. The app connectors above use this same mechanism under the hood.",
   "ConnectorsPanel.exportingButton": "Exporting…",
   "ConnectorsPanel.exportAuditButton": "Export audit report",
   "AddMcpServerForm.heading": "Add MCP server",
   "AddMcpServerForm.transportStdioLabel": "Stdio (local command)",
   "AddMcpServerForm.transportHttpLabel": "HTTP (remote server)",
-  "AddMcpServerForm.labelPlaceholder": 'Label, e.g. "GitHub"',
-  "AddMcpServerForm.commandPlaceholder":
-    "Command, e.g. npx -y @modelcontextprotocol/server-github",
+  "AddMcpServerForm.labelPlaceholder": "Label, e.g. \"GitHub\"",
+  "AddMcpServerForm.commandPlaceholder": "Command, e.g. npx -y @modelcontextprotocol/server-github",
   "AddMcpServerForm.urlPlaceholder": "Server URL, e.g. https://example.com/mcp",
   "AddMcpServerForm.argsLabel": "Arguments (one per line)",
   "AddMcpServerForm.argsPlaceholder": "--flag\nvalue",
   "AddMcpServerForm.envLabel": "Environment variables",
-  "AddMcpServerForm.envHelpText":
-    "Stdio env values are saved in mcp_servers.json. Keep long-lived secrets in your shell environment or use HTTP tokens, which are keychain-backed.",
+  "AddMcpServerForm.envHelpText": "Stdio env values are saved in mcp_servers.json. Keep long-lived secrets in your shell environment or use HTTP tokens, which are keychain-backed.",
   "AddMcpServerForm.envKeyPlaceholder": "KEY",
   "AddMcpServerForm.envValuePlaceholder": "value",
   "AddMcpServerForm.removeEnvRowAriaLabel": "Remove this environment variable",
   "AddMcpServerForm.addEnvRowButton": "Add variable",
   "AddMcpServerForm.tokenLabel": "Bearer token (optional)",
   "AddMcpServerForm.tokenPlaceholder": "Paste a bearer token…",
-  "AddMcpServerForm.tokenHelpText":
-    "Stored in your OS keychain — never written to mcp_servers.json.",
+  "AddMcpServerForm.tokenHelpText": "Stored in your OS keychain — never written to mcp_servers.json.",
   "AddMcpServerForm.timeoutLabel": "Timeout in seconds (optional)",
   "AddMcpServerForm.timeoutPlaceholder": "60",
-  "AddMcpServerForm.helpText":
-    "Stdio servers run as a child process on your machine; HTTP servers connect to a remote endpoint.",
+  "AddMcpServerForm.helpText": "Stdio servers run as a child process on your machine; HTTP servers connect to a remote endpoint.",
   "AddMcpServerForm.addButton": "Add server",
   "AddMcpServerForm.addingButton": "Adding…",
   "SettingsModal.tabPrompts": "Skills",
-  "PromptLibraryPanel.description":
-    'Save reusable snippets, personas, and procedural skills, then invoke them by typing "/" in chat.',
-  "PromptLibraryPanel.emptyState":
-    "No saved prompts yet. Add a snippet, persona, or skill below.",
+  "PromptLibraryPanel.description": "Save reusable snippets, personas, and procedural skills, then invoke them by typing \"/\" in chat.",
+  "PromptLibraryPanel.emptyState": "No saved prompts yet. Add a snippet, persona, or skill below.",
   "PromptLibraryPanel.personaBadge": "Persona",
   "PromptLibraryPanel.snippetBadge": "Snippet",
   "PromptLibraryPanel.skillBadge": "Skill",
@@ -2512,30 +2107,24 @@ export const en: Record<string, string> = {
   "PromptLibraryPanel.createHeading": "New prompt",
   "PromptLibraryPanel.editHeading": "Edit prompt",
   "PromptLibraryPanel.kindSnippetLabel": "Snippet (inserted into the composer)",
-  "PromptLibraryPanel.kindPersonaLabel":
-    "Persona (shapes the whole conversation via the system prompt)",
-  "PromptLibraryPanel.kindSkillLabel":
-    "Skill (task-scoped instructions invoked with /command)",
-  "PromptLibraryPanel.namePlaceholder": 'Name, e.g. "Code Reviewer"',
+  "PromptLibraryPanel.kindPersonaLabel": "Persona (shapes the whole conversation via the system prompt)",
+  "PromptLibraryPanel.kindSkillLabel": "Skill (task-scoped instructions invoked with /command)",
+  "PromptLibraryPanel.namePlaceholder": "Name, e.g. \"Code Reviewer\"",
   "PromptLibraryPanel.commandPlaceholder": "slash-command",
   "PromptLibraryPanel.contentPlaceholder": "The prompt or snippet text…",
-  "PromptLibraryPanel.descriptionPlaceholder":
-    "Description (optional, shown in the autocomplete)",
+  "PromptLibraryPanel.descriptionPlaceholder": "Description (optional, shown in the autocomplete)",
   "PromptLibraryPanel.cancelButton": "Cancel",
   "PromptLibraryPanel.createButton": "Create",
   "PromptLibraryPanel.saveButton": "Save",
   "PromptLibraryPanel.addButton": "Add prompt",
   "PromptLibraryPanel.nameRequiredError": "Name is required.",
   "PromptLibraryPanel.commandRequiredError": "Command is required.",
-  "PromptLibraryPanel.commandFormatError":
-    "Command must be 1-32 lowercase letters, digits, or hyphens.",
-  "PromptLibraryPanel.commandTakenError":
-    "Another prompt already uses this command.",
+  "PromptLibraryPanel.commandFormatError": "Command must be 1-32 lowercase letters, digits, or hyphens.",
+  "PromptLibraryPanel.commandTakenError": "Another prompt already uses this command.",
   "PromptLibraryPanel.contentRequiredError": "Content is required.",
   "PromptLibraryPanel.exportButton": "Export…",
   "PromptLibraryPanel.importButton": "Import…",
-  "PromptLibraryPanel.importEmptyError":
-    "That file doesn't contain any prompts.",
+  "PromptLibraryPanel.importEmptyError": "That file doesn't contain any prompts.",
   "PromptLibraryPanel.importPreviewMessage": "Import {{count}} prompt(s)?",
   "PromptLibraryPanel.importConfirmButton": "Import",
   "PromptLibraryPanel.importSuccess": "Imported {{count}} prompt(s).",
@@ -2545,25 +2134,19 @@ export const en: Record<string, string> = {
   "SlashCommandAutocomplete.skillBadge": "Skill",
   "ChatWindow.activeSkillsLabel": "Skills active for this turn",
   "PersonaSelector.noneLabel": "None",
-  "PersonaSelector.emptyState":
-    "No personas saved yet — add one in the Prompts tab.",
+  "PersonaSelector.emptyState": "No personas saved yet — add one in the Prompts tab.",
   "PersonaSelector.managePromptsLabel": "Manage prompts…",
   "SettingsModal.tabWeb": "Web",
-  "WebPanel.description":
-    "Let the agent research the web with web_search and read pages with web_fetch. Every call still prompts for permission — this toggle only controls whether the tools are offered to the model at all.",
+  "WebPanel.description": "Let the agent research the web with web_search and read pages with web_fetch. Every call still prompts for permission — this toggle only controls whether the tools are offered to the model at all.",
   "WebPanel.enableToggleLabel": "Enable web tools",
-  "WebPanel.enableToggleDescription":
-    "Offers web_fetch and web_search to the model. Turning this off doesn't revoke anything already granted — it just makes both tools invisible, the same way disabling Memory does for the remember tool.",
+  "WebPanel.enableToggleDescription": "Offers web_fetch and web_search to the model. Turning this off doesn't revoke anything already granted — it just makes both tools invisible, the same way disabling Memory does for the remember tool.",
   "WebPanel.providerHeading": "Search provider",
   "WebPanel.providerDuckduckgoLabel": "DuckDuckGo (default, no key needed)",
-  "WebPanel.providerDuckduckgoDescription":
-    "Scrapes DuckDuckGo's keyless HTML results page. Works out of the box, but is unofficial and can break or get rate-limited without notice.",
+  "WebPanel.providerDuckduckgoDescription": "Scrapes DuckDuckGo's keyless HTML results page. Works out of the box, but is unofficial and can break or get rate-limited without notice.",
   "WebPanel.providerBraveLabel": "Brave Search",
-  "WebPanel.providerBraveDescription":
-    "Official API, needs a key (add one below) — more reliable than DuckDuckGo's keyless page.",
+  "WebPanel.providerBraveDescription": "Official API, needs a key (add one below) — more reliable than DuckDuckGo's keyless page.",
   "WebPanel.providerSearxngLabel": "SearXNG",
-  "WebPanel.providerSearxngDescription":
-    "Your own or a trusted public SearXNG instance (base URL below). No key needed.",
+  "WebPanel.providerSearxngDescription": "Your own or a trusted public SearXNG instance (base URL below). No key needed.",
   "WebPanel.braveKeyLabel": "Brave API key",
   "WebPanel.braveKeySaved": "Key saved",
   "WebPanel.braveKeyRemoveButton": "Remove key",
@@ -2575,20 +2158,15 @@ export const en: Record<string, string> = {
   "WebPanel.searxngUrlPlaceholder": "https://searx.example.com",
   "WebPanel.searxngUrlSaveButton": "Save",
   "WebPanel.searxngUrlSavingButton": "Saving…",
-  "WebPanel.searxngFormatsHint":
-    'The instance must enable "formats: [html, json]" in its settings.yml, or searches will fail with HTTP 403.',
+  "WebPanel.searxngFormatsHint": "The instance must enable \"formats: [html, json]\" in its settings.yml, or searches will fail with HTTP 403.",
   "WebPanel.advancedHeading": "Advanced",
   "WebPanel.allowLocalNetworkLabel": "Allow fetching local-network addresses",
-  "WebPanel.allowLocalNetworkDescription":
-    "Lets web_fetch/web_search target loopback and private-network hosts.",
-  "WebPanel.allowLocalNetworkWarning":
-    "Warning: enabling this exposes any service listening on your machine or local network — including llama-server (:8090) and Ollama (:11434) — to whatever URL the model is told to fetch. Leave this off unless you specifically need it.",
+  "WebPanel.allowLocalNetworkDescription": "Lets web_fetch/web_search target loopback and private-network hosts.",
+  "WebPanel.allowLocalNetworkWarning": "Warning: enabling this exposes any service listening on your machine or local network — including llama-server (:8090) and Ollama (:11434) — to whatever URL the model is told to fetch. Leave this off unless you specifically need it.",
   "CliInstallSection.heading": "Terminal CLI",
-  "CliInstallSection.description":
-    "Little Monkey includes a terminal agent (monkey). This controls whether it's automatically installed onto your PATH.",
+  "CliInstallSection.description": "Little Monkey includes a terminal agent (monkey). This controls whether it's automatically installed onto your PATH.",
   "CliInstallSection.toggleLabel": "Install monkey command automatically",
-  "CliInstallSection.toggleDescription":
-    "Symlinks (macOS/Linux) or adds to your user PATH (Windows) on launch. Turning this off removes it immediately, not just on the next launch.",
+  "CliInstallSection.toggleDescription": "Symlinks (macOS/Linux) or adds to your user PATH (Windows) on launch. Turning this off removes it immediately, not just on the next launch.",
   "CliInstallSection.installedOnPath": "Installed",
   "CliInstallSection.installedNotOnPath": "Installed, not on PATH",
   "CliInstallSection.notInstalled": "Not installed",
@@ -2597,14 +2175,12 @@ export const en: Record<string, string> = {
   "SettingsModal.tabApiServer": "API Server",
   "SettingsModal.tabKnowledge": "Knowledge",
   "KnowledgePanel.embedServerHeading": "Local embedding server",
-  "KnowledgePanel.embedServerDescription":
-    "A managed llama.cpp instance used to embed your stacks' content and search queries.",
+  "KnowledgePanel.embedServerDescription": "A managed llama.cpp instance used to embed your stacks' content and search queries.",
   "KnowledgePanel.embedStatus_stopped": "Stopped",
   "KnowledgePanel.embedStatus_starting": "Starting…",
   "KnowledgePanel.embedStatus_ready": "Ready",
   "KnowledgePanel.embedStatus_error": "Error",
-  "KnowledgePanel.selectDownloadedModelPlaceholder":
-    "Select a downloaded embedding model…",
+  "KnowledgePanel.selectDownloadedModelPlaceholder": "Select a downloaded embedding model…",
   "KnowledgePanel.embedServerStartButton": "Start",
   "KnowledgePanel.embedServerStopButton": "Stop",
   "KnowledgePanel.embeddingModelsHeading": "Embedding models",
@@ -2616,24 +2192,20 @@ export const en: Record<string, string> = {
   "KnowledgePanel.backendLlama": "Local (llama.cpp)",
   "KnowledgePanel.backendOllama": "Ollama",
   "KnowledgePanel.modelLabel": "Embedding model",
-  "KnowledgePanel.ollamaTagPlaceholder":
-    "Ollama embedding tag (e.g. nomic-embed-text)",
+  "KnowledgePanel.ollamaTagPlaceholder": "Ollama embedding tag (e.g. nomic-embed-text)",
   "KnowledgePanel.selectModelError": "Select an embedding model first.",
   "KnowledgePanel.enterOllamaTagError": "Enter an Ollama embedding tag.",
   "KnowledgePanel.cancelButton": "Cancel",
   "KnowledgePanel.createSubmit": "Create",
-  "KnowledgePanel.emptyState":
-    "No knowledge stacks yet. Create one to index folders or files for semantic search.",
-  "KnowledgePanel.confirmDelete":
-    'Delete stack "{{name}}"? This removes its index permanently.',
+  "KnowledgePanel.emptyState": "No knowledge stacks yet. Create one to index folders or files for semantic search.",
+  "KnowledgePanel.confirmDelete": "Delete stack \"{{name}}\"? This removes its index permanently.",
   "KnowledgePanel.renamePrompt": "Rename stack",
   "KnowledgePanel.renameButton": "Rename",
   "KnowledgePanel.deleteButton": "Delete",
   "KnowledgePanel.sourcesHeading": "Sources",
   "KnowledgePanel.addFolderButton": "Add folder",
   "KnowledgePanel.addFileButton": "Add file",
-  "KnowledgePanel.noSourcesHint":
-    "No sources yet — add a folder or file to index.",
+  "KnowledgePanel.noSourcesHint": "No sources yet — add a folder or file to index.",
   "KnowledgePanel.removeSourceAriaLabel": "Remove source",
   "KnowledgePanel.neverIndexed": "Not indexed yet",
   "KnowledgePanel.indexedAt": "Indexed {{when}} · {{count}} chunks",
@@ -2648,8 +2220,7 @@ export const en: Record<string, string> = {
   "KnowledgePanel.searchingLabel": "Searching…",
   "KnowledgePanel.noResults": "No results",
   "KnowledgePanel.scoreLabel": "score {{score}}",
-  "KnowledgeV2Panel.stackSelectorAriaLabel":
-    "Stack to configure — also expands that stack above",
+  "KnowledgeV2Panel.stackSelectorAriaLabel": "Stack to configure — also expands that stack above",
   "KnowledgeV2Panel.connectorGitHubRepo": "GitHub repository",
   "KnowledgeV2Panel.connectorS3Bucket": "S3 / R2 bucket",
   "KnowledgeV2Panel.connectorWatchedFolder": "Watched folder (auto-refresh)",
@@ -2658,8 +2229,7 @@ export const en: Record<string, string> = {
   "KnowledgeV2Panel.connectorJiraProject": "Jira project",
   "KnowledgeV2Panel.connectorAccountLabel": "Connector account",
   "KnowledgeV2Panel.connectorAccountNoneOption": "No connected account yet",
-  "KnowledgeV2Panel.connectorAccountMissingHint":
-    "Connect an account for this provider in Settings → Connectors first.",
+  "KnowledgeV2Panel.connectorAccountMissingHint": "Connect an account for this provider in Settings → Connectors first.",
   "KnowledgeV2Panel.githubOwnerLabel": "Owner",
   "KnowledgeV2Panel.githubRepoLabel": "Repository",
   "KnowledgeV2Panel.githubRefLabel": "Branch / ref (optional)",
@@ -2672,10 +2242,8 @@ export const en: Record<string, string> = {
   "KnowledgeV2Panel.notionRootIdLabel": "Root page or database id",
   "KnowledgeV2Panel.slackChannelIdsLabel": "Channel ids (comma-separated)",
   "KnowledgeV2Panel.jiraProjectKeyLabel": "Project key",
-  "KnowledgeV2Panel.connectorNonGoalsNote":
-    "SharePoint and Google Drive are not offered here — both require a registered OAuth app, which is out of scope for this connector catalog. GitLab is a possible future addition, not yet built.",
-  "ScheduledTasksPanel.description":
-    "Saved recipes — YAML tasks with a prompt, model target, and permission policy — runnable here or headlessly via `monkey task run`.",
+  "KnowledgeV2Panel.connectorNonGoalsNote": "SharePoint and Google Drive are not offered here — both require a registered OAuth app, which is out of scope for this connector catalog. GitLab is a possible future addition, not yet built.",
+  "ScheduledTasksPanel.description": "Saved recipes — YAML tasks with a prompt, model target, and permission policy — runnable here or headlessly via `monkey task run`.",
   "ScheduledTasksPanel.newRecipe": "New recipe",
   "ScheduledTasksPanel.runNow": "Run now",
   "ScheduledTasksPanel.edit": "Edit",
@@ -2684,8 +2252,7 @@ export const en: Record<string, string> = {
   "ScheduledTasksPanel.save": "Save",
   "ScheduledTasksPanel.cancel": "Cancel",
   "ScheduledTasksPanel.loading": "Loading recipes…",
-  "ScheduledTasksPanel.empty":
-    "No recipes yet. Create one, or add a .yml file to .littlemonkey/recipes/ in your workspace.",
+  "ScheduledTasksPanel.empty": "No recipes yet. Create one, or add a .yml file to .littlemonkey/recipes/ in your workspace.",
   "ScheduledTasksPanel.newRecipeTitle": "New recipe",
   "ScheduledTasksPanel.editRecipeTitle": "Editing: {{name}}",
   "ScheduledTasksPanel.validateOk": "Valid recipe: {{name}}",
@@ -2693,29 +2260,21 @@ export const en: Record<string, string> = {
   "ScheduledTasksPanel.lastRun": "last run {{time}}",
   "ScheduledTasksPanel.lastDaemonDelivery": "last daemon delivery {{time}}",
   "ScheduledTasksPanel.viewSession": "View session",
-  "ScheduledTasksPanel.schedulerDaemonRunning":
-    "Persistent daemon authority is active. Enabled schedules continue after every Little Monkey window closes.",
-  "ScheduledTasksPanel.schedulerDaemonStopped":
-    "The installed daemon still owns these schedules but its service is stopped. Schedules are paused; in-app fallback stays off to prevent duplicate runs.",
+  "ScheduledTasksPanel.schedulerDaemonRunning": "Persistent daemon authority is active. Enabled schedules continue after every Little Monkey window closes.",
+  "ScheduledTasksPanel.schedulerDaemonStopped": "The installed daemon still owns these schedules but its service is stopped. Schedules are paused; in-app fallback stays off to prevent duplicate runs.",
   "ScheduledTasksPanel.deleteSchedule": "Delete schedule",
-  "ScheduledTasksPanel.schedulerInApp":
-    "In-app fallback is active because no daemon is installed. Schedules run only while Little Monkey is open.",
-  "ScheduledTasksPanel.schedulerUnknown":
-    "Schedule authority cannot be verified, so automatic runs are paused to prevent duplicate execution.",
+  "ScheduledTasksPanel.schedulerInApp": "In-app fallback is active because no daemon is installed. Schedules run only while Little Monkey is open.",
+  "ScheduledTasksPanel.schedulerUnknown": "Schedule authority cannot be verified, so automatic runs are paused to prevent duplicate execution.",
   "StackPicker.noneLabel": "Knowledge",
   "StackPicker.attachedCount": "{{count}} stack(s)",
-  "StackPicker.emptyState":
-    "No knowledge stacks yet — add one in the Knowledge tab.",
+  "StackPicker.emptyState": "No knowledge stacks yet — add one in the Knowledge tab.",
   "StackPicker.chunkCount": "{{count}} chunks indexed",
   "StackPicker.notIndexed": "Not indexed yet",
   "StackPicker.docChatToggleLabel": "Doc-chat mode",
-  "StackPicker.docChatToggleDescription":
-    "Auto-retrieve relevant passages from attached stacks before every reply and cite sources.",
-  "ApiServerPanel.description":
-    "Expose the models Little Monkey manages — the running local model and every pulled Ollama tag — over a local OpenAI-compatible endpoint, so any app that speaks the OpenAI API (IDEs, scripts, other AI tools) can use them.",
+  "StackPicker.docChatToggleDescription": "Auto-retrieve relevant passages from attached stacks before every reply and cite sources.",
+  "ApiServerPanel.description": "Expose the models Little Monkey manages — the running local model and every pulled Ollama tag — over a local OpenAI-compatible endpoint, so any app that speaks the OpenAI API (IDEs, scripts, other AI tools) can use them.",
   "ApiServerPanel.enableToggleLabel": "Run local API server",
-  "ApiServerPanel.enableToggleDescription":
-    "Binds to 127.0.0.1 only — never reachable from other devices on your network. Off by default.",
+  "ApiServerPanel.enableToggleDescription": "Binds to 127.0.0.1 only — never reachable from other devices on your network. Off by default.",
   "ApiServerPanel.status.stopped": "Stopped",
   "ApiServerPanel.status.starting": "Starting…",
   "ApiServerPanel.status.running": "Running",
@@ -2724,8 +2283,7 @@ export const en: Record<string, string> = {
   "ApiServerPanel.lastRequestLabel": "Last request: {{time}}",
   "ApiServerPanel.connectionHeading": "Connection",
   "ApiServerPanel.portLabel": "Port",
-  "ApiServerPanel.portHint":
-    "Applies immediately — if the server is currently running, it restarts automatically to pick up the new port.",
+  "ApiServerPanel.portHint": "Applies immediately — if the server is currently running, it restarts automatically to pick up the new port.",
   "ApiServerPanel.portSaveButton": "Save",
   "ApiServerPanel.portSavingButton": "Saving…",
   "ApiServerPanel.baseUrlLabel": "Base URL",
@@ -2733,37 +2291,25 @@ export const en: Record<string, string> = {
   "ApiServerPanel.copiedButton": "Copied!",
   "ApiServerPanel.settingsHeading": "Settings",
   "ApiServerPanel.autostartLabel": "Start automatically",
-  "ApiServerPanel.autostartDescription":
-    "Runs the server as soon as Little Monkey launches, using whatever's saved here.",
+  "ApiServerPanel.autostartDescription": "Runs the server as soon as Little Monkey launches, using whatever's saved here.",
   "ApiServerPanel.requireTokenLabel": "Require a bearer token",
-  "ApiServerPanel.requireTokenDescription":
-    "Turning this off is an escape hatch for tools that can't set headers.",
-  "ApiServerPanel.requireTokenOffWarning":
-    "Any local process can reach this server with no credential at all while this is off.",
+  "ApiServerPanel.requireTokenDescription": "Turning this off is an escape hatch for tools that can't set headers.",
+  "ApiServerPanel.requireTokenOffWarning": "Any local process can reach this server with no credential at all while this is off.",
   "ApiServerPanel.exposeOllamaLabel": "Expose Ollama models",
-  "ApiServerPanel.exposeOllamaDescription":
-    "List and serve every pulled Ollama tag through this endpoint too, not just the managed local model.",
+  "ApiServerPanel.exposeOllamaDescription": "List and serve every pulled Ollama tag through this endpoint too, not just the managed local model.",
   "ApiServerPanel.exposeProvidersLabel": "Expose cloud providers",
-  "ApiServerPanel.exposeProvidersDescription":
-    "Route requests to your connected cloud AI providers (OpenAI, Anthropic, …) through this endpoint.",
-  "ApiServerPanel.exposeProvidersConfirmMessage":
-    'Any local app with a token scoped to "providers" will be able to spend your cloud API credits through this endpoint. Turn this on?',
+  "ApiServerPanel.exposeProvidersDescription": "Route requests to your connected cloud AI providers (OpenAI, Anthropic, …) through this endpoint.",
+  "ApiServerPanel.exposeProvidersConfirmMessage": "Any local app with a token scoped to \"providers\" will be able to spend your cloud API credits through this endpoint. Turn this on?",
   "ApiServerPanel.exposeProvidersConfirmButton": "Turn on",
   "ApiServerPanel.exposeProvidersCancelButton": "Cancel",
-  "ApiServerPanel.exposeProvidersWarning":
-    'Any local app with a "providers"-scoped token can spend your cloud API credits through this endpoint.',
-  "ApiServerPanel.pairingMigrationHeading":
-    "Use Runtime Hub pairing for new clients",
-  "ApiServerPanel.pairingMigrationDescription":
-    "New IDEs, scripts, agents, and widgets should receive a scoped pairing token in Runtime Hub › LAN. Existing legacy tokens remain accepted during migration, and published Local Apps keep their embedded restricted tokens.",
+  "ApiServerPanel.exposeProvidersWarning": "Any local app with a \"providers\"-scoped token can spend your cloud API credits through this endpoint.",
+  "ApiServerPanel.pairingMigrationHeading": "Use Runtime Hub pairing for new clients",
+  "ApiServerPanel.pairingMigrationDescription": "New IDEs, scripts, agents, and widgets should receive a scoped pairing token in Runtime Hub › LAN. Existing legacy tokens remain accepted during migration, and published Local Apps keep their embedded restricted tokens.",
   "ApiServerPanel.pairingMigrationButton": "Open Runtime Hub pairing",
   "ApiServerPanel.tokensHeading": "Legacy token compatibility",
-  "ApiServerPanel.tokensEmptyState":
-    "No legacy tokens are stored on this device.",
-  "ApiServerPanel.legacyTokensDescription":
-    "Existing legacy tokens remain visible so you can audit or revoke them. General-purpose minting is retired; publishing a Local App still creates its restricted compatibility token automatically.",
-  "ApiServerPanel.mintedTokenWarning":
-    "Copy this token now — you won't see it again.",
+  "ApiServerPanel.tokensEmptyState": "No legacy tokens are stored on this device.",
+  "ApiServerPanel.legacyTokensDescription": "Existing legacy tokens remain visible so you can audit or revoke them. General-purpose minting is retired; publishing a Local App still creates its restricted compatibility token automatically.",
+  "ApiServerPanel.mintedTokenWarning": "Copy this token now — you won't see it again.",
   "ApiServerPanel.mintedTokenDismissButton": "Done",
   "ApiServerPanel.neverUsedLabel": "never used",
   "ApiServerPanel.createdLabel": "Created {{date}}",
@@ -2772,7 +2318,7 @@ export const en: Record<string, string> = {
   "ApiServerPanel.revokeConfirmButton": "Confirm revoke",
   "ApiServerPanel.revokeCancelButton": "Cancel",
   "ApiServerPanel.createTokenHeading": "Create a token",
-  "ApiServerPanel.createTokenLabelPlaceholder": 'Label, e.g. "My IDE"',
+  "ApiServerPanel.createTokenLabelPlaceholder": "Label, e.g. \"My IDE\"",
   "ApiServerPanel.createTokenScopesLabel": "Scopes",
   "ApiServerPanel.createTokenBackendsLabel": "Backends",
   "ApiServerPanel.createTokenButton": "Create token",
@@ -2798,8 +2344,7 @@ export const en: Record<string, string> = {
   "ApiServerPanel.expiredLabel": "Expired {{date}}",
   "ApiServerPanel.neverExpiresLabel": "never expires",
   "ApiServerPanel.auditHeading": "Audit log",
-  "ApiServerPanel.auditDescription":
-    "Every token ever created, active or revoked — never shows the token digest or plaintext.",
+  "ApiServerPanel.auditDescription": "Every token ever created, active or revoked — never shows the token digest or plaintext.",
   "ApiServerPanel.auditRefreshButton": "Refresh",
   "ApiServerPanel.auditRefreshingButton": "Refreshing…",
   "ApiServerPanel.auditCopyButton": "Copy JSON",
@@ -2810,27 +2355,21 @@ export const en: Record<string, string> = {
   "ApiServerPanel.auditRevokedBadge": "Revoked",
   "ApiServerPanel.auditRevokedLabel": "Revoked {{date}}",
   "ApiServerPanel.widgetHeading": "Widget",
-  "ApiServerPanel.widgetDescription":
-    "Generate an embeddable chat widget for an internal site or homelab portal. Pair a dedicated chat-only client in Runtime Hub › LAN, copy its one-time token, then paste it below.",
+  "ApiServerPanel.widgetDescription": "Generate an embeddable chat widget for an internal site or homelab portal. Pair a dedicated chat-only client in Runtime Hub › LAN, copy its one-time token, then paste it below.",
   "ApiServerPanel.widgetNoTokensState": "Create a token above first.",
   "ApiServerPanel.widgetTokenLabel": "Reference token",
-  "ApiServerPanel.widgetScopeWarning":
-    "This token isn't scoped for \"chat\" — the widget won't be able to send messages with it.",
-  "ApiServerPanel.widgetBroadScopeWarning":
-    "This token also carries {{scopes}} — anyone who views this page's source can read the embedded plaintext. Mint a chat-only token for the widget instead.",
+  "ApiServerPanel.widgetScopeWarning": "This token isn't scoped for \"chat\" — the widget won't be able to send messages with it.",
+  "ApiServerPanel.widgetBroadScopeWarning": "This token also carries {{scopes}} — anyone who views this page's source can read the embedded plaintext. Mint a chat-only token for the widget instead.",
   "ApiServerPanel.widgetPasteTokenLabel": "Paired chat token",
-  "ApiServerPanel.widgetPasteTokenPlaceholder":
-    "Paste the one-time token from Runtime Hub pairing",
+  "ApiServerPanel.widgetPasteTokenPlaceholder": "Paste the one-time token from Runtime Hub pairing",
   "ApiServerPanel.widgetTitleLabel": "Widget title (optional)",
   "ApiServerPanel.widgetTitlePlaceholder": "Ask the homelab",
   "ApiServerPanel.widgetModelLabel": "Model (optional)",
   "ApiServerPanel.widgetModelPlaceholder": "qwen2.5-7b-instruct",
   "ApiServerPanel.widgetSnippetLabel": "Embed snippet",
   "ApiServerPanel.widgetCopySnippetButton": "Copy snippet",
-  "ApiServerPanel.widgetSnippetHint":
-    "Use a dedicated chat-only pairing token: anyone who can view the embedding page's source can read its plaintext.",
-  "UsagePanel.description":
-    "Token usage tracked since this device started recording it — nothing is sent anywhere, this is local to your machine.",
+  "ApiServerPanel.widgetSnippetHint": "Use a dedicated chat-only pairing token: anyone who can view the embedding page's source can read its plaintext.",
+  "UsagePanel.description": "Token usage tracked since this device started recording it — nothing is sent anywhere, this is local to your machine.",
   "UsagePanel.statLifetime": "Lifetime tokens",
   "UsagePanel.statPeak": "Peak tokens",
   "UsagePanel.statLongestTask": "Longest task",
@@ -2849,16 +2388,13 @@ export const en: Record<string, string> = {
   "UsagePanel.insightChatSessions": "Chat sessions",
   "UsagePanel.byModelHeading": "Most used models",
   "UsagePanel.modelTurns": "{{count}} turns",
-  "UsagePanel.emptyState":
-    "No usage recorded yet — token counts appear here once you start chatting.",
+  "UsagePanel.emptyState": "No usage recorded yet — token counts appear here once you start chatting.",
   "UsagePanel.clearButton": "Clear usage history",
-  "UsagePanel.clearConfirmMessage":
-    "Clear all recorded usage history? This can't be undone.",
+  "UsagePanel.clearConfirmMessage": "Clear all recorded usage history? This can't be undone.",
   "UsagePanel.clearConfirmButton": "Clear",
   "UsagePanel.clearCancelButton": "Cancel",
   "UsagePanel.costControlsHeading": "Cost attribution and budgets",
-  "UsagePanel.costControlsDescription":
-    "Configure exact per-model prices, attribute every reported usage event to its session and durable run, and warn or pause new cloud calls when a local daily or monthly budget is reached. Calls without a configured price stay visibly unknown.",
+  "UsagePanel.costControlsDescription": "Configure exact per-model prices, attribute every reported usage event to its session and durable run, and warn or pause new cloud calls when a local daily or monthly budget is reached. Calls without a configured price stay visibly unknown.",
   "UsagePanel.costControlsEnabled": "Enable budgets",
   "UsagePanel.dailyBudget": "Daily budget (USD)",
   "UsagePanel.monthlyBudget": "Monthly budget (USD)",
@@ -2876,23 +2412,19 @@ export const en: Record<string, string> = {
   "UsagePanel.costStatus.exceeded": "Limit reached",
   "UsagePanel.unknownPricedCalls": "{{count}} call(s) have unknown pricing",
   "UsagePanel.pricingHeading": "Provider model pricing",
-  "UsagePanel.pricingDescription":
-    "Prices are user-entered USD per one million tokens; the app never guesses provider pricing.",
+  "UsagePanel.pricingDescription": "Prices are user-entered USD per one million tokens; the app never guesses provider pricing.",
   "UsagePanel.model": "Provider model",
   "UsagePanel.inputPrice": "Input / 1M tokens",
   "UsagePanel.outputPrice": "Output / 1M tokens",
-  "UsagePanel.noProviderModels":
-    "Connect a cloud provider and load its model list to configure pricing.",
+  "UsagePanel.noProviderModels": "Connect a cloud provider and load its model list to configure pricing.",
   "UsagePanel.attributionHeading": "Attribution",
-  "UsagePanel.attributionDescription":
-    "Where the recorded spend went. A workspace is the folder that was open when the request was made — the same identity the process ledger stamps on what ran — so its device time is shown beside its token bill. A project is the folder the conversation itself belongs to, which differs once a chat outlives the folder it was started in. Anything recorded without one is counted under Unattributed rather than charged to a folder it may not belong to.",
+  "UsagePanel.attributionDescription": "Where the recorded spend went. A workspace is the folder that was open when the request was made — the same identity the process ledger stamps on what ran — so its device time is shown beside its token bill. A project is the folder the conversation itself belongs to, which differs once a chat outlives the folder it was started in. Anything recorded without one is counted under Unattributed rather than charged to a folder it may not belong to.",
   "UsagePanel.scope.workspace": "Workspace",
   "UsagePanel.scope.project": "Project",
   "UsagePanel.scope.session": "Session",
   "UsagePanel.scope.target": "Model",
   "UsagePanel.unattributed": "Unattributed",
-  "UsagePanel.attributionEmpty":
-    "No usage recorded yet — attribution appears here once a request is priced or a process exits.",
+  "UsagePanel.attributionEmpty": "No usage recorded yet — attribution appears here once a request is priced or a process exits.",
   "UsagePanel.colEstimatedSpend": "Estimated spend",
   "UsagePanel.colTokens": "Tokens",
   "UsagePanel.colUnpricedCalls": "Unpriced calls",
@@ -2901,38 +2433,30 @@ export const en: Record<string, string> = {
   "UsagePanel.colDevice_gpuDeviceMs": "GPU time",
   "UsagePanel.deviceUnmeasured": "not measured",
   "UsagePanel.deviceNoRows": "no processes recorded",
-  "UsagePanel.deviceLedgerUnavailable":
-    "Device time could not be read, so these columns are blank rather than zero: {{reason}}",
+  "UsagePanel.deviceLedgerUnavailable": "Device time could not be read, so these columns are blank rather than zero: {{reason}}",
   "UsagePanel.noRecordedCalls": "no calls",
   "UsagePanel.reconciliationHeading": "Provider billing reconciliation",
-  "UsagePanel.reconciliationDescription":
-    "Every figure above is an estimate computed from the rates you entered — this app cannot see your invoices and never will. Enter what a provider actually billed you for {{month}} and the drift against the estimate is shown. Recording a bill never rewrites the per-call estimates: a monthly total cannot be honestly split back across individual calls.",
-  "UsagePanel.reconciliationEmpty":
-    "Connect a cloud provider to reconcile its billing.",
+  "UsagePanel.reconciliationDescription": "Every figure above is an estimate computed from the rates you entered — this app cannot see your invoices and never will. Enter what a provider actually billed you for {{month}} and the drift against the estimate is shown. Recording a bill never rewrites the per-call estimates: a monthly total cannot be honestly split back across individual calls.",
+  "UsagePanel.reconciliationEmpty": "Connect a cloud provider to reconcile its billing.",
   "UsagePanel.colProvider": "Provider",
   "UsagePanel.colActualBilled": "Actually billed",
   "UsagePanel.colDrift": "Drift",
   "UsagePanel.actualBilledPlaceholder": "unknown",
   "GoldenDatasetBuilder.title": "Golden Dataset Builder",
-  "GoldenDatasetBuilder.subtitle":
-    "Generate labeled synthetic examples, mix in real ones through a privacy filter, and trace every example back to its source",
+  "GoldenDatasetBuilder.subtitle": "Generate labeled synthetic examples, mix in real ones through a privacy filter, and trace every example back to its source",
   "GoldenDatasetBuilder.close": "Close Golden Dataset Builder",
   "GoldenDatasetBuilder.selectDataset": "Select a dataset…",
   "GoldenDatasetBuilder.newDataset": "New dataset",
   "GoldenDatasetBuilder.deleteDataset": "Delete dataset",
-  "GoldenDatasetBuilder.datasetNamePlaceholder":
-    'Dataset name (e.g. "Support ticket triage")',
-  "GoldenDatasetBuilder.seedPlaceholder":
-    'Describe what this dataset should contain (e.g. "20 example support tickets with a category label")',
-  "GoldenDatasetBuilder.fieldsPlaceholder":
-    "Schema fields, comma-separated (e.g. text, category)",
+  "GoldenDatasetBuilder.datasetNamePlaceholder": "Dataset name (e.g. \"Support ticket triage\")",
+  "GoldenDatasetBuilder.seedPlaceholder": "Describe what this dataset should contain (e.g. \"20 example support tickets with a category label\")",
+  "GoldenDatasetBuilder.fieldsPlaceholder": "Schema fields, comma-separated (e.g. text, category)",
   "GoldenDatasetBuilder.createDataset": "Create dataset",
   "GoldenDatasetBuilder.cancel": "Cancel",
   "GoldenDatasetBuilder.generationError": "Failed: {{error}}",
   "GoldenDatasetBuilder.dismiss": "Dismiss",
   "GoldenDatasetBuilder.noDatasets": "No dataset selected",
-  "GoldenDatasetBuilder.noDatasetsHint":
-    "Create a dataset from a seed description and schema, then generate synthetic examples or import real ones.",
+  "GoldenDatasetBuilder.noDatasetsHint": "Create a dataset from a seed description and schema, then generate synthetic examples or import real ones.",
   "GoldenDatasetBuilder.seedHeading": "Seed description",
   "GoldenDatasetBuilder.noSeed": "No seed description set.",
   "GoldenDatasetBuilder.schemaFields": "Schema fields: {{fields}}",
@@ -2941,19 +2465,15 @@ export const en: Record<string, string> = {
   "GoldenDatasetBuilder.generate": "Generate examples",
   "GoldenDatasetBuilder.importReal": "Import real examples",
   "GoldenDatasetBuilder.runEval": "Run eval",
-  "GoldenDatasetBuilder.importHint":
-    'Paste a JSON array of objects matching the schema fields, or one example per line with fields separated by "|" in schema order. The same privacy filter used for synthetic examples runs on every imported row — rows that fail are flagged and excluded, never silently included.',
-  "GoldenDatasetBuilder.importSourcePlaceholder":
-    'Source label (e.g. "support-export.csv")',
+  "GoldenDatasetBuilder.importHint": "Paste a JSON array of objects matching the schema fields, or one example per line with fields separated by \"|\" in schema order. The same privacy filter used for synthetic examples runs on every imported row — rows that fail are flagged and excluded, never silently included.",
+  "GoldenDatasetBuilder.importSourcePlaceholder": "Source label (e.g. \"support-export.csv\")",
   "GoldenDatasetBuilder.importTextPlaceholder": "Paste real examples here…",
   "GoldenDatasetBuilder.importButton": "Import",
-  "GoldenDatasetBuilder.importResult":
-    "Imported {{imported}} example(s); {{skipped}} line(s) skipped (didn't match the schema).",
+  "GoldenDatasetBuilder.importResult": "Imported {{imported}} example(s); {{skipped}} line(s) skipped (didn't match the schema).",
   "GoldenDatasetBuilder.examplesCount": "{{count}} example(s)",
   "GoldenDatasetBuilder.includedCount": "{{count}} included",
   "GoldenDatasetBuilder.noExamplesYet": "No examples yet",
-  "GoldenDatasetBuilder.noExamplesHint":
-    "Generate synthetic examples or import real ones to get started.",
+  "GoldenDatasetBuilder.noExamplesHint": "Generate synthetic examples or import real ones to get started.",
   "GoldenDatasetBuilder.versionHistory": "Version history",
   "GoldenDatasetBuilder.versionEntry": "v{{version}} — {{note}}",
   "GoldenDatasetBuilder.exampleCountLabel": "{{count}} example(s)",
@@ -2978,28 +2498,20 @@ export const en: Record<string, string> = {
   "SettingsModal.tabDesktopControl": "Desktop Control",
 
   "DesktopControlPanel.title": "Safe Desktop Control (research spike)",
-  "DesktopControlPanel.disabledDescription":
-    "Lets Little Monkey move the mouse and send keystrokes on macOS, only inside an explicit, allowlisted, per-action-approved session — never from the model's own initiative, never from an unattended run. Off by default. Read docs/safe-desktop-control-design.md before enabling.",
-  "DesktopControlPanel.enabledDescription":
-    "A control session is a bounded window in which every mouse/keyboard action must be approved before it runs, unless the session was started in approved-batch mode. Emergency stop always works immediately.",
+  "DesktopControlPanel.disabledDescription": "Lets Little Monkey move the mouse and send keystrokes on macOS, only inside an explicit, allowlisted, per-action-approved session — never from the model's own initiative, never from an unattended run. Off by default. Read docs/safe-desktop-control-design.md before enabling.",
+  "DesktopControlPanel.enabledDescription": "A control session is a bounded window in which every mouse/keyboard action must be approved before it runs, unless the session was started in approved-batch mode. Emergency stop always works immediately.",
   "DesktopControlPanel.enableLabel": "Enable Safe Desktop Control",
-  "DesktopControlPanel.enableDescription":
-    "Research spike — off by default. Never reachable while permission mode is bypass, regardless of this setting.",
+  "DesktopControlPanel.enableDescription": "Research spike — off by default. Never reachable while permission mode is bypass, regardless of this setting.",
   "DesktopControlPanel.emergencyStopButton": "Emergency stop",
-  "DesktopControlPanel.emergencyStopStatus":
-    "Emergency stop: deactivated {{sessions}} session(s), cancelled {{actions}} pending action(s).",
+  "DesktopControlPanel.emergencyStopStatus": "Emergency stop: deactivated {{sessions}} session(s), cancelled {{actions}} pending action(s).",
   "DesktopControlPanel.startSessionHeading": "Start a session",
-  "DesktopControlPanel.startSessionDescription":
-    "Name every application or window this session may act within. Actions targeting anything else are rejected before they reach the input backend.",
-  "DesktopControlPanel.allowlistLabel":
-    "Allowed applications/windows (comma-separated)",
+  "DesktopControlPanel.startSessionDescription": "Name every application or window this session may act within. Actions targeting anything else are rejected before they reach the input backend.",
+  "DesktopControlPanel.allowlistLabel": "Allowed applications/windows (comma-separated)",
   "DesktopControlPanel.allowlistPlaceholder": "e.g. Notes, TextEdit",
   "DesktopControlPanel.lifetimeLabel": "Session length (minutes, max 30)",
-  "DesktopControlPanel.approvedBatchLabel":
-    "Approved batch mode (skip per-action approval for this session)",
+  "DesktopControlPanel.approvedBatchLabel": "Approved batch mode (skip per-action approval for this session)",
   "DesktopControlPanel.startSessionButton": "Start session",
-  "DesktopControlPanel.sessionStarted":
-    "Session started. The companion overlay is now visible as the on-screen indicator.",
+  "DesktopControlPanel.sessionStarted": "Session started. The companion overlay is now visible as the on-screen indicator.",
   "DesktopControlPanel.sessionStopped": "Session stopped.",
   "DesktopControlPanel.sessionsHeading": "Sessions",
   "DesktopControlPanel.noSessions": "No sessions yet.",
@@ -3008,21 +2520,16 @@ export const en: Record<string, string> = {
   "DesktopControlPanel.approvedBatchBadge": "approved batch",
   "DesktopControlPanel.stopSessionButton": "Stop",
   "DesktopControlPanel.pendingActionsHeading": "Pending actions",
-  "DesktopControlPanel.pendingActionsDescription":
-    "Every action from a non-batch session waits here until you approve or deny it.",
+  "DesktopControlPanel.pendingActionsDescription": "Every action from a non-batch session waits here until you approve or deny it.",
   "DesktopControlPanel.noPendingActions": "Nothing is waiting for approval.",
   "DesktopControlPanel.approveButton": "Approve",
   "DesktopControlPanel.denyButton": "Deny",
-  "DesktopControlPanel.actionDescriptionMouseMove":
-    "Move mouse to ({{x}}, {{y}})",
-  "DesktopControlPanel.actionDescriptionMouseClick":
-    "Click the {{button}} mouse button",
-  "DesktopControlPanel.actionDescriptionKeyPress": 'Press key "{{key}}"',
+  "DesktopControlPanel.actionDescriptionMouseMove": "Move mouse to ({{x}}, {{y}})",
+  "DesktopControlPanel.actionDescriptionMouseClick": "Click the {{button}} mouse button",
+  "DesktopControlPanel.actionDescriptionKeyPress": "Press key \"{{key}}\"",
   "DesktopControlPanel.testActionHeading": "Send a test action",
-  "DesktopControlPanel.testActionDescription":
-    "Exercises the approval gate end to end against an active session — nothing here bypasses it.",
-  "DesktopControlPanel.noActiveSessions":
-    "Start a session above to send a test action.",
+  "DesktopControlPanel.testActionDescription": "Exercises the approval gate end to end against an active session — nothing here bypasses it.",
+  "DesktopControlPanel.noActiveSessions": "Start a session above to send a test action.",
   "DesktopControlPanel.actionKindMouseMove": "Move mouse",
   "DesktopControlPanel.actionKindMouseClick": "Click mouse button",
   "DesktopControlPanel.actionKindKeyPress": "Press key",
@@ -3045,8 +2552,7 @@ export const en: Record<string, string> = {
   "UpdatesPanel.cancel": "Cancel",
   "UpdatesPanel.stateChecking": "Checking for updates…",
   "UpdatesPanel.stateDownloading": "Downloading the update…",
-  "UpdatesPanel.stateDownloadingPercent":
-    "Downloading the update… {{percent}}%",
+  "UpdatesPanel.stateDownloadingPercent": "Downloading the update… {{percent}}%",
   "UpdatesPanel.stateReady": "Version {{version}} is staged and ready",
   "UpdatesPanel.stateApplying": "Applying the update…",
   "UpdatesPanel.stateUpToDate": "This is the latest version",
@@ -3066,8 +2572,7 @@ export const en: Record<string, string> = {
   "UpdatesPanel.rollbackDiscard": "Discard",
   "UpdatesPanel.rollbackRestartNote":
     "Rolling back closes Little Monkey, restores the saved build, and reopens it.",
-  "UpdatesPanel.rollbackFailed":
-    "The rollback point could not be handled: {{error}}",
+  "UpdatesPanel.rollbackFailed": "The rollback point could not be handled: {{error}}",
   "UpdatesPanel.integrityTitle": "Startup integrity",
   "UpdatesPanel.integrityDescription":
     "Checked once at launch: this app's own signature, and every file of every managed runtime against its trusted manifest. A mismatch refuses to load rather than warning.",
@@ -3083,5 +2588,5 @@ export const en: Record<string, string> = {
   "UpdatesPanel.componentApp": "Application signature",
   "UpdatesPanel.componentLlama": "llama.cpp runtime",
   "UpdatesPanel.componentLlamaTts": "Speech runtime",
-  "UpdatesPanel.componentSd": "Image and video runtime",
+  "UpdatesPanel.componentSd": "Image and video runtime"
 };

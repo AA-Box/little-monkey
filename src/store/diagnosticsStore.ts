@@ -5,8 +5,7 @@ import { errorMessage } from "../lib/errors";
 /** Mirrors the Rust `DiagnosticStatus` enum (src-tauri/src/diagnostics.rs)
  * exactly — `#[serde(rename_all = "snake_case")]` on already-lowercase or
  * two-word variant names serializes to exactly these strings. */
-export type DiagnosticStatus =
-  "pass" | "info" | "warning" | "critical" | "fixed" | "not_configured";
+export type DiagnosticStatus = "pass" | "info" | "warning" | "critical" | "fixed" | "not_configured";
 
 /** Mirrors the Rust `DiagnosticFinding` struct exactly. */
 export interface DiagnosticFinding {
@@ -52,11 +51,9 @@ export interface SupportTraceSection {
   events: SupportTraceEvent[];
   /** How many events were dropped to fit the section cap. */
   omitted: number;
-  /**
-   * Why this section is empty, when it is empty for a reason other than
+  /** Why this section is empty, when it is empty for a reason other than
    * nothing having happened. Rendering an unavailable section as an empty one
-   * is how a reader concludes a subsystem was idle when it was unreadable.
-   */
+   * is how a reader concludes a subsystem was idle when it was unreadable. */
   unavailable?: string;
 }
 
@@ -78,11 +75,9 @@ export interface DiagnosticsBundle {
   appVersion: string;
   platform: string;
   report: DiagnosticReport;
-  /**
-   * Redacted lifecycle trace for the daemon-owned subsystems. Absent when the
+  /** Redacted lifecycle trace for the daemon-owned subsystems. Absent when the
    * background service could not be asked — see `traceUnavailable`, which is
-   * the reason, and is not the same thing as a trace with no events in it.
-   */
+   * the reason, and is not the same thing as a trace with no events in it. */
   trace?: SupportTrace;
   traceUnavailable?: string;
 }
@@ -103,10 +98,7 @@ const SUMMARY_FIELD: Record<DiagnosticStatus, keyof DiagnosticSummary> = {
 /** Applied after a successful `applyFix`: replaces the one finding in place
  * and moves its count from its old status bucket to `fixed` in the summary,
  * so the header tallies stay correct without a full `run()` round trip. */
-function replaceFindingAndResummarize(
-  report: DiagnosticReport,
-  updated: DiagnosticFinding,
-): DiagnosticReport {
+function replaceFindingAndResummarize(report: DiagnosticReport, updated: DiagnosticFinding): DiagnosticReport {
   const previous = report.findings.find((finding) => finding.id === updated.id);
   const summary = { ...report.summary };
   if (previous) summary[SUMMARY_FIELD[previous.status]] -= 1;
@@ -114,9 +106,7 @@ function replaceFindingAndResummarize(
   return {
     ...report,
     summary,
-    findings: report.findings.map((finding) =>
-      finding.id === updated.id ? updated : finding,
-    ),
+    findings: report.findings.map((finding) => (finding.id === updated.id ? updated : finding)),
   };
 }
 
@@ -138,10 +128,7 @@ export interface DiagnosticsStore {
 }
 
 export const useDiagnosticsStore = create<DiagnosticsStore>((set) => {
-  const perform = async <T>(
-    key: string,
-    task: () => Promise<T>,
-  ): Promise<T> => {
+  const perform = async <T>(key: string, task: () => Promise<T>): Promise<T> => {
     set((state) => ({ busy: { ...state.busy, [key]: true }, error: null }));
     try {
       return await task();
@@ -161,35 +148,25 @@ export const useDiagnosticsStore = create<DiagnosticsStore>((set) => {
 
     clearError: () => set({ error: null }),
 
-    run: () =>
-      perform("run", async () => {
-        const report = await invoke<DiagnosticReport>("diagnostics_run");
-        set({ report });
-        return report;
-      }),
+    run: () => perform("run", async () => {
+      const report = await invoke<DiagnosticReport>("diagnostics_run");
+      set({ report });
+      return report;
+    }),
 
-    applyFix: (findingId) =>
-      perform(`fix-${findingId}`, async () => {
-        const updated = await invoke<DiagnosticFinding>(
-          "diagnostics_apply_fix",
-          { findingId },
-        );
-        set((state) => ({
-          report: state.report
-            ? replaceFindingAndResummarize(state.report, updated)
-            : state.report,
-        }));
-        return updated;
-      }),
+    applyFix: (findingId) => perform(`fix-${findingId}`, async () => {
+      const updated = await invoke<DiagnosticFinding>("diagnostics_apply_fix", { findingId });
+      set((state) => ({
+        report: state.report ? replaceFindingAndResummarize(state.report, updated) : state.report,
+      }));
+      return updated;
+    }),
 
-    exportBundle: () =>
-      perform("export", async () => {
-        const bundle = await invoke<DiagnosticsBundle>(
-          "diagnostics_export_bundle",
-        );
-        set({ bundle });
-        return bundle;
-      }),
+    exportBundle: () => perform("export", async () => {
+      const bundle = await invoke<DiagnosticsBundle>("diagnostics_export_bundle");
+      set({ bundle });
+      return bundle;
+    }),
 
     dismissBundle: () => set({ bundle: null }),
   };
