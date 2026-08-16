@@ -30,12 +30,23 @@ import { buildManifest, canonicalJson, signManifest } from "./lib/mlxPackage.mjs
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SOURCE_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_server.py");
+const SOURCE_VIDEO_SERVICE = join(REPOSITORY_ROOT, "packaging/mlx/service/mlx_video_server.py");
 const OUTPUT_ROOT = join(REPOSITORY_ROOT, "packaging/mlx/dist");
 
 /** Must match MLX_RELEASE_KEY_ID in src-tauri/src/m3_production.rs. */
 const KEY_ID = "release-2026-1";
 /** Pinned so a package states exactly which MLX it carries. */
 const MLX_LM_VERSION = "0.28.4";
+/**
+ * The video engine, pinned to a commit rather than a version.
+ *
+ * mlx-video publishes no releases and no tags, its `__version__` has read
+ * "0.0.1" since the repository was created, and the name `mlx-video` on PyPI
+ * belongs to an unrelated project — so a version range would be meaningless and
+ * a bare `pip install mlx-video` would install the wrong software. A commit is
+ * the only thing that identifies what this package actually carries.
+ */
+const MLX_VIDEO_COMMIT = "87db56a51758fefb748a359b90a5283bb8ba4837";
 /** Catalog identity. `componentId` is the stable key the component hub
  *  versions against, so it must not carry the version. */
 const SOURCE_ID = "little-monkey-mlx";
@@ -81,6 +92,20 @@ function build() {
     ["-m", "pip", "install", "--quiet", "--upgrade", `mlx-lm==${MLX_LM_VERSION}`],
     { stdio: "inherit" },
   );
+  // Installed into the same interpreter rather than a second one: both services
+  // are launched from this venv, and mlx-lm and mlx-video agree on mlx itself.
+  console.log("adding the video engine…");
+  execFileSync(
+    join(OUTPUT_ROOT, "runtime/bin/python3"),
+    [
+      "-m",
+      "pip",
+      "install",
+      "--quiet",
+      `mlx-video @ git+https://github.com/Blaizzy/mlx-video.git@${MLX_VIDEO_COMMIT}`,
+    ],
+    { stdio: "inherit" },
+  );
 
   // Compiled bytecode is regenerable cache, not payload: it is nearly half the
   // files a fresh venv contains, every one of which would otherwise be
@@ -89,9 +114,15 @@ function build() {
 
   mkdirSync(join(OUTPUT_ROOT, "service"), { recursive: true });
   cpSync(SOURCE_SERVICE, join(OUTPUT_ROOT, "service/mlx_server.py"));
+  // The second service. It is not the manifest's `serviceEntry` — that names
+  // the one the M3 runtime adapter launches — but it is covered by the same
+  // digests, so Studio can only ever run a file this package signed for.
+  cpSync(SOURCE_VIDEO_SERVICE, join(OUTPUT_ROOT, "service/mlx_video_server.py"));
 
   const pythonExecutable = "runtime/bin/python3";
-  const version = `mlx-lm-${MLX_LM_VERSION}+${pythonVersion(join(OUTPUT_ROOT, pythonExecutable))}`;
+  const version = `mlx-lm-${MLX_LM_VERSION}+video-${MLX_VIDEO_COMMIT.slice(0, 12)}+${pythonVersion(
+    join(OUTPUT_ROOT, pythonExecutable),
+  )}`;
   let manifest = buildManifest({
     root: OUTPUT_ROOT,
     packageVersion: version,
@@ -153,7 +184,9 @@ function publish(version, manifest) {
     sha256: createHash("sha256").update(bytes).digest("hex"),
     sizeBytes: bytes.length,
     publishedAtMs: Number(process.env.SOURCE_DATE_EPOCH ?? 0) * 1000,
-    compatibilityNote: `Requires Apple silicon. Ships ${manifest.files.length} files.`,
+    compatibilityNote:
+      `Requires Apple silicon. Carries the MLX chat runtime and the MLX video ` +
+      `engine. Ships ${manifest.files.length} files.`,
     metadata: {},
   };
   const catalog = join(REPOSITORY_ROOT, "packaging/mlx", "mlx-catalog.json");

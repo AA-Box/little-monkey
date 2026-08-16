@@ -157,6 +157,18 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.chooseFolder": "Choose folder…",
   "Studio.add.clearFolder": "Clear folder",
   "Studio.add.noFolder": "None",
+  // Which program renders the model. Named by what the user has to know — the
+  // file format each one reads — because "MLX" and "stable-diffusion.cpp" mean
+  // nothing next to a downloaded file, and picking wrong fails deep inside a
+  // loader with a message about tensors.
+  "Studio.add.engine": "Engine",
+  "Studio.add.engineBundled": "Built in (stable-diffusion.cpp)",
+  "Studio.add.engineMlxVideo": "MLX video (Apple silicon)",
+  "Studio.add.engineHint":
+    "Reads safetensors and GGUF weights. The right choice for everything except a checkpoint converted for MLX.",
+  "Studio.add.engineMlxVideoHint":
+    "For MLX conversions — a folder holding config.json beside model, t5_encoder and vae safetensors. Needs the MLX package from Settings → Runtime Hub, and makes video only.",
+
   // Launch-time engine switches. Each hint says what it costs as well as what
   // it buys — every one of these is a trade, and a checkbox that only promises
   // the upside gets turned on by everybody and blamed for the downside.
