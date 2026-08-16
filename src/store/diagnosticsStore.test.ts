@@ -125,6 +125,71 @@ describe("diagnosticsStore.exportBundle", () => {
     expect(result).toEqual(bundle);
     expect(useDiagnosticsStore.getState().bundle).toEqual(bundle);
   });
+
+  it("keeps the redacted activity trace the backend attached", async () => {
+    const bundle = {
+      schemaVersion: 1,
+      generatedAtMs: 1700000000000,
+      appVersion: "0.1.0",
+      platform: "macos",
+      report: makeReport([makeFinding()]),
+      trace: {
+        schemaVersion: 1,
+        generatedAtMs: 1700000000000,
+        appVersion: "0.1.0",
+        platform: "macos",
+        redaction: {
+          identifiersPseudonymized: true,
+          excluded: ["message text", "recorded or streamed audio"],
+        },
+        sections: {
+          telephony: {
+            events: [
+              {
+                atMs: 1700000000000,
+                event: "sms.inbound",
+                subject: "phone:1a2b3c4d5e6f",
+                outcome: "accepted",
+              },
+            ],
+            omitted: 12,
+          },
+        },
+      },
+    };
+    invokeMock.mockResolvedValueOnce(bundle);
+
+    const result = await useDiagnosticsStore.getState().exportBundle();
+
+    // Pseudonymous, and it says so -- the panel renders this notice before
+    // somebody sends the file anywhere.
+    expect(result.trace?.redaction.identifiersPseudonymized).toBe(true);
+    expect(result.trace?.sections.telephony.events[0].subject).toBe(
+      "phone:1a2b3c4d5e6f",
+    );
+    // A capped section reports what it dropped, so a reader does not mistake
+    // one event for the whole history.
+    expect(result.trace?.sections.telephony.omitted).toBe(12);
+  });
+
+  it("keeps the reason a trace is missing, rather than dropping it silently", async () => {
+    const bundle = {
+      schemaVersion: 1,
+      generatedAtMs: 1700000000000,
+      appVersion: "0.1.0",
+      platform: "macos",
+      report: makeReport([makeFinding()]),
+      traceUnavailable: "the background service is not running",
+    };
+    invokeMock.mockResolvedValueOnce(bundle);
+
+    const result = await useDiagnosticsStore.getState().exportBundle();
+
+    // No trace and a reason is a different thing from a trace with no events
+    // in it, and the panel has to be able to tell them apart.
+    expect(result.trace).toBeUndefined();
+    expect(result.traceUnavailable).toBe("the background service is not running");
+  });
 });
 
 describe("diagnosticsStore.dismissBundle", () => {

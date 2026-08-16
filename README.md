@@ -228,6 +228,7 @@ Boundaries in full: **[docs/security.md](docs/security.md)**. Vulnerabilities go
 | Know where a claim stops | [Limitations](docs/limitations.md) |
 | Connect remote MCP over OAuth | [BYO OAuth clients](docs/byo-oauth-clients.md) |
 | Use a paired phone's camera, mic or location | [Paired devices](docs/paired-devices.md) |
+| Reach an agent by message, phone, device or peer | [Messaging, devices and phones](docs/messaging-devices-and-phones.md) |
 | Check the conformance suite | [Conformance suite](docs/conformance-suite.md) |
 
 ## Development
