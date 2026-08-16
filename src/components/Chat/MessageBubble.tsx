@@ -312,7 +312,7 @@ function UserBubble({
                 >
                   <Split size={13} />
                 </button>
-                <Tooltip text={t("MessageBubble.startSideTask")} />
+                <Tooltip text={t("MessageBubble.startSideTask")} hint={t("MessageBubble.startSideTaskHint")} />
               </span>
             )}
             {onEdit && (
@@ -326,7 +326,7 @@ function UserBubble({
                 >
                   <Pencil size={13} />
                 </button>
-                <Tooltip text={t("MessageBubble.editMessageAriaLabel")} />
+                <Tooltip text={t("MessageBubble.editMessageAriaLabel")} hint={t("MessageBubble.editMessageHint")} />
               </span>
             )}
           </div>
@@ -402,7 +402,7 @@ function AssistantMessage({
             >
               <Split size={13} />
             </button>
-            <Tooltip text={t("MessageBubble.startSideTask")} />
+            <Tooltip text={t("MessageBubble.startSideTask")} hint={t("MessageBubble.startSideTaskHint")} />
           </span>
         )}
       </div>
