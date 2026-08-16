@@ -30,7 +30,8 @@ use reqwest::Method;
 use crate::daemon::store::{restrict_file, DaemonPaths};
 
 use self::protocol::{
-    PairingBootstrap, PairingInvitation, RemoteAction, RemoteScopes, REMOTE_PROTOCOL_VERSION,
+    DeviceCapability, PairingBootstrap, PairingInvitation, RemoteAction, RemoteScopes,
+    REMOTE_PROTOCOL_VERSION,
 };
 use self::store::{KeyringRemoteSecrets, RemoteStore};
 
@@ -2174,7 +2175,7 @@ pub(crate) fn host_config(
     server::load_host_config(paths)
 }
 
-fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {
+pub(crate) fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {
     let config = server::load_host_config(paths)?
         .ok_or_else(|| "Remote host is not configured".to_string())?;
     if !config.enabled {
@@ -2183,7 +2184,7 @@ fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, Strin
     Ok(config)
 }
 
-fn protected_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+pub(crate) fn protected_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create output directory: {error}"))?;
@@ -2324,6 +2325,101 @@ pub(crate) async fn peer_call(
     body: Vec<u8>,
 ) -> Result<serde_json::Value, String> {
     client::call(paths, alias, method, path_and_query, body, now_ms()?).await
+}
+
+/// Take up the replacement key a peer produced when it rotated this pairing.
+///
+/// The same bundle format and the same verification a controller rotation
+/// uses — a peer credential is a device credential, and giving it a second
+/// path would mean a second place for the scope checks to be forgotten.
+pub(crate) fn accept_peer_rotation(
+    paths: &DaemonPaths,
+    alias: &str,
+    bundle: &Path,
+) -> Result<protocol::ControllerProfile, String> {
+    client::accept_rotation(paths, alias, bundle, now_ms()?)
+}
+
+/// Introduce this installation to a peer and record what came back.
+///
+/// The one call that both proves a peer is reachable and refreshes what each
+/// side knows about the other. `last_seen_at_ms` is written only on success —
+/// a failed probe must never read as contact.
+pub(crate) async fn peer_hello(
+    paths: &DaemonPaths,
+    alias: &str,
+    requested: &BTreeSet<DeviceCapability>,
+) -> Result<protocol::PeerHelloResponse, String> {
+    let request = protocol::PeerHelloRequest {
+        protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+        instance_id: local_instance_id(paths, alias)?,
+        advertised: protocol::all_peer_capabilities(),
+        requested: requested.clone(),
+    };
+    request.validate()?;
+    let value = peer_call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/peer/hello",
+        serde_json::to_vec(&request).map_err(|error| error.to_string())?,
+    )
+    .await?;
+    let response: protocol::PeerHelloResponse = serde_json::from_value(value)
+        .map_err(|error| format!("Peer hello response is invalid: {error}"))?;
+    response.validate()?;
+
+    let now = now_ms()?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    if let Some(mut profile) = store.controller(alias)? {
+        profile.last_seen_at_ms = Some(now);
+        profile.peer_advertised = response.advertised.clone();
+        profile.peer_requested = request.requested.clone();
+        // The far side is authoritative about what it grants; recording its
+        // answer is how a revocation over there shows up over here without
+        // this installation guessing.
+        profile.capabilities = protocol::peer_capabilities_of(&response.granted);
+        let secret = RemoteStore::controller_secret(&profile, &KeyringRemoteSecrets)?;
+        store.save_controller(&profile, &secret, now, &KeyringRemoteSecrets)?;
+    }
+    Ok(response)
+}
+
+/// Hand one artifact's bytes to a peer before referencing it in an envelope.
+///
+/// Push, not pull: the receiver holds no outbound pairing back here, so it
+/// could not fetch even if it wanted to. Returns what the receiver stored,
+/// which is what the envelope must then name.
+pub(crate) async fn peer_put_artifact(
+    paths: &DaemonPaths,
+    alias: &str,
+    bytes: &[u8],
+    filename: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<protocol::PeerArtifactStored, String> {
+    use base64::Engine as _;
+    let upload = protocol::PeerArtifactUpload {
+        protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+        sha256: protocol::sha256_hex(bytes),
+        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        filename: filename.map(str::to_string),
+        media_type: media_type.map(str::to_string),
+    };
+    upload.validate()?;
+    let value = peer_call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/peer/artifacts",
+        serde_json::to_vec(&upload).map_err(|error| error.to_string())?,
+    )
+    .await?;
+    let stored: protocol::PeerArtifactStored = serde_json::from_value(value)
+        .map_err(|error| format!("Peer artifact response is invalid: {error}"))?;
+    if stored.sha256 != upload.sha256 || stored.artifact_id != upload.sha256 {
+        return Err("The peer stored different content than was sent".to_string());
+    }
+    Ok(stored)
 }
 
 /// What this installation calls itself in an envelope's origin chain.
