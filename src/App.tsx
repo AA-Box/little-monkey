@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Activity, Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import ChatSessionList from "./components/Chat/ChatSessionList";
+import ExternalConversationView from "./components/Chat/ExternalConversationView";
+import { useExternalConversationStore } from "./store/externalConversationStore";
 import { StudioNav, type StudioMode } from "./components/Studio/StudioNav";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
@@ -255,6 +257,10 @@ function App() {
   const activeCrewSessionId = useSessionStore((s) =>
     s.sessions.find((session) => session.id === s.activeSessionId)?.crewRun ? s.activeSessionId : null
   );
+  // A conversation from another environment (a paired phone, a messaging
+  // thread) takes the main pane in place of the chat, exactly like a
+  // comparison or a crew run does.
+  const externalConversation = useExternalConversationStore((s) => s.selected);
   const newSession = useSessionStore((s) => s.newSession);
   const switchSession = useSessionStore((s) => s.switchSession);
   const splitSessionId = useSessionStore((s) => s.splitSessionId);
@@ -1289,6 +1295,10 @@ function App() {
               <CompareView groupId={activeComparisonId} />
             ) : activeCrewSessionId ? (
               <CrewView sessionId={activeCrewSessionId} />
+            ) : externalConversation ? (
+              // A session from another environment — a paired phone, a
+              // messaging thread. Read-only; see `ExternalConversationView`.
+              <ExternalConversationView selection={externalConversation} />
             ) : (
               <ChatWindow
                 sessionId={activeSessionId}
