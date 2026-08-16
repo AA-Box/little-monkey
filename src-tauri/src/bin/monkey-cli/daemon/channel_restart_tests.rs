@@ -2799,26 +2799,24 @@ async fn matrix_replaying_a_room_event_after_a_restart_runs_it_once() {
 
 /// A spoken turn survives a restart and is not answered twice.
 ///
-/// A Talk utterance becomes an ordinary durable turn keyed by
-/// `talk-<session generation>-<utterance index>`, and the queue's job id is
-/// derived from it. That key is what has to hold across a restart: the audio is
-/// gone the moment the socket dies, so the only thing standing between a
-/// re-submitted utterance and a second answer is the id.
+/// The Talk-side proof is `remote::talk`'s
+/// `the_same_utterance_after_a_restart_lands_on_the_run_it_already_made`, which
+/// drives two real sessions with two different generations. This is the other
+/// half of it: that the durable seam those submissions land on really does
+/// collapse a repeated client key into one turn and one run, across a store
+/// that is closed and reopened.
 ///
-/// The store is closed and reopened between the two submissions, so what is
-/// asserted is the durable job identity rather than an in-memory guard. Driven
-/// through `submit_conversation_turn` with the ingress `TalkTurns::submit`
-/// itself builds -- a Talk turn is not a special kind of turn, and that is the
-/// point of the test.
+/// Both are needed. A Talk test with a fake queue cannot show the queue
+/// deduplicates; this one cannot show the socket produces a stable key.
 #[tokio::test]
-async fn a_talk_turn_resubmitted_after_a_restart_answers_once() {
+async fn a_repeated_client_key_after_a_restart_is_one_turn_and_one_run() {
     let paths = temp_daemon_paths();
     let queue = FakeQueue::default();
-    // The identity the socket mints: a generation token, and this utterance's
-    // index within the session.
+    // The key `TalkSessionTurns::submit` builds: the session, and the device's
+    // own name for the utterance.
     let ingress = super::mobile_chat_ingress(
         "session-talk-1",
-        "talk-9f2c4a7b1d3e5f60-0",
+        "talk-session-talk-1-utt-a1b2c3",
         "what is on today",
         NOW,
     );
@@ -2846,11 +2844,7 @@ async fn a_talk_turn_resubmitted_after_a_restart_answers_once() {
         | super::channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => job_id.clone(),
         other => panic!("expected the turn to be queued, got {other:?}"),
     };
-    assert_eq!(
-        job_of(&after_restart),
-        job_of(&first),
-        "the utterance's own identity is what keeps it one turn"
-    );
+    assert_eq!(job_of(&after_restart), job_of(&first));
     assert!(
         matches!(
             after_restart,
@@ -2867,11 +2861,10 @@ async fn a_talk_turn_resubmitted_after_a_restart_answers_once() {
     );
     assert_eq!(distinct_runs(&queue), 1, "and one run");
 
-    // A *different* utterance in the same session is a different turn: the key
-    // must not be so coarse that it swallows the next thing somebody says.
+    // A different utterance is a different turn.
     let next = super::mobile_chat_ingress(
         "session-talk-1",
-        "talk-9f2c4a7b1d3e5f60-1",
+        "talk-session-talk-1-utt-d4e5f6",
         "and tomorrow",
         NOW + 6_000,
     );

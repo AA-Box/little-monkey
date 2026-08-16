@@ -244,7 +244,11 @@ fn device_section(paths: &DaemonPaths, redactor: &Redactor) -> TraceSection {
         Ok(store) => store,
         Err(error) => return TraceSection::unavailable(bounded_reason(&error)),
     };
-    let commands = match store.active_device_commands() {
+    // Recent commands whatever state they reached, not the active set. A
+    // postmortem is almost always about a command that already finished or
+    // failed, and reading only what is still in flight produces a trace that is
+    // empty exactly when somebody needs it.
+    let commands = match store.recent_device_commands(READ_LIMIT) {
         Ok(commands) => commands,
         Err(error) => return TraceSection::unavailable(bounded_reason(&error)),
     };
@@ -294,6 +298,9 @@ mod tests {
     const NUMBER: &str = "+15550001111";
     const PEER: &str = "+15559998888";
     const BODY: &str = "the secret plan is at 3pm";
+    /// What a notification command carries -- the words shown on somebody's
+    /// lock screen, which is exactly what a bundle must never carry.
+    const SECRET_PAYLOAD: &str = "hunter2-the-actual-clipboard-contents";
 
     fn channel_account(id: &str, kind: ChannelKind) -> ChannelAccountRecord {
         ChannelAccountRecord {
@@ -446,11 +453,139 @@ mod tests {
         );
     }
 
+    /// A finished command is in the trace, because a finished command is what a
+    /// postmortem is about.
+    ///
+    /// The Security Doctor's reader deliberately shows only what is still in
+    /// flight — the question there is "is a microphone open right now". Reusing
+    /// it here produced a device section that was empty exactly when somebody
+    /// needed it, which is the failure this test exists to prevent recurring.
+    #[test]
+    fn a_completed_device_command_is_in_the_trace_and_its_payload_is_not() {
+        use crate::daemon::remote::protocol::{
+            DeviceCapability, DeviceCommandState, RemoteAction, RemoteScopes,
+        };
+        use crate::daemon::remote::store::{DeviceCommandRequest, RemoteSecretStore, RemoteStore};
+
+        #[derive(Default)]
+        struct Secrets(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+        impl RemoteSecretStore for Secrets {
+            fn get(&self, slot: &str) -> Result<Vec<u8>, String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .get(slot)
+                    .cloned()
+                    .ok_or_else(|| "missing".to_string())
+            }
+            fn set(&self, slot: &str, secret: &[u8]) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(slot.to_string(), secret.to_vec());
+                Ok(())
+            }
+            fn delete(&self, slot: &str) -> Result<(), String> {
+                self.0.lock().unwrap().remove(slot);
+                Ok(())
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-bundle-devices-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = DaemonPaths::under(&root);
+        paths.ensure().expect("paths");
+        let secrets = Secrets::default();
+        let mut store = RemoteStore::open(&paths.root).expect("remote store");
+        let invitation = store
+            .create_invitation(
+                &RemoteScopes {
+                    actions: std::collections::BTreeSet::from([RemoteAction::ViewRuns]),
+                    run_ids: std::collections::BTreeSet::from(["run-one".to_string()]),
+                    workspace_ids: std::collections::BTreeSet::new(),
+                    max_artifact_bytes: 1024,
+                },
+                1,
+                1_000_000,
+            )
+            .expect("invitation");
+        let device = store
+            .accept_invitation(
+                &invitation.pairing_id,
+                &invitation.token,
+                "Ada's phone",
+                "runner-one",
+                1,
+                &secrets,
+            )
+            .expect("pair")
+            .device_id;
+        let command = store
+            .enqueue_device_command(
+                &DeviceCommandRequest {
+                    device_id: device.clone(),
+                    capability: DeviceCapability::NotificationPost,
+                    // The kind of payload that must never reach a bundle: the
+                    // words that would be shown on somebody's lock screen.
+                    arguments: serde_json::json!({ "body": SECRET_PAYLOAD }),
+                    source_run_id: None,
+                    source_session_id: None,
+                    source_tool_call_id: None,
+                    invocation_id: None,
+                    expires_at_ms: 1_000_000,
+                },
+                1,
+            )
+            .expect("enqueue");
+        store.lease_device_command(&device, 30_000, 2).ok();
+        store
+            .complete_device_command(
+                &device,
+                &command.command_id,
+                DeviceCommandState::Succeeded,
+                Some(&serde_json::json!({ "body": SECRET_PAYLOAD })),
+                None,
+                None,
+                None,
+                3,
+            )
+            .expect("complete");
+        drop(store);
+
+        let section = device_section(
+            &paths,
+            &Redactor::from_seed_for_tests("support-bundle-cli-tests"),
+        );
+        let json = serde_json::to_string(&section).expect("json");
+        assert!(
+            json.contains("device.notification_post"),
+            "a finished command has to be in the trace: {json}"
+        );
+        assert!(json.contains("succeeded"), "{json}");
+        // And what it carried is not.
+        for forbidden in [SECRET_PAYLOAD, &device] {
+            assert!(!json.contains(forbidden), "'{forbidden}' leaked: {json}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A store that cannot be read says so, rather than contributing an empty
     /// section somebody reads as "this subsystem did nothing".
     #[test]
     fn a_subsystem_that_cannot_be_read_is_distinguishable_from_a_quiet_one() {
-        let paths = DaemonPaths::under(std::path::Path::new("/definitely/not/a/directory"));
+        // A daemon root that is a *file*. A merely-absent directory is not
+        // unopenable — SQLite will happily create one, and a Unix-shaped
+        // absent path is a relative path on Windows and gets created next to
+        // the test binary. A regular file cannot have a database placed inside
+        // it on any platform, which is the failure this test needs.
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-unreadable-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&root, b"not a directory").expect("write blocker file");
+        let paths = DaemonPaths::under(&root);
         let section = device_section(
             &paths,
             &Redactor::from_seed_for_tests("support-bundle-cli-tests"),
@@ -463,5 +598,6 @@ mod tests {
         );
         assert!(quiet.unavailable.is_none());
         assert!(quiet.events.is_empty());
+        let _ = std::fs::remove_file(&root);
     }
 }

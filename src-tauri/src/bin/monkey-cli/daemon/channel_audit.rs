@@ -734,7 +734,10 @@ mod tests {
     /// depends on the daemon's working directory.
     #[test]
     fn a_relative_helper_path_is_critical_and_a_missing_file_is_a_warning() {
-        let (_root, paths) = store();
+        let (root, paths) = store();
+        // A path with no root is relative on every platform, which is the
+        // hazard the finding names: which program runs depends on where the
+        // daemon was started.
         let mut account = account("acct-1", ChannelKind::Signal);
         account.non_secret_config = serde_json::json!({
             "helper_path": "signal-cli",
@@ -748,8 +751,14 @@ mod tests {
             .expect("relative finding");
         assert_eq!(finding.status, FindingStatus::Critical);
 
+        // Absolute *for this platform*, and pointing at nothing. A Unix-shaped
+        // literal would be a relative path on Windows and would exercise the
+        // branch above instead -- which is the production check working
+        // correctly, and the test asking the wrong question.
+        let absent_helper = root.join("gone").join("signal-cli");
+        assert!(absent_helper.is_absolute());
         account.non_secret_config = serde_json::json!({
-            "helper_path": "/definitely/not/here/signal-cli",
+            "helper_path": absent_helper.to_string_lossy(),
             "account": "+15550000000",
         });
         seed(&paths, &account);

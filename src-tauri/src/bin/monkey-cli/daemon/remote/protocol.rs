@@ -27,6 +27,10 @@ pub const MAX_TALK_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_TALK_ERROR_BYTES: usize = 4 * 1024;
 pub const MAX_TALK_MEDIA_TYPE_BYTES: usize = 128;
 pub const MAX_TALK_SESSION_ID_BYTES: usize = 256;
+/// Long enough for a UUID or a device-local counter with a prefix, short enough
+/// that it cannot become somewhere to park data on a frame that is otherwise
+/// pure audio.
+pub const MAX_TALK_UTTERANCE_ID_BYTES: usize = 128;
 pub const MAX_TALK_SESSION_GENERATION_BYTES: usize = 128;
 pub const MAX_TALK_TICKET_BYTES: usize = 128;
 pub const DEFAULT_TALK_TICKET_TTL_MS: u64 = 30_000;
@@ -1670,6 +1674,32 @@ pub enum TalkClientFrameKind {
         /// complete recording over to transcription.
         #[serde(default)]
         last: bool,
+        /// The device's own durable name for this utterance, required on the
+        /// frame that closes one (`last: true`) and ignored on the others.
+        ///
+        /// # Why the device has to name it
+        ///
+        /// This is the idempotency key the turn is queued under, and the runner
+        /// cannot mint one that survives a restart. The obvious server-side
+        /// identity — the session generation plus an utterance counter — is
+        /// per *socket*: a generation is minted fresh with every ticket, and
+        /// the counter restarts at zero. So a daemon that restarts mid-turn,
+        /// and a device that reconnects and retransmits the recording it never
+        /// got an answer for, would produce a second key and a second run — and
+        /// a Talk turn can send a message or place a call, so that is a
+        /// duplicated external effect, not just a duplicated answer.
+        ///
+        /// Keying on `(session_id, utterance_index)` instead would be worse: the
+        /// counter resets, so the first utterance of a reconnected session would
+        /// collide with the first of the old one and two different things
+        /// somebody said would merge into one.
+        ///
+        /// Only the device knows that the audio it is sending now is the audio
+        /// it sent before, so only the device can name it. Required rather than
+        /// optional-with-a-fallback, because a fallback is the hole: a client
+        /// that omitted it would silently get the unkeyed behaviour back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utterance_id: Option<String>,
     },
     State {
         state: TalkState,
@@ -1726,11 +1756,30 @@ impl TalkClientFrame {
                 audio_sequence,
                 media_type,
                 audio_base64,
-                ..
+                last,
+                utterance_id,
             } => {
                 validate_talk_audio_sequence(*audio_sequence)?;
                 validate_talk_media_type(media_type)?;
                 validate_talk_audio(audio_base64)?;
+                // Only the closing frame queues a turn, so only the closing
+                // frame needs the key it is queued under. Refused rather than
+                // defaulted: a fallback identity is the hole this field exists
+                // to close, and it would be invisible -- the turn would run,
+                // and only a restart would show that it ran twice.
+                match (last, utterance_id.as_deref()) {
+                    (true, None) => {
+                        return Err(
+                            "A Talk utterance must carry an utterance_id on its final audio frame"
+                                .to_string(),
+                        )
+                    }
+                    (true, Some(utterance_id)) => validate_talk_utterance_id(utterance_id)?,
+                    // Ignored on a mid-utterance frame rather than refused: a
+                    // device that stamps every chunk is not doing anything
+                    // wrong, and the closing frame is what is read.
+                    (false, _) => {}
+                }
             }
             TalkClientFrameKind::State { .. } => {}
             TalkClientFrameKind::Interrupt { reason } => {
@@ -1908,6 +1957,18 @@ fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
         ));
     }
     validate_id(session_id)
+}
+
+/// The device's own name for one utterance.
+///
+/// Bounded and character-restricted like every other identifier that crosses
+/// this boundary, because it becomes part of a durable key: it reaches
+/// `submit_conversation_turn` as the client key and ends up in a job id.
+/// Deliberately *not* required to be base64 or to carry entropy — a device that
+/// names its utterances `1`, `2`, `3` within a session is behaving correctly,
+/// and the value is scoped to the session it arrived on.
+fn validate_talk_utterance_id(utterance_id: &str) -> Result<(), String> {
+    validate_talk_token("utterance id", utterance_id, 1, MAX_TALK_UTTERANCE_ID_BYTES)
 }
 
 fn validate_talk_session_generation(session_generation: &str) -> Result<(), String> {
@@ -2807,6 +2868,7 @@ mod tests {
                     media_type: "audio/webm;codecs=opus".into(),
                     audio_base64: audio.clone(),
                     last: false,
+                    utterance_id: None,
                 },
             ),
             client_talk_frame(
@@ -2883,6 +2945,7 @@ mod tests {
                 media_type: "audio/webm".into(),
                 audio_base64: STANDARD.encode(b"audio"),
                 last: false,
+                utterance_id: None,
             },
         );
         frame.protocol_version += 1;
@@ -2896,6 +2959,7 @@ mod tests {
             media_type: "video/webm".into(),
             audio_base64: STANDARD.encode(b"audio"),
             last: false,
+            utterance_id: None,
         };
         assert!(frame.validate().is_err());
         frame.kind = TalkClientFrameKind::Audio {
@@ -2903,6 +2967,7 @@ mod tests {
             media_type: "audio/webm".into(),
             audio_base64: STANDARD.encode(vec![0; MAX_TALK_AUDIO_BYTES + 1]),
             last: false,
+            utterance_id: None,
         };
         assert!(frame.validate().is_err());
 
