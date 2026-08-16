@@ -3143,6 +3143,7 @@ async fn process_one_pending_delivery(
             paths,
             store,
             shared,
+            &DaemonChannelQueue::new(paths.clone()),
             pending,
             extension_id,
             handler_id,
@@ -3238,10 +3239,11 @@ async fn process_one_pending_delivery(
     store.mark_delivery_submitted(&pending.trigger_id, &pending.delivery_id, &queued.job_id)
 }
 
-async fn dispatch_extension_delivery(
+pub(crate) async fn dispatch_extension_delivery(
     paths: &DaemonPaths,
     store: &mut DaemonStore,
     shared: &mut SharedLedger,
+    queue: &dyn channel_worker::RunQueue,
     pending: &PendingDelivery,
     extension_id: &str,
     handler_id: &str,
@@ -3315,7 +3317,7 @@ async fn dispatch_extension_delivery(
     // ends at "these are the messages that arrived", and everything after it —
     // access policy, pairing, dedupe, routing, the session a turn lands in — is
     // the same code every other provider goes through.
-    ingest_extension_channel_envelopes(paths, store, &result.output_json)?;
+    ingest_extension_channel_envelopes(store, queue, &result.output_json)?;
     // The extension invocation/result commits first. A crash before these
     // markers re-enters with the same id and receives the cached result.
     shared.mark_delivery_submitted_external(
@@ -3339,8 +3341,8 @@ async fn dispatch_extension_delivery(
 /// `(account_id, provider_event_id)`, which is what makes a redelivered
 /// webhook collapse onto one turn.
 fn ingest_extension_channel_envelopes(
-    paths: &DaemonPaths,
     store: &mut DaemonStore,
+    queue: &dyn channel_worker::RunQueue,
     output_json: &str,
 ) -> Result<(), String> {
     #[derive(serde::Deserialize)]
@@ -3373,9 +3375,8 @@ fn ingest_extension_channel_envelopes(
         &account_id,
         output.inbound.messages,
     )?;
-    let queue = DaemonChannelQueue::new(paths.clone());
     for envelope in &envelopes {
-        channel_ingress::accept_channel_envelope(store, &queue, envelope, now_ms()? as i64)?;
+        channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms()? as i64)?;
     }
     Ok(())
 }

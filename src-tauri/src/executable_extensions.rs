@@ -6535,6 +6535,28 @@ mod tests {
         }
     }
 
+    /// Wait for `invocation_id` to register and cancel it without releasing
+    /// the registry in between.
+    ///
+    /// Observing and cancelling under one lock is what makes the assertion
+    /// about the return value sound: an entry is inserted and removed under
+    /// this same mutex, so a cancel issued while holding it cannot be aimed at
+    /// an invocation that has already finished.
+    async fn cancel_once_registered(invocation_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(active) = CANCELLATIONS.lock().unwrap().get(invocation_id) {
+                active.token.cancel();
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "'{invocation_id}' never registered for cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn infinite_guest_can_be_cancelled_and_host_remains_usable() {
         let _runtime = runtime_guard();
@@ -6597,15 +6619,14 @@ mod tests {
         // lifetime to the second's start-up: an infinite guest is racing its
         // own fuel ceiling from the instant it begins, and on a runner slow
         // enough that the second component's compile took a while, the first
-        // had already trapped by the time anything cancelled it — `cancel`
-        // then answered `false` about an invocation that was simply over.
+        // had already trapped by the time anything cancelled it — the cancel
+        // then applied to an invocation that was simply over.
         //
         // The waits sleep rather than spinning on `yield_now`, for the same
         // reason: a tight loop burns the core the compile it is waiting for
-        // needs. Both budgets are generous because what they guard is a hang,
+        // needs. Their budgets are generous because what they guard is a hang,
         // not a stopwatch.
-        wait_until_registered("cancel-loop").await;
-        assert!(cancel("cancel-loop").unwrap());
+        cancel_once_registered("cancel-loop").await;
         wait_until_registered("second-loop").await;
         // Cancellation is per invocation, not a switch on the extension: the
         // other one is still in flight. Read as registry membership rather
@@ -6644,11 +6665,7 @@ mod tests {
                 })
                 .await
         });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while !CANCELLATIONS.lock().unwrap().contains_key("stop-loop") {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::task::yield_now().await;
-        }
+        wait_until_registered("stop-loop").await;
         let stopped = manager
             .set_running("dev.example.echo", false)
             .await

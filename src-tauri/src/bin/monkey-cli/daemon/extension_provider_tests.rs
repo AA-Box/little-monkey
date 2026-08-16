@@ -443,6 +443,353 @@ fn extension_account(extension_id: &str, capability_id: &str) -> ChannelAccountR
 // Channel
 // ---------------------------------------------------------------------------
 
+/// One answer that serves both halves of the adapter contract.
+///
+/// The guest ABI is one `run` export, so a poll and a send reach the same
+/// component; the two response shapes have no overlapping field, so a single
+/// object satisfies both without either side seeing anything it did not ask
+/// for. That is a property of the wire contract, not a trick — an extension
+/// with real state would branch on `op`.
+const CHANNEL_FIXTURE_OUTPUT: &str = r#"{"messages":[{"provider_event_id":"evt-1","conversation_id":"room-1","conversation_kind":"direct","sender_id":"user-1","text":"is the build green","mentions_self":true}],"cursor":"c-1","status":"sent","provider_message_id":"m-9"}"#;
+
+/// An account and an open route, in a store the caller owns.
+///
+/// Written through the store's own upsert/insert rather than assembled as
+/// rows, so what the ingress gate reads back is what the settings UI would
+/// have written.
+fn seed_extension_channel(
+    store: &mut super::store::DaemonStore,
+    extension_id: &str,
+    capability_id: &str,
+) {
+    use little_monkey_lib::channels::policy::{AccessPolicy, GroupActivation};
+    use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
+
+    let mut account = extension_account(extension_id, capability_id);
+    account.access_policy = ChannelAccessPolicy {
+        direct: AccessPolicy::Open,
+        group: AccessPolicy::Open,
+        group_activation: GroupActivation::Always,
+    };
+    account.health = ChannelHealth::connected(super::channel_restart_tests::NOW, None);
+    store.upsert_channel_account(&account).expect("account");
+    store
+        .insert_channel_route(&ChannelRoute {
+            route_id: "route-ext".to_string(),
+            scope: RouteScope::account("acct-ext"),
+            target: RouteTarget::new("chat"),
+            enabled: true,
+            created_at_ms: super::channel_restart_tests::NOW,
+            updated_at_ms: super::channel_restart_tests::NOW,
+        })
+        .expect("route");
+}
+
+/// The application-level claim: an extension channel is a channel.
+///
+/// Inbound runs the daemon's own `poll_account_once` — the ingress gate, the
+/// durable event, dedupe, routing and the run submission all belong to
+/// `channel_ingress`, not to anything extension-specific. Outbound runs the
+/// agent tool's own `plan_send`/`queue_send` into the shared outbox and then
+/// the daemon's `drain_outbox_once`, which is what actually reaches the
+/// adapter. Nothing between the fixture's two answers is written here.
+#[tokio::test]
+async fn an_extension_channel_rides_the_common_durable_path_in_both_directions() {
+    use super::channel_restart_tests::{FakeQueue, NOW};
+    use super::channel_tool::{plan_send, queue_send, ChannelSendRequest, SendAuthority};
+    use super::channel_worker::{drain_outbox_once, poll_account_once};
+
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.chat",
+        CHANNEL_FIXTURE_OUTPUT,
+        &[(CapabilityKind::Channel, "room")],
+        Vec::new(),
+    )
+    .await;
+    let paths = super::store::DaemonPaths::under(&app_data);
+    paths.ensure().unwrap();
+
+    let mut store = super::store::DaemonStore::open(&paths).expect("the daemon store opens");
+    seed_extension_channel(&mut store, "dev.example.chat", "room");
+    let account = store
+        .channel_account("acct-ext")
+        .unwrap()
+        .expect("the account was seeded");
+    let adapter: std::sync::Arc<dyn super::channel_adapter::ChannelAdapter> = build_adapter(
+        &AdapterConfig {
+            account: &account,
+            secret: String::new(),
+        },
+        Some(&paths),
+    )
+    .expect("the registry builds the adapter the daemon would build")
+    .into();
+
+    // --- Inbound: provider event → durable turn → queued run.
+    let queue = FakeQueue::default();
+    let report = poll_account_once(&mut store, &queue, "acct-ext", adapter.as_ref(), NOW)
+        .await
+        .expect("the daemon's own poll pass runs");
+    assert_eq!(report.accepted, 1, "{report:?}");
+    assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+
+    let dedupe_key = little_monkey_lib::channels::ingress::dedupe_key_for(
+        little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
+        "acct-ext",
+        "evt-1",
+    );
+    let turn = store
+        .ingress_turn_by_dedupe_key(&dedupe_key)
+        .unwrap()
+        .expect("the turn is durable before any run exists");
+    assert!(turn.job_id.is_some(), "the durable turn owns a job");
+
+    // The provider redelivering the same event must not become a second run.
+    // The cursor moved, so this is the ingress gate collapsing it, not the
+    // adapter declining to hand it over twice.
+    let again = poll_account_once(&mut store, &queue, "acct-ext", adapter.as_ref(), NOW + 1)
+        .await
+        .expect("a redelivery is polled the same way");
+    assert_eq!(again.duplicates, 1, "{again:?}");
+    assert_eq!(queue.submitted.lock().unwrap().len(), 1);
+
+    // --- Outbound: the agent's reply → shared outbox → this adapter.
+    let request = ChannelSendRequest {
+        account_id: Some("acct-ext".to_string()),
+        conversation_id: Some("room-1".to_string()),
+        text: "the build is green".to_string(),
+        ..ChannelSendRequest::default()
+    };
+    let authority = SendAuthority {
+        accounts: vec!["acct-ext".to_string()],
+        ..SendAuthority::default()
+    };
+    let plan = plan_send(&request, &authority, None).expect("the run may reach this account");
+    let queued = queue_send(
+        &mut store,
+        &paths,
+        &request,
+        &plan,
+        None,
+        &super::channel_tool::SendInvocation {
+            job_id: Some("job-ext".to_string()),
+            tool_call_id: Some("call-1".to_string()),
+        },
+        NOW,
+    )
+    .expect("the reply becomes a durable outbox row");
+    assert_eq!(queued["status"], "queued");
+    assert_eq!(store.outbox_count_for_job("job-ext").unwrap(), 1);
+
+    let adapters = BTreeMap::from([("acct-ext".to_string(), adapter.clone())]);
+    let drained = drain_outbox_once(&mut store, &adapters, NOW + 60_000)
+        .await
+        .expect("the daemon's own outbox drain runs");
+    assert_eq!(drained.sent, 1, "{drained:?}");
+
+    // Delivered exactly once and recorded as such: a second drain has nothing
+    // left to claim, which is the outbox — not the adapter — holding the
+    // at-most-once guarantee for this provider like every other.
+    let repeat = drain_outbox_once(&mut store, &adapters, NOW + 120_000)
+        .await
+        .expect("a second pass runs");
+    assert_eq!(repeat, super::channel_worker::OutboxReport::default());
+}
+
+/// A secret store this test owns, so signing never touches the OS keychain.
+///
+/// The verification is the production one either way — only where the shared
+/// secret is kept differs, and that is the one thing a test may not use the
+/// operator's real copy of.
+struct TestSecrets(String);
+
+impl super::trigger::SecretStore for TestSecrets {
+    fn put(&self, _trigger_id: &str, _secret: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn get(&self, _trigger_id: &str) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+    fn delete(&self, _trigger_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// An extension handler is reached by the daemon's existing webhook ingress,
+/// after the delivery is already durable — never by a socket of its own.
+///
+/// The order is the point. `ingest_signed_delivery` authenticates the request,
+/// bounds it, deduplicates it and commits it; only a later pass over the
+/// committed rows runs any guest code. So the acknowledgement a provider
+/// receives is never a promise about something still in flight, and a process
+/// that dies between the two re-enters at the same row.
+#[tokio::test]
+async fn an_extension_webhook_handler_runs_only_after_the_delivery_is_durable() {
+    use super::trigger::{
+        canonical_generic_signature_message, ingest_signed_delivery, signature_hex, IngestOutcome,
+        SignedDelivery, TriggerConfig, TriggerTarget,
+    };
+
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.chat",
+        r#"{"account_id":"acct-ext","messages":[{"provider_event_id":"hook-1","conversation_id":"room-1","conversation_kind":"direct","sender_id":"user-1","text":"delivered by webhook","mentions_self":true}]}"#,
+        &[(CapabilityKind::Channel, "incoming")],
+        vec![PermissionDeclaration {
+            permission_id: "webhook-incoming".to_string(),
+            kind: PermissionKind::WebhookReceive,
+            scope: "incoming".to_string(),
+            reason: "Fixture receives its provider's callbacks".to_string(),
+        }],
+    )
+    .await;
+    let trust = manager.inspect("dev.example.chat").unwrap();
+
+    let paths = super::store::DaemonPaths::under(&app_data);
+    paths.ensure().unwrap();
+    let mut store = super::store::DaemonStore::open(&paths).unwrap();
+    seed_extension_channel(&mut store, "dev.example.chat", "incoming");
+    let mut shared = super::ledger::SharedLedger::open(&paths.ledger_db).unwrap();
+
+    let config = TriggerConfig::SignedWebhook {
+        target: TriggerTarget::Extension {
+            extension_id: "dev.example.chat".to_string(),
+            handler_id: "incoming".to_string(),
+            version: trust.active_version.clone(),
+            manifest_sha256: trust.trust.manifest_sha256.clone(),
+        },
+        workflow: None,
+        secret_reference: Some("vault-hook".to_string()),
+        max_skew_ms: 60_000,
+    };
+    shared
+        .upsert_trigger(
+            "hook-ext",
+            config.kind_token(),
+            &serde_json::to_vec(&config).unwrap(),
+            10_000,
+            None,
+        )
+        .unwrap();
+
+    let secret = "0123456789abcdef";
+    let secrets = TestSecrets(secret.to_string());
+    let payload = br#"{"event":"message.created"}"#;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let signature = signature_hex(
+        secret.as_bytes(),
+        &canonical_generic_signature_message(10_000, &nonce, payload),
+    );
+    let delivery = SignedDelivery {
+        trigger_id: "hook-ext",
+        delivery_id: "delivery-one",
+        timestamp_ms: 10_000,
+        nonce: &nonce,
+        signature: &signature,
+        event_name: None,
+        payload,
+    };
+    assert_eq!(
+        ingest_signed_delivery(&mut shared, &mut store, &secrets, &delivery, 10_001).unwrap(),
+        IngestOutcome::Accepted
+    );
+    // Redelivery is answered from the ledger, without the handler running a
+    // second time — the dedupe every trigger already has, not a new one.
+    assert_eq!(
+        ingest_signed_delivery(&mut shared, &mut store, &secrets, &delivery, 10_002).unwrap(),
+        IngestOutcome::Duplicate
+    );
+    let forged = SignedDelivery {
+        delivery_id: "delivery-forged",
+        signature: &signature_hex(
+            b"the wrong secret",
+            &canonical_generic_signature_message(10_000, &nonce, payload),
+        ),
+        ..delivery
+    };
+    assert_eq!(
+        ingest_signed_delivery(&mut shared, &mut store, &secrets, &forged, 10_003).unwrap(),
+        IngestOutcome::Rejected
+    );
+
+    let pending = store.pending_delivery_payloads(10).unwrap();
+    assert_eq!(pending.len(), 1, "one committed delivery, awaiting its pass");
+
+    let queue = super::channel_restart_tests::FakeQueue::default();
+    super::dispatch_extension_delivery(
+        &paths,
+        &mut store,
+        &mut shared,
+        &queue,
+        &pending[0],
+        "dev.example.chat",
+        "incoming",
+        &trust.active_version,
+        &trust.trust.manifest_sha256,
+    )
+    .await
+    .expect("the committed delivery reaches the handler");
+
+    // What the handler normalized is now an ordinary channel turn: the same
+    // acceptance, the same dedupe key, the same table as a polled message.
+    let turn = store
+        .ingress_turn_by_dedupe_key(&little_monkey_lib::channels::ingress::dedupe_key_for(
+            little_monkey_lib::channels::ingress::ConversationSource::MessagingChannel,
+            "acct-ext",
+            "hook-1",
+        ))
+        .unwrap()
+        .expect("the webhook message became a durable conversation turn");
+    assert_eq!(turn.source_event_id, "hook-1");
+    assert_eq!(turn.source_account_id, "acct-ext");
+    assert!(store.pending_delivery_payloads(10).unwrap().is_empty());
+
+    // A second, genuinely new callback — the first is already `submitted`, and
+    // re-entering it is the idempotent replay rather than a fresh dispatch.
+    let second_nonce = uuid::Uuid::new_v4().to_string();
+    let second = SignedDelivery {
+        delivery_id: "delivery-two",
+        nonce: &second_nonce,
+        signature: &signature_hex(
+            secret.as_bytes(),
+            &canonical_generic_signature_message(10_004, &second_nonce, payload),
+        ),
+        timestamp_ms: 10_004,
+        ..delivery
+    };
+    assert_eq!(
+        ingest_signed_delivery(&mut shared, &mut store, &secrets, &second, 10_005).unwrap(),
+        IngestOutcome::Accepted
+    );
+    let pending = store.pending_delivery_payloads(10).unwrap();
+    assert_eq!(pending.len(), 1);
+
+    // The version and manifest the trigger was pinned to are re-checked on
+    // every delivery, so an update between two callbacks cannot silently
+    // redirect the handler to different code.
+    let stale = super::dispatch_extension_delivery(
+        &paths,
+        &mut store,
+        &mut shared,
+        &queue,
+        &pending[0],
+        "dev.example.chat",
+        "incoming",
+        "9.9.9",
+        &trust.trust.manifest_sha256,
+    )
+    .await
+    .expect_err("a pinned version that no longer matches is refused");
+    assert!(stale.contains("immutable version"), "{stale}");
+}
+
 #[test]
 fn an_extension_channel_account_must_name_both_halves_of_its_binding() {
     let error = validate_non_secret_config(
