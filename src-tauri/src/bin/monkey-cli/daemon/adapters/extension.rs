@@ -68,10 +68,24 @@ pub(crate) struct ExtensionChannelAdapter {
 }
 
 impl ExtensionChannelAdapter {
-    pub(crate) fn new(config: &AdapterConfig<'_>) -> Result<Self, String> {
+    /// `state` is the daemon's own paths when one is running.
+    ///
+    /// Taken from there rather than resolved ambiently because the daemon
+    /// already knows which profile's data root it serves, and an extension
+    /// registry is per-root. The CLI's one-shot `channels probe` has no daemon
+    /// and falls back to the ambient resolution, which is the same root it
+    /// would have reached anyway.
+    pub(crate) fn new(
+        config: &AdapterConfig<'_>,
+        state: Option<&crate::daemon::store::DaemonPaths>,
+    ) -> Result<Self, String> {
         let (extension_id, capability_id) = binding_from_config(&config.account.non_secret_config)?;
-        let app_data = little_monkey_lib::app_paths::data_dir()
-            .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())?;
+        let app_data = match state {
+            Some(paths) => paths.app_data()?.to_path_buf(),
+            None => little_monkey_lib::app_paths::data_dir().ok_or_else(|| {
+                "Could not resolve the Little Monkey app-data directory".to_string()
+            })?,
+        };
         Ok(Self {
             manager: ExtensionManager::new(app_data)?,
             account_id: config.account.account_id.clone(),

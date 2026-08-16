@@ -323,7 +323,7 @@ pub(crate) fn build_adapter(
         ChannelKind::Sms => {
             return Err("An SMS account is built from its telephony account".to_string())
         }
-        ChannelKind::Extension => Arc::new(extension::ExtensionChannelAdapter::new(config)?),
+        ChannelKind::Extension => Arc::new(extension::ExtensionChannelAdapter::new(config, state)?),
     })
 }
 

@@ -253,11 +253,11 @@ fn an_extension_channel_account_must_name_both_halves_of_its_binding() {
 
 #[tokio::test]
 async fn the_channel_registry_builds_an_extension_adapter_that_polls_normalized_messages() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.chat",
         r#"{"messages":[{"provider_event_id":"evt-1","conversation_id":"room-1","conversation_kind":"group","sender_id":"user-1","text":"hello from the fixture","mentions_self":true}],"cursor":"c-1"}"#,
         &[(CapabilityKind::Channel, "room")],
@@ -271,7 +271,7 @@ async fn the_channel_registry_builds_an_extension_adapter_that_polls_normalized_
             account: &account,
             secret: String::new(),
         },
-        None,
+        Some(&super::store::DaemonPaths::under(&app_data)),
     )
     .expect("the registry knows this kind");
     assert_eq!(adapter.kind(), ChannelKind::Extension);
@@ -291,11 +291,11 @@ async fn the_channel_registry_builds_an_extension_adapter_that_polls_normalized_
 
 #[tokio::test]
 async fn an_extension_channel_send_reports_a_normalized_outcome_to_the_outbox() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.chat",
         r#"{"status":"sent","provider_message_id":"m-9"}"#,
         &[(CapabilityKind::Channel, "room")],
@@ -309,7 +309,7 @@ async fn an_extension_channel_send_reports_a_normalized_outcome_to_the_outbox() 
             account: &account,
             secret: String::new(),
         },
-        None,
+        Some(&super::store::DaemonPaths::under(&app_data)),
     )
     .unwrap();
     let outcome = adapter
@@ -334,11 +334,11 @@ async fn an_extension_channel_send_reports_a_normalized_outcome_to_the_outbox() 
 
 #[tokio::test]
 async fn a_channel_send_whose_extension_is_disabled_needs_reconciliation() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.chat",
         r#"{"status":"sent"}"#,
         &[(CapabilityKind::Channel, "room")],
@@ -352,7 +352,7 @@ async fn a_channel_send_whose_extension_is_disabled_needs_reconciliation() {
             account: &account,
             secret: String::new(),
         },
-        None,
+        Some(&super::store::DaemonPaths::under(&app_data)),
     )
     .unwrap();
     manager
@@ -382,11 +382,11 @@ async fn a_channel_send_whose_extension_is_disabled_needs_reconciliation() {
 
 #[tokio::test]
 async fn an_unhealthy_extension_channel_never_reports_itself_connected() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.chat",
         r#"{"ok":false,"error":"the token was revoked"}"#,
         &[(CapabilityKind::Channel, "room")],
@@ -400,7 +400,7 @@ async fn an_unhealthy_extension_channel_never_reports_itself_connected() {
             account: &account,
             secret: String::new(),
         },
-        None,
+        Some(&super::store::DaemonPaths::under(&app_data)),
     )
     .unwrap();
     let health = adapter.probe().await;
@@ -414,11 +414,11 @@ async fn an_unhealthy_extension_channel_never_reports_itself_connected() {
 
 #[tokio::test]
 async fn an_extension_device_provider_is_discovered_with_namespaced_ids() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.lab",
         r#"{"devices":[{"id":"bench","name":"Bench camera","actions":["camera_capture","device_info"]}]}"#,
         &[(CapabilityKind::DeviceProvider, "instruments")],
@@ -449,11 +449,11 @@ async fn an_extension_device_provider_is_discovered_with_namespaced_ids() {
 
 #[tokio::test]
 async fn an_undeclared_device_action_is_refused_before_the_sandbox_starts() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.lab",
         r#"{"devices":[{"id":"bench","actions":["device_info"]}]}"#,
         &[(CapabilityKind::DeviceProvider, "instruments")],
@@ -475,11 +475,11 @@ async fn an_undeclared_device_action_is_refused_before_the_sandbox_starts() {
 
 #[tokio::test]
 async fn a_device_action_runs_through_the_normal_dispatch_and_returns_a_normalized_record() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.lab",
         r#"{"devices":[{"id":"bench","actions":["device_info"]}],"result":{"model":"fixture bench"}}"#,
         &[(CapabilityKind::DeviceProvider, "instruments")],
@@ -527,11 +527,11 @@ async fn a_device_action_runs_through_the_normal_dispatch_and_returns_a_normaliz
 
 #[tokio::test]
 async fn a_realtime_extension_serves_the_call_speech_a_live_call_holds() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.line",
         r#"{"events":[{"kind":"transcript","payload":{"text":"the caller said this"}}],"done":false}"#,
         &[(CapabilityKind::RealtimeVoice, "converse")],
@@ -558,11 +558,11 @@ async fn a_realtime_extension_serves_the_call_speech_a_live_call_holds() {
 
 #[tokio::test]
 async fn a_realtime_selection_with_no_capability_fails_before_a_call_starts() {
-    let home = IsolatedDataDir::new();
-    let app_data = home.app_data().to_path_buf();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
     let _manager = install_fixture(
         &app_data,
-        &home.sources(),
+        &root.0,
         "dev.example.line",
         r#"{"events":[],"done":true}"#,
         &[(CapabilityKind::RealtimeVoice, "converse")],
@@ -599,67 +599,4 @@ fn select_realtime_extension(app_data: &Path, extension_id: &str, capability_id:
         serde_json::to_vec_pretty(&config).unwrap(),
     )
     .unwrap();
-}
-
-/// A fixture installation living exactly where `dirs::data_dir()` will look.
-///
-/// The channel adapter registry resolves its own data root, exactly as it does
-/// in the daemon, so a test that wants a fixture registry has to *be* at that
-/// root rather than hand one in. The extension store refuses a symlinked root
-/// — deliberately, since a redirectable store is a redirectable component — so
-/// the directory is placed under a fixture `HOME` and used from there.
-///
-/// `HOME` is process-wide, so the tests that need one are serialized by the
-/// lock this guard holds and the previous value is restored on drop.
-struct IsolatedDataDir {
-    app_data: PathBuf,
-    previous: Option<std::ffi::OsString>,
-    _root: TestRoot,
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-static DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-impl IsolatedDataDir {
-    fn new() -> Self {
-        let guard = DATA_DIR_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let root = TestRoot::new();
-        let home = root.0.join("home");
-        // `dirs::data_dir()` is `$HOME/Library/Application Support` on macOS
-        // and `$HOME/.local/share` elsewhere.
-        #[cfg(target_os = "macos")]
-        let app_data = home.join("Library/Application Support/com.littlemonkey.app");
-        #[cfg(not(target_os = "macos"))]
-        let app_data = home.join(".local/share/com.littlemonkey.app");
-        std::fs::create_dir_all(&app_data).unwrap();
-        let previous = std::env::var_os("HOME");
-        std::env::set_var("HOME", &home);
-        Self {
-            app_data,
-            previous,
-            _root: root,
-            _guard: guard,
-        }
-    }
-
-    fn app_data(&self) -> &Path {
-        &self.app_data
-    }
-
-    fn sources(&self) -> PathBuf {
-        let sources = self._root.0.join("sources");
-        std::fs::create_dir_all(&sources).unwrap();
-        sources
-    }
-}
-
-impl Drop for IsolatedDataDir {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(previous) => std::env::set_var("HOME", previous),
-            None => std::env::remove_var("HOME"),
-        }
-    }
 }

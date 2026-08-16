@@ -80,6 +80,18 @@ jobs:
           workspaces: src-tauri
           key: executable-extension-${{ matrix.os }}
 
+      # `build.rs` calls `tauri-build`, which refuses to run without the
+      # `monkey-cli` sidecar at the `externalBin` path — and that binary is
+      # gitignored, so a fresh checkout has none. The same bootstrap `ci.yml`
+      # does before its own Rust tests: an empty placeholder, not a real build,
+      # since nothing here executes the CLI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Stage the CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
       - name: Exercise the Component Model sandbox on the release architecture
         run: >-
           cargo test --manifest-path src-tauri/Cargo.toml --lib
