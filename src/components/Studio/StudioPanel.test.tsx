@@ -231,4 +231,42 @@ describe("StudioPanel extension history", () => {
     expect(undo().hasAttribute("disabled")).toBe(true);
     expect(redo().hasAttribute("disabled")).toBe(true);
   });
+
+  /** The engine renders on a 32-pixel grid. A field left holding a number off
+   *  that grid reports a canvas the run never had. */
+  it("holds the size the engine will really render", async () => {
+    await setup();
+    // The label holds both controls; typing happens in the number one.
+    const typed = screen
+      .getByLabelText("Width")
+      .parentElement!.querySelector<HTMLInputElement>('input[type="number"]')!;
+    fireEvent.change(typed, { target: { value: "645" } });
+    fireEvent.blur(typed);
+    // Nearest, not up: 645 is answered with 640 rather than the 672 the
+    // backend would have rounded it to.
+    await waitFor(() => expect(widthValue()).toBe("640"));
+  });
+
+  it("confirms a typed size on Enter, without leaving the field", async () => {
+    await setup();
+    const typed = screen
+      .getByLabelText("Width")
+      .parentElement!.querySelector<HTMLInputElement>('input[type="number"]')!;
+    fireEvent.change(typed, { target: { value: "700" } });
+    fireEvent.keyDown(typed, { key: "Enter" });
+    await waitFor(() => expect(widthValue()).toBe("704"));
+  });
+
+  it("takes the canvas from the source image's own size", async () => {
+    vi.stubGlobal(
+      "Image",
+      class extends StubImage {
+        naturalWidth = 645;
+        naturalHeight = 890;
+      },
+    );
+    await setup();
+    fireEvent.click(screen.getByLabelText("Original size of the source image"));
+    await waitFor(() => expect(widthValue()).toBe("640"));
+  });
 });
