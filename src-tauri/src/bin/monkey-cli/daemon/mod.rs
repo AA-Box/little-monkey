@@ -39,6 +39,9 @@ mod service;
 pub(crate) mod store;
 pub(crate) mod telecom_store;
 pub(crate) mod telecom_tool;
+/// The carrier callback path, end to end through the production route.
+#[cfg(test)]
+mod telecom_webhook_tests;
 pub(crate) mod telecom_worker;
 pub(crate) mod telephony;
 mod trigger;

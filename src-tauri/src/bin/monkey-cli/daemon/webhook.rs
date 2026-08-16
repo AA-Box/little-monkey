@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 
 use super::ledger::SharedLedger;
 use super::store::{DaemonPaths, DaemonStore};
+use super::telecom_store::CallDirection;
 use super::trigger::{
     ingest_signed_delivery, IngestOutcome, KeyringSecretStore, SignedDelivery, MAX_WEBHOOK_BYTES,
 };
@@ -94,14 +95,26 @@ async fn handle(paths: DaemonPaths, request: Request<Incoming>) -> Response<Full
     if let Some(account_id) = channel_account {
         return handle_channel_delivery(paths, account_id, request).await;
     }
-    if let Some(account_id) = request
-        .uri()
-        .path()
-        .strip_prefix("/v1/telecom/")
-        .filter(|value| !value.is_empty() && !value.contains('/'))
-        .map(str::to_string)
-    {
-        return handle_carrier_callback(paths, account_id, request).await;
+    // Two carrier paths, and the difference is the whole reply. `/v1/telecom/<id>`
+    // is where a carrier asks what to do with a live call, and the answer is
+    // the markup that connects it; `/v1/telecom/<id>/status` is where it
+    // reports what became of a message or a call, and the answer is an
+    // acknowledgement. Both are signed over the URL they arrived at, so the
+    // path travels to the verifier rather than being assumed there.
+    if let Some(rest) = request.uri().path().strip_prefix("/v1/telecom/") {
+        let (account_id, on_status_path) = match rest.strip_suffix("/status") {
+            Some(account_id) => (account_id, true),
+            None => (rest, false),
+        };
+        if !account_id.is_empty() && !account_id.contains('/') {
+            let account_id = account_id.to_string();
+            let path = if on_status_path {
+                super::telephony::status_callback_path(&account_id)
+            } else {
+                super::telephony::callback_path(&account_id)
+            };
+            return handle_carrier_callback(paths, account_id, path, request).await;
+        }
     }
     let Some(trigger_id) = request
         .uri()
@@ -479,14 +492,14 @@ fn open_webhook_adapter(
             ))
         }
     };
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    };
+    // An account whose credential cannot be produced verifies nothing. It joins
+    // the same flat 404 as an unknown account: there is no adapter to build, and
+    // a stranger probing the endpoint still learns nothing about what exists.
+    let secret = super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    )
+    .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
     let config = super::channel_adapter::AdapterConfig {
         account: &account,
         secret,
@@ -593,6 +606,7 @@ fn handle_channel_verification(
 async fn handle_carrier_callback(
     paths: DaemonPaths,
     account_id: String,
+    path: String,
     request: Request<Incoming>,
 ) -> Response<Full<Bytes>> {
     let headers: Vec<(String, String)> = request
@@ -628,49 +642,73 @@ async fn handle_carrier_callback(
         Ok(_) => return response(StatusCode::NOT_FOUND, "not_found"),
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
     };
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
+    // The credential is what makes a callback checkable, so a missing one ends
+    // the request here rather than downgrading the check. An empty HMAC key is
+    // not a weaker secret, it is a published one: anyone who knows this URL can
+    // sign a body with it, and every carrier callback below — answering a live
+    // line, advancing a call, accepting a text — would then run for them.
+    //
+    // The refusal is counted like any other, because "this account stopped
+    // verifying callbacks" is the only form of it the operator can act on.
+    let secret = match super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    ) {
+        Ok(secret) => secret,
+        Err(reason) => {
+            let _ = store.record_callback_rejection(&account.account_id, &reason, now_ms);
+            return response(StatusCode::UNAUTHORIZED, "rejected");
+        }
     };
     let provider = match super::telephony::provider_for_account(&account, secret.clone()) {
         Ok(provider) => provider,
         Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
     };
 
-    let event = match provider.verify_webhook(&headers, &body, now_ms) {
-        Ok(event) => event,
-        Err(_) => return response(StatusCode::UNAUTHORIZED, "rejected"),
+    let event = match provider.verify_webhook(&path, &headers, &body, now_ms) {
+        Ok(event) => {
+            // It verified, so whatever was wrong before is fixed. The counter
+            // reads "since it last worked", which is the only form of it an
+            // operator can act on.
+            let _ = store.clear_callback_rejections(&account.account_id);
+            event
+        }
+        Err(reason) => {
+            // The body earns no durable row — it is unauthenticated — but the
+            // fact that this account is refusing callbacks does, because a
+            // carrier posting to a URL that never verifies is invisible
+            // otherwise. Only the verifier's own reason is kept; see
+            // `record_callback_rejection`.
+            let _ = store.record_callback_rejection(&account.account_id, &reason, now_ms);
+            return response(StatusCode::UNAUTHORIZED, "rejected");
+        }
     };
 
     let digest = super::trigger::sha256_hex(&body);
     let provider_event_id = carrier_event_id(&event, &digest);
-    match store.record_telecom_event(
-        &account.account_id,
-        &provider_event_id,
-        carrier_event_kind(&event),
-        None,
-        &digest,
-        now_ms,
-    ) {
-        // A redelivered event this daemon has already recorded is finished —
-        // except for an inbound message, where this row is not proof that the
-        // conversation turn behind it exists. A crash between this commit and
-        // the acceptance would otherwise have the carrier answered "duplicate"
-        // for a message nothing ever ran. Handling it again is safe: the
-        // channel event and the turn each deduplicate on their own identity,
-        // so a genuine duplicate collapses and an unfinished one is repaired.
-        Ok(super::telecom_store::TelecomEventRecording::Duplicate { .. })
-            if !matches!(event, super::telephony::TelecomEvent::InboundSms(_)) =>
-        {
-            return response(StatusCode::OK, "duplicate")
-        }
-        Ok(super::telecom_store::TelecomEventRecording::Duplicate { .. }) => {}
-        Ok(super::telecom_store::TelecomEventRecording::Recorded { .. }) => {}
-        Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
+    // This row records that the callback was *seen*. It is never proof that
+    // what the callback asked for happened: the effect is committed after it,
+    // and a crash in between would otherwise turn the carrier's retry — the
+    // only thing that can repair the gap — into an immediate "duplicate" and
+    // lose the call, the receipt or the message for good.
+    //
+    // So a duplicate is handled again rather than short-circuited. Every effect
+    // below is idempotent by its own identity: a call row deduplicates on its
+    // idempotency key, `advance_call` ignores a transition it has already made
+    // or has moved past, a delivery receipt is an overwrite of the same
+    // columns, and a message deduplicates on its provider event id.
+    if store
+        .record_telecom_event(
+            &account.account_id,
+            &provider_event_id,
+            carrier_event_kind(&event),
+            None,
+            &digest,
+            now_ms,
+        )
+        .is_err()
+    {
+        return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable");
     }
 
     let queue = super::DaemonChannelQueue::new(paths.clone());
@@ -683,9 +721,34 @@ async fn handle_carrier_callback(
         Ok(super::telecom_worker::CarrierOutcome::Call {
             call_id,
             answered: true,
-        }) => match answer_document(&provider, &account, &secret, &call_id, now_ms) {
-            Some(document) => xml_response(document),
+        }) => match media_socket_url(&provider, &account, &secret, &call_id, now_ms) {
             None => response(StatusCode::ACCEPTED, "accepted"),
+            Some(media_url) => match provider.answer_instructions(&media_url) {
+                // A carrier that answers with markup reads this response body.
+                Some(document) => xml_response(document),
+                // A carrier driven by commands (Telnyx) ignores it: the call is
+                // answered, or the stream started on it, by a REST call made
+                // here. A failure is reported as a failure rather than as a
+                // cheerful acknowledgement of a call nobody can hear.
+                None => {
+                    let answered_already = matches!(
+                        store.telecom_call(&call_id),
+                        Ok(Some(ref call)) if call.direction == CallDirection::Outbound
+                    );
+                    match provider
+                        .connect_media(
+                            &provider_call_id_for(&store, &call_id),
+                            &media_url,
+                            answered_already,
+                            account.limits.recording_enabled,
+                        )
+                        .await
+                    {
+                        Ok(()) => response(StatusCode::OK, "accepted"),
+                        Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "not_connected"),
+                    }
+                }
+            },
         },
         Ok(_) => response(StatusCode::ACCEPTED, "accepted"),
         Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "not_handled"),
@@ -704,13 +767,25 @@ const MEDIA_TOKEN_TTL_MS: i64 = 120_000;
 /// `None` when the account has no public URL configured or the carrier has no
 /// media stream: without both there is nowhere for the audio to go, and a
 /// document that connects a caller to silence is worse than not answering.
-fn answer_document(
+/// The carrier's own id for a call this daemon knows, for a command addressed
+/// to it. Empty when the row has none, which a command-driven carrier reports
+/// as a failure rather than acting on.
+fn provider_call_id_for(store: &DaemonStore, call_id: &str) -> String {
+    store
+        .telecom_call(call_id)
+        .ok()
+        .flatten()
+        .and_then(|call| call.provider_call_id)
+        .unwrap_or_default()
+}
+
+fn media_socket_url(
     provider: &std::sync::Arc<dyn super::telephony::TelecomProvider>,
     account: &super::telecom_store::TelecomAccountRecord,
     secret: &str,
     call_id: &str,
     now_ms: i64,
-) -> Option<super::telephony::AnswerDocument> {
+) -> Option<String> {
     provider.media_stream()?;
     let base = account.public_base_url.as_deref()?.trim_end_matches('/');
     let socket_base = base
@@ -723,11 +798,10 @@ fn answer_document(
     let expires_at_ms = now_ms + MEDIA_TOKEN_TTL_MS;
     let token =
         super::telephony::media_stream_token(secret, &account.account_id, call_id, expires_at_ms);
-    let url = format!(
+    Some(format!(
         "{socket_base}/v1/telecom/{}/media?call={call_id}&exp={expires_at_ms}&sig={token}",
         account.account_id
-    );
-    provider.answer_instructions(&url)
+    ))
 }
 
 fn xml_response(document: super::telephony::AnswerDocument) -> Response<Full<Bytes>> {
@@ -745,9 +819,11 @@ fn carrier_event_id(event: &super::telephony::TelecomEvent, digest: &str) -> Str
     use super::telephony::TelecomEvent;
     match event {
         TelecomEvent::InboundSms(envelope) => format!("sms:{}", envelope.provider_event_id),
-        TelecomEvent::InboundCall {
-            provider_call_id, ..
-        } => format!("call:{provider_call_id}"),
+        TelecomEvent::AnswerRequest {
+            provider_call_id,
+            direction,
+            ..
+        } => format!("answer:{}:{provider_call_id}", direction.as_str()),
         TelecomEvent::CallProgress {
             provider_call_id,
             state,
@@ -766,7 +842,7 @@ fn carrier_event_kind(event: &super::telephony::TelecomEvent) -> &'static str {
     use super::telephony::TelecomEvent;
     match event {
         TelecomEvent::InboundSms(_) => "inbound_sms",
-        TelecomEvent::InboundCall { .. } => "inbound_call",
+        TelecomEvent::AnswerRequest { .. } => "answer_request",
         TelecomEvent::CallProgress { .. } => "call_progress",
         TelecomEvent::SmsStatus { .. } => "sms_status",
         TelecomEvent::Ignored => "ignored",
@@ -1013,13 +1089,14 @@ fn serve_signed_attachment(
     if !account.enabled {
         return response(StatusCode::NOT_FOUND, "not_found");
     }
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
+    // Same key, same rule as the callback route: a media token verified under an
+    // empty secret is one an attacker can mint for any artifact this account can
+    // reach. No credential, no media.
+    let Ok(secret) = super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
     };
     if super::telephony::verify_media_file_token(
         &secret,

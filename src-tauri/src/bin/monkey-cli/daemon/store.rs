@@ -2292,7 +2292,48 @@ CREATE INDEX peer_rejection_events_recent_idx
 "#;
 
 const DAEMON_V17: i64 = 17;
-const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-peer-artifact-provenance";
+const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-sms-delivery-and-callback-rejections";
+
+/// What became of a message after the carrier accepted it, and whether a
+/// carrier's callbacks are being refused at the door.
+///
+/// # Delivery is not sending
+///
+/// `channel_outbox.state` answers "did the provider take it?" — `sent` is the
+/// end of that story. A carrier answers a second question minutes later: did it
+/// reach the handset? On SMS that answer is routine and routinely negative
+/// (a wrong number, a landline, a carrier block), and until now it arrived,
+/// verified, and was dropped. These columns are where it lands, so an operator
+/// can see that the text they were told was sent was never delivered.
+///
+/// `delivery_state` is deliberately separate from `state` rather than a new
+/// value in it: a delivery receipt must never move a row back into the retry
+/// machinery, and a schema where "delivered" and "sent" are the same column
+/// invites exactly that.
+///
+/// # Rejected callbacks
+///
+/// A signature that does not verify earns no durable row — the body is
+/// attacker-supplied and recording it would be storage anyone can write. But
+/// the *fact* that this account's callbacks are being rejected is the single
+/// most useful thing Security Doctor can tell an operator whose public URL no
+/// longer matches what they configured, so a bounded counter and the reason
+/// code (never the body, never a header) live on the account itself.
+const DAEMON_V17_SQL: &str = r#"
+ALTER TABLE channel_outbox ADD COLUMN delivery_state TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivery_error TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivered_at_ms INTEGER;
+
+CREATE INDEX IF NOT EXISTS channel_outbox_provider_message_idx
+    ON channel_outbox(account_id, provider_message_id);
+
+ALTER TABLE telecom_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
+const DAEMON_V18: i64 = 18;
+const DAEMON_V18_CHECKSUM: &str = "daemon-jobs-v18-peer-artifact-provenance";
 
 /// Who handed this installation which bytes, and what this installation sent.
 ///
@@ -2338,7 +2379,7 @@ const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-peer-artifact-provenance";
 /// minted plus the last state a poll observed; there is no remote enumeration
 /// route and none is wanted, so knowing which threads to ask about is exactly
 /// what this table is for.
-const DAEMON_V17_SQL: &str = r#"
+const DAEMON_V18_SQL: &str = r#"
 CREATE TABLE peer_artifact_receipts (
     peer_device_id TEXT NOT NULL CHECK (length(peer_device_id) BETWEEN 1 AND 128),
     artifact_id TEXT NOT NULL CHECK (length(artifact_id) BETWEEN 1 AND 128),
@@ -2402,12 +2443,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
     (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
     (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
+    (DAEMON_V18, DAEMON_V18_CHECKSUM, DAEMON_V18_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V17;
+const DAEMON_LATEST: i64 = DAEMON_V18;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2504,15 +2546,21 @@ mod tests {
         assert!(store.committed_reservations().unwrap().is_empty());
     }
 
-    /// Peer provenance arrives on a database that is already at V16 — the
-    /// shape every installation that took PR #386 is sitting on.
+    /// Peer provenance arrives on a database that is already at V17 — the
+    /// telephony shape, which is what a live installation is sitting on.
     ///
-    /// The new tables are additions, so there is nothing to backfill and
-    /// nothing that could fail: what matters is that the migration applies
-    /// forward from V16 rather than only onto a fresh file, and that the
-    /// existing peer rows are still there afterwards.
+    /// Two branches both reached for v17 at once: the telephony delivery
+    /// columns landed on `develop` while the peer tables were in review. Only
+    /// one of them can *be* v17, because the version is the identity a
+    /// migration is recorded under and the checksum guard exists to catch
+    /// exactly this — a schema edited in place under a number already applied.
+    /// Telephony landed first and keeps v17; peer provenance became v18.
+    ///
+    /// So the upgrade worth proving is not "from a fresh file" and not "from
+    /// v16": it is that a database carrying v17's telephony columns *and rows*
+    /// takes v18 and keeps both.
     #[test]
-    fn peer_provenance_upgrades_a_database_that_is_already_at_v16() {
+    fn peer_provenance_upgrades_a_database_that_is_already_at_v17() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
@@ -2524,7 +2572,7 @@ mod tests {
             )
             .unwrap();
         for &(version, checksum, sql) in DAEMON_MIGRATIONS {
-            if version > DAEMON_V16 {
+            if version > DAEMON_V17 {
                 break;
             }
             connection.execute_batch(sql).unwrap();
@@ -2536,12 +2584,34 @@ mod tests {
                 )
                 .unwrap();
         }
+        // Rows in both subsystems this upgrade passes over: a peer thread from
+        // v16, and traffic using the columns v17 itself added.
         connection
             .execute_batch(
                 "INSERT INTO peer_threads (
                     peer_device_id, thread_id, peer_instance_id, session_key,
                     created_at_ms, last_activity_at_ms
-                 ) VALUES ('device-1','thread-1','instance-remote','peer:device-1:thread-1',1,1);",
+                 ) VALUES ('device-1','thread-1','instance-remote','peer:device-1:thread-1',1,1);
+
+                 INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json, credential_ref,
+                    access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES ('acct-1','telegram','One',1,'{}',NULL,'{}','connected',1,1);
+
+                 INSERT INTO channel_outbox (
+                    outbox_id, account_id, conversation_id, state, payload_json,
+                    payload_digest, idempotency_key, attempt, max_attempts, created_at_ms,
+                    updated_at_ms, delivery_state, delivery_error, delivered_at_ms
+                 ) VALUES ('out-1','acct-1','c1','sent','{}','d1','key-1',0,3,1,1,
+                           'undelivered','carrier rejected the handset',9);
+
+                 INSERT INTO telecom_accounts (
+                    account_id, kind, label, enabled, carrier_account_id, from_number,
+                    credential_ref, public_base_url, non_secret_config_json, inbound_policy,
+                    outbound_approval, health, created_at_ms, updated_at_ms,
+                    rejected_callbacks, last_rejection, last_rejection_at_ms
+                 ) VALUES ('tel-1','mock','Mock',1,'carrier-1','+15550000000',NULL,NULL,'{}',
+                           'reject','never','connected',1,1,3,'signature_mismatch',7);",
             )
             .unwrap();
 
@@ -2554,9 +2624,31 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            DAEMON_V17
+            DAEMON_V18
         );
-        // The pre-existing traffic is untouched, and the new tables are there.
+        // v17's own columns still hold what they held. An upgrade that quietly
+        // recreated a table would pass a "the table exists" check and fail this.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT delivery_state FROM channel_outbox WHERE outbox_id='out-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "undelivered"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rejected_callbacks FROM telecom_accounts WHERE account_id='tel-1'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        // The pre-existing peer traffic is untouched, and the new tables are there.
         let store = DaemonStore { connection };
         assert!(store.peer_thread("device-1", "thread-1").unwrap().is_some());
         assert!(store
