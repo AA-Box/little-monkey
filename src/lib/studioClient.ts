@@ -602,6 +602,19 @@ export function normalizeDimension(value: number): number {
   return Math.min(Math.ceil(clamped / 32) * 32, 4096);
 }
 
+/** The same grid, taken to the nearest edge rather than the one above.
+ *
+ *  What the controls set, because a size asked for is a size wanted: 645 is
+ *  answered with 640 rather than the 672 the backend would round it to, which
+ *  is four percent larger than the picture the user was looking at. The two
+ *  never disagree about what gets rendered — the controls only ever hand the
+ *  backend a value already on the grid, and [normalizeDimension] leaves those
+ *  alone. It stays the truth for sizes that arrive from elsewhere. */
+export function alignDimension(value: number): number {
+  const clamped = Math.min(Math.max(Math.trunc(value), 32), 4096);
+  return Math.min(Math.round(clamped / 32) * 32, 4096);
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes <= 0) return "0 GB";
   const gigabytes = bytes / 1_000_000_000;
