@@ -180,9 +180,12 @@ export async function runCandidateEvaluation(
   }
   // Every arm of every case is copied from the same starting state, before any
   // of them runs — the baseline never hands its mutated files to the candidate.
-  const selfChecking = plan.cases.find(
-    (testCase) => testCase.kind === "positive" && testCase.verification_required,
-  );
+  // Only where success is a change of state. A read-only procedure was never
+  // supposed to alter anything, so a workspace that already passes its own
+  // verification is its normal condition — not evidence of a pre-solved task.
+  const selfChecking = plan.observed_mutation
+    ? plan.cases.find((testCase) => testCase.kind === "positive" && testCase.verification_required)
+    : undefined;
   const arms = [
     ...plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase))),
     ...(selfChecking ? [STARTING_STATE_ARM] : []),

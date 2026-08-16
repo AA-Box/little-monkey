@@ -497,6 +497,15 @@ pub struct EvaluationPlan {
     /// rather than running the arms against the user's live files.
     #[serde(default)]
     pub workspace_path: Option<String>,
+    /// The observed run changed workspace files, so what it achieved is a
+    /// change of state and the rebuilt starting state must not already look
+    /// finished. A runtime checks that before running any arm.
+    ///
+    /// False for a read-only procedure, which was never supposed to change
+    /// anything: a workspace that already passes its own verification is the
+    /// normal condition there, not evidence that the task was pre-solved.
+    #[serde(default)]
+    pub observed_mutation: bool,
 }
 
 /// Where an evaluation's disposable arms come from — see
@@ -511,6 +520,10 @@ pub struct EvaluationEnvironment {
     /// reproducing an already-solved task. A caller that cannot rewind must
     /// refuse to build the environment rather than evaluate against the answer.
     pub requires_pre_task_state: bool,
+    /// The observed run ran a shell command. No checkpoint captures what a
+    /// shell created, changed or deleted, so its starting state cannot be
+    /// shown to be the task — see [`PreTaskState::complete`].
+    pub used_shell: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -761,6 +774,22 @@ impl RunEvidence {
             .iter()
             .max_by_key(|entry| entry.sequence)
             .map(|entry| entry.passed)
+    }
+
+    /// The run changed at least one workspace file through this app's own
+    /// write or edit tools — the changes a turn checkpoint records.
+    pub fn mutated_the_workspace(&self) -> bool {
+        !self.changed_files.is_empty()
+    }
+
+    /// The run ran a shell command, whose effects no checkpoint captures.
+    ///
+    /// Every outcome counts, not only success: a command that failed may
+    /// still have written something before it did.
+    pub fn used_shell(&self) -> bool {
+        self.tool_calls
+            .iter()
+            .any(|call| call.tool_name == "run_shell")
     }
 
     /// How the run itself ended, from its own terminal event.
@@ -1414,11 +1443,14 @@ impl SkillLearningStore {
         Ok(EvaluationEnvironment {
             workspace: candidate.workspace_path.clone().map(PathBuf::from),
             checkpoint_id: evidence.and_then(|evidence| evidence.checkpoint_id.clone()),
-            // The observed procedure changed files, so the workspace on disk
-            // now holds its result. Without a rewind the arms would start
-            // from the answer.
-            requires_pre_task_state: evidence
-                .is_some_and(|evidence| !evidence.changed_files.is_empty()),
+            // Both read from the evidence rather than from the checkpoint: a
+            // read-only turn's checkpoint is discarded the moment it ends (it
+            // recorded no file), while its `checkpoint_linked` event survives
+            // in the ledger. Asking that deleted checkpoint what the run did
+            // would refuse every read-only candidate — the very class the
+            // auto-promote-safe policy exists for.
+            requires_pre_task_state: evidence.is_some_and(RunEvidence::mutated_the_workspace),
+            used_shell: evidence.is_some_and(RunEvidence::used_shell),
         })
     }
 
@@ -1714,6 +1746,10 @@ impl SkillLearningStore {
             allowed_tools: entry.allowed_tools.clone(),
             cases,
             workspace_path: entry.workspace_path.clone(),
+            observed_mutation: entry
+                .evidence
+                .as_ref()
+                .is_some_and(RunEvidence::mutated_the_workspace),
         };
         self.save(&state)?;
         Ok(plan)
@@ -3856,6 +3892,46 @@ fn same_folder(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
+    }
+}
+
+/// What has to be put back before an arm can run — decided from the run's own
+/// evidence, never from the checkpoint, which a read-only turn discards while
+/// its `checkpoint_linked` event lives on in the ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreTaskSource {
+    /// The run left the workspace as it found it, so a copy of it already is
+    /// the starting state.
+    NothingToUndo,
+    /// The run changed files through this app's write and edit tools; rewind
+    /// them from this checkpoint.
+    Checkpoint(String),
+    /// The starting state cannot be shown to be the task. Carries what to tell
+    /// the user; the store refuses to build the environment either way.
+    Unreproducible(String),
+}
+
+/// Reads [`EvaluationEnvironment`] into the one decision the sandbox builder
+/// needs. Pure, so every branch is testable without a running app.
+pub fn pre_task_source(environment: &EvaluationEnvironment) -> PreTaskSource {
+    if environment.used_shell {
+        // No checkpoint captures what a shell command created, changed or
+        // deleted, so part of the procedure's own result could still be in the
+        // copy and an arm could "reproduce" a step it never performed.
+        return PreTaskSource::Unreproducible(
+            "the observed run used the shell, whose effects no checkpoint captures, so the state it started from cannot be rebuilt"
+                .to_string(),
+        );
+    }
+    if !environment.requires_pre_task_state {
+        return PreTaskSource::NothingToUndo;
+    }
+    match &environment.checkpoint_id {
+        Some(checkpoint_id) => PreTaskSource::Checkpoint(checkpoint_id.clone()),
+        None => PreTaskSource::Unreproducible(
+            "the observed run changed files but linked no checkpoint, so the task it solved cannot be put back for evaluation"
+                .to_string(),
+        ),
     }
 }
 
@@ -6555,6 +6631,295 @@ mod tests {
         assert!(eval_sandbox_identity(directory.path(), &sandbox).is_err());
     }
 
+    /// The whole loop for a read-only procedure, which is the class the
+    /// auto-promote-safe policy exists for.
+    ///
+    /// A read-only turn records no file, so its checkpoint is discarded the
+    /// moment it ends — while the `checkpoint_linked` event it wrote lives on
+    /// in the ledger. Asking that deleted checkpoint what to rewind would
+    /// refuse every such candidate. Nothing needs rewinding: the run left the
+    /// workspace as it found it, so a copy of it IS the starting state.
+    #[tokio::test]
+    async fn a_read_only_procedure_proves_itself_and_promotes_unattended() {
+        let directory = TestDirectory::new("read-only-loop");
+        let work = TestDirectory::new("read-only-workspace");
+        let workspace = work.path().to_path_buf();
+        seed_workspace(&workspace);
+
+        let candidate_id;
+        let installed_sha;
+        {
+            let store = store(&directory);
+            let manager = manager(&directory);
+            store.set_mode(LearningMode::AutoPromoteSafe).unwrap();
+            // The checkpoint id names a checkpoint that no longer exists —
+            // exactly what a read-only turn leaves behind.
+            let evidence = evidence_from_events(
+                "run-1",
+                "remember how to audit the uploader for retry coverage",
+                &read_only_procedure_events("checkpoint-gone"),
+            );
+            assert_eq!(evidence.checkpoint_id.as_deref(), Some("checkpoint-gone"));
+            assert!(!evidence.mutated_the_workspace());
+            assert!(!evidence.used_shell());
+
+            let detected = store
+                .detect(&evidence, SkillScope::Workspace, Some(&workspace))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                detected.source_kind,
+                LearningSourceKind::ExplicitUserInstruction
+            );
+            candidate_id = detected.candidate_id.clone();
+            store.begin_reflection(&candidate_id).unwrap();
+
+            let mut proposal = workspace_proposal(
+                "uploader-audit",
+                "Read the uploader, grep for the retry helper, and report what is missing.",
+            );
+            proposal.allowed_tools = vec!["read_file".to_string(), "grep".to_string()];
+            let staged = store
+                .propose(
+                    &candidate_id,
+                    None,
+                    &proposal,
+                    &manager,
+                    Some(&workspace),
+                    &[],
+                )
+                .unwrap();
+            // Read-only, so nothing here needs a human decision.
+            assert!(staged.policy.clone().unwrap().auto_promote_allowed);
+
+            // The environment is buildable even though the checkpoint is gone,
+            // because the evidence says nothing was changed.
+            let plan = store.plan_evaluation(&candidate_id).unwrap();
+            let environment = store.evaluation_environment(&plan.evaluation_id).unwrap();
+            assert!(!environment.requires_pre_task_state);
+            assert!(!environment.used_shell);
+            assert!(
+                !plan.observed_mutation,
+                "a read-only run's starting state is not defined by a change"
+            );
+
+            let record = evaluate_read_only(&store, &plan, &workspace).await;
+            assert_eq!(record.mode, EvaluationMode::RealIsolated);
+            assert_eq!(
+                record.verdict,
+                EvaluationVerdict::Passed,
+                "{}",
+                record.summary
+            );
+
+            // Unattended: no approval grant, and the policy still allows it.
+            let outcome = store
+                .promote(&candidate_id, None, true, &manager, Some(&workspace))
+                .unwrap();
+            let PromotionOutcome::Promoted { candidate, .. } = outcome else {
+                panic!("a safe, evaluated, read-only candidate installs unattended");
+            };
+            assert_eq!(candidate.policy.unwrap().auto_promote_allowed, true);
+            installed_sha = candidate.installed_sha256.clone().unwrap();
+        }
+
+        // Restart, discover through the ordinary native runtime, use it on a
+        // second read-only task, and record that use against the exact hash.
+        let store = store(&directory);
+        let manager = manager(&directory);
+        store.reconcile(&manager, Some(&workspace), &[]).unwrap();
+        let mut descriptors = manager.discover(Some(&workspace), &[]).unwrap();
+        store.decorate(&mut descriptors).unwrap();
+        let learned = descriptors
+            .iter()
+            .find(|entry| entry.command == "uploader-audit")
+            .expect("the learned skill is in the catalog after a restart");
+        assert_eq!(learned.sha256, installed_sha);
+        // Stored sorted by the runtime; the set is what matters.
+        assert_eq!(learned.allowed_tools, vec!["grep", "read_file"]);
+
+        let used = evidence_from_events(
+            "run-20",
+            "audit the downloader the same way",
+            &run_that_used("run-20", "uploader-audit", &installed_sha, None),
+        );
+        assert!(store
+            .record_run(&used, Some("session-a"))
+            .unwrap()
+            .is_empty());
+        let summary = store
+            .learned_skills(&manager, Some(&workspace), &[])
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.active_sha256 == installed_sha)
+            .unwrap();
+        assert_eq!(summary.uses, 1);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(summary.provenance.candidate_id, candidate_id);
+    }
+
+    /// Runs a read-only candidate's evaluation for real. Each arm reads the
+    /// sandbox off disk; only the arm holding the procedure knows to grep for
+    /// the helper, which is what the case requires. Verification is the
+    /// workspace's own command, run for real in the sandbox.
+    async fn evaluate_read_only(
+        store: &SkillLearningStore,
+        plan: &EvaluationPlan,
+        workspace: &Path,
+    ) -> EvaluationRecord {
+        let arms = plan
+            .cases
+            .iter()
+            .flat_map(|case| {
+                [
+                    format!("baseline-{}", case.case_id),
+                    format!("candidate-{}", case.case_id),
+                ]
+            })
+            .collect::<Vec<_>>();
+        // Nothing to rewind, and nothing was solved: the copy is the task.
+        let sandboxes = store
+            .create_eval_sandboxes(
+                &plan.evaluation_id,
+                workspace,
+                &arms,
+                &reproducible(Vec::new()),
+            )
+            .unwrap();
+        let mut reports = Vec::new();
+        for case in &plan.cases {
+            for (arm, with_skill) in [
+                (EvaluationArm::Baseline, false),
+                (EvaluationArm::Candidate, true),
+            ] {
+                let name = format!(
+                    "{}-{}",
+                    match arm {
+                        EvaluationArm::Baseline => "baseline",
+                        EvaluationArm::Candidate => "candidate",
+                    },
+                    case.case_id
+                );
+                let sandbox = sandboxes
+                    .iter()
+                    .find(|(entry, _)| *entry == name)
+                    .map(|(_, path)| path.clone())
+                    .unwrap();
+                let mut used_tools = Vec::new();
+                let mut verification_passed = None;
+                if case.kind == EvaluationCaseKind::Positive {
+                    let source = fs::read_to_string(sandbox.join("src/uploader.rs")).unwrap();
+                    used_tools.push("read_file".to_string());
+                    if with_skill {
+                        // The procedure's own step: the baseline never learns
+                        // to look for the helper by name.
+                        assert!(!source.contains("with_retry("));
+                        used_tools.push("grep".to_string());
+                    }
+                    let result = crate::verify::run_command_impl(
+                        &crate::AppState::default(),
+                        &sandbox,
+                        &read_only_verification_command(),
+                        None,
+                        crate::test_support::RecordingProjector::shared(),
+                    )
+                    .await;
+                    verification_passed = Some(!result.timed_out && result.code == Some(0));
+                }
+                reports.push(EvaluationCaseReport {
+                    case_id: case.case_id.clone(),
+                    arm,
+                    completed: true,
+                    used_tools,
+                    verification_passed,
+                    latency_ms: 4,
+                    input_tokens: 8,
+                    output_tokens: 4,
+                    cost_micros: None,
+                    permission_requests: Vec::new(),
+                    tool_failures: Vec::new(),
+                    error: None,
+                });
+            }
+        }
+        // Nothing was written: an arm's copy is byte-for-byte the workspace it
+        // came from, and the user's own files were never touched.
+        for (_, path) in &sandboxes {
+            assert_eq!(
+                fs::read_to_string(path.join("src/uploader.rs")).unwrap(),
+                UNSOLVED
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(workspace.join("src/uploader.rs")).unwrap(),
+            UNSOLVED
+        );
+        let record = store
+            .report_evaluation(&plan.evaluation_id, EvaluationMode::RealIsolated, &reports)
+            .unwrap();
+        store.destroy_eval_sandboxes(&plan.evaluation_id).unwrap();
+        record
+    }
+
+    /// A verification an already-healthy workspace passes — which is the
+    /// normal condition for a read-only task, and must not be read as the
+    /// task having been pre-solved.
+    fn read_only_verification_command() -> crate::verify::VerifyCommand {
+        crate::verify::VerifyCommand {
+            id: "verify-1".to_string(),
+            label: "sources present".to_string(),
+            kind: "test".to_string(),
+            command: "test -f src/uploader.rs".to_string(),
+            enabled: true,
+            timeout_secs: Some(30),
+        }
+    }
+
+    /// What has to be put back comes from what the run did, not from whether a
+    /// checkpoint happens to still be there.
+    #[test]
+    fn what_to_rewind_is_decided_by_the_evidence() {
+        let environment =
+            |mutated: bool, shell: bool, checkpoint: Option<&str>| EvaluationEnvironment {
+                workspace: Some(PathBuf::from("/ws")),
+                checkpoint_id: checkpoint.map(str::to_string),
+                requires_pre_task_state: mutated,
+                used_shell: shell,
+            };
+
+        // Read-only, and its checkpoint was discarded at turn end because it
+        // recorded no file — while the `checkpoint_linked` event survives.
+        // Nothing to undo, so the stale id is never dereferenced.
+        assert_eq!(
+            pre_task_source(&environment(false, false, Some("checkpoint-gone"))),
+            PreTaskSource::NothingToUndo
+        );
+        assert_eq!(
+            pre_task_source(&environment(false, false, None)),
+            PreTaskSource::NothingToUndo
+        );
+
+        // Changed files: rewind from that run's own checkpoint, or refuse.
+        assert_eq!(
+            pre_task_source(&environment(true, false, Some("checkpoint-7"))),
+            PreTaskSource::Checkpoint("checkpoint-7".to_string())
+        );
+        assert!(matches!(
+            pre_task_source(&environment(true, false, None)),
+            PreTaskSource::Unreproducible(reason) if reason.contains("linked no checkpoint")
+        ));
+
+        // The shell wins over everything, including a read-only-looking run:
+        // a shell command's effects are in no checkpoint and leave no
+        // `changed_files` entry either.
+        for mutated in [false, true] {
+            assert!(matches!(
+                pre_task_source(&environment(mutated, true, Some("checkpoint-7"))),
+                PreTaskSource::Unreproducible(reason) if reason.contains("used the shell")
+            ));
+        }
+    }
+
     /// A run that used the shell cannot have its starting state reproduced —
     /// no checkpoint captures what a shell created — so the environment is
     /// refused rather than built out of a state that may still hold part of
@@ -7107,6 +7472,61 @@ mod tests {
                 .collect(),
             complete: !state.shell_ran,
         }
+    }
+
+    /// A run that read the workspace, changed nothing, and ended verified —
+    /// the shape the auto-promote-safe policy exists for. Its turn checkpoint
+    /// recorded no file and was therefore discarded at turn end, but the
+    /// `checkpoint_linked` event it wrote is still in the ledger.
+    fn read_only_procedure_events(checkpoint_id: &str) -> Vec<RunEventEnvelope> {
+        let mut events = Vec::new();
+        events.extend(tool_pair(
+            1,
+            "call-1",
+            "read_file",
+            false,
+            ToolOutcome::Succeeded,
+            None,
+            Some("src/uploader.rs"),
+        ));
+        events.extend(tool_pair(
+            3,
+            "call-2",
+            "grep",
+            false,
+            ToolOutcome::Succeeded,
+            Some("src/uploader.rs:1: pub fn upload"),
+            None,
+        ));
+        events.push(envelope(
+            5,
+            RunEvent::CheckpointLinked {
+                checkpoint_id: checkpoint_id.to_string(),
+                kind: CheckpointKind::Workspace,
+                label: "audit the uploader".to_string(),
+                content_sha256: None,
+            },
+        ));
+        events.push(envelope(
+            6,
+            RunEvent::VerificationFinished {
+                verification_id: "verify-1".to_string(),
+                name: "cargo test".to_string(),
+                passed: true,
+                summary: "42 passed".to_string(),
+                artifact_ids: Vec::new(),
+                duration_ms: 900,
+            },
+        ));
+        events.push(envelope(
+            7,
+            RunEvent::Completed {
+                summary: Some("Audited the uploader".to_string()),
+                result_artifact_ids: Vec::new(),
+                usage: usage(),
+            },
+        ));
+        events
     }
 
     /// A fully reproducible pre-task state made of these files.

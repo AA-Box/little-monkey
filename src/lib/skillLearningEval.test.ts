@@ -48,6 +48,7 @@ function plan(overrides: Partial<EvaluationPlan> = {}): EvaluationPlan {
       },
     ],
     workspace_path: "/tmp/workspace",
+    observed_mutation: true,
     ...overrides,
   };
 }
@@ -196,6 +197,20 @@ describe("runCandidateEvaluation", () => {
     expect(turnId).toBe("eval-abc-starting-state");
     // Not "whatever workspace is open" — the one the candidate was learned in.
     expect(workspacePath).toBe("/tmp/workspace");
+  });
+
+  it("does not hold a read-only procedure against an already-green workspace", async () => {
+    // A read-only run was never supposed to change anything, so its starting
+    // state passing is the normal condition — not evidence the task was
+    // pre-solved. The check exists for tasks defined by a change of state.
+    const api = client({ planEvaluation: vi.fn(async () => plan({ observed_mutation: false })) });
+    runSandboxVerification.mockResolvedValue({ passed: true, detail: "1 command passed" });
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    expect(api.markUnevaluated).not.toHaveBeenCalled();
+    expect(api.reportEvaluation).toHaveBeenCalled();
+    // No starting-state copy is made or checked at all.
+    const [, arms] = api.createSandboxes.mock.calls[0] as unknown as [string, string[]];
+    expect(arms).not.toContain("starting-state");
   });
 
   it("is unevaluated, never a pass, when no reproducible environment exists", async () => {

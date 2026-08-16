@@ -173,17 +173,23 @@ arms to solve a solved problem. If the run changed files and its checkpoint is
 gone — pruned, or never taken — the environment cannot be rebuilt and the
 result is `unevaluated`.
 
-The rewind covers every file this app's own write and edit tools changed. No
-checkpoint captures what a shell command created, changed or deleted, so a run
-that used the shell leaves a rewind that cannot be shown to be complete — its
-copy could still hold part of the procedure's own result, and an arm could then
-"reproduce" a step it never performed. That is refused up front: a real
-isolated evaluation of such a run is `unevaluated`, not attempted.
+What has to be put back is decided by what the run did, from its own evidence.
+A procedure that only read the workspace changed nothing, so a copy of that
+workspace already *is* its starting state and no rewind is involved. A
+procedure that wrote files is rewound from its turn's checkpoint. A procedure
+that used the shell cannot be rebuilt at all — no checkpoint captures what a
+shell created, changed or deleted, so the copy could still hold part of the
+procedure's own result and an arm could "reproduce" a step it never performed.
+That is refused up front: a real isolated evaluation of such a run is
+`unevaluated`, not attempted.
 
-The evaluation also checks its own starting state, for everything the rewind
-was never going to see. Before any arm runs it verifies one untouched copy, and
-if that copy *already* satisfies the workspace's verification, the case is a
-solved problem and the result is `unevaluated`.
+For a task defined by a change of state, the evaluation also checks its own
+starting state, for anything the rewind was never going to see. Before any arm
+runs it verifies one untouched copy, and if that copy *already* satisfies the
+workspace's verification, the case is a solved problem and the result is
+`unevaluated`. A read-only procedure is exempt: it was never supposed to change
+anything, so a workspace that already passes its own checks is its normal
+condition, not a sign the task was pre-solved.
 
 Verification uses the commands configured for the workspace the candidate was
 learned in — not whichever folder happens to be open, and not anything read out

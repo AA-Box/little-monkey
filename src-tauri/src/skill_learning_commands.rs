@@ -17,11 +17,11 @@ use crate::native_skills::{ExternalSignedSkill, SkillDescriptor, SkillMutationRe
 use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
-    approval_operation_digest, evidence_from_events, reflection_brief, ApprovalGrant,
-    CandidateProposal, CorrectedExecution, EffectivenessRecord, EvaluationCaseReport,
-    EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary, LearningCandidate,
-    LearningMode, LearningSettings, PreTaskFile, PreTaskState, PromotionOutcome, RunEvidence,
-    SkillLearningStore,
+    approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
+    ApprovalGrant, CandidateProposal, CorrectedExecution, EffectivenessRecord,
+    EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary,
+    LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
+    PromotionOutcome, RunEvidence, SkillLearningStore,
 };
 use crate::AppState;
 
@@ -264,15 +264,20 @@ pub async fn skill_learning_create_sandboxes(
     run_blocking(move || {
         let environment = store.evaluation_environment(&evaluation_id)?;
         let invalid = crate::native_skills::SkillError::Invalid;
-        let source = environment.workspace.ok_or_else(|| {
+        let source = environment.workspace.clone().ok_or_else(|| {
             invalid(
                 "this candidate has no recorded workspace, so no reproducible evaluation environment can be built"
                     .to_string(),
             )
         })?;
-        let pre_task = match &environment.checkpoint_id {
-            Some(checkpoint_id) => {
-                let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, checkpoint_id)
+        // What the run did decides what has to be put back, and the evidence
+        // is the authority on that — not the checkpoint, which a read-only
+        // turn discards while its `checkpoint_linked` event lives on.
+        let pre_task = match pre_task_source(&environment) {
+            PreTaskSource::NothingToUndo => PreTaskState { files: Vec::new(), complete: true },
+            PreTaskSource::Unreproducible(reason) => return Err(invalid(reason)),
+            PreTaskSource::Checkpoint(checkpoint_id) => {
+                let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, &checkpoint_id)
                     .map_err(invalid)?;
                 PreTaskState {
                     files: state
@@ -280,21 +285,9 @@ pub async fn skill_learning_create_sandboxes(
                         .into_iter()
                         .map(|file| PreTaskFile { path: file.path, contents: file.contents })
                         .collect(),
-                    // No checkpoint captures what a shell command created,
-                    // changed or deleted, so a run that used one leaves a
-                    // rewind that cannot be shown to be complete. The store
-                    // refuses it rather than evaluating a starting state that
-                    // may still hold part of the procedure's own result.
                     complete: !state.shell_ran,
                 }
             }
-            None if environment.requires_pre_task_state => {
-                return Err(invalid(
-                    "the observed run changed files but its checkpoint is no longer available, so the task it solved cannot be put back for evaluation"
-                        .to_string(),
-                ))
-            }
-            None => PreTaskState { files: Vec::new(), complete: true },
         };
         let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms, &pre_task)?;
         Ok(created

@@ -197,6 +197,10 @@ export interface EvaluationPlan {
    * isolated environment can be built, which is an `unevaluated`, never a run
    * against the user's live files. */
   workspace_path: string | null;
+  /** The observed run changed files, so the rebuilt starting state must not
+   * already look finished. False for a read-only procedure, where an
+   * already-passing workspace is the normal condition. */
+  observed_mutation: boolean;
 }
 
 export interface EvaluationCaseReport {
