@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import {
   AppWindow,
   BarChart3,
@@ -44,7 +44,25 @@ import { IconButton } from "../ui";
 import { useModelStore } from "../../store/modelStore";
 import { ProviderCard } from "./ProviderCard";
 import { AddCustomProviderForm } from "./AddCustomProviderForm";
-import { AutomationPanel } from "./AutomationPanel";
+/** The largest panel in this modal by a wide margin, and one behind a tab most
+ * sessions never open. Loading it with the rest of Settings put the whole of it
+ * in the modal's chunk, which is what finally pushed that chunk past its
+ * budget. Split out here rather than by raising the budget: the budget is doing
+ * its job. */
+/** Shown while a lazily-loaded panel's chunk arrives. Mirrors the app's own
+ * lazy-panel fallback rather than inventing a second spinner. */
+function PanelFallback() {
+  return (
+    <div className="flex min-h-32 w-full items-center justify-center" aria-busy="true">
+      <div className="h-5 w-5 animate-spin rounded-full border-2 border-border border-t-accent" />
+    </div>
+  );
+}
+
+const AutomationPanel = lazy(() =>
+  import("./AutomationPanel").then((module) => ({ default: module.AutomationPanel })),
+);
+
 import { ProviderModelsPanel } from "./OpenRouterModelsPanel";
 import {
   connectedProviderNavigationItems,
@@ -449,7 +467,11 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
                 </div>
               )}
               {tab === "knowledge" && <KnowledgePanel />}
-              {tab === "automation" && <AutomationPanel />}
+              {tab === "automation" && (
+                <Suspense fallback={<PanelFallback />}>
+                  <AutomationPanel />
+                </Suspense>
+              )}
               {tab === "rules" && <RulesMemoryPanel />}
               {tab === "memorystudio" && <MemoryStudioPanel />}
               {tab === "connectors" && <ConnectorsPanel />}
