@@ -2291,6 +2291,47 @@ CREATE INDEX peer_rejection_events_recent_idx
     ON peer_rejection_events(occurred_at_ms DESC, event_id DESC);
 "#;
 
+const DAEMON_V17: i64 = 17;
+const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-sms-delivery-and-callback-rejections";
+
+/// What became of a message after the carrier accepted it, and whether a
+/// carrier's callbacks are being refused at the door.
+///
+/// # Delivery is not sending
+///
+/// `channel_outbox.state` answers "did the provider take it?" — `sent` is the
+/// end of that story. A carrier answers a second question minutes later: did it
+/// reach the handset? On SMS that answer is routine and routinely negative
+/// (a wrong number, a landline, a carrier block), and until now it arrived,
+/// verified, and was dropped. These columns are where it lands, so an operator
+/// can see that the text they were told was sent was never delivered.
+///
+/// `delivery_state` is deliberately separate from `state` rather than a new
+/// value in it: a delivery receipt must never move a row back into the retry
+/// machinery, and a schema where "delivered" and "sent" are the same column
+/// invites exactly that.
+///
+/// # Rejected callbacks
+///
+/// A signature that does not verify earns no durable row — the body is
+/// attacker-supplied and recording it would be storage anyone can write. But
+/// the *fact* that this account's callbacks are being rejected is the single
+/// most useful thing Security Doctor can tell an operator whose public URL no
+/// longer matches what they configured, so a bounded counter and the reason
+/// code (never the body, never a header) live on the account itself.
+const DAEMON_V17_SQL: &str = r#"
+ALTER TABLE channel_outbox ADD COLUMN delivery_state TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivery_error TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivered_at_ms INTEGER;
+
+CREATE INDEX IF NOT EXISTS channel_outbox_provider_message_idx
+    ON channel_outbox(account_id, provider_message_id);
+
+ALTER TABLE telecom_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2318,12 +2359,13 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
     (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
     (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
+    (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V16;
+const DAEMON_LATEST: i64 = DAEMON_V17;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,

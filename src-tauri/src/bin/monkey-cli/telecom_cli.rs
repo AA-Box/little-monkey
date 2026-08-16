@@ -20,7 +20,7 @@ use little_monkey_lib::channels::types::{ChannelHealth, HealthState};
 use crate::daemon::channel_adapter::{ChannelSecrets, KeyringChannelSecrets};
 use crate::daemon::store::{DaemonPaths, DaemonStore};
 use crate::daemon::telecom_store::{
-    CallLimits, InboundCallPolicy, OutboundCallApproval, TelecomAccountRecord,
+    CallLimits, InboundCallPolicy, OutboundCallApproval, TelecomAccountRecord, TelecomMessageRecord,
 };
 use crate::daemon::telephony::{provider_for_account, TelecomKind};
 
@@ -112,6 +112,30 @@ pub enum TelecomCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Change where this account's carrier reaches it, or its non-secret
+    /// settings. A tunnel that moved is the usual reason.
+    SetUrl {
+        account_id: String,
+        /// The operator's own canonical public URL. Pass `--clear` to remove it.
+        #[arg(long)]
+        url: Option<String>,
+        /// Non-secret carrier settings as a JSON object, merged into what is
+        /// stored — Telnyx's rotated webhook public key goes here.
+        #[arg(long)]
+        config: Option<String>,
+        /// Remove the public URL, leaving the account with nowhere for its
+        /// carrier to deliver.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Recent texts on this number, both directions, with their delivery state.
+    Messages {
+        account_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// The callback URL this account's carrier should post to.
     CallbackUrl {
         account_id: String,
@@ -170,6 +194,17 @@ pub async fn dispatch(action: &TelecomCmd) -> Result<(), String> {
             limit,
             json,
         } => calls(account_id, *limit, *json),
+        TelecomCmd::SetUrl {
+            account_id,
+            url,
+            config,
+            clear,
+        } => set_public_url(account_id, url.as_deref(), config.as_deref(), *clear),
+        TelecomCmd::Messages {
+            account_id,
+            limit,
+            json,
+        } => messages(account_id, *limit, *json),
         TelecomCmd::CallbackUrl { account_id, json } => callback_url(account_id, *json),
         TelecomCmd::Remove { account_id } => remove(account_id),
     }
@@ -228,12 +263,52 @@ pub(crate) fn account_json(account: &TelecomAccountRecord) -> serde_json::Value 
     })
 }
 
+/// The same view plus what only the store can answer: how many callbacks this
+/// account has refused since one last verified. Separate from
+/// [`account_json`] because that function is handed a record and this one needs
+/// the store the record came from.
+pub(crate) fn account_json_with_store(
+    store: &DaemonStore,
+    account: &TelecomAccountRecord,
+) -> serde_json::Value {
+    let mut value = account_json(account);
+    let rejections = store
+        .callback_rejections(&account.account_id)
+        .unwrap_or_default();
+    value["callback_rejections"] = serde_json::json!({
+        "count": rejections.count,
+        "last_reason": rejections.last_reason,
+        "last_at_ms": rejections.last_at_ms,
+    });
+    value
+}
+
+/// JSON view of one recent text. No credential can reach this: it is built
+/// from a message row and nothing else.
+pub(crate) fn message_json(message: &TelecomMessageRecord) -> serde_json::Value {
+    serde_json::json!({
+        "direction": message.direction.as_str(),
+        "peer_number": message.peer_number,
+        "text": message.text,
+        "state": message.state,
+        "delivery_state": message.delivery_state,
+        "error": message.error,
+        "at_ms": message.at_ms,
+    })
+}
+
 fn list(json: bool) -> Result<(), String> {
-    let accounts = store()?.telecom_accounts()?;
+    let store = store()?;
+    let accounts = store.telecom_accounts()?;
     if json {
         println!(
             "{}",
-            serde_json::Value::Array(accounts.iter().map(account_json).collect())
+            serde_json::Value::Array(
+                accounts
+                    .iter()
+                    .map(|account| account_json_with_store(&store, account))
+                    .collect()
+            )
         );
         return Ok(());
     }
@@ -318,7 +393,12 @@ fn add(
         created_at_ms: now,
         updated_at_ms: now,
     };
-    store()?.upsert_telecom_account(&record)?;
+    let mut store = store()?;
+    store.upsert_telecom_account(&record)?;
+    // The messaging side gets its account now rather than on the first text,
+    // so an operator can authorize senders and set up routing for this number
+    // before anyone texts it.
+    crate::daemon::telecom_worker::ensure_sms_channel_account(&mut store, &record, now)?;
     if json {
         println!("{}", account_json(&record));
     } else {
@@ -595,6 +675,112 @@ fn calls(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Point this account's carrier at a different place, or update its non-secret
+/// settings.
+///
+/// The public URL is the one value every signature check depends on: Twilio and
+/// Plivo sign the URL their callback was posted to, so a base that no longer
+/// matches the carrier console rejects every genuine callback. An operator
+/// whose tunnel moved needs to be able to fix it without deleting the number
+/// and its call history.
+fn set_public_url(
+    account_id: &str,
+    url: Option<&str>,
+    config_json: Option<&str>,
+    clear: bool,
+) -> Result<(), String> {
+    if url.is_none() && config_json.is_none() && !clear {
+        return Err("Pass --url, --config or --clear.".to_string());
+    }
+    let mut store = store()?;
+    let mut account = store
+        .telecom_account(account_id)?
+        .ok_or_else(|| format!("No such account '{account_id}'"))?;
+    if let Some(url) = url {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err("The public URL must start with https://".to_string());
+        }
+        account.public_base_url = Some(url.trim_end_matches('/').to_string());
+    } else if clear {
+        account.public_base_url = None;
+    }
+    if let Some(raw) = config_json {
+        let patch: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| format!("--config must be a JSON object: {error}"))?;
+        let patch = patch
+            .as_object()
+            .ok_or_else(|| "--config must be a JSON object".to_string())?;
+        let mut merged = account
+            .non_secret_config
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in patch {
+            merged.insert(key.clone(), value.clone());
+        }
+        account.non_secret_config = serde_json::Value::Object(merged);
+    }
+    // Where a carrier reaches this number just changed, so what the last probe
+    // proved about it no longer holds.
+    account.health = ChannelHealth {
+        state: HealthState::Disconnected,
+        detail: Some(
+            "Callback settings changed; run a probe to verify the connection.".to_string(),
+        ),
+        last_error: None,
+        probed_at_ms: now_ms(),
+    };
+    account.updated_at_ms = now_ms();
+    store.upsert_telecom_account(&account)?;
+    // The old rejections were about the old URL.
+    store.clear_callback_rejections(account_id)?;
+    match &account.public_base_url {
+        Some(base) => println!(
+            "{account_id} now expects its carrier at {}",
+            crate::daemon::telephony::callback_url(base, account_id)
+        ),
+        None => println!("{account_id} has no public URL, so its carrier has nowhere to post to."),
+    }
+    Ok(())
+}
+
+fn messages(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
+    let store = store()?;
+    if store.telecom_account(account_id)?.is_none() {
+        return Err(format!("No such account '{account_id}'"));
+    }
+    let messages = store.recent_telecom_messages(account_id, limit)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::Value::Array(messages.iter().map(message_json).collect())
+        );
+        return Ok(());
+    }
+    if messages.is_empty() {
+        println!("No texts on {account_id} yet.");
+        return Ok(());
+    }
+    for message in &messages {
+        println!(
+            "{}  {}  {}  {}{}",
+            message.direction.as_str(),
+            message.peer_number,
+            message
+                .delivery_state
+                .as_deref()
+                .unwrap_or(message.state.as_str()),
+            message.text,
+            message
+                .error
+                .as_ref()
+                .map(|error| format!("  ({error})"))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 fn callback_url(account_id: &str, json: bool) -> Result<(), String> {
     let account = store()?
         .telecom_account(account_id)?
@@ -602,7 +788,7 @@ fn callback_url(account_id: &str, json: bool) -> Result<(), String> {
     let url = account
         .public_base_url
         .as_ref()
-        .map(|base| format!("{}/v1/telecom/{account_id}", base.trim_end_matches('/')));
+        .map(|base| crate::daemon::telephony::callback_url(base, account_id));
     if json {
         println!(
             "{}",

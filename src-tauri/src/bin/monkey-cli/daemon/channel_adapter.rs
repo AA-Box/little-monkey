@@ -850,6 +850,12 @@ pub fn attachment_mime(
 pub fn credential_required(account: &ChannelAccountRecord) -> bool {
     match account.kind {
         ChannelKind::Signal | ChannelKind::IMessage => false,
+        // The messaging half of a phone number holds no credential of its own:
+        // the carrier's lives on the telephony account, and texts go out
+        // through that carrier rather than through a channel adapter. Asking
+        // for one here would block an operator from enabling a number they
+        // already configured.
+        ChannelKind::Sms => false,
         ChannelKind::Irc => account
             .non_secret_config
             .get("use_sasl")
@@ -1244,6 +1250,17 @@ mod tests {
         for kind in [ChannelKind::Signal, ChannelKind::IMessage] {
             assert!(!credential_required(&account(kind, serde_json::json!({}))));
         }
+    }
+
+    #[test]
+    fn the_messaging_half_of_a_phone_number_holds_no_credential() {
+        // The carrier credential lives on the telephony account and texts go
+        // out through that carrier. Demanding one here would leave an operator
+        // unable to enable a number they had already finished configuring.
+        assert!(!credential_required(&account(
+            ChannelKind::Sms,
+            serde_json::json!({"from_number": "+15550001111"})
+        )));
     }
 
     #[test]

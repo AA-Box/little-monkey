@@ -3404,6 +3404,53 @@ pub async fn telecom_calls(account_id: String, limit: u32) -> Result<Value, Stri
     )
 }
 
+/// Point an account's carrier somewhere else, or update its non-secret
+/// settings. The public URL is what every signature check is rebuilt from, so
+/// an operator whose tunnel moved fixes it here rather than by re-adding the
+/// number and losing its history.
+#[tauri::command]
+pub async fn telecom_set_public_url(
+    account_id: String,
+    url: Option<String>,
+    config: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "set-url".into(), account_id];
+    match url {
+        Some(url) => {
+            validate_token("public URL", &url, 512)?;
+            args.push("--url".into());
+            args.push(url);
+        }
+        None if config.is_none() => args.push("--clear".into()),
+        None => {}
+    }
+    if let Some(config) = config {
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Carrier settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    command(args).await.map(|_| ())
+}
+
+/// Recent texts on a number, both directions, with their delivery state.
+#[tauri::command]
+pub async fn telecom_messages(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "messages".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
 /// The URL the operator pastes into their carrier's console.
 #[tauri::command]
 pub async fn telecom_callback_url(account_id: String) -> Result<Value, String> {

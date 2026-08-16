@@ -32,6 +32,10 @@ pub(crate) enum CarrierOutcome {
     Call { call_id: String, answered: bool },
     /// Progress was applied to a call we already knew about.
     Progress { call_id: String },
+    /// A carrier said whether a text arrived. `matched` is false for a receipt
+    /// about a message this machine has no outbox row for, which is normal on
+    /// a number that was used from somewhere else and is not an error.
+    Delivery { delivered: bool, matched: bool },
     /// Verified and understood, and nothing followed from it.
     Nothing,
 }
@@ -59,7 +63,60 @@ pub(crate) fn handle_carrier_event(
                 ignored: report.ignored + report.challenged + report.duplicates,
             })
         }
-        TelecomEvent::InboundCall {
+        TelecomEvent::AnswerRequest {
+            provider_call_id,
+            request_id,
+            direction: CallDirection::Outbound,
+            received_at_ms,
+            ..
+        } => {
+            // A call this machine placed, now picked up at the far end. It was
+            // approved, recorded and limited when it was dialed; all that is
+            // left is to connect it to its media socket — which is what the
+            // caller does with `answered: true`. Nothing new is created here:
+            // an outbound call the store has never heard of is a carrier
+            // inventing one.
+            let existing =
+                match store.call_by_provider_id(&account.account_id, &provider_call_id)? {
+                    Some(call) => Some(call),
+                    // Plivo accepts a dial with a `RequestUUID` and then identifies
+                    // the live call by `CallUUID`. The row still carries the first,
+                    // so it is found by that and taught the second — after which
+                    // progress, hangup and reconciliation all address the same
+                    // call the carrier does.
+                    None => match request_id.as_deref() {
+                        Some(request_id) => {
+                            match store.call_by_provider_id(&account.account_id, request_id)? {
+                                Some(call) => {
+                                    store.set_call_provider_id(
+                                        &call.call_id,
+                                        &provider_call_id,
+                                        now_ms,
+                                    )?;
+                                    Some(call)
+                                }
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    },
+                };
+            let Some(call) = existing else {
+                return Ok(CarrierOutcome::Nothing);
+            };
+            if call.state.is_terminal() {
+                // Reconciled, cancelled or already over. Connecting audio to it
+                // would resurrect a call the store has closed.
+                return Ok(CarrierOutcome::Nothing);
+            }
+            store.advance_call(&call.call_id, CallState::InProgress, None, now_ms)?;
+            let _ = received_at_ms;
+            Ok(CarrierOutcome::Call {
+                call_id: call.call_id,
+                answered: true,
+            })
+        }
+        TelecomEvent::AnswerRequest {
             provider_call_id,
             from_number,
             received_at_ms,
@@ -152,9 +209,27 @@ pub(crate) fn handle_carrier_event(
                 call_id: call.call_id,
             })
         }
-        // Delivery receipts and carrier heartbeats: the event row the caller
-        // already wrote is the whole record.
-        TelecomEvent::SmsStatus { .. } | TelecomEvent::Ignored => Ok(CarrierOutcome::Nothing),
+        // A delivery receipt is the carrier answering a question the send never
+        // could: the send said "accepted", this says whether a handset got it.
+        // It lands on the outbox row that produced the message and moves
+        // nothing else — see `record_delivery_receipt`.
+        TelecomEvent::SmsStatus {
+            provider_message_id,
+            delivered,
+            error,
+        } => {
+            let matched = store.record_delivery_receipt(
+                &account.account_id,
+                &provider_message_id,
+                delivered,
+                error.as_deref(),
+                now_ms,
+            )?;
+            Ok(CarrierOutcome::Delivery { delivered, matched })
+        }
+        // A carrier heartbeat: the event row the caller already wrote is the
+        // whole record.
+        TelecomEvent::Ignored => Ok(CarrierOutcome::Nothing),
     }
 }
 
@@ -168,7 +243,7 @@ pub(crate) fn handle_carrier_event(
 ///
 /// The default policy is the conservative one messaging already ships: a text
 /// from a stranger starts a pairing handshake rather than running.
-fn ensure_sms_channel_account(
+pub(crate) fn ensure_sms_channel_account(
     store: &mut DaemonStore,
     account: &TelecomAccountRecord,
     now_ms: i64,
@@ -625,6 +700,132 @@ mod tests {
     }
 
     #[test]
+    fn a_carrier_saying_a_text_never_arrived_lands_on_the_message_it_is_about() {
+        let (mut store, account) = seeded(InboundCallPolicy::Reject);
+        // The channel account the outbox row hangs off, which a real number
+        // gets when it is added.
+        ensure_sms_channel_account(&mut store, &account, NOW).expect("sms account");
+        super::super::telecom_webhook_tests::stage_sent_text(
+            &mut store,
+            "tel-1",
+            "on my way",
+            "carrier-msg-1",
+        );
+        let queue = FakeQueue::default();
+
+        let outcome = handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::SmsStatus {
+                provider_message_id: "carrier-msg-1".into(),
+                delivered: false,
+                error: Some("handset unreachable".into()),
+            },
+            NOW + 1_000,
+        )
+        .expect("handled");
+
+        assert_eq!(
+            outcome,
+            CarrierOutcome::Delivery {
+                delivered: false,
+                matched: true
+            }
+        );
+        let messages = store
+            .recent_telecom_messages("tel-1", 10)
+            .expect("messages");
+        let sent = messages
+            .iter()
+            .find(|message| matches!(message.direction, CallDirection::Outbound))
+            .expect("the text");
+        assert_eq!(sent.delivery_state.as_deref(), Some("undelivered"));
+        assert_eq!(sent.error.as_deref(), Some("handset unreachable"));
+        // The send itself still succeeded. A receipt that moved the row back
+        // toward the retry machinery would text the person again.
+        assert_eq!(sent.state, "sent");
+    }
+
+    #[test]
+    fn a_delivery_receipt_for_a_message_this_machine_never_sent_changes_nothing() {
+        let (mut store, account) = seeded(InboundCallPolicy::Reject);
+        ensure_sms_channel_account(&mut store, &account, NOW).expect("sms account");
+        super::super::telecom_webhook_tests::stage_sent_text(
+            &mut store,
+            "tel-1",
+            "ours",
+            "carrier-msg-1",
+        );
+        let queue = FakeQueue::default();
+
+        let outcome = handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::SmsStatus {
+                provider_message_id: "somebody-elses-message".into(),
+                delivered: true,
+                error: None,
+            },
+            NOW,
+        )
+        .expect("handled");
+
+        assert_eq!(
+            outcome,
+            CarrierOutcome::Delivery {
+                delivered: true,
+                matched: false
+            },
+            "a receipt naming an unknown message is acknowledged, not applied"
+        );
+        let messages = store
+            .recent_telecom_messages("tel-1", 10)
+            .expect("messages");
+        assert!(messages
+            .iter()
+            .all(|message| message.delivery_state.is_none()));
+    }
+
+    #[test]
+    fn recent_messages_carry_both_directions_newest_first() {
+        let (mut store, account) = seeded(InboundCallPolicy::Reject);
+        let queue = FakeQueue::default();
+        handle_carrier_event(
+            &mut store,
+            &queue,
+            &account,
+            TelecomEvent::InboundSms(Box::new(text("are you there", "sms-1"))),
+            NOW,
+        )
+        .expect("handled");
+        super::super::telecom_webhook_tests::stage_sent_text(
+            &mut store,
+            "tel-1",
+            "on my way",
+            "carrier-msg-1",
+        );
+
+        let messages = store.recent_telecom_messages("tel-1", 10).expect("recent");
+
+        // Three: the text that arrived, the pairing challenge it triggered,
+        // and the reply. The challenge showing up is the point — an operator
+        // asking "why did nothing happen?" is looking at exactly that.
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        let inbound = messages
+            .iter()
+            .find(|message| matches!(message.direction, CallDirection::Inbound))
+            .expect("the text that arrived");
+        assert_eq!(inbound.peer_number, "+15551234567");
+        assert_eq!(inbound.text, "are you there");
+        // A text that only started a pairing handshake still shows: an
+        // operator wondering why nothing happened needs to see it arrived.
+        assert_eq!(inbound.state, "challenged");
+        assert!(messages[0].at_ms >= messages[1].at_ms);
+    }
+
+    #[test]
     fn a_call_is_recorded_even_when_the_policy_refuses_it() {
         let (mut store, account) = seeded(InboundCallPolicy::Reject);
         let queue = FakeQueue::default();
@@ -633,7 +834,9 @@ mod tests {
             &mut store,
             &queue,
             &account,
-            TelecomEvent::InboundCall {
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
                 provider_call_id: "carrier-call-1".into(),
                 from_number: "+15551234567".into(),
                 to_number: "+15550000000".into(),
@@ -656,7 +859,9 @@ mod tests {
     fn a_redelivered_ring_does_not_become_a_second_call() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
-        let ring = || TelecomEvent::InboundCall {
+        let ring = || TelecomEvent::AnswerRequest {
+            request_id: None,
+            direction: CallDirection::Inbound,
             provider_call_id: "carrier-call-1".into(),
             from_number: "+15551234567".into(),
             to_number: "+15550000000".into(),
@@ -674,7 +879,9 @@ mod tests {
     fn a_second_caller_is_refused_while_the_line_is_busy() {
         let (mut store, account) = seeded(InboundCallPolicy::Answer);
         let queue = FakeQueue::default();
-        let ring = |id: &str, from: &str| TelecomEvent::InboundCall {
+        let ring = |id: &str, from: &str| TelecomEvent::AnswerRequest {
+            request_id: None,
+            direction: CallDirection::Inbound,
             provider_call_id: id.into(),
             from_number: from.into(),
             to_number: "+15550000000".into(),
@@ -728,7 +935,9 @@ mod tests {
             &mut store,
             &queue,
             &account,
-            TelecomEvent::InboundCall {
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
                 provider_call_id: "c-1".into(),
                 from_number: "+15551110000".into(),
                 to_number: "+15550000000".into(),
@@ -769,7 +978,9 @@ mod tests {
             &mut store,
             &queue,
             &account,
-            TelecomEvent::InboundCall {
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
                 provider_call_id: "c-1".into(),
                 from_number: "+15551110000".into(),
                 to_number: "+15550000000".into(),
@@ -830,7 +1041,9 @@ mod tests {
             &mut store,
             &queue,
             &account,
-            TelecomEvent::InboundCall {
+            TelecomEvent::AnswerRequest {
+                request_id: None,
+                direction: CallDirection::Inbound,
                 provider_call_id: "carrier-call-1".into(),
                 from_number: "+15551234567".into(),
                 to_number: "+15550000000".into(),

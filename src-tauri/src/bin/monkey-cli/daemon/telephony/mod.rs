@@ -20,6 +20,8 @@ use async_trait::async_trait;
 use little_monkey_lib::channels::types::{ChannelEnvelope, ChannelHealth, SendOutcome};
 use serde::{Deserialize, Serialize};
 
+use super::telecom_store::CallDirection;
+
 pub mod mock;
 pub mod plivo;
 pub mod telnyx;
@@ -138,6 +140,82 @@ pub fn provider_for_account(
     })
 }
 
+/// The path this daemon serves an account's carrier callbacks on.
+///
+/// One function because three things have to agree on it exactly or nothing
+/// works: the listener that routes the request, the setup UI that tells the
+/// operator what to paste into their carrier's console, and — least obviously —
+/// the signature verifiers. Twilio and Plivo sign the *URL* the carrier posted
+/// to, and `verify_webhook` is handed only headers and a body, so it has to
+/// rebuild that URL from the operator's configured base plus this path. A
+/// verifier that rebuilt a different path than the console was given would
+/// reject every genuine callback, and no unit test written against the same
+/// wrong constant would notice.
+pub fn callback_path(account_id: &str) -> String {
+    format!("/v1/telecom/{account_id}")
+}
+
+/// The full callback URL for an account under the operator's own public base.
+pub fn callback_url(public_base_url: &str, account_id: &str) -> String {
+    format!(
+        "{}{}",
+        public_base_url.trim_end_matches('/'),
+        callback_path(account_id)
+    )
+}
+
+/// Where a carrier reports what became of something, as opposed to asking what
+/// to do next.
+///
+/// Two paths rather than one because a carrier posting to the answer URL is
+/// asking a question — "this line is up, what now?" — and the reply is markup
+/// that connects it. A delivery receipt or a hangup notice is a statement, and
+/// answering it with a stream document would connect a call that has ended.
+/// The operator never configures this one: every outbound request carries it,
+/// and the number's own status callback can point here too.
+pub fn status_callback_path(account_id: &str) -> String {
+    format!("{}/status", callback_path(account_id))
+}
+
+/// The full status-callback URL under the operator's own public base.
+pub fn status_callback_url(public_base_url: &str, account_id: &str) -> String {
+    format!(
+        "{}{}",
+        public_base_url.trim_end_matches('/'),
+        status_callback_path(account_id)
+    )
+}
+
+/// Put a carrier's spelling of a phone number into E.164.
+///
+/// Carriers disagree about the leading `+`. Twilio and Telnyx send it; Plivo
+/// sends bare digits (`15551234567`), and a few send it spaced or bracketed.
+/// That disagreement is not cosmetic here: the number *is* the conversation id
+/// and the sender id, so the same person texting through two carriers — or one
+/// carrier that changes its mind — would otherwise land in two conversations
+/// and match none of the senders the operator authorized.
+///
+/// Only formatting is removed. A number that is not a plausible E.164 after
+/// that is returned untouched rather than mangled into one: inventing a country
+/// code would be a guess, and a wrong guess is a text to a stranger.
+pub fn normalize_e164(number: &str) -> String {
+    let trimmed = number.trim();
+    let stripped: String = trimmed
+        .chars()
+        .filter(|character| !matches!(character, ' ' | '-' | '(' | ')' | '.'))
+        .collect();
+    let digits = stripped.strip_prefix('+').unwrap_or(&stripped);
+    if digits.is_empty()
+        || !digits.chars().all(|character| character.is_ascii_digit())
+        || !(7..=15).contains(&digits.len())
+    {
+        // A short code, an alphanumeric sender id, or something this function
+        // has no business rewriting.
+        return trimmed.to_string();
+    }
+    format!("+{digits}")
+}
+
 /// Where a call is in its life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,10 +276,25 @@ pub enum TelecomEvent {
     /// An inbound text. Already a channel envelope, because that is what it
     /// becomes: SMS runs through the messaging subsystem, not beside it.
     InboundSms(Box<ChannelEnvelope>),
-    /// Somebody is calling. The answer is decided by the inbound-call policy,
-    /// never by the carrier.
-    InboundCall {
+    /// The carrier is asking what to do with a line that is up right now.
+    ///
+    /// Both directions arrive here, and the difference matters. Inbound is a
+    /// stranger calling, and the account's inbound policy decides whether
+    /// anything answers. Outbound is a call this machine placed being picked
+    /// up at the far end — already approved, already durable, and needing only
+    /// to be connected to its media socket.
+    ///
+    /// Outbound was the case that used to be missed: it normalized as ordinary
+    /// progress, and progress is acknowledged rather than answered, so the
+    /// person who picked up heard nothing at all.
+    AnswerRequest {
         provider_call_id: String,
+        /// The id the carrier used when it accepted the dial, when that is not
+        /// the id it uses now. Plivo answers `POST /Call/` with a
+        /// `RequestUUID` and then identifies the live call by `CallUUID`;
+        /// without this the row placed at dial time can never be found again.
+        request_id: Option<String>,
+        direction: CallDirection,
         from_number: String,
         to_number: String,
         received_at_ms: i64,
@@ -353,11 +446,19 @@ pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
     /// `record` is the account's own recording setting. A carrier that cannot
     /// record a call it places must refuse rather than place an unrecorded one:
     /// an operator who turned recording on may be relying on it.
+    ///
+    /// `idempotency_key` is the call row's, so a retry after a crash collapses
+    /// at the carrier where the carrier supports one (Telnyx's `command_id`).
+    /// Where it does not, the row's own state machine is the only thing between
+    /// the operator and a second ring at somebody's phone — which is why this
+    /// is passed even to carriers that ignore it: a carrier that gains the
+    /// feature should not need a new call site.
     async fn place_call(
         &self,
         to_number: &str,
         answer_url: &str,
         record: bool,
+        idempotency_key: &str,
     ) -> Result<CallHandle, String>;
 
     /// End a call we placed or answered.
@@ -374,17 +475,50 @@ pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
     /// with, given the media socket URL it should connect to.
     ///
     /// Carrier-specific markup, which is why it lives with the carrier. `None`
-    /// from a provider that has no such document (the mock) leaves the call
-    /// recorded and unanswered rather than inventing one.
+    /// from a provider that has no such document leaves the call recorded and
+    /// unanswered rather than inventing one.
     fn answer_instructions(&self, _media_url: &str) -> Option<AnswerDocument> {
         None
+    }
+
+    /// Connect a live call to its media socket, for a carrier that is driven
+    /// by commands rather than by a document.
+    ///
+    /// `answered_already` separates the two cases a command-driven carrier
+    /// spells differently: an inbound call still ringing has to be answered
+    /// (and the stream is an argument of answering), while an outbound call the
+    /// far end just picked up is already up and only needs streaming started on
+    /// it. Answering an answered call, or starting a stream on a ringing one,
+    /// is an error at the carrier rather than a silent no-op.
+    ///
+    /// The default is a refusal, because a carrier that returns no answer
+    /// document and implements no command cannot connect audio at all, and
+    /// pretending otherwise leaves a caller listening to silence.
+    async fn connect_media(
+        &self,
+        _provider_call_id: &str,
+        _media_url: &str,
+        _answered_already: bool,
+        _record: bool,
+    ) -> Result<(), String> {
+        Err("This carrier has no way to connect a call to a media stream".to_string())
     }
 
     /// Verify a carrier callback over the exact bytes received and normalize
     /// it. An unverified body must return `Err` and leave no trace: it has not
     /// earned a durable row.
+    ///
+    /// `path` is the request path this daemon actually served, supplied by the
+    /// route rather than read from a header. Twilio and Plivo sign the URL the
+    /// callback was posted to, so the verifier needs the exact path to rebuild
+    /// it; and the path is what separates an answer request from a status
+    /// report, since the two carry the same call id and mean opposite things.
+    /// The *host* still comes only from the operator's configured public base —
+    /// never from `Host` or `X-Forwarded-*`, which an unauthenticated caller
+    /// controls.
     fn verify_webhook(
         &self,
+        path: &str,
         headers: &[(String, String)],
         body: &[u8],
         now_ms: i64,
@@ -436,9 +570,11 @@ mod tests {
 
     #[test]
     fn every_streaming_carrier_answers_with_its_own_document() {
+        // Telnyx is deliberately absent: it is a Call Control carrier and
+        // ignores a webhook's response body, so it answers with a command
+        // instead — see `a_command_driven_carrier_offers_no_document`.
         let cases = [
             (TelecomKind::Twilio, "<Connect>", "streamSid"),
-            (TelecomKind::Telnyx, "<Connect>", "stream_id"),
             (TelecomKind::Plivo, "<Stream", "streamId"),
         ];
         for (kind, expected_markup, expected_stream_key) in cases {
@@ -459,6 +595,20 @@ mod tests {
                 document.body
             );
         }
+    }
+
+    #[test]
+    fn a_command_driven_carrier_offers_no_document() {
+        let telnyx = build_provider(config(TelecomKind::Telnyx)).expect("telnyx");
+
+        // Telnyx reads only the status code of a webhook response. A document
+        // here would be markup nobody parses and a caller connected to
+        // silence; the route falls through to `connect_media` instead.
+        assert!(telnyx
+            .answer_instructions("wss://calls.example.test/v1/telecom/tel-1/media")
+            .is_none());
+        // It still streams — the audio is attached by a command, not by markup.
+        assert!(telnyx.media_stream().is_some());
     }
 
     #[test]
@@ -572,6 +722,25 @@ mod tests {
     /// A syntactically valid Ed25519 key, so the Telnyx provider can be built in
     /// a test that is about answer documents rather than about signatures.
     const STANDARD_TEST_KEY: &str = "MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=";
+
+    #[test]
+    fn every_carrier_s_spelling_of_a_number_becomes_the_same_one() {
+        // Plivo sends bare digits, Twilio sends E.164, and a human-entered
+        // number arrives formatted. All three are the same person.
+        assert_eq!(normalize_e164("15551234567"), "+15551234567");
+        assert_eq!(normalize_e164("+15551234567"), "+15551234567");
+        assert_eq!(normalize_e164(" +1 (555) 123-4567 "), "+15551234567");
+        assert_eq!(normalize_e164("+46 70 123 45 67"), "+46701234567");
+    }
+
+    #[test]
+    fn something_that_is_not_a_phone_number_is_left_alone() {
+        // A short code and an alphanumeric sender are real inbound senders. A
+        // `+` glued to either would address nothing.
+        for value in ["40404", "VERIFY", "", "+1555123456789012"] {
+            assert_eq!(normalize_e164(value), value, "{value} was rewritten");
+        }
+    }
 
     #[test]
     fn carrier_tokens_round_trip() {
