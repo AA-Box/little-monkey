@@ -1411,6 +1411,146 @@ pub async fn tool_read_skill_resource(
     .await
 }
 
+/// The model's only route into the learning loop.
+///
+/// Deliberately not a filesystem primitive: there is no action here that
+/// writes into a skills directory, approves anything, or widens a permission.
+/// `propose` hands structured fields to `skill_learning.rs`, which rebuilds
+/// and validates the package itself; `request_evaluation`/`request_promotion`
+/// are requests whose outcome is decided by the durable policy and (unless
+/// the user turned on unattended promotion for safe changes) by the user.
+///
+/// `run_id` is injected by the frontend (`turnEngine.ts`'s reserved-args
+/// registry), never supplied by the model — it only ever *appends* the
+/// reflection turn to a candidate's evidence chain; the evidence a candidate
+/// is founded on was written by the backend when the signal was detected.
+#[tauri::command]
+pub async fn tool_manage_skill_learning(
+    app: tauri::State<'_, AppState>,
+    native: tauri::State<'_, native_skill_commands::NativeSkillsCommandState>,
+    m4: tauri::State<'_, crate::m4_commands::M4CommandState>,
+    learning: tauri::State<'_, crate::skill_learning_commands::SkillLearningCommandState>,
+    action: String,
+    candidate_id: Option<String>,
+    command: Option<String>,
+    reason: Option<String>,
+    reflection: Option<crate::skill_learning::CandidateProposal>,
+    run_id: Option<String>,
+) -> Result<String, String> {
+    let workspace = native_skill_commands::optional_primary_workspace(&app)?;
+    let packages = crate::skill_learning_commands::signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    native_skill_commands::run_blocking(move || {
+        let json = match action.as_str() {
+            "propose" => {
+                let candidate_id = candidate_id.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "propose needs the candidate_id of an open learning signal; a candidate cannot be created without run evidence".to_string(),
+                    )
+                })?;
+                let reflection = reflection.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "propose needs a structured reflection object".to_string(),
+                    )
+                })?;
+                let candidate = store.propose(
+                    &candidate_id,
+                    run_id.as_deref(),
+                    &reflection,
+                    &manager,
+                    workspace.as_deref(),
+                    &packages,
+                )?;
+                serde_json::json!({
+                    "status": "staged",
+                    "candidate_id": candidate.candidate_id,
+                    "command": candidate.proposed_command,
+                    "candidate_sha256": candidate.candidate_sha256,
+                    "deduplication": candidate.dedup,
+                    "deduplication_detail": candidate.dedup_detail,
+                    "policy": candidate.policy,
+                    "note": "Staged only. It is not installed, and this tool cannot install it.",
+                })
+            }
+            "inspect_candidate" => {
+                let candidate_id = candidate_id.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "inspect_candidate needs a candidate_id".to_string(),
+                    )
+                })?;
+                serde_json::to_value(store.candidate(&candidate_id)?).unwrap_or_default()
+            }
+            "request_evaluation" => {
+                let candidate_id = candidate_id.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "request_evaluation needs a candidate_id".to_string(),
+                    )
+                })?;
+                let plan = store.plan_evaluation(&candidate_id)?;
+                serde_json::json!({
+                    "status": "evaluation_requested",
+                    "evaluation_id": plan.evaluation_id,
+                    "cases": plan.cases.len(),
+                    "note": "The evaluation is executed and scored outside this turn. Its verdict is not yours to report.",
+                })
+            }
+            "request_promotion" => {
+                let candidate_id = candidate_id.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "request_promotion needs a candidate_id".to_string(),
+                    )
+                })?;
+                let candidate = store.request_promotion(&candidate_id)?;
+                serde_json::json!({
+                    "status": candidate.status,
+                    "candidate_id": candidate.candidate_id,
+                    "policy": candidate.policy,
+                    "note": "Requested only. Installation requires the user's approval, or an unattended policy the user configured.",
+                })
+            }
+            "deprecate_learned_skill" => {
+                let command = command.ok_or_else(|| {
+                    crate::native_skills::SkillError::Invalid(
+                        "deprecate_learned_skill needs the installed command".to_string(),
+                    )
+                })?;
+                let reason = reason.unwrap_or_else(|| "no reason given".to_string());
+                // Scope is resolved by trying workspace first: a workspace copy
+                // shadows nothing (the core refuses duplicate active commands),
+                // so at most one of these can match.
+                let mutation = store
+                    .deprecate(
+                        &command,
+                        crate::native_skills::SkillScope::Workspace,
+                        &reason,
+                        &manager,
+                        workspace.as_deref(),
+                        &packages,
+                    )
+                    .or_else(|_| {
+                        store.deprecate(
+                            &command,
+                            crate::native_skills::SkillScope::Global,
+                            &reason,
+                            &manager,
+                            workspace.as_deref(),
+                            &packages,
+                        )
+                    })?;
+                serde_json::json!({ "status": "deprecated", "command": mutation.command, "enabled": mutation.enabled })
+            }
+            other => {
+                return Err(crate::native_skills::SkillError::Invalid(format!(
+                    "unknown action '{other}'"
+                )))
+            }
+        };
+        Ok(serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string()))
+    })
+    .await
+}
+
 /// Cancel in-flight tool invocations: kills running `tool_run_shell` child
 /// processes (via the per-turn cancel notification each one selects on) and
 /// denies permission prompts still awaiting an answer. Invoked by the

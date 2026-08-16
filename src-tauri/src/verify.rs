@@ -610,15 +610,43 @@ pub fn verify_set_config(
 /// `turn_id` (optional — a manual "run now" affordance in a later slice would
 /// omit it) scopes Stop-button cancellation to the calling turn, exactly like
 /// `tool_run_shell`'s.
+/// Runs one configured verification command.
+///
+/// `sandbox_path` runs the workspace's own configured commands inside a
+/// disposable learning-evaluation sandbox instead of the workspace itself. It
+/// is accepted only for a marker-verified, app-created sandbox — the same
+/// fail-closed check tool calls go through — so it can never be pointed at an
+/// arbitrary directory. The configuration still comes from the real workspace:
+/// an evaluation arm is verified by the commands the user actually configured,
+/// not by ones invented for the evaluation.
+///
+/// Which workspace's commands, specifically, comes from the backend's own
+/// registry of live sandboxes rather than from whatever folder is open — or
+/// from anything inside the sandbox, which the arm being evaluated can write
+/// to. A candidate learned in A can be evaluated while B is open, or with
+/// nothing open at all, and verifying its arms with B's commands would produce
+/// a bogus pass or a bogus failure against A's files.
 #[tauri::command]
 pub async fn verify_run(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     command_id: String,
     turn_id: Option<String>,
+    sandbox_path: Option<String>,
 ) -> Result<VerifyResult, String> {
-    let root = workspace::primary_root_canon(state.inner())?;
-    let key = root.to_string_lossy().to_string();
+    let (root, key) = match &sandbox_path {
+        None => {
+            let root = workspace::primary_root_canon(state.inner())?;
+            let key = root.to_string_lossy().to_string();
+            (root, key)
+        }
+        Some(path) => {
+            let data_root = crate::app_paths::data_dir()
+                .ok_or_else(|| "Could not resolve the application data directory".to_string())?;
+            let (sandbox, source) = crate::skill_learning::eval_sandbox_identity(&data_root, path)?;
+            (sandbox, source.to_string_lossy().to_string())
+        }
+    };
     let configs = load_configs_from(&verify_configs_path(&app)?);
     let config = configs.get(&key).cloned().unwrap_or_default();
     let cmd = find_command(&config, &command_id)

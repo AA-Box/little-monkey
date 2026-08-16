@@ -10,6 +10,7 @@ import {
   type NativeSkillInstallPreview,
   type NativeSkillScope,
 } from "../../lib/nativeSkillsClient";
+import { skillLearningClient } from "../../lib/skillLearningClient";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
@@ -69,7 +70,11 @@ export function NativeSkillsManager() {
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      setSkills(await nativeSkillsClient.discover());
+      // The learning-aware discovery: identical descriptors plus `learned`
+      // provenance for whichever active content hashes this app's learning
+      // loop installed, so a learned skill is visibly one here rather than
+      // only in the learning panel.
+      setSkills(await skillLearningClient.discover());
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -359,6 +364,14 @@ export function NativeSkillsManager() {
                   <span className={`rounded px-1 py-0.5 text-[10px] ${skill.enabled && skill.eligibility.eligible ? "bg-success-soft text-success" : "bg-warning-soft text-warning"}`}>
                     {!skill.enabled ? "disabled" : skill.eligibility.eligible ? skillScope : "ineligible"}
                   </span>
+                  {skill.learned && (
+                    <span
+                      className="rounded border border-border px-1 py-0.5 text-[10px] text-muted"
+                      title={`Learned from runs ${skill.learned.source_run_ids.join(", ")} (${skill.learned.source_kind}), promoted by ${skill.learned.promotion_policy}`}
+                    >
+                      learned
+                    </span>
+                  )}
                   <span className="ml-auto font-mono text-[10px] text-faint">{skill.sha256.slice(0, 12)}…</span>
                   <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
                     {skill.enabled ? "Disable" : "Enable"}

@@ -57,6 +57,13 @@ import {
   type SourcesNotice,
   type VerifyNotice,
 } from "../../lib/agentLoop";
+import {
+  isLearningNotice,
+  parseLearningNotice,
+  type LearningNotice,
+} from "../../lib/skillLearning";
+import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore";
+import type { SettingsTab } from "../Settings/SettingsModal";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
 import { isBtwNotice, isCommandNotice, parseCommandNotice, type CommandNotice } from "../../lib/slashCommands";
 import { selectRunningVerifyLabel, selectTurnRunning, useSessionStore } from "../../store/sessionStore";
@@ -122,6 +129,9 @@ export interface MessageListProps {
    * clicking a parallel-agents card reveals its per-agent table there (see
    * that component's `onOpenPanel`). Omitted keeps the inline expansion. */
   onOpenBackgroundTasks?: () => void;
+  /** Deep-links a learning notice's "Review candidate" button into Settings.
+   * Omitted renders the notice without the action rather than a dead button. */
+  onOpenSettingsTab?: (tab: SettingsTab) => void;
 }
 
 type TimelineItem =
@@ -136,6 +146,7 @@ type TimelineItem =
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "learning"; key: string; notice: LearningNotice }
   | { kind: "sources"; key: string; notice: SourcesNotice }
   | { kind: "recipe"; key: string; notice: RecipeNotice }
   | { kind: "typing"; key: string };
@@ -289,6 +300,13 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         const notice = parseSourcesNotice(msg);
         if (notice) {
           items.push({ kind: "sources", key: `sources-${index}`, notice });
+        }
+        return;
+      }
+      if (isLearningNotice(msg.content)) {
+        const notice = parseLearningNotice(msg.content);
+        if (notice) {
+          items.push({ kind: "learning", key: `learning-${notice.candidateId}`, notice });
         }
         return;
       }
@@ -901,6 +919,50 @@ const RecipeRow = memo(function RecipeRow({ notice }: { notice: RecipeNotice }) 
  * reuses `ToolCallRow`'s collapse affordance rather than introducing a new
  * one. Report-only in this slice: there is nothing to act on here yet (no
  * "run again"/"fix it" affordance), just the result. */
+/**
+ * The learning notice: a suggested reusable procedure, or one that was
+ * actually installed.
+ *
+ * It carries the exact `candidateId` rather than telling the user to go and
+ * find it, so "Review candidate" opens that candidate in Settings. The
+ * "installed" wording is only ever reached from a candidate the backend
+ * reported as promoted — a staged draft says "suggested".
+ */
+const LearningRow = memo(function LearningRow({
+  notice,
+  onOpenSettingsTab,
+}: {
+  notice: LearningNotice;
+  onOpenSettingsTab?: (tab: SettingsTab) => void;
+}) {
+  const { t } = useT();
+  const installed = notice.state === "installed";
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] min-w-0 items-center gap-2 overflow-hidden rounded-md border border-border bg-surface-2 px-3 py-1.5 text-xs text-muted">
+        <Brain size={13} className="shrink-0 text-faint" />
+        <span className="truncate font-medium text-foreground">
+          {installed ? t("MessageList.learningInstalled") : t("MessageList.learningSuggested")}
+        </span>
+        {notice.command && <span className="shrink-0 font-mono text-faint">/{notice.command}</span>}
+        <span className="truncate text-faint">— {notice.why}</span>
+        {onOpenSettingsTab && (
+          <button
+            type="button"
+            className="ml-auto shrink-0 cursor-pointer whitespace-nowrap underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-foreground"
+            onClick={() => {
+              useSkillLearningFocusStore.getState().focus(notice.candidateId);
+              onOpenSettingsTab("prompts");
+            }}
+          >
+            {t("MessageList.learningReview")}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+});
+
 const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
@@ -1129,6 +1191,7 @@ export default function MessageList({
   onStartSideTask,
   onEditGeneratedImage,
   onOpenBackgroundTasks,
+  onOpenSettingsTab,
 }: MessageListProps) {
   const { t } = useT();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -1276,6 +1339,9 @@ export default function MessageList({
             }
             if (item.kind === "verify") {
               return <VerifyRow key={item.key} notice={item.notice} />;
+            }
+            if (item.kind === "learning") {
+              return <LearningRow key={item.key} notice={item.notice} onOpenSettingsTab={onOpenSettingsTab} />;
             }
             if (item.kind === "sources") {
               return <SourcesRow key={item.key} notice={item.notice} />;
