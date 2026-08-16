@@ -348,6 +348,13 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "daemon service lifecycle",
     ),
     (
+        "daemon/peer_live.rs",
+        Class::HostUtility,
+        "the opt-in peer live-validation test mints its own self-signed \
+         certificate with `openssl`; every argument is a literal and the only \
+         paths are inside the test's own temporary directory",
+    ),
+    (
         "daemon/engine.rs",
         Class::ManagedService,
         "the job runner: each child is bounded by its recipe's own budgets, enforced by \

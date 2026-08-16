@@ -16,12 +16,15 @@ import {
   type InboundPeer,
   type OutboundPeer,
   type PeerGrant,
+  type PeerOutboundMessage,
   type PeerPresence,
   type PeerThread,
   type PeerThreadMessage,
   PEER_GRANTS,
+  byThread,
   formatFingerprint,
   hasRejection,
+  isPending,
   peersAccept,
   peersAcceptRotation,
   peersClear,
@@ -29,6 +32,8 @@ import {
   peersGrant,
   peersInvite,
   peersList,
+  peersOutbound,
+  peersRemoteThread,
   peersRevoke,
   peersRotate,
   peersStatus,
@@ -95,6 +100,21 @@ function dispositionLabel(disposition: PeerThreadMessage["disposition"], t: Tran
   if (disposition === "accepted") return t("PeersPanel.statusAccepted");
   if (disposition === "rejected") return t("PeersPanel.statusRejected");
   return t("PeersPanel.statusDelivered");
+}
+
+function sentStateLabel(state: string, t: Translate): string {
+  if (state === "succeeded") return t("PeersPanel.sentSucceeded");
+  if (state === "failed") return t("PeersPanel.sentFailed");
+  if (state === "cancelled") return t("PeersPanel.sentCancelled");
+  if (state === "rejected") return t("PeersPanel.sentRejected");
+  if (state === "duplicate") return t("PeersPanel.sentDuplicate");
+  return t("PeersPanel.sentPending");
+}
+
+function sentStateTone(state: string): PillTone {
+  if (state === "succeeded") return "success";
+  if (state === "failed" || state === "rejected" || state === "cancelled") return "danger";
+  return "neutral";
 }
 
 function safeFileStem(value: string): string {
@@ -187,12 +207,99 @@ function ThreadHistory({ threads, t }: { threads: PeerThread[]; t: Translate }) 
   );
 }
 
+/**
+ * What this installation asked another one to do, and what came back.
+ *
+ * Only threads this side opened are listed, because only this side knows they
+ * exist: there is deliberately no route that enumerates a peer's threads, and
+ * adding one would let any paired peer map out conversations that are none of
+ * its business. Refreshing is a manual, per-thread signed call for the same
+ * reason a background poll is not offered — nothing here should be talking to
+ * another machine while an operator is not looking at it.
+ */
+function SentHistory({
+  alias,
+  messages,
+  busy,
+  onRefresh,
+  t,
+}: {
+  alias: string;
+  messages: PeerOutboundMessage[];
+  busy: string | null;
+  onRefresh: (threadId: string) => void;
+  t: Translate;
+}) {
+  if (messages.length === 0) return <p className="text-xs text-muted">{t("PeersPanel.sentEmpty")}</p>;
+
+  return (
+    <div className="space-y-3">
+      {byThread(messages).map((thread) => (
+        <section key={thread.threadId} className="min-w-0 space-y-2 rounded-md border border-border bg-background p-3">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <p className="min-w-0 break-all font-mono text-xs text-foreground">{thread.threadId}</p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="shrink-0"
+              disabled={busy !== null}
+              aria-label={t("PeersPanel.sentRefreshLabel", { thread: thread.threadId, alias })}
+              onClick={() => onRefresh(thread.threadId)}
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${busy === `remote-${alias}-${thread.threadId}` ? "animate-spin" : ""}`}
+                aria-hidden
+              />
+              {t("PeersPanel.sentRefresh")}
+            </Button>
+          </div>
+          <ol className="space-y-2" aria-label={t("PeersPanel.sentMessages")}>
+            {thread.messages.map((message) => (
+              <li key={message.message_id} className="min-w-0 rounded-md border border-border/70 bg-surface p-2.5 text-xs">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-foreground">
+                  <span className="font-medium">{messageKindLabel(message.kind, t)}</span>
+                  <StatusPill tone={sentStateTone(message.state)}>
+                    {sentStateLabel(message.state, t)}
+                  </StatusPill>
+                  <span className="text-muted">
+                    {t("PeersPanel.sentAt", { time: timestampLabel(message.sent_at_ms, t) })}
+                  </span>
+                </div>
+                <dl className="mt-2 grid min-w-0 gap-1 text-muted sm:grid-cols-2">
+                  <div className="min-w-0">
+                    <dt className="inline font-medium">{t("PeersPanel.correlation")}: </dt>
+                    <dd className="inline break-all font-mono">
+                      {message.correlation_id ?? t("PeersPanel.notSupplied")}
+                    </dd>
+                  </div>
+                  <div className="min-w-0">
+                    <dt className="inline font-medium">{t("PeersPanel.messageId")}: </dt>
+                    <dd className="inline break-all font-mono">{message.message_id}</dd>
+                  </div>
+                </dl>
+                {message.result_text && (
+                  <p className="mt-1 whitespace-pre-wrap break-words text-foreground">{message.result_text}</p>
+                )}
+                {isPending(message) && message.checked_at_ms === null && (
+                  <p className="mt-1 text-muted">{t("PeersPanel.sentNeverChecked")}</p>
+                )}
+              </li>
+            ))}
+          </ol>
+        </section>
+      ))}
+    </div>
+  );
+}
+
 export function PeersPanel() {
   const { t } = useT();
   const [inbound, setInbound] = useState<InboundPeer[] | null>(null);
   const [outbound, setOutbound] = useState<OutboundPeer[]>([]);
   const [threads, setThreads] = useState<PeerThread[]>([]);
+  const [sent, setSent] = useState<PeerOutboundMessage[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [selectedSent, setSelectedSent] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -207,10 +314,15 @@ export function PeersPanel() {
 
   const load = useCallback(async () => {
     try {
-      const [peers, opened] = await Promise.all([peersList(), peersThreads(null, 20)]);
+      const [peers, opened, outgoing] = await Promise.all([
+        peersList(),
+        peersThreads(null, 20),
+        peersOutbound(null, 50),
+      ]);
       setInbound(peers.inbound);
       setOutbound(peers.outbound);
       setThreads(opened.threads);
+      setSent(outgoing.messages);
       setError(null);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -664,7 +776,37 @@ export function PeersPanel() {
                   {t("PeersPanel.forget")}
                 </Button>
               )}
+              <Button
+                variant="ghost"
+                disabled={busy !== null}
+                aria-expanded={selectedSent === peer.alias}
+                aria-controls={`peer-sent-${peer.alias}`}
+                onClick={() => setSelectedSent(selectedSent === peer.alias ? null : peer.alias)}
+              >
+                {t("PeersPanel.showSent", {
+                  count: sent.filter((message) => message.alias === peer.alias).length,
+                })}
+              </Button>
             </div>
+            {selectedSent === peer.alias && (
+              <div id={`peer-sent-${peer.alias}`} className="space-y-2 border-t border-border pt-3">
+                <SentHistory
+                  alias={peer.alias}
+                  messages={sent.filter((message) => message.alias === peer.alias)}
+                  busy={busy}
+                  onRefresh={(threadId) =>
+                    void run(`remote-${peer.alias}-${threadId}`, async () => {
+                      const refreshed = await peersRemoteThread(peer.alias, threadId);
+                      return t("PeersPanel.sentRefreshed", {
+                        thread: threadId,
+                        count: refreshed.messages.length,
+                      });
+                    })
+                  }
+                  t={t}
+                />
+              </div>
+            )}
           </article>
         ))}
       </section>

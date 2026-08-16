@@ -3882,6 +3882,11 @@ mod tests {
             // belongs to needs a restored session, and the real session cannot
             // be restored until that answer is known.
             ("bin/monkey-cli/daemon/adapters/matrix.rs", 0, 2),
+            // The opt-in peer live-validation test's client, pinned to the
+            // self-signed certificate the test mints for its own loopback
+            // listener — the same `tls_certs_only` pin as the client below, and
+            // reaching nothing but `127.0.0.1` on a port it just bound.
+            ("bin/monkey-cli/daemon/peer_live.rs", 0, 1),
             // The daemon's client for a remote runner: `tls_certs_only` pins the
             // runner's certificate, plus `https_only`, a connect timeout and a
             // silence budget. Stricter than `hardened()`, which has no way to pin

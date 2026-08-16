@@ -108,6 +108,27 @@ pub enum PeersCmd {
         #[arg(long)]
         json: bool,
     },
+    /// What this installation has sent to peers, and the last answer each got.
+    ///
+    /// Read locally: there is no route that lists another node's threads, and
+    /// adding one would let any paired peer enumerate conversations that are
+    /// none of its business. This is the record of what *this* side sent.
+    Outbound {
+        #[arg(long)]
+        alias: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask a peer about one thread this installation opened, and update what is
+    /// known about the messages in it.
+    RemoteThread {
+        alias: String,
+        thread_id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Threads inbound peers opened here, and what happened to them.
     Threads {
         #[arg(long)]
@@ -202,6 +223,12 @@ pub async fn dispatch(command: &PeersCmd) -> Result<(), String> {
             thread_id,
             json,
         } => thread(alias, thread_id, *json).await,
+        PeersCmd::Outbound { alias, limit, json } => outbound(alias.as_deref(), *limit, *json),
+        PeersCmd::RemoteThread {
+            alias,
+            thread_id,
+            json,
+        } => remote_thread(alias, thread_id, *json).await,
         PeersCmd::Threads { peer, limit, json } => threads(peer.as_deref(), *limit, *json),
         PeersCmd::Rotate {
             device_id,
@@ -637,6 +664,10 @@ fn forget(alias: &str) -> Result<(), String> {
     if !RemoteStore::open(&paths.root)?.forget_controller(alias, &KeyringRemoteSecrets)? {
         return Err(format!("Unknown peer '{alias}'"));
     }
+    // Nothing is left that could poll those threads, so the record of what was
+    // sent to this peer goes with the credential rather than lingering as rows
+    // whose state can never advance again.
+    DaemonStore::open(&paths)?.delete_outbound_peer_messages(alias)?;
     println!(
         "Forgot '{alias}'. This installation can no longer reach it; revoking this installation \
          over there is that peer's own decision."
@@ -693,14 +724,8 @@ async fn send(
         .validate_for_send(now)
         .map_err(|rejection| rejection.message().to_string())?;
 
-    let response = crate::daemon::remote::peer_call(
-        &paths,
-        alias,
-        reqwest::Method::POST,
-        "/v1/remote/peer/messages",
-        serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
-    )
-    .await?;
+    let response =
+        crate::daemon::peer_tool::deliver_envelope(&paths, alias, &envelope, now).await?;
     if json {
         println!("{response}");
         return Ok(());
@@ -748,6 +773,57 @@ async fn thread(alias: &str, thread_id: &str, json: bool) -> Result<(), String> 
             body.lines().next().unwrap_or_default()
         );
     }
+    Ok(())
+}
+
+/// One outbound record, in the shape the desktop's typed bridge decodes.
+fn outbound_row(message: &crate::daemon::peer_store::PeerOutboundMessage) -> serde_json::Value {
+    serde_json::json!({
+        "alias": message.alias,
+        "message_id": message.message_id,
+        "thread_id": message.thread_id,
+        "correlation_id": message.correlation_id,
+        "kind": message.kind,
+        "state": message.state,
+        "result_text": message.result_text,
+        "sent_at_ms": message.sent_at_ms,
+        "checked_at_ms": message.checked_at_ms,
+    })
+}
+
+fn print_outbound(messages: &[crate::daemon::peer_store::PeerOutboundMessage], json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "messages": messages.iter().map(outbound_row).collect::<Vec<_>>()
+            })
+        );
+        return;
+    }
+    if messages.is_empty() {
+        println!("This installation has not sent anything to a peer yet.");
+        return;
+    }
+    for message in messages {
+        println!(
+            "{}  {}  {}  {}  {}",
+            message.sent_at_ms, message.alias, message.thread_id, message.kind, message.state,
+        );
+    }
+}
+
+fn outbound(alias: Option<&str>, limit: u32, json: bool) -> Result<(), String> {
+    let messages =
+        DaemonStore::open(&paths()?)?.outbound_peer_messages(alias, limit.clamp(1, 200))?;
+    print_outbound(&messages, json);
+    Ok(())
+}
+
+async fn remote_thread(alias: &str, thread_id: &str, json: bool) -> Result<(), String> {
+    let messages =
+        crate::daemon::peer_tool::refresh_remote_thread(&paths()?, alias, thread_id).await?;
+    print_outbound(&messages, json);
     Ok(())
 }
 
