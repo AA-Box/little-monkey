@@ -396,17 +396,27 @@ pub(crate) fn spawn_telecom_runtime(paths: super::store::DaemonPaths) {
 fn load_carriers(
     store: &DaemonStore,
 ) -> std::collections::BTreeMap<String, std::sync::Arc<dyn super::telephony::TelecomProvider>> {
-    use super::channel_adapter::{ChannelSecrets, KeyringChannelSecrets};
+    use super::channel_adapter::{resolve_credential, KeyringChannelSecrets};
 
     let mut carriers = std::collections::BTreeMap::new();
     let Ok(accounts) = store.telecom_accounts() else {
         return carriers;
     };
     for account in accounts.into_iter().filter(|account| account.enabled) {
-        let secret = match &account.credential_ref {
-            Some(reference) => KeyringChannelSecrets.get(reference).unwrap_or_default(),
-            None => String::new(),
-        };
+        // A carrier built on an empty credential cannot hang anything up — it
+        // would authenticate to nobody — so the account is skipped loudly
+        // rather than added as one that silently refuses every request.
+        let secret =
+            match resolve_credential(&KeyringChannelSecrets, account.credential_ref.as_deref()) {
+                Ok(secret) => secret,
+                Err(error) => {
+                    eprintln!(
+                        "monkey daemon: telephony account {} has no usable credential: {error}",
+                        account.account_id
+                    );
+                    continue;
+                }
+            };
         if let Ok(provider) = super::telephony::provider_for_account(&account, secret) {
             carriers.insert(account.account_id.clone(), provider);
         }

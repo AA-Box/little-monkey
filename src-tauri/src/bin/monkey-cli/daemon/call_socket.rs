@@ -95,7 +95,9 @@ pub(crate) async fn handle_media_upgrade(
     if !account.enabled {
         return refuse();
     }
-    let secret = account_secret(&account);
+    let Some(secret) = account_secret(&account) else {
+        return refuse();
+    };
     if super::telephony::verify_media_stream_token(
         &secret,
         &account_id,
@@ -283,7 +285,7 @@ async fn end_dropped_call(paths: DaemonPaths, account_id: String, call_id: Strin
         .ok()
         .flatten()
         .and_then(|account| {
-            let secret = account_secret(&account);
+            let secret = account_secret(&account)?;
             super::telephony::provider_for_account(&account, secret).ok()
         });
     let Ok(now_ms) = super::now_ms()
@@ -311,15 +313,17 @@ async fn end_dropped_call(paths: DaemonPaths, account_id: String, call_id: Strin
 }
 
 /// The carrier credential for one account, resolved from the keychain.
-fn account_secret(account: &super::telecom_store::TelecomAccountRecord) -> String {
-    match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    }
+///
+/// `None` when there is none to resolve. It signs and verifies the media stream
+/// tokens that let a socket into a live call, and an empty key there is one any
+/// caller can forge, so the absence has to stay visible to the caller rather
+/// than collapsing into an empty string.
+fn account_secret(account: &super::telecom_store::TelecomAccountRecord) -> Option<String> {
+    super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    )
+    .ok()
 }
 
 /// The route a call's turns run under.
@@ -414,7 +418,13 @@ mod tests {
     }
 
     /// A telephony account and one call in progress on it, in a store of their
-    /// own. No credential reference, so nothing reaches for the keychain.
+    /// own.
+    ///
+    /// The credential is seeded rather than left out: an account whose secret
+    /// cannot be resolved has no carrier to hang up with, so leaving it out
+    /// would test the reconciliation path instead of the hangup these tests are
+    /// about. Its own reference per label, since the seeded table is
+    /// process-wide and tests run in parallel.
     fn call_in_progress(label: &str) -> (DaemonPaths, String) {
         use super::super::telecom_store::{
             CallLimits, OutboundCallApproval, TelecomAccountRecord, TelecomCallRecord,
@@ -431,6 +441,8 @@ mod tests {
         let paths = DaemonPaths::under(&root);
         paths.ensure().expect("paths");
         let mut store = DaemonStore::open(&paths).expect("store");
+        let credential_ref = format!("telecom:call-socket-{label}");
+        super::super::channel_adapter::test_secrets::put(&credential_ref, "call-socket-secret");
         store
             .upsert_telecom_account(&TelecomAccountRecord {
                 account_id: "tel-1".into(),
@@ -439,7 +451,7 @@ mod tests {
                 enabled: true,
                 carrier_account_id: "carrier-1".into(),
                 from_number: "+15550000000".into(),
-                credential_ref: None,
+                credential_ref: Some(credential_ref.clone()),
                 public_base_url: None,
                 non_secret_config: serde_json::json!({}),
                 inbound_policy: InboundCallPolicy::Answer,

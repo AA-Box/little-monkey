@@ -553,6 +553,12 @@ impl DaemonStore {
     /// carrier callback must never resurrect a call this store already
     /// considers finished, because the finished state is what the approval
     /// and billing story downstream is built on.
+    ///
+    /// Refuses to move it BACKWARDS for the same reason. Carrier callbacks
+    /// arrive out of order, concurrently and more than once, so a `ringing`
+    /// landing after `in_progress` is a delayed duplicate of something already
+    /// known — see [`CallState::progress_rank`] for what a regression would
+    /// cost a call that is up and talking.
     pub fn advance_call(
         &mut self,
         call_id: &str,
@@ -580,10 +586,15 @@ impl DaemonStore {
                 "call '{call_id}' has unknown state '{current_state_token}'"
             ));
         };
-        if current_state.is_terminal() {
-            // A crashed daemon or a duplicated webhook can replay a callback
-            // after the call is already settled; changing nothing here is the
-            // correct outcome, not an error.
+        // A crashed daemon or a duplicated webhook can replay a callback after
+        // the call has already settled or already moved past that point;
+        // changing nothing is the correct outcome in both cases, not an error.
+        //
+        // A terminal state is the one thing that always applies to a call still
+        // running: a hangup may legitimately follow a ring the carrier never
+        // told us about, so it is compared by rank like everything else and
+        // wins by having the highest one.
+        if current_state.is_terminal() || state.progress_rank() <= current_state.progress_rank() {
             transaction.commit().map_err(|error| error.to_string())?;
             return Ok(());
         }
@@ -1389,6 +1400,59 @@ mod tests {
             .expect("late callback");
         let still_completed = store.telecom_call("call-1").expect("get").expect("present");
         assert_eq!(still_completed, completed);
+    }
+
+    /// A carrier is allowed to deliver its callbacks out of order, and a call
+    /// that is up and talking must not be walked backwards by one that took the
+    /// scenic route: the sweeper reads a call sitting in `ringing` as one still
+    /// waiting to be picked up and cuts it at `ring_timeout_s`.
+    #[test]
+    fn advance_call_ignores_out_of_order_progress() {
+        let mut store = seeded();
+        store
+            .start_call(&call("call-1", "acct-1", "idem-1", CallState::Queued))
+            .expect("start");
+
+        // call.answered arrives first: the far end picked up.
+        store
+            .advance_call("call-1", CallState::InProgress, Some("answered"), 1_200)
+            .expect("answered");
+        let answered = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(answered.state, CallState::InProgress);
+        assert_eq!(answered.started_at_ms, Some(1_200));
+
+        // The delayed call.initiated the carrier sent before it.
+        store
+            .advance_call("call-1", CallState::Queued, Some("initiated"), 1_300)
+            .expect("late initiated");
+        assert_eq!(
+            store
+                .telecom_call("call-1")
+                .expect("get")
+                .expect("present")
+                .state,
+            CallState::InProgress
+        );
+
+        // And the delayed ringing between them.
+        store
+            .advance_call("call-1", CallState::Ringing, Some("ringing"), 1_400)
+            .expect("late ringing");
+        let still_live = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(still_live.state, CallState::InProgress);
+        assert_eq!(still_live.started_at_ms, Some(1_200));
+        assert_eq!(still_live.ended_at_ms, None);
+        // Nothing about the call changed, down to the detail column.
+        assert_eq!(still_live, answered);
+
+        // Forward is still forward: a hangup lands even though the states
+        // between it and here never arrived.
+        store
+            .advance_call("call-1", CallState::Completed, Some("hangup"), 1_500)
+            .expect("hangup");
+        let ended = store.telecom_call("call-1").expect("get").expect("present");
+        assert_eq!(ended.state, CallState::Completed);
+        assert_eq!(ended.ended_at_ms, Some(1_500));
     }
 
     #[test]

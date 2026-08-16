@@ -260,6 +260,27 @@ impl CallState {
             CallState::Completed | CallState::Failed | CallState::NeedsReconciliation
         )
     }
+
+    /// How far through its life this state puts a call.
+    ///
+    /// A call only ever moves forward: queued, then ringing, then in progress,
+    /// then finished. Carriers do not promise to tell us in that order —
+    /// Telnyx says outright that its webhooks can arrive out of order,
+    /// concurrently and more than once — so a callback carrying a state behind
+    /// the one we already hold is late news, not new news, and is dropped by
+    /// comparing this rank.
+    ///
+    /// This is not cosmetic. A live conversation knocked back to `ringing` by a
+    /// delayed `call.initiated` is one the limit sweep then measures against
+    /// `ring_timeout_s` and hangs up mid-sentence.
+    pub fn progress_rank(self) -> u8 {
+        match self {
+            CallState::Queued => 0,
+            CallState::Ringing => 1,
+            CallState::InProgress => 2,
+            CallState::Completed | CallState::Failed | CallState::NeedsReconciliation => 3,
+        }
+    }
 }
 
 /// A call the carrier accepted.

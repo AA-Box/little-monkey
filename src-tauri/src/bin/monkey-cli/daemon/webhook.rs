@@ -492,14 +492,14 @@ fn open_webhook_adapter(
             ))
         }
     };
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    };
+    // An account whose credential cannot be produced verifies nothing. It joins
+    // the same flat 404 as an unknown account: there is no adapter to build, and
+    // a stranger probing the endpoint still learns nothing about what exists.
+    let secret = super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    )
+    .map_err(|_| refuse(StatusCode::NOT_FOUND, "not_found"))?;
     let config = super::channel_adapter::AdapterConfig {
         account: &account,
         secret,
@@ -642,13 +642,23 @@ async fn handle_carrier_callback(
         Ok(_) => return response(StatusCode::NOT_FOUND, "not_found"),
         Err(_) => return response(StatusCode::INTERNAL_SERVER_ERROR, "state_unavailable"),
     };
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
+    // The credential is what makes a callback checkable, so a missing one ends
+    // the request here rather than downgrading the check. An empty HMAC key is
+    // not a weaker secret, it is a published one: anyone who knows this URL can
+    // sign a body with it, and every carrier callback below — answering a live
+    // line, advancing a call, accepting a text — would then run for them.
+    //
+    // The refusal is counted like any other, because "this account stopped
+    // verifying callbacks" is the only form of it the operator can act on.
+    let secret = match super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    ) {
+        Ok(secret) => secret,
+        Err(reason) => {
+            let _ = store.record_callback_rejection(&account.account_id, &reason, now_ms);
+            return response(StatusCode::UNAUTHORIZED, "rejected");
+        }
     };
     let provider = match super::telephony::provider_for_account(&account, secret.clone()) {
         Ok(provider) => provider,
@@ -1079,13 +1089,14 @@ fn serve_signed_attachment(
     if !account.enabled {
         return response(StatusCode::NOT_FOUND, "not_found");
     }
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
+    // Same key, same rule as the callback route: a media token verified under an
+    // empty secret is one an attacker can mint for any artifact this account can
+    // reach. No credential, no media.
+    let Ok(secret) = super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    ) else {
+        return response(StatusCode::NOT_FOUND, "not_found");
     };
     if super::telephony::verify_media_file_token(
         &secret,

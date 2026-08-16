@@ -161,14 +161,10 @@ pub(crate) async fn place_call(
         CallRecording::Recorded { call_id } => call_id,
     };
 
-    let secret = match &account.credential_ref {
-        Some(reference) => super::channel_adapter::ChannelSecrets::get(
-            &super::channel_adapter::KeyringChannelSecrets,
-            reference,
-        )
-        .unwrap_or_default(),
-        None => String::new(),
-    };
+    let secret = super::channel_adapter::resolve_credential(
+        &super::channel_adapter::KeyringChannelSecrets,
+        account.credential_ref.as_deref(),
+    )?;
     let provider = provider_for_account(&account, secret)?;
 
     // The carrier calls us back on this account's own callback path under the

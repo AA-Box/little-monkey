@@ -35,11 +35,17 @@ const NOW: i64 = 1_700_000_000_000;
 const ACCOUNT: &str = "tel-wire";
 const NUMBER: &str = "+15550001111";
 
-/// A telephony account with no stored credential.
+/// The carrier credential these tests sign with.
 ///
-/// The route resolves the carrier secret from the keychain and falls back to an
-/// empty one, so a test signs with the same empty secret the route will verify
-/// with — real verification, no keychain entry, nothing left on the machine.
+/// The route resolves it from the keychain the way the daemon does, and in a
+/// test build that lookup answers from an in-process table seeded by
+/// [`seeded`] — real verification against a real secret, nothing left on the
+/// machine. It has to be a real one: the route refuses an account whose
+/// credential it cannot produce, which is the whole point of
+/// [`a_callback_is_refused_when_the_accounts_credential_is_gone`].
+const SECRET: &str = "wire-test-carrier-secret";
+const CREDENTIAL_REF: &str = "telecom:tel-wire";
+
 fn account(inbound_policy: InboundCallPolicy) -> TelecomAccountRecord {
     TelecomAccountRecord {
         account_id: ACCOUNT.to_string(),
@@ -48,7 +54,7 @@ fn account(inbound_policy: InboundCallPolicy) -> TelecomAccountRecord {
         enabled: true,
         carrier_account_id: "carrier-1".to_string(),
         from_number: NUMBER.to_string(),
-        credential_ref: None,
+        credential_ref: Some(CREDENTIAL_REF.to_string()),
         public_base_url: Some("https://ops.example.test".to_string()),
         non_secret_config: serde_json::json!({}),
         inbound_policy,
@@ -68,6 +74,7 @@ fn account(inbound_policy: InboundCallPolicy) -> TelecomAccountRecord {
 fn seeded(inbound_policy: InboundCallPolicy) -> (DaemonPaths, TelecomAccountRecord) {
     let paths = temp_daemon_paths();
     let record = account(inbound_policy);
+    super::channel_adapter::test_secrets::put(CREDENTIAL_REF, SECRET);
     let mut store = DaemonStore::open(&paths).expect("open store");
     store.upsert_telecom_account(&record).expect("seed account");
     // The messaging side of the number, as `telecom add` creates it.
@@ -83,7 +90,7 @@ fn carrier() -> MockProvider {
         kind: TelecomKind::Mock,
         carrier_account_id: "carrier-1".to_string(),
         from_number: NUMBER.to_string(),
-        secret: String::new(),
+        secret: SECRET.to_string(),
         public_base_url: Some("https://ops.example.test".to_string()),
         webhook_public_key: None,
     })
@@ -208,6 +215,72 @@ async fn a_forged_callback_leaves_nothing_and_is_counted_against_the_account() {
     let rejections = store.callback_rejections(ACCOUNT).expect("rejections");
     assert_eq!(rejections.count, 1);
     assert!(rejections.last_reason.is_some());
+}
+
+/// The account still has its credential reference, but the keychain entry it
+/// points at is gone — deleted, unreadable, or emptied by a keychain migration.
+///
+/// Signature verification must stop, not weaken. The attacker here is not
+/// guessing a secret: they are using the one the route used to fall back to,
+/// the empty string, which anyone who knows the callback URL can also sign
+/// with. So this posts a body signed under `""` and demands the same 401 a
+/// forged body gets — and demands the operator can see why, because a number
+/// that has silently stopped accepting its carrier's callbacks looks exactly
+/// like a quiet phone.
+#[tokio::test]
+async fn a_callback_is_refused_when_the_accounts_credential_is_gone() {
+    let (paths, mut record) = seeded(InboundCallPolicy::Answer);
+    // Point the account at an entry the keychain answers empty for. A separate
+    // reference rather than emptying this file's own: the seeded table is
+    // process-wide and these tests run in parallel.
+    const EMPTIED: &str = "telecom:tel-wire-emptied";
+    super::channel_adapter::test_secrets::put(EMPTIED, "");
+    record.credential_ref = Some(EMPTIED.to_string());
+    store(&paths)
+        .upsert_telecom_account(&record)
+        .expect("repoint the account");
+
+    let attacker = MockProvider::new(TelecomConfig {
+        account_id: ACCOUNT.to_string(),
+        kind: TelecomKind::Mock,
+        carrier_account_id: "carrier-1".to_string(),
+        from_number: NUMBER.to_string(),
+        secret: String::new(),
+        public_base_url: Some("https://ops.example.test".to_string()),
+        webhook_public_key: None,
+    });
+    let (headers, body) = attacker.sign_inbound_sms("+15551234567", NUMBER, "let me in");
+
+    let response = test_route::post(&paths, &path(), &headers, &body).await;
+
+    assert_eq!(
+        response.status, 401,
+        "an account whose credential cannot be read must verify nothing"
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent"),
+        Vec::new(),
+        "and must keep nothing the unverified body carried"
+    );
+    assert_eq!(
+        store(&paths)
+            .callback_rejections(ACCOUNT)
+            .expect("rejections")
+            .count,
+        1
+    );
+
+    // Restore the real credential and the very same signature is still refused,
+    // which is what says the 401 came from the key and not from the shape of
+    // the request.
+    record.credential_ref = Some(CREDENTIAL_REF.to_string());
+    store(&paths)
+        .upsert_telecom_account(&record)
+        .expect("restore the account");
+    let response = test_route::post(&paths, &path(), &headers, &body).await;
+    assert_eq!(response.status, 401);
 }
 
 #[tokio::test]
