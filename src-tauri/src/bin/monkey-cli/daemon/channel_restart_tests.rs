@@ -36,7 +36,7 @@ pub(crate) const NOW: i64 = 1_700_000_000_000;
 
 #[derive(Default)]
 pub(crate) struct FakeQueue {
-    submitted: StdMutex<Vec<String>>,
+    pub(crate) submitted: StdMutex<Vec<String>>,
 }
 
 impl RunQueue for FakeQueue {

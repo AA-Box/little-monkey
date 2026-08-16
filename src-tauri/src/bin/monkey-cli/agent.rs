@@ -1186,7 +1186,7 @@ async fn execute_tool_call(
                     let settings = web_cli::load_settings();
                     let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
                     let start_index = args["start_index"].as_u64().map(|v| v as usize);
-                    web::fetch_impl(&settings, url, max_chars, start_index)
+                    web::fetch_for_call(&settings, tool_call_id, url, max_chars, start_index)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|e| e.to_string()))
                 }
@@ -1211,7 +1211,7 @@ async fn execute_tool_call(
                         None
                     };
                     let count = args["count"].as_u64().map(|v| v as usize);
-                    web::search_impl(&settings, brave_key, query, count)
+                    web::search_for_call(&settings, tool_call_id, brave_key, query, count)
                         .await
                         .and_then(|results| {
                             serde_json::to_value(results).map_err(|e| e.to_string())

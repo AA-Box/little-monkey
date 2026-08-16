@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type CaptureKind = "text" | "file" | "window" | "screen" | "microphone" | "meeting";
-export type TranscriptionBackendKind = "local_whisper" | "provider";
+export type TranscriptionBackendKind = "local_whisper" | "provider" | "executable_extension";
 export type ImageEndpointKind = "comfy_ui" | "open_ai_compatible";
 
 export interface CaptureGrant {
@@ -26,7 +26,9 @@ export interface CompanionArtifact {
   createdAtMs: number;
 }
 
-export type SpeechBackendKind = 'system';
+/** Which synthesizer speaks. `system` is this machine's own voice; an
+ * executable extension is a sandboxed provider the operator installed. */
+export type SpeechBackendKind = 'system' | 'executable_extension';
 
 export interface VoiceConfig {
   backend: TranscriptionBackendKind;
@@ -34,14 +36,23 @@ export interface VoiceConfig {
   whisperModel: string | null;
   providerId: string | null;
   providerModel: string;
+  extensionId: string | null;
+  extensionCapabilityId: string | null;
   language: string;
   ttsVoice: string | null;
+  ttsBackend: SpeechBackendKind;
+  ttsExtensionId: string | null;
+  ttsExtensionCapabilityId: string | null;
+  /** Which backend serves a live phone call, which is a session rather than a
+   * clip and is therefore chosen separately from `ttsBackend`. */
+  realtimeBackend: SpeechBackendKind;
+  realtimeExtensionId: string | null;
+  realtimeExtensionCapabilityId: string | null;
   saveRawAudio: boolean;
   /** `MediaDeviceInfo.deviceId` of the chosen microphone, or null for the
    * system default. Talk and the companion overlay both honour it. */
   inputDeviceId: string | null;
   outputDeviceId: string | null;
-  ttsBackend: SpeechBackendKind;
   vadMinSpeechMs: number;
   vadSilenceMs: number;
   vadMaxUtteranceMs: number;

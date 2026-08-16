@@ -38,6 +38,15 @@ pub enum ChannelKind {
     IMessage,
     Irc,
     Sms,
+    /// A messaging provider a sandboxed executable extension speaks for.
+    ///
+    /// One wire string for every such provider, because the persisted string
+    /// is a *kind*, not an identity: which extension and which of its channel
+    /// capabilities an account belongs to lives in that account's own
+    /// configuration, where it is validated on write and re-resolved on every
+    /// use. Minting a kind per installed extension would put an unbounded,
+    /// user-controlled vocabulary into a column that routes.
+    Extension,
 }
 
 impl ChannelKind {
@@ -57,6 +66,7 @@ impl ChannelKind {
         ChannelKind::IMessage,
         ChannelKind::Irc,
         ChannelKind::Sms,
+        ChannelKind::Extension,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -74,6 +84,7 @@ impl ChannelKind {
             ChannelKind::IMessage => "imessage",
             ChannelKind::Irc => "irc",
             ChannelKind::Sms => "sms",
+            ChannelKind::Extension => "extension",
         }
     }
 
@@ -101,6 +112,7 @@ impl ChannelKind {
             ChannelKind::IMessage => "iMessage",
             ChannelKind::Irc => "IRC",
             ChannelKind::Sms => "SMS",
+            ChannelKind::Extension => "Extension",
         }
     }
 }

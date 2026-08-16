@@ -1,0 +1,11 @@
+[package]
+name = "little-monkey-extension-sdk"
+version = "1.0.0"
+description = "Guest-side helpers for Little Monkey executable extensions"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

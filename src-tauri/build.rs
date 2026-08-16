@@ -41,7 +41,10 @@ fn main() {
 /// `MANAGED_LLAMA_VERSION` / `MANAGED_SD_VERSION` in `src/managed_runtime.rs`;
 /// a mismatch emits no digest, which fails discovery closed rather than open.
 fn emit_managed_runtime_trust() {
-    emit_runtime_digest("llama-b9637", "LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256");
+    emit_runtime_digest(
+        "llama-b9637",
+        "LITTLE_MONKEY_TRUSTED_RUNTIME_MANIFEST_SHA256",
+    );
     emit_runtime_digest(
         "llama-tts-b10278",
         "LITTLE_MONKEY_TRUSTED_TTS_MANIFEST_SHA256",
@@ -64,10 +67,7 @@ fn emit_runtime_digest(staged_directory: &str, env_name: &str) {
     // case the crate still compiles, but app-owned runtime discovery fails
     // closed until `pnpm stage:runtime` is run and the crate is rebuilt.
     if let Ok(bytes) = std::fs::read(&manifest) {
-        println!(
-            "cargo:rustc-env={env_name}={:x}",
-            Sha256::digest(bytes)
-        );
+        println!("cargo:rustc-env={env_name}={:x}", Sha256::digest(bytes));
     }
 }
 

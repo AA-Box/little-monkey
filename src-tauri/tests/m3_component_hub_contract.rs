@@ -414,7 +414,10 @@ async fn bounded_retention_keeps_only_the_most_recent_versions() {
     }
     let view = last_view.expect("at least one install");
     assert_eq!(view.versions.len(), 3);
-    assert!(view.versions.iter().any(|v| v.active && v.version == "12.4"));
+    assert!(view
+        .versions
+        .iter()
+        .any(|v| v.active && v.version == "12.4"));
     let kept_versions: Vec<&str> = view.versions.iter().map(|v| v.version.as_str()).collect();
     assert!(kept_versions.contains(&"12.4"));
     assert!(kept_versions.contains(&"12.3"));
@@ -514,7 +517,8 @@ async fn pinned_channel_never_reports_an_update_while_stable_does() {
         )
         .expect("static component registry"),
     );
-    hub.replace_sources(vec![registry]).expect("replace sources");
+    hub.replace_sources(vec![registry])
+        .expect("replace sources");
 
     let checks = hub.check_updates(&context).await.expect("check updates");
     let mlx_check = checks
