@@ -19,9 +19,10 @@ use little_monkey_lib::peers::{
     PeerArtifactRef, PeerEnvelope, PeerMessageKind, MAX_ARTIFACT_REFS, MAX_BODY_BYTES,
 };
 
+use super::peer_store::PeerOutboundMessage;
 use super::remote::protocol::DeviceCapability;
 use super::remote::store::RemoteStore;
-use super::store::DaemonPaths;
+use super::store::{DaemonPaths, DaemonStore};
 
 /// Longest text this tool will send. Well under the envelope's own byte bound,
 /// because a model writing more than this to a peer is not having a
@@ -162,14 +163,7 @@ pub(crate) async fn send_peer_message(
         .validate_for_send(now)
         .map_err(|rejection| rejection.message().to_string())?;
 
-    let response = super::remote::peer_call(
-        &paths,
-        alias,
-        reqwest::Method::POST,
-        "/v1/remote/peer/messages",
-        serde_json::to_vec(&envelope).map_err(|error| error.to_string())?,
-    )
-    .await?;
+    let response = deliver_envelope(&paths, alias, &envelope, now).await?;
 
     Ok(serde_json::json!({
         "sent": true,
@@ -227,9 +221,194 @@ pub(crate) async fn upload_artifacts(
     Ok(refs)
 }
 
+/// Hand one envelope to a peer, with this side's record of it written first.
+///
+/// The order is the point. The row goes in as `pending` *before* the request
+/// leaves, and failing to write it fails the send: nothing has been asked of
+/// the peer yet, so refusing here costs a message that was never delivered.
+/// The reverse order costs far more. A peer durably accepts a task, starts
+/// running it, answers 202 — and this side dies before it can write anything
+/// down. The peer still owns the work, but the thread id died with the
+/// process, no route enumerates a peer's threads (deliberately, see below),
+/// and the result poll only ever *updates* an outbound row, so there is
+/// nothing left to reconstruct the task from.
+///
+/// A row is therefore a record of what this installation *asked*, not proof of
+/// what the peer took. `pending` is the honest state for a request whose answer
+/// never arrived: this side cannot tell one the peer never received from one it
+/// accepted and could not acknowledge. Either way the thread id survives, and
+/// the receiver deduplicates on message id, so sending the same envelope again
+/// is safe.
+///
+/// This row is also the reason there is no remote "list every thread" route and
+/// no need for one. The only installation that legitimately knows which threads
+/// exist on a peer is the one that opened them, so it keeps the list itself
+/// rather than asking the peer to enumerate its conversations to whoever calls.
+pub(crate) async fn deliver_envelope(
+    paths: &DaemonPaths,
+    alias: &str,
+    envelope: &PeerEnvelope,
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    let body = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
+    record_send_state(paths, alias, envelope, "pending", now_ms)?;
+    let response = match super::remote::peer_call(
+        paths,
+        alias,
+        reqwest::Method::POST,
+        "/v1/remote/peer/messages",
+        body,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(format!(
+                "{error} (recorded locally as pending in thread {}; poll it or send again with \
+                 the same message id, which the peer deduplicates)",
+                envelope.thread_id
+            ))
+        }
+    };
+    let state = response["state"].as_str().unwrap_or("accepted");
+    // The far side answers `accepted:false` for a duplicate it had already
+    // refused; taking its word is the whole point of asking.
+    let state = if response["accepted"] == serde_json::Value::Bool(false) {
+        "rejected"
+    } else {
+        state
+    };
+    // Best-effort, and defensible here in a way the whole record never was: the
+    // row already exists, so the worst case is a delivered message left reading
+    // `pending` until the next poll of a thread this side still knows about.
+    let _ = record_send_state(paths, alias, envelope, state, now_ms);
+    Ok(response)
+}
+
+/// Write what this installation knows about one outgoing message. Upserts on
+/// the message id, so the same envelope moving from `pending` to its answer
+/// updates the row rather than adding one.
+fn record_send_state(
+    paths: &DaemonPaths,
+    alias: &str,
+    envelope: &PeerEnvelope,
+    state: &str,
+    now_ms: i64,
+) -> Result<(), String> {
+    DaemonStore::open(paths)?.record_outbound_peer_message(
+        alias,
+        &envelope.message_id,
+        &envelope.thread_id,
+        envelope.correlation_id.as_deref(),
+        envelope.kind.as_str(),
+        state,
+        now_ms,
+    )
+}
+
+/// Ask one peer about one thread this installation opened, and fold what came
+/// back into the local record.
+///
+/// Deliberately narrow. There is no route that enumerates a node's peer threads
+/// and there should not be — that would let any paired peer discover the shape
+/// of every conversation a node is having. The thread id here comes from this
+/// installation's own outbound record, so it asks only about conversations it
+/// started.
+pub(crate) async fn refresh_remote_thread(
+    paths: &DaemonPaths,
+    alias: &str,
+    thread_id: &str,
+) -> Result<Vec<PeerOutboundMessage>, String> {
+    check_peer_id(thread_id)?;
+    let response = super::remote::peer_call(
+        paths,
+        alias,
+        reqwest::Method::GET,
+        &format!("/v1/remote/peer/threads/{thread_id}"),
+        Vec::new(),
+    )
+    .await?;
+    let now = i64::try_from(super::remote::now_ms_public()?).unwrap_or(i64::MAX);
+    let mut store = DaemonStore::open(paths)?;
+    let empty = Vec::new();
+    for message in response["messages"].as_array().unwrap_or(&empty) {
+        let payload = &message["payload"];
+        match message["kind"].as_str() {
+            // A result the peer produced for something this installation asked
+            // for. `in_reply_to` is the message id this side minted.
+            Some("result") => {
+                let Some(in_reply_to) = payload["in_reply_to"].as_str() else {
+                    continue;
+                };
+                store.record_outbound_peer_result(
+                    alias,
+                    in_reply_to,
+                    payload["state"].as_str().unwrap_or("succeeded"),
+                    payload["text"].as_str(),
+                    now,
+                )?;
+            }
+            // The peer's echo of what this installation sent, which is where a
+            // refusal shows up.
+            Some(_) if message["disposition"] == "rejected" => {
+                let Some(message_id) = message["message_id"].as_str() else {
+                    continue;
+                };
+                store.record_outbound_peer_result(
+                    alias,
+                    message_id,
+                    "rejected",
+                    message["rejection"].as_str(),
+                    now,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(store
+        .outbound_peer_messages(Some(alias), 200)?
+        .into_iter()
+        .filter(|message| message.thread_id == thread_id)
+        .collect())
+}
+
+/// The identifier alphabet the peer plane uses everywhere else.
+///
+/// Checked before a thread id reaches a URL: an id is the operator's or this
+/// installation's own, but it still must not be able to become a different
+/// route by carrying a slash or a query string.
+fn check_peer_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > little_monkey_lib::peers::MAX_ID_LEN
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(format!("'{value}' is not a peer thread id"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_thread_id_cannot_turn_into_a_different_route() {
+        for forged in [
+            "../../v1/remote/runs",
+            "thread-1/../node",
+            "thread 1",
+            "thread-1?all=true",
+            "",
+        ] {
+            assert!(
+                check_peer_id(forged).is_err(),
+                "'{forged}' must not be usable as a thread id"
+            );
+        }
+        assert!(check_peer_id("thread-abc.1:2_3").is_ok());
+    }
 
     #[tokio::test]
     async fn an_unknown_peer_is_refused_without_contacting_anything() {
@@ -237,6 +416,56 @@ mod tests {
             .await
             .expect_err("unknown peer");
         assert!(error.contains("not a peer"));
+    }
+
+    /// The crash window this ordering exists to close.
+    ///
+    /// The record has to be on disk before the request goes out, because the
+    /// dangerous case is the one where the peer takes the work and this side
+    /// never learns that it did. Nothing enumerates a peer's threads, and the
+    /// result poll only updates an existing row, so a thread id that was never
+    /// written down is a task nobody can find again.
+    ///
+    /// Driven through a delivery that fails — no pairing exists, so the call
+    /// cannot leave — because a failed send and a crashed sender leave this
+    /// side in exactly the same state, and only one of them can be written as
+    /// a test.
+    #[tokio::test]
+    async fn a_delivery_that_never_reaches_the_peer_still_leaves_a_thread_to_find() {
+        let paths = super::super::channel_restart_tests::temp_daemon_paths();
+        let envelope = PeerEnvelope::new(
+            "pmsg-crash",
+            "thread-crash",
+            PeerMessageKind::TaskRequest,
+            "instance-local",
+            "run the build",
+            1_700_000_000_000,
+            TTL_MS,
+        );
+
+        let error = deliver_envelope(&paths, "ghost", &envelope, 1_700_000_000_000)
+            .await
+            .expect_err("no pairing, so nothing can be delivered");
+        assert!(
+            error.contains("thread-crash"),
+            "the failure has to name the thread that survived it: {error}"
+        );
+
+        let recorded = DaemonStore::open(&paths)
+            .expect("store")
+            .outbound_peer_messages(Some("ghost"), 10)
+            .expect("read");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the send must be recorded before it goes"
+        );
+        assert_eq!(recorded[0].thread_id, "thread-crash");
+        assert_eq!(recorded[0].message_id, "pmsg-crash");
+        assert_eq!(
+            recorded[0].state, "pending",
+            "unanswered is not the same as rejected: the peer may hold it"
+        );
     }
 
     #[tokio::test]

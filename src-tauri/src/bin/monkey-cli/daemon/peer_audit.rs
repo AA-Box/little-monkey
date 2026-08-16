@@ -211,9 +211,35 @@ pub(crate) fn audit_peers(paths: &DaemonPaths, now_ms: i64) -> Vec<SecurityFindi
             None,
         ));
     }
+    // Content one peer handed over and may still name. An admission that
+    // belongs to a pairing that is gone cannot authorize anything — the gate
+    // resolves the pairing first — but it is state nobody is watching, and
+    // `Clear` is what removes it.
+    if let Ok(receipts) = store.peer_artifact_receipts(None, 500) {
+        let stranded = receipts
+            .iter()
+            .filter(|receipt| !active_ids.contains(&receipt.peer_device_id.as_str()))
+            .count();
+        if stranded > 0 {
+            findings.push(finding(
+                "peers.orphaned_artifact_admissions",
+                "Content admissions remain for a peer that is no longer paired",
+                format!(
+                    "{stranded} artifact admission(s) belong to a pairing that is revoked or gone. They authorize nothing while the pairing is refused."
+                ),
+                FindingStatus::Info,
+                Some("Use Clear in Settings → Peers to drop them; the content itself may belong to a run and is left alone."),
+            ));
+        }
+    }
     // Refusals that never became a message row: loops, expired envelopes,
     // malformed shapes. These are the ones worth watching as a *rate*, because
     // an envelope that fails validation costs the sender nothing to retry.
+    //
+    // The table this reads is bounded per pairing, so a peer flooding it
+    // cannot push another peer's evidence out and cannot grow the database
+    // without end. What the doctor sees is the most recent traffic, which is
+    // what these findings are about.
     if let Ok(events) = store.peer_rejection_events(500) {
         let mut loops = 0usize;
         let mut expired_events = 0usize;
@@ -309,10 +335,13 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use little_monkey_lib::peers::{PeerEnvelope, PeerMessageKind, PeerRejection};
 
     const NOW: i64 = 1_700_000_000_000;
+    const NOW_U64: u64 = 1_700_000_000_000;
 
     fn temp_paths() -> (std::path::PathBuf, DaemonPaths) {
         let root =
@@ -375,6 +404,181 @@ mod tests {
         // Nothing anywhere in the report may carry what a peer said.
         let rendered = serde_json::to_string(&findings).expect("serialize");
         assert!(!rendered.contains("exfiltrate"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Pair one peer for real, so the traffic findings below actually run.
+    fn paths_with_a_peer(
+        capabilities: BTreeSet<DeviceCapability>,
+    ) -> (std::path::PathBuf, DaemonPaths, String) {
+        let (root, paths) = temp_paths();
+        let mut remote = RemoteStore::open(&paths.root).expect("remote store");
+        let scopes = super::super::remote::protocol::RemoteScopes {
+            actions: BTreeSet::new(),
+            run_ids: BTreeSet::new(),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        };
+        let invitation = remote
+            .create_invitation_with_capabilities(&scopes, &capabilities, NOW_U64, NOW_U64 + 600_000)
+            .expect("invitation");
+        let accepted = remote
+            .accept_invitation_with_capabilities(
+                &invitation.pairing_id,
+                &invitation.token,
+                "peer",
+                "instance-local",
+                None,
+                NOW_U64 + 1,
+                &MemorySecrets::default(),
+            )
+            .expect("accept");
+        (root, paths, accepted.device_id)
+    }
+
+    #[derive(Default)]
+    struct MemorySecrets(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+    impl super::super::remote::store::RemoteSecretStore for MemorySecrets {
+        fn set(&self, slot: &str, secret: &[u8]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(slot.to_string(), secret.to_vec());
+            Ok(())
+        }
+
+        fn get(&self, slot: &str) -> Result<Vec<u8>, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(slot)
+                .cloned()
+                .ok_or_else(|| "missing".to_string())
+        }
+
+        fn delete(&self, slot: &str) -> Result<(), String> {
+            self.0.lock().unwrap().remove(slot);
+            Ok(())
+        }
+    }
+
+    /// The findings the bounded refusal table is *for*.
+    ///
+    /// Retention changed underneath these; the point of the table did not, so
+    /// the loop, clock-skew and malformed findings still have to appear from
+    /// the rows that survive.
+    #[test]
+    fn loops_clock_skew_and_malformed_traffic_are_still_reported_from_a_bounded_table() {
+        let (root, paths, device_id) = paths_with_a_peer(BTreeSet::from([
+            DeviceCapability::PeerMessage,
+            DeviceCapability::PeerTaskRequest,
+        ]));
+        let mut store = DaemonStore::open(&paths).expect("store");
+        for (reason, count) in [
+            (PeerRejection::OriginLoop, 3),
+            (PeerRejection::ZeroHops, 3),
+            (PeerRejection::Expired, 4),
+            (PeerRejection::CreatedInFuture, 2),
+            (PeerRejection::MalformedId, 6),
+        ] {
+            for index in 0..count {
+                store
+                    .record_peer_rejection_event(
+                        &device_id,
+                        Some("msg-1"),
+                        Some("thread-1"),
+                        reason,
+                        NOW + index,
+                    )
+                    .expect("record");
+            }
+        }
+        drop(store);
+
+        let findings = audit_peers(&paths, NOW);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"peers.relay_loops"), "{ids:?}");
+        assert!(ids.contains(&"peers.clock_skew"), "{ids:?}");
+        assert!(ids.contains(&"peers.malformed_traffic"), "{ids:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One peer flooding must not be able to erase what another peer did.
+    #[test]
+    fn a_flood_from_one_peer_leaves_another_peers_evidence_intact() {
+        let (root, paths, loud) =
+            paths_with_a_peer(BTreeSet::from([DeviceCapability::PeerMessage]));
+        let mut store = DaemonStore::open(&paths).expect("store");
+        for index in 0..super::super::peer_store::MAX_PEER_REJECTION_EVENTS_PER_PEER * 2 {
+            store
+                .record_peer_rejection_event(
+                    &loud,
+                    None,
+                    None,
+                    PeerRejection::MalformedId,
+                    NOW + i64::from(index),
+                )
+                .expect("record");
+        }
+        // A second pairing that sent five expired envelopes long before.
+        for index in 0..5 {
+            store
+                .record_peer_rejection_event(
+                    "device-quiet",
+                    None,
+                    None,
+                    PeerRejection::Expired,
+                    NOW - 1_000 + index,
+                )
+                .expect("record");
+        }
+        assert_eq!(
+            store
+                .peer_rejection_event_count(Some("device-quiet"))
+                .unwrap(),
+            5,
+            "the quiet peer's rows are still there"
+        );
+        drop(store);
+
+        let findings = audit_peers(&paths, NOW);
+        let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
+        // Both peers' stories are told, from a table that is bounded for each.
+        assert!(ids.contains(&"peers.malformed_traffic"), "{ids:?}");
+        assert!(ids.contains(&"peers.clock_skew"), "{ids:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn admissions_left_by_a_pairing_that_is_gone_are_reported_without_naming_content() {
+        let (root, paths, _device_id) =
+            paths_with_a_peer(BTreeSet::from([DeviceCapability::PeerArtifact]));
+        let mut store = DaemonStore::open(&paths).expect("store");
+        store
+            .record_peer_artifact_receipt(
+                "device-vanished",
+                &"a".repeat(64),
+                &"a".repeat(64),
+                12,
+                Some("payroll.csv"),
+                Some("text/csv"),
+                NOW,
+            )
+            .expect("admit");
+        drop(store);
+
+        let findings = audit_peers(&paths, NOW);
+        let finding = findings
+            .iter()
+            .find(|f| f.id == "peers.orphaned_artifact_admissions")
+            .expect("stranded admissions are reported");
+        assert_eq!(finding.status, FindingStatus::Info);
+        // A filename is the peer's own text and a digest identifies content;
+        // neither belongs in a report that ends up in a support bundle.
+        let rendered = serde_json::to_string(&findings).expect("serialize");
+        assert!(!rendered.contains("payroll.csv"));
+        assert!(!rendered.contains(&"a".repeat(64)));
         let _ = std::fs::remove_dir_all(root);
     }
 }
