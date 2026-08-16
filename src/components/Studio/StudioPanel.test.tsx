@@ -77,6 +77,7 @@ const MODEL: GenerationModel = {
     acceptanceRequired: false,
   },
   extraLaunchArgs: [],
+  engine: "stable_diffusion_cpp",
   installed: true,
   totalBytes: 2_000_000_000,
   missingBytes: 0,
