@@ -138,6 +138,48 @@ pub enum ComponentSlot {
     Vocoder,
 }
 
+/// Which engine renders a model.
+///
+/// Not an architecture and not a task: it names the program that has to be
+/// started, because two of them cannot read the same file. An MLX conversion
+/// stores its weights as packed `U32` groups with separate scales and biases,
+/// which stable-diffusion.cpp's safetensors reader has no case for, and a GGUF
+/// quantization is equally unreadable to MLX. Whichever engine is wrong for a
+/// file fails deep inside a loader with a message about tensors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationEngineKind {
+    /// The bundled `sd-server`. Every model added before this field existed.
+    #[default]
+    StableDiffusionCpp,
+    /// The video service in the installed MLX package. Apple silicon only,
+    /// and only present once the user installs that package.
+    MlxVideo,
+}
+
+/// What to spawn for a model: a program, and the arguments that must precede
+/// the ones [`launch_args`] builds.
+///
+/// `sd-server` is its own executable, so the prefix is empty. The MLX service
+/// is a Python file inside a verified package, so the program is that package's
+/// own interpreter and the prefix is the script — neither of which the engine
+/// state should be resolving for itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineCommand {
+    pub program: PathBuf,
+    pub prefix_args: Vec<String>,
+}
+
+impl EngineCommand {
+    /// A plain executable, which is what the bundled engines are.
+    pub fn binary(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            prefix_args: Vec::new(),
+        }
+    }
+}
+
 impl ComponentSlot {
     pub fn flag(self) -> &'static str {
         match self {
@@ -413,6 +455,13 @@ pub struct GenerationModelSpec {
     pub license: LicenseGate,
     /// Model-specific `sd-server` launch flags beyond the component slots.
     pub extra_launch_args: Vec<String>,
+    /// Which engine renders this model.
+    ///
+    /// Defaulted rather than required: `studio-models.json` already holds
+    /// entries written before this field existed, and the whole registry fails
+    /// to parse if one of them cannot deserialize.
+    #[serde(default)]
+    pub engine: GenerationEngineKind,
 }
 
 impl GenerationModelSpec {
@@ -689,8 +738,19 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
 /// leaves the id alone, so an id-keyed reuse would keep serving the old file
 /// set until the app restarted, and the fix the user just made would appear to
 /// do nothing.
-fn launch_signature(spec: &GenerationModelSpec, model_root: &Path) -> Vec<String> {
-    launch_args(spec, model_root, 0)
+fn launch_signature(
+    engine: &EngineCommand,
+    spec: &GenerationModelSpec,
+    model_root: &Path,
+) -> Vec<String> {
+    // The program is part of the signature, not just its arguments: switching a
+    // model between engines leaves every slot flag identical, so an args-only
+    // signature would keep serving the warm process from the engine the user
+    // just switched away from.
+    let mut signature = vec![engine.program.to_string_lossy().to_string()];
+    signature.extend(engine.prefix_args.iter().cloned());
+    signature.extend(launch_args(spec, model_root, 0));
+    signature
 }
 
 /// The weight file that identifies a loaded model to `sd-server`, which
@@ -1540,10 +1600,14 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
 const MAX_STDERR_TAIL: usize = 4_000;
 
 /// Engine failures whose own wording does not say what to change, paired with
-/// the sentence that does. Both entries below were hit for real: the first by
-/// putting an all-in-one checkpoint on the wrong slot, the second by a
-/// quantization built for a different loader.
+/// the sentence that does. Every entry below was hit for real: a checkpoint on
+/// the wrong slot, a quantization built for a different loader, and a weight
+/// file stored in a data type the engine's safetensors reader has no case for.
 const ENGINE_FAILURE_HINTS: &[(&str, &str)] = &[
+    (
+        "unsupported dtype",
+        "That file stores its weights in a data type this engine cannot read. It accepts F32, F16, BF16, F8_E4M3, F8_E5M2, I32 and I64; a `U32` tensor means the weights are packed integers — MLX `-q4`/`-q8` repositories store them that way, as do GPTQ, AWQ, bitsandbytes NF4 and torchao. An MLX quantization is for Apple's MLX runtime and no flag makes it load here. Use the F16/BF16 or FP8 release of the same model, or a GGUF quantization built for stable-diffusion.cpp.",
+    ),
     (
         "get sd version from file failed",
         "The engine could not detect a model version in that file. A standalone UNet or DiT belongs on --diffusion-model; only an all-in-one checkpoint belongs on --model. Check which slot the file is on — either direction produces this error.",
@@ -1574,9 +1638,13 @@ fn engine_failure_detail(tail: &str) -> String {
     } else {
         errors.join("\n")
     };
+    // The earliest signature wins, not the first one listed: a loader gives up
+    // in cascade — an unreadable tensor is reported as a missing model version
+    // two lines later — and only the first line is the cause.
     match ENGINE_FAILURE_HINTS
         .iter()
-        .find(|(signature, _)| tail.contains(signature))
+        .filter_map(|(signature, hint)| tail.find(signature).map(|at| (at, hint)))
+        .min_by_key(|(at, _)| *at)
     {
         Some((_, hint)) => format!("{body}\n\n{hint}"),
         None => body,
@@ -1863,11 +1931,11 @@ impl GenerationEngineState {
     /// different model is loaded. Returns the base URL to submit jobs to.
     pub async fn ensure_ready(
         &self,
-        binary: &Path,
+        engine: &EngineCommand,
         spec: &GenerationModelSpec,
         model_root: &Path,
     ) -> Result<String, String> {
-        let signature = launch_signature(spec, model_root);
+        let signature = launch_signature(engine, spec, model_root);
         let warm = self
             .inner
             .lock()
@@ -1894,7 +1962,8 @@ impl GenerationEngineState {
             }
         }
 
-        let mut child = Command::new(binary)
+        let mut child = Command::new(&engine.program)
+            .args(&engine.prefix_args)
             .args(launch_args(spec, model_root, port))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2524,6 +2593,7 @@ mod tests {
             min_ram_bytes: 16 * 1024 * 1024 * 1024,
             license: LicenseGate::default(),
             extra_launch_args: vec!["--diffusion-fa".to_string()],
+            engine: GenerationEngineKind::default(),
         }
     }
 
@@ -2729,17 +2799,78 @@ mod tests {
             "unet.gguf",
             1,
         )];
-        let before = launch_signature(&spec, root);
+        let engine = EngineCommand::binary("/engines/sd-server");
+        let before = launch_signature(&engine, &spec, root);
         spec.components.push(ModelComponent::huggingface(
             ComponentSlot::Vae,
             "r",
             "vae.safetensors",
             1,
         ));
-        assert_ne!(before, launch_signature(&spec, root));
+        assert_ne!(before, launch_signature(&engine, &spec, root));
         // The port is the one thing that legitimately differs between two
-        // launches of the same file set, so it must not be in the key.
-        assert_eq!(launch_signature(&spec, root), launch_args(&spec, root, 0),);
+        // launches of the same file set, so it must not be in the key:
+        // everything after the engine's own argv is exactly a port-zero launch.
+        assert_eq!(
+            launch_signature(&engine, &spec, root)[1..],
+            launch_args(&spec, root, 0)[..]
+        );
+    }
+
+    /// Two engines take the same slot flags, so the flags alone cannot say
+    /// which process is warm.
+    #[test]
+    fn switching_engines_invalidates_a_warm_process() {
+        let root = Path::new("/models");
+        let spec = model("m", vec![GenerationTask::TextToVideo], FrameGrid::DownTo4nPlus1);
+        let bundled = launch_signature(&EngineCommand::binary("/engines/sd-server"), &spec, root);
+        let mlx = launch_signature(
+            &EngineCommand {
+                program: PathBuf::from("/packages/mlx/runtime/bin/python3"),
+                prefix_args: vec!["/packages/mlx/service/mlx_video_server.py".to_string()],
+            },
+            &spec,
+            root,
+        );
+        assert_ne!(bundled, mlx);
+        // Same model, same files: only the program differs, which is exactly
+        // the case an args-only signature would miss.
+        assert_eq!(bundled[1..], mlx[2..]);
+    }
+
+    /// Every model in a library written before the engine field existed is a
+    /// stable-diffusion.cpp model, and a registry that fails to parse takes
+    /// every other model down with it.
+    #[test]
+    fn a_spec_saved_without_an_engine_still_loads() {
+        let stored = serde_json::json!({
+            "id": "wan",
+            "name": "Wan",
+            "family": "Wan",
+            "tasks": ["text_to_video"],
+            "components": [],
+            "defaults": {
+                "width": 832,
+                "height": 480,
+                "steps": 20,
+                "cfgScale": 6.0,
+                "sampleMethod": "euler",
+                "flowShift": 3.0,
+                "fps": 24,
+                "videoFrames": 33,
+                "frameGrid": "down_to4n_plus1"
+            },
+            "minRamBytes": 0,
+            "license": {"id": "", "name": "", "url": "", "excludedTerritories": [], "acceptanceRequired": false},
+            "extraLaunchArgs": []
+        });
+        let spec: GenerationModelSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(spec.engine, GenerationEngineKind::StableDiffusionCpp);
+        // And the name it round-trips under is the one the frontend sends.
+        assert_eq!(
+            serde_json::to_value(GenerationEngineKind::MlxVideo).unwrap(),
+            serde_json::json!("mlx_video")
+        );
     }
 
     /// A checkpoint that needs a separate VAE does not name one, so the common
@@ -3654,6 +3785,17 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         assert!(detail.contains("get sd version from file failed"));
         assert!(detail.contains("belongs on --model"), "{detail}");
 
+        // A packed-integer quantization fails on the first tensor it cannot
+        // read and then reports a missing model version, which is how a
+        // U32 Wan checkpoint came back as advice about slots.
+        let dtype_tail = "\
+[ERROR] model_loader.cpp:321 - unsupported dtype 'U32' (tensor 'blocks.0.cross_attn.k.weight')
+[ERROR] stable-diffusion.cpp:902 - get sd version from file failed: ''
+[ERROR] main.cpp:92 - new_sd_ctx_t failed";
+        let dtype_detail = engine_failure_detail(dtype_tail);
+        assert!(dtype_detail.contains("cannot read"), "{dtype_detail}");
+        assert!(!dtype_detail.contains("belongs on --model"), "{dtype_detail}");
+
         // A quantization for another loader is the other failure that reads as
         // a broken download rather than a wrong file.
         assert!(engine_failure_detail(
@@ -3880,7 +4022,7 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         runtime.block_on(async {
             let engine = GenerationEngineState::default();
             let base_url = engine
-                .ensure_ready(Path::new(&binary), &spec, Path::new("/unused"))
+                .ensure_ready(&EngineCommand::binary(&binary), &spec, Path::new("/unused"))
                 .await
                 .expect("engine ready");
             let client = reqwest::Client::new();
