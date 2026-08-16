@@ -17,7 +17,7 @@
 // the build succeeds.
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync } from "node:fs";
+import { chmodSync, copyFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureSidecarPlaceholder, hostTriple } from "./lib/cliSidecarPlaceholder.mjs";
@@ -29,7 +29,7 @@ const explicitTarget = process.env.CLI_SIDECAR_TARGET;
 const target = explicitTarget || hostTriple();
 const isWindows = target.includes("windows");
 
-const stagedPath = ensureSidecarPlaceholder(repoRoot, target, isWindows);
+const stagedPath = ensureSidecarPlaceholder(repoRoot, target, isWindows, explicitTarget);
 
 const cargoArgs = ["build", "--release", "--bin", "monkey-cli", "--manifest-path", manifestPath];
 if (explicitTarget) cargoArgs.push("--target", explicitTarget);
@@ -43,6 +43,12 @@ const builtDir = explicitTarget
   : join(repoRoot, "src-tauri", "target", "release");
 const builtPath = join(builtDir, builtName);
 
+// The one thing that must never be staged is an empty file: tauri-build
+// copies whatever is here over the target directory's `monkey-cli`, and a
+// zero-byte sidecar reaches the bundle looking exactly like a real one.
+if (statSync(builtPath).size === 0) {
+  throw new Error(`${builtPath} is empty — refusing to stage it as the sidecar`);
+}
 copyFileSync(builtPath, stagedPath);
 if (!isWindows) chmodSync(stagedPath, 0o755);
 

@@ -10,8 +10,9 @@ import { fileURLToPath } from "node:url";
 import { ensureSidecarPlaceholder, hostTriple } from "./lib/cliSidecarPlaceholder.mjs";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const target = process.env.CLI_SIDECAR_TARGET || hostTriple();
+const explicitTarget = process.env.CLI_SIDECAR_TARGET;
+const target = explicitTarget || hostTriple();
 const isWindows = target.includes("windows");
 
-const path = ensureSidecarPlaceholder(repoRoot, target, isWindows);
+const path = ensureSidecarPlaceholder(repoRoot, target, isWindows, explicitTarget);
 console.log(`[ensure-cli-sidecar-placeholder] ${path}`);
