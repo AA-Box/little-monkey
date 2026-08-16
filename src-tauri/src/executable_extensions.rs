@@ -6351,6 +6351,23 @@ mod tests {
         assert_eq!(host.logs.len(), 6);
     }
 
+    /// Block until `invocation_id` has registered for cancellation.
+    ///
+    /// Its guest has to be compiled and instantiated first, which is the
+    /// slowest thing in this suite on the slowest runner in the fleet. The
+    /// budget guards against a registration that never happens, so it is
+    /// deliberately far longer than the operation should ever take.
+    async fn wait_until_registered(invocation_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while !CANCELLATIONS.lock().unwrap().contains_key(invocation_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "'{invocation_id}' never registered for cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn infinite_guest_can_be_cancelled_and_host_remains_usable() {
         let _runtime = runtime_guard();
@@ -6408,18 +6425,27 @@ mod tests {
                 })
                 .await
         });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while {
-            let active = CANCELLATIONS.lock().unwrap();
-            !active.contains_key("cancel-loop") || !active.contains_key("second-loop")
-        } {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::task::yield_now().await;
-        }
+        // Each invocation is cancelled as soon as *it* registers, rather than
+        // after both have. Waiting for the pair coupled the first guest's
+        // lifetime to the second's start-up: an infinite guest is racing its
+        // own fuel ceiling from the instant it begins, and on a runner slow
+        // enough that the second component's compile took a while, the first
+        // had already trapped by the time anything cancelled it — `cancel`
+        // then answered `false` about an invocation that was simply over.
+        //
+        // The waits sleep rather than spinning on `yield_now`, for the same
+        // reason: a tight loop burns the core the compile it is waiting for
+        // needs. Both budgets are generous because what they guard is a hang,
+        // not a stopwatch.
+        wait_until_registered("cancel-loop").await;
         assert!(cancel("cancel-loop").unwrap());
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        wait_until_registered("second-loop").await;
+        // Cancellation is per invocation, not a switch on the extension: the
+        // other one is still in flight. Read as registry membership rather
+        // than as `!second_task.is_finished()`, because an entry is removed
+        // exactly when its invocation ends — which is the same fact without a
+        // timing window around it.
         assert!(CANCELLATIONS.lock().unwrap().contains_key("second-loop"));
-        assert!(!second_task.is_finished());
         atomic_write(
             &manager.invocation_cancel_path("second-loop").unwrap(),
             b"cancel\n",
