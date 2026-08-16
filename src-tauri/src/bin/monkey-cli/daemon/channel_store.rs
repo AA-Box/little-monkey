@@ -16,7 +16,7 @@ use little_monkey_lib::channels::ingress::ConversationSource;
 use little_monkey_lib::channels::policy::{ChannelAccessPolicy, SenderState};
 use little_monkey_lib::channels::routing::{ChannelRoute, RouteScope, RouteTarget};
 use little_monkey_lib::channels::types::{
-    BoundedMetadata, ChannelHealth, ChannelKind, HealthState,
+    BoundedMetadata, ChannelEnvelope, ChannelHealth, ChannelKind, HealthState, OutboundMessage,
 };
 
 use super::store::DaemonStore;
@@ -120,6 +120,38 @@ pub struct NewChannelEvent {
     pub envelope_json: String,
     pub disposition: EventDisposition,
     pub received_at_ms: i64,
+}
+
+/// One messaging conversation that has a durable session, as a session list
+/// shows it. Carries no message text — that is `channel_conversation_messages`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelConversationRow {
+    /// Stable identity of the conversation's session — what a caller passes
+    /// back to read the transcript.
+    pub session_key: String,
+    pub account_id: String,
+    /// Provider token (`slack`, `signal`, …) — the environment this
+    /// conversation belongs to.
+    pub account_kind: String,
+    pub account_label: String,
+    pub conversation_id: String,
+    pub thread_id: Option<String>,
+    pub session_id: String,
+    /// The provider's own title, when it sent one.
+    pub title: Option<String>,
+    pub last_activity_ms: i64,
+    pub message_count: u32,
+}
+
+/// One message in a channel conversation, in either direction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelConversationMessage {
+    /// True for something this installation sent, false for what arrived.
+    pub outbound: bool,
+    /// The provider's id for whoever sent it; absent on our own messages.
+    pub author: Option<String>,
+    pub text: String,
+    pub at_ms: i64,
 }
 
 /// A stored inbound/outbound event, as read back for the recent-events view.
@@ -1337,6 +1369,208 @@ impl DaemonStore {
             .map_err(|error| error.to_string())
     }
 
+    /// Every conversation this installation holds a durable session for,
+    /// newest activity first.
+    ///
+    /// One row is one *session* in a messaging environment — the same unit
+    /// the desktop's sidebar calls a session — so the listing reads the
+    /// session map rather than the event log: a message that was ignored, or
+    /// still awaits sender approval, never bound a session and is not a
+    /// conversation anybody can open.
+    ///
+    /// Activity and counts come from the event log and the outbox together,
+    /// because a conversation the agent answered has traffic in both
+    /// directions, and a "last active" that ignored half of it would be wrong
+    /// in exactly the case that matters.
+    pub fn channel_conversations(&self, limit: u32) -> Result<Vec<ChannelConversationRow>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT m.session_key, m.account_id, a.kind, a.label, m.conversation_id,
+                        m.thread_id, m.session_id,
+                        MAX(
+                          m.last_used_at_ms,
+                          COALESCE((SELECT MAX(e.received_at_ms) FROM channel_events e
+                                     WHERE e.account_id = m.account_id
+                                       AND e.conversation_id = m.conversation_id
+                                       AND (m.thread_id IS NULL OR e.thread_id IS m.thread_id)), 0),
+                          COALESCE((SELECT MAX(COALESCE(o.sent_at_ms, o.created_at_ms))
+                                      FROM channel_outbox o
+                                     WHERE o.account_id = m.account_id
+                                       AND o.conversation_id = m.conversation_id
+                                       AND (m.thread_id IS NULL OR o.thread_id IS m.thread_id)), 0)
+                        ),
+                        (SELECT COUNT(*) FROM channel_events e
+                          WHERE e.account_id = m.account_id
+                            AND e.conversation_id = m.conversation_id
+                            AND (m.thread_id IS NULL OR e.thread_id IS m.thread_id)
+                            AND e.direction = 'inbound' AND e.disposition = 'accepted')
+                        + (SELECT COUNT(*) FROM channel_outbox o
+                            WHERE o.account_id = m.account_id
+                              AND o.conversation_id = m.conversation_id
+                              AND (m.thread_id IS NULL OR o.thread_id IS m.thread_id)
+                              AND o.state IN ('queued','sending','sent')),
+                        (SELECT e.envelope_json FROM channel_events e
+                          WHERE e.account_id = m.account_id
+                            AND e.conversation_id = m.conversation_id
+                            AND (m.thread_id IS NULL OR e.thread_id IS m.thread_id)
+                            AND e.direction = 'inbound'
+                          ORDER BY e.received_at_ms DESC LIMIT 1)
+                 FROM channel_session_map m
+                 JOIN channel_accounts a ON a.account_id = m.account_id
+                 ORDER BY 8 DESC
+                 LIMIT ?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![i64::from(limit.min(500))], |row| {
+                let envelope: Option<String> = row.get(9)?;
+                Ok((
+                    ChannelConversationRow {
+                        session_key: row.get(0)?,
+                        account_id: row.get(1)?,
+                        account_kind: row.get(2)?,
+                        account_label: row.get(3)?,
+                        conversation_id: row.get(4)?,
+                        thread_id: row.get(5)?,
+                        session_id: row.get(6)?,
+                        last_activity_ms: row.get(7)?,
+                        message_count: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(u32::MAX),
+                        // Filled from the envelope below: the provider's own
+                        // title when it sent one, never a routing identifier
+                        // dressed up as one.
+                        title: None,
+                    },
+                    envelope,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(mut row, envelope)| {
+                        row.title = envelope
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str::<ChannelEnvelope>(json).ok())
+                            .and_then(|envelope| envelope.conversation.title);
+                        row
+                    })
+                    .collect()
+            })
+    }
+
+    /// One conversation's messages, oldest first: what the provider delivered
+    /// and what this installation sent back.
+    ///
+    /// Both directions are read from what was durably recorded rather than
+    /// re-fetched from the provider, so the transcript is exactly what this
+    /// machine acted on. A row whose stored payload no longer parses is left
+    /// out rather than rendered as an empty message — that is a storage-format
+    /// mismatch, not something anybody said.
+    pub fn channel_conversation_messages(
+        &self,
+        session_key: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelConversationMessage>, String> {
+        let Some((account_id, conversation_id, thread_id)) = self
+            .connection
+            .query_row(
+                "SELECT account_id, conversation_id, thread_id FROM channel_session_map
+                 WHERE session_key=?1",
+                [session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let bound = i64::from(limit.clamp(1, 2_000));
+        let mut messages = Vec::new();
+
+        let mut inbound = self
+            .connection
+            .prepare(
+                "SELECT envelope_json, sender_id, received_at_ms FROM channel_events
+                  WHERE account_id=?1 AND conversation_id=?2
+                    AND (?3 IS NULL OR thread_id IS ?3)
+                    AND direction='inbound' AND disposition='accepted'
+                  ORDER BY received_at_ms DESC LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let inbound_rows = inbound
+            .query_map(
+                params![account_id, conversation_id, thread_id, bound],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        for row in inbound_rows {
+            let (envelope_json, sender_id, at_ms) = row.map_err(|error| error.to_string())?;
+            let Ok(envelope) = serde_json::from_str::<ChannelEnvelope>(&envelope_json) else {
+                continue;
+            };
+            messages.push(ChannelConversationMessage {
+                outbound: false,
+                author: sender_id.or_else(|| Some(envelope.sender.sender_id.clone())),
+                text: envelope.text,
+                at_ms,
+            });
+        }
+
+        let mut outbound = self
+            .connection
+            .prepare(
+                "SELECT payload_json, COALESCE(sent_at_ms, created_at_ms) FROM channel_outbox
+                  WHERE account_id=?1 AND conversation_id=?2
+                    AND (?3 IS NULL OR thread_id IS ?3)
+                    AND state IN ('queued','sending','sent')
+                  ORDER BY COALESCE(sent_at_ms, created_at_ms) DESC LIMIT ?4",
+            )
+            .map_err(|error| error.to_string())?;
+        let outbound_rows = outbound
+            .query_map(
+                params![account_id, conversation_id, thread_id, bound],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(|error| error.to_string())?;
+        for row in outbound_rows {
+            let (payload_json, at_ms) = row.map_err(|error| error.to_string())?;
+            let Ok(payload) = serde_json::from_str::<OutboundMessage>(&payload_json) else {
+                continue;
+            };
+            messages.push(ChannelConversationMessage {
+                outbound: true,
+                author: None,
+                text: payload.text,
+                at_ms,
+            });
+        }
+
+        messages.sort_by_key(|message| message.at_ms);
+        // Both halves were read newest-first under the same bound, so an
+        // over-long conversation keeps its most recent `limit` messages
+        // rather than an arbitrary mix of the two directions.
+        let keep = bound as usize;
+        if messages.len() > keep {
+            messages.drain(..messages.len() - keep);
+        }
+        Ok(messages)
+    }
+
     /// How many outbound rows this job queued.
     ///
     /// Test-only: the send path used to derive its idempotency key from this
@@ -2497,6 +2731,117 @@ mod tests {
         };
         assert!(store.insert_channel_route(&route("r1", orphan)).is_err());
         assert_eq!(store.channel_routes().expect("routes").len(), 0);
+    }
+
+    /// The session list's view of a channel: one row per bound conversation,
+    /// and a transcript that interleaves both directions in time order.
+    #[test]
+    fn conversations_read_back_with_both_directions() {
+        let mut store = seeded();
+        store
+            .bind_channel_session("key-1", "acct-1", "conv-1", None, "sess-1", 1_000)
+            .expect("bind");
+
+        let envelope = serde_json::json!({
+            "account_id": "acct-1",
+            "kind": "telegram",
+            "provider_event_id": "evt-1",
+            "conversation": { "conversation_id": "conv-1", "kind": "direct", "title": "Ops room" },
+            "sender": { "sender_id": "user-3" },
+            "text": "is the deploy done?",
+            "received_at_ms": 2_000,
+        })
+        .to_string();
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "evt-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                sender_id: Some("user-3".into()),
+                envelope_json: envelope,
+                disposition: EventDisposition::Accepted,
+                received_at_ms: 2_000,
+            })
+            .expect("record inbound");
+
+        let payload = serde_json::json!({
+            "account_id": "acct-1",
+            "kind": "telegram",
+            "conversation_id": "conv-1",
+            "text": "yes, it shipped",
+            "idempotency_key": "idem-1",
+        })
+        .to_string();
+        store
+            .enqueue_channel_message(&NewOutboxMessage {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                thread_id: None,
+                reply_to_provider_id: None,
+                payload_json: payload,
+                payload_digest: "digest-1".into(),
+                idempotency_key: "idem-1".into(),
+                invocation_id: None,
+                max_attempts: 3,
+                job_id: None,
+                created_at_ms: 3_000,
+            })
+            .expect("enqueue outbound");
+
+        let conversations = store.channel_conversations(50).expect("list");
+        assert_eq!(conversations.len(), 1);
+        let row = &conversations[0];
+        assert_eq!(row.session_key, "key-1");
+        assert_eq!(row.account_kind, "telegram");
+        assert_eq!(row.title.as_deref(), Some("Ops room"));
+        // Both directions count, and activity follows the newer of the two.
+        assert_eq!(row.message_count, 2);
+        assert_eq!(row.last_activity_ms, 3_000);
+
+        let messages = store
+            .channel_conversation_messages("key-1", 50)
+            .expect("messages");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| (message.outbound, message.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(false, "is the deploy done?"), (true, "yes, it shipped")],
+        );
+        assert_eq!(messages[0].author.as_deref(), Some("user-3"));
+
+        // An unknown session is an empty transcript, never an error: a phone
+        // unpaired or an account removed mid-read is ordinary.
+        assert!(store
+            .channel_conversation_messages("key-missing", 50)
+            .expect("missing")
+            .is_empty());
+    }
+
+    /// A conversation nobody may talk to yet has no session and must not
+    /// appear in a session list.
+    #[test]
+    fn conversations_exclude_unbound_traffic() {
+        let mut store = seeded();
+        store
+            .record_channel_event(&NewChannelEvent {
+                account_id: "acct-1".into(),
+                source: ConversationSource::MessagingChannel,
+                direction: EventDirection::Inbound,
+                provider_event_id: "evt-9".into(),
+                conversation_id: "conv-9".into(),
+                thread_id: None,
+                sender_id: Some("stranger".into()),
+                envelope_json: "{}".into(),
+                disposition: EventDisposition::Challenged,
+                received_at_ms: 4_000,
+            })
+            .expect("record challenged");
+
+        assert!(store.channel_conversations(50).expect("list").is_empty());
     }
 
     #[test]

@@ -2222,6 +2222,58 @@ fn channel_id(label: &str, value: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
+/// Conversations that live outside the desktop app — a paired phone's chat, a
+/// messaging conversation the agent is answering — so the session list can
+/// show them next to this machine's own sessions.
+///
+/// `environment` is optional and validated as a token rather than an id: it is
+/// a fixed vocabulary (`remote_control`, `channel`, `channel:<provider>`) the
+/// CLI itself refuses anything outside of.
+#[tauri::command]
+pub async fn conversations_list(environment: Option<String>, limit: u32) -> Result<Value, String> {
+    let mut args = vec!["conversations".into(), "list".into()];
+    if let Some(environment) = environment {
+        validate_token("environment", &environment, 64)?;
+        if environment.starts_with('-') {
+            return Err("Invalid environment".to_string());
+        }
+        args.push("--environment".into());
+        args.push(environment);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 500).to_string());
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// One outside conversation's transcript, oldest first.
+#[tauri::command]
+pub async fn conversations_show(
+    environment: String,
+    id: String,
+    limit: u32,
+) -> Result<Value, String> {
+    validate_token("environment", &environment, 64)?;
+    let id = channel_id("conversation id", &id)?;
+    if environment.starts_with('-') {
+        return Err("Invalid environment".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "conversations".into(),
+            "show".into(),
+            "--environment".into(),
+            environment,
+            "--id".into(),
+            id,
+            "--limit".into(),
+            limit.clamp(1, 2_000).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
 #[tauri::command]
 pub async fn channels_list() -> Result<Value, String> {
     parse_json(&command(vec!["channels".into(), "list".into(), "--json".into()]).await?)
