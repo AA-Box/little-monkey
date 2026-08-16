@@ -39,6 +39,7 @@ const ACCOUNT: ChannelAccount = {
   last_probe_at_ms: 0,
   non_secret_config: {},
   created_at_ms: 0,
+  callback_rejections: { count: 0, last_reason: null, last_at_ms: null },
   updated_at_ms: 0,
 };
 

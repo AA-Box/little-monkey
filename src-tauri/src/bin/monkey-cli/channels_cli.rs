@@ -288,6 +288,20 @@ fn now_ms() -> i64 {
 /// JSON view of an account. Deliberately not the storage struct: this one can
 /// never grow a secret field, because it has nowhere to put one.
 fn account_json(account: &ChannelAccountRecord) -> serde_json::Value {
+    account_json_with(account, Default::default())
+}
+
+/// The same view, plus the refusal tally the store holds separately.
+///
+/// Split so `list` can read the tally once per account without every other
+/// caller having to. A provider whose deliveries stopped authenticating has no
+/// other symptom — messages simply stop — so this is the one number that turns
+/// a rotated secret from a mystery into a sentence, and the panel shows it the
+/// way the telephony panel shows the same thing for a carrier.
+fn account_json_with(
+    account: &ChannelAccountRecord,
+    rejections: crate::daemon::telecom_store::CallbackRejections,
+) -> serde_json::Value {
     serde_json::json!({
         "account_id": account.account_id,
         "kind": account.kind.as_str(),
@@ -303,13 +317,28 @@ fn account_json(account: &ChannelAccountRecord) -> serde_json::Value {
         "non_secret_config": account.non_secret_config,
         "created_at_ms": account.created_at_ms,
         "updated_at_ms": account.updated_at_ms,
+        "callback_rejections": {
+            "count": rejections.count,
+            // The verifier's own reason code, never a body or a header.
+            "last_reason": rejections.last_reason,
+            "last_at_ms": rejections.last_at_ms,
+        },
     })
 }
 
 pub fn list(json: bool) -> Result<(), String> {
-    let accounts = store()?.channel_accounts()?;
+    let store = store()?;
+    let accounts = store.channel_accounts()?;
     if json {
-        let rows: Vec<serde_json::Value> = accounts.iter().map(account_json).collect();
+        let rows: Vec<serde_json::Value> = accounts
+            .iter()
+            .map(|account| {
+                let rejections = store
+                    .channel_callback_rejections(&account.account_id)
+                    .unwrap_or_default();
+                account_json_with(account, rejections)
+            })
+            .collect();
         println!("{}", serde_json::json!({ "accounts": rows }));
         return Ok(());
     }
