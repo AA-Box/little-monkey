@@ -55,11 +55,17 @@ pub(crate) struct PeerContext<'a> {
     pub revoked: bool,
     /// This installation's own instance id, for the loop check.
     pub local_instance_id: &'a str,
-    /// The content store an artifact reference must already resolve in.
+    /// The content store an admitted artifact's bytes are read back from.
     ///
     /// Present rather than optional because the check it enables is
-    /// fail-closed: an envelope naming content this node was never handed is
+    /// fail-closed: an envelope naming content this node cannot verify is
     /// refused, so a run never sees an attachment nobody can read.
+    ///
+    /// It is deliberately *not* the authorization: this store is shared with
+    /// every other artifact on the machine, so "the digest resolves here" would
+    /// let a peer reference a local blob it never sent, or one another peer
+    /// sent. The durable receipt decides that, and this store only proves the
+    /// admitted bytes are still there and still hash to what was admitted.
     pub artifacts: &'a ArtifactStore,
 }
 
@@ -170,26 +176,17 @@ pub(crate) fn accept_peer_envelope(
             );
         }
     }
-    // Content is handed over before it is referenced. Checking here — after the
-    // artifact grant, before anything runs — means a peer cannot make this node
-    // queue a turn that carries an attachment it will never be able to open,
-    // and cannot use a reference to probe for content it did not send.
-    for artifact in &envelope.artifacts {
-        if !context
-            .artifacts
-            .exists(&artifact.artifact_id)
-            .unwrap_or(false)
-        {
-            return reject(
-                store,
-                thread.thread_id,
-                message_row_id,
-                PeerRejection::ArtifactUnavailable,
-            );
-        }
-    }
+    // Content is handed over before it is referenced, *by this peer*. Checking
+    // here — after the artifact grant, before anything runs — means a peer
+    // cannot make this node queue a turn carrying an attachment it will never
+    // be able to open, cannot use a reference to probe the shared content store
+    // for blobs it did not send, and cannot reach another peer's uploads.
+    let admitted = match admit_artifacts(store, context, envelope, now_ms)? {
+        Ok(admitted) => admitted,
+        Err(reason) => return reject(store, thread.thread_id, message_row_id, reason),
+    };
 
-    let ingress = ingress_for(envelope, context.device_id, &thread.session_key);
+    let ingress = ingress_for(envelope, context.device_id, &thread.session_key, &admitted);
     let params = vec![format!(
         "{MESSAGE_PARAM}={}",
         channel_ingress::message_param(
@@ -261,7 +258,74 @@ fn device_capability(capability: PeerCapability) -> DeviceCapability {
     }
 }
 
-fn ingress_for(envelope: &PeerEnvelope, device_id: &str, session_key: &str) -> ConversationIngress {
+/// Resolve every artifact an envelope names to the admission that authorizes it.
+///
+/// The whole security question of a peer attachment lives here, and it is not
+/// "do these bytes exist". A SHA-256 is an integrity value: it is derivable from
+/// content, it travels in the open, and it identifies a blob in a store shared
+/// with every run, channel attachment and local import on this machine. Treating
+/// its presence as permission would mean a peer that learned one digest could
+/// have that blob attached to a turn its own words wrote — and would mean any
+/// paired peer could name any other paired peer's upload.
+///
+/// So the question asked is "did *this* pairing hand these bytes over, recently,
+/// and are they still the bytes it handed over":
+///
+/// - a live receipt for `(authenticated peer, artifact id)` must exist,
+/// - its digest must be the one the envelope declares,
+/// - its size must be the one the envelope declares, when the envelope declares
+///   one at all,
+/// - and the blob must still read back and verify against its own digest.
+///
+/// The verifying read comes last, after every cheap check has passed, so an
+/// unauthorized reference never costs a hash of up to 32 MiB.
+///
+/// Returns the receipts, in envelope order — the attachment metadata is built
+/// from them rather than from the envelope, so the sender describes its content
+/// once, at upload, and cannot describe it differently afterwards.
+type ArtifactAdmission = Result<Vec<super::peer_store::PeerArtifactReceipt>, PeerRejection>;
+
+fn admit_artifacts(
+    store: &DaemonStore,
+    context: &PeerContext<'_>,
+    envelope: &PeerEnvelope,
+    now_ms: i64,
+) -> Result<ArtifactAdmission, String> {
+    let mut admitted = Vec::with_capacity(envelope.artifacts.len());
+    for artifact in &envelope.artifacts {
+        let Some(receipt) =
+            store.peer_artifact_receipt(context.device_id, &artifact.artifact_id, now_ms)?
+        else {
+            return Ok(Err(PeerRejection::ArtifactUnavailable));
+        };
+        if receipt.sha256 != artifact.sha256.to_ascii_lowercase() {
+            return Ok(Err(PeerRejection::ArtifactUnavailable));
+        }
+        if artifact
+            .size_bytes
+            .is_some_and(|declared| declared != receipt.size_bytes)
+        {
+            return Ok(Err(PeerRejection::ArtifactUnavailable));
+        }
+        // `read` re-hashes and refuses a mismatch, so this proves the admitted
+        // bytes are still on disk and still the admitted bytes. The value is
+        // dropped immediately: only the fact of verification is wanted, and the
+        // run reads the blob itself when it opens the attachment.
+        match context.artifacts.read(&artifact.artifact_id) {
+            Ok(bytes) if bytes.len() as u64 == receipt.size_bytes => {}
+            _ => return Ok(Err(PeerRejection::ArtifactUnavailable)),
+        }
+        admitted.push(receipt);
+    }
+    Ok(Ok(admitted))
+}
+
+fn ingress_for(
+    envelope: &PeerEnvelope,
+    device_id: &str,
+    session_key: &str,
+    admitted: &[super::peer_store::PeerArtifactReceipt],
+) -> ConversationIngress {
     let mut ingress = ConversationIngress::direct(
         ConversationSource::Peer,
         device_id,
@@ -271,23 +335,26 @@ fn ingress_for(envelope: &PeerEnvelope, device_id: &str, session_key: &str) -> C
         RouteTarget::new(PEER_TASK_RECIPE),
         envelope.created_at_ms,
     );
-    ingress.attachments = envelope
-        .artifacts
+    // Built from the receipts, never from the envelope. The envelope's filename
+    // and media type are the sender describing bytes it already described when
+    // it uploaded them; taking the second description would let a peer hand over
+    // `build.log` and present the same content as `secrets.env`.
+    ingress.attachments = admitted
         .iter()
-        .map(|artifact| ChannelAttachment {
-            provider_id: Some(artifact.artifact_id.clone()),
+        .map(|receipt| ChannelAttachment {
+            provider_id: Some(receipt.artifact_id.clone()),
             kind: AttachmentKind::Other,
-            filename: artifact.filename.clone(),
-            mime_type: artifact.media_type.clone(),
-            declared_size_bytes: artifact.size_bytes,
+            filename: receipt.filename.clone(),
+            mime_type: receipt.media_type.clone(),
+            declared_size_bytes: Some(receipt.size_bytes),
             // A handle, not a URL: nothing here can name a path on this
             // machine, and there is nothing left to fetch — the sender handed
             // the bytes over before it referenced them, so the content store
             // already holds them under `stored_artifact_id`.
             source: AttachmentSource::ProviderHandle {
-                handle: format!("peer:{device_id}:{}", artifact.artifact_id),
+                handle: format!("peer:{device_id}:{}", receipt.artifact_id),
             },
-            stored_artifact_id: Some(artifact.artifact_id.clone()),
+            stored_artifact_id: Some(receipt.artifact_id.clone()),
             fetch_error: None,
             text_excerpt: None,
         })
@@ -492,21 +559,52 @@ mod tests {
         assert!(queue.submitted.lock().unwrap().is_empty());
     }
 
+    /// Store the bytes and record the admission the upload route would, so a
+    /// test starts from the state a completed `POST /peer/artifacts` leaves.
+    fn upload(
+        store: &mut DaemonStore,
+        blobs: &ArtifactStore,
+        device_id: &str,
+        bytes: &[u8],
+        filename: Option<&str>,
+        media_type: Option<&str>,
+    ) -> (String, u64) {
+        let blob = blobs.put(bytes).expect("store bytes");
+        store
+            .record_peer_artifact_receipt(
+                device_id, &blob.id, &blob.id, blob.size, filename, media_type, NOW,
+            )
+            .expect("admit");
+        (blob.id, blob.size)
+    }
+
+    fn referencing(message_id: &str, artifact_id: &str, size: Option<u64>) -> PeerEnvelope {
+        let mut envelope = envelope(message_id, PeerMessageKind::Message);
+        envelope.artifacts.push(PeerArtifactRef {
+            artifact_id: artifact_id.to_string(),
+            sha256: artifact_id.to_string(),
+            filename: Some("build.log".into()),
+            media_type: Some("text/plain".into()),
+            size_bytes: size,
+        });
+        envelope
+    }
+
     #[test]
     fn attaching_an_artifact_needs_its_own_grant() {
         let mut store = DaemonStore::open_in_memory().expect("open");
         let queue = FakeQueue::default();
         let (_blob_dir, blobs) = artifacts();
         // The sender handed the bytes over first, so the reference resolves.
-        let blob = blobs.put(b"build failed at step 4").expect("store bytes");
-        let mut with_file = envelope("msg-1", PeerMessageKind::Message);
-        with_file.artifacts.push(PeerArtifactRef {
-            artifact_id: blob.id.clone(),
-            sha256: blob.id.clone(),
-            filename: Some("build.log".into()),
-            media_type: Some("text/plain".into()),
-            size_bytes: Some(blob.size),
-        });
+        let (artifact_id, size) = upload(
+            &mut store,
+            &blobs,
+            "device-1",
+            b"build failed at step 4",
+            Some("build.log"),
+            Some("text/plain"),
+        );
+        let with_file = referencing("msg-1", &artifact_id, Some(size));
 
         let grants = BTreeSet::from([DeviceCapability::PeerMessage]);
         let refused = accept_peer_envelope(
@@ -537,14 +635,232 @@ mod tests {
         assert_eq!(
             attachment.source,
             AttachmentSource::ProviderHandle {
-                handle: format!("peer:device-1:{}", blob.id)
+                handle: format!("peer:device-1:{artifact_id}")
             }
         );
         assert_eq!(
             attachment.stored_artifact_id.as_deref(),
-            Some(blob.id.as_str())
+            Some(artifact_id.as_str())
         );
         assert_eq!(attachment.filename.as_deref(), Some("build.log"));
+    }
+
+    /// The one that the shared content store cannot answer on its own.
+    ///
+    /// The blob is present and its digest is correct — it belongs to something
+    /// else on this machine. A peer that guessed or learned that digest must
+    /// still be refused, because existence is not admission.
+    #[test]
+    fn a_local_blob_this_peer_never_uploaded_is_not_referenceable() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        // Local content: a run's output, an operator's import — nobody's upload.
+        let local = blobs.put(b"the operator's own notes").expect("store bytes");
+
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &referencing("msg-1", &local.id, Some(local.size)),
+            &context(&grants, &blobs),
+            NOW,
+        )
+        .expect("decide");
+
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+        assert!(queue.submitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_peer_cannot_reference_what_another_peer_uploaded() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let (artifact_id, size) = upload(
+            &mut store,
+            &blobs,
+            "device-1",
+            b"alice's build log",
+            Some("build.log"),
+            None,
+        );
+
+        let mut other = context(&grants, &blobs);
+        other.device_id = "device-2";
+        let mut theirs = referencing("msg-1", &artifact_id, Some(size));
+        theirs.sender_instance_id = "instance-second".into();
+        theirs.origin_chain = vec!["instance-second".into()];
+        let refused =
+            accept_peer_envelope(&mut store, &queue, &theirs, &other, NOW).expect("decide");
+
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+        // And the peer that did upload it is still able to reference it.
+        assert!(matches!(
+            accept_peer_envelope(
+                &mut store,
+                &queue,
+                &referencing("msg-2", &artifact_id, Some(size)),
+                &context(&grants, &blobs),
+                NOW,
+            )
+            .expect("decide"),
+            PeerAcceptance::Accepted { .. }
+        ));
+    }
+
+    /// What the receiver validated at upload time is what the run is told.
+    #[test]
+    fn an_envelope_cannot_rename_content_it_already_handed_over() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let (artifact_id, size) = upload(
+            &mut store,
+            &blobs,
+            "device-1",
+            b"build failed at step 4",
+            Some("build.log"),
+            Some("text/plain"),
+        );
+
+        // A size that disagrees with what was admitted is a refusal outright:
+        // there is no reading of it that is not a lie about the same bytes.
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &referencing("msg-1", &artifact_id, Some(size + 1)),
+            &context(&grants, &blobs),
+            NOW,
+        )
+        .expect("decide");
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+
+        // A different filename is simply not read: the attachment is built from
+        // the receipt, so the run sees what the upload declared.
+        let mut renamed = referencing("msg-2", &artifact_id, None);
+        renamed.artifacts[0].filename = Some("secrets.env".into());
+        renamed.artifacts[0].media_type = Some("application/x-envfile".into());
+        accept_peer_envelope(&mut store, &queue, &renamed, &context(&grants, &blobs), NOW)
+            .expect("accept");
+
+        let submitted = queue.submitted.lock().unwrap();
+        let attachment = &submitted[0].0.attachments[0];
+        assert_eq!(attachment.filename.as_deref(), Some("build.log"));
+        assert_eq!(attachment.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(attachment.declared_size_bytes, Some(size));
+    }
+
+    #[test]
+    fn a_digest_that_disagrees_with_the_admission_is_refused() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let (artifact_id, size) = upload(&mut store, &blobs, "device-1", b"log", None, None);
+
+        let mut forged = referencing("msg-1", &artifact_id, Some(size));
+        forged.artifacts[0].sha256 = "f".repeat(64);
+        let refused =
+            accept_peer_envelope(&mut store, &queue, &forged, &context(&grants, &blobs), NOW)
+                .expect("decide");
+
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_admission_that_has_expired_no_longer_authorizes_a_reference() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let (artifact_id, size) = upload(&mut store, &blobs, "device-1", b"stale log", None, None);
+        let expired_at = NOW + super::super::peer_store::PEER_ARTIFACT_ADMISSION_TTL_MS;
+
+        let mut late = referencing("msg-1", &artifact_id, Some(size));
+        late.created_at_ms = expired_at;
+        late.expires_at_ms = expired_at + 60_000;
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &late,
+            &context(&grants, &blobs),
+            expired_at,
+        )
+        .expect("decide");
+
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+        assert!(queue.submitted.lock().unwrap().is_empty());
+    }
+
+    /// Clearing a peer withdraws the standing its uploads bought it.
+    #[test]
+    fn clearing_a_peer_means_it_has_to_upload_again_before_referencing() {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let queue = FakeQueue::default();
+        let grants = all_grants();
+        let (_blob_dir, blobs) = artifacts();
+        let (artifact_id, size) = upload(&mut store, &blobs, "device-1", b"build log", None, None);
+        accept_peer_envelope(
+            &mut store,
+            &queue,
+            &referencing("msg-1", &artifact_id, Some(size)),
+            &context(&grants, &blobs),
+            NOW,
+        )
+        .expect("accept");
+
+        store.delete_peer_traffic("device-1").expect("clear");
+
+        let refused = accept_peer_envelope(
+            &mut store,
+            &queue,
+            &referencing("msg-2", &artifact_id, Some(size)),
+            &context(&grants, &blobs),
+            NOW + 1,
+        )
+        .expect("decide");
+        assert!(matches!(
+            refused,
+            PeerAcceptance::Rejected {
+                reason: PeerRejection::ArtifactUnavailable,
+                ..
+            }
+        ));
+        // The blob is still there; it may belong to something else entirely.
+        assert!(blobs.exists(&artifact_id).unwrap());
     }
 
     #[test]

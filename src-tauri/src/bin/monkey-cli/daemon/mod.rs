@@ -30,6 +30,7 @@ pub(crate) mod peer_audit;
 #[cfg(test)]
 mod peer_e2e;
 pub(crate) mod peer_ingress;
+mod peer_live;
 pub(crate) mod peer_store;
 pub(crate) mod peer_tool;
 pub(crate) mod remote;

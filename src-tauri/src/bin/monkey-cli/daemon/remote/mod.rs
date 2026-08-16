@@ -18,6 +18,11 @@ pub(crate) mod voice;
 pub(crate) mod watch;
 mod web;
 
+/// The bound-listener entry point the opt-in peer live-validation test serves
+/// through. Test-only so the module itself stays private.
+#[cfg(test)]
+pub(crate) use server::serve_listener_for_test;
+
 pub use desktop::DesktopControlRuntime;
 
 use std::collections::BTreeSet;
