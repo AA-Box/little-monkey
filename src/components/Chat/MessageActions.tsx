@@ -20,31 +20,43 @@ const ACTION_CLASSES =
  * bubble, which these buttons deliberately no longer set (two tooltips for
  * one icon reads as a bug).
  *
+ * `hint` adds a second line explaining what the action actually does — for
+ * the controls whose consequence an icon and a two-word label can't carry
+ * (interrupting a turn, editing a message and losing what followed it). The
+ * bubble wraps to a fixed width once it has one; without a hint it stays the
+ * single nowrap line it has always been.
+ *
  * Exported because every icon-only control in a message's footer needs it,
  * not only the ones this file owns — `MessageBubble.tsx`'s translate, edit,
  * and side-task buttons sit in the same row and would otherwise be the only
  * ones falling back to `title`. Wrap the button in
  * `<span className="group/action relative">` for the hover/focus target.
  */
-export function Tooltip({ text }: { text: string }) {
+export function Tooltip({ text, hint }: { text: string; hint?: string }) {
   return (
     <span
       role="tooltip"
-      className="pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 hidden -translate-x-1/2 whitespace-nowrap rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground shadow-lg group-hover/action:block group-focus-within/action:block"
+      className={`pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 hidden -translate-x-1/2 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground shadow-lg group-hover/action:block group-focus-within/action:block ${
+        hint ? "w-max max-w-[15rem] text-left" : "whitespace-nowrap"
+      }`}
     >
       {text}
+      {hint && <span className="mt-0.5 block text-faint">{hint}</span>}
     </span>
   );
 }
 
 function ActionButton({
   label,
+  hint,
   pressed,
   onClick,
   children,
 }: {
   /** Names the action — both the tooltip's text and the button's a11y name. */
   label: string;
+  /** Optional sentence explaining the action's effect, shown under `label`. */
+  hint?: string;
   /** Toggle state for the actions that have one (pinned, speaking); omitted
    * for the plain ones, which then expose no `aria-pressed` at all. */
   pressed?: boolean;
@@ -62,7 +74,7 @@ function ActionButton({
       >
         {children}
       </button>
-      <Tooltip text={label} />
+      <Tooltip text={label} hint={hint} />
     </span>
   );
 }
@@ -157,6 +169,7 @@ export default function MessageActions({
       {onToggleChapter && (
         <ActionButton
           label={pinLabel}
+          hint={t("MessageBubble.pinChapterHint")}
           pressed={pinned}
           onClick={() => onToggleChapter(pinned ? undefined : chapterTitle(text))}
         >
