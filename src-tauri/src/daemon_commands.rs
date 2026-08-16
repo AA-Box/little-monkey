@@ -6,6 +6,7 @@
 //! engine/ledger owner.
 
 use rusqlite::{params, TransactionBehavior};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -300,6 +301,11 @@ pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
 }
 
 fn parse_json(output: &str) -> Result<Value, String> {
+    serde_json::from_str(output.trim())
+        .map_err(|error| format!("Invalid daemon JSON output: {error}"))
+}
+
+fn parse_typed_json<T: DeserializeOwned>(output: &str) -> Result<T, String> {
     serde_json::from_str(output.trim())
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
 }
@@ -2197,6 +2203,175 @@ mod tests {
         assert_eq!(manual_enabled, 1);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// The peer bridge, held against a real `monkey peers list --json` payload
+    /// rather than a round trip of these structs' own output.
+    ///
+    /// A round trip would pass with any spelling, including one no CLI has ever
+    /// emitted and no `peersClient.ts` has ever read. What matters is that the
+    /// exact bytes the CLI prints decode here with every field populated, and
+    /// that what goes back out carries the same names the panel indexes by —
+    /// because a silent rename does not fail anywhere, it just renders blank.
+    #[test]
+    fn the_peer_bridge_decodes_the_cli_and_re_emits_what_the_panel_reads() {
+        let payload = r#"{
+            "inbound": [{
+                "device_id": "device-1",
+                "label": "Studio desktop",
+                "grants": ["message"],
+                "advertised_grants": ["message", "task", "artifact"],
+                "requested_grants": ["task"],
+                "state": "active",
+                "peer_only": true,
+                "last_sequence": 4,
+                "last_seen_at_ms": 1700000000000,
+                "presence": "online",
+                "secret_generation": 2
+            }],
+            "outbound": [{
+                "alias": "studio",
+                "peer_id": "runner-two",
+                "peer_url": "https://studio.invalid",
+                "grants": ["message", "task"],
+                "advertised_grants": ["message", "task", "artifact"],
+                "requested_grants": [],
+                "certificate_sha256": "ab",
+                "last_seen_at_ms": null,
+                "presence": "unknown",
+                "secret_generation": 1
+            }]
+        }"#;
+
+        let listed: PeerListResponse = parse_typed_json(payload).expect("decode the CLI payload");
+        let inbound = &listed.inbound[0];
+        assert_eq!(inbound.grants, vec![PeerGrantView::Message]);
+        // What it asked for is decoded, and is not what it holds.
+        assert_eq!(inbound.requested_grants, vec![PeerGrantView::Task]);
+        assert_eq!(inbound.presence, PeerPresenceView::Online);
+        assert_eq!(inbound.state, PeerPairingStateView::Active);
+        assert_eq!(inbound.last_seen_at_ms, Some(1_700_000_000_000));
+        assert_eq!(inbound.secret_generation, 2);
+        let outbound = &listed.outbound[0];
+        assert_eq!(outbound.presence, PeerPresenceView::Unknown);
+        assert_eq!(outbound.last_seen_at_ms, None);
+
+        // Back out under the names `peersClient.ts` declares. These views are
+        // snake_case in *both* directions, unlike the camelCase responses
+        // elsewhere in this file — see the comment above `PeerGrantView`.
+        let value = serde_json::to_value(&listed).unwrap();
+        for field in [
+            "device_id",
+            "advertised_grants",
+            "requested_grants",
+            "peer_only",
+            "last_seen_at_ms",
+            "secret_generation",
+            "presence",
+        ] {
+            assert!(
+                value["inbound"][0].get(field).is_some(),
+                "the panel reads `{field}` and the bridge did not emit it"
+            );
+        }
+        assert!(value["inbound"][0].get("deviceId").is_none());
+        assert_eq!(value["inbound"][0]["presence"], "online");
+        assert_eq!(value["inbound"][0]["requested_grants"][0], "task");
+
+        // An older CLI that has not learned the newer fields still decodes, so
+        // a mid-upgrade desktop shows a peer rather than an error.
+        let older: PeerListResponse = parse_typed_json(
+            r#"{"inbound":[{"device_id":"d","label":"l","grants":[],"state":"revoked",
+                 "peer_only":true,"last_sequence":0,"last_seen_at_ms":null,
+                 "presence":"unknown","secret_generation":1}],"outbound":[]}"#,
+        )
+        .expect("decode without the advertisement fields");
+        assert!(older.inbound[0].advertised_grants.is_empty());
+        assert_eq!(older.inbound[0].state, PeerPairingStateView::Revoked);
+    }
+
+    /// Every other peer command's response, same rule.
+    #[test]
+    fn each_peer_command_decodes_the_shape_its_cli_prints() {
+        let threads: PeerThreadsResponse = parse_typed_json(
+            r#"{"threads":[{"thread_id":"thread-1","peer_device_id":"device-1",
+                 "peer_instance_id":"instance-remote","session_key":"peer:device-1:thread-1",
+                 "created_at_ms":1,"last_activity_at_ms":2,"message_count":1,
+                 "recent":[{"message_id":"msg-1","direction":"inbound","kind":"task_request",
+                 "disposition":"rejected","rejection":"missing_capability","job_id":null,
+                 "correlation_id":"corr-1","created_at_ms":1}]}],"recipe":"peer-task"}"#,
+        )
+        .expect("threads");
+        assert_eq!(threads.recipe, "peer-task");
+        let message = &threads.threads[0].recent[0];
+        assert_eq!(message.disposition, PeerMessageDispositionView::Rejected);
+        assert_eq!(message.direction, PeerMessageDirectionView::Inbound);
+        assert_eq!(message.correlation_id.as_deref(), Some("corr-1"));
+
+        let rotated: PeerRotationResponse = parse_typed_json(
+            r#"{"device_id":"device-1","secret_generation":3,"output":"/tmp/rot.json"}"#,
+        )
+        .expect("rotation");
+        assert_eq!(rotated.secret_generation, 3);
+
+        let accepted: PeerRotationAcceptedResponse = parse_typed_json(
+            r#"{"alias":"studio","secret_generation":3,"certificate_sha256":"ab"}"#,
+        )
+        .expect("rotation accepted");
+        assert_eq!(accepted.alias, "studio");
+
+        let cleared: PeerClearResponse = parse_typed_json(
+            r#"{"device_id":"device-1","threads_removed":2,"grants_cleared":true}"#,
+        )
+        .expect("clear");
+        assert_eq!(cleared.threads_removed, 2);
+        assert!(cleared.grants_cleared);
+
+        // `peers status --json` carries more than the desktop reads. Extra
+        // fields must not break the decode, or adding one to the CLI would
+        // break the app.
+        let status: PeerStatusResponse = parse_typed_json(
+            r#"{"alias":"studio","peer_id":"runner-two","last_seen_at_ms":5,
+                "presence":"online","advertised_grants":["message"],"granted":["message"]}"#,
+        )
+        .expect("status");
+        assert_eq!(status.presence, PeerPresenceView::Online);
+        assert_eq!(status.last_seen_at_ms, Some(5));
+
+        let invited: PeerInvitationResponse = parse_typed_json(
+            r#"{"pairing_id":"pair-1","expires_at_ms":9,"grants":["message"],
+                "output":"/tmp/invite.json"}"#,
+        )
+        .expect("invitation");
+        assert_eq!(invited.grants, vec![PeerGrantView::Message]);
+
+        let paired: PeerAcceptedResponse = parse_typed_json(
+            r#"{"alias":"studio","peer_id":"runner-two","peer_url":"https://studio.invalid",
+                "grants":["message","task"],"certificate_sha256":"ab"}"#,
+        )
+        .expect("accepted");
+        assert_eq!(paired.grants.len(), 2);
+
+        let granted: PeerGrantResponse =
+            parse_typed_json(r#"{"device_id":"device-1","grants":["message","artifact"]}"#)
+                .expect("grant");
+        assert_eq!(
+            granted.grants,
+            vec![PeerGrantView::Message, PeerGrantView::Artifact]
+        );
+    }
+
+    /// A grant the peer surface must never hand out is refused at the bridge,
+    /// before an argument is built.
+    #[test]
+    fn the_peer_bridge_refuses_a_grant_that_is_not_a_peer_grant() {
+        assert!(peer_grants(&["message".into(), "task".into()]).is_ok());
+        for forbidden in ["admin", "place_runs", "view_runs", "control_desktop", ""] {
+            assert!(
+                peer_grants(&[forbidden.to_string()]).is_err(),
+                "'{forbidden}' must not be spellable as a peer grant"
+            );
+        }
+    }
 }
 
 // --- Messaging channels ---------------------------------------------------
@@ -2583,6 +2758,187 @@ pub async fn channels_set_credential(account_id: String, secret: String) -> Resu
 // file the operator chooses and moved out of band, exactly as a controller
 // pairing already is.
 
+// --- Peers -----------------------------------------------------------------
+//
+// Every view below is **snake_case in both directions**, unlike the camelCase
+// responses elsewhere in this file. That is deliberate and load-bearing: these
+// types decode `monkey peers … --json`, which emits snake_case, and they are
+// also what `peersClient.ts` reads. Making the two spellings the same means the
+// typed bridge is a validating pass-through — a field the CLI renames fails to
+// decode here rather than reaching the UI as `undefined`.
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerGrantView {
+    Message,
+    Task,
+    Artifact,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerPresenceView {
+    Online,
+    Offline,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerPairingStateView {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InboundPeerView {
+    pub device_id: String,
+    pub label: String,
+    pub grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub advertised_grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub requested_grants: Vec<PeerGrantView>,
+    pub state: PeerPairingStateView,
+    pub peer_only: bool,
+    pub last_sequence: u64,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+    pub secret_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OutboundPeerView {
+    pub alias: String,
+    pub peer_id: String,
+    pub peer_url: String,
+    pub grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub advertised_grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub requested_grants: Vec<PeerGrantView>,
+    pub certificate_sha256: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+    pub secret_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerListResponse {
+    pub inbound: Vec<InboundPeerView>,
+    pub outbound: Vec<OutboundPeerView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerInvitationResponse {
+    pub pairing_id: String,
+    pub expires_at_ms: u64,
+    pub grants: Vec<PeerGrantView>,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerAcceptedResponse {
+    pub alias: String,
+    pub peer_id: String,
+    pub peer_url: String,
+    pub grants: Vec<PeerGrantView>,
+    pub certificate_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerGrantResponse {
+    pub device_id: String,
+    pub grants: Vec<PeerGrantView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerMessageDirectionView {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerMessageDispositionView {
+    Accepted,
+    Rejected,
+    Delivered,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadMessageView {
+    pub message_id: String,
+    pub direction: PeerMessageDirectionView,
+    pub kind: String,
+    pub disposition: PeerMessageDispositionView,
+    pub rejection: Option<String>,
+    pub job_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadView {
+    pub thread_id: String,
+    pub peer_device_id: String,
+    pub peer_instance_id: String,
+    pub session_key: String,
+    pub created_at_ms: i64,
+    pub last_activity_at_ms: i64,
+    pub message_count: usize,
+    pub recent: Vec<PeerThreadMessageView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadsResponse {
+    pub threads: Vec<PeerThreadView>,
+    pub recipe: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerRotationResponse {
+    pub device_id: String,
+    pub secret_generation: u64,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerRotationAcceptedResponse {
+    pub alias: String,
+    pub secret_generation: u64,
+    pub certificate_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerClearResponse {
+    pub device_id: String,
+    pub threads_removed: u32,
+    pub grants_cleared: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerStatusResponse {
+    pub alias: String,
+    pub peer_id: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+}
+
 /// Peer grants an operator may hand out, spelled once.
 fn peer_grants(allow: &[String]) -> Result<String, String> {
     let mut tokens = Vec::new();
@@ -2596,8 +2952,8 @@ fn peer_grants(allow: &[String]) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn peers_list() -> Result<Value, String> {
-    parse_json(&command(vec!["peers".into(), "list".into(), "--json".into()]).await?)
+pub async fn peers_list() -> Result<PeerListResponse, String> {
+    parse_typed_json(&command(vec!["peers".into(), "list".into(), "--json".into()]).await?)
 }
 
 /// Offer another installation peer standing on this one. The invitation is
@@ -2608,7 +2964,7 @@ pub async fn peers_invite(
     allow: Vec<String>,
     expires_minutes: u64,
     output: String,
-) -> Result<Value, String> {
+) -> Result<PeerInvitationResponse, String> {
     validate_token("peer label", &label, 120)?;
     validate_output_path(&output)?;
     let grants = peer_grants(&allow)?;
@@ -2620,7 +2976,7 @@ pub async fn peers_invite(
     if !(1..=24 * 60).contains(&expires_minutes) {
         return Err("Invitation expiry must be between 1 and 1440 minutes".to_string());
     }
-    parse_json(
+    parse_typed_json(
         &command(vec![
             "peers".into(),
             "invite".into(),
@@ -2639,13 +2995,16 @@ pub async fn peers_invite(
 
 /// Take up another installation's invitation from a file the operator chose.
 #[tauri::command]
-pub async fn peers_accept(invitation: String, alias: String) -> Result<Value, String> {
+pub async fn peers_accept(
+    invitation: String,
+    alias: String,
+) -> Result<PeerAcceptedResponse, String> {
     validate_id("peer alias", &alias)?;
     let path = Path::new(&invitation);
     if !path.is_absolute() || !path.is_file() {
         return Err("Choose the invitation file the other installation gave you".to_string());
     }
-    parse_json(
+    parse_typed_json(
         &command(vec![
             "peers".into(),
             "accept".into(),
@@ -2660,10 +3019,13 @@ pub async fn peers_accept(invitation: String, alias: String) -> Result<Value, St
 /// Replace what one inbound peer may ask for. An empty list leaves it paired
 /// and unable to ask for anything.
 #[tauri::command]
-pub async fn peers_grant(device_id: String, allow: Vec<String>) -> Result<Value, String> {
+pub async fn peers_grant(
+    device_id: String,
+    allow: Vec<String>,
+) -> Result<PeerGrantResponse, String> {
     validate_id("device id", &device_id)?;
     let grants = peer_grants(&allow)?;
-    parse_json(
+    parse_typed_json(
         &command(vec![
             "peers".into(),
             "grant".into(),
@@ -2691,9 +3053,98 @@ pub async fn peers_revoke(device_id: String, reason: String) -> Result<(), Strin
     .map(|_| ())
 }
 
+/// Rotate an inbound peer's HMAC credential. The old key stops working before
+/// the bundle is returned; the bundle contains the replacement once and is
+/// written only to the operator-selected private path.
+#[tauri::command]
+pub async fn peers_rotate(
+    device_id: String,
+    output: String,
+) -> Result<PeerRotationResponse, String> {
+    validate_id("device id", &device_id)?;
+    validate_output_path(&output)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "rotate".into(),
+            device_id,
+            "--output".into(),
+            output,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Import the bundle produced by the peer that rotated this outbound
+/// pairing. The remote store verifies identity and refuses scope expansion.
+#[tauri::command]
+pub async fn peers_accept_rotation(
+    bundle: String,
+    alias: String,
+) -> Result<PeerRotationAcceptedResponse, String> {
+    validate_id("peer alias", &alias)?;
+    validate_existing_private_input("rotation bundle", &bundle)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "accept-rotation".into(),
+            bundle,
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Clear one peer's operational traffic. For a revoked pairing this also
+/// clears the retained peer grants so it leaves the management list; the
+/// immutable remote audit trail remains intact.
+#[tauri::command]
+pub async fn peers_clear(device_id: String) -> Result<PeerClearResponse, String> {
+    validate_id("device id", &device_id)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "clear".into(),
+            device_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Forget an outbound peer profile and remove its current keychain secret.
+#[tauri::command]
+pub async fn peers_forget(alias: String) -> Result<(), String> {
+    validate_id("peer alias", &alias)?;
+    command(vec!["peers".into(), "forget".into(), alias])
+        .await
+        .map(|_| ())
+}
+
+/// Perform a signed, certificate-pinned liveness check against one outbound
+/// peer. The response contains identity and time only.
+#[tauri::command]
+pub async fn peers_status(alias: String) -> Result<PeerStatusResponse, String> {
+    validate_id("peer alias", &alias)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "status".into(),
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
 /// Threads inbound peers opened here, with their recent traffic.
 #[tauri::command]
-pub async fn peers_threads(peer: Option<String>, limit: u32) -> Result<Value, String> {
+pub async fn peers_threads(
+    peer: Option<String>,
+    limit: u32,
+) -> Result<PeerThreadsResponse, String> {
     let mut args = vec!["peers".into(), "threads".into()];
     if let Some(peer) = peer {
         validate_id("device id", &peer)?;
@@ -2703,7 +3154,7 @@ pub async fn peers_threads(peer: Option<String>, limit: u32) -> Result<Value, St
     args.push("--limit".into());
     args.push(limit.clamp(1, 200).to_string());
     args.push("--json".into());
-    parse_json(&command(args).await?)
+    parse_typed_json(&command(args).await?)
 }
 
 // --- Conversation ingress -------------------------------------------------
