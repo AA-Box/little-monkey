@@ -153,6 +153,23 @@ CREATE TABLE IF NOT EXISTS remote_placed_runs (
 CREATE INDEX IF NOT EXISTS remote_placed_runs_device_idx
     ON remote_placed_runs(device_id,created_at_ms DESC);
 
+-- Answering side: what an inbound peer said about itself the last time it
+-- introduced itself, and what it would like to be granted.
+--
+-- Deliberately separate from `remote_device_capabilities`: that table is what
+-- the operator *granted*, this one is what the peer *claims*. Merging them
+-- would let a peer widen its own standing by talking, which is the one thing
+-- this surface must never allow. Nothing here is ever consulted by a gate.
+CREATE TABLE IF NOT EXISTS remote_peer_advertisements (
+    device_id TEXT PRIMARY KEY REFERENCES remote_devices(device_id) ON DELETE CASCADE,
+    -- The peer's own instance id, as it introduced itself. Display and loop
+    -- diagnostics only; identity remains the signed device credential.
+    peer_instance_id TEXT NOT NULL,
+    advertised_json BLOB NOT NULL,
+    requested_json BLOB NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+) STRICT;
+
 -- Asking side: a node this machine may place work on, and the last description
 -- it gave of itself.
 CREATE TABLE IF NOT EXISTS remote_nodes (
@@ -404,7 +421,23 @@ pub struct DeviceRecord {
     pub scopes: RemoteScopes,
     pub capabilities: std::collections::BTreeSet<DeviceCapability>,
     pub last_sequence: u64,
+    /// When this device last made a signed request that got as far as being
+    /// admitted. Advanced by [`RemoteStore::reserve_command`] and nowhere else,
+    /// so a refused signature never looks like contact.
+    pub last_seen_at_ms: Option<u64>,
     pub revoked_at_ms: Option<u64>,
+}
+
+/// What an inbound peer says about itself, as opposed to what it was granted.
+///
+/// Held apart from [`DeviceRecord::capabilities`] on purpose: this is a claim,
+/// and no gate anywhere reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAdvertisement {
+    pub peer_instance_id: String,
+    pub advertised: BTreeSet<DeviceCapability>,
+    pub requested: BTreeSet<DeviceCapability>,
+    pub updated_at_ms: u64,
 }
 
 impl DeviceRecord {
@@ -917,7 +950,8 @@ impl RemoteStore {
                 "SELECT device_id,device_name,secret_generation,scopes_json,
                         last_sequence,revoked_at_ms,
                         (SELECT capabilities_json FROM remote_device_capabilities c
-                          WHERE c.device_id=remote_devices.device_id)
+                          WHERE c.device_id=remote_devices.device_id),
+                        last_seen_at_ms
                  FROM remote_devices WHERE device_id=?1",
                 [device_id],
                 read_device,
@@ -933,7 +967,8 @@ impl RemoteStore {
                 "SELECT device_id,device_name,secret_generation,scopes_json,
                         last_sequence,revoked_at_ms,
                         (SELECT capabilities_json FROM remote_device_capabilities c
-                          WHERE c.device_id=remote_devices.device_id)
+                          WHERE c.device_id=remote_devices.device_id),
+                        last_seen_at_ms
                  FROM remote_devices ORDER BY created_at_ms ASC,device_id ASC",
             )
             .map_err(|error| error.to_string())?;
@@ -942,6 +977,104 @@ impl RemoteStore {
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
+    }
+
+    /// Record what an inbound peer says it supports and would like granted.
+    ///
+    /// A claim, stored next to the pairing and never merged into it: the
+    /// operator reads it on the Peers screen and decides. Overwrites rather
+    /// than accumulating, so a peer that narrows what it advertises is shown
+    /// narrowing it.
+    pub fn record_peer_advertisement(
+        &mut self,
+        device_id: &str,
+        peer_instance_id: &str,
+        advertised: &BTreeSet<DeviceCapability>,
+        requested: &BTreeSet<DeviceCapability>,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        for claimed in [advertised, requested] {
+            if !claimed.is_empty() && !crate::daemon::remote::protocol::is_peer_only(claimed) {
+                return Err("A peer may only advertise peer capabilities".to_string());
+            }
+        }
+        let advertised_json = serde_json::to_vec(advertised).map_err(|e| e.to_string())?;
+        let requested_json = serde_json::to_vec(requested).map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO remote_peer_advertisements(
+                     device_id,peer_instance_id,advertised_json,requested_json,updated_at_ms)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                     peer_instance_id=excluded.peer_instance_id,
+                     advertised_json=excluded.advertised_json,
+                     requested_json=excluded.requested_json,
+                     updated_at_ms=excluded.updated_at_ms",
+                params![
+                    device_id,
+                    peer_instance_id,
+                    advertised_json,
+                    requested_json,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn peer_advertisement(&self, device_id: &str) -> Result<Option<PeerAdvertisement>, String> {
+        self.connection
+            .query_row(
+                "SELECT peer_instance_id,advertised_json,requested_json,updated_at_ms
+                 FROM remote_peer_advertisements WHERE device_id=?1",
+                [device_id],
+                |row| {
+                    let advertised: Vec<u8> = row.get(1)?;
+                    let requested: Vec<u8> = row.get(2)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        advertised,
+                        requested,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|(peer_instance_id, advertised, requested, updated_at_ms)| {
+                Ok(PeerAdvertisement {
+                    peer_instance_id,
+                    advertised: serde_json::from_slice(&advertised)
+                        .map_err(|error| error.to_string())?,
+                    requested: serde_json::from_slice(&requested)
+                        .map_err(|error| error.to_string())?,
+                    updated_at_ms: from_i64(updated_at_ms).map_err(|error| error.to_string())?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Forget an outbound peer entirely: the profile row and the key it used.
+    ///
+    /// The asking side of a pairing has nothing the operator can revoke on the
+    /// far machine — that is the far side's decision — so the honest local
+    /// action is to stop being able to reach it at all.
+    pub fn forget_controller(
+        &mut self,
+        alias: &str,
+        secrets: &dyn RemoteSecretStore,
+    ) -> Result<bool, String> {
+        let Some(profile) = self.controller(alias)? else {
+            return Ok(false);
+        };
+        let removed = self
+            .connection
+            .execute("DELETE FROM remote_controllers WHERE alias=?1", [alias])
+            .map_err(|error| error.to_string())?;
+        // After the row, so a failure to delete leaves a usable pairing rather
+        // than a profile whose key is gone.
+        let _ = secrets.delete(&controller_secret_slot(alias, profile.secret_generation));
+        Ok(removed == 1)
     }
 
     /// Replace one device's peer grants, leaving every other capability alone.
@@ -964,7 +1097,10 @@ impl RemoteStore {
         let mut device = self
             .device(device_id)?
             .ok_or_else(|| format!("Unknown paired device '{device_id}'"))?;
-        if !device.active() {
+        // Taking standing away from a revoked pairing is always allowed —
+        // that is what clears the retained grants Security Doctor reports.
+        // Handing any back is not: a revoked pairing must stay revoked.
+        if !device.active() && !peer_capabilities.is_empty() {
             return Err("This pairing was revoked".to_string());
         }
         let mut capabilities: BTreeSet<DeviceCapability> = if device.capabilities.is_empty() {
@@ -996,13 +1132,33 @@ impl RemoteStore {
                 params![device_id, stored],
             )
             .map_err(|error| error.to_string())?;
-        transaction
-            .execute(
-                "UPDATE remote_devices SET updated_at_ms=?2 WHERE device_id=?1",
-                params![device_id, to_i64(now_ms)?],
-            )
-            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
+        // A grant change is an operator decision worth keeping, and the audit
+        // trail is where every other one already lives. (`remote_devices` has
+        // no `updated_at_ms`; writing one here failed at runtime, which is why
+        // this records the change instead of stamping the row.)
+        self.audit(
+            now_ms,
+            Some(device_id),
+            "peer_grant",
+            Some(
+                &capabilities
+                    .iter()
+                    .filter_map(|capability| {
+                        matches!(
+                            capability,
+                            DeviceCapability::PeerMessage
+                                | DeviceCapability::PeerTaskRequest
+                                | DeviceCapability::PeerArtifact
+                        )
+                        .then(|| capability_token(*capability))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            "applied",
+            None,
+        )?;
         device.capabilities = capabilities;
         Ok(device)
     }
@@ -3025,6 +3181,12 @@ impl RemoteStore {
             capabilities: bundle_capabilities,
             next_sequence: 1,
             event_cursors: old.event_cursors,
+            // A key rotation replaces a credential, not what either side knows
+            // about the other. Carried across so a rotation does not read as a
+            // peer that suddenly went quiet.
+            last_seen_at_ms: old.last_seen_at_ms,
+            peer_advertised: old.peer_advertised,
+            peer_requested: old.peer_requested,
         };
         self.save_controller(&profile, bundle.device_secret.as_bytes(), now_ms, secrets)?;
         let _ = secrets.delete(&controller_secret_slot(alias, old.secret_generation));
@@ -3058,6 +3220,7 @@ fn read_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRecord> {
         capabilities,
         last_sequence: from_i64(row.get(4)?)?,
         revoked_at_ms: row.get::<_, Option<i64>>(5)?.map(from_i64).transpose()?,
+        last_seen_at_ms: row.get::<_, Option<i64>>(7)?.map(from_i64).transpose()?,
     })
 }
 
@@ -3794,6 +3957,218 @@ mod tests {
                 1_301,
             )
             .is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A peer pairing, the shape the peer surface actually creates: empty
+    /// scopes, peer capabilities only.
+    fn peer_scopes() -> RemoteScopes {
+        RemoteScopes {
+            actions: BTreeSet::new(),
+            run_ids: BTreeSet::new(),
+            workspace_ids: BTreeSet::new(),
+            max_artifact_bytes: 1_024,
+        }
+    }
+
+    fn admit_peer(
+        store: &mut RemoteStore,
+        secrets: &FakeSecrets,
+        grants: BTreeSet<DeviceCapability>,
+    ) -> String {
+        let scopes = peer_scopes();
+        let invitation = store
+            .create_invitation_with_capabilities(&scopes, &grants, 1_000, 2_000)
+            .unwrap();
+        store
+            .accept_invitation_with_capabilities(
+                &invitation.pairing_id,
+                &invitation.token,
+                "peer",
+                "runner-one",
+                None,
+                1_100,
+                secrets,
+            )
+            .unwrap()
+            .device_id
+    }
+
+    /// What a peer *claims* is stored beside the pairing and never inside it.
+    /// Anything else would let a peer widen its own standing by talking.
+    #[test]
+    fn a_peer_advertisement_is_recorded_without_touching_what_was_granted() {
+        let (root, mut store, secrets, _) = fixture();
+        let device_id = admit_peer(
+            &mut store,
+            &secrets,
+            BTreeSet::from([DeviceCapability::PeerMessage]),
+        );
+
+        store
+            .record_peer_advertisement(
+                &device_id,
+                "instance-remote",
+                &BTreeSet::from([
+                    DeviceCapability::PeerMessage,
+                    DeviceCapability::PeerTaskRequest,
+                ]),
+                &BTreeSet::from([DeviceCapability::PeerTaskRequest]),
+                1_200,
+            )
+            .unwrap();
+
+        let claim = store.peer_advertisement(&device_id).unwrap().unwrap();
+        assert_eq!(claim.peer_instance_id, "instance-remote");
+        assert_eq!(
+            claim.requested,
+            BTreeSet::from([DeviceCapability::PeerTaskRequest])
+        );
+        // The grant list is exactly what it was.
+        assert_eq!(
+            store.device(&device_id).unwrap().unwrap().capabilities,
+            BTreeSet::from([DeviceCapability::PeerMessage])
+        );
+
+        // Nothing outside the three peer grants can be claimed at all.
+        assert!(store
+            .record_peer_advertisement(
+                &device_id,
+                "instance-remote",
+                &BTreeSet::from([DeviceCapability::Admin]),
+                &BTreeSet::new(),
+                1_300,
+            )
+            .is_err());
+
+        // Re-advertising replaces rather than accumulating, so a peer that
+        // narrows what it offers is shown narrowing it.
+        store
+            .record_peer_advertisement(
+                &device_id,
+                "instance-remote",
+                &BTreeSet::from([DeviceCapability::PeerMessage]),
+                &BTreeSet::new(),
+                1_400,
+            )
+            .unwrap();
+        let claim = store.peer_advertisement(&device_id).unwrap().unwrap();
+        assert_eq!(
+            claim.advertised,
+            BTreeSet::from([DeviceCapability::PeerMessage])
+        );
+        assert!(claim.requested.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Taking standing away from a revoked pairing is always allowed; handing
+    /// any back never is. This is what `peers clear` relies on to drop the
+    /// grants Security Doctor reports as retained.
+    #[test]
+    fn a_revoked_pairing_can_lose_its_grants_but_never_regain_them() {
+        let (root, mut store, secrets, _) = fixture();
+        let device_id = admit_peer(
+            &mut store,
+            &secrets,
+            BTreeSet::from([DeviceCapability::PeerMessage]),
+        );
+        store
+            .revoke_device(&device_id, "operator", 1_200, &secrets, None)
+            .unwrap();
+
+        assert!(store
+            .set_peer_capabilities(
+                &device_id,
+                &BTreeSet::from([DeviceCapability::PeerTaskRequest]),
+                1_300
+            )
+            .is_err());
+
+        let cleared = store
+            .set_peer_capabilities(&device_id, &BTreeSet::new(), 1_400)
+            .unwrap();
+        assert!(cleared.capabilities.is_empty());
+        assert!(!cleared.active());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Granting works at all — it writes an audit row rather than stamping a
+    /// column that does not exist.
+    #[test]
+    fn changing_a_peers_grants_succeeds_and_leaves_an_audit_trail() {
+        let (root, mut store, secrets, _) = fixture();
+        let device_id = admit_peer(
+            &mut store,
+            &secrets,
+            BTreeSet::from([DeviceCapability::PeerMessage]),
+        );
+
+        let updated = store
+            .set_peer_capabilities(
+                &device_id,
+                &BTreeSet::from([
+                    DeviceCapability::PeerMessage,
+                    DeviceCapability::PeerArtifact,
+                ]),
+                1_500,
+            )
+            .unwrap();
+        assert_eq!(
+            updated.capabilities,
+            BTreeSet::from([
+                DeviceCapability::PeerMessage,
+                DeviceCapability::PeerArtifact
+            ])
+        );
+        assert_eq!(
+            store.device(&device_id).unwrap().unwrap().capabilities,
+            updated.capabilities,
+            "the change was durable, not just returned"
+        );
+        let audit = store.audit_entries(10).unwrap();
+        assert!(audit.iter().any(|entry| entry.action == "peer_grant"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Forgetting an outbound peer takes its key with it, and says honestly
+    /// whether there was anything to forget.
+    #[test]
+    fn forgetting_an_outbound_peer_removes_its_profile_and_its_key() {
+        let (root, mut store, secrets, _) = fixture();
+        let profile = ControllerProfile {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            alias: "studio".into(),
+            runner_id: "runner-two".into(),
+            runner_url: "https://studio.invalid".into(),
+            server_certificate_pem: "pem".into(),
+            server_certificate_sha256: "b".repeat(64),
+            device_id: "device-here".into(),
+            secret_generation: 1,
+            scopes: peer_scopes(),
+            capabilities: BTreeSet::from([DeviceCapability::PeerMessage]),
+            next_sequence: 1,
+            event_cursors: Default::default(),
+            last_seen_at_ms: Some(1_700_000_000_000),
+            peer_advertised: BTreeSet::from([DeviceCapability::PeerTaskRequest]),
+            peer_requested: BTreeSet::from([DeviceCapability::PeerArtifact]),
+        };
+        store
+            .save_controller(&profile, b"a peer secret", 1_100, &secrets)
+            .unwrap();
+
+        // The new fields survive the JSON round trip through SQLite.
+        let stored = store.controller("studio").unwrap().unwrap();
+        assert_eq!(stored.last_seen_at_ms, Some(1_700_000_000_000));
+        assert_eq!(
+            stored.peer_advertised,
+            BTreeSet::from([DeviceCapability::PeerTaskRequest])
+        );
+
+        assert!(store.forget_controller("studio", &secrets).unwrap());
+        assert!(store.controller("studio").unwrap().is_none());
+        assert!(secrets.get(&controller_secret_slot("studio", 1)).is_err());
+        // And forgetting something that is already gone is not an error.
+        assert!(!store.forget_controller("studio", &secrets).unwrap());
         let _ = std::fs::remove_dir_all(root);
     }
 }

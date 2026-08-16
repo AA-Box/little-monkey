@@ -965,15 +965,37 @@ async fn execute_tool_call(
         let peer = args["peer"].as_str().unwrap_or_default().to_string();
         let text = args["text"].as_str().unwrap_or_default().to_string();
         let thread = args["thread"].as_str().map(str::to_string);
+        let correlation = args["correlation"].as_str().map(str::to_string);
         let task = args["task"].as_bool().unwrap_or(false);
+        let artifacts: Vec<String> = args["artifacts"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         let preview: String = text.chars().take(120).collect();
-        let summary = format!("{} {peer}: {preview}", if task { "ask" } else { "message" });
+        // The count is in the prompt because handing files over is the part an
+        // operator would want to see before approving, not after.
+        let summary = format!(
+            "{} {peer}: {preview}{}",
+            if task { "ask" } else { "message" },
+            match artifacts.len() {
+                0 => String::new(),
+                1 => " (with 1 artifact)".to_string(),
+                many => format!(" (with {many} artifacts)"),
+            }
+        );
         return match perms.request("peer_message", &summary).await {
             Ok(()) => match crate::daemon::peer_tool::send_peer_message(
                 &peer,
                 &text,
                 thread.as_deref(),
                 task,
+                correlation.as_deref(),
+                &artifacts,
             )
             .await
             {

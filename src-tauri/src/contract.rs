@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.6.0";
+pub const CONTRACT_VERSION: &str = "1.7.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -393,6 +393,23 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         method: "GET",
         path: "/v1/remote/peer/threads/{thread_id}",
         gate: RemoteGate::PeerStanding,
+    },
+    // Liveness and self-description in one call: a peer says who it is and
+    // what it supports, and learns the same plus what it is actually granted.
+    // Nothing it sends here changes what it may do.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/hello",
+        gate: RemoteGate::PeerStanding,
+    },
+    // Content a peer hands over before the envelope that references it. Its
+    // own grant, because handing over bytes is not the same act as speaking.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/artifacts",
+        gate: RemoteGate::Capability("PeerArtifact"),
     },
 ];
 

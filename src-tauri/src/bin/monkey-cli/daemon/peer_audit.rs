@@ -103,7 +103,38 @@ pub(crate) fn audit_peers(paths: &DaemonPaths, now_ms: i64) -> Vec<SecurityFindi
                     peer.device_id
                 ),
                 FindingStatus::Info,
-                Some("No action is required; clear the grants in Settings → Peers to keep the listing honest."),
+                Some("No action is required; use Clear in Settings → Peers to drop the retained grants and keep the listing honest."),
+            ));
+        }
+        // A peer that answers is a peer that exists. One that was paired,
+        // granted, and has never made a single admitted request is either a
+        // pairing that never completed or one the operator forgot about — both
+        // worth saying out loud rather than leaving as a silent row.
+        if peer.active() && peer.last_seen_at_ms.is_none() {
+            findings.push(finding(
+                "peers.never_seen",
+                "A peer holds grants but has never been in touch",
+                format!(
+                    "Pairing {} has made no signed request since it was created.",
+                    peer.device_id
+                ),
+                FindingStatus::Info,
+                Some("Check the far side finished pairing, or revoke it in Settings → Peers."),
+            ));
+        } else if peer.active()
+            && peer.last_seen_at_ms.is_some_and(|seen| {
+                now_ms.saturating_sub(i64::try_from(seen).unwrap_or(i64::MAX)) > STALE_AFTER_MS
+            })
+        {
+            findings.push(finding(
+                "peers.stale_pairing",
+                "A peer has not been in touch for a long time",
+                format!(
+                    "Pairing {} last made a signed request more than sixty days ago and still holds peer grants.",
+                    peer.device_id
+                ),
+                FindingStatus::Warning,
+                Some("Revoke it in Settings → Peers if it is no longer in use."),
             ));
         }
     }
@@ -133,7 +164,8 @@ pub(crate) fn audit_peers(paths: &DaemonPaths, now_ms: i64) -> Vec<SecurityFindi
                 .unwrap_or(thread.last_activity_at_ms)
                 .max(thread.last_activity_at_ms),
         );
-        let Ok(messages) = store.peer_messages(&thread.thread_id, 200) else {
+        let Ok(messages) = store.peer_messages(&thread.peer_device_id, &thread.thread_id, 200)
+        else {
             continue;
         };
         for message in messages {
@@ -179,6 +211,61 @@ pub(crate) fn audit_peers(paths: &DaemonPaths, now_ms: i64) -> Vec<SecurityFindi
             None,
         ));
     }
+    // Refusals that never became a message row: loops, expired envelopes,
+    // malformed shapes. These are the ones worth watching as a *rate*, because
+    // an envelope that fails validation costs the sender nothing to retry.
+    if let Ok(events) = store.peer_rejection_events(500) {
+        let mut loops = 0usize;
+        let mut expired_events = 0usize;
+        let mut malformed = 0usize;
+        for event in &events {
+            match event.reason.as_str() {
+                "origin_loop" | "zero_hops" | "hop_limit_exceeded" | "invalid_origin_chain" => {
+                    loops += 1
+                }
+                "expired" | "created_in_future" | "invalid_timestamp" | "expiry_too_far" => {
+                    expired_events += 1
+                }
+                _ => malformed += 1,
+            }
+        }
+        if loops > 0 {
+            findings.push(finding(
+                "peers.relay_loops",
+                "Peer messages were refused for circulating",
+                format!(
+                    "{loops} envelope(s) were dropped because they had already passed through this installation or had no hops left.",
+                ),
+                if loops >= REJECTION_ALARM {
+                    FindingStatus::Warning
+                } else {
+                    FindingStatus::Info
+                },
+                Some("Two installations forwarding to each other will do this. Check the peer topology in Settings → Peers."),
+            ));
+        }
+        if expired_events >= REJECTION_ALARM {
+            findings.push(finding(
+                "peers.clock_skew",
+                "Peer messages keep arriving outside their validity window",
+                format!(
+                    "{expired_events} envelope(s) were refused for being expired or dated in the future.",
+                ),
+                FindingStatus::Warning,
+                Some("Check the clock on the peer that is sending them; a large skew makes every request fail."),
+            ));
+        }
+        if malformed >= REJECTION_ALARM {
+            findings.push(finding(
+                "peers.malformed_traffic",
+                "An unusual amount of malformed peer traffic was refused",
+                format!("{malformed} envelope(s) were refused before they could be recorded."),
+                FindingStatus::Warning,
+                Some("A paired peer running a different version explains this; anything else is worth investigating in Settings → Peers."),
+            ));
+        }
+    }
+
     if let Some(latest) = newest_activity {
         if now_ms.saturating_sub(latest) > STALE_AFTER_MS {
             findings.push(finding(

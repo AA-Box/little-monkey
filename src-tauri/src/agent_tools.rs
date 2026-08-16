@@ -282,7 +282,16 @@ pub fn peer_message_tool_def(aliases: &[String]) -> serde_json::Value {
                     "peer": { "type": "string", "description": "The peer's alias.", "enum": aliases },
                     "text": { "type": "string", "description": "What to say or ask for." },
                     "thread": { "type": "string", "description": "An existing thread id to continue. Omit to start a new one." },
-                    "task": { "type": "boolean", "description": "True to ask the peer to do work rather than just saying something." }
+                    "task": { "type": "boolean", "description": "True to ask the peer to do work rather than just saying something." },
+                    "correlation": { "type": "string", "description": "Your own handle for this request, returned with the peer's result so a later turn can match them up." },
+                    // Ids from this installation's own content store, never
+                    // paths: the tool hands the bytes over and the peer stores
+                    // them itself, so nothing here can name a file on disk.
+                    "artifacts": {
+                        "type": "array",
+                        "description": "Artifact ids from this run's own outputs to hand over. Requires the peer to have granted artifact exchange.",
+                        "items": { "type": "string" }
+                    }
                 },
                 "required": ["peer", "text"],
                 "additionalProperties": false
