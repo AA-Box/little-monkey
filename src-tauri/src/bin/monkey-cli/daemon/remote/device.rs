@@ -472,6 +472,42 @@ fn extension_manager_owned(
     extension_manager(&app_data)
 }
 
+/// The content id of `arguments`' artifact, if it names one, or `None` if this
+/// action carries no artifact at all.
+///
+/// The lookup is `artifact_id AND run_id` against the run ledger — the same
+/// pair the signed artifact route resolves for a paired device, and the same
+/// refusal when the artifact belongs to some other run. Nothing here trusts
+/// the caller's id beyond using it as a key: what comes back is the content
+/// digest the ledger recorded, which is what the artifact store is keyed on
+/// and what the invocation grant names.
+fn resolve_run_artifact(
+    paths: &DaemonPaths,
+    arguments: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let (Some(artifact_id), Some(run_id)) = (
+        arguments.get("artifact_id").and_then(|v| v.as_str()),
+        arguments.get("run_id").and_then(|v| v.as_str()),
+    ) else {
+        return Ok(None);
+    };
+    let connection = rusqlite::Connection::open(&paths.ledger_db)
+        .map_err(|error| format!("Could not open the run ledger: {error}"))?;
+    connection
+        .query_row(
+            "SELECT content_sha256 FROM artifacts WHERE artifact_id=?1 AND run_id=?2",
+            rusqlite::params![artifact_id, run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map(Some)
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                format!("Artifact '{artifact_id}' is not linked to run '{run_id}'")
+            }
+            other => format!("Could not resolve the artifact to play: {other}"),
+        })
+}
+
 /// Run one action on an extension-provided device.
 ///
 /// The action reaches the guest as a capability token the host resolved, never
@@ -479,11 +515,12 @@ fn extension_manager_owned(
 /// through, and a device the provider did not advertise is refused before the
 /// sandbox is even started.
 async fn dispatch_extension(
-    app_data: &std::path::Path,
+    paths: &DaemonPaths,
     request: &DeviceActionRequest,
     device: &ExtensionDevice,
     now_ms: u64,
 ) -> Result<DeviceCommandRecord, String> {
+    let app_data = paths.app_data()?.to_path_buf();
     if !device.actions.contains(&request.capability) {
         return Err(format!(
             "Device '{}' does not advertise '{}'",
@@ -491,7 +528,28 @@ async fn dispatch_extension(
             capability_token(request.capability)
         ));
     }
-    let arguments = validate_arguments(request.capability, &request.arguments)?;
+    let mut arguments = validate_arguments(request.capability, &request.arguments)?;
+    // A paired phone fetches a stored artifact for itself over the signed
+    // route, under the run it was granted. A guest has no route to fetch over,
+    // so the host does the same resolution here and hands the bytes across as
+    // an explicit invocation grant. The run link is the authority in both
+    // cases: an artifact that is not this run's resolves to nothing, and the
+    // id the guest is given is the content id the host looked up rather than
+    // the one the caller wrote.
+    let granted_artifact_ids = match resolve_run_artifact(paths, &arguments)? {
+        Some(content_sha256) => {
+            let object = arguments
+                .as_object_mut()
+                .ok_or_else(|| "Device arguments are not an object".to_string())?;
+            object.remove("run_id");
+            object.insert(
+                "artifact_id".to_string(),
+                serde_json::Value::String(content_sha256.clone()),
+            );
+            vec![content_sha256]
+        }
+        None => Vec::new(),
+    };
     let (_, _, local_id) = extension_device_target(&device.device_id)
         .ok_or_else(|| "Extension device id is malformed".to_string())?;
     let input_json = serde_json::json!({
@@ -501,7 +559,7 @@ async fn dispatch_extension(
         "arguments": arguments,
     })
     .to_string();
-    let manager = extension_manager(app_data)?;
+    let manager = extension_manager(&app_data)?;
     // The same at-most-once identity a paired device's command carries, spent
     // through the extension runtime's own durable invocation ledger: a retried
     // tool call with the same invocation identity replays the cached result
@@ -526,7 +584,7 @@ async fn dispatch_extension(
             &device.capability_id,
             input_json,
             Some(command_id.clone()),
-            Vec::new(),
+            granted_artifact_ids,
         )
         .await?;
     let output: serde_json::Value = serde_json::from_str(&result.output_json)
@@ -642,7 +700,7 @@ pub async fn dispatch(
                          advertises that device with this action."
                     )
                 })?;
-            return dispatch_extension(&app_data, request, device, now_ms).await;
+            return dispatch_extension(paths, request, device, now_ms).await;
         }
     }
     let arguments = validate_arguments(request.capability, &request.arguments)?;
@@ -673,7 +731,7 @@ pub async fn dispatch(
             0 => return Err(error),
             1 => {
                 let device = extension_candidates.first().expect("length checked");
-                return dispatch_extension(&app_data, request, device, now_ms).await;
+                return dispatch_extension(paths, request, device, now_ms).await;
             }
             _ => {
                 return Err(format!(

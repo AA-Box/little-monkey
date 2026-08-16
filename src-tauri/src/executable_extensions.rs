@@ -3876,6 +3876,50 @@ pub struct SessionStep {
     pub written_artifact_ids: Vec<String>,
 }
 
+/// One event a trusted host subsystem feeds into a session, together with the
+/// artifacts that subsystem is granting the guest for this step alone.
+///
+/// The two halves are deliberately separate values. An artifact id that
+/// appears inside `event` is *data* — a caller's audio clip is named there so
+/// the guest knows which of its grants to read — and naming it grants nothing.
+/// Authority comes only from `input_artifact_ids`, which is reachable only
+/// from Rust: this type has no `Deserialize`, so no channel payload, model
+/// output, connector document or guest reply can ever produce one. A host
+/// subsystem that means to hand over bytes says so in a second place, in code,
+/// beside the artifact it created itself.
+#[derive(Debug, Clone, Default)]
+pub struct SessionInput {
+    event: serde_json::Value,
+    input_artifact_ids: Vec<String>,
+}
+
+impl SessionInput {
+    /// An event carrying no artifact authority — the common case.
+    pub fn event(event: serde_json::Value) -> Self {
+        Self {
+            event,
+            input_artifact_ids: Vec::new(),
+        }
+    }
+
+    /// Grant this step read access to exactly these host-created artifacts.
+    ///
+    /// Only ever called with ids the caller itself just wrote or already owns.
+    /// Passing through an id that arrived from outside the host would defeat
+    /// the whole point of the split.
+    #[must_use]
+    pub fn reading_artifacts(mut self, artifact_ids: Vec<String>) -> Self {
+        self.input_artifact_ids = artifact_ids;
+        self
+    }
+}
+
+impl From<serde_json::Value> for SessionInput {
+    fn from(event: serde_json::Value) -> Self {
+        Self::event(event)
+    }
+}
+
 /// What a guest returns from a session step.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3961,7 +4005,7 @@ impl ExtensionManager {
         kind: CapabilityKind,
         expected_extension_id: &str,
         capability_id: &str,
-        open_input: serde_json::Value,
+        open_input: impl Into<SessionInput>,
     ) -> Result<SessionStep, String> {
         validate_id("extension id", expected_extension_id)?;
         let owner = self.resolve_active_capability(kind, capability_id)?;
@@ -3999,7 +4043,10 @@ impl ExtensionManager {
                 },
             );
         }
-        match self.run_session_step(&session_id, "open", open_input).await {
+        match self
+            .run_session_step(&session_id, "open", open_input.into())
+            .await
+        {
             Ok(step) => Ok(step),
             Err(error) => {
                 let _ = close_session(&session_id);
@@ -4012,9 +4059,10 @@ impl ExtensionManager {
     pub async fn session_send(
         &self,
         session_id: &str,
-        event: serde_json::Value,
+        event: impl Into<SessionInput>,
     ) -> Result<SessionStep, String> {
-        self.run_session_step(session_id, "event", event).await
+        self.run_session_step(session_id, "event", event.into())
+            .await
     }
 
     /// Tell the guest the session is ending, then close it either way.
@@ -4023,7 +4071,7 @@ impl ExtensionManager {
     /// its session, because the host — not the guest — owns the table.
     pub async fn session_close(&self, session_id: &str) -> Result<SessionStep, String> {
         let result = self
-            .run_session_step(session_id, "close", serde_json::Value::Null)
+            .run_session_step(session_id, "close", SessionInput::default())
             .await;
         let _ = close_session(session_id);
         result
@@ -4033,9 +4081,13 @@ impl ExtensionManager {
         &self,
         session_id: &str,
         phase: &str,
-        event: serde_json::Value,
+        input: SessionInput,
     ) -> Result<SessionStep, String> {
         validate_id("session id", session_id)?;
+        let SessionInput {
+            event,
+            input_artifact_ids,
+        } = input;
         let encoded_event = serde_json::to_string(&event)
             .map_err(|error| format!("Session event is not encodable: {error}"))?;
         if encoded_event.len() > MAX_SESSION_EVENT_BYTES {
@@ -4086,7 +4138,10 @@ impl ExtensionManager {
                 capability_id: binding.capability_id.clone(),
                 input_json,
                 invocation_id: Some(invocation_id.clone()),
-                input_artifact_ids: Vec::new(),
+                // The grants this step's trusted call site attached, and only
+                // those. `event` was already serialized into `input_json`
+                // above; nothing reads an artifact id back out of it.
+                input_artifact_ids,
                 expected_kind: Some(binding.kind),
                 expected_version: Some(binding.version.clone()),
             })
@@ -5609,6 +5664,118 @@ pub(crate) mod test_fixtures {
                 (export "run" (func $run))))"#,
             artifact = escape(artifact),
             artifact_len = artifact.len(),
+            prefix = escape(prefix.as_bytes()),
+            prefix_len = prefix.len(),
+            suffix = escape(suffix.as_bytes()),
+            suffix_len = suffix.len(),
+        ))
+        .unwrap()
+    }
+
+    /// A component that writes the *input* it was handed through the host's
+    /// own `artifact-write` import and answers with `prefix` + the returned
+    /// artifact id + `suffix`.
+    ///
+    /// Its purpose is to make "did what the caller sent actually reach the
+    /// guest" answerable in bytes. A fixture that answers with a constant
+    /// cannot distinguish a subsystem that assembled the right request from
+    /// one that assembled nothing at all, and a guest cannot echo JSON into
+    /// JSON without an escaper. Writing the raw bytes into the artifact store
+    /// sidesteps both: the caller reads back exactly what the sandbox saw.
+    pub(crate) fn component_wat_echoing_input(prefix: &str, suffix: &str) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (import "little-monkey:extension/host@1.0.0" (instance $host
+                (export "artifact-write"
+                  (func (param "bytes" (list u8)) (result (result string (error string)))))))
+              (core module $libc
+                (memory (export "memory") 8)
+                (global $heap (mut i32) (i32.const 262144))
+                (func $realloc (export "realloc")
+                  (param i32 i32 i32 i32) (result i32)
+                  (local $ret i32)
+                  global.get $heap
+                  local.set $ret
+                  global.get $heap
+                  local.get 3
+                  i32.add
+                  global.set $heap
+                  local.get $ret))
+              (core instance $libc_i (instantiate $libc))
+              (alias core export $libc_i "memory" (core memory $mem))
+              (alias core export $libc_i "realloc" (core func $realloc))
+              (core func $write (canon lower (func $host "artifact-write")
+                (memory $mem) (realloc $realloc)))
+              (core module $m
+                (import "libc" "memory" (memory 8))
+                (import "host" "artifact-write" (func $write (param i32 i32 i32)))
+                (data (i32.const 2048) "{prefix}")
+                (data (i32.const 3072) "{suffix}")
+                (func (export "run")
+                  (param i32 i32 i32 i32) (result i32)
+                  (local $id_ptr i32) (local $id_len i32) (local $total i32)
+                  ;; artifact-write(input-json) -> return area at 4096
+                  local.get 2
+                  local.get 3
+                  i32.const 4096
+                  call $write
+                  i32.const 4096
+                  i32.load
+                  if
+                    unreachable
+                  end
+                  i32.const 4100
+                  i32.load
+                  local.set $id_ptr
+                  i32.const 4104
+                  i32.load
+                  local.set $id_len
+                  i32.const 8192
+                  i32.const 2048
+                  i32.const {prefix_len}
+                  memory.copy
+                  i32.const 8192
+                  i32.const {prefix_len}
+                  i32.add
+                  local.get $id_ptr
+                  local.get $id_len
+                  memory.copy
+                  i32.const 8192
+                  i32.const {prefix_len}
+                  i32.add
+                  local.get $id_len
+                  i32.add
+                  i32.const 3072
+                  i32.const {suffix_len}
+                  memory.copy
+                  i32.const {prefix_len}
+                  local.get $id_len
+                  i32.add
+                  i32.const {suffix_len}
+                  i32.add
+                  local.set $total
+                  i32.const 64
+                  i32.const 0
+                  i32.store8
+                  i32.const 68
+                  i32.const 8192
+                  i32.store
+                  i32.const 72
+                  local.get $total
+                  i32.store
+                  i32.const 64))
+              (core instance $i (instantiate $m
+                (with "libc" (instance $libc_i))
+                (with "host" (instance (export "artifact-write" (func $write))))))
+              (func $run
+                (param "capability-id" string)
+                (param "input-json" string)
+                (result (result string (error string)))
+                (canon lift (core func $i "run")
+                  (memory $mem)
+                  (realloc $realloc)))
+              (instance (export (interface "little-monkey:extension/guest@1.0.0"))
+                (export "run" (func $run))))"#,
             prefix = escape(prefix.as_bytes()),
             prefix_len = prefix.len(),
             suffix = escape(suffix.as_bytes()),

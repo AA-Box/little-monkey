@@ -704,28 +704,40 @@ impl RealtimeExtensionSpeech {
     async fn step(
         &self,
         event: serde_json::Value,
+        granted_artifact_ids: Vec<String>,
     ) -> Result<little_monkey_lib::executable_extensions::SessionStep, String> {
+        use little_monkey_lib::executable_extensions::SessionInput;
         let mut guard = self.session.lock().await;
         let outcome = match &*guard {
             RealtimeSessionState::Ended => {
                 return Err("This call's realtime speech session has ended".to_string())
             }
+            // The first turn of a call opens the session *and* carries its
+            // event, so the open step needs the same grant a later send would
+            // have had. Anything else would make the first utterance the one
+            // the provider cannot hear.
             RealtimeSessionState::Unopened => {
                 self.manager
                     .open_session(
                         little_monkey_lib::executable_extensions::CapabilityKind::RealtimeVoice,
                         &self.extension_id,
                         &self.capability_id,
-                        serde_json::json!({
+                        SessionInput::event(serde_json::json!({
                             "sample_rate": CALL_SAMPLE_RATE,
                             "encoding": "pcm_s16le",
                             "first_event": event,
-                        }),
+                        }))
+                        .reading_artifacts(granted_artifact_ids),
                     )
                     .await
             }
             RealtimeSessionState::Open(session_id) => {
-                self.manager.session_send(session_id, event).await
+                self.manager
+                    .session_send(
+                        session_id,
+                        SessionInput::event(event).reading_artifacts(granted_artifact_ids),
+                    )
+                    .await
             }
         };
         match outcome {
@@ -769,12 +781,19 @@ impl CallSpeech for RealtimeExtensionSpeech {
             .artifacts
             .put(&wav)
             .map_err(|error| format!("Could not publish the caller's audio: {error}"))?;
+        // Two separate statements about the same id: the event *names* it so
+        // the guest knows what to ask for, and the grant beside it is what
+        // makes the ask succeed. The host wrote these bytes a line ago, which
+        // is the only reason it has the standing to hand them over.
         let step = self
-            .step(serde_json::json!({
-                "kind": "caller_audio",
-                "artifact_id": audio.id,
-                "byte_len": wav.len(),
-            }))
+            .step(
+                serde_json::json!({
+                    "kind": "caller_audio",
+                    "artifact_id": audio.id,
+                    "byte_len": wav.len(),
+                }),
+                vec![audio.id.clone()],
+            )
             .await?;
         let payload = Self::event(&step, "transcript")
             .ok_or_else(|| "The realtime extension returned no transcript".to_string())?;
@@ -794,7 +813,10 @@ impl CallSpeech for RealtimeExtensionSpeech {
 
     async fn synthesize(&self, text: &str) -> Result<Vec<i16>, String> {
         let step = self
-            .step(serde_json::json!({ "kind": "agent_text", "text": text }))
+            .step(
+                serde_json::json!({ "kind": "agent_text", "text": text }),
+                Vec::new(),
+            )
             .await?;
         let payload = Self::event(&step, "audio")
             .ok_or_else(|| "The realtime extension returned no audio".to_string())?;

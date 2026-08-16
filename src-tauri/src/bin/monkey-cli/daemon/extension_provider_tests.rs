@@ -111,6 +111,198 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+fn escape(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| format!("\\{byte:02x}").into_bytes())
+        .map(char::from)
+        .collect()
+}
+
+/// A component that reads `read_id` through the host's own `artifact-read`
+/// import, writes `marker` followed by the bytes it got back through
+/// `artifact-write`, and answers `prefix` + the id the host returned for that
+/// write + `suffix`.
+///
+/// Every part of that is load-bearing.
+///
+/// *Reading through the real import* is what makes this fixture able to fail:
+/// a component that only received an artifact id in its input JSON and echoed
+/// it would pass whether or not the host granted anything. This one asks, and
+/// a refusal comes back as an error it propagates as its own — so a step run
+/// with no trusted grant fails loudly instead of quietly succeeding.
+///
+/// *Writing the bytes back behind a marker* is what proves the bytes are the
+/// caller's and not something the guest already knew. The store is content
+/// addressed, so writing the clip unchanged would return the very id the
+/// fixture was told to read, and echoing that id would look identical. With a
+/// marker in front, the answer is `sha256(marker ++ clip)` — a value no guest
+/// can produce without having held the clip.
+fn component_wat_echoing_artifact(
+    read_id: &str,
+    marker: &[u8],
+    prefix: &str,
+    suffix: &str,
+) -> Vec<u8> {
+    wat::parse_str(format!(
+        r#"(component
+          (import "little-monkey:extension/host@1.0.0" (instance $host
+            (export "artifact-read"
+              (func (param "artifact-id" string) (result (result (list u8) (error string)))))
+            (export "artifact-write"
+              (func (param "bytes" (list u8)) (result (result string (error string)))))))
+          (core module $libc
+            (memory (export "memory") 16)
+            (global $heap (mut i32) (i32.const 524288))
+            (func $realloc (export "realloc")
+              (param i32 i32 i32 i32) (result i32)
+              (local $ret i32)
+              global.get $heap
+              local.set $ret
+              global.get $heap
+              local.get 3
+              i32.add
+              global.set $heap
+              local.get $ret))
+          (core instance $libc_i (instantiate $libc))
+          (alias core export $libc_i "memory" (core memory $mem))
+          (alias core export $libc_i "realloc" (core func $realloc))
+          (core func $read (canon lower (func $host "artifact-read")
+            (memory $mem) (realloc $realloc)))
+          (core func $write (canon lower (func $host "artifact-write")
+            (memory $mem) (realloc $realloc)))
+          (core module $m
+            (import "libc" "memory" (memory 16))
+            (import "host" "artifact-read" (func $read (param i32 i32 i32)))
+            (import "host" "artifact-write" (func $write (param i32 i32 i32)))
+            (data (i32.const 1024) "{read_id}")
+            (data (i32.const 2048) "{prefix}")
+            (data (i32.const 3072) "{suffix}")
+            (data (i32.const 4096) "{marker}")
+            (func (export "run")
+              (param i32 i32 i32 i32) (result i32)
+              (local $ptr i32) (local $len i32) (local $id_ptr i32) (local $id_len i32)
+              (local $total i32)
+              ;; artifact-read(read_id) -> result area at 5120
+              i32.const 1024
+              i32.const {read_id_len}
+              i32.const 5120
+              call $read
+              i32.const 5120
+              i32.load
+              if
+                ;; Denied. The host's reason becomes this guest's own error,
+                ;; so the subsystem above sees why rather than a bare trap.
+                i32.const 64
+                i32.const 1
+                i32.store8
+                i32.const 68
+                i32.const 5124
+                i32.load
+                i32.store
+                i32.const 72
+                i32.const 5128
+                i32.load
+                i32.store
+                i32.const 64
+                return
+              end
+              i32.const 5124
+              i32.load
+              local.set $ptr
+              i32.const 5128
+              i32.load
+              local.set $len
+              ;; marker ++ what was read, staged at 16384
+              i32.const 16384
+              i32.const 4096
+              i32.const {marker_len}
+              memory.copy
+              i32.const 16384
+              i32.const {marker_len}
+              i32.add
+              local.get $ptr
+              local.get $len
+              memory.copy
+              ;; artifact-write(marker ++ bytes) -> result area at 5136
+              i32.const 16384
+              i32.const {marker_len}
+              local.get $len
+              i32.add
+              i32.const 5136
+              call $write
+              i32.const 5136
+              i32.load
+              if
+                unreachable
+              end
+              i32.const 5140
+              i32.load
+              local.set $id_ptr
+              i32.const 5144
+              i32.load
+              local.set $id_len
+              ;; prefix ++ the id the host answered with ++ suffix
+              i32.const 262144
+              i32.const 2048
+              i32.const {prefix_len}
+              memory.copy
+              i32.const 262144
+              i32.const {prefix_len}
+              i32.add
+              local.get $id_ptr
+              local.get $id_len
+              memory.copy
+              i32.const 262144
+              i32.const {prefix_len}
+              i32.add
+              local.get $id_len
+              i32.add
+              i32.const 3072
+              i32.const {suffix_len}
+              memory.copy
+              i32.const {prefix_len}
+              local.get $id_len
+              i32.add
+              i32.const {suffix_len}
+              i32.add
+              local.set $total
+              i32.const 64
+              i32.const 0
+              i32.store8
+              i32.const 68
+              i32.const 262144
+              i32.store
+              i32.const 72
+              local.get $total
+              i32.store
+              i32.const 64))
+          (core instance $i (instantiate $m
+            (with "libc" (instance $libc_i))
+            (with "host" (instance
+              (export "artifact-read" (func $read))
+              (export "artifact-write" (func $write))))))
+          (func $run
+            (param "capability-id" string)
+            (param "input-json" string)
+            (result (result string (error string)))
+            (canon lift (core func $i "run")
+              (memory $mem)
+              (realloc $realloc)))
+          (instance (export (interface "little-monkey:extension/guest@1.0.0"))
+            (export "run" (func $run))))"#,
+        read_id = escape(read_id.as_bytes()),
+        read_id_len = read_id.len(),
+        prefix = escape(prefix.as_bytes()),
+        prefix_len = prefix.len(),
+        suffix = escape(suffix.as_bytes()),
+        suffix_len = suffix.len(),
+        marker = escape(marker),
+        marker_len = marker.len(),
+    ))
+    .unwrap()
+}
+
 /// Install one fixture extension declaring exactly `capabilities`, and bring
 /// it to the healthy+running state every provider registry requires.
 async fn install_fixture(
@@ -121,7 +313,27 @@ async fn install_fixture(
     capabilities: &[(CapabilityKind, &str)],
     permissions: Vec<PermissionDeclaration>,
 ) -> ExtensionManager {
-    let component = component_wat(output);
+    install_component(
+        app_data,
+        source_root,
+        extension_id,
+        component_wat(output),
+        capabilities,
+        permissions,
+    )
+    .await
+}
+
+/// The same lifecycle for a caller that built its own component — one that
+/// calls host imports rather than answering with a constant.
+async fn install_component(
+    app_data: &Path,
+    source_root: &Path,
+    extension_id: &str,
+    component: Vec<u8>,
+    capabilities: &[(CapabilityKind, &str)],
+    permissions: Vec<PermissionDeclaration>,
+) -> ExtensionManager {
     let digest = sha256_hex(&component);
     let source = source_root.join(extension_id);
     std::fs::create_dir_all(&source).unwrap();
@@ -521,6 +733,58 @@ async fn a_device_action_runs_through_the_normal_dispatch_and_returns_a_normaliz
     );
 }
 
+/// Playing a stored clip on an extension device resolves the artifact against
+/// the run that owns it, and refuses when there is no such link.
+///
+/// The device's own read grant is what protects a paired phone here; a guest
+/// has no pairing, so the run link is the whole of the authority. An artifact
+/// id in the arguments that the ledger does not tie to that run reaches no
+/// sandbox at all — which is also what stops a well-formed digest naming
+/// somebody else's bytes from becoming an invocation grant.
+#[tokio::test]
+async fn an_extension_device_cannot_play_an_artifact_that_is_not_the_runs() {
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.lab",
+        r#"{"devices":[{"id":"speaker","actions":["audio_playback"]}],"result":{}}"#,
+        &[(CapabilityKind::DeviceProvider, "instruments")],
+        Vec::new(),
+    )
+    .await;
+    let paths = super::store::DaemonPaths::under(&app_data);
+    paths.ensure().unwrap();
+    // A migrated but empty ledger, so what the refusal is about is the missing
+    // link rather than a machine that has never run anything.
+    little_monkey_lib::run_ledger::RunLedger::open(&paths.ledger_db).unwrap();
+
+    let error = super::remote::device::dispatch(
+        &paths,
+        &super::remote::device::DeviceActionRequest {
+            device_id: Some("ext:dev.example.lab:instruments:speaker".to_string()),
+            capability: super::remote::protocol::DeviceCapability::AudioPlayback,
+            arguments: serde_json::json!({
+                "artifact_id": "artifact-01",
+                "run_id": "run-nobody-owns",
+            }),
+            wait_ms: 5_000,
+            source_run_id: None,
+            source_session_id: None,
+            source_tool_call_id: None,
+            invocation_id: None,
+        },
+        1_700_000_000_000,
+    )
+    .await
+    .expect_err("an artifact this run does not own is not playable");
+    assert!(
+        error.contains("not linked to run 'run-nobody-owns'"),
+        "{error}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Realtime voice
 // ---------------------------------------------------------------------------
@@ -554,6 +818,211 @@ async fn a_realtime_extension_serves_the_call_speech_a_live_call_holds() {
         .expect("the call's own speech backend reaches the session");
     assert_eq!(text, "the caller said this");
     speech.finish().await;
+}
+
+/// What the fixture below wraps the caller's clip in before writing it back,
+/// so the id it answers with cannot be the id it was told to read.
+const ECHO_MARKER: &[u8] = b"heard:";
+
+/// The two literals that turn the id the host answered with into the one
+/// session step shape a realtime provider emits.
+const TRANSCRIPT_PREFIX: &str = r#"{"events":[{"kind":"transcript","payload":{"text":""#;
+const TRANSCRIPT_SUFFIX: &str = r#""}}],"done":false}"#;
+
+/// Everything a realtime extension needs to read the audio a call hands it.
+fn realtime_audio_permissions() -> Vec<PermissionDeclaration> {
+    vec![
+        PermissionDeclaration {
+            permission_id: "artifact-read-inputs".to_string(),
+            kind: PermissionKind::ArtifactRead,
+            scope: "invocation_inputs".to_string(),
+            reason: "Fixture reads the caller's audio".to_string(),
+        },
+        PermissionDeclaration {
+            permission_id: "artifact-write".to_string(),
+            kind: PermissionKind::ArtifactWrite,
+            scope: "content_v1".to_string(),
+            reason: "Fixture publishes what it heard".to_string(),
+        },
+    ]
+}
+
+/// The whole of the functional claim: a live call's PCM reaches an extension.
+///
+/// Nothing here is asserted about the artifact id. The transcript the guest
+/// answers with is the id the *host* returned when the guest wrote back what
+/// it had read, so it can only be right if the exact bytes arrived — and the
+/// clip is read out of the store afterwards to say so in bytes rather than in
+/// a digest.
+#[tokio::test]
+async fn a_live_calls_audio_reaches_a_realtime_extension_through_a_trusted_grant() {
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let wav = wav_fixture();
+    let clip_id = sha256_hex(&wav);
+    let echoed: Vec<u8> = ECHO_MARKER
+        .iter()
+        .copied()
+        .chain(wav.iter().copied())
+        .collect();
+    let echoed_id = sha256_hex(&echoed);
+
+    let _manager = install_component(
+        &app_data,
+        &root.0,
+        "dev.example.line",
+        component_wat_echoing_artifact(&clip_id, ECHO_MARKER, TRANSCRIPT_PREFIX, TRANSCRIPT_SUFFIX),
+        &[(CapabilityKind::RealtimeVoice, "converse")],
+        realtime_audio_permissions(),
+    )
+    .await;
+    select_realtime_extension(&app_data, "dev.example.line", "converse");
+
+    let speech = super::call_media::select_call_speech(&app_data)
+        .expect("the operator's selection resolves to the extension backend");
+    let text = speech
+        .transcribe(wav.clone())
+        .await
+        .expect("the caller's audio is readable inside the sandbox");
+    speech.finish().await;
+
+    assert_eq!(
+        text, echoed_id,
+        "the guest answered with an id it could not have computed without the clip"
+    );
+    let store = little_monkey_lib::artifact_store::ArtifactStore::new(app_data.join("content-v1"))
+        .expect("the call's own artifact store opens");
+    assert_eq!(
+        store.read(&echoed_id).expect("the guest's write landed"),
+        echoed,
+        "the bytes that came back out are the caller's own PCM"
+    );
+}
+
+/// The same fixture, one grant short: a guest that names a real artifact the
+/// host never attached to this step is refused.
+///
+/// The artifact exists and is readable by the host — this is not "unknown id",
+/// it is "not yours for this step", which is the case a content-addressed
+/// shared store makes easy to get wrong.
+#[tokio::test]
+async fn a_realtime_extension_cannot_read_an_artifact_the_call_never_granted() {
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let unrelated = b"a recording from somebody else's call".to_vec();
+    let unrelated_id =
+        little_monkey_lib::artifact_store::ArtifactStore::new(app_data.join("content-v1"))
+            .expect("the artifact store opens")
+            .put(&unrelated)
+            .expect("the unrelated clip is stored")
+            .id;
+
+    let _manager = install_component(
+        &app_data,
+        &root.0,
+        "dev.example.line",
+        component_wat_echoing_artifact(
+            &unrelated_id,
+            ECHO_MARKER,
+            TRANSCRIPT_PREFIX,
+            TRANSCRIPT_SUFFIX,
+        ),
+        &[(CapabilityKind::RealtimeVoice, "converse")],
+        realtime_audio_permissions(),
+    )
+    .await;
+    select_realtime_extension(&app_data, "dev.example.line", "converse");
+
+    let speech = super::call_media::select_call_speech(&app_data).unwrap();
+    let error = speech
+        .transcribe(wav_fixture())
+        .await
+        .expect_err("an ungranted artifact is not readable");
+    speech.finish().await;
+    assert!(
+        error.contains(&unrelated_id) && error.to_lowercase().contains("denied"),
+        "{error}"
+    );
+}
+
+/// The security invariant behind the fix, stated on its own: an artifact id
+/// inside a session event is data, not authority.
+///
+/// Both halves run against the same installed extension and the same session
+/// API, differing only in whether the trusted call site attached the grant. A
+/// regression that started deriving grants from the event JSON would turn the
+/// first half green and be caught here rather than in a live call.
+#[tokio::test]
+async fn an_artifact_id_inside_a_session_event_grants_nothing_by_itself() {
+    use little_monkey_lib::executable_extensions::{CapabilityKind, SessionInput};
+
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let clip = b"the caller's own PCM".to_vec();
+    let clip_id =
+        little_monkey_lib::artifact_store::ArtifactStore::new(app_data.join("content-v1"))
+            .expect("the artifact store opens")
+            .put(&clip)
+            .expect("the clip is stored")
+            .id;
+    let echoed: Vec<u8> = ECHO_MARKER
+        .iter()
+        .copied()
+        .chain(clip.iter().copied())
+        .collect();
+
+    let manager = install_component(
+        &app_data,
+        &root.0,
+        "dev.example.line",
+        component_wat_echoing_artifact(&clip_id, ECHO_MARKER, TRANSCRIPT_PREFIX, TRANSCRIPT_SUFFIX),
+        &[(CapabilityKind::RealtimeVoice, "converse")],
+        realtime_audio_permissions(),
+    )
+    .await;
+    let manager = manager
+        .with_artifact_root(app_data.join("content-v1"))
+        .expect("the manager reads the same store the call uses");
+
+    // The event names the artifact exactly as the real call-media path names
+    // it. Run first with the host attaching it, so what the second half
+    // removes is the grant and nothing else.
+    let named = SessionInput::event(serde_json::json!({
+        "kind": "caller_audio",
+        "artifact_id": clip_id,
+    }));
+    let step = manager
+        .open_session(
+            CapabilityKind::RealtimeVoice,
+            "dev.example.line",
+            "converse",
+            named.clone().reading_artifacts(vec![clip_id.clone()]),
+        )
+        .await
+        .expect("an explicitly attached artifact is readable");
+    assert_eq!(
+        step.written_artifact_ids,
+        vec![sha256_hex(&echoed)],
+        "the host recorded the write the guest made from the bytes it read"
+    );
+    let _ = little_monkey_lib::executable_extensions::close_session(&step.session_id);
+
+    // The same extension, the same capability, the same event JSON — and no
+    // grant. A regression that derived authority from the JSON would make
+    // this succeed exactly like the call above.
+    let error = manager
+        .open_session(
+            CapabilityKind::RealtimeVoice,
+            "dev.example.line",
+            "converse",
+            named,
+        )
+        .await
+        .expect_err("naming an artifact in JSON is not a grant");
+    assert!(
+        error.contains(&clip_id) && error.to_lowercase().contains("denied"),
+        "{error}"
+    );
 }
 
 #[tokio::test]

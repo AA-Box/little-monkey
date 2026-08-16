@@ -317,9 +317,20 @@ fn extension_provider_id(extension_id: &str, capability_id: &str) -> Option<Stri
 /// uninstall take effect everywhere at once rather than in each list that
 /// happened to remember it.
 pub fn extension_model_providers() -> Vec<ProviderConfig> {
-    let Some(app_data) = crate::app_paths::data_dir() else {
-        return Vec::new();
-    };
+    match crate::app_paths::data_dir() {
+        Some(app_data) => extension_model_providers_under(&app_data),
+        None => Vec::new(),
+    }
+}
+
+/// The same discovery against an explicit data root.
+///
+/// [`extension_model_providers`] is this function plus the profile chokepoint
+/// that decides which root the running app is serving. Split so the discovery
+/// itself can be driven against a root a caller owns — the CLI's own provider
+/// listing and this crate's tests both need that — without either of them
+/// reimplementing what "a provider an extension contributes" means.
+pub fn extension_model_providers_under(app_data: &std::path::Path) -> Vec<ProviderConfig> {
     let Ok(manager) = crate::executable_extensions::ExtensionManager::new(app_data) else {
         return Vec::new();
     };
@@ -1153,9 +1164,12 @@ enum ExtensionChatEvent {
 /// the one SSE frame shape this app's stream reader parses. Cancellation stops
 /// pulling and closes the session, which cancels the step still inside the
 /// sandbox.
+// Generic over the runtime for the same reason the tool commands are: it is
+// what lets this crate's tests drive the real function rather than a copy of
+// it. The desktop build still passes its own `AppHandle`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_extension_chat(
-    app: &AppHandle,
+pub(crate) async fn run_extension_chat<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     app_data: &std::path::Path,
     request_id: &str,
     extension_id: &str,

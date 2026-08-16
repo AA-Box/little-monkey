@@ -15,8 +15,8 @@
 use std::path::Path;
 
 use crate::executable_extensions::test_fixtures::{
-    component_wat, component_wat_writing_artifact, fixture_wav, manifest_for, runtime_guard,
-    write_manifest_bundle, TestRoot,
+    component_wat, component_wat_echoing_input, component_wat_writing_artifact, fixture_wav,
+    manifest_for, runtime_guard, write_manifest_bundle, TestRoot,
 };
 use crate::executable_extensions::{
     CapabilityDeclaration, CapabilityKind, ExtensionManager, ExtensionManifest, PermissionGrant,
@@ -493,6 +493,254 @@ async fn an_extension_model_provider_is_listed_and_answers_a_model_query() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "fixture-small");
     assert_eq!(models[0].context_length, Some(4096));
+}
+
+/// Whatever the frontend's stream reader is handed for one request.
+///
+/// `providers_stream_chat` reaches the outside world entirely through these
+/// three events, so collecting them is collecting the completion: a test that
+/// reads them is standing exactly where `llamaClient.ts` stands.
+#[derive(Default)]
+struct StreamCapture {
+    chunks: std::sync::Mutex<Vec<serde_json::Value>>,
+    done: std::sync::Mutex<Vec<serde_json::Value>>,
+    errors: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+impl StreamCapture {
+    /// Subscribe to the provider stream of `app`, for `request_id`.
+    fn listening(
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+        request_id: &str,
+    ) -> std::sync::Arc<Self> {
+        use tauri::Listener;
+        let capture = std::sync::Arc::new(Self::default());
+        for (event, sink) in [
+            ("provider://chat-chunk", 0usize),
+            ("provider://chat-done", 1),
+            ("provider://chat-error", 2),
+        ] {
+            let capture = capture.clone();
+            let request_id = request_id.to_string();
+            app.listen(event, move |event| {
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    return;
+                };
+                if payload.get("request_id").and_then(|v| v.as_str()) != Some(request_id.as_str()) {
+                    return;
+                }
+                let bucket = match sink {
+                    0 => &capture.chunks,
+                    1 => &capture.done,
+                    _ => &capture.errors,
+                };
+                bucket.lock().unwrap().push(payload);
+            });
+        }
+        capture
+    }
+
+    /// The assistant text of every SSE frame emitted so far, concatenated.
+    ///
+    /// Parsed out of the wire format rather than out of a side channel: this
+    /// is the `data: {...}\n\n` shape the app's own reader parses, so a
+    /// regression that emitted a different frame would show up here.
+    fn assistant_text(&self) -> String {
+        self.chunks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|payload| {
+                let frame = payload.get("chunk")?.as_str()?;
+                let json = frame.strip_prefix("data: ")?.trim_end();
+                let value: serde_json::Value = serde_json::from_str(json).ok()?;
+                Some(
+                    value
+                        .get("choices")?
+                        .get(0)?
+                        .get("delta")?
+                        .get("content")?
+                        .as_str()?
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+/// The two literals that wrap the artifact id the fixture answers with into
+/// the one streaming event shape a model-provider extension emits.
+const DELTA_PREFIX: &str = r#"{"events":[{"kind":"text_delta","payload":{"text":""#;
+const DELTA_DONE_SUFFIX: &str = r#""}}],"done":true}"#;
+const DELTA_OPEN_SUFFIX: &str = r#""}}],"done":false}"#;
+
+/// The whole model-provider path, from "which providers exist" to "the caller
+/// has the answer", with nothing between the two supplied by the test.
+///
+/// Deliberately never calls `open_session`/`session_send`: the only thing this
+/// test knows about is `providers::run_extension_chat`, which is the function
+/// the `providers_stream_chat` command dispatches to the moment
+/// `extension_provider_target` recognises the id discovery handed out. What
+/// crosses into the sandbox and what comes back are read from the artifact
+/// store and from the emitted SSE frames respectively.
+#[tokio::test]
+async fn an_extension_model_answers_through_the_normal_provider_stream() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.llm",
+        component_wat_echoing_input(DELTA_PREFIX, DELTA_DONE_SUFFIX),
+        vec![(CapabilityKind::ModelProvider, "chat")],
+        vec![artifact_write_permission()],
+    )
+    .await;
+
+    // 1. Discovery. The provider list the settings UI and the model picker
+    //    read is built from this, and nothing was told the extension exists.
+    let discovered = crate::providers::extension_model_providers_under(&app_data);
+    let provider = discovered
+        .iter()
+        .find(|entry| entry.id == "extension:dev.example.llm:chat")
+        .expect("a healthy extension contributes its provider");
+    assert!(provider.is_extension && !provider.has_key);
+
+    // 2. Resolution and 3. dispatch: the id resolves to the owning pair, and
+    //    the endpoint lookup every non-extension provider goes through
+    //    refuses it — so the stream command has exactly one branch it can
+    //    take for this id.
+    let (extension_id, capability_id) = crate::providers::extension_provider_target(&provider.id)
+        .expect("the discovered id is one the dispatch recognises");
+    assert!(crate::providers::resolve_base_url(&provider.id, &[]).is_err());
+    let models = crate::providers::extension_models(&app_data, &extension_id, &capability_id).await;
+    assert!(models.is_ok(), "{models:?}");
+
+    // 4-5. The request crosses into the sandbox and the answer comes back out
+    //      as the frames the frontend parses.
+    let app = crate::test_support::mock_app();
+    let capture = StreamCapture::listening(app.handle(), "req-1");
+    crate::providers::run_extension_chat(
+        app.handle(),
+        &app_data,
+        "req-1",
+        &extension_id,
+        &capability_id,
+        "fixture-small",
+        vec![serde_json::json!({"role": "user", "content": "what is the capital of France"})],
+        Vec::new(),
+        None,
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    )
+    .await
+    .expect("the production provider entry point drives the extension");
+
+    let echoed_id = capture.assistant_text();
+    assert!(!echoed_id.is_empty(), "no assistant delta was emitted");
+    assert_eq!(capture.done.lock().unwrap().len(), 1);
+    assert!(capture.errors.lock().unwrap().is_empty());
+
+    let seen = crate::artifact_store::ArtifactStore::new(app_data.join("content-v1"))
+        .expect("the store the runtime wrote through opens")
+        .read(&echoed_id)
+        .expect("the guest wrote what it was handed");
+    let seen: serde_json::Value =
+        serde_json::from_slice(&seen).expect("the guest was handed bounded JSON");
+    let messages = seen
+        .pointer("/event/messages")
+        .or_else(|| seen.pointer("/event/first_event"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        serde_json::to_string(&messages)
+            .unwrap()
+            .contains("capital of France"),
+        "the prompt did not reach the sandbox: {seen}"
+    );
+    assert_eq!(
+        seen.pointer("/event/model").and_then(|v| v.as_str()),
+        Some("fixture-small"),
+        "the resolved model did not reach the sandbox"
+    );
+
+    // 7. Disabling the extension takes the provider out of the same discovery
+    //    the picker reads, with no list left holding a stale copy.
+    manager.set_enabled("dev.example.llm", false).await.unwrap();
+    assert!(crate::providers::extension_model_providers_under(&app_data)
+        .iter()
+        .all(|entry| entry.id != "extension:dev.example.llm:chat"));
+    manager.set_running("dev.example.llm", false).await.unwrap();
+    manager.uninstall("dev.example.llm").unwrap();
+    assert!(crate::providers::extension_model_providers_under(&app_data).is_empty());
+}
+
+/// 6. Cancellation, mid-stream rather than before the first byte.
+///
+/// The fixture never reports `done`, so the completion is still running when
+/// the stop signal arrives — which is the case that matters. What proves the
+/// cancellation reached the sandbox rather than only the loop around it is the
+/// session table: a session left open would mean a guest still holding the
+/// call, and the host closes it on the way out.
+#[tokio::test]
+async fn a_streaming_extension_completion_stops_when_the_caller_cancels() {
+    let _runtime = runtime_guard();
+    let root = TestRoot::new();
+    let app_data = root.0.join("app-data");
+    let _manager = install_fixture(
+        &app_data,
+        &root.0,
+        "dev.example.llm",
+        component_wat_echoing_input(DELTA_PREFIX, DELTA_OPEN_SUFFIX),
+        vec![(CapabilityKind::ModelProvider, "chat")],
+        vec![artifact_write_permission()],
+    )
+    .await;
+
+    let app = crate::test_support::mock_app();
+    let capture = StreamCapture::listening(app.handle(), "req-cancel");
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let handle = app.handle().clone();
+    let data_dir = app_data.clone();
+    let stop = cancel.clone();
+    let streaming = tokio::spawn(async move {
+        crate::providers::run_extension_chat(
+            &handle,
+            &data_dir,
+            "req-cancel",
+            "dev.example.llm",
+            "chat",
+            "fixture-small",
+            vec![serde_json::json!({"role": "user", "content": "keep going"})],
+            Vec::new(),
+            None,
+            stop,
+        )
+        .await
+    });
+
+    // Wait for the stream to actually be running before stopping it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while capture.chunks.lock().unwrap().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the completion never started streaming"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    cancel.notify_one();
+    streaming
+        .await
+        .expect("the streaming task finishes")
+        .expect("a cancelled completion is not an error");
+
+    let done = capture.done.lock().unwrap();
+    assert_eq!(done.len(), 1);
+    assert_eq!(
+        done[0].get("cancelled").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(capture.errors.lock().unwrap().is_empty());
 }
 
 #[test]
