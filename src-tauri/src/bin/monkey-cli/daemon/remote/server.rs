@@ -155,6 +155,22 @@ pub async fn serve(
     serve_bound(listener, acceptor, api).await
 }
 
+/// Serve an already-bound listener with a caller-supplied API.
+///
+/// Exists for the opt-in live-validation test, which binds `127.0.0.1:0` so it
+/// can learn the port, and injects an API with a fake run queue. Everything
+/// under it is the production path: the same TLS acceptor built from the same
+/// certificate pin, the same HTTP/1 framing, the same header parsing and the
+/// same body limit.
+#[cfg(test)]
+pub(crate) async fn serve_listener_for_test(
+    listener: TcpListener,
+    config: &RemoteHostConfig,
+    api: RemoteApi,
+) -> Result<(), String> {
+    serve_bound(listener, acceptor(config)?, api).await
+}
+
 async fn bind(config: &RemoteHostConfig) -> Result<TcpListener, String> {
     let address: SocketAddr = config
         .listen
@@ -504,10 +520,32 @@ fn tls_config_from_pem(
                 .ok_or_else(|| "TLS private key is empty".to_string())?,
         ))
     };
+    install_crypto_provider();
     rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certificates, key)
         .map_err(|error| format!("TLS certificate/key do not form a usable identity: {error}"))
+}
+
+/// Choose the cryptography behind the remote listener, once per process.
+///
+/// `ServerConfig::builder()` reads a process-wide default provider, and
+/// *panics* when it cannot pick one on its own. This build compiles rustls with
+/// both `ring` and `aws-lc-rs` present — `ring` is a deliberate direct
+/// dependency for its audited AEAD API, and `aws-lc-rs` arrives with rustls's
+/// own defaults — so rustls refuses to guess and the listener would take the
+/// whole daemon down with it the moment a remote host was configured.
+///
+/// `ring` is the explicit choice, because it is the one this build already
+/// depends on by name rather than by accident. Installing it is idempotent and
+/// deliberately tolerant of losing the race: another component may have
+/// installed a provider first, and any installed provider is better than the
+/// panic that follows from none.
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn pem_blocks(bytes: &[u8], label: &str) -> Result<Vec<Vec<u8>>, String> {
