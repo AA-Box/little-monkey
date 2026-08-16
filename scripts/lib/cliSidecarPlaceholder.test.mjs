@@ -18,7 +18,9 @@ import { test } from "node:test";
 
 import {
   builtCliPath,
+  DEBUG,
   ensureSidecarPlaceholder,
+  RELEASE,
   sidecarStagedPath,
 } from "./cliSidecarPlaceholder.mjs";
 
@@ -54,7 +56,7 @@ test("a fresh checkout with nothing built gets an empty placeholder", () => {
     // Empty is the point: it exists, which is all tauri-build's existence
     // check wants, and it displaces nothing because nothing is built yet.
     assert.equal(readFileSync(staged).length, 0);
-    assert.equal(builtCliPath(root, false, undefined), undefined);
+    assert.equal(builtCliPath(root, false, { profile: DEBUG }), undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -137,6 +139,63 @@ test("a tree already holding a zero-byte binary is repaired rather than left bro
   }
 });
 
+test("each profile stages its own binary when both exist", () => {
+  const root = repo();
+  try {
+    // `pnpm stage:cli` builds --release while a debug binary from `cargo test`
+    // sits in the same tree. Answering with the debug one would seed the
+    // release destination with a debug executable — a substitution that still
+    // runs, which is what makes it worth a test.
+    const debugBinary = Buffer.from("the debug binary");
+    const releaseBinary = Buffer.from("the release binary");
+    writeBuiltCli(root, DEBUG, debugBinary);
+    writeBuiltCli(root, RELEASE, releaseBinary);
+
+    ensureSidecarPlaceholder(root, TRIPLE, false, { profile: RELEASE });
+    assert.deepEqual(readFileSync(sidecarStagedPath(root, TRIPLE, false)), releaseBinary);
+    tauriBuildCopiesSidecarIntoTarget(root, RELEASE);
+    assert.deepEqual(
+      readFileSync(join(root, "src-tauri", "target", RELEASE, "monkey-cli")),
+      releaseBinary,
+    );
+
+    ensureSidecarPlaceholder(root, TRIPLE, false, { profile: DEBUG });
+    assert.deepEqual(readFileSync(sidecarStagedPath(root, TRIPLE, false)), debugBinary);
+    tauriBuildCopiesSidecarIntoTarget(root, DEBUG);
+    assert.deepEqual(
+      readFileSync(join(root, "src-tauri", "target", DEBUG, "monkey-cli")),
+      debugBinary,
+    );
+
+    // Neither profile's binary was ever seeded from the other's.
+    assert.deepEqual(
+      readFileSync(join(root, "src-tauri", "target", RELEASE, "monkey-cli")),
+      releaseBinary,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a bootstrap for one profile leaves the other profile's binary alone", () => {
+  const root = repo();
+  try {
+    // Only a release binary exists and the debug bootstrap runs: it must not
+    // stage the release binary into the debug destination either.
+    const releaseBinary = Buffer.from("the release binary");
+    writeBuiltCli(root, RELEASE, releaseBinary);
+
+    const staged = ensureSidecarPlaceholder(root, TRIPLE, false, { profile: DEBUG });
+    assert.equal(readFileSync(staged).length, 0, "an empty placeholder, not the wrong profile");
+    assert.deepEqual(
+      readFileSync(join(root, "src-tauri", "target", RELEASE, "monkey-cli")),
+      releaseBinary,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a cross build stages from its own triple-named target directory", () => {
   const root = repo();
   try {
@@ -147,8 +206,14 @@ test("a cross build stages from its own triple-named target directory", () => {
     // The host's own debug output must not be mistaken for the cross build's.
     writeBuiltCli(root, "debug", Buffer.from("the host binary"));
 
-    assert.equal(builtCliPath(root, true, target), join(dir, "monkey-cli.exe"));
-    const staged = ensureSidecarPlaceholder(root, target, true, target);
+    assert.equal(
+      builtCliPath(root, true, { profile: RELEASE, explicitTarget: target }),
+      join(dir, "monkey-cli.exe"),
+    );
+    const staged = ensureSidecarPlaceholder(root, target, true, {
+      profile: RELEASE,
+      explicitTarget: target,
+    });
     assert.deepEqual(readFileSync(staged), REAL_BINARY);
   } finally {
     rmSync(root, { recursive: true, force: true });

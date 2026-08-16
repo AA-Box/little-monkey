@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component as PathComponent, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -3648,23 +3648,35 @@ impl ExtensionManager {
         let started = std::time::Instant::now();
         let cancellation = host.cancellation.clone();
         let deadline_reached = Arc::new(AtomicBool::new(false));
+        let ending = Ending::running();
         let engine = self.engine.clone();
         let timer_token = cancellation.clone();
         let timer_deadline = deadline_reached.clone();
+        let timer_ending = ending.clone();
         let cancellation_markers = host.cancellation_markers.clone();
         let timer = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS);
             loop {
                 if cancellation_markers.iter().any(|path| path.exists()) {
-                    timer_token.cancel();
+                    if timer_ending.claim(Ending::CANCELLED) {
+                        timer_token.cancel();
+                    }
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    timer_deadline.store(true, Ordering::Release);
+                    if timer_ending.claim(Ending::TIMED_OUT) {
+                        timer_deadline.store(true, Ordering::Release);
+                    }
                     break;
                 }
                 tokio::select! {
-                    _ = timer_token.cancelled() => break,
+                    // An in-process cancel reaches the guest through the same
+                    // token, so this is where that one is claimed. Losing the
+                    // claim means the guest had already ended when it landed.
+                    _ = timer_token.cancelled() => {
+                        timer_ending.claim(Ending::CANCELLED);
+                        break;
+                    }
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {},
                 }
             }
@@ -3725,50 +3737,43 @@ impl ExtensionManager {
         store.set_epoch_deadline(1);
         let remaining_ms = DEFAULT_TIMEOUT_MS
             .saturating_sub(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
-        let mut outcome = tokio::time::timeout(
+        let guest_ending = ending.clone();
+        let outcome = tokio::time::timeout(
             Duration::from_millis(remaining_ms.saturating_add(1_000)),
             async {
-                let instance =
-                    bindings::Extension::instantiate_async(&mut store, &component, &linker)
-                        .await
-                        .map_err(|error| format!("Component instantiation failed: {error}"))?;
-                match call {
-                    Some((capability_id, input_json)) => instance
-                        .little_monkey_extension_guest()
-                        .call_run(&mut store, capability_id, input_json)
-                        .await
-                        .map_err(|error| {
-                            classify_guest_stop(&error, trap_deadline.load(Ordering::Acquire))
-                        })?,
-                    None => Ok(String::new()),
+                // Every path out of the guest claims the ending in its first
+                // statement, so anything the watcher observes from that instant
+                // on is late by construction. Nothing downstream consults a
+                // marker or a flag again.
+                let instantiated =
+                    bindings::Extension::instantiate_async(&mut store, &component, &linker).await;
+                let instance = match instantiated {
+                    Ok(instance) => instance,
+                    Err(error) => {
+                        guest_ending.claim(Ending::FINISHED);
+                        return Err(format!("Component instantiation failed: {error}"));
+                    }
+                };
+                let Some((capability_id, input_json)) = call else {
+                    guest_ending.claim(Ending::FINISHED);
+                    return Ok(String::new());
+                };
+                let answer = instance
+                    .little_monkey_extension_guest()
+                    .call_run(&mut store, capability_id, input_json)
+                    .await;
+                let interrupted_by_deadline = trap_deadline.load(Ordering::Acquire);
+                guest_ending.claim(Ending::FINISHED);
+                match answer {
+                    Ok(answer) => answer,
+                    Err(error) => Err(classify_guest_stop(&error, interrupted_by_deadline)),
                 }
             },
         )
         .await
         .unwrap_or_else(|_| Err(TIMEOUT_ERROR.to_string()));
         timer.abort();
-        // A guest that never reached a trap — one blocked in a host call, or
-        // one that answered in the same instant a cancel landed — still ends
-        // as cancelled, because the caller asked for it to stop.
-        //
-        // A guest that spent its whole fuel budget is the one exception. Fuel
-        // is the guest's own ceiling and it had already stopped when the cancel
-        // arrived, so relabelling it would both lie about what happened and
-        // let a real runaway escape the trap counters that protectively
-        // disable it.
-        if !matches!(&outcome, Err(error) if error == FUEL_EXHAUSTED_ERROR) {
-            if cancellation.is_cancelled()
-                || store
-                    .data()
-                    .cancellation_markers
-                    .iter()
-                    .any(|path| path.exists())
-            {
-                outcome = Err(CANCELLED_ERROR.to_string());
-            } else if deadline_reached.load(Ordering::Acquire) {
-                outcome = Err(TIMEOUT_ERROR.to_string());
-            }
-        }
+        let outcome = settle_outcome(outcome, ending.observed());
         let remaining = store.get_fuel().unwrap_or(0);
         let fuel_consumed = self.fuel.saturating_sub(remaining);
         let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -4308,6 +4313,61 @@ fn remember_invocation(
             break;
         };
         record.completed_invocations.remove(&oldest);
+    }
+}
+
+/// Which of the three things that can end one invocation got there first.
+///
+/// The question this answers is not "was a cancellation ever requested" but
+/// "was one requested *while the guest was still running*". Those differ by a
+/// hair of wall clock and by everything else: a marker that appears after a
+/// guest has already trapped stopped nothing, and recording it as a
+/// cancellation would erase a real trap from the counters that protectively
+/// disable a misbehaving extension.
+///
+/// A single compare-and-exchange settles it. The watcher claims when it sees a
+/// marker, a cancelled token or the wall-clock deadline; the execution claims
+/// in the first statement after the guest returns control. Exactly one of them
+/// wins, and the loser's observation is late by construction.
+#[derive(Clone)]
+struct Ending(Arc<AtomicU8>);
+
+impl Ending {
+    const RUNNING: u8 = 0;
+    const FINISHED: u8 = 1;
+    const CANCELLED: u8 = 2;
+    const TIMED_OUT: u8 = 3;
+
+    fn running() -> Self {
+        Self(Arc::new(AtomicU8::new(Self::RUNNING)))
+    }
+
+    /// Try to be the one that ended this invocation. `true` if this claim won.
+    fn claim(&self, ending: u8) -> bool {
+        self.0
+            .compare_exchange(Self::RUNNING, ending, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn observed(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Decide what an invocation reports, given what it produced and what ended it.
+///
+/// The rule is that execution's own answer stands. Wasmtime is the only thing
+/// that knows whether a guest trapped, spent its fuel or took an interrupt, and
+/// `classify_guest_stop` has already named that; an external ending never
+/// rewrites it. What an external ending does decide is the case execution left
+/// open — a guest that answered anyway, either because it swallowed a cancelled
+/// host call or because it finished in the instant after something outside it
+/// had already committed to stopping it. That answer is not delivered.
+fn settle_outcome(outcome: Result<String, String>, ending: u8) -> Result<String, String> {
+    match (outcome, ending) {
+        (Ok(_), Ending::CANCELLED) => Err(CANCELLED_ERROR.to_string()),
+        (Ok(_), Ending::TIMED_OUT) => Err(TIMEOUT_ERROR.to_string()),
+        (outcome, _) => outcome,
     }
 }
 
@@ -6957,6 +7017,122 @@ mod tests {
         assert_eq!(detail.health.trap_count, 1);
         assert_eq!(detail.health.consecutive_failures, 1);
         assert_eq!(detail.health.state, HealthState::Degraded);
+    }
+
+    /// A record with nothing on it but the counters this asserts about.
+    fn fixture_record() -> InstalledRecord {
+        InstalledRecord {
+            extension_id: "dev.example.echo".to_string(),
+            active_version: "1.0.0".to_string(),
+            previous_version: None,
+            versions: BTreeMap::new(),
+            config: BTreeMap::new(),
+            configured_secret_slots: BTreeSet::new(),
+            health: RuntimeHealth::default(),
+            logs: Vec::new(),
+            private_state: BTreeMap::new(),
+            last_tool_result: None,
+            last_events: Vec::new(),
+            completed_invocations: BTreeMap::new(),
+            active_invocations: BTreeMap::new(),
+        }
+    }
+
+    /// What a run reports is what execution produced, whatever a marker that
+    /// arrived afterwards says.
+    ///
+    /// The accounting is the reason this matters rather than the wording.
+    /// `record_invocation_failure` exempts a cancellation from the failure and
+    /// trap counters, which is right — a user pressing Stop is not a
+    /// misbehaving extension. So a marker allowed to relabel a *trap* as a
+    /// cancellation erases that trap from the count that protectively disables
+    /// an extension after three of them, and one allowed to relabel a
+    /// wall-clock timeout does the same. Both are asserted here on the counters
+    /// themselves, not only on the sentence.
+    ///
+    /// The Ok cases are the other half of the rule: execution left the question
+    /// open — the guest answered anyway, having swallowed a cancelled host call
+    /// or finished in the instant after something outside it had committed to
+    /// stopping it — and there the external ending decides, because a caller
+    /// who cancelled is not owed a result.
+    #[test]
+    fn an_ending_never_rewrites_what_execution_itself_produced() {
+        let trapped = || Err("Component trapped: wasm `unreachable`".to_string());
+        for ending in [Ending::CANCELLED, Ending::TIMED_OUT, Ending::FINISHED] {
+            assert_eq!(settle_outcome(trapped(), ending), trapped());
+            assert_eq!(
+                settle_outcome(Err(TIMEOUT_ERROR.into()), ending),
+                Err(TIMEOUT_ERROR.into())
+            );
+            assert_eq!(
+                settle_outcome(Err(FUEL_EXHAUSTED_ERROR.into()), ending),
+                Err(FUEL_EXHAUSTED_ERROR.into())
+            );
+            assert_eq!(
+                settle_outcome(Err(CANCELLED_ERROR.into()), ending),
+                Err(CANCELLED_ERROR.into())
+            );
+            // A guest's own error is its own answer too.
+            assert_eq!(
+                settle_outcome(Err("the guest said no".into()), ending),
+                Err("the guest said no".into())
+            );
+        }
+        // Only an answer execution left standing can be overridden.
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::CANCELLED),
+            Err(CANCELLED_ERROR.into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::TIMED_OUT),
+            Err(TIMEOUT_ERROR.into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::FINISHED),
+            Ok("{}".into())
+        );
+        assert_eq!(
+            settle_outcome(Ok("{}".into()), Ending::RUNNING),
+            Ok("{}".into())
+        );
+
+        // And the accounting that follows from each, on a real record.
+        let mut record = fixture_record();
+        record_invocation_failure(
+            &mut record,
+            &settle_outcome(trapped(), Ending::CANCELLED).unwrap_err(),
+            "late-marker-trap",
+        );
+        assert_eq!(record.health.trap_count, 1);
+        assert_eq!(record.health.consecutive_failures, 1);
+        record_invocation_failure(
+            &mut record,
+            &settle_outcome(Err(TIMEOUT_ERROR.into()), Ending::CANCELLED).unwrap_err(),
+            "late-marker-timeout",
+        );
+        assert_eq!(record.health.trap_count, 2);
+        assert_eq!(record.health.consecutive_failures, 2);
+        // The contrast: a cancellation that really did stop a running guest
+        // touches neither counter.
+        record_invocation_failure(&mut record, CANCELLED_ERROR, "real-cancellation");
+        assert_eq!(record.health.trap_count, 2);
+        assert_eq!(record.health.consecutive_failures, 2);
+    }
+
+    /// Exactly one claim on an ending can win, whichever order they arrive in.
+    #[test]
+    fn only_the_first_claim_on_an_ending_wins() {
+        let ending = Ending::running();
+        assert_eq!(ending.observed(), Ending::RUNNING);
+        assert!(ending.claim(Ending::FINISHED));
+        assert!(!ending.claim(Ending::CANCELLED));
+        assert!(!ending.claim(Ending::TIMED_OUT));
+        assert_eq!(ending.observed(), Ending::FINISHED);
+
+        let raced = Ending::running();
+        assert!(raced.claim(Ending::CANCELLED));
+        assert!(!raced.claim(Ending::FINISHED));
+        assert_eq!(raced.observed(), Ending::CANCELLED);
     }
 
     /// The gap this suite used to have: an on-disk marker stopping a guest that

@@ -68,25 +68,36 @@ function isSymlink(path) {
 }
 
 /**
- * The real `monkey-cli` a previous cargo build left behind, if there is one.
+ * Where cargo puts `monkey-cli` for one profile, and where tauri-build will
+ * copy the staged sidecar back onto.
  *
- * Debug first: that is the profile `cargo test` and `cargo run` use, so it is
- * the binary an incremental developer build stands to lose. A cross build
- * (`CLI_SIDECAR_TARGET`) puts its output under a triple-named directory
- * instead, so that layout is the one consulted in that case.
+ * A cross build (`CLI_SIDECAR_TARGET`) puts its output under a triple-named
+ * directory instead, so that layout is the one consulted in that case.
  */
-export function builtCliPath(repoRoot, isWindows, explicitTarget) {
-  return cliDestinations(repoRoot, isWindows, explicitTarget).find((path) => fileSize(path) > 0);
-}
-
-function cliDestinations(repoRoot, isWindows, explicitTarget) {
+export function cliDestination(repoRoot, isWindows, { profile, explicitTarget } = {}) {
   const name = isWindows ? "monkey-cli.exe" : "monkey-cli";
   const targetRoot = join(repoRoot, "src-tauri", "target");
-  const profiles = explicitTarget
-    ? [join(targetRoot, explicitTarget, "debug"), join(targetRoot, explicitTarget, "release")]
-    : [join(targetRoot, "debug"), join(targetRoot, "release")];
-  return profiles.map((profile) => join(profile, name));
+  const base = explicitTarget ? join(targetRoot, explicitTarget) : targetRoot;
+  return join(base, profile ?? DEBUG, name);
 }
+
+/**
+ * The real `monkey-cli` a previous cargo build of **this profile** left behind.
+ *
+ * Profile-exact rather than first-match, because the staged file is copied onto
+ * the destination of whichever profile is being built. `pnpm stage:cli` builds
+ * `--release`, so on a tree that holds both a debug and a release binary,
+ * answering with the debug one would seed the release destination with a debug
+ * executable — the same class of substitution this whole module exists to
+ * prevent, only quieter, because the result still runs.
+ */
+export function builtCliPath(repoRoot, isWindows, options = {}) {
+  const path = cliDestination(repoRoot, isWindows, options);
+  return fileSize(path) > 0 ? path : undefined;
+}
+
+export const DEBUG = "debug";
+export const RELEASE = "release";
 
 /**
  * Clear a zero-byte `monkey-cli` out of the target directory.
@@ -97,10 +108,13 @@ function cliDestinations(repoRoot, isWindows, explicitTarget) {
  * is merely empty, so removing it is what lets the next build repair itself
  * instead of failing several minutes later inside a test that runs the CLI.
  *
- * Safe by construction: an empty file is never a binary anyone can run.
+ * Safe by construction: an empty file is never a binary anyone can run. Both
+ * profiles are swept rather than only the one being staged, because an empty
+ * file in either is damage whoever finds it did not cause.
  */
 function removeEmptyBuiltCli(repoRoot, isWindows, explicitTarget) {
-  for (const path of cliDestinations(repoRoot, isWindows, explicitTarget)) {
+  for (const profile of [DEBUG, RELEASE]) {
+    const path = cliDestination(repoRoot, isWindows, { profile, explicitTarget });
     try {
       if (!isSymlink(path) && statSync(path).isFile() && statSync(path).size === 0) {
         unlinkSync(path);
@@ -113,14 +127,18 @@ function removeEmptyBuiltCli(repoRoot, isWindows, explicitTarget) {
 
 /**
  * Put something at the staged sidecar path that tauri-build can copy into the
- * target directory without destroying anything: the real binary when one
- * exists, an empty placeholder only when none does.
+ * target directory without destroying anything: this profile's real binary when
+ * one exists, an empty placeholder only when none does.
+ *
+ * `profile` is the profile whose destination the copy will land on — `release`
+ * for `pnpm stage:cli`, `debug` for the `cargo test`/`cargo run` bootstrap.
  */
-export function ensureSidecarPlaceholder(repoRoot, target, isWindows, explicitTarget) {
+export function ensureSidecarPlaceholder(repoRoot, target, isWindows, options = {}) {
+  const { profile = DEBUG, explicitTarget } = options;
   mkdirSync(join(repoRoot, "src-tauri", "binaries"), { recursive: true });
   const path = sidecarStagedPath(repoRoot, target, isWindows);
   removeEmptyBuiltCli(repoRoot, isWindows, explicitTarget);
-  const built = builtCliPath(repoRoot, isWindows, explicitTarget);
+  const built = builtCliPath(repoRoot, isWindows, { profile, explicitTarget });
   if (built) {
     // Not create-if-missing: a stale binary from an older build would be
     // copied over the current one just as destructively as an empty
