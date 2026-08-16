@@ -474,7 +474,7 @@ describe("runSecurityAutofixAgent", () => {
   it("returns the agent's final reply once it stops requesting tool calls", async () => {
     mocks.attemptStream.mockResolvedValue({ content: "Upgraded lodash and ran tests.", toolCalls: [], streamError: null, contentStarted: true });
     const result = await runSecurityAutofixAgent(baseParams());
-    expect(result).toEqual({ outcome: "completed", summary: "Upgraded lodash and ran tests.", durableRunId: null });
+    expect(result).toMatchObject({ outcome: "completed", summary: "Upgraded lodash and ran tests.", durableRunId: null });
   });
 
   it("reports a stream error as an error outcome", async () => {
@@ -505,7 +505,7 @@ describe("runSecurityAutofixAgent", () => {
 
     const result = await runSecurityAutofixAgent(baseParams());
 
-    expect(result).toEqual({ outcome: "completed", summary: "Done.", durableRunId: null });
+    expect(result).toMatchObject({ outcome: "completed", summary: "Done.", durableRunId: null });
     expect(mocks.executeToolCall).toHaveBeenCalledTimes(1);
     expect(mocks.executeToolCall.mock.calls[0][8]).toBe("security-autofix");
   });

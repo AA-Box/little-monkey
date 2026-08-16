@@ -1628,6 +1628,21 @@ pub enum RunEvent {
     ToolStarted {
         tool_call_id: String,
     },
+    /// A native skill was frozen into this run's prompt, with the exact
+    /// content hash that was used.
+    ///
+    /// Written by the invocation path itself rather than inferred later: a
+    /// reader asking "which version of /review did this run actually use?"
+    /// must get the answer from the run, not from whatever happens to be
+    /// installed when the question is asked. Learning provenance,
+    /// effectiveness, correction attribution and regression analysis all key
+    /// off this hash.
+    SkillInvoked {
+        command: String,
+        /// `global` or `workspace` — the root the skill was discovered in.
+        scope: String,
+        sha256: String,
+    },
     ToolFinished {
         tool_call_id: String,
         outcome: ToolOutcome,
@@ -1822,6 +1837,20 @@ impl RunEvent {
             }
             Self::ToolStarted { tool_call_id } => {
                 validate_protocol_id("event.tool_call_id", tool_call_id)?;
+            }
+            Self::SkillInvoked {
+                command,
+                scope,
+                sha256,
+            } => {
+                validate_single_line("event.command", command, MAX_LABEL_BYTES)?;
+                if !matches!(scope.as_str(), "global" | "workspace") {
+                    return Err(ProtocolValidationError::new(
+                        "event.scope",
+                        "must be global or workspace",
+                    ));
+                }
+                validate_sha256("event.sha256", sha256)?;
             }
             Self::ToolFinished {
                 tool_call_id,

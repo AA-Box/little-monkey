@@ -1492,6 +1492,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         onStartSideTask={handleStartSideTask}
         onEditGeneratedImage={handleEditGeneratedImage}
         onOpenBackgroundTasks={onOpenBackgroundTasks}
+        onOpenSettingsTab={onOpenSettingsTab}
       />
 
       {error !== null && (

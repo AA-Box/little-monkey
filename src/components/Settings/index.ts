@@ -5,6 +5,7 @@ export * from "./KeyboardShortcutsPanel";
 export * from "./GitDeliveryPanel";
 export * from "./CompanionPanel";
 export * from "./NativeSkillsManager";
+export * from "./SkillLearningPanel";
 export * from "./SecurityDoctorPanel";
 export * from "./AppearancePanel";
 export * from "./DesktopControlPanel";

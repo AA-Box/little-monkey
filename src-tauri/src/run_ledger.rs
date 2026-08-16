@@ -5148,6 +5148,7 @@ fn derive_event_effects(event: &RunEvent) -> EventEffects<'_> {
         // snapshot that records what it was.
         RunEvent::RoutingDecided { .. } => ("routing_decided", None, Projection::None),
         RunEvent::ToolStarted { .. } => ("tool_started", None, Projection::None),
+        RunEvent::SkillInvoked { .. } => ("skill_invoked", None, Projection::None),
         RunEvent::ToolFinished { .. } => ("tool_finished", None, Projection::None),
         RunEvent::ArtifactAdded {
             artifact_id,

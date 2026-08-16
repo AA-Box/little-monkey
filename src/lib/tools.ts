@@ -695,6 +695,102 @@ export const SKILL_INVOKE_TOOL: ToolDef = {
 };
 
 /**
+ * The `manage_skill_learning` tool: the model's only route into the learning
+ * loop (`src-tauri/src/skill_learning.rs`).
+ *
+ * Deliberately NOT a filesystem primitive. There is no action here that
+ * writes into a skills directory, approves anything, or widens a permission:
+ * `propose` hands the backend structured fields, which it validates and turns
+ * into `SKILL.md` bytes itself under an app-owned staging directory, and the
+ * two `request_*` actions are requests whose outcome the durable policy (and,
+ * unless the user turned on unattended promotion for safe changes, the user)
+ * decides.
+ *
+ * `candidate_id` is not optional in practice: a candidate only exists once
+ * the backend detected a signal from a real run's durable events, so a model
+ * with nothing to cite cannot invent one. `run_id` is injected by
+ * `turnEngine.ts`'s reserved-args registry and is scrubbed if the model
+ * supplies it.
+ *
+ * Offered only when `settingsStore.skillLearningEnabled` is on and the
+ * backend's learning mode is not `off` — see `agentLoop.ts`'s
+ * `toolsForSettings` call site.
+ */
+export const MANAGE_SKILL_LEARNING_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'manage_skill_learning',
+    description:
+      "Draft, inspect, or request review of a reusable skill derived from THIS session's real, verified work. Only ever propose against a candidate id the app opened from run evidence. Proposing does not install anything, and requesting evaluation or promotion does not approve anything — the user and the app's policy decide that.",
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['propose', 'inspect_candidate', 'request_evaluation', 'request_promotion', 'deprecate_learned_skill'],
+          description: 'What to do with the learning backend.',
+        },
+        candidate_id: {
+          type: 'string',
+          description: 'The candidate this action applies to, as given to you by the app. Required for every action except deprecate_learned_skill.',
+        },
+        command: {
+          type: 'string',
+          description: 'For deprecate_learned_skill: the installed learned skill\'s command name, without the leading slash.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Short, evidence-backed reason for this action.',
+        },
+        reflection: {
+          type: 'object',
+          description: 'For propose: the structured skill. The app builds and validates the actual SKILL.md from these fields — do not write frontmatter or file paths outside proposed_resource_files.',
+          properties: {
+            scope: { type: 'string', enum: ['workspace', 'global'], description: 'Must match the scope the signal was detected in.' },
+            title: { type: 'string', description: 'Short name for the skill.' },
+            description: { type: 'string', description: 'One sentence describing when this procedure applies.' },
+            proposed_command: { type: 'string', description: 'Slash command name: lowercase letters, digits and single dashes.' },
+            proposed_skill_content: { type: 'string', description: 'The reusable procedure itself, in Markdown. Generalize it — do not embed one-off values from the observed run.' },
+            proposed_resource_files: {
+              type: 'array',
+              description: 'Optional bundled reference files, read on demand via read_skill_resource. Paths are relative and stay inside the skill folder.',
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  content: { type: 'string' },
+                },
+                required: ['path', 'content'],
+                additionalProperties: false,
+              },
+            },
+            allowed_tools: {
+              type: 'array',
+              description: 'Tools this skill needs while active. Narrower is better; an empty list means unrestricted and will require approval when it widens an existing version.',
+              items: { type: 'string' },
+            },
+            requirements: {
+              type: 'object',
+              description: 'External executables and environment variables the procedure genuinely needs. Declaring any of these requires the user\'s approval before installation.',
+              properties: {
+                bins: { type: 'array', items: { type: 'string' } },
+                env: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['bins', 'env'],
+              additionalProperties: false,
+            },
+          },
+          required: ['scope', 'title', 'description', 'proposed_command', 'proposed_skill_content', 'allowed_tools', 'requirements'],
+          additionalProperties: false,
+        },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
  * The `read_skill_resource` tool: reads one bundled file (other than
  * `SKILL.md` itself) from a native skill's folder — the progressive-
  * disclosure counterpart to a skill's `resource_files` listing (see

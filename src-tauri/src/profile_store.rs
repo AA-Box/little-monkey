@@ -2799,6 +2799,17 @@ fn searchable_run_event(
             "node",
             format!("{origin_node_id} {origin_last_sequence}"),
         ),
+        // Indexed by command and hash: "which runs used this version of
+        // /review" is the question this event makes answerable.
+        RunEvent::SkillInvoked {
+            command,
+            scope,
+            sha256,
+        } => (
+            "skill_invoked",
+            "skill",
+            format!("/{command} {scope} {sha256}"),
+        ),
     }
 }
 
