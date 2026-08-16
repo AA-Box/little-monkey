@@ -2185,6 +2185,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::PermissionDecided { .. } => "permission_decided",
         RunEvent::RoutingDecided { .. } => "routing_decided",
         RunEvent::ToolStarted { .. } => "tool_started",
+        RunEvent::SkillInvoked { .. } => "skill_invoked",
         RunEvent::ToolFinished { .. } => "tool_finished",
         RunEvent::ArtifactAdded { .. } => "artifact_added",
         RunEvent::CheckpointLinked { .. } => "checkpoint_linked",

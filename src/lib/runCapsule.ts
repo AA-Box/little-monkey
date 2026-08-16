@@ -250,6 +250,7 @@ function timelineSummary(envelope: RunEventEnvelopeWire): { title: string; summa
     // the policy, which is what "which policy chose this target" asks for.
     case "routing_decided": return { title: "Dispatch decided", summary: shortText(event.payload.reason) };
     case "tool_started": return { title: "Tool started", summary: event.payload.tool_call_id };
+    case "skill_invoked": return { title: "Skill invoked", summary: `/${event.payload.command} (${event.payload.scope}) at ${event.payload.sha256.slice(0, 12)}…` };
     case "tool_finished": return { title: "Tool finished", summary: `${event.payload.outcome} in ${event.payload.duration_ms} ms` };
     case "artifact_added": return { title: "Artifact captured", summary: `${event.payload.name} · ${event.payload.media_type}` };
     case "checkpoint_linked": return { title: "Checkpoint linked", summary: event.payload.label };

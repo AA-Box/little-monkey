@@ -24,9 +24,20 @@
  * same mechanism a manual model switch uses — no separate sticky field.
  */
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import {
+  candidateNotice,
+  finalizeLearningForRun,
+  formatLearningNotice,
+  learnFromFinishedRun,
+  type InvokedSkillUse,
+  type ReflectionCall,
+} from './skillLearning';
+import { cachedLearningMode } from './skillLearningClient';
+import type { NativeSkillScope } from './nativeSkillsClient';
 import { mcpToolDefs } from './mcpTools';
 import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
@@ -597,6 +608,7 @@ export function toolsForSettings(
   subagentsEnabled = false,
   skillToolEnabled = false,
   readSkillResourceToolEnabled = false,
+  skillLearningToolEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -608,6 +620,7 @@ export function toolsForSettings(
     ...(subagentsEnabled ? [TASK_TOOL, WORKFLOW_TOOL] : []),
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
+    ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
   ];
 }
 
@@ -621,30 +634,12 @@ export function toolsForSettings(
  * only when EVERY invoked skill declares one does this return the union of
  * their sets, so stacking a restrictive skill with a permissive one never
  * silently locks the model out of tools the permissive skill actually needs.
+ *
+ * Implemented in `allowedTools.ts` and re-exported here, where every caller
+ * already looks for it: `headlessAgentRunner.ts` applies the same narrowing to
+ * an evaluation arm and cannot import this module.
  */
-export function allowedToolsRestriction(
-  invokedCommands: ReadonlySet<string>,
-  availableSkills: SlashSkill[],
-): ReadonlySet<string> | null {
-  const invoked = availableSkills.filter((candidate) => invokedCommands.has(candidate.command));
-  if (invoked.length === 0 || invoked.some((candidate) => !candidate.allowedTools || candidate.allowedTools.length === 0)) {
-    return null;
-  }
-  return new Set(invoked.flatMap((candidate) => candidate.allowedTools ?? []));
-}
-
-/**
- * Applies `allowedToolsRestriction`'s result (if any) to a per-turn tool
- * list — the `skill` tool itself always stays offered even under a
- * restrictive list (deliberate exception): this app stacks up to
- * `MAX_SKILLS_PER_TURN` skills per turn (unlike a single-skill-at-a-time
- * model), so a restrictive skill must never strand the model unable to
- * invoke a different, less-restricted one.
- */
-export function applyAllowedToolsRestriction(tools: ToolDef[], restriction: ReadonlySet<string> | null): ToolDef[] {
-  if (restriction === null) return tools;
-  return tools.filter((tool) => tool.function.name === 'skill' || restriction.has(tool.function.name));
-}
+export { allowedToolsRestriction, applyAllowedToolsRestriction };
 
 /** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
  * `KnowledgeStack` — kept local (rather than importing the full interface)
@@ -916,6 +911,53 @@ function buildVerifyOutput(result: VerifyRunResult): string {
   const combined = parts.join('\n\n');
   if (combined.length <= VERIFY_NOTICE_OUTPUT_CAP) return combined;
   return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
+}
+
+/**
+ * Runs the workspace's own configured verification commands inside one
+ * learning-evaluation sandbox, and reports whether they passed.
+ *
+ * Same config and same Rust runner the ordinary post-turn phase uses — only
+ * the working directory differs, and Rust accepts that directory only for a
+ * marker-verified sandbox this app created. `null` means the workspace has no
+ * verification configured, which is reported as "no result", never as a pass:
+ * an evaluation may not claim a verification that never ran.
+ */
+export async function runSandboxVerification(
+  sandboxPath: string,
+  turnId: string,
+  signal?: AbortSignal,
+  workspacePath?: string,
+): Promise<{ passed: boolean; detail: string } | null> {
+  let config: VerifyConfig;
+  try {
+    // The commands of the workspace this sandbox is a copy of, which is not
+    // necessarily the one open right now — a candidate learned in A can be
+    // evaluated from B, or with nothing open. `verify_run` independently
+    // derives the same workspace from the sandbox's own marker, so a wrong
+    // value here cannot make it execute another workspace's commands.
+    config = await invoke<VerifyConfig>('verify_get_config', { workspacePath });
+  } catch {
+    return null;
+  }
+  const enabled = config.commands.filter((command) => command.enabled);
+  if (enabled.length === 0) return null;
+  for (const command of enabled) {
+    if (signal?.aborted) return null;
+    try {
+      const result = await invoke<VerifyRunResult>('verify_run', {
+        commandId: command.id,
+        turnId,
+        sandboxPath,
+      });
+      if (result.timedOut || result.code !== 0) {
+        return { passed: false, detail: `${result.label}: ${buildVerifyOutput(result).slice(0, 400)}` };
+      }
+    } catch (err) {
+      return { passed: false, detail: `${command.label}: ${errorMessage(err)}` };
+    }
+  }
+  return { passed: true, detail: `${enabled.length} verification command(s) passed` };
 }
 
 /** The first failed command from a `runVerificationPhase` pass — enough
@@ -1476,6 +1518,54 @@ function registerDurableController(
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  /** One-shot model call for the bounded learning reflection pass, built by
+   * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
+   * and consumed by `runAgentTurn`'s `finally` — the learning step can only
+   * run once the durable run is COMPLETE, because the backend classifies the
+   * signal from that run's own terminal events. `null` when the turn never
+   * got as far as resolving a target. */
+  reflect: ReflectionCall | null;
+  /** This turn's live skill context. Held by reference (not a copy) because
+   * `invokedCommands` is mutated in place as the turn runs, so
+   * `runAgentTurn`'s `finally` sees every skill the turn ended up using no
+   * matter which of this loop's early returns it took. */
+  skills: SkillToolContext | null;
+  /** Failing tool results this turn produced, classified exactly as the
+   * durable recorder classifies them. Part of a learned skill's effectiveness
+   * record, and the reason a turn that "completed" with three failed tool
+   * calls is not counted as a success for the skill it used. */
+  toolFailures: string[];
+}
+
+/** Cap on the failing tool results carried into a learned skill's
+ * effectiveness record — the record is a signal, not a log. */
+const MAX_RECORDED_TOOL_FAILURES = 8;
+
+/**
+ * One invoked native skill, paired with the exact content hash it was frozen
+ * at. Local prompt skills and signed packages are excluded: neither can be a
+ * learned skill, and neither carries a content hash an outcome could be
+ * attributed to.
+ *
+ * Scope comes from the descriptor id `nativeSkills` built (`native:<scope>:…`)
+ * rather than from a second lookup, so it always agrees with the root the
+ * skill was actually discovered in.
+ */
+export function skillUse(skill: SlashSkill): InvokedSkillUse | null {
+  if (skill.source !== 'native') return null;
+  const scope = skill.id.split(':')[1];
+  if (scope !== 'global' && scope !== 'workspace') return null;
+  return { command: skill.command, scope, sha256: skill.contentSha256 };
+}
+
+/** Writes the durable `skill_invoked` event for one invocation. The run's own
+ * record of WHICH version it ran — the only thing a later effectiveness,
+ * correction or regression judgement can honestly be keyed to, since the
+ * installed version can have moved on (or been rolled back) by then. */
+function recordSkillInvocation(durable: DurableTurnContext, skill: SlashSkill): void {
+  const use = skillUse(skill);
+  if (!use) return;
+  durable.recorder?.recordSkillInvoked(use.command, use.scope, use.sha256);
 }
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
@@ -2180,7 +2270,7 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null };
+  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2233,6 +2323,7 @@ async function runTurnGuarded(
           console.error('Failed to record cancellation request', error),
         );
       }
+      const cleanlyCompleted = !signal.aborted && thrown === null && durable.failure === null;
       const terminal = signal.aborted
         ? durable.recorder.cancel('Stopped by the user')
         : thrown !== null
@@ -2241,6 +2332,34 @@ async function runTurnGuarded(
             ? durable.recorder.fail(new Error(durable.failure), true)
             : durable.recorder.complete('Desktop turn completed');
       await terminal.catch((error) => console.error('Failed to finalize durable run', error));
+
+      // Learning runs strictly AFTER the run is durably complete.
+      //
+      // Effectiveness is finalized for EVERY terminal state — a failed or
+      // cancelled turn that used a learned skill is exactly the turn its
+      // history most needs — and the backend reads which versions the run
+      // used from the run's own durable events, so nothing here names a hash.
+      // Detection is the narrower half: only a run that actually completed
+      // can be a candidate. Everything is best-effort — a turn that already
+      // succeeded must never surface a learning failure as its own.
+      await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
+      if (cleanlyCompleted && durable.reflect !== null) {
+        const scope: NativeSkillScope =
+          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
+        const candidate = await learnFromFinishedRun(
+          durable.recorder.runId,
+          userText,
+          scope,
+          durable.reflect,
+          signal,
+        );
+        if (candidate) {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatLearningNotice(candidateNotice(candidate)),
+          });
+        }
+      }
     }
   }
 }
@@ -2722,7 +2841,15 @@ async function runAgentTurnBody(
     availableSkills,
     invokedCommands: invokedSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    runId: durable.recorder?.runId,
+    onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
+  durable.skills = skillToolContext;
+  // Explicit `/command` invocations are already frozen into the system prompt
+  // by the time the loop starts, so they are recorded here rather than through
+  // `onInvoked` — the event has to name every version this run used, not only
+  // the ones the model picked itself.
+  for (const invocation of skillInvocations) recordSkillInvocation(durable, invocation.skill);
   const skillToolEnabled =
     settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
@@ -2741,6 +2868,10 @@ async function runAgentTurnBody(
     settings.subagentsEnabled || ultracode,
     skillToolEnabled,
     readSkillResourceToolEnabled,
+    // The learning tool is a capability, so an unknown backend mode means
+    // "not offered" — see `cachedLearningMode`. It also needs a durable run:
+    // without one there is no evidence chain for a proposal to append to.
+    cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -2820,6 +2951,34 @@ async function runAgentTurnBody(
         },
         signal
       ),
+  };
+
+  // The bounded learning reflection pass shares `sendForSummary`/`classify`'s
+  // exact transport — one non-streaming, privacy-gated call against this
+  // turn's own target — and is stashed on the durable context because it can
+  // only run once `runAgentTurn`'s `finally` has completed the run.
+  durable.reflect = async (reflectionMessages, reflectionTools, reflectionSignal) => {
+    const prepared = await privacyGateWireForTarget(target, reflectionMessages);
+    if (!prepared) {
+      throw new Error('Privacy Firewall cancelled the learning reflection.');
+    }
+    const result = await attemptStream(
+      prepared.target,
+      prepared.messages,
+      reflectionTools,
+      reflectionSignal,
+      effort,
+      sessionId,
+      undefined,
+      true,
+      undefined,
+      durable.recorder?.runId,
+      // Side-channel work, like the risk judge — kept out of the turn's own
+      // token status line.
+      false,
+      { preGated: true },
+    );
+    return { content: result.content, toolCalls: result.toolCalls, streamError: result.streamError };
   };
 
   // Absolute paths this turn's `write_file`/`edit_file` calls have
@@ -3252,6 +3411,20 @@ async function runAgentTurnBody(
           Date.now() - toolStartedAt,
           result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
         );
+        // Failing results are also this turn's evidence about any learned
+        // skill it invoked (see `recordSkillUses`). Classified the same way
+        // `durableRun.ts`'s `resultOutcome` classifies it, and bounded so a
+        // pathological round cannot grow the record without limit.
+        if (result !== CANCELLED_TOOL_RESULT && durable.toolFailures.length < MAX_RECORDED_TOOL_FAILURES) {
+          try {
+            const parsed = JSON.parse(result) as { error?: unknown };
+            if (parsed && typeof parsed === 'object' && parsed.error) {
+              durable.toolFailures.push(`${toolCall.function.name}: ${String(parsed.error).slice(0, 200)}`);
+            }
+          } catch {
+            // A plain-text tool result is a success — nothing to record.
+          }
+        }
         return result;
       };
       // Reject (without executing) any call whose name wasn't actually

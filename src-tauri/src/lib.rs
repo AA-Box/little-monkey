@@ -239,8 +239,14 @@ pub mod prompts;
 // ROADMAP #3). `pub` for the same reason as `prompts`: `WorkflowService` and
 // `monkey-cli` record into it without an `AppHandle`.
 pub mod config_revisions;
+// The evidence-backed learning loop over the native `SKILL.md` runtime. `pub`
+// for the same reason as `native_skills` itself: `monkey-cli`'s
+// `skills learned` subcommands drive the identical store, so the desktop and
+// the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+pub mod skill_learning;
+mod skill_learning_commands;
 mod system;
 mod terminal;
 mod tools;
@@ -834,6 +840,16 @@ pub fn run() {
     let native_skills_state =
         native_skill_commands::NativeSkillsCommandState::production(&app_data_dir)
             .expect("failed to initialize the native SKILL.md runtime");
+    let skill_learning_state =
+        skill_learning_commands::SkillLearningCommandState::production(&app_data_dir)
+            .expect("failed to initialize the skill learning store");
+    // Resolves an interrupted promotion against what is actually installed
+    // before anything can discover or invoke a half-published skill.
+    skill_learning_commands::reconcile_at_startup(
+        &skill_learning_state.store,
+        &native_skills_state.manager,
+        None,
+    );
     let browser_state = browser_worker::BrowserCommandState::production(&app_data_dir)
         .expect("failed to initialize the isolated browser worker");
     let m7_state = m7_companion::M7CompanionState::production(&app_data_dir)
@@ -930,6 +946,7 @@ pub fn run() {
         .manage(unified_http_server::UnifiedHttpServerState::default())
         .manage(m4_state)
         .manage(native_skills_state)
+        .manage(skill_learning_state)
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
@@ -1271,6 +1288,7 @@ pub fn run() {
             tools::list_workspace_paths,
             tools::tool_remember,
             tools::tool_read_skill_resource,
+            tools::tool_manage_skill_learning,
             web::tool_web_fetch,
             web::tool_web_search,
             web::web_get_settings,
@@ -1552,6 +1570,30 @@ pub fn run() {
             native_skill_commands::native_skills_uninstall_many,
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
+            skill_learning_commands::skill_learning_mode,
+            skill_learning_commands::skill_learning_set_mode,
+            skill_learning_commands::skill_learning_detect,
+            skill_learning_commands::skill_learning_list_candidates,
+            skill_learning_commands::skill_learning_candidate,
+            skill_learning_commands::skill_learning_begin_reflection,
+            skill_learning_commands::skill_learning_stage,
+            skill_learning_commands::skill_learning_plan_evaluation,
+            skill_learning_commands::skill_learning_report_evaluation,
+            skill_learning_commands::skill_learning_mark_unevaluated,
+            skill_learning_commands::skill_learning_evaluations,
+            skill_learning_commands::skill_learning_promote,
+            skill_learning_commands::skill_learning_reject,
+            skill_learning_commands::skill_learning_finalize_run,
+            skill_learning_commands::skill_learning_record_correction,
+            skill_learning_commands::skill_learning_create_sandboxes,
+            skill_learning_commands::skill_learning_destroy_sandboxes,
+            skill_learning_commands::skill_learning_settings,
+            skill_learning_commands::skill_learning_set_settings,
+            skill_learning_commands::skill_learning_reflection_brief,
+            skill_learning_commands::skill_learning_learned_skills,
+            skill_learning_commands::skill_learning_effectiveness,
+            skill_learning_commands::skill_learning_deprecate,
+            skill_learning_commands::skill_learning_discover,
             security_commands::security_audit,
             self_integrity::self_integrity_report,
             update_rollback::update_install_info,

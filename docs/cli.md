@@ -89,6 +89,19 @@ monkey skills install-local <folder> --approval-digest <sha256> --yes
 monkey skills preview-git <repository-url> <40-char-commit> [--subdirectory <path>]
 monkey skills install-git <repository-url> <40-char-commit> --approval-digest <sha256> --yes
 monkey skills enable|disable|rollback|uninstall <command>
+monkey skills learned list [--json]
+monkey skills learned candidates [--json]
+monkey skills learned inspect <candidate-id>
+monkey skills learned evaluate <candidate-id> [--report <case-reports.json>]
+monkey skills learned promote <candidate-id> --yes
+monkey skills learned reject <candidate-id> [--reason <text>]
+monkey skills learned deprecate <command> [--scope global|workspace]
+monkey skills learned mode [off|suggest-only|auto-stage|auto-promote-safe]
+
+# `learned evaluate --report` records a preflight result: it describes what some
+# runtime did, and can never back an unattended promotion. Only the app's own
+# isolated executor, which really runs the arms in disposable workspace copies,
+# produces a promotion-grade pass.
 
 monkey plugins list [--json]
 monkey plugins health [--json]

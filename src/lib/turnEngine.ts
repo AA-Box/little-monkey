@@ -306,6 +306,8 @@ interface ReservedArgContext {
   /** Managed agent-worktree path a worktree-isolated subagent's fs/shell
    * calls resolve against — see `WORKTREE_OVERRIDE_TOOLS`. */
   workspaceRootOverride?: string;
+  /** This turn's durable run id — see the `run_id` entry in `RESERVED_ARGS`. */
+  learningRunId?: string;
 }
 
 /** The tools whose path/cwd resolution honours a worktree override — the
@@ -379,6 +381,12 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // worktree (`agent_worktrees::resolve_with_override`), so even a forged
   // value could only ever name a directory this app created for this purpose.
   { key: 'workspace_root_override', resolve: (ctx) => (WORKTREE_OVERRIDE_TOOLS.has(ctx.name) ? ctx.workspaceRootOverride : undefined) },
+  // Binds a `manage_skill_learning` call to the run it was actually made
+  // from. Frontend-owned like everything else here: a model-supplied
+  // `run_id` is scrubbed, and even the injected value can only ever APPEND
+  // the reflection turn to a candidate's evidence — the runs a candidate is
+  // founded on were written by the backend when it detected the signal.
+  { key: 'run_id', resolve: (ctx) => (ctx.name === 'manage_skill_learning' ? ctx.learningRunId : undefined) },
 ];
 
 function scrubReservedArgs(args: Record<string, unknown>): void {
@@ -515,6 +523,19 @@ export interface SkillToolContext {
    * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
    * already enforces for stacked explicit invocations. */
   maxSkillsPerTurn: number;
+  /** Called with each skill this turn actually invokes, at the moment the
+   * invocation is recorded — the seam the durable `skill_invoked` event is
+   * written from (see `agentLoop.ts`'s `recordSkillInvocation`). A callback
+   * rather than a recorder handle for the same reason `onRoutingDecision` is:
+   * this module never learns what a durable run is. */
+  onInvoked?: (skill: SlashSkill) => void;
+  /** This turn's durable run id, injected as `manage_skill_learning`'s
+   * `run_id` (see `RESERVED_ARGS`). Lives here rather than as a thirteenth
+   * positional parameter because it is skill-adjacent bookkeeping and every
+   * caller that offers the learning tool already builds this context.
+   * `undefined` when the turn has no durable run — the backend then simply
+   * has no reflection run to append to the candidate's evidence. */
+  runId?: string;
 }
 
 /**
@@ -713,6 +734,7 @@ async function executeToolCallInner(
     attachedStackNames,
     riskClassification,
     workspaceRootOverride,
+    learningRunId: skill?.runId,
   });
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
@@ -900,6 +922,7 @@ async function executeToolCallInner(
       // synchronous bookkeeping (no `await` happens between the checks above
       // and this line).
       skill.invokedCommands.add(command);
+      skill.onInvoked?.(matched);
       const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
       return formatSkillToolResult(matched, argumentsText);
     } catch (err) {
