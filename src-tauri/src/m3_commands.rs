@@ -1578,31 +1578,33 @@ pub async fn m3_component_check_updates(
     finish(&state, &operation_id, result).await
 }
 
+#[cfg(target_os = "macos")]
 #[tauri::command]
 pub async fn m3_component_install(
-    #[cfg(target_os = "macos")] app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
-    #[cfg(target_os = "macos")]
     let app_data_dir = app
         .profile_data_dir()
         .map_err(|error| command_error(M3HubError::Runtime(error.to_string())))?;
     component_install_impl(&state, operation_id, timeout_ms, request, |artifact| {
-        #[cfg(target_os = "macos")]
-        {
-            return crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact)
-                .map(|_| ());
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = artifact;
-            Ok(())
-        }
+        crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
     })
     .await
+}
+
+#[cfg(not(target_os = "macos"))]
+#[tauri::command]
+pub async fn m3_component_install(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+) -> Result<M3InstalledComponentView, String> {
+    component_install_impl(&state, operation_id, timeout_ms, request, |_| Ok(())).await
 }
 
 async fn component_install_impl<F>(

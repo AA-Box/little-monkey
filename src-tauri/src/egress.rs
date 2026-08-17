@@ -2365,7 +2365,7 @@ mod tests {
                 EgressRule::SchemeNotAllowed
             );
             assert_eq!(
-                hop("http://192.168.1.10/catalog.json")
+                hop("https://192.168.1.10/catalog.json")
                     .expect_err("the LAN is not this machine")
                     .rule(),
                 EgressRule::PrivateV4
@@ -4700,7 +4700,7 @@ mod tests {
             // `validate_https_url` allows to be remote. `redirect::Policy::none()`
             // — stricter than `hardened()`'s same-origin rule — and every request
             // runs inside `run_bounded`, so the deadline lives one layer up.
-            ("m3_runtime_hub.rs", 0, 2),
+            ("m3_runtime_hub.rs", 0, 0),
             // OAuth token/revocation and the workflow client; deadlines audited
             // below.
             ("m4_runtime.rs", 0, 2),

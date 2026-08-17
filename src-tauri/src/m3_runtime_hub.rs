@@ -765,10 +765,12 @@ impl HttpM3CatalogSource {
         validate_https_url(endpoint, "catalogSource.endpoint", true)?;
         let endpoint = Url::parse(endpoint)
             .map_err(|error| invalid("catalogSource.endpoint", error.to_string()))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| M3HubError::Transport(error.to_string()))?;
+        let client = crate::egress::public_download_client(
+            crate::egress::PublicDestinations::Only,
+            "m3 catalog source",
+        )
+        .build()
+        .map_err(|error| M3HubError::Transport(error.to_string()))?;
         Ok(Self {
             source_id,
             endpoint,
