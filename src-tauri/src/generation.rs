@@ -2822,7 +2822,11 @@ mod tests {
     #[test]
     fn switching_engines_invalidates_a_warm_process() {
         let root = Path::new("/models");
-        let spec = model("m", vec![GenerationTask::TextToVideo], FrameGrid::DownTo4nPlus1);
+        let spec = model(
+            "m",
+            vec![GenerationTask::TextToVideo],
+            FrameGrid::DownTo4nPlus1,
+        );
         let bundled = launch_signature(&EngineCommand::binary("/engines/sd-server"), &spec, root);
         let mlx = launch_signature(
             &EngineCommand {
@@ -3794,7 +3798,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
 [ERROR] main.cpp:92 - new_sd_ctx_t failed";
         let dtype_detail = engine_failure_detail(dtype_tail);
         assert!(dtype_detail.contains("cannot read"), "{dtype_detail}");
-        assert!(!dtype_detail.contains("belongs on --model"), "{dtype_detail}");
+        assert!(
+            !dtype_detail.contains("belongs on --model"),
+            "{dtype_detail}"
+        );
 
         // A quantization for another loader is the other failure that reads as
         // a broken download rather than a wrong file.

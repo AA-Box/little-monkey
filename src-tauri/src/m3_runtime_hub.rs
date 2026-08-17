@@ -444,7 +444,7 @@ impl M3CatalogModel {
         sha256_hex(self.asset_id().as_bytes())
     }
 
-    fn version_key(&self) -> String {
+    pub(crate) fn version_key(&self) -> String {
         sha256_hex(format!("{}\n{}\n{}", self.revision, self.sha256, self.download_url).as_bytes())
     }
 
@@ -471,7 +471,7 @@ impl M3CatalogModel {
         if self.estimated_ram_bytes == 0 {
             return Err(invalid("catalog.estimatedRamBytes", "must be positive"));
         }
-        validate_download_url(&self.download_url)?;
+        validate_download_url(&self.download_url, false)?;
         if self.supported_os.is_empty() || self.supported_arch.is_empty() {
             return Err(invalid(
                 "catalog.platform",
@@ -765,10 +765,12 @@ impl HttpM3CatalogSource {
         validate_https_url(endpoint, "catalogSource.endpoint", true)?;
         let endpoint = Url::parse(endpoint)
             .map_err(|error| invalid("catalogSource.endpoint", error.to_string()))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| M3HubError::Transport(error.to_string()))?;
+        let client = crate::egress::public_download_client(
+            crate::egress::PublicDestinations::Only,
+            "m3 catalog source",
+        )
+        .build()
+        .map_err(|error| M3HubError::Transport(error.to_string()))?;
         Ok(Self {
             source_id,
             endpoint,
@@ -865,17 +867,84 @@ pub trait M3DownloadTransport: Send + Sync {
     ) -> M3HubFuture<'a, M3DownloadChunk>;
 }
 
+/// Names this path in a denial record, so a hop refused here stays
+/// distinguishable from the same address class refused by `web.rs` or
+/// `model_sources.rs`.
+pub(crate) const COMPONENT_EGRESS_GUARD: &str = "m3.component-download";
+
+/// Turns a response reqwest could not follow into an error that says so.
+///
+/// A `3xx` reaches a caller only when reqwest declined to follow it — no
+/// `Location`, or one that will not parse — because a hop that *was* followed is
+/// answered by the destination and a hop that was *refused* arrives as a transport
+/// error carrying the [`crate::egress::EgressRule`] that refused it. Both of the
+/// remaining shapes are malformed, and neither may be reported as the plain HTTP
+/// failure it is not: the whole point of this path is that a blocked or broken
+/// redirect can never be mistaken for a successful fetch of the pre-redirect page.
+fn refuse_unfollowable_redirect(response: &reqwest::Response, field: &str) -> M3HubResult<()> {
+    if response.status().is_redirection() {
+        return Err(invalid(
+            field,
+            format!(
+                "answered HTTP {} without a Location this app could follow",
+                response.status()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub struct ReqwestM3DownloadTransport {
     client: reqwest::Client,
+    allow_loopback: bool,
 }
 
 impl ReqwestM3DownloadTransport {
     pub fn new() -> M3HubResult<Self> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| M3HubError::Transport(error.to_string()))?;
-        Ok(Self { client })
+        // A published release asset has one stable URL and answers it with a
+        // cross-origin `302` to a signed, expiring CDN URL. The client this used
+        // to build had `Policy::none()`, so that hop was simply an error — which
+        // is why the MLX runtime this project publishes could be listed and never
+        // installed. `egress::public_download_client` follows it and re-checks
+        // every hop, and every resolved address, against the public-destination
+        // rule the initial URL had to pass. See its doc for why that is safe on a
+        // digest-verified, credential-free path and would not be as a client
+        // default.
+        let client = crate::egress::public_download_client(
+            crate::egress::PublicDestinations::Only,
+            COMPONENT_EGRESS_GUARD,
+        )
+        .build()
+        .map_err(|error| M3HubError::Transport(error.to_string()))?;
+        Ok(Self {
+            client,
+            allow_loopback: false,
+        })
+    }
+
+    /// [`Self::new`] against a fixture on this machine.
+    ///
+    /// The *only* difference is which destination class is allowed; the redirect
+    /// policy, the hop cap, the resolver and its address pruning are the same
+    /// objects production uses, so the end-to-end test below exercises the real
+    /// path rather than a parallel one. Kept `cfg(test)` so production has exactly
+    /// one answer for where a component may come from, and the reason a fixture
+    /// needs this at all is that a fixture listens on loopback — which is what
+    /// [`crate::egress::PublicDestinations::Only`] exists to refuse. The
+    /// public-side claims are made where they can be made honestly, against the
+    /// primitive itself in `egress.rs`.
+    #[cfg(test)]
+    pub(crate) fn for_loopback_fixture() -> M3HubResult<Self> {
+        let client = crate::egress::public_download_client(
+            crate::egress::PublicDestinations::LoopbackAllowed,
+            COMPONENT_EGRESS_GUARD,
+        )
+        .build()
+        .map_err(|error| M3HubError::Transport(error.to_string()))?;
+        Ok(Self {
+            client,
+            allow_loopback: true,
+        })
     }
 }
 
@@ -886,14 +955,15 @@ impl M3DownloadTransport for ReqwestM3DownloadTransport {
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, M3DownloadProbe> {
         Box::pin(async move {
-            validate_download_url(url)?;
+            validate_download_url(url, self.allow_loopback)?;
             context.preflight("probe model download")?;
             let response = run_bounded(context, "probe model download", async {
                 crate::egress::send(self.client.head(url))
                     .await
-                    .map_err(|error| M3HubError::Transport(error.to_string()))
+                    .map_err(transport_error)
             })
             .await?;
+            refuse_unfollowable_redirect(&response, "downloadUrl")?;
             if !response.status().is_success() {
                 return Err(M3HubError::Transport(format!(
                     "download probe returned HTTP {}",
@@ -927,7 +997,7 @@ impl M3DownloadTransport for ReqwestM3DownloadTransport {
         context: &'a M3OperationContext,
     ) -> M3HubFuture<'a, M3DownloadChunk> {
         Box::pin(async move {
-            validate_download_url(url)?;
+            validate_download_url(url, self.allow_loopback)?;
             context.preflight("download model range")?;
             if max_bytes == 0 || max_bytes > MAX_DOWNLOAD_CHUNK_BYTES {
                 return Err(invalid("download.maxBytes", "is outside the safe range"));
@@ -935,19 +1005,27 @@ impl M3DownloadTransport for ReqwestM3DownloadTransport {
             let end = offset
                 .checked_add(max_bytes as u64 - 1)
                 .ok_or_else(|| invalid("download.range", "overflow"))?;
-            let mut request = self
+            // `Range` and `If-Range` are set once and survive every hop, because
+            // reqwest re-issues a redirected `GET` with its headers and strips only
+            // the four it treats as credentials (`Authorization`, `Cookie`,
+            // `Proxy-Authorization`, `WWW-Authenticate`). That matters more here
+            // than it reads: a hop that dropped the range would be answered `200`
+            // with the whole artifact, and the `PARTIAL_CONTENT` check below would
+            // report "byte-range support is required" against a server that
+            // supports it perfectly well.
+            let request = self
                 .client
                 .get(url)
                 .header(RANGE, format!("bytes={offset}-{end}"));
-            if let Some(etag) = expected_etag {
-                request = request.header(IF_RANGE, etag);
-            }
+            let request = match expected_etag {
+                Some(etag) => request.header(IF_RANGE, etag),
+                None => request,
+            };
             let mut response = run_bounded(context, "download model range", async {
-                crate::egress::send(request)
-                    .await
-                    .map_err(|error| M3HubError::Transport(error.to_string()))
+                crate::egress::send(request).await.map_err(transport_error)
             })
             .await?;
+            refuse_unfollowable_redirect(&response, "downloadUrl")?;
             if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 return Err(M3HubError::Transport(format!(
                     "range request returned HTTP {}; byte-range support is required",
@@ -6258,8 +6336,23 @@ fn validate_relative_path(value: &str) -> M3HubResult<()> {
     Ok(())
 }
 
-fn validate_download_url(value: &str) -> M3HubResult<()> {
-    validate_https_url(value, "downloadUrl", false)
+fn validate_download_url(value: &str, allow_loopback_http: bool) -> M3HubResult<()> {
+    let parsed = Url::parse(value).map_err(|error| invalid("downloadUrl", error.to_string()))?;
+    if !allow_loopback_http {
+        crate::egress::classify_public_download_url(
+            &parsed,
+            crate::egress::PublicDestinations::Only,
+        )
+        .map_err(|denial| invalid("downloadUrl", denial.to_string()))?;
+    }
+    validate_https_url(value, "downloadUrl", allow_loopback_http)
+}
+
+fn transport_error(error: reqwest::Error) -> M3HubError {
+    match crate::egress::denial_from_error(&error) {
+        Some(denial) => M3HubError::Transport(denial.to_string()),
+        None => M3HubError::Transport(error.to_string()),
+    }
 }
 
 fn validate_https_url(value: &str, field: &str, allow_loopback_http: bool) -> M3HubResult<()> {
@@ -6519,13 +6612,20 @@ fn io_at(operation: &'static str, path: &Path, source: io::Error) -> M3HubError 
 // storage root and mutation lock so a component install/rollback can never
 // block or be blocked by a model operation.
 //
-// There is no real upstream binary registry/CDN this app can verify and hit
-// today for these artifacts, so — mirroring the pluggable `M3CatalogSource`
-// pattern used for model catalogs — `M3ComponentSource` is a trait with a
-// local, operator-editable implementation (`StaticM3ComponentSource`) rather
-// than a hardcoded call to a registry this environment cannot confirm
-// works. See `m3_production::component_registry_entries` for how production
-// wiring loads that local registry, and the crate-level PR notes for why.
+// There is no upstream binary registry/CDN for these artifacts, so — mirroring
+// the pluggable `M3CatalogSource` pattern used for model catalogs —
+// `M3ComponentSource` is a trait with a local, operator-editable
+// implementation (`StaticM3ComponentSource`) rather than a hardcoded call to a
+// registry this environment cannot confirm works. See
+// `m3_production::component_registry_entries` for how production wiring loads
+// that local registry, and the crate-level PR notes for why.
+//
+// What this project publishes for itself reaches that registry through
+// `fetch_component_catalog`: the panel fetches a catalog document by URL and
+// merges it in, so a published component is installable without the user
+// downloading a JSON file and importing it by hand. The listing path stays
+// local on purpose — entries are read from disk, so an unreachable catalog
+// costs the newest versions rather than the whole panel.
 
 pub const M3_COMPONENT_CATALOG_SCHEMA_VERSION: u32 = 1;
 pub const M3_COMPONENT_STATE_VERSION: u32 = 1;
@@ -6624,8 +6724,28 @@ impl M3ComponentCatalogEntry {
         sha256_hex(self.component_id.as_bytes())
     }
 
-    fn version_key(&self) -> String {
+    pub(crate) fn version_key(&self) -> String {
         sha256_hex(format!("{}\n{}\n{}", self.version, self.sha256, self.download_url).as_bytes())
+    }
+
+    /// The one identity the registry dedupes, merges and updates on.
+    ///
+    /// Four fields, and the fourth is why this exists: `component_id`, `version`
+    /// and `sha256` alone let two catalogs collide, so adopting one could
+    /// *overwrite* an entry another publisher had registered for the same version
+    /// while silently changing where its bytes come from. Including the URL makes
+    /// the two entries two rows, which is the honest outcome — a version the app
+    /// can fetch from two places is two things it knows, and the digest still
+    /// decides whether either one installs.
+    ///
+    /// Composed from [`Self::version_key`] rather than restating its three fields,
+    /// so the registry's identity and the *installed* version's identity cannot
+    /// drift apart. `source_id` is deliberately not in it: the local registry
+    /// restamps that field on adoption (see
+    /// `m3_production::adopt_into_registry`), so it is the same for every row and
+    /// could only ever make identity depend on when a row was written.
+    pub(crate) fn registry_key(&self) -> String {
+        format!("{}\n{}", self.component_id, self.version_key())
     }
 
     pub fn validate(&self) -> M3HubResult<()> {
@@ -6647,7 +6767,7 @@ impl M3ComponentCatalogEntry {
                 format!("must be between 1 and {MAX_DOWNLOAD_BYTES}"),
             ));
         }
-        validate_download_url(&self.download_url)?;
+        validate_download_url(&self.download_url, cfg!(test))?;
         validate_timestamp(self.published_at_ms, "component.publishedAtMs")?;
         if let Some(note) = &self.compatibility_note {
             validate_text(
@@ -6683,14 +6803,14 @@ pub trait M3ComponentSource: Send + Sync {
     ) -> M3HubFuture<'a, Vec<M3ComponentCatalogEntry>>;
 }
 
-/// A local, in-process registry of known component versions. There is no
-/// real upstream binary registry/CDN this app can verify and hit today for
-/// these artifacts, so this holds whatever entries production wiring loaded
-/// from a local, operator-editable file (see
-/// `m3_production::component_registry_entries`) instead of fetching a list
-/// of versions from the network. Only the already-known `download_url` of a
-/// chosen entry is ever fetched, through the same `M3DownloadTransport` used
-/// for models.
+/// A local, in-process registry of known component versions. This holds
+/// whatever entries production wiring loaded from a local, operator-editable
+/// file (see `m3_production::component_registry_entries`) instead of listing
+/// versions from the network: a catalog fetch ([`fetch_component_catalog`])
+/// writes into that file, so listing stays a disk read and being offline costs
+/// nothing already known. Only the already-known `download_url` of a chosen
+/// entry is ever fetched, through the same `M3DownloadTransport` used for
+/// models.
 pub struct StaticM3ComponentSource {
     source_id: String,
     entries: Vec<M3ComponentCatalogEntry>,
@@ -6736,6 +6856,146 @@ impl M3ComponentSource for StaticM3ComponentSource {
             Ok(self.entries.clone())
         })
     }
+}
+
+/// A published catalog document: either a bare array of entries, or the
+/// `{schemaVersion, entries}` wrapper the app writes for its own registry file.
+///
+/// Both are accepted for the same reason the file importer accepts both — the
+/// second shape is what someone re-importing a backup of their own registry
+/// has — and accepting them in one place keeps the fetch path and the file path
+/// from drifting into disagreeing about what a catalog is.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum M3ComponentCatalogDocument {
+    Entries(Vec<M3ComponentCatalogEntry>),
+    Envelope {
+        #[serde(rename = "entries")]
+        entries: Vec<M3ComponentCatalogEntry>,
+    },
+}
+
+/// Whether installing a component of this kind proves the artifact came from this
+/// project, rather than only that its bytes match a digest.
+///
+/// # Why a network catalog is limited by this
+///
+/// A catalog is discovery metadata. It names a URL, a size and a sha256, and a
+/// SHA-256 the catalog itself supplied proves only that the bytes are the bytes
+/// that catalog meant — whoever can replace the artifact can replace the digest
+/// beside it in the same document. For [`M3ComponentKind::MlxRuntime`] that is not
+/// the whole boundary: the installer re-derives every digest in the package
+/// manifest and verifies an Ed25519 signature against a key compiled into this app
+/// (`MLX_RELEASE_PUBLIC_KEY_HEX`), so a substituted archive fails to install no
+/// matter what the catalog claimed. No other kind has that today.
+///
+/// So [`fetch_component_catalog`] refuses a fetched catalog that lists any other
+/// kind. That is a rule in code and not a comment, and the match is exhaustive
+/// with no wildcard arm on purpose: a component kind added later is a compile
+/// error here, which is what stops "remotely installable" from becoming the silent
+/// default for the next executable component this app learns to run.
+///
+/// Nothing stops an operator from registering those kinds by hand — **Import
+/// catalog** and a directly edited registry file both still work, and both are
+/// acts a person performed rather than a document a server served.
+pub(crate) fn kind_verifies_publisher_signature(kind: M3ComponentKind) -> bool {
+    match kind {
+        M3ComponentKind::MlxRuntime => true,
+        M3ComponentKind::LlamaCppServer
+        | M3ComponentKind::Tokenizer
+        | M3ComponentKind::Converter
+        | M3ComponentKind::ProjectorRuntime
+        | M3ComponentKind::MetalSupport
+        | M3ComponentKind::CudaSupport
+        | M3ComponentKind::RocmSupport
+        | M3ComponentKind::VulkanSupport
+        | M3ComponentKind::StudioTool => false,
+    }
+}
+
+/// Fetches a component catalog over HTTP and returns the versions it lists.
+///
+/// Nothing is downloaded, installed, or persisted by this. Discovery and
+/// authenticity are deliberately separate: what this returns is a list of URLs,
+/// sizes and digests, and the checks that establish trust — the declared size, the
+/// whole-artifact SHA-256, and the pinned publisher key — all still happen at
+/// install time against the artifact itself. A hostile catalog can therefore cost
+/// a failed install, and the one thing it must not be able to do is *become* the
+/// authenticity boundary, which is what [`kind_verifies_publisher_signature`]
+/// refuses below.
+pub async fn fetch_component_catalog(
+    endpoint: &str,
+    context: &M3OperationContext,
+) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    context.preflight("component catalog fetch")?;
+    // Loopback HTTP is allowed for the same reason `HttpM3CatalogSource` allows
+    // it — a catalog served by something on this machine — but only when the
+    // *configured* endpoint is itself loopback. Deriving the permission from the
+    // endpoint and then handing that one decision to the client is what stops a
+    // public catalog from redirecting the fetch into a local service: with a public
+    // endpoint, neither a hop nor a resolved address may be loopback at all.
+    let destinations = if crate::egress::is_loopback_target(
+        &Url::parse(endpoint)
+            .map_err(|error| invalid("componentCatalog.url", error.to_string()))?,
+    ) {
+        crate::egress::PublicDestinations::LoopbackAllowed
+    } else {
+        crate::egress::PublicDestinations::Only
+    };
+    validate_download_url(
+        endpoint,
+        destinations == crate::egress::PublicDestinations::LoopbackAllowed,
+    )?;
+    let client = crate::egress::public_download_client(destinations, COMPONENT_EGRESS_GUARD)
+        .build()
+        .map_err(|error| M3HubError::Transport(error.to_string()))?;
+    let response = run_bounded(context, "component catalog fetch", async {
+        crate::egress::send(client.get(endpoint))
+            .await
+            .map_err(transport_error)
+    })
+    .await?;
+    refuse_unfollowable_redirect(&response, "componentCatalog.url")?;
+    if !response.status().is_success() {
+        return Err(M3HubError::Transport(format!(
+            "component catalog returned HTTP {}",
+            response.status()
+        )));
+    }
+    let bytes = read_response_bounded(response, MAX_CATALOG_BODY_BYTES, context).await?;
+    let entries = parse_component_catalog(&bytes)?;
+    for entry in &entries {
+        if !kind_verifies_publisher_signature(entry.kind) {
+            return Err(invalid(
+                "componentCatalog.kind",
+                format!(
+                    "a fetched catalog may only list components whose install verifies a pinned \
+                     publisher key; {:?} does not, so register it with Import catalog instead",
+                    entry.kind
+                ),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn parse_component_catalog(bytes: &[u8]) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    let entries = match serde_json::from_slice::<M3ComponentCatalogDocument>(bytes)? {
+        M3ComponentCatalogDocument::Entries(entries) => entries,
+        M3ComponentCatalogDocument::Envelope { entries } => entries,
+    };
+    if entries.len() > MAX_CATALOG_ENTRIES {
+        return Err(invalid(
+            "componentCatalog.entries",
+            format!("at most {MAX_CATALOG_ENTRIES} entries are accepted"),
+        ));
+    }
+    // Every entry is validated here rather than at install time, so a catalog
+    // that is malformed anywhere is refused whole instead of half-adopted.
+    for entry in &entries {
+        entry.validate()?;
+    }
+    Ok(entries)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -6956,11 +7216,12 @@ impl M3ComponentHub {
                         "source returned an entry for another source",
                     ));
                 }
-                let key = format!(
-                    "{}\n{}\n{}",
-                    entry.component_id, entry.version, entry.sha256
-                );
-                if dedupe.insert(key) {
+                // The registry's one identity, so listing dedupes on exactly what
+                // merging and update detection key on. It used to be
+                // `component_id`/`version`/`sha256` spelled out here, which
+                // collapsed two entries that differ only in `download_url` into
+                // whichever one a source happened to list first.
+                if dedupe.insert(entry.registry_key()) {
                     entries.push(entry);
                 }
             }
@@ -6977,6 +7238,47 @@ impl M3ComponentHub {
         let _guard = lock(&self.state_lock)?;
         let state = load_component_state(&self.state_root, &self.blobs_root)?;
         component_state_to_views(&state, &self.blobs_root)
+    }
+
+    /// Removes a newly committed version after a backend-owned post-download
+    /// authenticity check fails. Existing versions are never removed by callers.
+    pub async fn rollback_new_component_version(
+        &self,
+        component_id: &str,
+        version_key: &str,
+    ) -> M3HubResult<()> {
+        let _mutation = self.mutation_lock.lock().await;
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_component_state(&self.state_root, &self.blobs_root)?
+        };
+        let Some(index) = state
+            .components
+            .iter()
+            .position(|item| item.component_id == component_id)
+        else {
+            return Ok(());
+        };
+        let asset_key = state.components[index].asset_key.clone();
+        let versions = &mut state.components[index].versions;
+        let Some(version_index) = versions
+            .iter()
+            .position(|item| item.version_key == version_key)
+        else {
+            return Ok(());
+        };
+        versions.remove(version_index);
+        if versions.is_empty() {
+            state.components.remove(index);
+        } else if state.components[index].active_version_key == version_key {
+            state.components[index].active_version_key =
+                state.components[index].versions[0].version_key.clone();
+        }
+        {
+            let _guard = lock(&self.state_lock)?;
+            save_next_component_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
+        }
+        remove_owned_directory(&self.blobs_root.join(asset_key).join(version_key))
     }
 
     pub async fn check_updates(
@@ -7033,6 +7335,19 @@ impl M3ComponentHub {
         request: &M3InstallComponentRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<M3InstalledComponentView> {
+        self.install_component_with_precommit(request, context, |_| Ok(()))
+            .await
+    }
+
+    pub async fn install_component_with_precommit<F>(
+        &self,
+        request: &M3InstallComponentRequest,
+        context: &M3OperationContext,
+        precommit: F,
+    ) -> M3HubResult<M3InstalledComponentView>
+    where
+        F: FnOnce(&Path) -> M3HubResult<()>,
+    {
         context.preflight("install component")?;
         request.entry.validate()?;
         let _mutation = self.mutation_lock.lock().await;
@@ -7168,6 +7483,7 @@ impl M3ComponentHub {
             sync_directory(&asset_root)?;
         }
         remove_owned_file(&resume_path)?;
+        precommit(&final_root.join(COMPONENT_PAYLOAD_FILE))?;
         let artifact_relative_path = relative_component_payload(&asset_key, &version_key);
         let installed_at_ms = self.clock.now_ms()?;
 
@@ -8619,5 +8935,692 @@ mod tests {
                 "{kind:?} is not platform-gated and must stay offered everywhere"
             );
         }
+    }
+
+    /// The catalog this project actually publishes, byte-for-byte, as the MLX
+    /// packaging workflow last wrote it. Pasted rather than constructed so these
+    /// tests fail if the app stops being able to read the very document it ships a
+    /// URL for.
+    const PUBLISHED_CATALOG: &str = r#"[
+  {
+    "schemaVersion": 1,
+    "sourceId": "little-monkey-mlx",
+    "componentId": "mlx-runtime-apple-silicon",
+    "kind": "mlx_runtime",
+    "displayName": "MLX runtime (Apple silicon)",
+    "accelerator": null,
+    "version": "mlx-lm-0.28.4+py3.14",
+    "channel": "beta",
+    "downloadUrl": "https://github.com/AA-Box/little-monkey/releases/download/mlx-runtime-mlx-lm-0.28.4%2Bpy3.14/mlx-runtime-mlx-lm-0.28.4%2Bpy3.14.tar.gz",
+    "sha256": "6adde291eb28e3bbd4190e73f9a1c70417581a89201860332cd5499ede302e0a",
+    "sizeBytes": 70330595,
+    "publishedAtMs": 1786182708413,
+    "compatibilityNote": "Requires Apple silicon. Ships 5947 files.",
+    "metadata": {}
+  }
+]"#;
+
+    /// One artifact byte pattern, so an install test's success depends on the
+    /// digest check actually passing rather than on it being skipped. Longer than
+    /// one download chunk on purpose, so the install below reads several ranges.
+    fn fixture_artifact() -> Vec<u8> {
+        (0..196_608_u32).map(|index| (index % 251) as u8).collect()
+    }
+
+    /// The validator the fixture answers with, and the one a resumed range must
+    /// present back to it.
+    const FIXTURE_ETAG: &str = "\"fixture-etag\"";
+
+    /// A pair of loopback listeners standing in for an origin and the CDN it
+    /// redirects to.
+    ///
+    /// Two listeners and not one, because that is the difference between a test of
+    /// cross-origin redirects and a test of path rewriting: `127.0.0.1:A` and
+    /// `127.0.0.1:B` are different origins by the `(scheme, host, port)` rule, so a
+    /// hop between them is exactly the hop `egress::hardened`'s same-origin policy
+    /// refuses and the one a release asset requires. Responses are written by hand
+    /// because what is under test is status lines, `Location` headers and which
+    /// request headers survived, not a server framework.
+    struct RedirectFixture {
+        origin: String,
+    }
+
+    impl RedirectFixture {
+        async fn spawn() -> Self {
+            let assets = Self::serve(None).await;
+            let origin = Self::serve(Some(assets.clone())).await;
+            Self { origin }
+        }
+
+        /// `assets` is the base a redirect points at: the origin listener redirects
+        /// to the asset listener, and the asset listener answers.
+        async fn serve(assets: Option<String>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fixture");
+            let address = listener.local_addr().expect("fixture address");
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let assets = assets.clone();
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        // Drained before answering: a response written onto an
+                        // unread request closes with an RST on macOS, which the
+                        // client reports as a transport error rather than as the
+                        // status the test meant to assert on.
+                        let mut request = Vec::new();
+                        let mut buffer = [0_u8; 2048];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut buffer).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => request.extend_from_slice(&buffer[..read]),
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&request).to_string();
+                        let mut lines = request.lines();
+                        let start = lines.next().unwrap_or_default().to_string();
+                        let mut parts = start.split(' ');
+                        let method = parts.next().unwrap_or("GET").to_string();
+                        let path = parts.next().unwrap_or("/").to_string();
+                        let header = |name: &str| {
+                            request
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case(name)
+                                        .then(|| value.trim().to_string())
+                                })
+                                .unwrap_or_default()
+                        };
+                        // Every response says `connection: close`, because this
+                        // fixture serves one request per connection and then drops
+                        // it. Without saying so it looks like a keep-alive server,
+                        // and the hop-limit test — four requests to one origin in a
+                        // row — fails on a pooled socket the fixture had already
+                        // closed rather than on the hop limit under test. It passed
+                        // alone and failed in a loaded suite, which is the shape
+                        // that costs an afternoon.
+                        let redirect = |status: &str, location: &str| {
+                            format!(
+                                "HTTP/1.1 {status}\r\nlocation: {location}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                            )
+                        };
+                        let body = |status: &str, extra: &str, body: &[u8]| {
+                            let mut response = format!(
+                                "HTTP/1.1 {status}\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            if method != "HEAD" {
+                                response.extend_from_slice(body);
+                            }
+                            response
+                        };
+                        let artifact = fixture_artifact();
+                        let response = match (assets.as_deref(), path.as_str()) {
+                            // The origin listener: every path here answers with a
+                            // hop to the *other* listener, which is what makes the
+                            // redirect cross-origin.
+                            (Some(assets), "/catalog.json") => {
+                                redirect("302 Found", &format!("{assets}/catalog.json")).into_bytes()
+                            }
+                            (Some(assets), "/artifact.bin") => {
+                                redirect("302 Found", &format!("{assets}/artifact.bin")).into_bytes()
+                            }
+                            // Every redirect status a `GET`/`HEAD` may carry, so the
+                            // claim is about the class and not about `302`.
+                            (Some(assets), "/moved") => {
+                                redirect("301 Moved Permanently", &format!("{assets}/catalog.json"))
+                                    .into_bytes()
+                            }
+                            (Some(assets), "/see-other") => {
+                                redirect("303 See Other", &format!("{assets}/catalog.json"))
+                                    .into_bytes()
+                            }
+                            (Some(assets), "/temporary") => {
+                                redirect("307 Temporary Redirect", &format!("{assets}/catalog.json"))
+                                    .into_bytes()
+                            }
+                            (Some(assets), "/permanent") => {
+                                redirect("308 Permanent Redirect", &format!("{assets}/catalog.json"))
+                                    .into_bytes()
+                            }
+                            // Relative, so the resolution against the URL that
+                            // answered is exercised rather than assumed.
+                            (Some(_), "/relative") => {
+                                redirect("302 Found", "./catalog.json").into_bytes()
+                            }
+                            (Some(_), "/loop") => redirect("302 Found", "/loop").into_bytes(),
+                            // A `3xx` reqwest cannot follow. It must not reach a
+                            // caller as anything that could pass for success.
+                            (Some(_), "/no-location") => {
+                                b"HTTP/1.1 302 Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                                    .to_vec()
+                            }
+                            (Some(_), "/credentials") => {
+                                redirect("302 Found", "https://user:secret@public.invalid/catalog.json")
+                                    .into_bytes()
+                            }
+                            (Some(_), "/fragment") => {
+                                redirect("302 Found", "https://public.invalid/catalog.json#frag")
+                                    .into_bytes()
+                            }
+                            (Some(_), "/cleartext") => {
+                                redirect("302 Found", "http://public.invalid/catalog.json").into_bytes()
+                            }
+                            // The asset listener.
+                            (None, "/catalog.json") => body(
+                                "200 OK",
+                                "content-type: application/json\r\n",
+                                PUBLISHED_CATALOG.as_bytes(),
+                            ),
+                            (None, "/artifact.bin") => {
+                                let range = header("range");
+                                let if_range = header("if-range");
+                                if method == "HEAD" || range.is_empty() {
+                                    // No range: the whole artifact, exactly as a
+                                    // real asset host answers. `read_range` requires
+                                    // `206`, so a hop that lost the `Range` header
+                                    // fails here rather than quietly downloading
+                                    // everything.
+                                    body(
+                                        "200 OK",
+                                        "accept-ranges: bytes\r\netag: \"fixture-etag\"\r\n",
+                                        &artifact,
+                                    )
+                                } else if !if_range.is_empty() && if_range != FIXTURE_ETAG {
+                                    // A validator that does not match is a refusal,
+                                    // which is what `If-Range` is *for*. Answering
+                                    // `206` here regardless would make the header's
+                                    // survival unobservable, and an unobservable
+                                    // header is one a refactor can drop.
+                                    b"HTTP/1.1 412 Precondition Failed\r\nconnection: close\r\ncontent-length: 0\r\n\r\n".to_vec()
+                                } else {
+                                    let (start, end) = range
+                                        .trim_start_matches("bytes=")
+                                        .split_once('-')
+                                        .unwrap_or(("0", "0"));
+                                    let start: usize = start.parse().unwrap_or(0);
+                                    let end: usize = end
+                                        .parse()
+                                        .unwrap_or(artifact.len() - 1)
+                                        .min(artifact.len() - 1);
+                                    body(
+                                        "206 Partial Content",
+                                        &format!(
+                                            "content-range: bytes {start}-{end}/{}\r\netag: {FIXTURE_ETAG}\r\n",
+                                            artifact.len(),
+                                        ),
+                                        &artifact[start..=end],
+                                    )
+                                }
+                            }
+                            _ => b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n"
+                                .to_vec(),
+                        };
+                        let _ = stream.write_all(&response).await;
+                        let _ = stream.flush().await;
+                    });
+                }
+            });
+            format!("http://{address}")
+        }
+    }
+
+    /// The whole point of the fetch path: a published catalog answers the only
+    /// stable URL it has with a redirect to a different origin, and the app has to
+    /// end up holding the entries anyway. Before this, a `302` was an error and the
+    /// sole way to reach a published component was to download the JSON in a
+    /// browser and import the file by hand.
+    #[tokio::test]
+    async fn a_published_catalog_is_fetched_through_a_cross_origin_redirect() {
+        let fixture = RedirectFixture::spawn().await;
+        let context = M3OperationContext::default();
+        for path in [
+            "/catalog.json",
+            "/moved",
+            "/see-other",
+            "/temporary",
+            "/permanent",
+            "/relative",
+        ] {
+            let entries = fetch_component_catalog(&format!("{}{path}", fixture.origin), &context)
+                .await
+                .unwrap_or_else(|error| panic!("{path} must be followed: {error}"));
+            assert_eq!(entries.len(), 1, "{path}");
+            assert_eq!(entries[0].component_id, "mlx-runtime-apple-silicon");
+            assert_eq!(entries[0].version, "mlx-lm-0.28.4+py3.14");
+            assert_eq!(entries[0].kind, M3ComponentKind::MlxRuntime);
+        }
+    }
+
+    /// A redirect this app refuses or cannot follow must never look like a fetch
+    /// that worked. Each of these is a shape a hostile or broken `Location` could
+    /// take, and the assertion is on the *reason*, because "download failed" for all
+    /// of them is what made the old code impossible to debug.
+    #[tokio::test]
+    async fn a_redirect_that_cannot_be_followed_is_refused_by_name() {
+        let fixture = RedirectFixture::spawn().await;
+        let context = M3OperationContext::default();
+        for (path, expected) in [
+            ("/loop", "more than"),
+            ("/no-location", "without a Location"),
+            (
+                "/credentials",
+                crate::egress::EgressRule::EmbeddedCredentials.code(),
+            ),
+            ("/fragment", "error sending request"),
+            (
+                "/cleartext",
+                crate::egress::EgressRule::SchemeNotAllowed.code(),
+            ),
+        ] {
+            let error = fetch_component_catalog(&format!("{}{path}", fixture.origin), &context)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "{path} should have reported {expected}, said: {error}"
+            );
+        }
+    }
+
+    /// The artifact side of the same hop, and the reason a hand-rolled follower was
+    /// the wrong tool: a release asset is downloaded in ranges, and a hop that
+    /// dropped the range would be answered `200` with all 70 MB. `read_range`
+    /// requires `206`, so that failure surfaces as "byte-range support is required"
+    /// against a server that supports it perfectly well. `If-Range` matters for the
+    /// same reason one step later: it is what makes a *resumed* download safe.
+    #[tokio::test]
+    async fn a_redirected_range_request_keeps_its_range_and_validator() {
+        let fixture = RedirectFixture::spawn().await;
+        let context = M3OperationContext::default();
+        let transport = ReqwestM3DownloadTransport::for_loopback_fixture().expect("transport");
+        let url = format!("{}/artifact.bin", fixture.origin);
+
+        // `HEAD` after the hop, which is what a real release asset answers — probed
+        // for real rather than assumed, because if it did not this path would need a
+        // ranged fallback probe instead.
+        let probe = transport.probe(&url, &context).await.expect("probe");
+        assert_eq!(probe.total_bytes, fixture_artifact().len() as u64);
+        assert_eq!(probe.etag.as_deref(), Some(FIXTURE_ETAG));
+        assert!(
+            probe.accepts_ranges,
+            "HEAD survived the hop with its headers"
+        );
+
+        // `206` and these exact bytes is the proof: had the `Range` header not
+        // survived the hop, the fixture would have answered `200` with the whole
+        // artifact and `read_range` would have failed for want of byte-range
+        // support. Had `If-Range` not survived, the fixture — which refuses a
+        // mismatched validator, as `If-Range` exists to do — would have answered
+        // `412`.
+        let chunk = transport
+            .read_range(&url, 16, 64, probe.etag.as_deref(), &context)
+            .await
+            .expect("a redirected range request keeps its Range and If-Range");
+        assert_eq!(chunk.offset, 16);
+        assert_eq!(chunk.bytes, fixture_artifact()[16..80]);
+        assert_eq!(chunk.total_bytes, fixture_artifact().len() as u64);
+
+        // The negative half, so the two assertions above cannot both be passing for
+        // the wrong reason: a validator the asset does not match is refused, and the
+        // refusal reaches the caller.
+        let stale = transport
+            .read_range(&url, 16, 64, Some("\"someone-elses-etag\""), &context)
+            .await
+            .expect_err("a mismatched If-Range must not yield bytes");
+        assert!(stale.to_string().contains("412"), "{stale}");
+    }
+
+    /// The whole ladder, in one test, because every rung of it was reachable only in
+    /// theory before: a published catalog URL that redirects, the entries adopted
+    /// into a registry, an install that probes and reads ranges through a second
+    /// redirect, and the size and digest checks that decide whether any of it counts.
+    ///
+    /// `llama_cpp_server` rather than `mlx_runtime`, for two reasons. Its artifact is
+    /// a single blob, so the install completes on any platform instead of needing
+    /// macOS and a signed package — and the MLX signature path keeps its own tests,
+    /// which is where it belongs: a fake signed package built here would be a
+    /// production signature check tested against a fixture that agrees with it.
+    #[tokio::test]
+    async fn a_registered_component_installs_from_a_redirecting_url() {
+        let fixture = RedirectFixture::spawn().await;
+        let artifact = fixture_artifact();
+        let entry = M3ComponentCatalogEntry {
+            download_url: format!("{}/artifact.bin", fixture.origin),
+            sha256: sha256_hex(&artifact),
+            size_bytes: artifact.len() as u64,
+            ..registry_fixture_entry()
+        };
+        let root =
+            std::env::temp_dir().join(format!("little-monkey-component-e2e-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("component root");
+        let hub = M3ComponentHub::new(
+            &root,
+            M3HubConfig {
+                download_chunk_bytes: 65_536,
+                ..M3HubConfig::default()
+            },
+            M3ComponentHubDependencies {
+                clock: Arc::new(SystemM3Clock),
+                download: Arc::new(
+                    ReqwestM3DownloadTransport::for_loopback_fixture().expect("transport"),
+                ),
+                sources: vec![Arc::new(
+                    StaticM3ComponentSource::new("local", vec![entry.clone()])
+                        .expect("registry source"),
+                )],
+            },
+        )
+        .expect("component hub");
+        let context = M3OperationContext::default();
+
+        let listed = hub.list_registry(&context).await.expect("list registry");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].registry_key(), entry.registry_key());
+
+        let installed = hub
+            .install_component(
+                &M3InstallComponentRequest {
+                    entry: entry.clone(),
+                },
+                &context,
+            )
+            .await
+            .expect("a redirecting URL installs");
+        assert_eq!(installed.component_id, entry.component_id);
+        let active = installed
+            .versions
+            .iter()
+            .find(|version| version.active)
+            .expect("an installed component has an active version");
+        assert_eq!(active.sha256, entry.sha256);
+        assert_eq!(
+            std::fs::read(&active.artifact_path).expect("read installed artifact"),
+            artifact,
+            "the bytes on disk are the bytes the digest names"
+        );
+        assert!(
+            hub.list_installed()
+                .expect("list installed")
+                .iter()
+                .any(|component| component.component_id == entry.component_id),
+            "an installed component has to show up as installed"
+        );
+
+        // The digest is what decides, and it decides against the registry's claim
+        // rather than against the response: a catalog naming the right URL and the
+        // wrong digest installs nothing.
+        let wrong = M3ComponentCatalogEntry {
+            component_id: "llama-cpp-server-vulkan".to_string(),
+            sha256: "c".repeat(64),
+            ..entry.clone()
+        };
+        let error = hub
+            .install_component(&M3InstallComponentRequest { entry: wrong }, &context)
+            .await
+            .expect_err("a digest mismatch must refuse the install");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("sha256")
+                || error.to_string().to_ascii_lowercase().contains("digest")
+                || error.to_string().to_ascii_lowercase().contains("checksum"),
+            "{error}"
+        );
+
+        // And so does the declared size, which is checked at the probe before a byte
+        // is read.
+        let short = M3ComponentCatalogEntry {
+            component_id: "llama-cpp-server-cuda".to_string(),
+            size_bytes: artifact.len() as u64 - 1,
+            ..entry.clone()
+        };
+        let error = hub
+            .install_component(&M3InstallComponentRequest { entry: short }, &context)
+            .await
+            .expect_err("a size mismatch must refuse the install");
+        assert!(
+            error.to_string().contains("bytes but server declares"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A fetched catalog is adopted whole or not at all, so one malformed entry
+    /// cannot leave a partial registry behind — and the refusal happens before
+    /// anything is written, which is what makes "not at all" true rather than
+    /// aspirational.
+    #[test]
+    fn a_catalog_with_any_invalid_entry_is_refused_entirely() {
+        let mut entries: Vec<serde_json::Value> =
+            serde_json::from_str(PUBLISHED_CATALOG).expect("parse fixture");
+        let mut broken = entries[0].clone();
+        broken["sha256"] = serde_json::json!("not-a-digest");
+        entries.push(broken);
+        let document = serde_json::to_vec(&entries).expect("serialize");
+        assert!(parse_component_catalog(&document).is_err());
+    }
+
+    #[test]
+    fn a_catalog_is_read_as_a_bare_array_or_as_a_registry_export() {
+        let array = parse_component_catalog(PUBLISHED_CATALOG.as_bytes()).expect("bare array");
+        let envelope = parse_component_catalog(
+            format!(r#"{{"schemaVersion":1,"entries":{PUBLISHED_CATALOG}}}"#).as_bytes(),
+        )
+        .expect("registry export");
+        assert_eq!(array, envelope);
+    }
+
+    #[test]
+    fn a_catalog_listing_more_entries_than_the_cap_is_refused() {
+        let entry: serde_json::Value = serde_json::from_str(PUBLISHED_CATALOG)
+            .map(|entries: Vec<serde_json::Value>| entries[0].clone())
+            .expect("parse fixture");
+        let over = vec![entry; MAX_CATALOG_ENTRIES + 1];
+        let error = parse_component_catalog(&serde_json::to_vec(&over).expect("serialize"))
+            .expect_err("the cap is a cap");
+        assert!(error.to_string().contains("at most"), "{error}");
+    }
+
+    #[test]
+    fn an_initial_component_download_url_must_be_public() {
+        for url in [
+            "https://127.0.0.1/component.tar.gz",
+            "https://10.0.0.1/component.tar.gz",
+            "https://100.64.0.1/component.tar.gz",
+            "https://198.18.0.1/component.tar.gz",
+            "https://[::ffff:100.64.0.1]/component.tar.gz",
+            "https://[64:ff9b::6440:1]/component.tar.gz",
+            "https://[::ffff:198.18.0.1]/component.tar.gz",
+        ] {
+            assert!(validate_download_url(url, false).is_err(), "{url}");
+        }
+    }
+
+    /// The body cap has to hold before the allocation, not after it: a peer that
+    /// declares nothing and streams forever must be cut by our limit rather than by
+    /// its own honesty. This drives the same `read_response_bounded` the catalog
+    /// fetch uses.
+    #[tokio::test]
+    async fn an_oversized_catalog_body_is_refused_without_being_buffered() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                // Chunked with no declared length, so the only thing that can stop
+                // this is the reader's own cap.
+                if stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let filler = format!("{:x}\r\n{}\r\n", 64 * 1024, "x".repeat(64 * 1024));
+                while stream.write_all(filler.as_bytes()).await.is_ok() {}
+            }
+        });
+        let context = M3OperationContext::default();
+        let error = fetch_component_catalog(&format!("http://{address}/catalog.json"), &context)
+            .await
+            .expect_err("an unbounded body must be refused");
+        assert!(error.to_string().contains("body limit"), "{error}");
+    }
+
+    /// Discovery is not authenticity, and this is the line in code that says so.
+    ///
+    /// A SHA-256 the catalog supplied proves the bytes are the ones that catalog
+    /// meant, which is worth nothing against whoever can rewrite the catalog. Only
+    /// `mlx_runtime` installs through a pinned publisher key today, so only
+    /// `mlx_runtime` may arrive this way — and the refusal names the manual path
+    /// rather than pretending the kind does not exist.
+    #[tokio::test]
+    async fn a_fetched_catalog_may_only_list_kinds_whose_install_verifies_a_publisher_key() {
+        let mut entry: serde_json::Value = serde_json::from_str(PUBLISHED_CATALOG)
+            .map(|entries: Vec<serde_json::Value>| entries[0].clone())
+            .expect("parse fixture");
+        entry["kind"] = serde_json::json!("llama_cpp_server");
+        entry["componentId"] = serde_json::json!("llama-cpp-server-metal");
+        // Reaches the kind check only because everything else about it is valid,
+        // which is the case that matters: a well-formed catalog listing an
+        // unverifiable executable.
+        let document = serde_json::to_vec(&vec![entry]).expect("serialize");
+        parse_component_catalog(&document).expect("the entry itself is valid");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let document = document.clone();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    document.len()
+                );
+                let _ = stream.write_all(header.as_bytes()).await;
+                let _ = stream.write_all(&document).await;
+            }
+        });
+        let context = M3OperationContext::default();
+        let error = fetch_component_catalog(&format!("http://{address}/catalog.json"), &context)
+            .await
+            .expect_err("an unsigned executable kind must not arrive over the network")
+            .to_string();
+        assert!(error.contains("pinned publisher key"), "{error}");
+        assert!(error.contains("Import catalog"), "{error}");
+
+        // And the rule is exhaustive rather than a list someone has to remember to
+        // extend: every kind answers, and only one answers yes today.
+        let verified: Vec<M3ComponentKind> = [
+            M3ComponentKind::LlamaCppServer,
+            M3ComponentKind::MlxRuntime,
+            M3ComponentKind::Tokenizer,
+            M3ComponentKind::Converter,
+            M3ComponentKind::ProjectorRuntime,
+            M3ComponentKind::MetalSupport,
+            M3ComponentKind::CudaSupport,
+            M3ComponentKind::RocmSupport,
+            M3ComponentKind::VulkanSupport,
+            M3ComponentKind::StudioTool,
+        ]
+        .into_iter()
+        .filter(|kind| kind_verifies_publisher_signature(*kind))
+        .collect();
+        assert_eq!(verified, vec![M3ComponentKind::MlxRuntime]);
+    }
+
+    /// The registry's identity, and the field it was missing.
+    ///
+    /// `component_id` + `version` + `sha256` let two publishers' entries for the
+    /// same version collide, so adopting one could overwrite the other while
+    /// silently moving where the bytes come from. The URL is in the key, so those
+    /// are two rows. `entryKey` in `RuntimeHubComponents.test.ts` pins the same four
+    /// fields on the frontend side, which is what keeps the React key and the
+    /// registry row meaning the same thing.
+    #[test]
+    fn a_registry_key_is_the_one_identity_the_registry_merges_on() {
+        let base = registry_fixture_entry();
+        for mutate in [
+            (|entry: &mut M3ComponentCatalogEntry| entry.component_id = "other".to_string())
+                as fn(&mut M3ComponentCatalogEntry),
+            |entry| entry.version = "other".to_string(),
+            |entry| entry.sha256 = "b".repeat(64),
+            |entry| entry.download_url = "https://components.example.test/elsewhere".to_string(),
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_ne!(changed.registry_key(), base.registry_key());
+        }
+        // And nothing else. `source_id` especially: the local registry restamps it
+        // on adoption, so a key that read it would change under a row's feet.
+        for mutate in [
+            (|entry: &mut M3ComponentCatalogEntry| {
+                entry.source_id = "little-monkey-mlx".to_string()
+            }) as fn(&mut M3ComponentCatalogEntry),
+            |entry| entry.display_name = "Renamed".to_string(),
+            |entry| entry.compatibility_note = Some("needs macOS 15".to_string()),
+            |entry| entry.published_at_ms = 1_800_000_000_000,
+        ] {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert_eq!(changed.registry_key(), base.registry_key());
+        }
+    }
+
+    fn registry_fixture_entry() -> M3ComponentCatalogEntry {
+        M3ComponentCatalogEntry {
+            schema_version: M3_COMPONENT_CATALOG_SCHEMA_VERSION,
+            source_id: "local".to_string(),
+            component_id: "llama-cpp-server-metal".to_string(),
+            kind: M3ComponentKind::LlamaCppServer,
+            display_name: "llama.cpp server (Metal)".to_string(),
+            accelerator: None,
+            version: "b4100".to_string(),
+            channel: M3ComponentChannel::Stable,
+            download_url: "https://components.example.test/llama-server".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 1024,
+            published_at_ms: 1_700_000_000_000,
+            compatibility_note: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// The published catalog URL, fetched for real.
+    ///
+    /// Ignored by default and deliberately: normal CI must not fail because GitHub
+    /// is having a bad morning, and nothing here downloads the 70 MB runtime. What
+    /// it proves is the one thing a fixture cannot — that the stable URL this app
+    /// ships still answers, that its real redirect chain is accepted by the real
+    /// public-destination rule, and that the document on the other side still
+    /// parses into the component this project publishes.
+    ///
+    /// Run with `cargo test -- --ignored the_published_catalog_url`.
+    #[tokio::test]
+    #[ignore = "reaches github.com; run deliberately"]
+    async fn the_published_catalog_url_is_reachable_and_parses() {
+        let context = M3OperationContext::default();
+        let entries = fetch_component_catalog(
+            crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL,
+            &context,
+        )
+        .await
+        .expect("the published catalog is reachable through its redirect");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == M3ComponentKind::MlxRuntime),
+            "the published catalog no longer lists the MLX runtime: {entries:#?}"
+        );
     }
 }

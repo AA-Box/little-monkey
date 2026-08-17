@@ -96,8 +96,8 @@ jobs:
     # code — a single-OS CI job would silently never compile the arms that
     # don't match its own target at all (cfg-gated blocks that don't match
     # the runner's target are stripped before the compiler looks at them).
-    # Mirrors release.yml's platform set. `macos-latest` runs on Apple Silicon,
-    # so this matrix also compiles and tests its ARM-only paths.
+    # Mirrors release.yml's platform set. `macos-latest` is Apple Silicon, so
+    # its ARM-only test paths are compiled and exercised here too.
     strategy:
       fail-fast: false
       matrix:
@@ -275,6 +275,20 @@ jobs:
       - name: Rust tests
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
+
+      - name: Apple-Silicon MLX full-ladder transaction
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $(uname -m)"
+          test "$(uname -m)" = "arm64"
+          cargo test --manifest-path src-tauri/Cargo.toml -- --list | \
+            grep 'm3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional'
+          cargo test \
+            --manifest-path src-tauri/Cargo.toml \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --nocapture
 
       - name: The CLI reports this runner's resource-enforcement backend
         # Which mechanism actually holds a limit here, per platform, in the log —
