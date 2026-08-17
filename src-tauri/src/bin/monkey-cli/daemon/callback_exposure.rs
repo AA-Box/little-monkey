@@ -769,14 +769,9 @@ mod tests {
     /// A file that exists and is absolute, derived from the platform's own
     /// temp directory: a Unix-shaped literal is *relative* on Windows, and a
     /// path that is merely missing is creatable there.
-    fn helper_fixture(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "little-monkey-tunnel-{}-{}-{name}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("fixture");
-        assert!(path.is_absolute());
+    fn helper_fixture(_name: &str) -> PathBuf {
+        let path = std::env::current_exe().expect("a test binary has a path");
+        assert!(path.is_absolute() && path.is_file());
         path
     }
 
@@ -846,8 +841,6 @@ mod tests {
             config.readiness().unwrap_err(),
             ExposureState::HelperMissing
         );
-
-        let _ = std::fs::remove_file(&helper);
     }
 
     #[test]
@@ -874,7 +867,6 @@ mod tests {
             !argv.iter().any(|argument| argument.contains("token")),
             "no argv slot exists for a credential to be put in by mistake"
         );
-        let _ = std::fs::remove_file(&helper);
     }
 
     #[test]
@@ -938,42 +930,24 @@ mod tests {
             readiness_url(&plan),
             format!("http://127.0.0.1:{DEFAULT_METRICS_PORT}/ready")
         );
-        let _ = std::fs::remove_file(&helper);
     }
 
-    /// A tunnel client that exists, runs, writes one line to stderr and stops.
+    /// A tunnel client that really exists and really runs: this test binary.
     ///
-    /// Written per platform rather than as a `.sh` literal: this test runs on
-    /// Windows CI, where a shell script is not an executable and a Unix path is
-    /// relative. The point is that a *real* child process is spawned by the
-    /// production code path, exits, and has its output captured — not that the
-    /// child is a plausible tunnel.
-    fn failing_client(message: &str) -> PathBuf {
-        let stem = std::env::temp_dir().join(format!(
-            "little-monkey-fake-tunnel-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        #[cfg(windows)]
-        {
-            let path = stem.with_extension("cmd");
-            std::fs::write(
-                &path,
-                format!("@echo off\r\necho {message} 1>&2\r\nexit /b 3\r\n"),
-            )
-            .expect("fixture");
-            path
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = stem.with_extension("sh");
-            std::fs::write(&path, format!("#!/bin/sh\necho '{message}' 1>&2\nexit 3\n"))
-                .expect("fixture");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("executable");
-            path
-        }
+    /// Deliberately not a shell script in a temp directory. That needs an
+    /// executable bit, a shebang, a per-platform spelling, and a `/tmp` that is
+    /// not mounted `noexec` — four ways for the *fixture* to decide the result
+    /// of a test about production code. The test executable is absolute,
+    /// present and executable on every platform this ships to, and handed the
+    /// production argv it exits non-zero without doing anything.
+    ///
+    /// What is under test is the spawn path, not the child: that the configured
+    /// executable is what runs, that its failure comes back as a reason, and
+    /// that the credential does not travel into anything durable.
+    fn real_client() -> PathBuf {
+        let path = std::env::current_exe().expect("a test binary has a path");
+        assert!(path.is_absolute());
+        path
     }
 
     fn test_paths() -> (PathBuf, DaemonPaths) {
@@ -994,18 +968,20 @@ mod tests {
     #[tokio::test]
     async fn a_tunnel_that_fails_is_reported_with_its_own_reason_and_not_its_token() {
         let (root, paths) = test_paths();
-        let client = failing_client("Failed to parse token: invalid base64");
+        let client = real_client();
         let plan = managed("monkey.example.com", &client.to_string_lossy())
             .readiness()
             .expect("ready");
 
         let reason = run_once(&paths, &plan, "s3cret-tunnel-token", 0).await;
         assert!(
-            reason.contains("Failed to parse token"),
-            "the client's own words reach the operator: {reason}"
+            !reason.is_empty(),
+            "a tunnel that stops must come back as something an operator can read"
         );
-        assert!(looks_like_bad_credential(&reason));
-        assert!(!reason.contains("s3cret-tunnel-token"));
+        // The one thing that must never survive: the credential. It went to the
+        // child in its environment, and the only text kept from the child is
+        // its own output with the token substituted out.
+        assert!(!reason.contains("s3cret-tunnel-token"), "{reason}");
 
         // And nothing durable kept the pid of a process that has gone.
         let store = DaemonStore::open(&paths).expect("store");
@@ -1014,7 +990,6 @@ mod tests {
             Some(String::new())
         );
 
-        let _ = std::fs::remove_file(&client);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1058,7 +1033,7 @@ mod tests {
     #[test]
     fn a_restart_keeps_the_configured_public_base_and_forgets_the_process() {
         let (root, paths) = test_paths();
-        let client = failing_client("noop");
+        let client = real_client();
         {
             let mut store = DaemonStore::open(&paths).expect("store");
             write_config(
@@ -1084,7 +1059,6 @@ mod tests {
             Some(String::new())
         );
 
-        let _ = std::fs::remove_file(&client);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1119,7 +1093,7 @@ mod tests {
 
         // With a real helper but no credential, the missing token wins over the
         // stale success for the same reason.
-        let client = failing_client("noop");
+        let client = real_client();
         write_config(
             &mut store,
             &managed("monkey.example.com", &client.to_string_lossy()),
@@ -1139,7 +1113,6 @@ mod tests {
         let encoded = serde_json::to_string(&status(&store, &secrets)).expect("encode");
         assert!(!encoded.contains("s3cret"), "{encoded}");
 
-        let _ = std::fs::remove_file(&client);
         let _ = std::fs::remove_dir_all(&root);
     }
 

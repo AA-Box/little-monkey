@@ -1257,6 +1257,11 @@ pub(crate) use macos::ImessageAdapter;
 #[cfg(not(target_os = "macos"))]
 mod other {
     use async_trait::async_trait;
+    // Its own imports, because it is its own module: the macOS implementation's
+    // `use` lines above are compiled out here. A type added to
+    // `ProviderCapabilities` therefore has to be imported twice, and forgetting
+    // the second one builds fine on a Mac and fails on Linux and Windows.
+    use little_monkey_lib::channels::policy::EchoCorrelation;
     use little_monkey_lib::channels::types::{
         ChannelHealth, ChannelKind, InboundTransport, OutboundMessage, ProviderCapabilities,
         SendOutcome,
