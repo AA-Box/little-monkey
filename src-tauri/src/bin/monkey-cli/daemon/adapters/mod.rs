@@ -25,7 +25,7 @@ pub(crate) mod whatsapp;
 
 use std::sync::Arc;
 
-use little_monkey_lib::channels::types::ChannelKind;
+use little_monkey_lib::channels::types::{ChannelKind, InboundTransport};
 
 use super::channel_adapter::{AdapterConfig, ChannelAdapter};
 
@@ -115,6 +115,43 @@ const UNIVERSAL_CONFIG_FIELDS: &[ConfigField] = &[
     optional("max_attachment_excerpt_chars", ConfigFieldKind::Number),
     optional("max_listed_attachments", ConfigFieldKind::Number),
 ];
+
+/// How inbound messages reach this build for one provider, without building an
+/// adapter for it.
+///
+/// [`ChannelAdapter::capabilities`] answers the same question and is the
+/// authority for a *running* account, but it needs a constructed adapter, which
+/// needs the account's credential out of the keychain. Security Doctor asks
+/// about accounts that are misconfigured, disabled, or missing their credential
+/// entirely — exactly the ones no adapter can be built for — so it needs the
+/// static answer.
+///
+/// Exhaustive on purpose, like [`build_adapter`]: a new provider kind fails to
+/// compile here until somebody says how its messages arrive, rather than
+/// silently defaulting into a class whose audit questions do not apply to it.
+pub(crate) fn inbound_transport_for(kind: ChannelKind) -> InboundTransport {
+    match kind {
+        ChannelKind::Telegram => InboundTransport::LongPoll,
+        ChannelKind::Discord
+        | ChannelKind::Slack
+        | ChannelKind::Mattermost
+        | ChannelKind::Irc
+        | ChannelKind::Matrix => InboundTransport::Socket,
+        ChannelKind::WhatsApp
+        | ChannelKind::Teams
+        | ChannelKind::GoogleChat
+        | ChannelKind::Line
+        | ChannelKind::Sms => InboundTransport::Webhook,
+        ChannelKind::Signal | ChannelKind::IMessage => InboundTransport::Helper,
+        // An extension speaks for whatever it speaks for, and the host does not
+        // know which until the guest is resolved. Reported as its own delivery
+        // mechanism rather than guessed: the guest is what receives, and the
+        // questions this classification drives — "is a signing secret
+        // configured", "is the callback URL right" — are the extension's own,
+        // not this host's.
+        ChannelKind::Extension => InboundTransport::Socket,
+    }
+}
 
 /// The non-secret configuration schema of one provider — exactly the keys its
 /// adapter reads, kept next to [`build_adapter`] so a new provider that adds a

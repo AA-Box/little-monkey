@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
@@ -192,6 +193,7 @@ impl ChannelAdapter for MattermostAdapter {
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Mattermost, InboundTransport::Socket)
         }
     }
@@ -689,6 +691,7 @@ fn normalize_posted_event(
                     filename: None,
                     mime_type: None,
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
                         handle: file_id.to_string(),
                     },
@@ -701,6 +704,7 @@ fn normalize_posted_event(
         account_id: account_id.to_string(),
         kind: ChannelKind::Mattermost,
         provider_event_id: id,
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id: user_id,

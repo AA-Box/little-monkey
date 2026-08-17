@@ -510,6 +510,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Slack,
             provider_event_id: "evt".into(),
+            provider_message_id: None,
             conversation: ChannelConversation {
                 conversation_id: "C1".into(),
                 kind: ConversationKind::Channel,

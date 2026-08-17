@@ -55,6 +55,7 @@ use tokio_rustls::TlsConnector;
 use crate::daemon::channel_adapter::{
     AdapterConfig, ChannelAdapter, InboundBatch, TransportStatus,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     BoundedMetadata, ChannelConversation, ChannelEnvelope, ChannelHealth, ChannelKind,
     ChannelSender, HealthState, InboundTransport, OutboundMessage, ProviderCapabilities,
@@ -273,6 +274,7 @@ impl ChannelAdapter for IrcAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
         }
     }
 
@@ -910,6 +912,7 @@ fn normalize_privmsg(
         account_id: String::new(),
         kind: ChannelKind::Irc,
         provider_event_id: deterministic_event_id(server, target, sender_nick, raw_line, counter),
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id: sender_nick.to_string(),

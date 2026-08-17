@@ -121,9 +121,20 @@ pub fn build_provider(
 /// channel adapter's does. Every caller that has an account row wants exactly
 /// this mapping, so it lives here rather than being spelled out again at each
 /// call site.
+/// Build a carrier client for one number.
+///
+/// `public_base_url` is passed in rather than read off the account, and that is
+/// deliberate. It is the URL Twilio and Plivo *sign*, so a verifier that
+/// rebuilt a different one rejects every genuine callback — and a number with
+/// no URL of its own now inherits the machine's exposure, which the record
+/// alone does not know about. Making it a parameter means every call site has
+/// to have resolved it (see
+/// [`DaemonStore::telecom_callback_base`](super::telecom_store)), rather than
+/// silently getting `None` from a record that was correct yesterday.
 pub fn provider_for_account(
     account: &super::telecom_store::TelecomAccountRecord,
     secret: String,
+    public_base_url: Option<String>,
 ) -> Result<std::sync::Arc<dyn TelecomProvider>, String> {
     build_provider(TelecomConfig {
         account_id: account.account_id.clone(),
@@ -131,7 +142,7 @@ pub fn provider_for_account(
         carrier_account_id: account.carrier_account_id.clone(),
         from_number: account.from_number.clone(),
         secret,
-        public_base_url: account.public_base_url.clone(),
+        public_base_url,
         webhook_public_key: account
             .non_secret_config
             .get("webhook_public_key")
@@ -523,6 +534,26 @@ pub trait TelecomProvider: Send + Sync + super::call_media::MediaFrameCodec {
         _record: bool,
     ) -> Result<(), String> {
         Err("This carrier has no way to connect a call to a media stream".to_string())
+    }
+
+    /// Download one inbound MMS attachment from the carrier.
+    ///
+    /// A carrier-specific call rather than a plain GET, because the media URL a
+    /// carrier puts in its callback is not a public one: Twilio and Plivo serve
+    /// theirs from their own API and require the account's HTTP credential, and
+    /// an unauthenticated fetch of either gets a `401`, not the picture. Only
+    /// the carrier knows which credential and which header.
+    ///
+    /// `max_bytes` is the account's ceiling and must be enforced *while
+    /// streaming*: a `Content-Length` is a claim by the same host that is
+    /// sending the body, so a cap applied after the fact is not a cap. Every
+    /// implementation goes through [`super::channel_adapter::fetch_url`], which
+    /// abandons the body the moment it crosses.
+    ///
+    /// The default refuses, so a carrier that gains MMS says so rather than
+    /// silently handing back nothing.
+    async fn fetch_media(&self, _url: &str, _max_bytes: u64) -> Result<Vec<u8>, String> {
+        Err("This carrier cannot download inbound attachments".to_string())
     }
 
     /// Verify a carrier callback over the exact bytes received and normalize

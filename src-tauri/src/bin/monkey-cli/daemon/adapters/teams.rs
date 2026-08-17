@@ -78,6 +78,7 @@
 //! written anywhere.
 
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -495,6 +496,10 @@ impl WebhookChannelAdapter for TeamsAdapter {
         ChannelKind::Teams
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// The Bot Framework connector treats `200` as delivered and reads the
     /// body as an optional response activity; an empty JSON object is how a
     /// bot that will answer later says there is nothing to send back now.
@@ -695,6 +700,7 @@ impl ChannelAdapter for TeamsAdapter {
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Teams, InboundTransport::Webhook)
         }
     }
@@ -1080,6 +1086,7 @@ fn normalize_activity(
                             .map(str::to_string),
                         mime_type: mime_type.map(str::to_string),
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::Url {
                             url: content_url.to_string(),
                         },
@@ -1107,6 +1114,7 @@ fn normalize_activity(
         account_id: account_id.to_string(),
         kind: ChannelKind::Teams,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender,
         text,

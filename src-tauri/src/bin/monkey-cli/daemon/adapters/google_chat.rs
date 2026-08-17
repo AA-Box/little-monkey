@@ -48,6 +48,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -283,6 +284,10 @@ impl WebhookChannelAdapter for GoogleChatAdapter {
         ChannelKind::GoogleChat
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// Google Chat reads a `200`'s body as an optional immediate reply and
     /// treats any other status as a failed delivery. An empty JSON object is
     /// how an app that will answer through the API later says there is nothing
@@ -352,6 +357,7 @@ impl ChannelAdapter for GoogleChatAdapter {
             // `requestId` on messages.create, which the send always carries.
             supports_idempotency_key: true,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::GoogleChat, InboundTransport::Webhook)
         }
     }
@@ -721,6 +727,7 @@ fn normalize_event(
                             .map(str::to_string),
                         mime_type: mime_type.map(str::to_string),
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: resource.to_string(),
                         },
@@ -737,6 +744,7 @@ fn normalize_event(
         account_id: account_id.to_string(),
         kind: ChannelKind::GoogleChat,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender,
         text,

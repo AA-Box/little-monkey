@@ -48,6 +48,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope, ChannelHealth,
     ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
@@ -213,6 +214,7 @@ impl ChannelAdapter for SlackAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Slack, InboundTransport::Socket)
         }
     }
@@ -1003,6 +1005,7 @@ fn normalize_message_event(
                             .and_then(Value::as_str)
                             .map(str::to_string),
                         declared_size_bytes: file.get("size").and_then(Value::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle { handle },
                     })
                 })
@@ -1019,6 +1022,7 @@ fn normalize_message_event(
         account_id: account_id.to_string(),
         kind: ChannelKind::Slack,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id,

@@ -129,6 +129,29 @@ impl MockProvider {
             from: from_number.to_string(),
             to: to_number.to_string(),
             text: text.to_string(),
+            media: Vec::new(),
+        })
+    }
+
+    /// A signed inbound MMS: the same text callback carrying `(url, mime)`
+    /// pairs, which is the shape every real carrier's inbound media takes.
+    pub fn sign_inbound_mms(
+        &self,
+        from_number: &str,
+        to_number: &str,
+        text: &str,
+        media: &[(String, String)],
+    ) -> (Vec<(String, String)>, Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        state.next_message_id += 1;
+        let id = state.next_message_id;
+        drop(state);
+        self.sign_body(&MockWebhookBody::InboundSms {
+            message_id: format!("mock-msg-{id}"),
+            from: from_number.to_string(),
+            to: to_number.to_string(),
+            text: text.to_string(),
+            media: media.to_vec(),
         })
     }
 
@@ -239,6 +262,10 @@ enum MockWebhookBody {
         from: String,
         to: String,
         text: String,
+        /// Where the carrier says the attached media can be fetched from.
+        /// Empty for a plain text, which is the ordinary case.
+        #[serde(default)]
+        media: Vec<(String, String)>,
     },
     CallProgress {
         provider_call_id: String,
@@ -297,6 +324,12 @@ impl crate::daemon::call_media::MediaFrameCodec for MockProvider {
 impl TelecomProvider for MockProvider {
     fn kind(&self) -> TelecomKind {
         TelecomKind::Mock
+    }
+
+    /// The fixture carrier serves its media from a loopback test server, so the
+    /// production download path is what runs -- cap, redirect policy and all.
+    async fn fetch_media(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        crate::daemon::channel_adapter::fetch_url(url, None, max_bytes).await
     }
 
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
@@ -398,18 +431,41 @@ impl TelecomProvider for MockProvider {
                 from,
                 to,
                 text,
+                media,
             } => {
                 let from = super::normalize_e164(&from);
                 let mut metadata = BoundedMetadata::new();
                 metadata.insert("to_number", super::normalize_e164(&to));
+                let attachments = media
+                    .into_iter()
+                    .map(
+                        |(url, mime)| little_monkey_lib::channels::types::ChannelAttachment {
+                            provider_id: None,
+                            kind: little_monkey_lib::channels::types::AttachmentKind::from_mime(
+                                &mime,
+                            ),
+                            filename: None,
+                            mime_type: Some(mime),
+                            declared_size_bytes: None,
+                            stored_size_bytes: None,
+                            source: little_monkey_lib::channels::types::AttachmentSource::Url {
+                                url,
+                            },
+                            stored_artifact_id: None,
+                            fetch_error: None,
+                            text_excerpt: None,
+                        },
+                    )
+                    .collect();
                 Ok(TelecomEvent::InboundSms(Box::new(ChannelEnvelope {
                     account_id: self.account_id.clone(),
                     kind: ChannelKind::Sms,
                     provider_event_id: message_id,
+                    provider_message_id: None,
                     conversation: ChannelConversation::direct(from.clone()),
                     sender: ChannelSender::new(from),
                     text,
-                    attachments: Vec::new(),
+                    attachments,
                     reply_to_provider_id: None,
                     mentions_self: false,
                     received_at_ms: now_ms,

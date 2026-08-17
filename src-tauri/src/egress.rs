@@ -3882,6 +3882,14 @@ mod tests {
             // belongs to needs a restored session, and the real session cannot
             // be restored until that answer is known.
             ("bin/monkey-cli/daemon/adapters/matrix.rs", 0, 2),
+            // The readiness probe against the operator's own tunnel client, on
+            // the loopback metrics port this daemon told that child to open.
+            // Loopback by construction and carrying no credential: the tunnel's
+            // token goes to the child in its environment and never near an HTTP
+            // request. `hardened()` refuses loopback deliberately, which is why
+            // it cannot be used here; the probe's own 3s deadline is audited
+            // below.
+            ("bin/monkey-cli/daemon/callback_exposure.rs", 0, 1),
             // The opt-in peer live-validation test's client, pinned to the
             // self-signed certificate the test mints for its own loopback
             // listener — the same `tls_certs_only` pin as the client below, and
@@ -4095,6 +4103,10 @@ mod tests {
         /// about what the ceiling should be, not a mechanical conversion, and a
         /// `read_timeout` alone would let a wedged local model hang forever.
         const TOTAL_TIMEOUT_ALLOWED: &[(&str, usize)] = &[
+            // 3s on the tunnel client's loopback `/ready`, whose body is never
+            // read at all, only `status()`. Nothing to truncate, and a probe
+            // that hung would stall the supervisor's state reporting.
+            ("bin/monkey-cli/daemon/callback_exposure.rs", 1),
             // 8s for two favicon candidates. `MAX_FAVICON_BYTES` (256 KiB) is
             // checked *after* `bytes()` has already buffered the body, so the
             // deadline is doing the byte cap's job — a separate defect from this

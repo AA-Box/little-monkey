@@ -46,6 +46,7 @@ mod macos {
     use tokio::time::Instant;
 
     use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+    use little_monkey_lib::channels::policy::EchoCorrelation;
     use little_monkey_lib::channels::types::{
         AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
         ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -382,6 +383,7 @@ mod macos {
                                 .map(str::to_string),
                             mime_type,
                             declared_size_bytes: item.get("size").and_then(Value::as_u64),
+                            stored_size_bytes: None,
                             // An opaque handle the *helper* issued and only the
                             // helper can resolve. This process never learns
                             // where the file is, let alone opens it — which is
@@ -409,6 +411,7 @@ mod macos {
             // Messages' own stable identifier, which is what dedupe wants —
             // and what makes a row re-delivered after a helper crash harmless.
             provider_event_id: guid,
+            provider_message_id: None,
             conversation,
             sender: ChannelSender {
                 sender_id: sender,
@@ -462,6 +465,7 @@ mod macos {
                 supports_mention_metadata: false,
                 supports_idempotency_key: false,
                 supports_delivery_receipts: false,
+                echo_correlation: EchoCorrelation::HostAdapter,
             }
         }
 
@@ -1019,6 +1023,7 @@ done
                     filename: Some("x.png".to_string()),
                     mime_type: Some("image/png".to_string()),
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
                         // An opaque row id. This process could not open the file
                         // if it wanted to — it does not know where it is.
@@ -1151,6 +1156,7 @@ done
                         filename: None,
                         mime_type: None,
                         declared_size_bytes: None,
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: hostile.to_string(),
                         },
@@ -1251,6 +1257,11 @@ pub(crate) use macos::ImessageAdapter;
 #[cfg(not(target_os = "macos"))]
 mod other {
     use async_trait::async_trait;
+    // Its own imports, because it is its own module: the macOS implementation's
+    // `use` lines above are compiled out here. A type added to
+    // `ProviderCapabilities` therefore has to be imported twice, and forgetting
+    // the second one builds fine on a Mac and fails on Linux and Windows.
+    use little_monkey_lib::channels::policy::EchoCorrelation;
     use little_monkey_lib::channels::types::{
         ChannelHealth, ChannelKind, InboundTransport, OutboundMessage, ProviderCapabilities,
         SendOutcome,
@@ -1289,6 +1300,7 @@ mod other {
                 supports_mention_metadata: false,
                 supports_idempotency_key: false,
                 supports_delivery_receipts: false,
+                echo_correlation: EchoCorrelation::HostAdapter,
             }
         }
 

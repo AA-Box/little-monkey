@@ -26,6 +26,7 @@
 
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelEnvelope, ChannelHealth, ChannelKind,
     DeliveryReceipt, HealthState, OutboundMessage, ProviderCapabilities, SendOutcome,
@@ -168,13 +169,43 @@ pub trait ChannelAdapter: Send + Sync {
 /// crosses the cap, so an oversized file costs the cap and not its own size —
 /// a `Content-Length` cannot be trusted to be the truth about what follows.
 pub async fn fetch_url(url: &str, bearer: Option<&str>, max_bytes: u64) -> Result<Vec<u8>, String> {
+    fetch_authenticated(url, max_bytes, |request| match bearer {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    })
+    .await
+}
+
+/// The same download, authenticated the way an HTTP API expects rather than the
+/// way a bearer token does.
+///
+/// Twilio and Plivo serve inbound MMS media from their own API and require the
+/// account's HTTP credential; an unauthenticated fetch gets a `401` rather than
+/// the picture. Kept as a second entry point on the same body so the cap, the
+/// hardened client and the redirect policy are the ones every other attachment
+/// download already goes through — a carrier-local copy of this loop is how one
+/// of them ends up without a cap.
+pub async fn fetch_url_basic_auth(
+    url: &str,
+    username: &str,
+    password: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    fetch_authenticated(url, max_bytes, |request| {
+        request.basic_auth(username, Some(password))
+    })
+    .await
+}
+
+async fn fetch_authenticated(
+    url: &str,
+    max_bytes: u64,
+    authenticate: impl FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Result<Vec<u8>, String> {
     let client = little_monkey_lib::egress::hardened()
         .build()
         .map_err(|error| format!("Failed to build the download client: {error}"))?;
-    let mut request = client.get(url);
-    if let Some(token) = bearer {
-        request = request.bearer_auth(token);
-    }
+    let request = authenticate(client.get(url));
     let response = little_monkey_lib::egress::send(request)
         .await
         .map_err(|_| "The attachment could not be downloaded".to_string())?;
@@ -268,6 +299,109 @@ impl AttachmentLimits {
     }
 }
 
+/// Whether the host can recognise its own echo on this account.
+///
+/// Every adapter this project ships is host code holding the account's
+/// credential, and each one already returns the provider's message id on send
+/// and carries it inbound — so for them this is a property of the build, not of
+/// a setting somebody could get wrong.
+///
+/// An extension-backed account is the exception, and the whole reason
+/// [`EchoCorrelation`] exists: the thing normalizing its messages is a
+/// sandboxed guest. The transport has to *declare* that it supplies stable
+/// provider message ids, and an extension that has not been updated declares
+/// nothing and is treated as unable to — which restricts what reply policy the
+/// account may run under.
+pub(crate) fn echo_correlation_for(
+    account: &crate::daemon::channel_store::ChannelAccountRecord,
+) -> EchoCorrelation {
+    if account.kind != ChannelKind::Extension {
+        return EchoCorrelation::HostAdapter;
+    }
+    account
+        .non_secret_config
+        .get("echo_correlation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(EchoCorrelation::parse)
+        // Absent reads as unsupported, never as fine. A missing field is
+        // exactly the case where guessing in the permissive direction is how a
+        // reply loop ships.
+        .unwrap_or_default()
+}
+
+/// What the account can actually do right now, as opposed to what it declares.
+///
+/// The two differ when a send succeeded and writing its provider id to the echo
+/// ledger did not. That message is out and its id is not remembered, so for as
+/// long as it could come back, this account's causal evidence is incomplete —
+/// and an incomplete ledger is indistinguishable, at the ingress, from having
+/// none. So it is treated as having none.
+///
+/// Only a declared `ProviderMessageId` can be degraded. A built-in adapter's
+/// echo is decided by host code that does not consult the ledger, and an account
+/// that already declares `Unsupported` has nothing left to lose.
+///
+/// A store that will not answer degrades the account too: the question is
+/// whether this machine can prove it remembers what it sent, and a read that
+/// failed proves nothing.
+pub(crate) fn effective_echo_correlation(
+    store: &crate::daemon::store::DaemonStore,
+    account: &crate::daemon::channel_store::ChannelAccountRecord,
+    now_ms: i64,
+) -> EchoCorrelation {
+    let declared = echo_correlation_for(account);
+    if declared == EchoCorrelation::ProviderMessageId
+        && echo_evidence_incomplete(store, &account.account_id, now_ms)
+    {
+        return EchoCorrelation::Unsupported;
+    }
+    declared
+}
+
+/// Whether this account has a message out whose id this machine cannot prove it
+/// holds.
+///
+/// Two independent answers, because one of them is a write and writes fail.
+///
+/// The marker is what a *reported* failure leaves behind: the send succeeded,
+/// the ledger write did not, and the worker said so. It is exact, and it is
+/// the only one of the two that survives a store which recovers before the
+/// window closes.
+///
+/// The unresolved outbound row is what a store that would take **no** write
+/// leaves behind, and it needs no write at all: the row was claimed `sending`
+/// before the request went out, so it is already durable by the time anything
+/// can fail. That covers the sequence the marker cannot — ledger write fails,
+/// marker write fails too, and then either the daemon crashes or the store
+/// simply recovers — where there is otherwise nothing at all to say a message
+/// escaped unrecorded.
+///
+/// A row counts from the instant it is claimed, with no grace period, because
+/// a send that is one second old is a send whose id may be failing to record
+/// one second from now. Waiting would only pick a length of hole. So an
+/// account is narrowed while its own request is in flight, and unnarrowed by
+/// the write that completes it.
+///
+/// Either one means the same thing at the ingress: within the last retention
+/// window this account may have sent a message whose id would not match if the
+/// provider echoed it. Both are bounded by that window, so both clear on their
+/// own.
+///
+/// An unreadable store answers `true`. The question is whether this machine can
+/// prove it remembers what it sent, and a read that failed proves nothing.
+pub(crate) fn echo_evidence_incomplete(
+    store: &crate::daemon::store::DaemonStore,
+    account_id: &str,
+    now_ms: i64,
+) -> bool {
+    store
+        .echo_correlation_degraded(account_id, now_ms)
+        .unwrap_or(true)
+        || store
+            .has_unresolved_outbound(account_id, now_ms)
+            .unwrap_or(true)
+}
+
 /// The beginning of a file's text, when the bytes are text at all.
 ///
 /// A file that is not valid UTF-8 has no excerpt rather than a mangled one —
@@ -318,26 +452,70 @@ pub async fn hydrate_attachments(
     for window in pending.chunks(CONCURRENT_DOWNLOADS) {
         let fetches = window.iter().map(|(envelope_index, attachment_index)| {
             let attachment = &envelopes[*envelope_index].attachments[*attachment_index];
-            async move { adapter.fetch_attachment(attachment, limits).await }
+            async move {
+                // The provider's own declaration, checked before a socket is
+                // opened. Streaming already abandons an oversized body at the
+                // cap, so this is not the safety net — it is the difference
+                // between paying the cap for a file we were told up front we
+                // would refuse, and paying nothing. A provider that declares
+                // 4 GB gets no connection at all.
+                if let Some(declared) = attachment.declared_size_bytes {
+                    if declared > limits.max_bytes {
+                        return Err(format!(
+                            "The sender's file is {declared} bytes, over this account's \
+                             {}-byte limit",
+                            limits.max_bytes
+                        ));
+                    }
+                }
+                adapter.fetch_attachment(attachment, limits).await
+            }
         });
         let results = futures_util::future::join_all(fetches).await;
         for ((envelope_index, attachment_index), result) in window.iter().zip(results) {
             let attachment = &mut envelopes[*envelope_index].attachments[*attachment_index];
-            match result {
-                Ok(bytes) => match blobs.write(&bytes) {
-                    Ok(artifact_id) => {
-                        attachment.declared_size_bytes = Some(bytes.len() as u64);
-                        attachment.text_excerpt = text_excerpt(&bytes, limits.max_excerpt_chars);
-                        // Given a name a vision model can be pointed at, while
-                        // the bytes are known to be on disk — a failure here is
-                        // visible now rather than silent at prompt time.
-                        if let Some(extension) = vision_extension(attachment.mime_type.as_deref()) {
-                            blobs.image_path(&artifact_id, extension);
-                        }
-                        attachment.stored_artifact_id = Some(artifact_id);
+            let bytes = match result {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    attachment.fetch_error = Some(error);
+                    continue;
+                }
+            };
+            // What arrived, against what was promised. Before this the declared
+            // size was *overwritten* with the measured one, which made the two
+            // impossible to compare and quietly turned every provider's claim
+            // into whatever showed up. These providers report exact sizes —
+            // Telegram's `file_size`, Slack's and Discord's `size`, LINE's
+            // `fileSize` — so a mismatch means the bytes are not the file that
+            // was described, and the description is what the agent is told.
+            //
+            // Refused rather than stored with a note, for the reason the peer
+            // path refuses the same mismatch: an attachment that exists is a
+            // promise about what it is.
+            if let Some(declared) = attachment.declared_size_bytes {
+                if declared != bytes.len() as u64 {
+                    attachment.fetch_error = Some(format!(
+                        "The file the provider sent is {} bytes, not the {declared} it described",
+                        bytes.len()
+                    ));
+                    continue;
+                }
+            }
+            match blobs.write(&bytes) {
+                Ok(artifact_id) => {
+                    // The measured size, kept beside the declared one rather
+                    // than on top of it. An attachment that was never described
+                    // still gets a size the turn can show.
+                    attachment.stored_size_bytes = Some(bytes.len() as u64);
+                    attachment.text_excerpt = text_excerpt(&bytes, limits.max_excerpt_chars);
+                    // Given a name a vision model can be pointed at, while
+                    // the bytes are known to be on disk — a failure here is
+                    // visible now rather than silent at prompt time.
+                    if let Some(extension) = vision_extension(attachment.mime_type.as_deref()) {
+                        blobs.image_path(&artifact_id, extension);
                     }
-                    Err(error) => attachment.fetch_error = Some(error),
-                },
+                    attachment.stored_artifact_id = Some(artifact_id);
+                }
                 Err(error) => attachment.fetch_error = Some(error),
             }
         }
@@ -478,6 +656,16 @@ impl VerifiedWebhookDelivery {
 /// public base URL instead when a provider's signature covers it.
 pub trait WebhookChannelAdapter: Send + Sync {
     fn kind(&self) -> ChannelKind;
+
+    /// The account this adapter was built for.
+    ///
+    /// Not read from the request: the adapter is constructed from the stored
+    /// account the listener's own route matched, so this is the operator's
+    /// configuration rather than anything a caller claimed. Used to attribute a
+    /// refused delivery to the account it was aimed at, which is the only way
+    /// an operator ever learns that a rotated secret or a stale callback URL is
+    /// why their messages stopped arriving.
+    fn account_id(&self) -> &str;
 
     /// What this provider needs to see to consider the delivery finished.
     ///
@@ -1212,6 +1400,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-1"),
             sender: ChannelSender::new("user-1"),
             text: String::new(),
@@ -1222,6 +1411,7 @@ mod tests {
                     filename: Some(format!("file-{index}.txt")),
                     mime_type: Some("text/plain".into()),
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::ProviderHandle {
                         handle: format!("f{index}"),
                     },
@@ -1277,6 +1467,177 @@ mod tests {
                 assert!(attachment.fetch_error.is_none());
             }
         }
+    }
+
+    /// An adapter that records whether it was ever asked to download anything,
+    /// so a test can prove a refusal cost no socket rather than merely produced
+    /// the right error afterwards.
+    struct RecordingAdapter {
+        bytes: Vec<u8>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for RecordingAdapter {
+        fn kind(&self) -> ChannelKind {
+            ChannelKind::Telegram
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::minimal(
+                ChannelKind::Telegram,
+                little_monkey_lib::channels::types::InboundTransport::LongPoll,
+            )
+        }
+
+        async fn probe(&self) -> ChannelHealth {
+            ChannelHealth::connected(0, None)
+        }
+
+        async fn poll(&self, _cursor: Option<&str>) -> Result<InboundBatch, String> {
+            Ok(InboundBatch::default())
+        }
+
+        async fn send(&self, _message: &OutboundMessage) -> SendOutcome {
+            SendOutcome::PermanentFailure {
+                error: "not used".into(),
+            }
+        }
+
+        async fn fetch_attachment(
+            &self,
+            _attachment: &ChannelAttachment,
+            _limits: AttachmentLimits,
+        ) -> Result<Vec<u8>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.bytes.clone())
+        }
+    }
+
+    fn one_attachment(declared: Option<u64>) -> ChannelEnvelope {
+        let mut envelope = envelope_with(1);
+        envelope.attachments[0].declared_size_bytes = declared;
+        envelope
+    }
+
+    /// A file the provider itself says is over the limit costs nothing at all.
+    ///
+    /// Streaming already abandons an oversized body at the cap, so the bytes
+    /// were never the exposure — the connection was. A provider that declares
+    /// 4 GB should not get a socket, and the sender should be told why rather
+    /// than left with a file that silently vanished.
+    #[tokio::test]
+    async fn a_file_declared_over_the_limit_is_refused_without_opening_a_socket() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = RecordingAdapter {
+            bytes: b"hello".to_vec(),
+            calls: calls.clone(),
+        };
+        let limits = AttachmentLimits {
+            max_bytes: 1_024,
+            ..AttachmentLimits::default()
+        };
+        let mut envelopes = vec![one_attachment(Some(4 * 1024 * 1024 * 1024))];
+
+        hydrate_attachments(
+            &adapter,
+            &test_http::FixtureBlobs(Vec::new()),
+            limits,
+            &mut envelopes,
+        )
+        .await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the download must not be attempted at all"
+        );
+        let attachment = &envelopes[0].attachments[0];
+        assert!(attachment.stored_artifact_id.is_none());
+        assert!(
+            attachment
+                .fetch_error
+                .as_deref()
+                .is_some_and(|error| error.contains("over this account's")),
+            "{:?}",
+            attachment.fetch_error
+        );
+    }
+
+    /// Bytes that are not the file that was described are not stored.
+    ///
+    /// These providers report exact sizes, so a mismatch means the description
+    /// the agent is given — the filename, the type, the size — belongs to
+    /// something else. The old code made this undetectable by overwriting the
+    /// declaration with the measurement.
+    #[tokio::test]
+    async fn a_file_that_is_not_the_size_it_was_declared_to_be_is_refused() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapter = RecordingAdapter {
+            bytes: b"hello".to_vec(),
+            calls: calls.clone(),
+        };
+        // Declared 1 KiB, under the cap, so it is fetched — and five bytes
+        // arrive.
+        let mut envelopes = vec![one_attachment(Some(1_024))];
+
+        hydrate_attachments(
+            &adapter,
+            &test_http::FixtureBlobs(Vec::new()),
+            AttachmentLimits::default(),
+            &mut envelopes,
+        )
+        .await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let attachment = &envelopes[0].attachments[0];
+        assert!(
+            attachment.stored_artifact_id.is_none(),
+            "a mismatched file must not become an artifact"
+        );
+        assert!(attachment.stored_size_bytes.is_none());
+        assert!(
+            attachment
+                .fetch_error
+                .as_deref()
+                .is_some_and(|error| error.contains("5 bytes, not the 1024")),
+            "{:?}",
+            attachment.fetch_error
+        );
+    }
+
+    /// The honest case: what was declared is what arrived, and both are kept.
+    #[tokio::test]
+    async fn a_file_that_matches_its_declaration_keeps_both_numbers() {
+        let adapter = RecordingAdapter {
+            bytes: b"hello".to_vec(),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let mut envelopes = vec![one_attachment(Some(5))];
+
+        hydrate_attachments(
+            &adapter,
+            &test_http::FixtureBlobs(Vec::new()),
+            AttachmentLimits::default(),
+            &mut envelopes,
+        )
+        .await;
+
+        let attachment = &envelopes[0].attachments[0];
+        assert_eq!(
+            attachment.stored_artifact_id.as_deref(),
+            Some("fixture-blob")
+        );
+        assert_eq!(attachment.declared_size_bytes, Some(5));
+        assert_eq!(attachment.stored_size_bytes, Some(5));
+        // And the provenance survives the download: an artifact in the shared
+        // content store with no record of where it came from is
+        // indistinguishable from one the operator put there.
+        assert!(matches!(
+            attachment.source,
+            AttachmentSource::ProviderHandle { .. }
+        ));
+        assert!(attachment.fetch_error.is_none());
     }
 
     use super::*;

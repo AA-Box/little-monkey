@@ -36,6 +36,38 @@ export interface DiagnosticReport {
   findings: DiagnosticFinding[];
 }
 
+/** Mirrors the Rust `support_bundle::TraceEvent` struct exactly. */
+export interface SupportTraceEvent {
+  atMs: number;
+  event: string;
+  subject?: string;
+  context?: string;
+  outcome?: string;
+  reason?: string;
+}
+
+/** Mirrors the Rust `support_bundle::TraceSection` struct exactly. */
+export interface SupportTraceSection {
+  events: SupportTraceEvent[];
+  /** How many events were dropped to fit the section cap. */
+  omitted: number;
+  /** Why this section is empty, when it is empty for a reason other than
+   * nothing having happened. Rendering an unavailable section as an empty one
+   * is how a reader concludes a subsystem was idle when it was unreadable. */
+  unavailable?: string;
+}
+
+/** Mirrors the Rust `support_bundle::SupportBundle` struct exactly. */
+export interface SupportTrace {
+  schemaVersion: number;
+  generatedAtMs: number;
+  appVersion: string;
+  platform: string;
+  redaction: { identifiersPseudonymized: boolean; excluded: string[] };
+  /** Keyed by subsystem: `channels`, `telephony`, `peers`, `devices`. */
+  sections: Record<string, SupportTraceSection>;
+}
+
 /** Mirrors the Rust `DiagnosticsBundle` struct exactly. */
 export interface DiagnosticsBundle {
   schemaVersion: number;
@@ -43,6 +75,11 @@ export interface DiagnosticsBundle {
   appVersion: string;
   platform: string;
   report: DiagnosticReport;
+  /** Redacted lifecycle trace for the daemon-owned subsystems. Absent when the
+   * background service could not be asked — see `traceUnavailable`, which is
+   * the reason, and is not the same thing as a trace with no events in it. */
+  trace?: SupportTrace;
+  traceUnavailable?: string;
 }
 
 function errorText(error: unknown): string {

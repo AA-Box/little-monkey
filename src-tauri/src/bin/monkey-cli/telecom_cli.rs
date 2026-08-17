@@ -500,7 +500,8 @@ async fn probe(account_id: &str, json: bool) -> Result<(), String> {
         Some(reference) => KeyringChannelSecrets.get(reference)?,
         None => String::new(),
     };
-    let provider = provider_for_account(&account, secret)?;
+    let base = store.telecom_callback_base(&account);
+    let provider = provider_for_account(&account, secret, base)?;
     let health = provider.probe().await;
     store.set_telecom_account_health(account_id, &health, now_ms())?;
     if json {
@@ -734,10 +735,10 @@ fn set_public_url(
     store.upsert_telecom_account(&account)?;
     // The old rejections were about the old URL.
     store.clear_callback_rejections(account_id)?;
-    match &account.public_base_url {
+    match store.telecom_callback_base(&account) {
         Some(base) => println!(
             "{account_id} now expects its carrier at {}",
-            crate::daemon::telephony::callback_url(base, account_id)
+            crate::daemon::telephony::callback_url(&base, account_id)
         ),
         None => println!("{account_id} has no public URL, so its carrier has nowhere to post to."),
     }
@@ -782,13 +783,16 @@ fn messages(account_id: &str, limit: u32, json: bool) -> Result<(), String> {
 }
 
 fn callback_url(account_id: &str, json: bool) -> Result<(), String> {
-    let account = store()?
+    let store = store()?;
+    let account = store
         .telecom_account(account_id)?
         .ok_or_else(|| format!("No such account '{account_id}'"))?;
-    let url = account
-        .public_base_url
-        .as_ref()
-        .map(|base| crate::daemon::telephony::callback_url(base, account_id));
+    // Resolved, not stored: a number with no URL of its own uses the machine's
+    // exposure, and this is the string an operator pastes into a carrier
+    // console -- so it has to be the one the verifier will reconstruct.
+    let url = store
+        .telecom_callback_base(&account)
+        .map(|base| crate::daemon::telephony::callback_url(&base, account_id));
     if json {
         println!(
             "{}",

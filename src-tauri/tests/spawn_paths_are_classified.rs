@@ -343,6 +343,17 @@ const CLASSIFIED_CLI: &[(&str, Class, &str)] = &[
         "managed-runtime install and probe operations",
     ),
     (
+        "daemon/callback_exposure.rs",
+        Class::ManagedService,
+        "the operator's own tunnel client, started and supervised by the daemon \
+         so a webhook provider can reach a listener that binds loopback. Every \
+         argument is a literal from a fixed per-provider template except a \
+         validated absolute path and a port number; the credential is not an \
+         argument at all, it goes in the environment. Nothing model-authored \
+         reaches it -- React names a provider from a closed set of one, and the \
+         argv is built here",
+    ),
+    (
         "daemon/mod.rs",
         Class::ManagedService,
         "daemon service lifecycle",

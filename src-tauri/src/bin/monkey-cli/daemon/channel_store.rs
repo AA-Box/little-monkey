@@ -463,6 +463,302 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Count one webhook delivery this account refused to authenticate.
+    ///
+    /// Best-effort by signature at every call site, and deliberately so: the
+    /// request is already being refused, and failing to write the tally would
+    /// only turn a refusal into a second failure. What must not happen is the
+    /// reason growing — [`super::telecom_store::excerpt`]'s bound applies here
+    /// for the same reason it does there: this column is read in a settings
+    /// panel, and a rejected delivery is an attacker-controlled payload.
+    pub fn record_channel_callback_rejection(
+        &mut self,
+        account_id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE channel_accounts
+                 SET rejected_callbacks = rejected_callbacks + 1,
+                     last_rejection = ?2,
+                     last_rejection_at_ms = ?3
+                 WHERE account_id=?1",
+                params![account_id, super::telecom_store::excerpt(reason), now_ms],
+            )
+            .map_err(|error| format!("Failed to record a rejected callback: {error}"))?;
+        Ok(())
+    }
+
+    /// Forget them, because one finally verified. The count means "since it
+    /// last worked", which is the only version of it an operator can act on.
+    pub fn clear_channel_callback_rejections(&mut self, account_id: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "UPDATE channel_accounts
+                 SET rejected_callbacks = 0, last_rejection = NULL, last_rejection_at_ms = NULL
+                 WHERE account_id=?1 AND rejected_callbacks > 0",
+                [account_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn channel_callback_rejections(
+        &self,
+        account_id: &str,
+    ) -> Result<super::telecom_store::CallbackRejections, String> {
+        self.connection
+            .query_row(
+                "SELECT rejected_callbacks, last_rejection, last_rejection_at_ms
+                 FROM channel_accounts WHERE account_id=?1",
+                [account_id],
+                |row| {
+                    Ok(super::telecom_store::CallbackRejections {
+                        count: u32::try_from(row.get::<_, i64>(0)?).unwrap_or(u32::MAX),
+                        last_reason: row.get(1)?,
+                        last_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+            .map(Option::unwrap_or_default)
+    }
+
+    // -- The outbound echo ledger --------------------------------------------
+
+    /// How long a sent message's provider id is remembered.
+    ///
+    /// A provider echoes our own message back within seconds; a day is three
+    /// orders of magnitude of headroom for a provider that was down, and it
+    /// bounds a busy account's ledger to what one day of sending produced.
+    pub const ECHO_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+    /// And a second bound that does not depend on the clock: an account that
+    /// sends a million messages in an hour is bounded by this rather than by
+    /// the TTL.
+    pub const ECHO_MAX_ROWS_PER_ACCOUNT: usize = 5_000;
+
+    /// Remember that the provider called one of *our* messages this.
+    ///
+    /// Written after a send reports delivery, and the only thing that later
+    /// authorizes suppressing an inbound message as our own echo. Nothing about
+    /// what was said is stored: the question this table answers is "did we send
+    /// this", and the outbound event log already answers the other one.
+    pub fn record_outbound_echo(
+        &mut self,
+        account_id: &str,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        provider_message_id: &str,
+        outbox_id: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO channel_outbound_echo (
+                    account_id, conversation_id, thread_key, provider_message_id,
+                    outbox_id, sent_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_id, conversation_id, thread_key, provider_message_id)
+                 DO NOTHING",
+                params![
+                    account_id,
+                    conversation_id,
+                    thread_key(thread_id),
+                    provider_message_id,
+                    outbox_id,
+                    now_ms.max(1),
+                ],
+            )
+            .map_err(|error| format!("Failed to record an outbound message id: {error}"))?;
+        Ok(())
+    }
+
+    /// Note that this account's ledger has a hole in it.
+    ///
+    /// Called when a send succeeded and recording its provider id did not. The
+    /// message is out — it cannot be unsent, and retrying the send would post it
+    /// twice — so the only honest response is to stop claiming an echo guarantee
+    /// this account no longer has, until it does again.
+    ///
+    /// The window is the ledger's own retention, and for the same reason: an id
+    /// this machine failed to record can only come back inside the window in
+    /// which a *recorded* one would still have been matchable. Past that the row
+    /// would have been pruned anyway, so nothing is lost by the account
+    /// recovering on its own. That is the reconciliation — there is no flag for
+    /// an operator to find and clear, because a flag nobody clears is a
+    /// permanently narrowed account nobody can explain.
+    ///
+    /// In `daemon_meta` rather than a column, because the value is a deadline
+    /// this daemon observed and not part of what the account *is*: the
+    /// extension's declared capability is unchanged, and overwriting its
+    /// declaration with a runtime fault would lose the difference between an
+    /// extension that cannot correlate and one whose host failed to write a row.
+    pub fn mark_echo_correlation_degraded(
+        &mut self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let until = now_ms.saturating_add(Self::ECHO_RETENTION_MS);
+        self.set_meta(&echo_degraded_key(account_id), &until.to_string())
+    }
+
+    /// Whether this account is inside such a window.
+    ///
+    /// An unreadable answer counts as degraded. The question is "can this
+    /// machine prove it remembers everything it sent", and a store it cannot
+    /// read is not a store that proves anything.
+    pub fn echo_correlation_degraded(&self, account_id: &str, now_ms: i64) -> Result<bool, String> {
+        Ok(self
+            .get_meta(&echo_degraded_key(account_id))?
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .is_some_and(|until| until > now_ms))
+    }
+
+    /// Whether this account has a send whose outcome this machine never
+    /// recorded.
+    ///
+    /// The marker above is a *write*, and the failure it reports is a store that
+    /// would not take one — so the case where both writes fail leaves no marker
+    /// at all, and the account would come back claiming a guarantee a message
+    /// escaped from. This is the same question asked of state that was already
+    /// durable **before** the network request: the outbox row was claimed
+    /// `sending` first, precisely so a send in flight is never invisible.
+    ///
+    /// Both states count from the moment they appear, and `sending` counting is
+    /// the whole point rather than an over-reach. There is no age at which a
+    /// `sending` row is safe: the request may have been accepted a millisecond
+    /// ago and the write that would record its id may be failing right now. A
+    /// grace period would only choose a length of hole — a full disk that
+    /// empties again in ten seconds is an ordinary event, and the provider's
+    /// echo arrives well inside any wait worth calling a wait.
+    ///
+    /// The cost is that an account is narrowed while its own request is in
+    /// flight, which is the milliseconds between claiming a row and completing
+    /// it. That is the right side of this trade: the alternative is answering
+    /// strangers during a window in which this machine cannot recognise its own
+    /// message coming back.
+    ///
+    /// [`Self::complete_outbox_send`] is what ends it — the row becomes `sent`
+    /// with its provider id, which is the same write that puts the id in the
+    /// ledger's reach. A send that ends any other way leaves a row that is no
+    /// longer `sending`, and the account is unrestricted again the moment it
+    /// does.
+    ///
+    /// Bounded by the ledger's own retention: past it, an id that was never
+    /// recorded could no longer have been matched against one that was, so the
+    /// row stops meaning anything about echo. A row an operator never
+    /// reconciles therefore stops narrowing the account by itself — it is still
+    /// theirs to resolve, but it does not become a permanent restriction nobody
+    /// can explain.
+    pub fn has_unresolved_outbound(&self, account_id: &str, now_ms: i64) -> Result<bool, String> {
+        let since = now_ms.saturating_sub(Self::ECHO_RETENTION_MS);
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM channel_outbox
+                    WHERE account_id=?1
+                      AND state IN ('sending', 'needs_reconciliation')
+                      AND updated_at_ms > ?2
+                 )",
+                params![account_id, since],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Did *we* send this exact provider message, here, in this conversation?
+    ///
+    /// The whole of self-echo determination for a provider whose sender
+    /// identity the host cannot verify. It is a causal question with a durable
+    /// answer, rather than a claim on an envelope.
+    pub fn is_own_outbound_echo(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        provider_message_id: &str,
+    ) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM channel_outbound_echo
+                 WHERE account_id=?1 AND conversation_id=?2 AND thread_key=?3
+                   AND provider_message_id=?4",
+                params![
+                    account_id,
+                    conversation_id,
+                    thread_key(thread_id),
+                    provider_message_id
+                ],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Drop what is too old or too numerous to matter, and say how much went.
+    ///
+    /// Both bounds in one statement per account, so a pass is deterministic:
+    /// the same ledger and the same clock always prune the same rows.
+    pub fn prune_outbound_echo(&mut self, now_ms: i64) -> Result<u32, String> {
+        let cutoff = now_ms.saturating_sub(Self::ECHO_RETENTION_MS);
+        let by_age = self
+            .connection
+            .execute(
+                "DELETE FROM channel_outbound_echo WHERE sent_at_ms < ?1",
+                [cutoff],
+            )
+            .map_err(|error| error.to_string())?;
+        let by_count = self
+            .connection
+            .execute(
+                "DELETE FROM channel_outbound_echo
+                 WHERE rowid IN (
+                    SELECT rowid FROM channel_outbound_echo AS outer_row
+                    WHERE (
+                        SELECT COUNT(*) FROM channel_outbound_echo AS newer
+                        WHERE newer.account_id = outer_row.account_id
+                          AND (newer.sent_at_ms, newer.rowid) > (outer_row.sent_at_ms, outer_row.rowid)
+                    ) >= ?1
+                 )",
+                [i64::try_from(Self::ECHO_MAX_ROWS_PER_ACCOUNT).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(u32::try_from(by_age + by_count).unwrap_or(u32::MAX))
+    }
+
+    /// How many messages this account has actually got out of the door.
+    ///
+    /// The denominator for the ledger check: an empty ledger proves nothing on
+    /// an account that has never sent anything, and everything on one that has.
+    pub fn sent_outbox_count(&self, account_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox WHERE account_id=?1 AND state='sent'",
+                [account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many ids this account is currently remembering. Read by the audit,
+    /// which is the only thing that can tell an operator the ledger is empty
+    /// for an account that has been sending.
+    pub fn outbound_echo_count(&self, account_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbound_echo WHERE account_id=?1",
+                [account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn delete_channel_account(&mut self, account_id: &str) -> Result<bool, String> {
         self.connection
             .execute(
@@ -571,7 +867,25 @@ impl DaemonStore {
         }
     }
 
+    /// The base every callback URL is composed from, whichever way the operator
+    /// exposes this listener.
+    ///
+    /// One function, because there is one answer: every provider — messaging
+    /// and carrier alike — has to be told the same URL the signature verifier
+    /// will later reconstruct. Routing managed exposure through here rather
+    /// than through each provider is what keeps a tunnel from becoming a
+    /// thirteenth place a public URL can come from.
     pub fn channel_public_base_url(&self) -> Result<Option<String>, String> {
+        let manual = self.channel_public_base_url_manual()?;
+        Ok(super::callback_exposure::read_config(self).public_base(manual.as_deref()))
+    }
+
+    /// The value the operator typed in, ignoring any managed exposure.
+    ///
+    /// Kept separate so switching to a managed tunnel and back does not lose
+    /// the URL somebody configured, and so the settings form can show what is
+    /// stored rather than what is in force.
+    pub fn channel_public_base_url_manual(&self) -> Result<Option<String>, String> {
         self.get_meta(CHANNEL_PUBLIC_BASE_URL_KEY)
     }
 
@@ -1073,6 +1387,57 @@ impl DaemonStore {
             .map_err(|error| error.to_string())?
             .into_iter()
             .collect()
+    }
+
+    /// How many inbound messages in a row this conversation has taken from a
+    /// machine, most recent first, stopping at the first one from a person.
+    ///
+    /// The measurement `AccessContext::consecutive_machine_messages` needs, and
+    /// it has to be read rather than inferred: the reply-depth chain only sees
+    /// an exchange the far end threads, and a bot is under no obligation to
+    /// thread anything.
+    ///
+    /// Bounded by `window` because the answer is only ever compared against a
+    /// small ceiling — once the streak is long enough to refuse, how much
+    /// longer it is does not change the decision, and scanning a whole
+    /// conversation's history to find out would.
+    pub fn consecutive_machine_messages(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        window: u32,
+    ) -> Result<u32, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT envelope_json FROM channel_events
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction='inbound'
+                 ORDER BY received_at_ms DESC, rowid DESC LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(
+                params![account_id, conversation_id, i64::from(window)],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut streak = 0;
+        for envelope_json in rows {
+            let envelope_json = envelope_json.map_err(|error| error.to_string())?;
+            // A row we cannot read is not evidence that a person spoke, so it
+            // neither extends the streak nor resets it — it ends the scan. The
+            // conservative direction here is the shorter count: refusing a
+            // human's message because of a corrupt row would be worse than
+            // taking one more machine message.
+            let Ok(envelope) = serde_json::from_str::<ChannelEnvelope>(&envelope_json) else {
+                break;
+            };
+            if !envelope.sender.is_bot {
+                break;
+            }
+            streak += 1;
+        }
+        Ok(streak)
     }
 
     // -- Outbox --------------------------------------------------------------
@@ -2141,6 +2506,23 @@ fn insert_outbox_message(
 /// callbacks. A KV row rather than a schema column: one value, daemon-wide.
 const CHANNEL_PUBLIC_BASE_URL_KEY: &str = "channels.public_base_url";
 
+/// `daemon_meta` key holding when one account's echo ledger stops being
+/// suspect. Per account, because a write that failed for one says nothing about
+/// any other.
+fn echo_degraded_key(account_id: &str) -> String {
+    format!("channels.echo_degraded.{account_id}")
+}
+
+/// A thread id as the echo ledger's key sees it.
+///
+/// `NULL` is not equal to itself in SQL, so a nullable column inside a UNIQUE
+/// constraint silently permits duplicates and matches none of them. Folding
+/// "no thread" to the empty string — which no provider uses as a thread id —
+/// makes the key total.
+fn thread_key(thread_id: Option<&str>) -> &str {
+    thread_id.unwrap_or("")
+}
+
 /// The listener-relative path one account's webhook deliveries arrive on.
 pub fn channel_callback_path(account_id: &str) -> String {
     format!("/v1/channels/{account_id}")
@@ -2300,6 +2682,71 @@ mod tests {
             disposition: EventDisposition::Accepted,
             received_at_ms: 1_000,
         }
+    }
+
+    /// The streak counts machines back to the last person, and no further.
+    ///
+    /// Both halves are the point. Without the count, two bots that do not
+    /// thread their replies never trip the reply-depth ceiling. Without the
+    /// reset, a group that once had a run of bot messages would refuse a human
+    /// forever.
+    #[test]
+    fn the_machine_streak_stops_at_the_last_person_who_spoke() {
+        use little_monkey_lib::channels::types::{
+            ChannelConversation, ChannelEnvelope, ChannelSender,
+        };
+
+        let mut store = seeded();
+        fn record(store: &mut DaemonStore, provider_event_id: &str, is_bot: bool, at: i64) {
+            let mut sender = ChannelSender::new("someone");
+            sender.is_bot = is_bot;
+            let envelope = ChannelEnvelope {
+                account_id: "acct-1".into(),
+                kind: ChannelKind::Telegram,
+                provider_event_id: provider_event_id.into(),
+                provider_message_id: None,
+                conversation: ChannelConversation::group("conv-1"),
+                sender,
+                text: "hello".into(),
+                attachments: Vec::new(),
+                reply_to_provider_id: None,
+                mentions_self: false,
+                received_at_ms: at,
+                metadata: Default::default(),
+            };
+            let mut event = new_event("acct-1", provider_event_id);
+            event.envelope_json = serde_json::to_string(&envelope).expect("json");
+            event.received_at_ms = at;
+            store.record_channel_event(&event).expect("record");
+        }
+
+        record(&mut store, "evt-1", true, 1_000);
+        record(&mut store, "evt-2", true, 2_000);
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-1", 8)
+                .expect("count"),
+            2
+        );
+
+        // Somebody says something, and the budget is whole again.
+        record(&mut store, "evt-3", false, 3_000);
+        record(&mut store, "evt-4", true, 4_000);
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-1", 8)
+                .expect("count"),
+            1
+        );
+
+        // And a different conversation on the same account is unaffected: the
+        // budget is per conversation, not per account.
+        assert_eq!(
+            store
+                .consecutive_machine_messages("acct-1", "conv-other", 8)
+                .expect("count"),
+            0
+        );
     }
 
     #[test]
@@ -2516,6 +2963,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "evt-1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation {
                 conversation_id: "C1".into(),
                 kind: ConversationKind::Channel,

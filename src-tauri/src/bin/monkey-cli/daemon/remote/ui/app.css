@@ -1353,3 +1353,27 @@ dialog p:not(.eyebrow) {
   color: var(--danger, #dc2626);
 }
 
+.talk-pending {
+  margin-top: 0.75rem;
+}
+
+.talk-pending-list {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.talk-pending-item {
+  border: 1px solid var(--border, #d7dce2);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+/* An unconfirmed recording is the one that needs a decision from a person, so
+   it is the one that is marked. An accepted turn is only waiting. */
+.talk-pending-item[data-state="pending"] {
+  border-color: var(--warning, #d97706);
+}
+

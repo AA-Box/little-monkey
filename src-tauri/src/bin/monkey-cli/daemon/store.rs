@@ -2415,6 +2415,87 @@ CREATE INDEX peer_outbound_messages_recent_idx
     ON peer_outbound_messages(sent_at_ms DESC);
 "#;
 
+const DAEMON_V19: i64 = 19;
+const DAEMON_V19_CHECKSUM: &str = "daemon-jobs-v19-channel-callback-rejections";
+
+/// A messaging provider whose deliveries never authenticate.
+///
+/// V17 gave telephony accounts this and left the messaging side without it, and
+/// the asymmetry is not defensible: a webhook provider — WhatsApp, Teams, Google
+/// Chat, LINE — whose signing secret was rotated on one side, or whose console
+/// points at a URL that no longer resolves here, produces *exactly nothing*. No
+/// event row, no health transition, no error anywhere an operator can look. The
+/// delivery is refused before anything durable is written, which is the correct
+/// thing to do with an unauthenticated request and the worst possible thing to
+/// do to somebody trying to work out why their messages stopped arriving.
+///
+/// So the refusal itself becomes the bounded, non-secret record: how many in a
+/// row, the last reason code, and when. Never the body, never a header, never
+/// the signature that failed — a rejected delivery is an attacker-controlled
+/// payload, and this is a column an operator reads, not an evidence locker.
+///
+/// Cleared the moment one verifies, so the count reads "since it last worked"
+/// rather than "ever" — the same rule the telephony columns follow.
+const DAEMON_V19_SQL: &str = r#"
+ALTER TABLE channel_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
+const DAEMON_V20: i64 = 20;
+const DAEMON_V20_CHECKSUM: &str = "daemon-jobs-v20-outbound-echo-ledger";
+
+/// Which of our own messages have come back to us.
+///
+/// # Why a table and not `sender.is_self`
+///
+/// Every adapter in this build except one is host code holding the account's
+/// own credential, so when it says a message is ours, that is the host's own
+/// conclusion. An extension-backed account is different: the thing that says
+/// "this is from you" is sandboxed guest code, and a boolean it set is guest
+/// data. The host cannot verify an arbitrary provider's sender identity from
+/// it, so an account whose loop protection rested on that boolean had no loop
+/// protection the host could stand behind.
+///
+/// The answer is causal rather than assertive. The question stops being *does
+/// the extension claim this is us* and becomes *is this the provider's own id
+/// for a message we already committed to sending*. Only the host knows that,
+/// because only the host queued the outbound row and recorded what the provider
+/// called it.
+///
+/// # Scope
+///
+/// Keyed by account and conversation as well as by the provider's id, because
+/// a provider is only obliged to make a message id unique within a
+/// conversation. `thread_id` is folded into the key as `''` when absent — SQL
+/// `NULL` is distinct from itself, so a nullable column in a UNIQUE would let
+/// the same threadless message be recorded twice and match neither time.
+///
+/// # Bounds
+///
+/// A busy account would otherwise grow this forever. Pruning is by age and by
+/// rows-per-account, both deterministic, and the retention only has to outlast
+/// the window in which a provider might echo something back — minutes, in
+/// practice, against a day of headroom.
+///
+/// No message text. The ledger answers "did we send this", not "what did we
+/// say"; the outbound event log already holds the latter and is what an
+/// operator reads.
+const DAEMON_V20_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_outbound_echo (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_key TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL CHECK (length(provider_message_id) > 0),
+    outbox_id TEXT NOT NULL,
+    sent_at_ms INTEGER NOT NULL CHECK (sent_at_ms > 0),
+    PRIMARY KEY(account_id, conversation_id, thread_key, provider_message_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_outbound_echo_age_idx
+    ON channel_outbound_echo(account_id, sent_at_ms DESC);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -2444,12 +2525,14 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
     (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
     (DAEMON_V18, DAEMON_V18_CHECKSUM, DAEMON_V18_SQL),
+    (DAEMON_V19, DAEMON_V19_CHECKSUM, DAEMON_V19_SQL),
+    (DAEMON_V20, DAEMON_V20_CHECKSUM, DAEMON_V20_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V18;
+const DAEMON_LATEST: i64 = DAEMON_V20;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -2624,7 +2707,36 @@ mod tests {
                     0
                 ))
                 .unwrap(),
-            DAEMON_V18
+            DAEMON_V20
+        );
+        // V20's ledger exists and is empty. Empty is the correct starting
+        // state and not a vacuous assertion: the alternative a migration could
+        // have taken — back-filling it from the outbound event log — would
+        // claim the host had recorded ids it never recorded, and every one of
+        // those would suppress a real inbound message once.
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM channel_outbound_echo", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        // V19's columns exist and defaulted, on the account row that was
+        // written before they did. An `ALTER TABLE ... NOT NULL DEFAULT` that
+        // was mis-declared would fail the migration outright; what this proves
+        // is the historical row reads as "nothing has been refused" rather than
+        // as NULL, which is what the audit's threshold compares against.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rejected_callbacks FROM channel_accounts WHERE account_id='acct-1'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
         // v17's own columns still hold what they held. An upgrade that quietly
         // recreated a table would pass a "the table exists" check and fail this.

@@ -355,11 +355,30 @@ pub(crate) fn accept_webhook_delivery(
         delivery.now_ms,
     ) {
         Ok(verified) => verified,
-        // Deliberately opaque, and deliberately not recorded. Covers both a
-        // delivery that did not authenticate and one that did but could not
-        // produce the addressing its own message requires.
-        Err(_) => return DeliveryOutcome::Rejected,
+        // The *caller* is still told nothing: an unverified body has not earned
+        // a row, and the response stays a bare 401 with no hint about which
+        // half of the check failed. What is recorded is a counter on the
+        // operator's own account, because the alternative — the original
+        // behaviour — was total silence, and a rotated signing secret or a
+        // console pointed at a stale URL then has no symptom at all: messages
+        // simply stop, and every other check on the page passes.
+        //
+        // Best-effort: this delivery is already being refused, and failing to
+        // tally it must not turn one failure into two.
+        Err(reason) => {
+            let _ = store.record_channel_callback_rejection(
+                adapter.account_id(),
+                &reason,
+                delivery.now_ms,
+            );
+            return DeliveryOutcome::Rejected;
+        }
     };
+    // It verified, so the streak is over. Cleared here rather than after the
+    // envelopes land, because what this counter measures is authentication, and
+    // authentication is what just succeeded — an event that fails to commit
+    // afterwards is a different problem with its own visible symptom.
+    let _ = store.clear_channel_callback_rejections(adapter.account_id());
     let super::channel_adapter::VerifiedWebhookDelivery {
         envelopes,
         durable_addressing,
@@ -443,7 +462,7 @@ fn record_durable_addressing(
 /// envelope stored here. Nothing about the sender's access, the route or the
 /// recipe is consulted at this point: those are reads of operator
 /// configuration, and none of them change whether this message arrived.
-fn record_accepted_event(
+pub(super) fn record_accepted_event(
     store: &mut DaemonStore,
     envelope: &little_monkey_lib::channels::types::ChannelEnvelope,
 ) -> Result<super::channel_store::EventRecording, String> {
@@ -660,13 +679,29 @@ async fn handle_carrier_callback(
             return response(StatusCode::UNAUTHORIZED, "rejected");
         }
     };
-    let provider = match super::telephony::provider_for_account(&account, secret.clone()) {
-        Ok(provider) => provider,
-        Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
-    };
+    // The URL Twilio and Plivo sign is rebuilt from this, and it comes from
+    // what the operator configured -- never from `Host` or any `X-Forwarded-*`
+    // header on the request being verified, all of which a tunnel sets and an
+    // attacker can forge.
+    let verification_base = store.telecom_callback_base(&account);
+    let provider =
+        match super::telephony::provider_for_account(&account, secret.clone(), verification_base) {
+            Ok(provider) => provider,
+            Err(_) => return response(StatusCode::NOT_FOUND, "not_found"),
+        };
 
     let event = match provider.verify_webhook(&path, &headers, &body, now_ms) {
-        Ok(event) => {
+        Ok(mut event) => {
+            // Whose number this arrived on. Stamped here, once, rather than in
+            // each carrier: the account is what *this* function looked up to
+            // find the credential the signature was checked with, so it is the
+            // only value that cannot be wrong. Twilio, Plivo and Telnyx all
+            // normalize an inbound text without one — a `ChannelEnvelope` has
+            // no way to know which account it belongs to — and an envelope with
+            // an empty account id is refused by the ingress as
+            // "Unknown channel account ''", which is every real carrier's
+            // inbound SMS silently failing while the mock's worked.
+            stamp_account(&mut event, &account.account_id);
             // It verified, so whatever was wrong before is fixed. The counter
             // reads "since it last worked", which is the only form of it an
             // operator can act on.
@@ -815,6 +850,16 @@ fn xml_response(document: super::telephony::AnswerDocument) -> Response<Full<Byt
 /// The carrier's own identifier for this event, which is what dedupe hangs on.
 /// A carrier that supplies none falls back to the body digest — deterministic,
 /// so a redelivery of the identical body still collapses.
+/// Put the receiving account on an inbound envelope.
+///
+/// Only `InboundSms` carries one: a call and a delivery receipt are matched by
+/// their own carrier identifiers and never enter the messaging ingress.
+fn stamp_account(event: &mut super::telephony::TelecomEvent, account_id: &str) {
+    if let super::telephony::TelecomEvent::InboundSms(envelope) = event {
+        envelope.account_id = account_id.to_string();
+    }
+}
+
 fn carrier_event_id(event: &super::telephony::TelecomEvent, digest: &str) -> String {
     use super::telephony::TelecomEvent;
     match event {

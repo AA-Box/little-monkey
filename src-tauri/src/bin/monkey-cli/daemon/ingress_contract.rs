@@ -148,6 +148,7 @@ fn telegram_dm(text: &str, event_id: &str) -> ChannelEnvelope {
         account_id: "acct-1".into(),
         kind: ChannelKind::Telegram,
         provider_event_id: event_id.into(),
+        provider_message_id: None,
         conversation: ChannelConversation::direct("chat-7"),
         sender: ChannelSender::new("user-3"),
         text: text.into(),
@@ -1564,6 +1565,7 @@ fn a_correction_can_still_reach_the_attachments_of_the_turn_it_corrects() {
         filename: Some("fix.patch".into()),
         mime_type: Some("text/x-patch".into()),
         declared_size_bytes: Some(64),
+        stored_size_bytes: None,
         source: AttachmentSource::ProviderHandle {
             handle: "file-1".into(),
         },
@@ -1714,6 +1716,7 @@ fn an_accepted_attachment_survives_the_crash_and_the_recovery() {
         filename: Some("shot.png".into()),
         mime_type: Some("image/png".into()),
         declared_size_bytes: Some(2048),
+        stored_size_bytes: None,
         source: AttachmentSource::ProviderHandle {
             handle: "file-1".into(),
         },

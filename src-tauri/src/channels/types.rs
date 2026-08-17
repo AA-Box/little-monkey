@@ -322,10 +322,30 @@ pub struct ChannelAttachment {
     pub filename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// What the provider said this file weighs, before anything was fetched.
+    ///
+    /// The sender's claim, never overwritten with what actually arrived —
+    /// keeping them apart is the whole of what makes the comparison possible.
+    /// Checked twice: once before a socket is opened, so a file declared over
+    /// the account's limit costs nothing at all, and once against the bytes
+    /// received, because a provider that described a different file than it
+    /// sent has described the wrong thing to the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_size_bytes: Option<u64>,
+    /// What the bytes on disk actually weigh.
+    ///
+    /// Present exactly when `stored_artifact_id` is: it is measured from the
+    /// body that was stored. Separate from the declaration above rather than
+    /// replacing it, which is what a single field made impossible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_size_bytes: Option<u64>,
     /// How the bytes are obtained. Either an https URL or a provider handle the
     /// adapter knows how to resolve.
+    ///
+    /// Kept after the download rather than cleared: this is the attachment's
+    /// provenance, and an artifact in the shared content store with no record
+    /// of where it came from is indistinguishable from one the operator put
+    /// there.
     pub source: AttachmentSource,
     /// Content-store id once the bytes have actually been fetched.
     ///
@@ -452,6 +472,19 @@ pub struct ChannelEnvelope {
     /// forms the dedupe key, so an adapter that cannot supply a stable one must
     /// synthesize a deterministic value (never a random id).
     pub provider_event_id: String,
+    /// The provider's own immutable id for *the message*, when it has one.
+    ///
+    /// Distinct from `provider_event_id`, which identifies the **delivery** —
+    /// a webhook redelivery or a second poll window may carry a fresh event id
+    /// for a message whose own id never changes. The two are frequently equal
+    /// and must not be assumed to be: the event id is what deduplicates, and
+    /// this is what the outbound echo ledger matches against.
+    ///
+    /// `None` means the transport cannot supply one. Never synthesized: a made
+    /// up id would either match nothing or, worse, collide with a real one and
+    /// suppress somebody's message as our own echo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
     pub conversation: ChannelConversation,
     pub sender: ChannelSender,
     /// Message text as the provider delivered it. Untrusted. Callers must not
@@ -526,6 +559,11 @@ pub struct ProviderCapabilities {
     pub supports_idempotency_key: bool,
     /// Provider reports delivery/read receipts asynchronously.
     pub supports_delivery_receipts: bool,
+    /// How the *host* recognises a message it sent coming back, for this
+    /// transport. Declared here beside every other provider fact rather than
+    /// inferred at each call site, so an adapter that cannot correlate says so
+    /// once. See [`super::policy::EchoCorrelation`].
+    pub echo_correlation: super::policy::EchoCorrelation,
 }
 
 impl ProviderCapabilities {
@@ -541,6 +579,11 @@ impl ProviderCapabilities {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            // Built-in transports are host code holding the credential, which
+            // is exactly what makes their own sender determination the host's.
+            // An adapter that is not — today only the extension one — overrides
+            // this with what its account actually declares.
+            echo_correlation: super::policy::EchoCorrelation::HostAdapter,
         }
     }
 }
@@ -808,6 +851,7 @@ mod tests {
             account_id: "acct".into(),
             kind: ChannelKind::Slack,
             provider_event_id: "evt-1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::group("C1"),
             sender: ChannelSender::new("U1"),
             text: "hi".into(),
@@ -840,6 +884,7 @@ mod tests {
             account_id: "acct".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "42".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat"),
             sender: ChannelSender::new("U1"),
             text: "hello".into(),
