@@ -61,12 +61,12 @@ jobs:
       - name: Build and sign
         env:
           MLX_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
-          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
         run: |
           if [ -z "$MLX_SIGNING_KEY" ]; then
             echo "::error::MLX_SIGNING_PRIVATE_KEY is not set. See pnpm mlx:keygen."
             exit 1
           fi
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           pnpm mlx:package
 
       - name: Publish the archive
@@ -103,11 +103,13 @@ jobs:
           '
           cat packaging/mlx/mlx-catalog.json
 
-      # The catalog names the archive and its digest. The app has no HTTP
-      # component source — the Runtime Hub's registry is local — so this is
-      # downloaded and imported through Components → Import catalog rather than
-      # subscribed to by URL. It is deliberately not signed: it only carries a
-      # URL and a digest, and the package it points at still has to satisfy the
+      # The catalog names the archive and its digest. The app fetches this asset
+      # by URL when the Runtime Hub's Components panel opens
+      # (`DEFAULT_COMPONENT_CATALOG_URL` in src-tauri/src/m3_production.rs), so
+      # the tag is rolling on purpose: the URL has to stay put while its
+      # contents move. Importing the file by hand still works and is the
+      # air-gapped path. It is deliberately not signed: it only carries a URL
+      # and a digest, and the package it points at still has to satisfy the
       # pinned publisher key before it installs.
       - name: Publish the catalog
         env:
@@ -117,7 +119,7 @@ jobs:
           gh release create mlx-catalog packaging/mlx/mlx-catalog.json \
             --title "MLX catalog" \
             --latest=false \
-            --notes "Component catalog for the MLX runtime. Download this file, then import it in the Runtime Hub under Components → Import catalog." \
+            --notes "Component catalog for the MLX runtime. The app fetches this automatically when the Runtime Hub's Components panel opens; download and import it there only if this machine cannot reach GitHub." \
             || gh release upload mlx-catalog packaging/mlx/mlx-catalog.json --clobber
 
       # Both URLs in one place, because the pair is what a user needs and the
@@ -138,7 +140,9 @@ jobs:
             echo "| Archive | $MLX_DOWNLOAD_URL |"
             echo "| Catalog | $CATALOG_URL |"
             echo
-            echo "Install: download the catalog, then Runtime Hub → Components → **Import catalog**."
+            echo "Install: open Runtime Hub → Components. The catalog above is fetched on open,"
+            echo "so the new version appears there; **Import catalog** is for machines that cannot"
+            echo "reach GitHub."
             echo "The archive is only installable if it verifies against the release key pinned in"
             echo '`MLX_RELEASE_PUBLIC_KEY_HEX` (src-tauri/src/m3_production.rs).'
           } >> "$GITHUB_STEP_SUMMARY"

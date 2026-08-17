@@ -2010,7 +2010,7 @@ fn io_at(operation: &'static str, path: &Path, source: io::Error) -> MlxError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Notify;
@@ -2031,10 +2031,10 @@ mod tests {
         }
     }
 
-    struct TestSignatureVerifier;
+    pub(crate) struct TestSignatureVerifier;
 
     impl TestSignatureVerifier {
-        fn sign(key_id: &str, payload: &[u8]) -> Vec<u8> {
+        pub(crate) fn sign(key_id: &str, payload: &[u8]) -> Vec<u8> {
             let mut hash = Sha256::new();
             hash.update(key_id.as_bytes());
             hash.update(payload);
@@ -2098,6 +2098,71 @@ mod tests {
             TestSignatureVerifier::sign(&manifest.signature_key_id, &payload),
         );
         MlxPackageBundle { manifest, files }
+    }
+
+    pub(crate) fn write_test_signed_archive(
+        path: &Path,
+        package_version: &str,
+        valid_signature: bool,
+    ) {
+        let mut bundle = package();
+        bundle.manifest.package_version = package_version.to_string();
+        let mut entropy = 0x9e37_79b9_u32;
+        let padding = (0..(3 * 64 * 1024 + 1))
+            .map(|_| {
+                entropy ^= entropy << 13;
+                entropy ^= entropy >> 17;
+                entropy ^= entropy << 5;
+                entropy as u8
+            })
+            .collect::<Vec<_>>();
+        bundle
+            .files
+            .insert("support/padding.bin".to_string(), padding.clone());
+        bundle.manifest.files.push(MlxPackageFile {
+            path: "support/padding.bin".to_string(),
+            size_bytes: padding.len() as u64,
+            sha256: sha256_hex(&padding),
+            executable: false,
+        });
+        let payload = canonical_json(&UnsignedMlxPackageManifest::from(&bundle.manifest))
+            .expect("canonical unsigned manifest");
+        bundle.manifest.signature_base64 = base64::engine::general_purpose::STANDARD.encode(
+            TestSignatureVerifier::sign(&bundle.manifest.signature_key_id, &payload),
+        );
+        if !valid_signature {
+            bundle.manifest.signature_base64 = base64::engine::general_purpose::STANDARD
+                .encode(b"invalid deterministic publisher signature");
+        }
+
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(path).expect("create test archive"),
+            flate2::Compression::fast(),
+        );
+        let mut archive = tar::Builder::new(encoder);
+        let manifest = serde_json::to_vec(&bundle.manifest).expect("serialize manifest");
+        let mut append = |name: &str, bytes: &[u8], mode: u32| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(mode);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, bytes)
+                .expect("append test archive member");
+        };
+        append("mlx-package.json", &manifest, 0o644);
+        for (name, bytes) in &bundle.files {
+            append(
+                name,
+                bytes,
+                if name == "bin/python" { 0o755 } else { 0o644 },
+            );
+        }
+        archive
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip");
     }
 
     /// Both canonicalizers must agree byte for byte, or packages built by the
