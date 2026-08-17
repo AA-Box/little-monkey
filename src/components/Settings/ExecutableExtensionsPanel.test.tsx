@@ -290,6 +290,10 @@ describe("ExecutableExtensionsPanel", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Update" }));
     });
+    await waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(
+      invoke.mock.calls.some(([command]) => command === "extensions_preview_update"),
+    ).toBe(true));
 
     const review = await screen.findByLabelText("Review extension");
     expect(within(review).getByText("d".repeat(64))).toBeTruthy();
@@ -348,6 +352,10 @@ describe("ExecutableExtensionsPanel", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Update" }));
     });
+    await waitFor(() => expect(open).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(
+      invoke.mock.calls.some(([command]) => command === "extensions_preview_update"),
+    ).toBe(true));
 
     const review = await screen.findByLabelText("Review extension");
     const apply = within(review).getByRole("button", { name: "Update" }) as HTMLButtonElement;
@@ -483,7 +491,12 @@ describe("ExecutableExtensionsPanel", () => {
     await screen.findByText("API token");
     const input = screen.getByPlaceholderText("Enter a new secret") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "fixture-super-secret" } });
-    fireEvent.click(screen.getByText("Save secret"));
+    await waitFor(() => expect(input.value).toBe("fixture-super-secret"));
+    const save = screen.getByRole("button", { name: "Save secret" }) as HTMLButtonElement;
+    await waitFor(() => expect(save.disabled).toBe(false));
+    await act(async () => {
+      fireEvent.click(save);
+    });
 
     await waitFor(() => expect(
       invoke.mock.calls.some(([command]) => command === "extensions_set_secret"),
