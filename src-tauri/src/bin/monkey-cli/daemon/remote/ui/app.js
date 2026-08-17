@@ -3442,6 +3442,15 @@ async function renderTalkPending() {
   entries.sort((left, right) => (left.createdAtMs || 0) - (right.createdAtMs || 0));
   talk.pending = entries;
   ui.talkPendingPanel.hidden = entries.length === 0;
+  // The button says what starting it would mean. A reload that lands on a
+  // device still holding a recording gets "Resume Talk" here rather than only
+  // after a session has ended, because a page that has just been opened is
+  // exactly when nobody remembers what was left unfinished.
+  if (!talk.running) {
+    ui.talkButton.textContent = entries.some(talkUtterancePending)
+      ? "Resume Talk"
+      : "Start Talk";
+  }
   ui.talkPendingList.replaceChildren(
     ...entries.map((entry) => {
       const item = document.createElement("li");
@@ -3510,7 +3519,6 @@ async function stopTalk(reason) {
   }
   talk.sessionId = null;
   talk.sessionGeneration = null;
-  ui.talkButton.textContent = talk.pending.some(talkUtterancePending) ? "Resume Talk" : "Start Talk";
   setTalkState(reason || "Not connected", "idle");
   if (reason) showTalkError(reason);
   // Last, and always: the buttons that offer a retry only exist while nothing
