@@ -1328,6 +1328,8 @@ export const en: Record<string, string> = {
   "ChannelsPanel.transport_webhook": "the provider calling you (a public callback URL is required)",
   "ChannelsPanel.transport_helper": "a helper app you install yourself",
   "ChannelsPanel.needsCredential": "No credential saved yet, so this account cannot connect.",
+  "ChannelsPanel.callbacksRejected":
+    "{{count}} delivery attempt(s) have failed verification since one last succeeded. Check that the callback URL in the provider's console matches the one shown here, and that its signing secret matches the credential saved here.",
   "ChannelsPanel.testConnection": "Test connection",
   "ChannelsPanel.enable": "Enable",
   "ChannelsPanel.disable": "Disable",
@@ -1459,6 +1461,29 @@ export const en: Record<string, string> = {
   "ChannelsPanel.publicBaseUrlSaved": "Public base URL saved.",
   "ChannelsPanel.savePublicBaseUrl": "Save",
   "ChannelsPanel.publicBaseUrlHint": "The address your tunnel or reverse proxy answers on, without a path. Little Monkey still listens only on this machine; this is what it tells providers to call.",
+  "ChannelsPanel.exposureTitle": "Public callback",
+  "ChannelsPanel.exposureIntro":
+    "Some providers deliver by posting to a URL, and this app listens only on this machine. Either you publish an address for it, or Little Monkey runs a tunnel for you — using your own tunnel account. There is no relay operated by anyone else.",
+  "ChannelsPanel.exposureManual": "I manage the public URL myself",
+  "ChannelsPanel.exposureManualHint": "A reverse proxy, your own domain, or a tunnel you run yourself.",
+  "ChannelsPanel.exposureManualSaved": "Little Monkey will use the URL you publish.",
+  "ChannelsPanel.exposureTunnel": "Let Little Monkey manage my tunnel",
+  "ChannelsPanel.exposureTunnelHint":
+    "Your Cloudflare tunnel, started and watched by the background service. Nothing is started until you have given a hostname, a path and a token.",
+  "ChannelsPanel.tunnelHostname": "Tunnel hostname",
+  "ChannelsPanel.tunnelExecutable": "Path to cloudflared",
+  "ChannelsPanel.tunnelToken": "Tunnel token",
+  "ChannelsPanel.tunnelTokenStored": "A token is stored. Type a new one to replace it.",
+  "ChannelsPanel.tunnelTokenSaved": "Tunnel token saved to your keychain.",
+  "ChannelsPanel.tunnelTokenCleared": "Tunnel token removed.",
+  "ChannelsPanel.saveTunnelToken": "Save token",
+  "ChannelsPanel.clearTunnelToken": "Remove token",
+  "ChannelsPanel.connectTunnel": "Connect",
+  "ChannelsPanel.tunnelSaved": "Tunnel configured. The background service will connect it.",
+  "ChannelsPanel.tunnelPrerequisite":
+    "In your own Cloudflare Zero Trust dashboard: create a tunnel, add a public hostname, and point that hostname at http://localhost and this app's webhook port. Then paste the tunnel's token here.",
+  "ChannelsPanel.echoBlind":
+    "This account is served by an extension that does not report provider message ids, so this machine cannot recognise a message it sent coming back. Open inboxes and answering every group message are refused for it.",
   "SettingsModal.tabTelephony": "Phone and SMS",
   "TelephonyPanel.loading": "Loading phone numbers…",
   "TelephonyPanel.title": "Phone and SMS",

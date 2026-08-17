@@ -584,6 +584,107 @@ mod tests {
             "one media type, fixed at construction, is what keeps hello and audio in agreement"
         );
 
+        // The client names its own utterances, and the runner refuses a closing
+        // audio frame that does not.
+        //
+        // This assertion exists because the two sides were changed apart: the
+        // runner started requiring `utterance_id` while the shipped module still
+        // built audio frames without one, so every closing frame was rejected
+        // and foreground Talk stopped working entirely. Nothing failed —
+        // `mobileTalkProtocol.test.ts` drove a client that agreed with itself,
+        // and the Rust tests drove a server that agreed with itself. Only a
+        // check that reads both can see them disagree.
+        //
+        // Proved by parsing the bytes the module really produces, not by
+        // matching a string and then hand-writing the JSON I expected it to
+        // make. `mobileTalkProtocol.test.ts` runs the shipped builder and
+        // writes every frame shape to this fixture; the runner's own
+        // `TalkClientFrame` parses and validates them here.
+        //
+        // That closes the gap that let the last defect ship: both suites were
+        // green because each drove a side that agreed with itself. A Rust test
+        // that constructs its own JSON has the same blind spot, because the
+        // thing that drifts is the JSON the client actually sends.
+        const CLIENT_FRAMES: &str = include_str!("../../fixtures/talk_client_frames.json");
+        let frames: Vec<serde_json::Value> =
+            serde_json::from_str(CLIENT_FRAMES).expect("the generated client frames must parse");
+        assert!(
+            frames.len() >= 4,
+            "the fixture must cover a whole session, not one frame"
+        );
+        let mut saw_closing_audio = false;
+        for value in frames {
+            let described = value.to_string();
+            let frame: crate::daemon::remote::protocol::TalkClientFrame =
+                serde_json::from_value(value).unwrap_or_else(|error| {
+                    panic!("the client sends a frame the runner cannot parse: {described}: {error}")
+                });
+            frame.validate().unwrap_or_else(|error| {
+                panic!("the client sends a frame the runner refuses: {described}: {error}")
+            });
+            if described.contains(r#""last":true"#) {
+                saw_closing_audio = true;
+                assert!(
+                    described.contains(r#""utterance_id""#),
+                    "a closing audio frame must name its utterance: {described}"
+                );
+            }
+        }
+        assert!(
+            saw_closing_audio,
+            "the fixture must contain the frame that closes an utterance -- it is the one the \
+             runner keys a turn on"
+        );
+
+        // The other direction, and the one the fixture cannot cover: the client
+        // has to *recognise* the frame that tells it a turn is durable, because
+        // that frame is the only thing it deletes a recording on. A client that
+        // ignored it would hold every utterance until the TTL and offer to
+        // re-send turns that had already run.
+        //
+        // The name is taken from a real serialized frame rather than typed as a
+        // literal, so renaming the variant fails here instead of silently
+        // leaving the client listening for a frame that no longer exists.
+        let accepted = serde_json::to_value(crate::daemon::remote::protocol::TalkServerFrame {
+            protocol_version: crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION,
+            session_id: "session-one".to_string(),
+            session_generation: "aBcDeFgHiJkLmNoPqRsTuVwX".to_string(),
+            frame_sequence: 1,
+            kind: crate::daemon::remote::protocol::TalkServerFrameKind::TurnAccepted {
+                utterance_id: "utt-1".to_string(),
+                run_id: "run-1".to_string(),
+            },
+        })
+        .expect("a server frame serializes");
+        let accepted_type = accepted
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .expect("a tagged frame names its type");
+        assert!(
+            javascript.contains(&format!("case \"{accepted_type}\":")),
+            "the client must handle the '{accepted_type}' frame; without it a recording is never \
+             released and every reconnect offers to re-send a turn that already ran"
+        );
+        // And the two fields it reads off that frame.
+        for field in ["utterance_id", "run_id"] {
+            assert!(
+                accepted.get(field).is_some(),
+                "the acknowledgement must carry {field}"
+            );
+            assert!(
+                javascript.contains(&format!("frame.{field}")),
+                "the client must read {field} from the acknowledgement"
+            );
+        }
+        // Both sides speak the same version. Two constants, one number.
+        assert!(
+            protocol.contains(&format!(
+                "export const TALK_PROTOCOL_VERSION = {};",
+                crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION
+            )),
+            "the shipped client must declare the protocol version the runner accepts"
+        );
+
         // Local detection, and only a finished utterance leaves the device.
         assert!(protocol.contains("export function createTalkDetector("));
         assert!(protocol.contains("noiseFloor = noiseFloor * 0.96"));
@@ -745,7 +846,35 @@ mod tests {
         // A dedicated object store: artifact bytes must not ride in the profile
         // record, which is rewritten on every sequence allocation.
         assert!(javascript.contains("const JOURNAL_STORE = \"device_command_journal\""));
-        assert!(javascript.contains("const DB_VERSION = 2"));
+        // v3 adds the Talk store beside it. What matters is that the upgrade
+        // stays additive — a device that already holds a pairing and a command
+        // journal must keep both, or every paired phone has to be paired again.
+        assert!(javascript.contains("const DB_VERSION = 3"));
+        assert!(javascript.contains("const TALK_STORE = \"talk_utterance_journal\""));
+        assert!(
+            javascript
+                .contains("journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE, TALK_STORE)"),
+            "one upgrade function creates whichever stores are absent and touches nothing else"
+        );
+        // Retention gates the upload rather than merely preceding it. An
+        // utterance the journal refused has one copy and it would be on the
+        // wire, so a socket that drops mid-flight loses it with no Retry to
+        // offer — which is the exact gap the journal exists to close. Pinned as
+        // an ordering because the failing version is a plausible edit: keep the
+        // retain call, keep the message, drop the early return.
+        let onstop = javascript
+            .split_once("recorder.onstop = async () => {")
+            .and_then(|(_, tail)| tail.split_once("\n  };"))
+            .map(|(body, _)| body)
+            .expect("the recorder's stop handler");
+        let refused_at = onstop
+            .find("if (!retained) return;")
+            .expect("a refused retention must stop the send");
+        assert!(
+            refused_at < onstop.find("talkSendFrame").expect("the send"),
+            "nothing may leave this device before the journal has agreed to hold it"
+        );
+
         // One executor per profile, holding the lock across the whole loop —
         // not merely around each signed request.
         assert!(javascript.contains("const EXECUTOR_LOCK = \"little-monkey-device-executor-v1\""));

@@ -35,6 +35,8 @@ export const diagnosticsLocale: Record<string, string> = {
   "DiagnosticsPanel.bundleDescription": "A redacted snapshot of this diagnosis plus your app version and platform — no prompts, chats, or secrets. Copy it into a support request.",
   "DiagnosticsPanel.bundleCopy": "Copy to clipboard",
   "DiagnosticsPanel.bundleCopied": "Copied",
+  "DiagnosticsPanel.bundleRedaction": "It also carries a trace of what your channels, phone numbers, peers and devices have been doing — as timing and outcomes only. Left out: {excluded}. Every name, number and handle is replaced by a token that means nothing outside this one bundle.",
+  "DiagnosticsPanel.bundleTraceUnavailable": "The activity trace is missing from this bundle: {reason}. Everything else here is still accurate — but nothing in it reflects your channels, phone numbers, peers or devices.",
   "DiagnosticsPanel.subsystemOllama": "Ollama",
   "DiagnosticsPanel.subsystemLlama": "Local chat model",
   "DiagnosticsPanel.subsystemEmbedLlama": "Local embeddings model",

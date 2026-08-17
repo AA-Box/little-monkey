@@ -1424,6 +1424,27 @@ impl ResourceController {
     /// Wall is checked first because it is the one bound that is always
     /// measurable, so a workload past its deadline is reported as such even on a
     /// host that can measure nothing else.
+    ///
+    /// # Why a kernel-held limit is never reported from here
+    ///
+    /// A measurement cannot be evidence of a refusal it did not observe. Where
+    /// the kernel holds the bound, the refusal *is* the enforcement — the
+    /// allocation or the spawn is denied — and the only record of it is the
+    /// mechanism's own notification, which [`Self::check`] reads first and
+    /// unconditionally for exactly that reason.
+    ///
+    /// A sample can still read past such a bound, because the number the kernel
+    /// holds and the number this app can measure are not the same number: a
+    /// Windows job caps *committed* memory while the sampler sums working sets,
+    /// and the two disagree by design. Minting a breach from that produced a
+    /// `level: "kernel"` with no counter behind it — a sampled observation
+    /// wearing the strongest claim this module can make, which is the specific
+    /// dishonesty [`EnforcementLevel`] exists to prevent.
+    ///
+    /// So the sample stays quiet and the next tick reports the notification.
+    /// Nothing runs away in the meantime: the kernel is already refusing the
+    /// work, which is why the measurement drifted rather than the workload
+    /// growing.
     #[must_use]
     pub fn breach(&self, sample: &ResourceSample, now_ms: i64) -> Option<LimitBreach> {
         let capabilities = self.capabilities();
@@ -1439,6 +1460,9 @@ impl ResourceController {
             // make it.
             let capability = capabilities.for_limit(limit);
             let level = capability.level()?;
+            if level == EnforcementLevel::Kernel {
+                return None;
+            }
             Some(LimitBreach {
                 limit: limit.as_str().to_string(),
                 configured,

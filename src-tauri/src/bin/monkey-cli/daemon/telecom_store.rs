@@ -372,6 +372,24 @@ impl DaemonStore {
             .transpose()
     }
 
+    /// The public base one number's callbacks use.
+    ///
+    /// Per-number remains authoritative when it is set — an operator running
+    /// two carriers behind two domains is a real configuration. What this adds
+    /// is the common case: one exposure in front of one listener, where making
+    /// every number repeat the same hostname is how one of them ends up stale.
+    ///
+    /// Resolved on read rather than written into the row. A derived value
+    /// stored back would be frozen by the next read-modify-write upsert, and
+    /// the number would keep pointing at a hostname the operator had since
+    /// changed — with the callback signature verified against the old one.
+    pub fn telecom_callback_base(&self, account: &TelecomAccountRecord) -> Option<String> {
+        account
+            .public_base_url
+            .clone()
+            .or_else(|| self.channel_public_base_url().ok().flatten())
+    }
+
     pub fn telecom_accounts(&self) -> Result<Vec<TelecomAccountRecord>, String> {
         let mut statement = self
             .connection
@@ -1057,7 +1075,11 @@ impl DaemonStore {
 
 /// Keep a stored string short enough to read in a settings panel and small
 /// enough that nothing here becomes a place to park data.
-fn excerpt(value: &str) -> String {
+///
+/// Shared with the messaging side's identical column rather than copied: two
+/// bounds that are meant to be the same bound drift, and the one that drifts
+/// upward is the one holding a string an unauthenticated caller influenced.
+pub(super) fn excerpt(value: &str) -> String {
     const MAX_CHARS: usize = 160;
     if value.chars().count() <= MAX_CHARS {
         return value.to_string();

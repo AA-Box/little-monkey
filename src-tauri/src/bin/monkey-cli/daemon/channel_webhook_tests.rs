@@ -315,6 +315,66 @@ async fn whatsapp_refuses_a_body_whose_signature_does_not_match_and_records_noth
     assert_eq!(distinct_runs(&queue), 0);
 }
 
+/// The refusal leaves no event and no turn — and one bounded counter, which is
+/// the only thing that separates "your signing secret was rotated" from total
+/// silence.
+///
+/// Both halves matter. Before this, an operator whose Meta app secret changed on
+/// one side saw messages simply stop, with every check on the Security Doctor
+/// page still passing. The counter is what that page reads. What must *not*
+/// happen is the counter turning into a log of forged bodies, so the recorded
+/// reason is the adapter's own sentence and nothing from the request.
+#[tokio::test]
+async fn a_refused_delivery_is_counted_against_the_account_and_a_verified_one_clears_it() {
+    let mut store = seeded_store("acct-wa", ChannelKind::WhatsApp);
+    let adapter = whatsapp_adapter("acct-wa");
+    let body = whatsapp_body("wamid.COUNTED");
+    let forged = {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"rotated-away");
+        let tag = ring::hmac::sign(&key, &body);
+        let hex: String = tag.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        vec![("x-hub-signature-256".to_string(), format!("sha256={hex}"))]
+    };
+
+    for _ in 0..3 {
+        assert_eq!(
+            deliver(&mut store, &adapter, &forged, &body),
+            DeliveryOutcome::Rejected
+        );
+    }
+    let refusals = store
+        .channel_callback_rejections("acct-wa")
+        .expect("rejections");
+    assert_eq!(refusals.count, 3);
+    assert!(
+        refusals
+            .last_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("signature verification failed")),
+        "{refusals:?}"
+    );
+    // Nothing that arrived is kept: the reason is the adapter's own sentence.
+    assert!(
+        !refusals
+            .last_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sha256="),
+        "the refused signature must not be stored"
+    );
+
+    // A delivery that authenticates ends the streak, so the count an operator
+    // reads means "since it last worked" rather than "ever".
+    assert!(deliver(&mut store, &adapter, &whatsapp_signature(&body), &body).is_success());
+    assert_eq!(
+        store
+            .channel_callback_rejections("acct-wa")
+            .expect("rejections")
+            .count,
+        0
+    );
+}
+
 #[tokio::test]
 async fn whatsapp_makes_a_new_message_durable_before_it_answers() {
     let mut store = seeded_store("acct-wa", ChannelKind::WhatsApp);

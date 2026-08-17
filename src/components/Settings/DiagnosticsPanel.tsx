@@ -216,6 +216,27 @@ export function DiagnosticsPanel() {
               </Button>
             </div>
           </div>
+          {/* What is in the bundle, stated before somebody sends it. The JSON
+              below is the authority, but nobody reads a hundred lines of it to
+              find out whether their messages are in there — and that is exactly
+              the question to answer before a file leaves the machine. */}
+          {bundle.trace && (
+            <p className="mt-2 text-xs leading-5 text-muted">
+              {t("DiagnosticsPanel.bundleRedaction", {
+                excluded: bundle.trace.redaction.excluded.join(", "),
+              })}
+            </p>
+          )}
+          {/* A trace that could not be read is said out loud rather than left
+              as an absent key. "Nothing happened" and "nothing could be read"
+              send a reader to different places. */}
+          {bundle.traceUnavailable && (
+            <p role="status" className="mt-2 text-xs leading-5 text-warning">
+              {t("DiagnosticsPanel.bundleTraceUnavailable", {
+                reason: bundle.traceUnavailable,
+              })}
+            </p>
+          )}
           <pre className="mt-2 max-h-48 overflow-auto rounded-md bg-background px-2 py-1 text-[10px] text-faint">
             {JSON.stringify(bundle, null, 2)}
           </pre>

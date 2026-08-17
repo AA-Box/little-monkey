@@ -1,3 +1,5 @@
+import { readFileSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 // The module under test is shipped to a browser as plain JavaScript with no
@@ -7,7 +9,7 @@ import { describe, expect, it } from "vitest";
 // would be a second copy of the API free to drift from the first, which is the
 // defect class this whole file exists to catch.
 // @ts-expect-error — untyped ES module served verbatim to the mobile client.
-import { MAX_TALK_AUDIO_BYTES, TALK_AUDIO_CHUNK_BASE64_CHARS, TALK_PROTOCOL_VERSION, chooseTalkMediaType, clampTalkChannels, clampTalkSampleRateHz, createTalkDetector, createTalkFrames, normalizeTalkMediaType, splitTalkAudioBase64 } from "../../src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js";
+import { MAX_TALK_AUDIO_BYTES, TALK_AUDIO_CHUNK_BASE64_CHARS, TALK_JOURNAL_LIMITS, TALK_PROTOCOL_VERSION, TALK_UTTERANCE, chooseTalkMediaType, clampTalkChannels, clampTalkSampleRateHz, createTalkDetector, createTalkFrames, createTalkJournal, normalizeTalkMediaType, prunableTalkUtterances, splitTalkAudioBase64, talkJournalRefusal, talkUtterancePending } from "../../src-tauri/src/bin/monkey-cli/daemon/remote/ui/talkProtocol.js";
 
 /**
  * The mobile Talk client's wire behaviour, driven rather than read.
@@ -34,6 +36,9 @@ const SESSION_ID = "mobile-device-Ab_3-xY";
 // 24 URL-safe base64 characters, the shape `TalkTicketResponse::issue` mints.
 const SESSION_GENERATION = "aBcDeFgHiJkLmNoPqRsTuVwX";
 
+/** A pinned utterance id, so a frame can be asserted whole. */
+const UTTERANCE_ID = "utt-fixed-for-tests";
+
 function newFrames(overrides: Record<string, unknown> = {}) {
   return createTalkFrames({
     sessionId: SESSION_ID,
@@ -41,6 +46,7 @@ function newFrames(overrides: Record<string, unknown> = {}) {
     mediaType: "audio/webm;codecs=opus",
     sampleRateHz: 48_000,
     channels: 1,
+    randomId: () => UTTERANCE_ID,
     ...overrides,
   });
 }
@@ -100,6 +106,7 @@ describe("the Talk frame builder", () => {
       media_type: "audio/webm;codecs=opus",
       audio_base64: "AAECAwQ=",
       last: true,
+      utterance_id: UTTERANCE_ID,
     });
 
     // Barge-in during the answer.
@@ -118,6 +125,10 @@ describe("the Talk frame builder", () => {
       media_type: "audio/webm;codecs=opus",
       audio_base64: "BQYHCA==",
       last: true,
+      // A second utterance, and its own name: the interrupting one must not
+      // inherit the key of the turn it interrupted, or two different things
+      // somebody said collapse into one run.
+      utterance_id: UTTERANCE_ID,
     });
   });
 
@@ -275,6 +286,318 @@ describe("the Talk frame builder", () => {
       sample_rate_hz: 192_000,
       channels: 1,
     });
+  });
+
+  /**
+   * The device names its own utterances, and the name is what survives a
+   * restart of the runner.
+   *
+   * The runner cannot mint one: its session generation is minted fresh with
+   * every ticket and its audio counter restarts with it, so a reconnected
+   * device re-sending an unanswered recording would otherwise produce a second
+   * turn. These assertions pin the three properties that make the name usable
+   * as that key.
+   */
+  it("names each utterance once, shares it across the chunks, and rotates after the last", () => {
+    let minted = 0;
+    const frames = newFrames({ randomId: () => `utt-${++minted}` });
+    frames.hello();
+
+    const first = [
+      frames.audio({ audioBase64: "AAEC" }),
+      frames.audio({ audioBase64: "AwQF" }),
+      frames.audio({ audioBase64: "BgcI", last: true }),
+    ] as Array<{ utterance_id: string }>;
+    // One name for the whole utterance, so the runner keys the turn once
+    // however many frames carried it.
+    expect(new Set(first.map((frame) => frame.utterance_id))).toEqual(
+      new Set(["utt-1"]),
+    );
+
+    // And the next utterance is a different turn.
+    const second = frames.audio({ audioBase64: "CQoL", last: true }) as {
+      utterance_id: string;
+    };
+    expect(second.utterance_id).toBe("utt-2");
+  });
+
+  it("re-sends a recording under the name it already used", () => {
+    const frames = newFrames({ randomId: () => "utt-generated" });
+    frames.hello();
+    // What a client retransmitting an unanswered utterance must do: name it
+    // explicitly rather than let a fresh one be minted.
+    const resent = frames.audio({
+      audioBase64: "AAEC",
+      last: true,
+      utteranceId: "utt-from-the-first-attempt",
+    }) as { utterance_id: string };
+    expect(resent.utterance_id).toBe("utt-from-the-first-attempt");
+  });
+
+  it("keeps a generated name inside the alphabet the runner accepts", () => {
+    const frames = newFrames({ randomId: () => "utt/with+slashes and spaces" });
+    frames.hello();
+    const frame = frames.audio({ audioBase64: "AAEC", last: true }) as {
+      utterance_id: string;
+    };
+    // Alphanumerics, `-` and `_` only: `validate_talk_token`'s rule. Repaired
+    // rather than refused, because this value is generated on our own side.
+    expect(frame.utterance_id).toMatch(/^[A-Za-z0-9_-]+$/u);
+  });
+});
+
+/**
+ * The bytes this client really sends, written where the runner's own tests can
+ * parse them.
+ *
+ * This exists because the two sides were changed apart once already: the runner
+ * began requiring `utterance_id` while the shipped module still built frames
+ * without one, and *both* test suites stayed green — each drove a side that
+ * agreed with itself. A Rust test that hand-writes the JSON it expects has the
+ * same blind spot, because the thing that drifts is the JSON the JS actually
+ * produces.
+ *
+ * So the frames are generated by the real module here, written to a checked-in
+ * fixture, and parsed by `TalkClientFrame` over in Rust. Neither side can move
+ * without the other failing: change the builder and this file rewrites the
+ * fixture, which the Rust test then rejects or accepts on its own terms; change
+ * the Rust contract and the fixture stops validating. No Node in the Rust job,
+ * no second copy of the wire shape.
+ */
+/**
+ * The pending-utterance journal, driven through the same module the client
+ * runs.
+ *
+ * The property under test is not "records are stored" — it is *when the audio
+ * is allowed to disappear*. Before this journal existed, a socket that dropped
+ * between "recording finished" and "answer arrived" lost the utterance outright,
+ * and the client's own message told the person to say it again. Every test here
+ * is about one of the two moments that may delete a recording: the runner
+ * confirming a durable turn, or the person choosing to discard it.
+ */
+function memoryJournal(now: () => number = () => 1_000) {
+  const rows = new Map<string, Record<string, unknown>>();
+  const adapter = {
+    all: () => Promise.resolve([...rows.values()]),
+    put: (record: { utteranceId: string }) => {
+      rows.set(record.utteranceId, record);
+      return Promise.resolve();
+    },
+    remove: (ids: string[]) => {
+      for (const id of ids) rows.delete(id);
+      return Promise.resolve();
+    },
+  };
+  return { rows, journal: createTalkJournal(adapter, { now }) };
+}
+
+const RECORDING = {
+  utteranceId: "utt-1",
+  sessionId: SESSION_ID,
+  mediaType: "audio/webm;codecs=opus",
+  sampleRateHz: 48_000,
+  channels: 1,
+  audioBase64: "AAECAwQ=",
+};
+
+describe("the Talk pending-utterance journal", () => {
+  it("holds a recording from before it is uploaded", async () => {
+    const { journal } = memoryJournal();
+    const { record, refused } = await journal.retain(RECORDING);
+    expect(refused).toBeUndefined();
+    expect(record.state).toBe(TALK_UTTERANCE.pending);
+    expect(record.audioBase64).toBe(RECORDING.audioBase64);
+    expect(talkUtterancePending(record)).toBe(true);
+  });
+
+  it("drops the audio only when the runner confirms a durable turn", async () => {
+    const { journal } = memoryJournal();
+    await journal.retain(RECORDING);
+
+    // Anything short of acceptance leaves the bytes exactly where they were:
+    // a failed attempt is the case a retry exists for.
+    const afterFailure = await journal.failed("utt-1", "socket closed");
+    expect(afterFailure.audioBase64).toBe(RECORDING.audioBase64);
+    expect(afterFailure.attempts).toBe(2);
+    expect(afterFailure.lastError).toBe("socket closed");
+
+    const accepted = await journal.accept("utt-1", "run-7");
+    expect(accepted.state).toBe(TALK_UTTERANCE.accepted);
+    expect(accepted.audioBase64).toBeNull();
+    expect(accepted.bytes).toBe(0);
+    // The note survives the audio, and that is the point: it is what stops the
+    // next reconnect offering to re-send a turn that is already running.
+    expect(accepted.runId).toBe("run-7");
+    expect(talkUtterancePending(accepted)).toBe(false);
+  });
+
+  it("removes everything about a discarded recording, with no later retry", async () => {
+    const { journal, rows } = memoryJournal();
+    await journal.retain(RECORDING);
+    await journal.remove(["utt-1"]);
+    expect(rows.size).toBe(0);
+    expect(await journal.all()).toEqual([]);
+    // A discarded utterance cannot be resurrected by acceptance arriving late.
+    expect(await journal.accept("utt-1", "run-7")).toBeNull();
+  });
+
+  it("refuses to hold more than its bounds allow, and says which bound", async () => {
+    const oversized = "x".repeat(TALK_JOURNAL_LIMITS.maxUtteranceBytes + 1);
+    expect(talkJournalRefusal([], oversized.length)).toMatch(/too large/u);
+
+    const pending = Array.from({ length: TALK_JOURNAL_LIMITS.maxPending }, (_unused, at) => ({
+      utteranceId: `utt-${at}`,
+      state: TALK_UTTERANCE.pending,
+      bytes: 1,
+      createdAtMs: at,
+    }));
+    expect(talkJournalRefusal(pending, 1)).toMatch(/unconfirmed recordings/u);
+
+    const heavy = [{ utteranceId: "utt-big", state: TALK_UTTERANCE.pending, bytes: TALK_JOURNAL_LIMITS.maxTotalBytes, createdAtMs: 0 }];
+    expect(talkJournalRefusal(heavy, 1)).toMatch(/as much unconfirmed audio/u);
+
+    // A refusal is an answer, not an exception — and it is a refusal of the
+    // *send*, not only of the storage. Nothing is retained, so the caller has
+    // nothing it could offer a Retry for, so it must not upload.
+    const { journal, rows } = memoryJournal();
+    const { refused, record } = await journal.retain({ ...RECORDING, audioBase64: oversized });
+    expect(refused).toMatch(/too large/u);
+    expect(record).toBeUndefined();
+    expect(rows.size).toBe(0);
+  });
+
+  /**
+   * Every bound says the recording was not sent.
+   *
+   * The client fails closed on a refusal, and the one thing that must never
+   * happen is a message telling somebody their sentence went out when the page
+   * has just dropped it. Asserted over all three bounds together rather than
+   * one at a time, because the failure this catches is a message added later
+   * that forgets.
+   */
+  it("tells the speaker their recording was not sent, whichever bound refused it", () => {
+    const full = Array.from({ length: TALK_JOURNAL_LIMITS.maxPending }, (_unused, at) => ({
+      utteranceId: `utt-${at}`,
+      state: TALK_UTTERANCE.pending,
+      bytes: 1,
+      createdAtMs: at,
+    }));
+    const heavy = [
+      {
+        utteranceId: "utt-big",
+        state: TALK_UTTERANCE.pending,
+        bytes: TALK_JOURNAL_LIMITS.maxTotalBytes,
+        createdAtMs: 0,
+      },
+    ];
+    for (const refusal of [
+      talkJournalRefusal([], TALK_JOURNAL_LIMITS.maxUtteranceBytes + 1),
+      talkJournalRefusal(full, 1),
+      talkJournalRefusal(heavy, 1),
+    ]) {
+      expect(refusal).toMatch(/not sent/u);
+      expect(refusal).not.toMatch(/it was sent/u);
+    }
+  });
+
+  it("prunes accepted notes and expired recordings, never a fresh unconfirmed one", () => {
+    const nowMs = 10 * TALK_JOURNAL_LIMITS.ttlMs;
+    const entries = [
+      { utteranceId: "fresh-pending", state: TALK_UTTERANCE.pending, createdAtMs: nowMs - 1_000 },
+      { utteranceId: "old-pending", state: TALK_UTTERANCE.pending, createdAtMs: nowMs - TALK_JOURNAL_LIMITS.ttlMs - 1 },
+      { utteranceId: "accepted", state: TALK_UTTERANCE.accepted, createdAtMs: nowMs - 2_000 },
+    ];
+    const dropping = prunableTalkUtterances(entries, nowMs);
+    expect(dropping).toContain("old-pending");
+    expect(dropping).not.toContain("fresh-pending");
+
+    // Over the count, the accepted note goes and the unconfirmed audio stays:
+    // one of the two can be reconstructed from the conversation and the other
+    // cannot be reconstructed from anywhere.
+    const crowded = [
+      ...Array.from({ length: TALK_JOURNAL_LIMITS.maxPending }, (_unused, at) => ({
+        utteranceId: `p-${at}`,
+        state: TALK_UTTERANCE.pending,
+        createdAtMs: nowMs - 1_000,
+      })),
+      entries[2],
+    ];
+    expect(prunableTalkUtterances(crowded, nowMs)).toEqual(["accepted"]);
+  });
+
+  it("expires a recording that nobody ever came back for", async () => {
+    let clock = 1_000;
+    const { journal, rows } = memoryJournal(() => clock);
+    await journal.retain(RECORDING);
+    clock += TALK_JOURNAL_LIMITS.ttlMs + 1;
+    expect(await journal.prune()).toEqual(["utt-1"]);
+    expect(rows.size).toBe(0);
+  });
+});
+
+describe("re-sending a retained recording", () => {
+  it("keeps the utterance's name across a fresh ticket and generation", () => {
+    // What a retry does: a *new* session generation, because a ticket is
+    // one-use, and the *same* utterance id, because that is the key the runner
+    // collapses the second arrival onto.
+    const first = newFrames();
+    first.hello();
+    const original = first.audio({ audioBase64: "AAECAwQ=", last: true });
+
+    const retry = createTalkFrames({
+      sessionId: SESSION_ID,
+      sessionGeneration: "zZzZzZzZzZzZzZzZzZzZzZzZ",
+      mediaType: "audio/webm;codecs=opus",
+      sampleRateHz: 48_000,
+      channels: 1,
+      // A retry that let the builder mint a name would be a second turn.
+      randomId: () => "utt-a-different-one",
+    });
+    retry.hello();
+    const resent = retry.audio({ audioBase64: "AAECAwQ=", last: true, utteranceId: UTTERANCE_ID });
+
+    expect(resent.utterance_id).toBe(original.utterance_id);
+    expect(resent.session_generation).not.toBe(original.session_generation);
+    expect(resent.session_id).toBe(original.session_id);
+  });
+});
+
+describe("the frames the runner will actually receive", () => {
+  it("writes every client frame shape to the fixture the runner's tests parse", () => {
+    const frames = newFrames({ randomId: () => UTTERANCE_ID });
+    // One whole session, in the order a device sends it.
+    const generated = [
+      frames.hello(),
+      frames.metrics({ audioSequence: 1, speechDetectionMs: 184, captureMs: 1_240, uploadMs: 96 }),
+      frames.audio({ audioBase64: "AAECAwQ=", last: false }),
+      frames.audio({ audioBase64: "BQYHCA==", last: true }),
+      frames.interrupt("barge_in"),
+    ];
+
+    const fixture = fileURLToPath(
+      new URL(
+        "../../src-tauri/src/bin/monkey-cli/fixtures/talk_client_frames.json",
+        import.meta.url,
+      ),
+    );
+    const serialized = `${JSON.stringify(generated, null, 2)}\n`;
+    // Read once and act on what that read returned. Asking whether the file
+    // exists and then reading it is two answers about a file that can change in
+    // between — the failure is only ever a confusing error here, but it is a
+    // real race and a scanner is right to say so.
+    let previous = "";
+    try {
+      previous = readFileSync(fixture, "utf8");
+    } catch {
+      // No fixture yet: the first run writes one and fails, which is the same
+      // outcome as a stale one.
+    }
+    if (previous !== serialized) writeFileSync(fixture, serialized);
+
+    // Regenerating is not the assertion — the assertion is that what the
+    // builder produces is what the *committed* fixture says, so a change that
+    // was never committed fails in CI, where the tree is clean.
+    expect(previous).toBe(serialized);
   });
 });
 

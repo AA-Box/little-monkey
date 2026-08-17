@@ -33,6 +33,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -107,6 +108,10 @@ impl WebhookChannelAdapter for LineAdapter {
         ChannelKind::Line
     }
 
+    fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
     /// LINE's own requirement, and the one its console's Verify button checks:
     /// status 200. It reads nothing else, including on a redelivery of an event
     /// this daemon already has.
@@ -167,6 +172,7 @@ impl ChannelAdapter for LineAdapter {
             // retried send takes.
             supports_idempotency_key: true,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Line, InboundTransport::Webhook)
         }
     }
@@ -523,6 +529,7 @@ fn normalize_event(
                             .map(str::to_string),
                         mime_type: None,
                         declared_size_bytes: message.get("fileSize").and_then(JsonValue::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle {
                             handle: id.to_string(),
                         },
@@ -600,6 +607,7 @@ fn normalize_event(
         account_id: account_id.to_string(),
         kind: ChannelKind::Line,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender: ChannelSender::new(sender_id),
         text,
