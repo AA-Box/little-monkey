@@ -276,6 +276,20 @@ jobs:
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
 
+      - name: Apple-Silicon MLX full-ladder transaction
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $(uname -m)"
+          test "$(uname -m)" = "arm64"
+          cargo test --manifest-path src-tauri/Cargo.toml -- --list | \
+            grep 'm3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional'
+          cargo test \
+            --manifest-path src-tauri/Cargo.toml \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --nocapture
+
       - name: The CLI reports this runner's resource-enforcement backend
         # Which mechanism actually holds a limit here, per platform, in the log —
         # and a required gate on the command itself.

@@ -934,7 +934,7 @@ impl ReqwestM3DownloadTransport {
     /// public-side claims are made where they can be made honestly, against the
     /// primitive itself in `egress.rs`.
     #[cfg(test)]
-    fn for_loopback_fixture() -> M3HubResult<Self> {
+    pub(crate) fn for_loopback_fixture() -> M3HubResult<Self> {
         let client = crate::egress::public_download_client(
             crate::egress::PublicDestinations::LoopbackAllowed,
             COMPONENT_EGRESS_GUARD,

@@ -2053,4 +2053,326 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&directory);
     }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod mlx_full_ladder {
+        use super::*;
+        use crate::m3_runtime_hub::{
+            fetch_component_catalog, M3Clock, M3ComponentCatalogEntry, M3ComponentChannel,
+            M3ComponentHub, M3ComponentHubDependencies, M3DownloadTransport, M3HardwareProbe,
+            M3HubConfig, M3RuntimeHub, M3RuntimeHubDependencies, ReqwestM3DownloadTransport,
+            M3_COMPONENT_CATALOG_SCHEMA_VERSION, M3_HUB_SCHEMA_VERSION,
+        };
+        use crate::mlx_runtime::tests::{write_test_signed_archive, TestSignatureVerifier};
+        use crate::runtime_adapter::{HardwareSnapshot, PlatformCapabilities};
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Directory(PathBuf);
+        impl Directory {
+            fn new() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                let path = std::env::temp_dir().join(format!(
+                    "m3-mlx-ladder-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir_all(&path).expect("test root");
+                Self(path)
+            }
+        }
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct Clock(AtomicU64);
+        impl M3Clock for Clock {
+            fn now_ms(&self) -> M3HubResult<u64> {
+                Ok(self.0.fetch_add(1, Ordering::Relaxed))
+            }
+        }
+        struct Hardware;
+        impl M3HardwareProbe for Hardware {
+            fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
+                Ok(HardwareSnapshot {
+                    captured_at_ms: 1,
+                    total_ram_bytes: 32 << 30,
+                    available_ram_bytes: 24 << 30,
+                    logical_cpu_count: 8,
+                    platform: PlatformCapabilities::from_host("macos", "aarch64", Vec::new()),
+                })
+            }
+        }
+        fn config() -> M3HubConfig {
+            M3HubConfig {
+                schema_version: M3_HUB_SCHEMA_VERSION,
+                storage_quota_bytes: 32 << 20,
+                storage_reserve_bytes: 1 << 20,
+                download_chunk_bytes: 64 << 10,
+                operation_timeout_ms: 10_000,
+                max_catalog_results: 16,
+            }
+        }
+        fn state(root: &Path, download: Arc<dyn M3DownloadTransport>) -> M3CommandState {
+            let runtime = Arc::new(
+                M3RuntimeHub::new(
+                    root.join("runtime"),
+                    config(),
+                    M3RuntimeHubDependencies {
+                        clock: Arc::new(Clock(AtomicU64::new(1))),
+                        hardware: Arc::new(Hardware),
+                        download: download.clone(),
+                        catalogs: Vec::new(),
+                        runtimes: Vec::new(),
+                        runtime_reconciler: None,
+                        lan_factory: None,
+                    },
+                )
+                .expect("runtime hub"),
+            );
+            let components = Arc::new(
+                M3ComponentHub::new(
+                    root.join("components"),
+                    config(),
+                    M3ComponentHubDependencies {
+                        clock: Arc::new(Clock(AtomicU64::new(2))),
+                        download,
+                        sources: Vec::new(),
+                    },
+                )
+                .expect("component hub"),
+            );
+            M3CommandState::new(runtime, components)
+        }
+        fn sha(bytes: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(bytes))
+        }
+        fn entry(url: String, bytes: &[u8], version: &str) -> M3ComponentCatalogEntry {
+            M3ComponentCatalogEntry {
+                schema_version: M3_COMPONENT_CATALOG_SCHEMA_VERSION,
+                source_id: "fixture-mlx".into(),
+                component_id: "mlx-runtime-apple-silicon".into(),
+                kind: M3ComponentKind::MlxRuntime,
+                display_name: "Fixture MLX".into(),
+                accelerator: None,
+                version: version.into(),
+                channel: M3ComponentChannel::Stable,
+                download_url: url,
+                sha256: sha(bytes),
+                size_bytes: bytes.len() as u64,
+                published_at_ms: 1,
+                compatibility_note: None,
+                metadata: BTreeMap::new(),
+            }
+        }
+
+        struct Fixture {
+            origin: String,
+            heads: Arc<AtomicUsize>,
+            ranges: Arc<AtomicUsize>,
+            if_ranges: Arc<AtomicUsize>,
+        }
+        impl Fixture {
+            async fn spawn(catalog: Vec<M3ComponentCatalogEntry>, artifact: Vec<u8>) -> Self {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let heads = Arc::new(AtomicUsize::new(0));
+                let ranges = Arc::new(AtomicUsize::new(0));
+                let if_ranges = Arc::new(AtomicUsize::new(0));
+                let asset = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let asset_addr = asset.local_addr().unwrap();
+                let catalog = serde_json::to_vec(&catalog).unwrap();
+                let h = heads.clone();
+                let r = ranges.clone();
+                let i = if_ranges.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut s, _)) = asset.accept().await {
+                        let catalog = catalog.clone();
+                        let artifact = artifact.clone();
+                        let h = h.clone();
+                        let r = r.clone();
+                        let i = i.clone();
+                        tokio::spawn(async move {
+                            let mut b = vec![0; 8192];
+                            let n = s.read(&mut b).await.unwrap_or(0);
+                            let req = String::from_utf8_lossy(&b[..n]);
+                            let first = req.lines().next().unwrap_or("");
+                            let range = req
+                                .lines()
+                                .find(|x| x.to_ascii_lowercase().starts_with("range:"))
+                                .map(|x| x[6..].trim());
+                            let if_range = req
+                                .lines()
+                                .any(|x| x.to_ascii_lowercase().starts_with("if-range:"));
+                            let (status, body, extra) = if first.contains("/catalog.json") {
+                                (
+                                    "200 OK",
+                                    catalog,
+                                    "content-type: application/json\r\n".to_string(),
+                                )
+                            } else if first.starts_with("HEAD") {
+                                h.fetch_add(1, Ordering::Relaxed);
+                                (
+                                    "200 OK",
+                                    artifact.clone(),
+                                    "accept-ranges: bytes\r\netag: \"mlx-fixture\"\r\n".to_string(),
+                                )
+                            } else {
+                                let value = range.unwrap();
+                                r.fetch_add(1, Ordering::Relaxed);
+                                if if_range {
+                                    i.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let start = value
+                                    .trim_start_matches("bytes=")
+                                    .split('-')
+                                    .next()
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap();
+                                let end = (start + 65536).min(artifact.len()) - 1;
+                                ("206 Partial Content", artifact[start..=end].to_vec(), format!("content-range: bytes {start}-{end}/{}\r\netag: \"mlx-fixture\"\r\n", artifact.len()))
+                            };
+                            let response=format!("HTTP/1.1 {status}\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n", body.len());
+                            let _ = s.write_all(response.as_bytes()).await;
+                            let _ = s.write_all(&body).await;
+                        });
+                    }
+                });
+                let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = origin.local_addr().unwrap();
+                tokio::spawn(async move {
+                    while let Ok((mut s, _)) = origin.accept().await {
+                        tokio::spawn(async move {
+                            let mut b = vec![0; 1024];
+                            let n = s.read(&mut b).await.unwrap_or(0);
+                            let path = String::from_utf8_lossy(&b[..n])
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("/")
+                                .to_string();
+                            let location = format!("http://{asset_addr}{path}");
+                            let response=format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+                            let _ = s.write_all(response.as_bytes()).await;
+                        });
+                    }
+                });
+                Self {
+                    origin: format!("http://{addr}"),
+                    heads,
+                    ranges,
+                    if_ranges,
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_to_signed_mlx_runtime_install_is_transactional() {
+            let root = Directory::new();
+            let valid = root.0.join("valid.tar.gz");
+            let bad = root.0.join("bad.tar.gz");
+            write_test_signed_archive(&valid, "mlx-test-v1", true);
+            write_test_signed_archive(&bad, "mlx-test-v2", false);
+            let valid_bytes = fs::read(&valid).unwrap();
+            let bad_bytes = fs::read(&bad).unwrap();
+            let valid_fixture = Fixture::spawn(Vec::new(), valid_bytes.clone()).await;
+            let valid_entry = entry(
+                format!("{}/artifact.tar.gz", valid_fixture.origin),
+                &valid_bytes,
+                "mlx-test-v1",
+            );
+            let catalog_fixture = Fixture::spawn(vec![valid_entry], valid_bytes.clone()).await;
+            let transport = Arc::new(ReqwestM3DownloadTransport::for_loopback_fixture().unwrap());
+            let state = state(&root.0, transport);
+            let context = M3OperationContext::new(10_000);
+            let fetched = fetch_component_catalog(
+                &format!("{}/catalog.json", catalog_fixture.origin),
+                &context,
+            )
+            .await
+            .unwrap();
+            crate::m3_production::merge_component_registry_entries(&state.component_hub, fetched)
+                .unwrap();
+            let adopted =
+                crate::m3_production::component_registry_entries(state.component_hub.root())
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            let app = root.0.join("app");
+            let installed = component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest {
+                    entry: adopted.clone(),
+                },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(installed.active_version_key, adopted.version_key());
+            assert!(valid_fixture.heads.load(Ordering::Relaxed) >= 1);
+            assert!(valid_fixture.ranges.load(Ordering::Relaxed) >= 3);
+            assert!(valid_fixture.if_ranges.load(Ordering::Relaxed) >= 1);
+            let bad_fixture = Fixture::spawn(Vec::new(), bad_bytes.clone()).await;
+            let bad_entry = entry(
+                format!("{}/artifact.tar.gz", bad_fixture.origin),
+                &bad_bytes,
+                "mlx-test-v2",
+            );
+            let error = component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest {
+                    entry: bad_entry.clone(),
+                },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("signature"));
+            let after = state.component_hub.list_installed().unwrap();
+            assert_eq!(after[0].active_version_key, adopted.version_key());
+            assert!(!after[0]
+                .versions
+                .iter()
+                .any(|v| v.version_key == bad_entry.version_key()));
+            component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest { entry: adopted },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .expect("failed operation releases its id for immediate reuse");
+        }
+    }
 }
