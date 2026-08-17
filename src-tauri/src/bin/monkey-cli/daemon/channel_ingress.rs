@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use little_monkey_lib::channels::ingress::{
     ContinuationKind, ConversationIngress, ConversationSource,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::policy::{
     decide_access, generate_pairing_code, pairing_challenge_reply, AccessContext, AccessDecision,
     IgnoreReason, SenderAuthorization, SenderState,
@@ -196,6 +197,28 @@ pub(crate) fn accept_channel_envelope_with(
         });
     }
 
+    // Did we send this? Asked before anything is decided, and answered from the
+    // host's own record of what it sent rather than from the envelope. This is
+    // what makes self-echo suppression a fact for a provider whose sender
+    // identity the host cannot verify — see `EchoCorrelation`.
+    //
+    // `provider_message_id` is the message's own immutable id; `provider_event_id`
+    // is the id of the *delivery*, which a provider may mint fresh on a
+    // redelivery. Matching on the wrong one would either miss every echo or
+    // suppress a real message.
+    let correlation = super::channel_adapter::echo_correlation_for(&account);
+    let own_outbound_echo = match (
+        correlation == EchoCorrelation::ProviderMessageId,
+        envelope.provider_message_id.as_deref(),
+    ) {
+        (true, Some(message_id)) => store.is_own_outbound_echo(
+            &envelope.account_id,
+            &envelope.conversation.conversation_id,
+            envelope.conversation.thread_id.as_deref(),
+            message_id,
+        )?,
+        _ => false,
+    };
     let stored_sender = store.channel_sender(&envelope.account_id, &envelope.sender.sender_id)?;
     let depth = inherited_reply_depth(store, envelope)?;
     // Counted only for a sender the provider says is a machine: for everybody
@@ -209,12 +232,19 @@ pub(crate) fn accept_channel_envelope_with(
     } else {
         0
     };
+    // The policy actually in force, which for an account that cannot recognise
+    // its own echo is narrower than the one stored. Clamped here rather than
+    // refused, so an account configured before this rule existed keeps working
+    // and stops being able to loop; Security Doctor is what says the stored
+    // setting is not the effective one.
+    let effective_policy = account.access_policy.clamped_for(correlation);
     let context = AccessContext {
-        policy: &account.access_policy,
+        policy: &effective_policy,
         sender: stored_sender.as_ref().map(sender_authorization),
         pending_pairings: store.count_pending_channel_senders(&envelope.account_id)?,
         automated_reply_depth: depth,
         consecutive_machine_messages: machine_streak,
+        own_outbound_echo,
         now_ms,
     };
 
@@ -1211,6 +1241,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: event_id.into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-7"),
             sender: ChannelSender::new("user-3"),
             text: text.into(),
@@ -2058,6 +2089,311 @@ mod tests {
         assert_eq!(
             options.deterministic_job_id.as_deref(),
             Some(ingress.deterministic_job_id().as_str())
+        );
+    }
+
+    // -- Host-owned self-echo suppression ------------------------------------
+    //
+    // The property under test is that suppression is *causal*: it follows from
+    // the host's own record of a message it sent, and holds regardless of what
+    // the envelope claims about who sent it. Every test below is written
+    // against an extension-backed account, because that is the one whose sender
+    // metadata is produced by sandboxed guest code and therefore cannot be the
+    // basis of the guarantee.
+
+    /// An extension account, with whatever it declares about correlation.
+    fn extension_store(policy: ChannelAccessPolicy, correlation: &str) -> DaemonStore {
+        let mut store = DaemonStore::open_in_memory().expect("open");
+        let mut config = serde_json::json!({
+            "extension_id": "dev.example.chat",
+            "capability_id": "room",
+        });
+        if !correlation.is_empty() {
+            config["echo_correlation"] = serde_json::json!(correlation);
+        }
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "acct-1".into(),
+                kind: ChannelKind::Extension,
+                label: "Fixture channel".into(),
+                enabled: true,
+                non_secret_config: config,
+                credential_ref: None,
+                access_policy: policy,
+                health: ChannelHealth::connected(NOW, None),
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("account");
+        store
+            .insert_channel_route(&ChannelRoute {
+                route_id: "route-1".into(),
+                scope: RouteScope::account("acct-1"),
+                target: RouteTarget::new("chat"),
+                enabled: true,
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("route");
+        store
+    }
+
+    /// One inbound message from an extension-backed account, carrying the
+    /// provider's own id for the message and whatever the guest says about its
+    /// sender.
+    fn extension_inbound(
+        event_id: &str,
+        provider_message_id: Option<&str>,
+        is_self: bool,
+    ) -> ChannelEnvelope {
+        ChannelEnvelope {
+            account_id: "acct-1".into(),
+            kind: ChannelKind::Extension,
+            provider_event_id: event_id.into(),
+            provider_message_id: provider_message_id.map(str::to_string),
+            conversation: ChannelConversation::direct("room-1"),
+            sender: ChannelSender {
+                sender_id: "user-9".into(),
+                display_label: None,
+                is_self,
+                is_bot: false,
+            },
+            text: "did the deploy finish?".into(),
+            attachments: Vec::new(),
+            reply_to_provider_id: None,
+            mentions_self: false,
+            received_at_ms: NOW,
+            metadata: Default::default(),
+        }
+    }
+
+    fn ignored_or_run(accepted: &ChannelAcceptance) -> &'static str {
+        match accepted {
+            ChannelAcceptance::Run { .. } => "run",
+            ChannelAcceptance::Ignore { .. } => "ignored",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn a_message_the_host_recorded_sending_is_suppressed_before_anything_runs() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        store
+            .record_outbound_echo("acct-1", "room-1", None, "m-42", "out-1", NOW)
+            .expect("the host records what it sent");
+
+        // `is_self: false` — the guest says this is somebody else's message.
+        // The host's own ledger says otherwise, and the host wins.
+        let accepted = plan(&mut store, &extension_inbound("evt-1", Some("m-42"), false));
+        assert_eq!(ignored_or_run(&accepted), "ignored");
+        assert_eq!(ignored_reason(&accepted), IgnoreReason::OwnMessage);
+
+        // And a different id in the same conversation is an ordinary message.
+        let other = plan(&mut store, &extension_inbound("evt-2", Some("m-43"), false));
+        assert_eq!(
+            ignored_or_run(&other),
+            "run",
+            "only the id the host actually sent is suppressed"
+        );
+    }
+
+    #[test]
+    fn suppression_survives_a_restart_because_the_ledger_is_durable() {
+        // Derived from `temp_dir` rather than written as a POSIX path: this
+        // test runs on Windows too, where a Unix-absolute path is relative.
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-echo-restart-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let paths = super::super::store::DaemonPaths::under(&root);
+
+        {
+            let mut store = DaemonStore::open(&paths).expect("open");
+            seed_extension_account(&mut store);
+            store
+                .record_outbound_echo("acct-1", "room-1", None, "m-42", "out-1", NOW)
+                .expect("recorded");
+        } // The daemon exits here: every handle is dropped.
+
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        let accepted = plan(&mut store, &extension_inbound("evt-1", Some("m-42"), false));
+        assert_eq!(
+            ignored_reason(&accepted),
+            IgnoreReason::OwnMessage,
+            "the provider echoed our message back after a restart and it was still recognized"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same helper as `extension_store`, against a store that already
+    /// exists — used by the restart test, which has to reopen a file rather
+    /// than build a fresh in-memory database.
+    fn seed_extension_account(store: &mut DaemonStore) {
+        store
+            .upsert_channel_account(&ChannelAccountRecord {
+                account_id: "acct-1".into(),
+                kind: ChannelKind::Extension,
+                label: "Fixture channel".into(),
+                enabled: true,
+                non_secret_config: serde_json::json!({
+                    "extension_id": "dev.example.chat",
+                    "capability_id": "room",
+                    "echo_correlation": "provider_message_id",
+                }),
+                credential_ref: None,
+                access_policy: open_policy(),
+                health: ChannelHealth::connected(NOW, None),
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("account");
+        store
+            .insert_channel_route(&ChannelRoute {
+                route_id: "route-1".into(),
+                scope: RouteScope::account("acct-1"),
+                target: RouteTarget::new("chat"),
+                enabled: true,
+                created_at_ms: NOW,
+                updated_at_ms: NOW,
+            })
+            .expect("route");
+    }
+
+    #[test]
+    fn one_conversations_message_id_never_matches_another_conversation() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        store
+            .record_outbound_echo("acct-1", "room-1", None, "m-42", "out-1", NOW)
+            .expect("recorded");
+
+        // Same id, different room. Providers only promise uniqueness within a
+        // conversation, so a bare id match would suppress a real message.
+        let mut elsewhere = extension_inbound("evt-1", Some("m-42"), false);
+        elsewhere.conversation = ChannelConversation::direct("room-2");
+        assert_eq!(ignored_or_run(&plan(&mut store, &elsewhere)), "run");
+
+        // And the same again for a thread inside the same room.
+        let mut threaded = extension_inbound("evt-2", Some("m-42"), false);
+        threaded.conversation.thread_id = Some("thread-5".into());
+        assert_eq!(ignored_or_run(&plan(&mut store, &threaded)), "run");
+
+        // A second account is a second world, even with the same id and room.
+        assert!(
+            !store
+                .is_own_outbound_echo("acct-other", "room-1", None, "m-42")
+                .expect("query"),
+            "the ledger is scoped by account"
+        );
+    }
+
+    #[test]
+    fn a_guests_claim_to_be_us_neither_grants_anything_nor_reaches_past_the_gate() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        // Nothing in the ledger, and the guest says the message is ours. It is
+        // dropped — which is the safe direction, and is all this flag can ever
+        // do. What matters is that it is *not* what the guarantee rests on: the
+        // test above proves suppression works with the flag set to false.
+        let accepted = plan(&mut store, &extension_inbound("evt-1", Some("m-1"), true));
+        assert_eq!(ignored_reason(&accepted), IgnoreReason::OwnMessage);
+        // No route resolved, no turn queued, no session bound: an inbound
+        // message that claims to be from us reaches exactly as far as the gate.
+        assert_eq!(ignored_or_run(&accepted), "ignored");
+    }
+
+    #[test]
+    fn an_account_that_cannot_correlate_is_held_to_a_narrower_policy_than_it_stores() {
+        // Stored: answer anybody, in any group, always. Declared: no way to
+        // recognize its own messages. The clamp is what makes the combination
+        // non-looping, and it has to happen at the ingress rather than only in
+        // the settings form — an account configured before this rule existed
+        // has the stored value and never passes through the form again.
+        let mut store = extension_store(open_policy(), "unsupported");
+        let stored = store
+            .channel_account("acct-1")
+            .expect("read")
+            .expect("account");
+        assert!(stored.access_policy.unsafe_without_echo_correlation());
+
+        let stranger = plan(&mut store, &extension_inbound("evt-1", None, false));
+        assert_eq!(
+            ignored_reason(&stranger),
+            IgnoreReason::SenderNotAllowed,
+            "Open was clamped to an approved-senders-only inbox"
+        );
+
+        // A group message from an unapproved sender is refused for the same
+        // reason, and an approved one still has to be addressed.
+        let mut group = extension_inbound("evt-2", None, false);
+        group.conversation = ChannelConversation::group("room-9");
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &group)),
+            IgnoreReason::SenderNotAllowed
+        );
+    }
+
+    #[test]
+    fn an_account_that_declares_nothing_is_treated_as_unable_to_correlate() {
+        // The compatibility case: an extension installed before this contract
+        // existed. Absent must read as unproven, because reading it as safe is
+        // exactly how a loop would ship.
+        let mut store = extension_store(open_policy(), "");
+        assert_eq!(
+            ignored_reason(&plan(&mut store, &extension_inbound("evt-1", None, false))),
+            IgnoreReason::SenderNotAllowed
+        );
+    }
+
+    #[test]
+    fn a_built_in_provider_is_unaffected_by_any_of_this() {
+        // The 13 shipped adapters are host code holding the credential, so
+        // their own sender determination is the host's. Nothing about them
+        // narrows, and no ledger lookup is required for them to work.
+        let mut store = store_with_account(open_policy());
+        assert_eq!(
+            ignored_or_run(&plan(&mut store, &dm("ship it", "1"))),
+            "run"
+        );
+    }
+
+    #[test]
+    fn the_ledger_is_bounded_by_age_and_by_rows_per_account() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        let old = NOW - DaemonStore::ECHO_RETENTION_MS - 1;
+        store
+            .record_outbound_echo("acct-1", "room-1", None, "m-old", "out-old", old)
+            .expect("recorded");
+        store
+            .record_outbound_echo("acct-1", "room-1", None, "m-new", "out-new", NOW)
+            .expect("recorded");
+
+        assert_eq!(store.prune_outbound_echo(NOW).expect("prune"), 1);
+        assert!(!store
+            .is_own_outbound_echo("acct-1", "room-1", None, "m-old")
+            .expect("query"));
+        assert!(store
+            .is_own_outbound_echo("acct-1", "room-1", None, "m-new")
+            .expect("query"));
+
+        // And the count bound, which does not depend on the clock at all.
+        for at in 0..(DaemonStore::ECHO_MAX_ROWS_PER_ACCOUNT + 10) {
+            store
+                .record_outbound_echo(
+                    "acct-1",
+                    "room-2",
+                    None,
+                    &format!("bulk-{at}"),
+                    "out-bulk",
+                    NOW + at as i64,
+                )
+                .expect("recorded");
+        }
+        store.prune_outbound_echo(NOW).expect("prune");
+        assert!(
+            store.outbound_echo_count("acct-1").expect("count")
+                <= DaemonStore::ECHO_MAX_ROWS_PER_ACCOUNT as u32,
+            "an account that sends forever does not grow the database forever"
         );
     }
 }

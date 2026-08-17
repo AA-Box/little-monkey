@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, ConversationKind, InboundTransport, OutboundMessage,
@@ -331,6 +332,7 @@ impl ChannelAdapter for TelegramAdapter {
             // sendMessage, and no delivery/read receipts are polled here.
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
         }
     }
 
@@ -816,6 +818,7 @@ fn normalize_update(
         account_id: String::new(),
         kind: ChannelKind::Telegram,
         provider_event_id: update.update_id.to_string(),
+        provider_message_id: None,
         conversation,
         sender,
         text,
@@ -1233,6 +1236,7 @@ mod tests {
             account_id: "acct-tg".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-7"),
             sender: ChannelSender::new("user-3"),
             text: String::new(),
@@ -1290,6 +1294,7 @@ mod tests {
             account_id: "acct-tg".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-7"),
             sender: ChannelSender::new("user-3"),
             text: "look".into(),

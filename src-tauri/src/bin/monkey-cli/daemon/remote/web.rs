@@ -636,6 +636,55 @@ mod tests {
              runner keys a turn on"
         );
 
+        // The other direction, and the one the fixture cannot cover: the client
+        // has to *recognise* the frame that tells it a turn is durable, because
+        // that frame is the only thing it deletes a recording on. A client that
+        // ignored it would hold every utterance until the TTL and offer to
+        // re-send turns that had already run.
+        //
+        // The name is taken from a real serialized frame rather than typed as a
+        // literal, so renaming the variant fails here instead of silently
+        // leaving the client listening for a frame that no longer exists.
+        let accepted = serde_json::to_value(crate::daemon::remote::protocol::TalkServerFrame {
+            protocol_version: crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION,
+            session_id: "session-one".to_string(),
+            session_generation: "aBcDeFgHiJkLmNoPqRsTuVwX".to_string(),
+            frame_sequence: 1,
+            kind: crate::daemon::remote::protocol::TalkServerFrameKind::TurnAccepted {
+                utterance_id: "utt-1".to_string(),
+                run_id: "run-1".to_string(),
+            },
+        })
+        .expect("a server frame serializes");
+        let accepted_type = accepted
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .expect("a tagged frame names its type");
+        assert!(
+            javascript.contains(&format!("case \"{accepted_type}\":")),
+            "the client must handle the '{accepted_type}' frame; without it a recording is never \
+             released and every reconnect offers to re-send a turn that already ran"
+        );
+        // And the two fields it reads off that frame.
+        for field in ["utterance_id", "run_id"] {
+            assert!(
+                accepted.get(field).is_some(),
+                "the acknowledgement must carry {field}"
+            );
+            assert!(
+                javascript.contains(&format!("frame.{field}")),
+                "the client must read {field} from the acknowledgement"
+            );
+        }
+        // Both sides speak the same version. Two constants, one number.
+        assert!(
+            protocol.contains(&format!(
+                "export const TALK_PROTOCOL_VERSION = {};",
+                crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION
+            )),
+            "the shipped client must declare the protocol version the runner accepts"
+        );
+
         // Local detection, and only a finished utterance leaves the device.
         assert!(protocol.contains("export function createTalkDetector("));
         assert!(protocol.contains("noiseFloor = noiseFloor * 0.96"));
@@ -797,7 +846,16 @@ mod tests {
         // A dedicated object store: artifact bytes must not ride in the profile
         // record, which is rewritten on every sequence allocation.
         assert!(javascript.contains("const JOURNAL_STORE = \"device_command_journal\""));
-        assert!(javascript.contains("const DB_VERSION = 2"));
+        // v3 adds the Talk store beside it. What matters is that the upgrade
+        // stays additive — a device that already holds a pairing and a command
+        // journal must keep both, or every paired phone has to be paired again.
+        assert!(javascript.contains("const DB_VERSION = 3"));
+        assert!(javascript.contains("const TALK_STORE = \"talk_utterance_journal\""));
+        assert!(
+            javascript
+                .contains("journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE, TALK_STORE)"),
+            "one upgrade function creates whichever stores are absent and touches nothing else"
+        );
         // One executor per profile, holding the lock across the whole loop —
         // not merely around each signed request.
         assert!(javascript.contains("const EXECUTOR_LOCK = \"little-monkey-device-executor-v1\""));

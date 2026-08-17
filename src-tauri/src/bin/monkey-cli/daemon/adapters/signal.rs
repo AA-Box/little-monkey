@@ -50,6 +50,7 @@ use crate::daemon::channel_adapter::{
     load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
     LoadedAttachment, MAX_ATTACHMENT_BYTES,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -495,6 +496,7 @@ fn parse_event(line: &str, account: &str) -> Option<ChannelEnvelope> {
         // Deterministic, never random: the durable-event dedupe key needs
         // the same line to always produce the same id.
         provider_event_id: format!("{source}:{timestamp}"),
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id: if is_self { account.to_string() } else { source },
@@ -584,6 +586,7 @@ impl ChannelAdapter for SignalAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
         }
     }
 
@@ -938,6 +941,7 @@ mod tests {
                 pending_pairings: 0,
                 automated_reply_depth: 0,
                 consecutive_machine_messages: 0,
+                own_outbound_echo: false,
                 now_ms: 1_700_000_006_000,
             },
             || "UNUSED12".to_string(),

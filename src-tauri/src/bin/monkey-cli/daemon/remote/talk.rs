@@ -160,6 +160,12 @@ pub struct TalkSessionLatency {
 pub struct TalkSessionReport {
     pub utterances: u32,
     pub turns_submitted: u32,
+    /// Utterances the device was told it may stop holding, because the turn
+    /// exists durably. Counted where `turns_submitted` is not: that one is
+    /// raised when an answer has finished streaming, so the gap between them is
+    /// the population this whole recovery path exists for — turns that were
+    /// accepted and whose answer the device never saw.
+    pub accepted: u32,
     pub interruptions: u32,
     pub spoken_chunks: u32,
     /// Errors reported to the device. A misconfigured speech backend ends a
@@ -779,6 +785,21 @@ impl Session {
                 return self.fail_turn(socket, "turn_refused", &error, true).await;
             }
         };
+        // The device has been holding this recording since before the socket
+        // existed, and this is the first moment it is safe to let go of: the
+        // user row is written and the job is queued under `client_key`, so a
+        // crash from here on is recovered by the queue rather than by somebody
+        // saying it again. Emitted before the answer streams, because the
+        // answer is exactly what may not arrive.
+        self.report.accepted += 1;
+        self.emit(
+            socket,
+            TalkServerFrameKind::TurnAccepted {
+                utterance_id,
+                run_id: run_id.clone(),
+            },
+        )
+        .await?;
         let outcome = self
             .stream_answer(socket, speech, turns, &run_id, turn_started)
             .await;
@@ -1335,6 +1356,16 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// A queue that will not take the turn — the case where nothing durable
+        /// exists and the device must keep its recording.
+        fn refusing() -> Self {
+            Self {
+                refuse: true,
+                granted: Arc::new(Mutex::new(true)),
+                ..Self::default()
+            }
+        }
     }
 
     impl TalkTurns for FakeTurns {
@@ -1556,6 +1587,153 @@ mod tests {
             submitted[0].0.contains("utt-a1b2c3"),
             "the key is the device's own name for the utterance: {}",
             submitted[0].0
+        );
+    }
+
+    /// Pull every acceptance out of what the runner sent, as `(utterance,
+    /// run)`.
+    fn acceptances(frames: &[TalkServerFrame]) -> Vec<(String, String)> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.kind {
+                TalkServerFrameKind::TurnAccepted {
+                    utterance_id,
+                    run_id,
+                } => Some((utterance_id.clone(), run_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The frame a device deletes a recording on, and *where* it appears.
+    ///
+    /// Position is the assertion, not decoration. Anything emitted before the
+    /// turn is durable would be an acknowledgement of a process rather than of
+    /// a row, and a device that acted on it would drop the only copy of what
+    /// somebody said the moment the runner crashed.
+    #[tokio::test]
+    async fn a_durably_accepted_utterance_is_acknowledged_before_its_answer() {
+        let turns = FakeTurns::answering(&["The deploy finished."]);
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio_named(&identity, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let sent = socket.sent.clone();
+        let report = run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            identity,
+        )
+        .await;
+
+        let frames = sent.lock().unwrap().clone();
+        assert_eq!(
+            acceptances(&frames),
+            vec![(
+                "utt-a1b2c3".to_string(),
+                turns.submitted.lock().unwrap()[0].0.clone()
+            )]
+            .into_iter()
+            .map(|(utterance, key)| (utterance, format!("run-{key}")))
+            .collect::<Vec<_>>(),
+            "the acknowledgement names the utterance and the run it became"
+        );
+        assert_eq!(report.accepted, 1);
+
+        let accepted_at = frames
+            .iter()
+            .position(|frame| matches!(frame.kind, TalkServerFrameKind::TurnAccepted { .. }))
+            .expect("an acceptance was sent");
+        let first_answer = frames
+            .iter()
+            .position(|frame| matches!(frame.kind, TalkServerFrameKind::AssistantDelta { .. }))
+            .expect("the answer streamed");
+        assert!(
+            accepted_at < first_answer,
+            "a device must be free to drop its recording before the answer, because the \
+             answer is exactly the part that may never arrive"
+        );
+    }
+
+    /// The other half of the rule: a turn that never became durable is never
+    /// acknowledged, so the device keeps the audio and can offer to send it
+    /// again.
+    #[tokio::test]
+    async fn a_refused_turn_is_never_acknowledged() {
+        let turns = FakeTurns::refusing();
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio_named(&identity, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let sent = socket.sent.clone();
+        let report =
+            run_talk_session(&mut socket, &FakeSpeech::new("anything"), &turns, identity).await;
+
+        assert_eq!(report.accepted, 0);
+        assert!(
+            acceptances(&sent.lock().unwrap()).is_empty(),
+            "nothing durable exists, so nothing may tell the device to let go of the audio"
+        );
+        assert!(
+            sent.lock().unwrap().iter().any(|frame| matches!(
+                &frame.kind,
+                TalkServerFrameKind::Error { code, retryable, .. }
+                    if code == "turn_refused" && *retryable
+            )),
+            "and the refusal is retryable, which is what makes the retry offer honest"
+        );
+    }
+
+    /// Re-sending across a restart: one run, and an acknowledgement each time.
+    ///
+    /// The second acknowledgement is the piece that makes recovery terminate. A
+    /// device that re-sent and heard nothing back would keep the recording and
+    /// keep offering to send it, forever, against a turn that has been finished
+    /// for hours.
+    #[tokio::test]
+    async fn re_sending_after_a_restart_is_acknowledged_with_the_same_run() {
+        let turns = FakeTurns::answering(&["The deploy finished."]);
+
+        let first = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&first),
+            audio_named(&first, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let first_sent = socket.sent.clone();
+        run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            first.clone(),
+        )
+        .await;
+
+        let mut after_restart = identity();
+        after_restart.session_id = first.session_id.clone();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&after_restart),
+            audio_named(&after_restart, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let second_sent = socket.sent.clone();
+        run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            after_restart,
+        )
+        .await;
+
+        let before = acceptances(&first_sent.lock().unwrap());
+        let after = acceptances(&second_sent.lock().unwrap());
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            before, after,
+            "same utterance, same run -- the retry landed on the turn the first attempt made \
+             rather than starting a second one"
         );
     }
 

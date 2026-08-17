@@ -55,6 +55,27 @@ export interface ChannelAccount {
    * correct. `last_reason` is the verifier's own code, never a body or header.
    */
   callback_rejections: { count: number; last_reason: string | null; last_at_ms: number | null };
+  /**
+   * How this machine recognises a message it sent coming back.
+   *
+   * `host_adapter` for every built-in provider: the code that reads the
+   * provider's payload is the host's own, holding the account's credential.
+   * An extension-backed account is the exception — the code that decides is a
+   * sandboxed guest — so it must declare `provider_message_id` and supply the
+   * provider's own message id, which the host matches against what it recorded
+   * sending. `unsupported` means it cannot, and is what an extension built
+   * before this contract existed reads as.
+   */
+  echo_correlation: "host_adapter" | "provider_message_id" | "unsupported";
+  /**
+   * True when the stored reply policy is *not* the one in force.
+   *
+   * An account that cannot recognise its own echo may not answer anyone, or
+   * answer every message in a group: both can talk to themselves forever. The
+   * ingress narrows the policy rather than refusing traffic, so this flag is
+   * the only way the panel can say the stored setting is not what is running.
+   */
+  reply_policy_restricted: boolean;
   created_at_ms: number;
   updated_at_ms: number;
 }
@@ -413,6 +434,103 @@ export const channelsCallbackUrl = (accountId: string) =>
   invoke<ChannelCallback>("channels_callback_url", { accountId });
 export const channelsSetPublicUrl = (url: string | null) =>
   invoke<void>("channels_set_public_url", { url });
+
+/** Mirrors the Rust `callback_exposure::ExposureMode` exactly. */
+export type ExposureMode = "manual" | "managed_tunnel";
+
+/** Mirrors the Rust `callback_exposure::TunnelProvider` exactly. A closed set:
+ * the daemon builds the argv from its own template and the operator supplies a
+ * validated path, so this is never a command. */
+export type TunnelProvider = "cloudflared";
+
+/** Mirrors the Rust `callback_exposure::ExposureState` exactly.
+ *
+ * Every value is a different thing to do about it, which is why they are not
+ * collapsed into "ok" and "broken": a missing helper, a missing credential and
+ * a rejected credential need three different sentences. Only `connected` means
+ * a provider posting to the public URL would reach this machine. */
+export type ExposureState =
+  | "not_configured"
+  | "helper_missing"
+  | "credential_missing"
+  | "connecting"
+  | "connected"
+  | "degraded"
+  | "reconnecting"
+  | "authentication_failed"
+  | "public_url_unavailable"
+  | "stopped";
+
+/** Mirrors the Rust `callback_exposure::ExposureStatus` exactly.
+ *
+ * Note what is not on it: no token, no argv, no pid. `credentialStored` is a
+ * boolean about whether the keychain holds something, which is the most the
+ * frontend is ever told about a secret. */
+export interface ExposureStatus {
+  mode: ExposureMode;
+  provider?: TunnelProvider;
+  state: ExposureState;
+  publicBase?: string;
+  credentialStored: boolean;
+  executable?: string;
+  lastError?: string;
+  restarts: number;
+  sinceMs?: number;
+}
+
+export const channelsExposureStatus = () =>
+  invoke<ExposureStatus>("channels_exposure_status");
+export const channelsExposureManual = () => invoke<void>("channels_exposure_manual");
+export const channelsExposureSetTunnel = (
+  provider: TunnelProvider,
+  hostname: string,
+  executable: string,
+  metricsPort: number | null,
+) =>
+  invoke<void>("channels_exposure_set_tunnel", {
+    provider,
+    hostname,
+    executable,
+    metricsPort,
+  });
+/** The token goes straight to the OS keychain. It is never stored in React
+ * state beyond the keystroke that submits it, and never comes back. */
+export const channelsExposureSetToken = (token: string) =>
+  invoke<void>("channels_exposure_set_token", { token });
+export const channelsExposureClearToken = () => invoke<void>("channels_exposure_clear_token");
+
+/** One sentence per state, in the operator's terms rather than the daemon's.
+ *
+ * A pure function so a test can assert every state is covered — a state that
+ * fell through to a default would render as a blank line exactly when
+ * something was wrong. */
+export function describeExposure(status: ExposureStatus): { tone: "ok" | "warn" | "bad"; text: string } {
+  switch (status.state) {
+    case "connected":
+      return { tone: "ok", text: "Connected. Deliveries to the public URL reach this machine." };
+    case "connecting":
+      return { tone: "warn", text: "Starting your tunnel…" };
+    case "reconnecting":
+      return {
+        tone: "warn",
+        text: `Reconnecting after ${status.restarts} restart${status.restarts === 1 ? "" : "s"}.`,
+      };
+    case "degraded":
+      return { tone: "warn", text: "Running, but it has not reported a live connection." };
+    case "helper_missing":
+      return { tone: "bad", text: "The tunnel client is not at the path given. Install it, or correct the path." };
+    case "credential_missing":
+      return { tone: "bad", text: "No tunnel token is stored yet." };
+    case "authentication_failed":
+      return { tone: "bad", text: "Your tunnel provider rejected the stored token. Issue a new one." };
+    case "public_url_unavailable":
+      return { tone: "bad", text: "No hostname is set, so there is no URL to give a provider." };
+    case "stopped":
+      return { tone: "warn", text: "Stopped. Nothing is exposing this machine." };
+    case "not_configured":
+      return { tone: "ok", text: "You publish the URL for this machine yourself." };
+  }
+}
 
 /** Whether this provider needs the operator to expose a public callback URL
  * on the channels listener. Setup asks for one only when it is genuinely

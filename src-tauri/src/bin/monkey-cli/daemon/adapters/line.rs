@@ -33,6 +33,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -171,6 +172,7 @@ impl ChannelAdapter for LineAdapter {
             // retried send takes.
             supports_idempotency_key: true,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Line, InboundTransport::Webhook)
         }
     }
@@ -605,6 +607,7 @@ fn normalize_event(
         account_id: account_id.to_string(),
         kind: ChannelKind::Line,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender: ChannelSender::new(sender_id),
         text,

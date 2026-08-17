@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     ChannelHealth, ChannelKind, InboundTransport, OutboundMessage, ProviderCapabilities,
     SendOutcome,
@@ -119,22 +120,25 @@ pub(crate) fn media_limit(media_type: &str) -> Option<usize> {
 impl SmsAdapter {
     /// Build the adapter for a telephony account. `secret` is that account's
     /// carrier credential, already read from the keychain by the caller.
+    ///
+    /// `public_base_url` is the *resolved* exposure for this number — its own
+    /// if it has one, otherwise the machine's. Both the carrier's signature
+    /// check and the outbound MMS links this adapter mints are built from it,
+    /// so it may not be read from the record here.
     pub(crate) fn new(
         account: &TelecomAccountRecord,
         secret: String,
         app_data_dir: std::path::PathBuf,
+        public_base_url: Option<String>,
     ) -> Result<Self, String> {
-        let media = account
-            .public_base_url
-            .clone()
-            .map(|public_base_url| MediaSigning {
-                account_id: account.account_id.clone(),
-                secret: secret.clone(),
-                public_base_url,
-                app_data_dir,
-            });
+        let media = public_base_url.clone().map(|public_base_url| MediaSigning {
+            account_id: account.account_id.clone(),
+            secret: secret.clone(),
+            public_base_url,
+            app_data_dir,
+        });
         Ok(Self {
-            carrier: provider_for_account(account, secret)?,
+            carrier: provider_for_account(account, secret, public_base_url)?,
             media,
         })
     }
@@ -238,6 +242,7 @@ impl ChannelAdapter for SmsAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: true,
             supports_delivery_receipts: true,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Sms, InboundTransport::Webhook)
         }
     }
@@ -407,8 +412,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_real_account_builds_its_configured_carrier() {
-        let adapter = SmsAdapter::new(&account(), "shared-secret".into(), std::env::temp_dir())
-            .expect("adapter");
+        let adapter = SmsAdapter::new(
+            &account(),
+            "shared-secret".into(),
+            std::env::temp_dir(),
+            account().public_base_url,
+        )
+        .expect("adapter");
 
         assert_eq!(adapter.kind(), ChannelKind::Sms);
         assert!(adapter.capabilities().supports_idempotency_key);
@@ -428,8 +438,13 @@ mod tests {
             .expect("put");
         let mut with_url = account();
         with_url.public_base_url = Some("https://calls.example.test".into());
-        let adapter =
-            SmsAdapter::new(&with_url, "carrier-secret".into(), root.clone()).expect("adapter");
+        let adapter = SmsAdapter::new(
+            &with_url,
+            "carrier-secret".into(),
+            root.clone(),
+            with_url.public_base_url.clone(),
+        )
+        .expect("adapter");
         let mut message = reply("here it is");
         message
             .attachments
@@ -509,8 +524,13 @@ mod tests {
         let blob = store.put(b"not a media file at all").expect("put");
         let mut with_url = account();
         with_url.public_base_url = Some("https://calls.example.test".into());
-        let adapter =
-            SmsAdapter::new(&with_url, "carrier-secret".into(), root.clone()).expect("adapter");
+        let adapter = SmsAdapter::new(
+            &with_url,
+            "carrier-secret".into(),
+            root.clone(),
+            with_url.public_base_url.clone(),
+        )
+        .expect("adapter");
         let mut message = reply("look at this");
         message
             .attachments
@@ -533,8 +553,13 @@ mod tests {
     async fn a_reply_carrying_several_attachments_is_refused_rather_than_billed() {
         let mut with_url = account();
         with_url.public_base_url = Some("https://calls.example.test".into());
-        let adapter =
-            SmsAdapter::new(&with_url, "secret".into(), std::env::temp_dir()).expect("adapter");
+        let adapter = SmsAdapter::new(
+            &with_url,
+            "secret".into(),
+            std::env::temp_dir(),
+            with_url.public_base_url.clone(),
+        )
+        .expect("adapter");
         let mut message = reply("two things");
         for _ in 0..2 {
             message
@@ -555,8 +580,13 @@ mod tests {
     async fn a_number_with_no_public_url_refuses_the_attachment_rather_than_dropping_it() {
         let mut without_url = account();
         without_url.public_base_url = None;
-        let adapter =
-            SmsAdapter::new(&without_url, "secret".into(), std::env::temp_dir()).expect("adapter");
+        let adapter = SmsAdapter::new(
+            &without_url,
+            "secret".into(),
+            std::env::temp_dir(),
+            without_url.public_base_url.clone(),
+        )
+        .expect("adapter");
         let mut message = reply("here it is");
         message
             .attachments
@@ -577,8 +607,13 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_is_ever_polled() {
-        let adapter = SmsAdapter::new(&account(), "shared-secret".into(), std::env::temp_dir())
-            .expect("adapter");
+        let adapter = SmsAdapter::new(
+            &account(),
+            "shared-secret".into(),
+            std::env::temp_dir(),
+            account().public_base_url,
+        )
+        .expect("adapter");
 
         let batch = adapter.poll(None).await.expect("poll");
 

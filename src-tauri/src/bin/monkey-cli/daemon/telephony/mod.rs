@@ -121,9 +121,20 @@ pub fn build_provider(
 /// channel adapter's does. Every caller that has an account row wants exactly
 /// this mapping, so it lives here rather than being spelled out again at each
 /// call site.
+/// Build a carrier client for one number.
+///
+/// `public_base_url` is passed in rather than read off the account, and that is
+/// deliberate. It is the URL Twilio and Plivo *sign*, so a verifier that
+/// rebuilt a different one rejects every genuine callback — and a number with
+/// no URL of its own now inherits the machine's exposure, which the record
+/// alone does not know about. Making it a parameter means every call site has
+/// to have resolved it (see
+/// [`DaemonStore::telecom_callback_base`](super::telecom_store)), rather than
+/// silently getting `None` from a record that was correct yesterday.
 pub fn provider_for_account(
     account: &super::telecom_store::TelecomAccountRecord,
     secret: String,
+    public_base_url: Option<String>,
 ) -> Result<std::sync::Arc<dyn TelecomProvider>, String> {
     build_provider(TelecomConfig {
         account_id: account.account_id.clone(),
@@ -131,7 +142,7 @@ pub fn provider_for_account(
         carrier_account_id: account.carrier_account_id.clone(),
         from_number: account.from_number.clone(),
         secret,
-        public_base_url: account.public_base_url.clone(),
+        public_base_url,
         webhook_public_key: account
             .non_secret_config
             .get("webhook_public_key")

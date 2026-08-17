@@ -78,6 +78,7 @@
 //! written anywhere.
 
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -699,6 +700,7 @@ impl ChannelAdapter for TeamsAdapter {
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Teams, InboundTransport::Webhook)
         }
     }
@@ -1112,6 +1114,7 @@ fn normalize_activity(
         account_id: account_id.to_string(),
         kind: ChannelKind::Teams,
         provider_event_id,
+        provider_message_id: None,
         conversation,
         sender,
         text,

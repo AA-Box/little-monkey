@@ -523,6 +523,7 @@ fn normalize_twilio_params(
             account_id: String::new(),
             kind: ChannelKind::Sms,
             provider_event_id: message_sid.clone(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct(from.clone()),
             sender: ChannelSender::new(from),
             text,

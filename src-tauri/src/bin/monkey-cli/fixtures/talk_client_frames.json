@@ -1,6 +1,6 @@
 [
   {
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "mobile-device-Ab_3-xY",
     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
     "frame_sequence": 1,
@@ -10,7 +10,7 @@
     "channels": 1
   },
   {
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "mobile-device-Ab_3-xY",
     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
     "frame_sequence": 2,
@@ -21,7 +21,7 @@
     "upload_ms": 96
   },
   {
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "mobile-device-Ab_3-xY",
     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
     "frame_sequence": 3,
@@ -33,7 +33,7 @@
     "utterance_id": "utt-fixed-for-tests"
   },
   {
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "mobile-device-Ab_3-xY",
     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
     "frame_sequence": 4,
@@ -45,7 +45,7 @@
     "utterance_id": "utt-fixed-for-tests"
   },
   {
-    "protocol_version": 2,
+    "protocol_version": 3,
     "session_id": "mobile-device-Ab_3-xY",
     "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
     "frame_sequence": 5,

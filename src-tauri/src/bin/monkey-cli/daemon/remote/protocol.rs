@@ -33,12 +33,26 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 /// identity here is what caused the duplicate-after-restart it was added to
 /// close, so accepting a frame without one would reintroduce it under a
 /// compatibility flag.
-pub const TALK_PROTOCOL_VERSION: u32 = 2;
+/// v3 adds [`TalkServerFrameKind::TurnAccepted`], which is the *only* signal a
+/// device may delete a recording on.
+///
+/// It is a version rather than an additive frame, even though a v2 client's
+/// `switch` would ignore an unknown type harmlessly. The incompatibility runs
+/// the other way: a v3 client keeps every unacknowledged utterance and offers
+/// to re-send it, so against a runner that never emits the acknowledgement it
+/// would offer to re-send *every* turn — including ones already answered. That
+/// is exactly the "tell somebody to repeat what is already running" failure the
+/// journal exists to prevent, so the two sides are pinned to each other.
+pub const TALK_PROTOCOL_VERSION: u32 = 3;
 
 /// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
 /// missing utterance id — so a client speaking it can be told precisely what is
 /// wrong rather than being handed an opaque refusal.
 const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
+
+/// The version that names its utterances but has nowhere to hear that one was
+/// durably accepted. Refused by version for the reason above.
+const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1856,6 +1870,31 @@ pub enum TalkServerFrameKind {
     State {
         state: TalkState,
     },
+    /// One utterance now exists as a durable turn, and the device may delete
+    /// the recording it has been holding.
+    ///
+    /// # Why this is not "we received your audio"
+    ///
+    /// Three different moments could plausibly acknowledge an utterance, and
+    /// only one of them is safe to forget a recording on:
+    ///
+    ///   audio received  ≠  transcription completed  ≠  durable turn accepted
+    ///
+    /// A crash after the first two leaves nothing: no row, no job, no run. A
+    /// device that had deleted its recording would have lost what somebody
+    /// said, with no way to know it had. This frame is emitted only after
+    /// [`TalkTurns::submit`](super::talk::TalkTurns::submit) has returned — the
+    /// user row is written and the job is queued under the utterance's own
+    /// idempotency key — so from here on a re-send is not merely safe, it is
+    /// unnecessary: it would collapse onto `run_id`.
+    ///
+    /// `run_id` is carried so a device that loses the socket before the answer
+    /// arrives can recover through the durable conversation rather than by
+    /// speaking again.
+    TurnAccepted {
+        utterance_id: String,
+        run_id: String,
+    },
     Transcript {
         text: String,
         is_final: bool,
@@ -1885,6 +1924,17 @@ impl TalkServerFrame {
         )?;
         match &self.kind {
             TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::TurnAccepted {
+                utterance_id,
+                run_id,
+            } => {
+                validate_talk_utterance_id(utterance_id)?;
+                // `validate_id` rather than the stricter Talk token alphabet: a
+                // run id is minted by the queue, not by this protocol, and it
+                // may carry `.` or `:`. Refusing one here would turn a
+                // successfully accepted turn into a dead socket.
+                validate_id(run_id)?;
+            }
             TalkServerFrameKind::Transcript { text, .. }
             | TalkServerFrameKind::AssistantDelta { text } => {
                 validate_talk_text("Talk text", text, MAX_TALK_TEXT_BYTES)?;
@@ -1967,7 +2017,10 @@ fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
     // A page that was already open when this runner was upgraded. Named
     // exactly, because the fix is one the person can perform and an opaque
     // "unsupported version" would not tell them to.
-    if protocol_version == TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID {
+    if matches!(
+        protocol_version,
+        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+    ) {
         return Err(
             "This Talk client is from an older version of the app; reload the page to continue"
                 .to_string(),

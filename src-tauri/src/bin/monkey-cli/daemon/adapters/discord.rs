@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
@@ -541,6 +542,7 @@ impl ChannelAdapter for DiscordAdapter {
             supports_mention_metadata: true,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::Discord, InboundTransport::Socket)
         }
     }
@@ -1387,6 +1389,7 @@ fn normalize_message_create(
         account_id: account_id.to_string(),
         kind: ChannelKind::Discord,
         provider_event_id: id,
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id: author_id,

@@ -26,7 +26,8 @@ Concretely, that means:
   useless.
 - You bring your own carrier account for SMS and calls, and you pay that carrier
   directly.
-- You bring your own public URL for anything a provider delivers to. See
+- You bring your own public URL for anything a provider delivers to — either
+  one you publish, or a tunnel this app runs on your own tunnel account. See
   [Public callbacks](#public-callbacks-are-yours-to-expose).
 - You install helper programs (`signal-cli`, the iMessage helper) yourself and
   point the account at them; this app never downloads or bundles one.
@@ -80,18 +81,58 @@ freely and can only raise them so far.
 
 ### Loops
 
-An account never answers itself: our own echo is recognized and refused before
-any policy runs. An exchange between two machines is bounded twice — through the
-reply chain when the other side threads its replies, and through a budget of
-consecutive machine messages when it does not. Somebody speaking resets the
-budget, so a human conversation is never rate-limited by it.
+An account never answers itself, and for the twelve built-in providers that is
+the host's own conclusion: the code reading the provider's payload is this app's,
+holding the account's credential.
+
+A sandboxed extension speaking for a provider is the case that cannot work that
+way — the thing deciding is the thing being checked. So for those accounts the
+question is causal instead. Every message this app sends is remembered by the
+id the provider gave it, in that conversation; an inbound message carrying one
+of those ids is our own echo, whatever its envelope says about its sender. A
+guest cannot write that record, and a guest claiming a message is ours grants it
+nothing — the claim can only ever cause *fewer* runs.
+
+A transport that cannot supply stable provider message ids says so, and is held
+to a narrower reply policy for it: no open inbox, and no answering every message
+in a group. Both are the settings that can talk to themselves forever, and an
+account that cannot recognise its own voice may not hold either. The ledger is
+bounded by age and by rows per account, and holds no message text — it answers
+"did we send this", not "what did we say".
+
+An exchange between two machines is bounded twice more — through the reply chain
+when the other side threads its replies, and through a budget of consecutive
+machine messages when it does not. Somebody speaking resets the budget, so a
+human conversation is never rate-limited by it.
 
 ## Public callbacks are yours to expose
 
 WhatsApp, Teams, Google Chat, LINE and the carriers deliver by **posting to a
-URL**. That URL has to be reachable from the internet, and reaching it is
-something you arrange — a tunnel, a reverse proxy, your own domain. This app
-binds loopback and never opens a port to the world on its own.
+URL**. That URL has to be reachable from the internet, and this app binds
+loopback. There are two ways to bridge that, and both of them are yours:
+
+- **You publish it.** A reverse proxy, your own domain, a tunnel you run
+  yourself. Paste the address into Settings and this app composes the callback
+  URL under it.
+- **This app runs your tunnel.** You create a tunnel in your own Cloudflare
+  Zero Trust dashboard, add a public hostname, point it at this machine's
+  webhook port, and paste the tunnel's token here. The background service then
+  starts the `cloudflared` you installed, watches it, restarts it with a bound,
+  and reports what it is doing. The token goes to the OS keychain and travels
+  to the process in its environment, never on a command line where every other
+  process could read it.
+
+There is no relay in either case. No hostname, account, credential or endpoint
+here belongs to anybody but you, and a managed tunnel is your tunnel — this app
+supplies the supervision, not the address.
+
+A named tunnel specifically: a quick tunnel mints a fresh random hostname on
+every start, which cannot be pasted into a provider console and would break
+every callback signature the moment the process restarted. A backend that
+cannot hold a stable URL is not webhook exposure, so it is not offered.
+
+**The tunnel is transport.** It terminates at the same loopback listener a
+`curl` from this machine would reach, and nothing past that point changes.
 
 What it does guarantee about that endpoint:
 
@@ -100,7 +141,10 @@ What it does guarantee about that endpoint:
   verify earns no row.
 - Nothing reads `Host` or `X-Forwarded-*`. A provider whose signature covers the
   callback URL is given **your configured public base**, never a value from the
-  request, because a header is attacker-controlled.
+  request, because a header is attacker-controlled — and a tunnel sets all of
+  them. This is why the public base comes from the hostname you configured
+  rather than from anything the running tunnel reports: a verification URL that
+  moved when a process restarted would be one an attacker could move.
 - A refused delivery is counted against the account with its reason code — never
   the body, never a header, never the signature. That counter is the only
   symptom a rotated secret or a stale console URL has, and Security Doctor reads
@@ -157,10 +201,23 @@ An utterance is an ordinary durable turn keyed by a name the *device* gives it,
 so re-sending one lands on the run the first attempt made rather than starting a
 second. The runner cannot mint that name itself — its session identity is minted
 fresh with every ticket — which is why a closing audio frame that carries none is
-refused. The shipped client does not re-send: when the socket drops it ends the
-session and says so. The name makes a retransmission safe, not automatic. Wake-phrase and
-always-listening are off unless you turn them on, and Security Doctor reports
-both — and separately reports any path that would send audio off this machine.
+refused.
+
+The device keeps the recording until the runner says the turn exists durably,
+and only then. "We have your audio" and "we transcribed it" are both claims
+about a process a crash erases; the acknowledgement is about a row that survives
+one. If the connection drops first, the recording is still there and you are
+offered **Retry** or **Discard** — retrying sends the audio already captured,
+under its original name, so it collapses onto the run the first attempt made.
+Nothing re-opens the microphone on its own; resuming is a button. If the turn
+*was* accepted and only the answer was lost, it is not re-sent — it is already
+running, and the answer arrives in the conversation.
+
+What is held is bounded: eight recordings, 8 MiB each, 32 MiB together, a day.
+Nothing about it reaches a log, a support bundle or a diagnostic — there is no
+field for audio in any of them. Wake-phrase and always-listening are off unless
+you turn them on, and Security Doctor reports both — and separately reports any
+path that would send audio off this machine.
 
 ## Peers
 
@@ -182,9 +239,11 @@ origins, bounded resources, and no ambient authority. Unsigned or untrusted
 extensions, broad network origins, high-risk permissions, an incompatible host
 API and repeated traps are all Security Doctor findings.
 
-An extension's word about a sender is the extension's word — the host cannot
-verify it — which is why an extension-backed channel account is reported as
-unable to recognize its own echo.
+An extension's word about a sender is the extension's word, and the host does
+not rest anything on it. An extension-backed channel account recognises its own
+echo through the host's own record of what it sent (see [Loops](#loops)); a
+transport that cannot supply stable provider message ids is reported as such and
+is held to a narrower reply policy for it.
 
 ## Security Doctor
 
@@ -192,6 +251,12 @@ unable to recognize its own echo.
 checks over the same state. Neither contacts a model. The categories are
 storage, network, MCP, extensions, skills, isolation, browser and companion
 grants, voice, devices, channels, telephony and peers.
+
+Under channels it also reports how this machine is exposed: a webhook account
+waiting for deliveries with nowhere to receive them, a tunnel client that is not
+where the account says it is, a missing or rejected tunnel credential, a tunnel
+that will not settle, a stopped one while accounts still expect it, and a public
+callback base that is not HTTPS.
 
 ## Support bundles
 
@@ -239,6 +304,17 @@ therefore **not** claimed as verified here.
 - Extension sandbox confinement, capability enforcement and cancellation.
 - Every Security Doctor check, and the redaction guarantees of the support
   bundle.
+- Host-owned echo suppression for an extension-backed account: the outbound id
+  is recorded by the production send path, the inbound match suppresses before
+  any policy runs, it survives a restart, a different id or a different
+  conversation is unaffected, and the ledger is bounded.
+- The Talk pending-utterance journal and its bounds, and the acknowledgement
+  that is the only thing a recording is deleted on — including that a refused
+  turn is never acknowledged and a re-send lands on the same run.
+- Managed callback exposure: which piece is missing is named, the credential is
+  never on a command line or in a stored error, a failing tunnel client's own
+  words reach the operator, the public base survives a restart, and a spoofed
+  `X-Forwarded-*` cannot move the URL a carrier signature is verified against.
 
 ### Needs your own account, hardware or exposure to verify
 
@@ -250,6 +326,11 @@ silently when they are absent, and never bundles or defaults one.
 - Any provider against a real account: that the live service behaves as the
   adapter expects, and that your token has the scopes it needs.
 - A publicly reachable callback URL, and the provider console accepting it.
+- A real Cloudflare tunnel account: that `cloudflared` connects with your token,
+  that the hostname routes to this machine, and that a provider's delivery
+  actually arrives through it. The lifecycle, the readiness probe and the
+  refusals are all exercised against real child processes and real sockets; what
+  is not is a live tunnel to Cloudflare's edge.
 - Real SMS delivery, a real inbound call, real audio in both directions, and
   what your carrier actually charges.
 - A physical phone: pairing by camera, the OS permission prompts, push delivery

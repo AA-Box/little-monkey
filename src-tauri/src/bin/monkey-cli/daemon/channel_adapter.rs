@@ -26,6 +26,7 @@
 
 use super::channel_store::ChannelAccountRecord;
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentSource, ChannelAttachment, ChannelEnvelope, ChannelHealth, ChannelKind,
     DeliveryReceipt, HealthState, OutboundMessage, ProviderCapabilities, SendOutcome,
@@ -296,6 +297,36 @@ impl AttachmentLimits {
                 .clamp(1, CEILING_LISTED),
         }
     }
+}
+
+/// Whether the host can recognise its own echo on this account.
+///
+/// Every adapter this project ships is host code holding the account's
+/// credential, and each one already returns the provider's message id on send
+/// and carries it inbound — so for them this is a property of the build, not of
+/// a setting somebody could get wrong.
+///
+/// An extension-backed account is the exception, and the whole reason
+/// [`EchoCorrelation`] exists: the thing normalizing its messages is a
+/// sandboxed guest. The transport has to *declare* that it supplies stable
+/// provider message ids, and an extension that has not been updated declares
+/// nothing and is treated as unable to — which restricts what reply policy the
+/// account may run under.
+pub(crate) fn echo_correlation_for(
+    account: &crate::daemon::channel_store::ChannelAccountRecord,
+) -> EchoCorrelation {
+    if account.kind != ChannelKind::Extension {
+        return EchoCorrelation::HostAdapter;
+    }
+    account
+        .non_secret_config
+        .get("echo_correlation")
+        .and_then(serde_json::Value::as_str)
+        .and_then(EchoCorrelation::parse)
+        // Absent reads as unsupported, never as fine. A missing field is
+        // exactly the case where guessing in the permissive direction is how a
+        // reply loop ships.
+        .unwrap_or_default()
 }
 
 /// The beginning of a file's text, when the bytes are text at all.
@@ -1296,6 +1327,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-1"),
             sender: ChannelSender::new("user-1"),
             text: String::new(),

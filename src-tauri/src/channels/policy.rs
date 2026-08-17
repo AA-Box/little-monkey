@@ -138,6 +138,113 @@ impl ChannelAccessPolicy {
             ConversationKind::Group | ConversationKind::Channel => self.group,
         }
     }
+
+    /// The policy this account may actually run under, given what the host can
+    /// prove about its own messages.
+    ///
+    /// See [`EchoCorrelation`]. Two settings are the loop-capable ones — an
+    /// inbox anyone may write to, and a room where every line is answered — and
+    /// an account that cannot recognise its own message must not hold either.
+    /// Clamped rather than refused at read time so an account configured before
+    /// this rule existed becomes *safe* immediately rather than becoming
+    /// silent; [`unsafe_without_echo_correlation`] is what tells the operator
+    /// their stored setting is not the one in force.
+    pub fn clamped_for(&self, correlation: EchoCorrelation) -> Self {
+        if correlation.is_host_verifiable() {
+            return self.clone();
+        }
+        let narrow = |policy| match policy {
+            AccessPolicy::Open => AccessPolicy::AllowList,
+            other => other,
+        };
+        Self {
+            direct: narrow(self.direct),
+            group: narrow(self.group),
+            group_activation: match self.group_activation {
+                GroupActivation::Always => GroupActivation::MentionOnly,
+                other => other,
+            },
+        }
+    }
+
+    /// Whether this configuration is one [`Self::clamped_for`] would narrow.
+    pub fn unsafe_without_echo_correlation(&self) -> bool {
+        matches!(self.direct, AccessPolicy::Open)
+            || matches!(self.group, AccessPolicy::Open)
+            || matches!(self.group_activation, GroupActivation::Always)
+    }
+}
+
+/// How — or whether — the host can tell one of *its own* messages coming back.
+///
+/// # Why this is not a property of the envelope
+///
+/// Every adapter this project ships is host code holding the account's
+/// credential, so when it marks a sender as us, that is the host's own reading
+/// of the provider's payload. An extension-backed account inverts that: the
+/// code that decides is a sandboxed guest, and `sender.is_self` from it is an
+/// assertion by the thing being checked. It cannot be relied on, and it cannot
+/// be made reliable — the host has no way to verify an arbitrary provider's
+/// sender identity from inside a capability call.
+///
+/// So the guarantee moves from *who does this claim to be from* to *is this the
+/// provider's own id for something we already committed to sending*. That is a
+/// question about the host's own durable record, which no guest can write.
+///
+/// [`Self::Unsupported`] is the honest answer for a transport that cannot
+/// return a stable message id, and it is a real restriction rather than a
+/// warning: see [`ChannelAccessPolicy::clamped_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EchoCorrelation {
+    /// The transport is host code holding the account's own credential, so the
+    /// sender identity on an envelope is the host's own reading of the
+    /// provider's payload rather than somebody's claim about it.
+    ///
+    /// Every provider this project ships built-in. Named rather than folded in
+    /// with the next variant because the mechanism is different — there is no
+    /// ledger involved — and an audit that said "correlated by provider message
+    /// id" about Telegram would be describing something that does not happen.
+    HostAdapter,
+    /// The transport is a sandboxed guest, and it returns the provider's stable
+    /// message id on send and carries it on inbound messages, so the *host* can
+    /// match the two against its own outbound ledger.
+    ProviderMessageId,
+    /// It cannot, so the host has no causal way to recognise its own echo.
+    ///
+    /// The default, and deliberately: an account configured before this
+    /// existed, or an extension that has not been updated, must read as
+    /// unproven rather than as safe. A missing field is exactly the case where
+    /// guessing "fine" is how a loop ships.
+    #[default]
+    Unsupported,
+}
+
+impl EchoCorrelation {
+    /// Whether the *host* can decide self-echo for this account, as opposed to
+    /// being told by the thing under test.
+    pub fn is_host_verifiable(self) -> bool {
+        !matches!(self, EchoCorrelation::Unsupported)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EchoCorrelation::HostAdapter => "host_adapter",
+            EchoCorrelation::ProviderMessageId => "provider_message_id",
+            EchoCorrelation::Unsupported => "unsupported",
+        }
+    }
+
+    /// Only the two values an *extension* may declare. `host_adapter` is a
+    /// property of a built-in transport and is deliberately not something a
+    /// manifest can claim.
+    pub fn parse(value: &str) -> Option<EchoCorrelation> {
+        match value {
+            "provider_message_id" => Some(EchoCorrelation::ProviderMessageId),
+            "unsupported" => Some(EchoCorrelation::Unsupported),
+            _ => None,
+        }
+    }
 }
 
 /// Durable authorization state for one sender on one account.
@@ -297,6 +404,15 @@ pub struct AccessContext<'a> {
     /// inferred, because the only honest source for "did a person say anything
     /// recently" is what actually arrived.
     pub consecutive_machine_messages: u32,
+    /// The host's own answer to "is this a message we sent?", from the durable
+    /// outbound echo ledger.
+    ///
+    /// A fact rather than a claim, and the reason it is a separate field from
+    /// `envelope.sender.is_self`: that flag is set by whichever code normalized
+    /// the message, which for an extension-backed account is a sandboxed guest.
+    /// This one is set by looking up an id the *host* recorded when it sent
+    /// something. A guest can lie about the first and cannot reach the second.
+    pub own_outbound_echo: bool,
     pub now_ms: i64,
 }
 
@@ -312,6 +428,22 @@ pub fn decide_access(
     // Loop prevention comes first. Our own message can never be worth running,
     // whatever the policy says, and checking it here means every provider gets
     // the protection whether or not its adapter remembered to filter.
+    //
+    // The causal test leads, and it is the one the guarantee rests on: this
+    // provider message id is one the host itself recorded sending, in this
+    // conversation. It holds no matter what the envelope says about its sender,
+    // which is what makes it usable for a provider whose sender identity the
+    // host cannot verify.
+    if context.own_outbound_echo {
+        return AccessDecision::Ignore(IgnoreReason::OwnMessage);
+    }
+    // The sender flag stays, and is deliberately *not* what any safety property
+    // depends on. For the adapters this project ships it is the host's own
+    // reading of the provider's payload and costs nothing to honour; for a
+    // guest-normalized message it can only ever cause fewer runs, which an
+    // extension could achieve anyway by not reporting the message at all. What
+    // it can never do is grant anything — an inbound message that sets it
+    // reaches no further than this line.
     if envelope.sender.is_self {
         return AccessDecision::Ignore(IgnoreReason::OwnMessage);
     }
@@ -477,6 +609,7 @@ mod tests {
             account_id: "acct".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation {
                 conversation_id: "c1".into(),
                 kind,
@@ -503,6 +636,7 @@ mod tests {
             pending_pairings: 0,
             automated_reply_depth: 0,
             consecutive_machine_messages: 0,
+            own_outbound_echo: false,
             now_ms: 1_000,
         }
     }

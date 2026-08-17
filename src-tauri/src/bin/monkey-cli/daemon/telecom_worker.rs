@@ -453,7 +453,8 @@ fn load_carriers(
                     continue;
                 }
             };
-        if let Ok(provider) = super::telephony::provider_for_account(&account, secret) {
+        let base = store.telecom_callback_base(&account);
+        if let Ok(provider) = super::telephony::provider_for_account(&account, secret, base) {
             carriers.insert(account.account_id.clone(), provider);
         }
     }
@@ -555,6 +556,7 @@ mod tests {
             account_id: "tel-1".into(),
             kind: ChannelKind::Sms,
             provider_event_id: id.into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("+15551234567"),
             sender: ChannelSender::new("+15551234567"),
             text: body.into(),

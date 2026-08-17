@@ -46,6 +46,7 @@ mod macos {
     use tokio::time::Instant;
 
     use crate::daemon::channel_adapter::{AdapterConfig, ChannelAdapter, InboundBatch};
+    use little_monkey_lib::channels::policy::EchoCorrelation;
     use little_monkey_lib::channels::types::{
         AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
         ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -410,6 +411,7 @@ mod macos {
             // Messages' own stable identifier, which is what dedupe wants —
             // and what makes a row re-delivered after a helper crash harmless.
             provider_event_id: guid,
+            provider_message_id: None,
             conversation,
             sender: ChannelSender {
                 sender_id: sender,
@@ -463,6 +465,7 @@ mod macos {
                 supports_mention_metadata: false,
                 supports_idempotency_key: false,
                 supports_delivery_receipts: false,
+                echo_correlation: EchoCorrelation::HostAdapter,
             }
         }
 
@@ -1292,6 +1295,7 @@ mod other {
                 supports_mention_metadata: false,
                 supports_idempotency_key: false,
                 supports_delivery_receipts: false,
+                echo_correlation: EchoCorrelation::HostAdapter,
             }
         }
 
