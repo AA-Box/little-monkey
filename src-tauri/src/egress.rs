@@ -4696,11 +4696,6 @@ mod tests {
             // `tokio::time::timeout(context.timeout_ms)` instead, which is the
             // bound the component-hub contract actually specifies.
             ("m3_production.rs", 0, 2),
-            // Catalog search and model download against an endpoint that
-            // `validate_https_url` allows to be remote. `redirect::Policy::none()`
-            // — stricter than `hardened()`'s same-origin rule — and every request
-            // runs inside `run_bounded`, so the deadline lives one layer up.
-            ("m3_runtime_hub.rs", 0, 0),
             // OAuth token/revocation and the workflow client; deadlines audited
             // below.
             ("m4_runtime.rs", 0, 2),
