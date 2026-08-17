@@ -61,12 +61,12 @@ jobs:
       - name: Build and sign
         env:
           MLX_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
-          SOURCE_DATE_EPOCH: ${{ github.event.repository.pushed_at }}
         run: |
           if [ -z "$MLX_SIGNING_KEY" ]; then
             echo "::error::MLX_SIGNING_PRIVATE_KEY is not set. See pnpm mlx:keygen."
             exit 1
           fi
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           pnpm mlx:package
 
       - name: Publish the archive
