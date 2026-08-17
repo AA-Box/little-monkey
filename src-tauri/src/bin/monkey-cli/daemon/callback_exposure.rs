@@ -510,12 +510,23 @@ pub(crate) fn backoff_ms(restarts: u32) -> u64 {
 /// and a machine that rebooted is exactly the machine whose daemon did not exit
 /// cleanly. `boot_marker` is `None` where the platform's clock is already
 /// absolute, so on macOS and Windows this compares `None` to `None`.
+///
+/// `image` is the program the kernel says that pid is running, and it is the
+/// one check that does not depend on the record having been written by a
+/// process on this machine that is still trusted. The pid and start time are
+/// already unambiguous within a boot; a record that was hand-edited, restored
+/// from a backup or copied from another host is not, and naming the program
+/// this daemon started is what refuses those. `None` on a platform that will
+/// not answer, where — as with `boot_marker` — the comparison is `None` to
+/// `None` and the pair carries the whole burden.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TunnelOwnership {
     pid: u32,
     start_time: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boot_marker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
 }
 
 /// Record what was spawned, so a later start can prove it is still there.
@@ -523,6 +534,10 @@ struct TunnelOwnership {
 /// A platform that will not report a start time records **nothing**: an
 /// unverifiable record is worse than no record, because the only thing a record
 /// is ever used for is to send a kill.
+///
+/// Every field is read back from the kernel here rather than assumed from the
+/// spawn, and the pid is safe to ask about: this daemon still holds the child,
+/// so nothing else can be holding that number yet.
 fn record_ownership(store: &mut DaemonStore, pid: u32) {
     let Some(identity) = little_monkey_lib::process_tree::ProcessIdentity::of(pid) else {
         let _ = store.set_meta(EXPOSURE_PID_KEY, "");
@@ -532,6 +547,7 @@ fn record_ownership(store: &mut DaemonStore, pid: u32) {
         pid: identity.pid,
         start_time: identity.start_time,
         boot_marker: little_monkey_lib::process_tree::boot_marker(),
+        image: little_monkey_lib::process_tree::process_image_path(pid),
     };
     if let Ok(encoded) = serde_json::to_string(&owned) {
         let _ = store.set_meta(EXPOSURE_PID_KEY, &encoded);
@@ -545,11 +561,13 @@ fn record_ownership(store: &mut DaemonStore, pid: u32) {
 ///
 /// Every step here is a reason *not* to signal. The record is cleared first and
 /// unconditionally, so a reap that cannot complete is not retried against an
-/// ever-staler pid. Then the host must be the same boot, and the pid must still
-/// carry the start time that was recorded with it. A mismatch means the pid was
-/// reused and this daemon has no claim on it, so the record goes and nothing is
-/// signalled: failing to reap one stale tunnel costs a duplicate connection the
-/// operator can see, and killing a stranger's process cannot be undone.
+/// ever-staler pid. Then the host must be the same boot, the pid must still
+/// carry the start time that was recorded with it, and it must still be running
+/// the program that record names. A mismatch on any of the three means the pid
+/// is not ours and this daemon has no claim on it, so the record goes and
+/// nothing is signalled: failing to reap one stale tunnel costs a duplicate
+/// connection the operator can see, and killing a stranger's process cannot be
+/// undone.
 fn reap_orphan(store: &mut DaemonStore) {
     let Some(recorded) = store.get_meta(EXPOSURE_PID_KEY).ok().flatten() else {
         return;
@@ -569,6 +587,13 @@ fn reap_orphan(store: &mut DaemonStore) {
     // reaped still answers to a start-time lookup, and signalling one is a
     // no-op that reads as success.
     if !identity.is_running() {
+        return;
+    }
+    // Asked last, because it is the only one of the three that needs the process
+    // to still be there to answer at all. A platform that will not name a
+    // running program answers `None` on both sides; a platform that will and
+    // disagrees has just told us this pid is somebody else's.
+    if owned.image != little_monkey_lib::process_tree::process_image_path(owned.pid) {
         return;
     }
     kill_pid(owned.pid);
@@ -1182,6 +1207,8 @@ mod tests {
                     // started at a different moment than what we recorded.
                     start_time: real.wrapping_add(1),
                     boot_marker: little_monkey_lib::process_tree::boot_marker(),
+                    // Truthful, so the start time is the only thing wrong.
+                    image: little_monkey_lib::process_tree::process_image_path(us),
                 })
                 .expect("encode"),
             )
@@ -1228,6 +1255,7 @@ mod tests {
                     // whose clock is absolute, and a btime nobody booted at on
                     // the one whose clock is not.
                     boot_marker: Some("linux-btime:1".to_string()),
+                    image: little_monkey_lib::process_tree::process_image_path(us),
                 })
                 .expect("encode"),
             )
@@ -1238,6 +1266,52 @@ mod tests {
         assert!(
             little_monkey_lib::process_tree::ProcessIdentity::of(us).is_some(),
             "a start time from another boot must not authorize a kill on this one"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pid running a program this record does not name is not signalled.
+    ///
+    /// The case the pid and start time cannot see: a record whose provenance is
+    /// wrong rather than whose pid was reused — hand-edited, restored from a
+    /// backup, carried from another machine — can name a live pid with a start
+    /// time that matches, because on this host that pid really did start then.
+    /// The program is what refuses it. Written with this process's real pid,
+    /// real start time and real boot marker, so the image is the only thing
+    /// standing between the code below and a `SIGTERM` to the test runner.
+    #[test]
+    fn a_pid_running_a_program_the_record_does_not_name_is_never_signalled() {
+        let (root, paths) = test_paths();
+        let mut store = DaemonStore::open(&paths).expect("store");
+        let us = std::process::id();
+        let real = little_monkey_lib::process_tree::ProcessIdentity::of(us)
+            .map(|identity| identity.start_time)
+            .unwrap_or_default();
+        assert!(
+            little_monkey_lib::process_tree::process_image_path(us).is_some(),
+            "this platform must name a running program for the check to mean anything"
+        );
+
+        store
+            .set_meta(
+                EXPOSURE_PID_KEY,
+                &serde_json::to_string(&TunnelOwnership {
+                    pid: us,
+                    start_time: real,
+                    boot_marker: little_monkey_lib::process_tree::boot_marker(),
+                    // A tunnel client, which the test runner is not.
+                    image: Some("/usr/local/bin/cloudflared".to_string()),
+                })
+                .expect("encode"),
+            )
+            .expect("meta");
+
+        reap_orphan(&mut store);
+
+        assert!(
+            little_monkey_lib::process_tree::ProcessIdentity::of(us).is_some(),
+            "a record naming another program must not authorize a kill"
         );
 
         let _ = std::fs::remove_dir_all(&root);
