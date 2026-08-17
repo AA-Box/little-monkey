@@ -2064,6 +2064,7 @@ mod tests {
             M3_COMPONENT_CATALOG_SCHEMA_VERSION, M3_HUB_SCHEMA_VERSION,
         };
         use crate::mlx_runtime::tests::{write_test_signed_archive, TestSignatureVerifier};
+        use crate::mlx_runtime::{MlxInstallLimits, MlxPackageInstaller};
         use crate::runtime_adapter::{HardwareSnapshot, PlatformCapabilities};
         use sha2::{Digest, Sha256};
         use std::collections::BTreeMap;
@@ -2170,6 +2171,17 @@ mod tests {
                 compatibility_note: None,
                 metadata: BTreeMap::new(),
             }
+        }
+        fn active_mlx_version(app: &Path) -> String {
+            MlxPackageInstaller::new(
+                app.join("m3").join("runtimes").join("mlx"),
+                Arc::new(TestSignatureVerifier),
+                MlxInstallLimits::default(),
+            )
+            .expect("test MLX installer")
+            .verify_active()
+            .expect("verified active MLX package")
+            .package_version
         }
 
         struct Fixture {
@@ -2323,6 +2335,7 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(installed.active_version_key, adopted.version_key());
+            assert_eq!(active_mlx_version(&app), "mlx-test-v1");
             assert!(valid_fixture.heads.load(Ordering::Relaxed) >= 1);
             assert!(valid_fixture.ranges.load(Ordering::Relaxed) >= 3);
             assert!(valid_fixture.if_ranges.load(Ordering::Relaxed) >= 1);
@@ -2357,6 +2370,7 @@ mod tests {
                 .versions
                 .iter()
                 .any(|v| v.version_key == bad_entry.version_key()));
+            assert_eq!(active_mlx_version(&app), "mlx-test-v1");
             component_install_impl(
                 &state,
                 "mlx-op".into(),
