@@ -50,6 +50,7 @@ use crate::daemon::channel_adapter::{
     load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
     LoadedAttachment, MAX_ATTACHMENT_BYTES,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, InboundTransport, OutboundMessage,
@@ -248,6 +249,7 @@ impl SignalAdapter {
             stdout,
             self.shared.clone(),
             self.inbound_tx.clone(),
+            self.account.clone(),
         ));
         Ok(())
     }
@@ -307,6 +309,10 @@ async fn run_rpc_loop(
     stdout: ChildStdout,
     shared: Arc<Shared>,
     inbound_tx: mpsc::Sender<ChannelEnvelope>,
+    // The registered number this helper runs as -- the one thing that lets the
+    // parser tell our own message from somebody else's, and tell a mention of
+    // us from a mention of anyone.
+    account: String,
 ) {
     let started_at = Instant::now();
     let mut lines = BufReader::new(stdout).lines();
@@ -326,7 +332,7 @@ async fn run_rpc_loop(
                     }
                     continue;
                 }
-                if let Some(envelope) = parse_event(&line) {
+                if let Some(envelope) = parse_event(&line, &account) {
                     // `try_send`, never `send().await`: the next line down
                     // this pipe may be the JSON-RPC response an in-flight
                     // `send` is waiting on, and a reader parked on a full
@@ -379,7 +385,7 @@ async fn run_rpc_loop(
 /// other notification types, malformed JSON, an empty message with no
 /// attachments) — `run_rpc_loop` handles the response case itself before
 /// ever reaching here.
-fn parse_event(line: &str) -> Option<ChannelEnvelope> {
+fn parse_event(line: &str, account: &str) -> Option<ChannelEnvelope> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("method").and_then(Value::as_str) != Some("receive") {
         return None;
@@ -391,7 +397,24 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let timestamp = envelope.get("timestamp").and_then(Value::as_i64)?;
-    let data_message = envelope.get("dataMessage")?;
+    // A message this account sent from one of its own linked devices comes
+    // back on the same stream as a sync notification. It has to be read, not
+    // skipped: an account whose owner also uses Signal on their phone would
+    // otherwise have every one of *our* replies arrive here looking exactly
+    // like an inbound message from a stranger, and with an open policy the
+    // agent would answer itself. Parsed into the same envelope shape and
+    // marked as ours, so `decide_access` refuses it by the same rule it uses
+    // for every other provider — and the refusal is durably visible rather
+    // than a line silently dropped in a parser.
+    let (data_message, is_self) = match envelope.get("dataMessage") {
+        Some(data_message) => (data_message, false),
+        None => (
+            envelope
+                .get("syncMessage")
+                .and_then(|sync| sync.get("sentMessage"))?,
+            true,
+        ),
+    };
     let text = data_message
         .get("message")
         .and_then(Value::as_str)
@@ -431,6 +454,7 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
                             .map(str::to_string),
                         mime_type: content_type,
                         declared_size_bytes: item.get("size").and_then(Value::as_u64),
+                        stored_size_bytes: None,
                         source: AttachmentSource::ProviderHandle { handle: id },
                     })
                 })
@@ -448,9 +472,22 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
         .and_then(Value::as_i64)
         .map(|id| id.to_string());
 
+    // A sync notification names the far end as `destination`; the ordinary one
+    // names it as `source`. Either way the conversation is the same one, so a
+    // direct echo must land on the peer's thread rather than on our own number.
+    let peer = if is_self {
+        data_message
+            .get("destination")
+            .or_else(|| data_message.get("destinationNumber"))
+            .and_then(Value::as_str)
+            .unwrap_or(source.as_str())
+            .to_string()
+    } else {
+        source.clone()
+    };
     let conversation = match &group_id {
         Some(group_id) => ChannelConversation::group(group_id.clone()),
-        None => ChannelConversation::direct(source.clone()),
+        None => ChannelConversation::direct(peer),
     };
 
     Some(ChannelEnvelope {
@@ -459,29 +496,47 @@ fn parse_event(line: &str) -> Option<ChannelEnvelope> {
         // Deterministic, never random: the durable-event dedupe key needs
         // the same line to always produce the same id.
         provider_event_id: format!("{source}:{timestamp}"),
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
-            sender_id: source,
+            sender_id: if is_self { account.to_string() } else { source },
             display_label: source_name,
-            // ponytail: always false — this parser only handles `receive`
-            // notifications, and signal-cli reports the account's own
-            // linked-device echoes as a separate `sentMessage` notification
-            // this parser does not read yet. Add a syncMessage/sentMessage
-            // branch here if multi-device echo suppression is needed.
-            is_self: false,
+            is_self,
             is_bot: false,
         },
         text,
         attachments,
         reply_to_provider_id,
-        // ponytail: always false — `dataMessage.mentions[]` (UUID-keyed)
-        // isn't checked because the account's own Signal UUID isn't
-        // threaded through `non_secret_config` yet. Add when it is; group
-        // gating falls back to allow-list authorization in the meantime.
-        mentions_self: false,
+        mentions_self: mentions_account(data_message, account),
         received_at_ms: timestamp,
         metadata: little_monkey_lib::channels::types::BoundedMetadata::new(),
     })
+}
+
+/// Whether `dataMessage.mentions[]` names this account.
+///
+/// Signal mentions are keyed by the recipient's UUID, and signal-cli also
+/// reports the `number` alongside it in every version that emits the field at
+/// all. The number is what this build has — it is the account it registered
+/// with and started the helper as — so that is what is compared, and a mention
+/// carrying only a UUID is not treated as a mention of us.
+///
+/// The alternative was leaving this permanently false, which is what it was:
+/// a Signal group set to answer only when addressed then never answered
+/// anything at all, because nothing could ever address it.
+fn mentions_account(data_message: &Value, account: &str) -> bool {
+    data_message
+        .get("mentions")
+        .and_then(Value::as_array)
+        .is_some_and(|mentions| {
+            mentions.iter().any(|mention| {
+                mention
+                    .get("number")
+                    .or_else(|| mention.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|number| number == account)
+            })
+        })
 }
 
 /// The registered numbers in a `listAccounts` result.
@@ -531,6 +586,7 @@ impl ChannelAdapter for SignalAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
         }
     }
 
@@ -772,6 +828,9 @@ impl SignalAdapter {
 mod tests {
     use super::*;
 
+    /// The number this helper is registered as, as `-a` was given it.
+    const TEST_ACCOUNT: &str = "+15550009999";
+
     const DM_LINE: &str = r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{
         "source": "+15551230001",
         "sourceName": "Ada",
@@ -810,6 +869,105 @@ mod tests {
         "dataMessage": {"message": ""}
     }}}"#;
 
+    /// Our own message, coming back because the owner also runs Signal on
+    /// their phone.
+    ///
+    /// signal-cli reports a linked device's send as a sync notification rather
+    /// than a `dataMessage`, and this parser used to read only the latter --
+    /// so nothing here could ever be recognized as ours. On an account with an
+    /// open policy the agent would have answered itself.
+    const OWN_ECHO_LINE: &str = r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{
+        "source": "+15550009999",
+        "timestamp": 1700000006000,
+        "syncMessage": {"sentMessage": {
+            "message": "on my way",
+            "destination": "+15551230001"
+        }}
+    }}}"#;
+
+    const MENTION_LINE: &str = r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{
+        "source": "+15551230006",
+        "timestamp": 1700000007000,
+        "dataMessage": {
+            "message": "can you take this one",
+            "groupInfo": {"groupId": "grp-abc="},
+            "mentions": [{"start": 0, "length": 1, "number": "+15550009999", "uuid": "u-1"}]
+        }
+    }}}"#;
+
+    const SOMEONE_ELSES_MENTION_LINE: &str = r#"{"jsonrpc":"2.0","method":"receive","params":{"envelope":{
+        "source": "+15551230007",
+        "timestamp": 1700000008000,
+        "dataMessage": {
+            "message": "over to you",
+            "groupInfo": {"groupId": "grp-abc="},
+            "mentions": [{"start": 0, "length": 1, "number": "+15551230008", "uuid": "u-2"}]
+        }
+    }}}"#;
+
+    /// The echo is recognized, not dropped: it becomes a durable event marked
+    /// as ours, which `decide_access` refuses by the same rule every other
+    /// provider gets. A parser that silently returned `None` would leave an
+    /// operator with no way to see it happened at all.
+    #[test]
+    fn a_linked_devices_own_send_comes_back_marked_as_ours() {
+        let envelope = parse_event(OWN_ECHO_LINE, TEST_ACCOUNT).expect("envelope");
+        assert!(envelope.sender.is_self);
+        assert_eq!(envelope.text, "on my way");
+        // And it lands on the conversation it belongs to -- the person we sent
+        // it to -- rather than on a thread named after ourselves.
+        assert_eq!(envelope.conversation.conversation_id, "+15551230001");
+    }
+
+    /// The policy gate is what actually stops the loop, so it is asserted
+    /// through the gate rather than on the flag alone.
+    #[test]
+    fn the_gate_refuses_our_own_echo_even_on_an_open_account() {
+        use little_monkey_lib::channels::policy::{
+            decide_access, AccessContext, AccessDecision, AccessPolicy, ChannelAccessPolicy,
+            GroupActivation, IgnoreReason,
+        };
+        let envelope = parse_event(OWN_ECHO_LINE, TEST_ACCOUNT).expect("envelope");
+        let policy = ChannelAccessPolicy {
+            direct: AccessPolicy::Open,
+            group: AccessPolicy::Open,
+            group_activation: GroupActivation::Always,
+        };
+        let decision = decide_access(
+            &envelope,
+            AccessContext {
+                policy: &policy,
+                sender: None,
+                pending_pairings: 0,
+                automated_reply_depth: 0,
+                consecutive_machine_messages: 0,
+                own_outbound_echo: false,
+                now_ms: 1_700_000_006_000,
+            },
+            || "UNUSED12".to_string(),
+        );
+        assert_eq!(decision, AccessDecision::Ignore(IgnoreReason::OwnMessage));
+    }
+
+    /// A Signal group set to answer only when addressed could never be
+    /// addressed: `mentions_self` was hard-coded false, so the group was
+    /// silently inert.
+    #[test]
+    fn a_mention_of_this_account_activates_a_group_and_one_of_somebody_else_does_not() {
+        let mentioned = parse_event(MENTION_LINE, TEST_ACCOUNT).expect("envelope");
+        assert!(mentioned.mentions_self);
+
+        let other = parse_event(SOMEONE_ELSES_MENTION_LINE, TEST_ACCOUNT).expect("envelope");
+        assert!(
+            !other.mentions_self,
+            "somebody else being addressed is not us being addressed"
+        );
+
+        // And a message with no mentions at all is unchanged.
+        let plain = parse_event(GROUP_LINE, TEST_ACCOUNT).expect("envelope");
+        assert!(!plain.mentions_self);
+    }
+
     #[test]
     fn every_shape_signal_cli_has_used_for_list_accounts_is_read() {
         assert_eq!(
@@ -831,7 +989,7 @@ mod tests {
 
     #[test]
     fn parses_a_direct_message() {
-        let envelope = parse_event(DM_LINE).expect("envelope");
+        let envelope = parse_event(DM_LINE, TEST_ACCOUNT).expect("envelope");
         assert_eq!(envelope.conversation.conversation_id, "+15551230001");
         assert_eq!(
             envelope.conversation.kind,
@@ -843,7 +1001,7 @@ mod tests {
 
     #[test]
     fn parses_a_group_message_keyed_on_group_id() {
-        let envelope = parse_event(GROUP_LINE).expect("envelope");
+        let envelope = parse_event(GROUP_LINE, TEST_ACCOUNT).expect("envelope");
         assert_eq!(envelope.conversation.conversation_id, "grp-abc=");
         assert_eq!(
             envelope.conversation.kind,
@@ -853,7 +1011,7 @@ mod tests {
 
     #[test]
     fn parses_an_attachment_as_a_provider_handle() {
-        let envelope = parse_event(ATTACHMENT_LINE).expect("envelope");
+        let envelope = parse_event(ATTACHMENT_LINE, TEST_ACCOUNT).expect("envelope");
         assert_eq!(envelope.attachments.len(), 1);
         let attachment = &envelope.attachments[0];
         assert_eq!(attachment.kind, AttachmentKind::Image);
@@ -866,7 +1024,7 @@ mod tests {
 
     #[test]
     fn carries_the_quoted_message_id_as_a_reply_target() {
-        let envelope = parse_event(QUOTE_LINE).expect("envelope");
+        let envelope = parse_event(QUOTE_LINE, TEST_ACCOUNT).expect("envelope");
         assert_eq!(
             envelope.reply_to_provider_id.as_deref(),
             Some("1699999999000")
@@ -875,23 +1033,23 @@ mod tests {
 
     #[test]
     fn ignores_rpc_responses_and_empty_messages() {
-        assert!(parse_event(RESPONSE_LINE).is_none());
-        assert!(parse_event(EMPTY_LINE).is_none());
-        assert!(parse_event("not json").is_none());
+        assert!(parse_event(RESPONSE_LINE, TEST_ACCOUNT).is_none());
+        assert!(parse_event(EMPTY_LINE, TEST_ACCOUNT).is_none());
+        assert!(parse_event("not json", TEST_ACCOUNT).is_none());
     }
 
     #[test]
     fn the_same_line_always_produces_the_same_id() {
-        let first = parse_event(DM_LINE).expect("envelope");
-        let second = parse_event(DM_LINE).expect("envelope");
+        let first = parse_event(DM_LINE, TEST_ACCOUNT).expect("envelope");
+        let second = parse_event(DM_LINE, TEST_ACCOUNT).expect("envelope");
         assert_eq!(first.provider_event_id, second.provider_event_id);
         assert_eq!(first.provider_event_id, "+15551230001:1700000000000");
     }
 
     #[test]
     fn different_lines_produce_different_ids() {
-        let dm = parse_event(DM_LINE).expect("envelope");
-        let group = parse_event(GROUP_LINE).expect("envelope");
+        let dm = parse_event(DM_LINE, TEST_ACCOUNT).expect("envelope");
+        let group = parse_event(GROUP_LINE, TEST_ACCOUNT).expect("envelope");
         assert_ne!(dm.provider_event_id, group.provider_event_id);
     }
 

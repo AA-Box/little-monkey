@@ -171,6 +171,22 @@ impl TelecomProvider for TwilioProvider {
         TelecomKind::Twilio
     }
 
+    /// Twilio serves inbound MMS media from its own API behind the account's
+    /// HTTP credential -- the same Account SID and Auth Token every other
+    /// request here uses. An unauthenticated GET of a `MediaUrl` returns a
+    /// `401`, so a plain download would store an error page as somebody's
+    /// photo.
+    async fn fetch_media(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>, String> {
+        crate::daemon::channel_adapter::fetch_url_basic_auth(
+            url,
+            &self.account_sid,
+            &self.auth_token,
+            max_bytes,
+        )
+        .await
+        .map_err(|error| self.redact(error))
+    }
+
     fn media_stream(&self) -> Option<crate::daemon::call_media::MediaStreamFormat> {
         Some(MEDIA_FORMAT)
     }
@@ -496,6 +512,7 @@ fn normalize_twilio_params(
                     filename: None,
                     mime_type: mime,
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: AttachmentSource::Url { url: url.clone() },
                 });
             }
@@ -506,6 +523,7 @@ fn normalize_twilio_params(
             account_id: String::new(),
             kind: ChannelKind::Sms,
             provider_event_id: message_sid.clone(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct(from.clone()),
             sender: ChannelSender::new(from),
             text,

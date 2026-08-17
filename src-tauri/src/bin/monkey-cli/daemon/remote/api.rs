@@ -6904,6 +6904,10 @@ mod tests {
                 "media_type": "audio/webm;codecs=opus",
                 "audio_base64": STANDARD.encode(b"first utterance bytes"),
                 "last": true,
+                // The device's own name for this utterance, which a closing
+                // frame must carry: it is the key the turn is queued under, and
+                // the only identity that survives a restart of this runner.
+                "utterance_id": "utt-first",
             })))
             .await
             .unwrap();
@@ -6958,6 +6962,7 @@ mod tests {
                     "media_type": "audio/webm;codecs=opus",
                     "audio_base64": STANDARD.encode(b"second utterance bytes"),
                     "last": true,
+                    "utterance_id": "utt-second",
                 }),
             ))
             .await

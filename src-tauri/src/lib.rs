@@ -95,6 +95,7 @@ pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+pub mod support_bundle;
 // Operational-health diagnostics (reachability/liveness of app-owned
 // services), sibling to `security_doctor` (which audits posture, not
 // health). Self-contained: engine + thin command layer live in one file,
@@ -1700,6 +1701,11 @@ pub fn run() {
             daemon_commands::channels_set_config,
             daemon_commands::channels_callback_url,
             daemon_commands::channels_set_public_url,
+            daemon_commands::channels_exposure_status,
+            daemon_commands::channels_exposure_manual,
+            daemon_commands::channels_exposure_set_tunnel,
+            daemon_commands::channels_exposure_set_token,
+            daemon_commands::channels_exposure_clear_token,
             daemon_commands::channels_events,
             daemon_commands::channels_remove,
             daemon_commands::ingress_turns,

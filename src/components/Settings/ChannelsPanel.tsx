@@ -7,6 +7,7 @@ import {
   type ChannelCallback,
   type ChannelEvent,
   type ChannelHealthState,
+  type ExposureStatus,
   type GroupActivation,
   type PendingSender,
   PROVIDER_GUIDES,
@@ -17,6 +18,11 @@ import {
   channelsDecideSender,
   channelsEnable,
   channelsEvents,
+  channelsExposureClearToken,
+  channelsExposureManual,
+  channelsExposureSetToken,
+  channelsExposureSetTunnel,
+  channelsExposureStatus,
   channelsList,
   channelsProbe,
   channelsRemove,
@@ -27,6 +33,7 @@ import {
   channelsSetPolicy,
   channelsSetPublicUrl,
   configFormValues,
+  describeExposure,
   editableConfigFields,
   mergeProviderConfig,
   missingRequiredConfig,
@@ -123,6 +130,13 @@ export function ChannelsPanel() {
    * Never assembled here: only the daemon knows what it is reachable as. */
   const [callback, setCallback] = useState<ChannelCallback | null>(null);
   const [publicUrlDraft, setPublicUrlDraft] = useState("");
+  /** How this machine is reached from the internet, as the daemon reports it.
+   * Machine-wide, not per account: one exposure in front of one listener. */
+  const [exposure, setExposure] = useState<ExposureStatus | null>(null);
+  const [tunnelDraft, setTunnelDraft] = useState({ hostname: "", executable: "" });
+  /** Held only until it is submitted, and never read back: the token goes to
+   * the OS keychain and the daemon reads it from there. */
+  const [tunnelToken, setTunnelToken] = useState("");
   /** Open editor for the selected account's non-secret settings, or null while
    * they are only being displayed. */
   const [settingsDraft, setSettingsDraft] = useState<Record<string, string> | null>(null);
@@ -137,6 +151,13 @@ export function ChannelsPanel() {
     } catch (reason) {
       setError(errorMessage(reason));
       setAccounts([]);
+    }
+    // Its own try: a daemon too old to answer this leaves the exposure card
+    // absent rather than taking the whole panel down with it.
+    try {
+      setExposure(await channelsExposureStatus());
+    } catch {
+      setExposure(null);
     }
   }, []);
 
@@ -219,6 +240,136 @@ export function ChannelsPanel() {
       {error && <p className="rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">{error}</p>}
       {notice && <p className="rounded-md border border-border bg-background p-2 text-xs text-muted">{notice}</p>}
 
+      {exposure && (
+        <section className="rounded-lg border border-border bg-surface p-4" data-testid="exposure">
+          <h4 className="text-sm font-semibold">{t("ChannelsPanel.exposureTitle")}</h4>
+          <p className="mt-1 text-xs leading-relaxed text-muted">{t("ChannelsPanel.exposureIntro")}</p>
+
+          <div className="mt-3 flex flex-col gap-2">
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="radio"
+                name="exposure-mode"
+                className="mt-0.5"
+                checked={exposure.mode === "manual"}
+                disabled={busy !== null}
+                onChange={() => void run("exposure", channelsExposureManual, t("ChannelsPanel.exposureManualSaved"))}
+              />
+              <span>
+                <span className="font-medium">{t("ChannelsPanel.exposureManual")}</span>
+                <span className="mt-0.5 block text-faint">{t("ChannelsPanel.exposureManualHint")}</span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="radio"
+                name="exposure-mode"
+                className="mt-0.5"
+                checked={exposure.mode === "managed_tunnel"}
+                disabled={busy !== null}
+                // Selecting it does not start anything: the daemon needs a
+                // hostname, a path and a token first, and each is asked for
+                // below. Switching a radio must never open a network listener.
+                onChange={() => setTunnelDraft({
+                  hostname: tunnelDraft.hostname,
+                  executable: tunnelDraft.executable,
+                })}
+              />
+              <span>
+                <span className="font-medium">{t("ChannelsPanel.exposureTunnel")}</span>
+                <span className="mt-0.5 block text-faint">{t("ChannelsPanel.exposureTunnelHint")}</span>
+              </span>
+            </label>
+          </div>
+
+          <p
+            className={`mt-3 text-xs ${
+              describeExposure(exposure).tone === "ok"
+                ? "text-muted"
+                : describeExposure(exposure).tone === "warn"
+                  ? "text-warning"
+                  : "text-danger"
+            }`}
+            data-testid="exposure-state"
+          >
+            {describeExposure(exposure).text}
+          </p>
+          {exposure.lastError && (
+            <p className="mt-1 break-words text-xs text-faint" data-testid="exposure-error">{exposure.lastError}</p>
+          )}
+          {exposure.publicBase && (
+            <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted">
+              <code className="min-w-0 break-all text-foreground">{exposure.publicBase}</code>
+              <Button size="sm" onClick={() => void navigator.clipboard.writeText(exposure.publicBase ?? "")}>
+                <Copy size={12} />{t("ChannelsPanel.copy")}
+              </Button>
+            </p>
+          )}
+
+          <div className="mt-3 grid gap-2 border-t border-border pt-3 sm:grid-cols-2">
+            <label className="text-xs text-muted">{t("ChannelsPanel.tunnelHostname")}
+              <input
+                className={`${INPUT} mt-1`}
+                value={tunnelDraft.hostname}
+                onChange={(event) => setTunnelDraft({ ...tunnelDraft, hostname: event.target.value })}
+                placeholder="monkey.example.com"
+              />
+            </label>
+            <label className="text-xs text-muted">{t("ChannelsPanel.tunnelExecutable")}
+              <input
+                className={`${INPUT} mt-1`}
+                value={tunnelDraft.executable}
+                onChange={(event) => setTunnelDraft({ ...tunnelDraft, executable: event.target.value })}
+                placeholder="/usr/local/bin/cloudflared"
+              />
+            </label>
+          </div>
+          <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-end">
+            <label className="min-w-0 flex-1 text-xs text-muted">{t("ChannelsPanel.tunnelToken")}
+              <input
+                className={`${INPUT} mt-1`}
+                type="password"
+                value={tunnelToken}
+                onChange={(event) => setTunnelToken(event.target.value)}
+                placeholder={exposure.credentialStored ? t("ChannelsPanel.tunnelTokenStored") : ""}
+              />
+            </label>
+            <Button
+              size="sm"
+              disabled={busy !== null || tunnelToken.length === 0}
+              onClick={() => void run("exposure-token", async () => {
+                await channelsExposureSetToken(tunnelToken);
+                setTunnelToken("");
+              }, t("ChannelsPanel.tunnelTokenSaved"))}
+            >{t("ChannelsPanel.saveTunnelToken")}</Button>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              disabled={
+                busy !== null
+                || tunnelDraft.hostname.trim().length === 0
+                || tunnelDraft.executable.trim().length === 0
+              }
+              onClick={() => void run("exposure", () => channelsExposureSetTunnel(
+                "cloudflared",
+                tunnelDraft.hostname.trim(),
+                tunnelDraft.executable.trim(),
+                null,
+              ), t("ChannelsPanel.tunnelSaved"))}
+            >{t("ChannelsPanel.connectTunnel")}</Button>
+            {exposure.credentialStored && (
+              <Button
+                size="sm"
+                disabled={busy !== null}
+                onClick={() => void run("exposure-token", channelsExposureClearToken, t("ChannelsPanel.tunnelTokenCleared"))}
+              >{t("ChannelsPanel.clearTunnelToken")}</Button>
+            )}
+          </div>
+          <p className="mt-2 text-faint">{t("ChannelsPanel.tunnelPrerequisite")}</p>
+        </section>
+      )}
+
       <section className="rounded-lg border border-border bg-surface p-4">
         <h4 className="text-sm font-semibold">{t("ChannelsPanel.accounts")}</h4>
         {accounts.length === 0 ? (
@@ -262,6 +413,37 @@ export function ChannelsPanel() {
               {account.last_error && <p className="mt-1 text-xs text-danger">{account.last_error}</p>}
               {account.credential_required && !account.has_credential && (
                 <p className="mt-1 text-xs text-warning">{t("ChannelsPanel.needsCredential")}</p>
+              )}
+              {/* A provider whose deliveries stop authenticating has no other
+                  symptom: the messages simply stop, health stays wherever the
+                  last probe left it, and every field above still reads
+                  correctly. This banner is the whole of what an operator has to
+                  go on, which is why it names the count and the reason and
+                  points at the two things that are actually wrong. */}
+              {account.callback_rejections.count > 0 && (
+                <p className="mt-2 flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 p-2 text-xs text-danger">
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  <span>
+                    {t("ChannelsPanel.callbacksRejected", { count: account.callback_rejections.count })}
+                    {account.callback_rejections.last_reason && (
+                      <span className="block text-faint">{account.callback_rejections.last_reason}</span>
+                    )}
+                  </span>
+                </p>
+              )}
+              {/* An extension-backed account whose transport cannot report the
+                  provider's own message ids. The host has no way to tell one of
+                  its own messages coming back, so the two loop-capable settings
+                  are refused for it — and this is the only place that
+                  difference between what is stored and what runs is visible. */}
+              {account.echo_correlation === "unsupported" && (
+                <p
+                  className="mt-2 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-2 text-xs text-warning"
+                  data-testid="echo-blind"
+                >
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                  <span>{t("ChannelsPanel.echoBlind")}</span>
+                </p>
               )}
               {settingsDraft === null && Object.keys(account.non_secret_config).length > 0 && (
                 <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 text-xs text-faint">
@@ -459,8 +641,17 @@ export function ChannelsPanel() {
                 value={account.access_policy.direct}
                 onChange={(event) => void run("policy", () => channelsSetPolicy(account.account_id, event.target.value as AccessPolicy, null, null))}
               >
+                {/* The two loop-capable settings are not offered to an account
+                    that cannot recognise its own echo. Disabled rather than
+                    hidden: an operator who wants one has to be able to see it
+                    is there and why it is refused, and the daemon refuses it
+                    again anyway -- this is the courtesy, not the guarantee. */}
                 {(["pairing", "allow_list", "open", "disabled"] as AccessPolicy[]).map((value) => (
-                  <option key={value} value={value}>{t(`ChannelsPanel.policy_${value}`)}</option>
+                  <option
+                    key={value}
+                    value={value}
+                    disabled={value === "open" && account.echo_correlation === "unsupported"}
+                  >{t(`ChannelsPanel.policy_${value}`)}</option>
                 ))}
               </select>
             </label>
@@ -471,7 +662,11 @@ export function ChannelsPanel() {
                 onChange={(event) => void run("policy", () => channelsSetPolicy(account.account_id, null, event.target.value as AccessPolicy, null))}
               >
                 {(["allow_list", "pairing", "open", "disabled"] as AccessPolicy[]).map((value) => (
-                  <option key={value} value={value}>{t(`ChannelsPanel.policy_${value}`)}</option>
+                  <option
+                    key={value}
+                    value={value}
+                    disabled={value === "open" && account.echo_correlation === "unsupported"}
+                  >{t(`ChannelsPanel.policy_${value}`)}</option>
                 ))}
               </select>
             </label>
@@ -482,7 +677,11 @@ export function ChannelsPanel() {
                 onChange={(event) => void run("policy", () => channelsSetPolicy(account.account_id, null, null, event.target.value as GroupActivation))}
               >
                 {(["mention_only", "always", "disabled"] as GroupActivation[]).map((value) => (
-                  <option key={value} value={value}>{t(`ChannelsPanel.activation_${value}`)}</option>
+                  <option
+                    key={value}
+                    value={value}
+                    disabled={value === "always" && account.echo_correlation === "unsupported"}
+                  >{t(`ChannelsPanel.activation_${value}`)}</option>
                 ))}
               </select>
             </label>

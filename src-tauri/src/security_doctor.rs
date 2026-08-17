@@ -90,7 +90,8 @@ pub struct SecurityAuditReport {
 /// this library would be a second copy of that schema, and the first migration
 /// would make the audit quietly wrong. The CLI, which already owns the store,
 /// collects this and hands it over.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceGrantSnapshot {
     pub device_id: String,
     pub device_name: String,
@@ -106,7 +107,8 @@ pub struct DeviceGrantSnapshot {
 }
 
 /// One device command that has not finished.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceCommandSnapshot {
     pub command_id: String,
     pub device_id: String,
@@ -115,7 +117,8 @@ pub struct DeviceCommandSnapshot {
 }
 
 /// The operator's push configuration, reduced to what the audit asks about.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PushPrivacySnapshot {
     pub configured: bool,
     pub enabled: bool,
@@ -135,6 +138,90 @@ pub struct VoicePrivacySnapshot {
     /// True when transcription runs on this machine. False means audio is
     /// uploaded to a provider the operator configured.
     pub local_only: bool,
+}
+
+/// Everything about the machine's security posture that only the daemon can
+/// see, as one value.
+///
+/// # Why this type exists at all
+///
+/// Three subsystems — paired devices, messaging accounts, phone numbers and
+/// peers — keep their state in databases whose schemas `monkey-cli` owns, and
+/// [`run_security_audit`] runs in this library, which cannot open them. The CLI
+/// therefore collected that half itself and appended it to its own report,
+/// which meant `monkey security audit` and the desktop Security Doctor were
+/// answering different questions: the desktop panel saw no device, no channel,
+/// no number and no peer, and said so by omission rather than by saying
+/// anything. An operator reading a clean page had no way to know a whole class
+/// of check had not run.
+///
+/// So the daemon-owned half became a value with a wire form. The CLI produces
+/// it in one place (`monkey security daemon-state --json`), the desktop reads
+/// exactly that, and both then run the same audit over the same inputs. Adding
+/// a daemon-owned check now reaches both surfaces or neither.
+///
+/// # Findings, not just inputs
+///
+/// Two kinds of thing travel here and they are deliberately not merged. The
+/// snapshot fields are *inputs* the library's own audit functions reason about.
+/// `findings` are already-decided results from the audits that live in the CLI
+/// because their state does. Asking the library to re-derive those would mean
+/// teaching it the schemas this type exists to avoid teaching it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSecurityState {
+    pub schema_version: u32,
+    pub devices: Vec<DeviceGrantSnapshot>,
+    #[serde(default)]
+    pub device_commands: Vec<DeviceCommandSnapshot>,
+    pub device_state_observed: bool,
+    #[serde(default)]
+    pub device_state_error: Option<String>,
+    #[serde(default)]
+    pub push: Option<PushPrivacySnapshot>,
+    #[serde(default)]
+    pub transport: Option<TransportSnapshot>,
+    /// Findings the daemon's own audits produced: channels, telephony, peers.
+    #[serde(default)]
+    pub findings: Vec<SecurityFinding>,
+}
+
+impl DaemonSecurityState {
+    /// Fold the input half into a runtime snapshot, and hand back the findings.
+    ///
+    /// Returns the findings rather than swallowing them so the caller decides
+    /// when they join the report — they must be appended *after*
+    /// [`run_security_audit`] has produced its summary, and
+    /// [`append_findings`] is what keeps that summary honest.
+    #[must_use]
+    pub fn apply(self, runtime: &mut SecurityRuntimeSnapshot) -> Vec<SecurityFinding> {
+        runtime.devices = self.devices;
+        runtime.device_commands = self.device_commands;
+        runtime.device_state_observed = self.device_state_observed;
+        runtime.device_state_error = self.device_state_error;
+        runtime.push = self.push;
+        runtime.transport = self.transport;
+        self.findings
+    }
+}
+
+/// Add findings produced outside [`run_security_audit`] to its report, keeping
+/// the summary counts true.
+///
+/// Shared rather than copied into each caller: a summary that disagrees with
+/// the list under it is the one bug in a report nobody notices, because both
+/// halves look plausible on their own.
+pub fn append_findings(report: &mut SecurityAuditReport, findings: Vec<SecurityFinding>) {
+    for finding in findings {
+        match finding.status {
+            FindingStatus::Pass => report.summary.passed += 1,
+            FindingStatus::Info => report.summary.informational += 1,
+            FindingStatus::Warning => report.summary.warnings += 1,
+            FindingStatus::Critical => report.summary.critical += 1,
+            FindingStatus::Fixed => report.summary.fixed += 1,
+        }
+        report.findings.push(finding);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,7 +252,8 @@ pub struct SecurityRuntimeSnapshot {
 }
 
 /// The advertised transport, reduced to what the device audit asks about.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TransportSnapshot {
     pub enabled: bool,
     pub advertise_url: String,

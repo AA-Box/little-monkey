@@ -19,7 +19,40 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Dedicated Talk frames are versioned independently so their WebSocket wire
 /// shape can evolve without changing the signed HTTP remote plane.
-pub const TALK_PROTOCOL_VERSION: u32 = 1;
+///
+/// # v2 — a closing audio frame must name its utterance
+///
+/// v1 accepted a `last: true` audio frame with no `utterance_id`; v2 refuses
+/// one. That is a semantic change to what a v1 frame means, so it gets a
+/// version rather than being made quietly under the old number: a client that
+/// still speaks v1 is refused *once, by version*, with something it can act on
+/// — reload — instead of having every utterance rejected by a field-level
+/// error it cannot interpret.
+///
+/// The old behaviour is deliberately not kept as a fallback. Minting the
+/// identity here is what caused the duplicate-after-restart it was added to
+/// close, so accepting a frame without one would reintroduce it under a
+/// compatibility flag.
+/// v3 adds [`TalkServerFrameKind::TurnAccepted`], which is the *only* signal a
+/// device may delete a recording on.
+///
+/// It is a version rather than an additive frame, even though a v2 client's
+/// `switch` would ignore an unknown type harmlessly. The incompatibility runs
+/// the other way: a v3 client keeps every unacknowledged utterance and offers
+/// to re-send it, so against a runner that never emits the acknowledgement it
+/// would offer to re-send *every* turn — including ones already answered. That
+/// is exactly the "tell somebody to repeat what is already running" failure the
+/// journal exists to prevent, so the two sides are pinned to each other.
+pub const TALK_PROTOCOL_VERSION: u32 = 3;
+
+/// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
+/// missing utterance id — so a client speaking it can be told precisely what is
+/// wrong rather than being handed an opaque refusal.
+const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
+
+/// The version that names its utterances but has nowhere to hear that one was
+/// durably accepted. Refused by version for the reason above.
+const TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE: u32 = 2;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -27,6 +60,10 @@ pub const MAX_TALK_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_TALK_ERROR_BYTES: usize = 4 * 1024;
 pub const MAX_TALK_MEDIA_TYPE_BYTES: usize = 128;
 pub const MAX_TALK_SESSION_ID_BYTES: usize = 256;
+/// Long enough for a UUID or a device-local counter with a prefix, short enough
+/// that it cannot become somewhere to park data on a frame that is otherwise
+/// pure audio.
+pub const MAX_TALK_UTTERANCE_ID_BYTES: usize = 128;
 pub const MAX_TALK_SESSION_GENERATION_BYTES: usize = 128;
 pub const MAX_TALK_TICKET_BYTES: usize = 128;
 pub const DEFAULT_TALK_TICKET_TTL_MS: u64 = 30_000;
@@ -1670,6 +1707,32 @@ pub enum TalkClientFrameKind {
         /// complete recording over to transcription.
         #[serde(default)]
         last: bool,
+        /// The device's own durable name for this utterance, required on the
+        /// frame that closes one (`last: true`) and ignored on the others.
+        ///
+        /// # Why the device has to name it
+        ///
+        /// This is the idempotency key the turn is queued under, and the runner
+        /// cannot mint one that survives a restart. The obvious server-side
+        /// identity — the session generation plus an utterance counter — is
+        /// per *socket*: a generation is minted fresh with every ticket, and
+        /// the counter restarts at zero. So a daemon that restarts mid-turn,
+        /// and a device that reconnects and retransmits the recording it never
+        /// got an answer for, would produce a second key and a second run — and
+        /// a Talk turn can send a message or place a call, so that is a
+        /// duplicated external effect, not just a duplicated answer.
+        ///
+        /// Keying on `(session_id, utterance_index)` instead would be worse: the
+        /// counter resets, so the first utterance of a reconnected session would
+        /// collide with the first of the old one and two different things
+        /// somebody said would merge into one.
+        ///
+        /// Only the device knows that the audio it is sending now is the audio
+        /// it sent before, so only the device can name it. Required rather than
+        /// optional-with-a-fallback, because a fallback is the hole: a client
+        /// that omitted it would silently get the unkeyed behaviour back.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        utterance_id: Option<String>,
     },
     State {
         state: TalkState,
@@ -1726,11 +1789,30 @@ impl TalkClientFrame {
                 audio_sequence,
                 media_type,
                 audio_base64,
-                ..
+                last,
+                utterance_id,
             } => {
                 validate_talk_audio_sequence(*audio_sequence)?;
                 validate_talk_media_type(media_type)?;
                 validate_talk_audio(audio_base64)?;
+                // Only the closing frame queues a turn, so only the closing
+                // frame needs the key it is queued under. Refused rather than
+                // defaulted: a fallback identity is the hole this field exists
+                // to close, and it would be invisible -- the turn would run,
+                // and only a restart would show that it ran twice.
+                match (last, utterance_id.as_deref()) {
+                    (true, None) => {
+                        return Err(
+                            "A Talk utterance must carry an utterance_id on its final audio frame"
+                                .to_string(),
+                        )
+                    }
+                    (true, Some(utterance_id)) => validate_talk_utterance_id(utterance_id)?,
+                    // Ignored on a mid-utterance frame rather than refused: a
+                    // device that stamps every chunk is not doing anything
+                    // wrong, and the closing frame is what is read.
+                    (false, _) => {}
+                }
             }
             TalkClientFrameKind::State { .. } => {}
             TalkClientFrameKind::Interrupt { reason } => {
@@ -1788,6 +1870,31 @@ pub enum TalkServerFrameKind {
     State {
         state: TalkState,
     },
+    /// One utterance now exists as a durable turn, and the device may delete
+    /// the recording it has been holding.
+    ///
+    /// # Why this is not "we received your audio"
+    ///
+    /// Three different moments could plausibly acknowledge an utterance, and
+    /// only one of them is safe to forget a recording on:
+    ///
+    ///   audio received  ≠  transcription completed  ≠  durable turn accepted
+    ///
+    /// A crash after the first two leaves nothing: no row, no job, no run. A
+    /// device that had deleted its recording would have lost what somebody
+    /// said, with no way to know it had. This frame is emitted only after
+    /// [`TalkTurns::submit`](super::talk::TalkTurns::submit) has returned — the
+    /// user row is written and the job is queued under the utterance's own
+    /// idempotency key — so from here on a re-send is not merely safe, it is
+    /// unnecessary: it would collapse onto `run_id`.
+    ///
+    /// `run_id` is carried so a device that loses the socket before the answer
+    /// arrives can recover through the durable conversation rather than by
+    /// speaking again.
+    TurnAccepted {
+        utterance_id: String,
+        run_id: String,
+    },
     Transcript {
         text: String,
         is_final: bool,
@@ -1817,6 +1924,17 @@ impl TalkServerFrame {
         )?;
         match &self.kind {
             TalkServerFrameKind::Ready | TalkServerFrameKind::State { .. } => {}
+            TalkServerFrameKind::TurnAccepted {
+                utterance_id,
+                run_id,
+            } => {
+                validate_talk_utterance_id(utterance_id)?;
+                // `validate_id` rather than the stricter Talk token alphabet: a
+                // run id is minted by the queue, not by this protocol, and it
+                // may carry `.` or `:`. Refusing one here would turn a
+                // successfully accepted turn into a dead socket.
+                validate_id(run_id)?;
+            }
             TalkServerFrameKind::Transcript { text, .. }
             | TalkServerFrameKind::AssistantDelta { text } => {
                 validate_talk_text("Talk text", text, MAX_TALK_TEXT_BYTES)?;
@@ -1893,12 +2011,24 @@ impl TalkSequenceTracker {
 }
 
 fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
-    if protocol_version != TALK_PROTOCOL_VERSION {
-        return Err(format!(
-            "Unsupported Talk protocol version {protocol_version}"
-        ));
+    if protocol_version == TALK_PROTOCOL_VERSION {
+        return Ok(());
     }
-    Ok(())
+    // A page that was already open when this runner was upgraded. Named
+    // exactly, because the fix is one the person can perform and an opaque
+    // "unsupported version" would not tell them to.
+    if matches!(
+        protocol_version,
+        TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID | TALK_PROTOCOL_VERSION_WITHOUT_ACCEPTANCE
+    ) {
+        return Err(
+            "This Talk client is from an older version of the app; reload the page to continue"
+                .to_string(),
+        );
+    }
+    Err(format!(
+        "Unsupported Talk protocol version {protocol_version}"
+    ))
 }
 
 fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
@@ -1908,6 +2038,18 @@ fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
         ));
     }
     validate_id(session_id)
+}
+
+/// The device's own name for one utterance.
+///
+/// Bounded and character-restricted like every other identifier that crosses
+/// this boundary, because it becomes part of a durable key: it reaches
+/// `submit_conversation_turn` as the client key and ends up in a job id.
+/// Deliberately *not* required to be base64 or to carry entropy — a device that
+/// names its utterances `1`, `2`, `3` within a session is behaving correctly,
+/// and the value is scoped to the session it arrived on.
+fn validate_talk_utterance_id(utterance_id: &str) -> Result<(), String> {
+    validate_talk_token("utterance id", utterance_id, 1, MAX_TALK_UTTERANCE_ID_BYTES)
 }
 
 fn validate_talk_session_generation(session_generation: &str) -> Result<(), String> {
@@ -2746,6 +2888,39 @@ mod tests {
         assert!(validate_capabilities(&capabilities, &scopes).is_ok());
     }
 
+    /// A page that was open across the upgrade is told what to do about it.
+    ///
+    /// v1 accepted a closing audio frame with no utterance id and v2 refuses
+    /// one, which is a change to what a v1 frame *means* rather than an
+    /// addition to it. Without the version bump such a client would keep
+    /// speaking v1 and have every utterance refused by a field-level error it
+    /// cannot interpret; with it, the session is refused once, by version, with
+    /// the one instruction that fixes it.
+    #[test]
+    fn a_client_from_before_the_utterance_id_is_told_to_reload() {
+        let mut frame = client_talk_frame(
+            1,
+            TalkClientFrameKind::Hello {
+                media_type: "audio/webm;codecs=opus".into(),
+                sample_rate_hz: 48_000,
+                channels: 1,
+            },
+        );
+        frame.protocol_version = TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID;
+        let error = frame.validate().expect_err("a v1 client must be refused");
+        assert!(error.contains("reload the page"), "{error}");
+
+        // A version this build has never spoken gets the generic refusal —
+        // telling somebody to reload would not help them.
+        frame.protocol_version = 99;
+        let error = frame.validate().expect_err("an unknown version is refused");
+        assert!(
+            error.contains("Unsupported Talk protocol version 99"),
+            "{error}"
+        );
+        assert!(!error.contains("reload"), "{error}");
+    }
+
     fn talk_generation() -> String {
         random_token(TALK_SESSION_GENERATION_RANDOM_BYTES).unwrap()
     }
@@ -2807,6 +2982,7 @@ mod tests {
                     media_type: "audio/webm;codecs=opus".into(),
                     audio_base64: audio.clone(),
                     last: false,
+                    utterance_id: None,
                 },
             ),
             client_talk_frame(
@@ -2883,6 +3059,7 @@ mod tests {
                 media_type: "audio/webm".into(),
                 audio_base64: STANDARD.encode(b"audio"),
                 last: false,
+                utterance_id: None,
             },
         );
         frame.protocol_version += 1;
@@ -2896,6 +3073,7 @@ mod tests {
             media_type: "video/webm".into(),
             audio_base64: STANDARD.encode(b"audio"),
             last: false,
+            utterance_id: None,
         };
         assert!(frame.validate().is_err());
         frame.kind = TalkClientFrameKind::Audio {
@@ -2903,6 +3081,7 @@ mod tests {
             media_type: "audio/webm".into(),
             audio_base64: STANDARD.encode(vec![0; MAX_TALK_AUDIO_BYTES + 1]),
             last: false,
+            utterance_id: None,
         };
         assert!(frame.validate().is_err());
 

@@ -164,6 +164,48 @@ pub enum ChannelsCmd {
     MarkCredential { account_id: String },
     /// Remove an account and its stored credential.
     Remove { account_id: String },
+    /// How this machine's webhook listener is reached from the internet: the
+    /// URL you publish yourself, or a tunnel the daemon runs on your behalf
+    /// using your own tunnel account.
+    #[command(subcommand)]
+    Exposure(ExposureCmd),
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ExposureCmd {
+    /// What is configured, what state it is in, and the public base in force.
+    /// Never prints a credential.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Go back to publishing the URL yourself. Stops any managed tunnel; the
+    /// URL you set with `set-public-url` comes back into force.
+    Manual,
+    /// Let the daemon run your own tunnel client.
+    ///
+    /// Everything here is yours: your tunnel provider account, your hostname,
+    /// a binary you installed. This project operates no relay and holds no
+    /// account of its own.
+    Tunnel {
+        /// Which tunnel client. Currently: cloudflared.
+        provider: String,
+        /// The hostname you configured in your tunnel provider's console, on
+        /// its own — `monkey.example.com`, not a URL.
+        #[arg(long)]
+        hostname: String,
+        /// Full path to the installed tunnel client.
+        #[arg(long)]
+        executable: String,
+        /// Loopback port the client serves its own readiness on.
+        #[arg(long)]
+        metrics_port: Option<u16>,
+    },
+    /// Store the tunnel credential, read from stdin so it never lands in a
+    /// shell history or a process listing.
+    SetToken,
+    /// Forget the tunnel credential.
+    ClearToken,
 }
 
 /// The scope and target of one route, shared by `add-route` and
@@ -268,6 +310,113 @@ pub async fn dispatch(action: &ChannelsCmd) -> Result<(), String> {
         ChannelsCmd::CallbackUrl { account_id, json } => callback_url(account_id, *json),
         ChannelsCmd::MarkCredential { account_id } => mark_credential(account_id),
         ChannelsCmd::Remove { account_id } => remove(account_id),
+        ChannelsCmd::Exposure(command) => exposure(command),
+    }
+}
+
+fn exposure(command: &ExposureCmd) -> Result<(), String> {
+    use crate::daemon::callback_exposure as exposure;
+    match command {
+        ExposureCmd::Status { json } => {
+            let store = store()?;
+            let status = exposure::status(&store, &KeyringChannelSecrets);
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&status).map_err(|error| error.to_string())?
+                );
+                return Ok(());
+            }
+            println!(
+                "{} — {}{}",
+                match status.mode {
+                    exposure::ExposureMode::Manual => "You publish the URL yourself",
+                    exposure::ExposureMode::ManagedTunnel => "Little Monkey runs your tunnel",
+                },
+                status.state.as_str(),
+                status
+                    .public_base
+                    .as_deref()
+                    .map(|base| format!(" at {base}"))
+                    .unwrap_or_default()
+            );
+            if let Some(error) = &status.last_error {
+                println!("Last failure: {error}");
+            }
+            // Said outright, because every other line here describes what is
+            // *configured* and this is the nearest thing to the question
+            // somebody actually has. Nearest, not the same: a live tunnel is the
+            // transport, and whether the hostname routes to this machine is set
+            // in the provider's dashboard where nothing local can look. A manual
+            // URL is never reported as connected at all — this machine cannot
+            // see the far side of a proxy it does not run.
+            println!(
+                "The tunnel {}.",
+                if status.state.is_tunnel_connected() {
+                    "reports a live connection to its provider's edge; its hostname must also route \
+                     to this machine's webhook listener"
+                } else {
+                    "does not report a live connection, so nothing is arriving through it"
+                }
+            );
+            Ok(())
+        }
+        ExposureCmd::Manual => {
+            let mut store = store()?;
+            let mut config = exposure::read_config(&store);
+            config.mode = exposure::ExposureMode::Manual;
+            exposure::write_config(&mut store, &config)?;
+            println!(
+                "Managed exposure is off. Any URL set with `set-public-url` is in force again."
+            );
+            Ok(())
+        }
+        ExposureCmd::Tunnel {
+            provider,
+            hostname,
+            executable,
+            metrics_port,
+        } => {
+            let provider = exposure::TunnelProvider::parse(provider)
+                .ok_or_else(|| format!("Unknown tunnel provider '{provider}' (cloudflared)"))?;
+            let hostname = exposure::validate_hostname(hostname)?;
+            let executable = exposure::validate_executable(executable)?;
+            let mut store = store()?;
+            let mut config = exposure::read_config(&store);
+            config.mode = exposure::ExposureMode::ManagedTunnel;
+            config.provider = Some(provider);
+            config.hostname = Some(hostname.clone());
+            config.executable = Some(executable);
+            config.metrics_port = *metrics_port;
+            exposure::write_config(&mut store, &config)?;
+            // Never a claim that it is up: the supervisor decides that, and
+            // saying "connected" here would be exactly the fake status this
+            // project refuses to print.
+            println!("Callbacks will be advertised under https://{hostname}.");
+            println!("{}", provider.prerequisite());
+            if !KeyringChannelSecrets
+                .get(exposure::TUNNEL_CREDENTIAL_REF)
+                .map(|token| !token.is_empty())
+                .unwrap_or(false)
+            {
+                println!(
+                    "No tunnel credential is stored yet — run `monkey channels exposure \
+                     set-token` and paste it on stdin."
+                );
+            }
+            Ok(())
+        }
+        ExposureCmd::SetToken => {
+            let token = read_secret_from_stdin()?;
+            KeyringChannelSecrets.put(exposure::TUNNEL_CREDENTIAL_REF, &token)?;
+            println!("Tunnel credential saved to the OS keychain.");
+            Ok(())
+        }
+        ExposureCmd::ClearToken => {
+            KeyringChannelSecrets.delete(exposure::TUNNEL_CREDENTIAL_REF)?;
+            println!("Tunnel credential removed.");
+            Ok(())
+        }
     }
 }
 
@@ -288,6 +437,20 @@ fn now_ms() -> i64 {
 /// JSON view of an account. Deliberately not the storage struct: this one can
 /// never grow a secret field, because it has nowhere to put one.
 fn account_json(account: &ChannelAccountRecord) -> serde_json::Value {
+    account_json_with(account, Default::default())
+}
+
+/// The same view, plus the refusal tally the store holds separately.
+///
+/// Split so `list` can read the tally once per account without every other
+/// caller having to. A provider whose deliveries stopped authenticating has no
+/// other symptom — messages simply stop — so this is the one number that turns
+/// a rotated secret from a mystery into a sentence, and the panel shows it the
+/// way the telephony panel shows the same thing for a carrier.
+fn account_json_with(
+    account: &ChannelAccountRecord,
+    rejections: crate::daemon::telecom_store::CallbackRejections,
+) -> serde_json::Value {
     serde_json::json!({
         "account_id": account.account_id,
         "kind": account.kind.as_str(),
@@ -301,15 +464,40 @@ fn account_json(account: &ChannelAccountRecord) -> serde_json::Value {
         "last_error": account.health.last_error,
         "last_probe_at_ms": account.health.probed_at_ms,
         "non_secret_config": account.non_secret_config,
+        // How this machine recognises one of its own messages coming back, and
+        // whether the stored reply policy is one it is allowed to run under.
+        // Both are shown, because the panel has to be able to say "what you
+        // configured is not what is in force" rather than silently rendering a
+        // setting the ingress narrows.
+        "echo_correlation":
+            crate::daemon::channel_adapter::echo_correlation_for(account).as_str(),
+        "reply_policy_restricted":
+            !crate::daemon::channel_adapter::echo_correlation_for(account).is_host_verifiable()
+                && account.access_policy.unsafe_without_echo_correlation(),
         "created_at_ms": account.created_at_ms,
         "updated_at_ms": account.updated_at_ms,
+        "callback_rejections": {
+            "count": rejections.count,
+            // The verifier's own reason code, never a body or a header.
+            "last_reason": rejections.last_reason,
+            "last_at_ms": rejections.last_at_ms,
+        },
     })
 }
 
 pub fn list(json: bool) -> Result<(), String> {
-    let accounts = store()?.channel_accounts()?;
+    let store = store()?;
+    let accounts = store.channel_accounts()?;
     if json {
-        let rows: Vec<serde_json::Value> = accounts.iter().map(account_json).collect();
+        let rows: Vec<serde_json::Value> = accounts
+            .iter()
+            .map(|account| {
+                let rejections = store
+                    .channel_callback_rejections(&account.account_id)
+                    .unwrap_or_default();
+                account_json_with(account, rejections)
+            })
+            .collect();
         println!("{}", serde_json::json!({ "accounts": rows }));
         return Ok(());
     }
@@ -520,6 +708,22 @@ pub fn set_token(account_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One secret, from stdin. Never an argument: an argument is visible to every
+/// process on the machine and lands in a shell history.
+fn read_secret_from_stdin() -> Result<String, String> {
+    use std::io::BufRead;
+    let mut secret = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut secret)
+        .map_err(|error| format!("Could not read the credential from stdin: {error}"))?;
+    let secret = secret.trim().to_string();
+    if secret.is_empty() {
+        return Err("No credential was supplied on stdin".to_string());
+    }
+    Ok(secret)
+}
+
 /// Point the account at its keychain entry after the app stored one there.
 pub fn mark_credential(account_id: &str) -> Result<(), String> {
     let mut store = store()?;
@@ -617,6 +821,21 @@ pub fn set_policy(
             GroupActivation::parse(value).ok_or_else(|| {
                 format!("Unknown activation '{value}' (always|mention_only|disabled)")
             })?;
+    }
+    // Refused here as well as clamped at the ingress. The clamp is what keeps
+    // an account configured before this rule existed safe; this is what stops
+    // somebody storing a setting the account will never honour and then
+    // wondering why an open inbox is not open.
+    let correlation = crate::daemon::channel_adapter::echo_correlation_for(&account);
+    if !correlation.is_host_verifiable() && account.access_policy.unsafe_without_echo_correlation()
+    {
+        return Err(format!(
+            "'{account_id}' is served by an extension that does not report provider message ids, \
+             so this machine cannot tell one of its own messages coming back. An open inbox, or \
+             answering every message in a group, could then answer itself forever. Update the \
+             extension and set echo_correlation=provider_message_id on the account, or choose a \
+             narrower policy."
+        ));
     }
     account.updated_at_ms = now_ms();
     store.upsert_channel_account(&account)?;

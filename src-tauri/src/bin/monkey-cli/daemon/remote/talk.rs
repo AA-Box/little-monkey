@@ -160,6 +160,12 @@ pub struct TalkSessionLatency {
 pub struct TalkSessionReport {
     pub utterances: u32,
     pub turns_submitted: u32,
+    /// Utterances the device was told it may stop holding, because the turn
+    /// exists durably. Counted where `turns_submitted` is not: that one is
+    /// raised when an answer has finished streaming, so the gap between them is
+    /// the population this whole recovery path exists for — turns that were
+    /// accepted and whose answer the device never saw.
+    pub accepted: u32,
     pub interruptions: u32,
     pub spoken_chunks: u32,
     /// Errors reported to the device. A misconfigured speech backend ends a
@@ -351,6 +357,7 @@ pub async fn run_talk_session(
         inbound: TalkSequenceTracker::default(),
         utterance: Vec::new(),
         utterance_media_type: None,
+        utterance_id: None,
         utterance_index: 0,
         greeted: false,
         revoked: false,
@@ -469,6 +476,7 @@ pub async fn run_talk_session(
                 media_type,
                 audio_base64,
                 last,
+                utterance_id,
             } => {
                 let Ok(bytes) = STANDARD.decode(&audio_base64) else {
                     session.report.errors += 1;
@@ -510,6 +518,10 @@ pub async fn run_talk_session(
                 if !last {
                     continue;
                 }
+                // The device's own name for this utterance, validated by
+                // `TalkClientFrame::validate` before the frame got here, which
+                // is why the closing frame always has one.
+                session.utterance_id = utterance_id;
                 if session
                     .answer_utterance(socket, speech, turns)
                     .await
@@ -585,6 +597,13 @@ struct Session {
     inbound: TalkSequenceTracker,
     utterance: Vec<u8>,
     utterance_media_type: Option<String>,
+    /// The device's own name for the utterance currently being accumulated.
+    ///
+    /// Set from the frame that closes it and taken when the turn is queued, so
+    /// it can never be inherited by the next one — the interrupt path answers a
+    /// second utterance in the same pass, and reusing this id would collapse
+    /// two different things somebody said into one run.
+    utterance_id: Option<String>,
     utterance_index: u32,
     greeted: bool,
     /// Set when the grant went away mid-answer. The socket is finished; the run
@@ -733,12 +752,32 @@ impl Session {
         .await?;
 
         // The utterance's stable identity, so a resubmitted turn collapses onto
-        // the run the first attempt made.
-        let client_key = format!(
-            "talk-{}-{}",
-            &self.identity.session_generation[..16.min(self.identity.session_generation.len())],
-            self.utterance_index
-        );
+        // the run the first attempt made — *including across a restart*, which
+        // is the whole reason this comes from the device.
+        //
+        // The runner cannot mint an identity that survives one: a session
+        // generation is per socket, and the utterance counter restarts with it.
+        // A device that reconnects after a restart and retransmits the
+        // recording it never got an answer for is the case that matters, and
+        // only the device knows that is what it is doing.
+        //
+        // Scoped by session as well as by the device's name, so two sessions
+        // that both call their first utterance `1` stay two utterances. Absent
+        // is unreachable — `validate` refuses a closing audio frame without one
+        // — and is treated as a refusal rather than silently keyed some other
+        // way, because the failure would be invisible until a restart.
+        let Some(utterance_id) = self.utterance_id.take() else {
+            self.report.fallbacks += 1;
+            return self
+                .fail_turn(
+                    socket,
+                    "utterance_unidentified",
+                    "That utterance arrived without an id, so it cannot be answered exactly once.",
+                    true,
+                )
+                .await;
+        };
+        let client_key = format!("talk-{}-{}", self.identity.session_id, utterance_id);
         let run_id = match turns.submit(&self.identity.session_id, &client_key, &text) {
             Ok(run_id) => run_id,
             Err(error) => {
@@ -746,6 +785,21 @@ impl Session {
                 return self.fail_turn(socket, "turn_refused", &error, true).await;
             }
         };
+        // The device has been holding this recording since before the socket
+        // existed, and this is the first moment it is safe to let go of: the
+        // user row is written and the job is queued under `client_key`, so a
+        // crash from here on is recovered by the queue rather than by somebody
+        // saying it again. Emitted before the answer streams, because the
+        // answer is exactly what may not arrive.
+        self.report.accepted += 1;
+        self.emit(
+            socket,
+            TalkServerFrameKind::TurnAccepted {
+                utterance_id,
+                run_id: run_id.clone(),
+            },
+        )
+        .await?;
         let outcome = self
             .stream_answer(socket, speech, turns, &run_id, turn_started)
             .await;
@@ -1043,6 +1097,7 @@ impl Session {
                     media_type,
                     audio_base64,
                     last,
+                    utterance_id,
                 } => {
                     self.retain_interrupting_audio(
                         audio_sequence,
@@ -1050,6 +1105,13 @@ impl Session {
                         &audio_base64,
                         last,
                     );
+                    // The interrupting audio becomes the next turn, so it needs
+                    // its own identity exactly as an ordinary utterance does —
+                    // and it must be *its* id, not the one the turn being
+                    // interrupted was queued under.
+                    if last {
+                        self.utterance_id = utterance_id;
+                    }
                     Interjection::Interrupt
                 }
                 TalkClientFrameKind::Metrics {
@@ -1294,6 +1356,16 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// A queue that will not take the turn — the case where nothing durable
+        /// exists and the device must keep its recording.
+        fn refusing() -> Self {
+            Self {
+                refuse: true,
+                granted: Arc::new(Mutex::new(true)),
+                ..Self::default()
+            }
+        }
     }
 
     impl TalkTurns for FakeTurns {
@@ -1383,12 +1455,29 @@ mod tests {
         )
     }
 
+    /// One audio frame, with the utterance id a device would stamp on a closing
+    /// one derived from the audio sequence so each utterance gets its own.
     fn audio(
         identity: &TalkIdentity,
         sequence: u64,
         audio_sequence: u64,
         payload: &[u8],
         last: bool,
+    ) -> String {
+        let named = format!("utt-{audio_sequence}");
+        audio_named(identity, sequence, audio_sequence, payload, last, &named)
+    }
+
+    /// The same, with the device's name for the utterance chosen by the caller
+    /// — what a restart test needs, because that name is the only thing that
+    /// survives one.
+    fn audio_named(
+        identity: &TalkIdentity,
+        sequence: u64,
+        audio_sequence: u64,
+        payload: &[u8],
+        last: bool,
+        utterance_id: &str,
     ) -> String {
         client_frame(
             identity,
@@ -1398,6 +1487,8 @@ mod tests {
                 media_type: "audio/webm;codecs=opus".into(),
                 audio_base64: STANDARD.encode(payload),
                 last,
+                // Only a closing frame queues a turn, so only it needs a key.
+                utterance_id: last.then(|| utterance_id.to_string()),
             },
         )
     }
@@ -1432,6 +1523,281 @@ mod tests {
 
     /// The whole point of the module: what somebody says becomes exactly one
     /// ordinary turn, its answer streams back as text, and that text is spoken.
+    /// The restart leg: the daemon dies mid-turn, the device reconnects on a
+    /// brand-new ticket, and retransmits the utterance it never got an answer
+    /// for. It must land on the run the first attempt made.
+    ///
+    /// The second session really is a second session — a fresh
+    /// `session_generation`, which is what the ticket mints and what the
+    /// anti-replay check requires. That is exactly why the identity cannot come
+    /// from this side: a generation, and the utterance counter that goes with
+    /// it, are per socket. Before the device named its own utterance, this test
+    /// could only be written by preserving the old generation by hand, which
+    /// proves dedupe inside one session and says nothing about a restart.
+    ///
+    /// A Talk turn can send a message or place a call, so a duplicate here is a
+    /// duplicated external effect, not a repeated sentence.
+    #[tokio::test]
+    async fn the_same_utterance_after_a_restart_lands_on_the_run_it_already_made() {
+        let turns = FakeTurns::answering(&["The deploy finished."]);
+
+        let first = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&first),
+            audio_named(&first, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let report = run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            first.clone(),
+        )
+        .await;
+        assert_eq!(report.turns_submitted, 1);
+
+        // RESTART. The device reconnects: new ticket, new generation, and its
+        // utterance counter starts over at zero.
+        let mut after_restart = identity();
+        assert_ne!(
+            after_restart.session_generation, first.session_generation,
+            "a reconnect mints a new generation -- that is the anti-replay rule"
+        );
+        after_restart.session_id = first.session_id.clone();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&after_restart),
+            // The same recording, under the same name the device gave it.
+            audio_named(&after_restart, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            after_restart,
+        )
+        .await;
+
+        let submitted = turns.submitted.lock().unwrap().clone();
+        assert_eq!(submitted.len(), 2, "both attempts reached the queue");
+        assert_eq!(
+            submitted[0].0, submitted[1].0,
+            "the same utterance must be queued under the same key across the restart, so the \
+             queue collapses it onto the run the first attempt made"
+        );
+        assert!(
+            submitted[0].0.contains("utt-a1b2c3"),
+            "the key is the device's own name for the utterance: {}",
+            submitted[0].0
+        );
+    }
+
+    /// Pull every acceptance out of what the runner sent, as `(utterance,
+    /// run)`.
+    fn acceptances(frames: &[TalkServerFrame]) -> Vec<(String, String)> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.kind {
+                TalkServerFrameKind::TurnAccepted {
+                    utterance_id,
+                    run_id,
+                } => Some((utterance_id.clone(), run_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The frame a device deletes a recording on, and *where* it appears.
+    ///
+    /// Position is the assertion, not decoration. Anything emitted before the
+    /// turn is durable would be an acknowledgement of a process rather than of
+    /// a row, and a device that acted on it would drop the only copy of what
+    /// somebody said the moment the runner crashed.
+    #[tokio::test]
+    async fn a_durably_accepted_utterance_is_acknowledged_before_its_answer() {
+        let turns = FakeTurns::answering(&["The deploy finished."]);
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio_named(&identity, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let sent = socket.sent.clone();
+        let report = run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            identity,
+        )
+        .await;
+
+        let frames = sent.lock().unwrap().clone();
+        assert_eq!(
+            acceptances(&frames),
+            vec![(
+                "utt-a1b2c3".to_string(),
+                turns.submitted.lock().unwrap()[0].0.clone()
+            )]
+            .into_iter()
+            .map(|(utterance, key)| (utterance, format!("run-{key}")))
+            .collect::<Vec<_>>(),
+            "the acknowledgement names the utterance and the run it became"
+        );
+        assert_eq!(report.accepted, 1);
+
+        let accepted_at = frames
+            .iter()
+            .position(|frame| matches!(frame.kind, TalkServerFrameKind::TurnAccepted { .. }))
+            .expect("an acceptance was sent");
+        let first_answer = frames
+            .iter()
+            .position(|frame| matches!(frame.kind, TalkServerFrameKind::AssistantDelta { .. }))
+            .expect("the answer streamed");
+        assert!(
+            accepted_at < first_answer,
+            "a device must be free to drop its recording before the answer, because the \
+             answer is exactly the part that may never arrive"
+        );
+    }
+
+    /// The other half of the rule: a turn that never became durable is never
+    /// acknowledged, so the device keeps the audio and can offer to send it
+    /// again.
+    #[tokio::test]
+    async fn a_refused_turn_is_never_acknowledged() {
+        let turns = FakeTurns::refusing();
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio_named(&identity, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let sent = socket.sent.clone();
+        let report =
+            run_talk_session(&mut socket, &FakeSpeech::new("anything"), &turns, identity).await;
+
+        assert_eq!(report.accepted, 0);
+        assert!(
+            acceptances(&sent.lock().unwrap()).is_empty(),
+            "nothing durable exists, so nothing may tell the device to let go of the audio"
+        );
+        assert!(
+            sent.lock().unwrap().iter().any(|frame| matches!(
+                &frame.kind,
+                TalkServerFrameKind::Error { code, retryable, .. }
+                    if code == "turn_refused" && *retryable
+            )),
+            "and the refusal is retryable, which is what makes the retry offer honest"
+        );
+    }
+
+    /// Re-sending across a restart: one run, and an acknowledgement each time.
+    ///
+    /// The second acknowledgement is the piece that makes recovery terminate. A
+    /// device that re-sent and heard nothing back would keep the recording and
+    /// keep offering to send it, forever, against a turn that has been finished
+    /// for hours.
+    #[tokio::test]
+    async fn re_sending_after_a_restart_is_acknowledged_with_the_same_run() {
+        let turns = FakeTurns::answering(&["The deploy finished."]);
+
+        let first = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&first),
+            audio_named(&first, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let first_sent = socket.sent.clone();
+        run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            first.clone(),
+        )
+        .await;
+
+        let mut after_restart = identity();
+        after_restart.session_id = first.session_id.clone();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&after_restart),
+            audio_named(&after_restart, 2, 1, b"deploy?", true, "utt-a1b2c3"),
+        ]);
+        let second_sent = socket.sent.clone();
+        run_talk_session(
+            &mut socket,
+            &FakeSpeech::new("what is the deploy status"),
+            &turns,
+            after_restart,
+        )
+        .await;
+
+        let before = acceptances(&first_sent.lock().unwrap());
+        let after = acceptances(&second_sent.lock().unwrap());
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            before, after,
+            "same utterance, same run -- the retry landed on the turn the first attempt made \
+             rather than starting a second one"
+        );
+    }
+
+    /// A different utterance in the same session is a different turn -- the key
+    /// must not be so coarse that it swallows the next thing somebody says.
+    #[tokio::test]
+    async fn two_utterances_in_one_session_are_two_turns() {
+        let identity = identity();
+        let mut socket = ScriptedSocket::new(vec![
+            hello(&identity),
+            audio_named(&identity, 2, 1, b"one", true, "utt-one"),
+            audio_named(&identity, 3, 2, b"two", true, "utt-two"),
+        ]);
+        let turns = FakeTurns::answering(&["ok"]);
+
+        run_talk_session(&mut socket, &FakeSpeech::new("something"), &turns, identity).await;
+
+        let submitted = turns.submitted.lock().unwrap().clone();
+        assert_eq!(submitted.len(), 2);
+        assert_ne!(submitted[0].0, submitted[1].0);
+    }
+
+    /// A closing audio frame with no utterance id is refused at the protocol
+    /// boundary, before it can be queued under an identity the runner invented.
+    ///
+    /// The fallback is the hole: a client that omitted the field would silently
+    /// get back the per-socket key, and nothing about the running system would
+    /// show it until a restart duplicated an effect.
+    #[test]
+    fn a_closing_audio_frame_without_an_utterance_id_is_refused() {
+        let identity = identity();
+        let raw = client_frame(
+            &identity,
+            2,
+            TalkClientFrameKind::Audio {
+                audio_sequence: 1,
+                media_type: "audio/webm;codecs=opus".into(),
+                audio_base64: STANDARD.encode(b"unnamed"),
+                last: true,
+                utterance_id: None,
+            },
+        );
+        let frame: TalkClientFrame = serde_json::from_str(&raw).expect("parses");
+        let error = frame.validate().expect_err("must be refused");
+        assert!(error.contains("utterance_id"), "{error}");
+
+        // A mid-utterance frame needs none: it queues nothing.
+        let raw = client_frame(
+            &identity,
+            3,
+            TalkClientFrameKind::Audio {
+                audio_sequence: 2,
+                media_type: "audio/webm;codecs=opus".into(),
+                audio_base64: STANDARD.encode(b"more"),
+                last: false,
+                utterance_id: None,
+            },
+        );
+        serde_json::from_str::<TalkClientFrame>(&raw)
+            .expect("parses")
+            .validate()
+            .expect("a mid-utterance frame carries no key");
+    }
+
     #[tokio::test]
     async fn one_utterance_becomes_one_turn_and_its_answer_is_spoken() {
         let identity = identity();

@@ -118,7 +118,8 @@ pub(crate) async fn handle_media_upgrade(
     if call.account_id != account_id || call.state.is_terminal() {
         return refuse();
     }
-    let Ok(provider) = super::telephony::provider_for_account(&account, secret) else {
+    let base = store.telecom_callback_base(&account);
+    let Ok(provider) = super::telephony::provider_for_account(&account, secret, base) else {
         return refuse();
     };
     if provider.media_stream().is_none() {
@@ -286,7 +287,8 @@ async fn end_dropped_call(paths: DaemonPaths, account_id: String, call_id: Strin
         .flatten()
         .and_then(|account| {
             let secret = account_secret(&account)?;
-            super::telephony::provider_for_account(&account, secret).ok()
+            let base = store.telecom_callback_base(&account);
+            super::telephony::provider_for_account(&account, secret, base).ok()
         });
     let Ok(now_ms) = super::now_ms()
         .and_then(|value| i64::try_from(value).map_err(|_| "clock is beyond bounds".to_string()))

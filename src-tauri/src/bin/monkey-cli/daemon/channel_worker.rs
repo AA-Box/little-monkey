@@ -31,6 +31,7 @@ use std::sync::Arc;
 use little_monkey_lib::channels::ingress::{
     ConversationIngress, FrozenExecutionContext, FrozenExecutionContextV1,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{ChannelEnvelope, SendOutcome};
 
 use super::channel_adapter::ChannelAdapter;
@@ -579,6 +580,72 @@ pub(crate) async fn drain_outbox_once(
                 provider_message_id,
             } => {
                 report.sent += 1;
+                // The causal half of self-echo suppression, and the only half
+                // the host can stand behind: this is the provider's own id for
+                // a message *we* just committed to sending, so an inbound
+                // message carrying it is ours no matter what its envelope
+                // claims about its sender.
+                //
+                // Written before the outbox row is completed. The two are not
+                // in one transaction and do not need to be — the failure this
+                // ordering avoids is the asymmetric one: a crash between them
+                // leaves an id remembered for a send that is retried, which
+                // costs a redundant row, whereas the other order would leave a
+                // sent message with no id remembered and a real echo answered.
+                //
+                // Recorded only for a transport that also carries the id
+                // *inbound*. A built-in adapter's self-echo is decided by host
+                // code already, so remembering ids nothing will ever look up
+                // would be a table that grows for no reader.
+                let correlates = matches!(
+                    adapter.capabilities().echo_correlation,
+                    EchoCorrelation::ProviderMessageId
+                );
+                if let (true, Some(provider_message_id)) = (correlates, provider_message_id) {
+                    if let Err(error) = store.record_outbound_echo(
+                        &row.account_id,
+                        &row.conversation_id,
+                        row.thread_id.as_deref(),
+                        provider_message_id,
+                        &row.outbox_id,
+                        now_ms,
+                    ) {
+                        // The message is already out. It cannot be unsent, and
+                        // re-sending it would post it twice — so there is no
+                        // retry here, and the id is simply not remembered.
+                        //
+                        // That is a hole in the only evidence this account uses
+                        // to recognise its own echo, and the one thing that must
+                        // not happen is for it to go unnoticed: the provider is
+                        // about to echo a message back that nothing will match,
+                        // and an account set to answer everyone would answer
+                        // itself. So the account stops claiming a guarantee it
+                        // no longer has, for as long as the unrecorded id could
+                        // still come back.
+                        eprintln!(
+                            "monkey daemon: outbound message id not recorded for account {}: \
+                             {error}",
+                            row.account_id
+                        );
+                        if let Err(error) =
+                            store.mark_echo_correlation_degraded(&row.account_id, now_ms)
+                        {
+                            // Both writes went to the same database, so this
+                            // failing too is the expected shape of a store that
+                            // is wholly unavailable rather than a second
+                            // surprise. It is still said out loud, because the
+                            // ingress's own fallback — an unreadable answer
+                            // counts as degraded — is what covers it, and a
+                            // silent `let _` here is what would leave nobody
+                            // able to tell the two apart.
+                            eprintln!(
+                                "monkey daemon: account {} could not be marked echo-degraded: \
+                                 {error}",
+                                row.account_id
+                            );
+                        }
+                    }
+                }
                 // The outbound event log is what an operator reads to see what
                 // Little Monkey said, and what the inbound side matches a
                 // provider echo against.
@@ -713,7 +780,16 @@ pub(crate) fn spawn_channel_runtime(paths: super::store::DaemonPaths) {
             if now_u64 >= next_reload_ms {
                 next_reload_ms = now_u64.saturating_add(RELOAD_INTERVAL_MS);
                 match DaemonStore::open(&paths) {
-                    Ok(mut store) => reconcile_workers(&paths, &mut store, &queue, &mut workers),
+                    Ok(mut store) => {
+                        reconcile_workers(&paths, &mut store, &queue, &mut workers);
+                        // On the reload tick rather than its own: the echo
+                        // ledger is bounded by age and by rows-per-account, and
+                        // neither bound needs a finer clock than the one that
+                        // already notices an account being enabled.
+                        if let Err(error) = store.prune_outbound_echo(now) {
+                            eprintln!("monkey daemon: echo ledger prune paused: {error}");
+                        }
+                    }
                     Err(error) => eprintln!("monkey daemon: channels paused: {error}"),
                 }
             }
@@ -1191,8 +1267,12 @@ fn build_sms_adapter(
         .parent()
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| "the daemon root has no app-data parent".to_string())?;
+    let public_base_url = store.telecom_callback_base(&telecom);
     Ok(Arc::new(super::adapters::sms::SmsAdapter::new(
-        &telecom, secret, app_data,
+        &telecom,
+        secret,
+        app_data,
+        public_base_url,
     )?))
 }
 
@@ -1259,6 +1339,9 @@ mod tests {
         /// long-polling and webhook provider.
         live: Option<little_monkey_lib::channels::types::HealthState>,
         transport: InboundTransport,
+        /// What this transport declares about supplying provider message ids.
+        /// The default is what every built-in adapter reports.
+        echo_correlation: EchoCorrelation,
     }
 
     impl FakeAdapter {
@@ -1269,6 +1352,17 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
                 live: None,
                 transport: InboundTransport::LongPoll,
+                echo_correlation: EchoCorrelation::HostAdapter,
+            }
+        }
+
+        /// A guest-normalized transport that declares it returns and reports
+        /// the provider's own message ids -- the only kind whose sends are
+        /// remembered in the echo ledger.
+        fn correlating() -> Self {
+            Self {
+                echo_correlation: EchoCorrelation::ProviderMessageId,
+                ..Self::new()
             }
         }
 
@@ -1306,7 +1400,10 @@ mod tests {
         }
 
         fn capabilities(&self) -> ProviderCapabilities {
-            ProviderCapabilities::minimal(ChannelKind::Telegram, self.transport)
+            ProviderCapabilities {
+                echo_correlation: self.echo_correlation,
+                ..ProviderCapabilities::minimal(ChannelKind::Telegram, self.transport)
+            }
         }
 
         fn live_transport(&self) -> Option<little_monkey_lib::channels::types::HealthState> {
@@ -1375,6 +1472,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: event_id.into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("chat-7"),
             sender: ChannelSender::new("user-3"),
             text: "ship it".into(),
@@ -1583,6 +1681,78 @@ mod tests {
 
         // Nothing is left to claim.
         assert!(store.claim_outbox_batch(NOW, 10).unwrap().is_empty());
+    }
+
+    /// The production send path is what writes the echo ledger.
+    ///
+    /// Asserted through `drain_outbox_once` rather than by calling the store
+    /// method directly: the property that matters is that a real send records
+    /// the id, and a helper that records one proves only that the helper works.
+    #[tokio::test]
+    async fn a_correlating_transports_send_records_the_provider_id_the_host_can_match_on() {
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let adapter = Arc::new(FakeAdapter::correlating());
+
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1);
+        assert!(
+            store
+                .is_own_outbound_echo("acct-1", "chat-7", None, "provider-1")
+                .expect("query"),
+            "the id the provider gave our message is what an inbound echo is matched against"
+        );
+    }
+
+    /// And when that write fails, the send has already happened.
+    ///
+    /// The one case with no retry in it: the provider has taken the message, so
+    /// re-sending would post it twice, and the id is simply lost. What must not
+    /// also be lost is the knowledge that it is — the account's echo evidence
+    /// now has a hole the ingress cannot see from the account's declaration, so
+    /// the send path has to say so out loud. The ledger is dropped outright
+    /// here because the cause on a real machine (a full disk, a corrupt page)
+    /// is not reproducible and is not what is being tested: the branch is.
+    #[tokio::test]
+    async fn a_send_whose_id_cannot_be_recorded_degrades_the_account_instead_of_passing_silently() {
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let adapter = Arc::new(FakeAdapter::correlating());
+        store
+            .connection
+            .execute("DROP TABLE channel_outbound_echo", [])
+            .expect("drop the ledger");
+
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1, "the message went out and is not sent again");
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .echo_correlation_degraded("acct-1", NOW)
+                .expect("query"),
+            "an id nothing wrote down is a hole the ingress has to be told about"
+        );
+    }
+
+    /// And a built-in transport records nothing, because nothing would read it.
+    #[tokio::test]
+    async fn a_built_in_transports_send_leaves_no_ledger_row() {
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let adapter = Arc::new(FakeAdapter::new());
+
+        drain_outbox_once(&mut store, &adapters_with(adapter), NOW)
+            .await
+            .expect("drain");
+        assert_eq!(
+            store.outbound_echo_count("acct-1").expect("count"),
+            0,
+            "host code decides its own echo directly; a table nothing reads is one nobody prunes"
+        );
     }
 
     #[tokio::test]

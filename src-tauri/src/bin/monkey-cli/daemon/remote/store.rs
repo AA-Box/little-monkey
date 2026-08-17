@@ -2513,6 +2513,32 @@ impl RemoteStore {
             .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
     }
 
+    /// The most recent commands across all devices, whatever state they ended
+    /// in.
+    ///
+    /// Deliberately *not* [`Self::active_device_commands`], which answers a
+    /// different question. That one exists for Security Doctor — "is a
+    /// microphone open right now" — and a finished command is correctly
+    /// invisible to it. A support bundle is the opposite case: the history
+    /// somebody needs is precisely the commands that already completed, failed,
+    /// expired or were cancelled, because that is where the thing being
+    /// investigated happened. Reading the active set for a postmortem produces
+    /// a trace that is empty exactly when it matters.
+    pub fn recent_device_commands(&self, limit: u32) -> Result<Vec<DeviceCommandRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "{DEVICE_COMMAND_SELECT}
+                 ORDER BY updated_at_ms DESC, command_id DESC LIMIT ?1"
+            ))
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![i64::from(limit.min(500))], read_device_command)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
     /// Every command not yet in a terminal state, across all devices — what the
     /// Security Doctor reads to see whether a microphone is open right now.
     pub fn active_device_commands(&self) -> Result<Vec<DeviceCommandRecord>, String> {

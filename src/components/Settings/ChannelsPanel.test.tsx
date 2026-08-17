@@ -23,6 +23,7 @@ import type {
   ChannelCallback,
   ChannelEvent,
   ChannelRoute,
+  ExposureStatus,
 } from "../../lib/channelsClient";
 
 const BASE: ChannelAccount = {
@@ -39,6 +40,9 @@ const BASE: ChannelAccount = {
   last_probe_at_ms: 0,
   non_secret_config: { helper_path: "/usr/local/bin/signal-cli", account: "+15550000000" },
   created_at_ms: 0,
+  callback_rejections: { count: 0, last_reason: null, last_at_ms: null },
+  echo_correlation: "host_adapter",
+  reply_policy_restricted: false,
   updated_at_ms: 0,
 };
 
@@ -61,12 +65,20 @@ function mockChannels(options: {
   routes?: ChannelRoute[];
   events?: ChannelEvent[];
   callback?: ChannelCallback;
+  exposure?: ExposureStatus | null;
   onCommand?: (command: string, args: unknown) => unknown;
 }) {
   invoke.mockImplementation((command: string, args: unknown) => {
     const custom = options.onCommand?.(command, args);
     if (custom !== undefined) return custom;
     if (command === "channels_list") return Promise.resolve({ accounts: options.accounts });
+    if (command === "channels_exposure_status") {
+      // `null` means a daemon that cannot answer, which must leave the card
+      // absent rather than taking the panel down.
+      return options.exposure === null
+        ? Promise.reject(new Error("no daemon"))
+        : Promise.resolve(options.exposure ?? MANUAL_EXPOSURE);
+    }
     if (command === "channels_routes") return Promise.resolve({ routes: options.routes ?? [ROUTE] });
     if (command === "channels_senders") return Promise.resolve({ pending: [] });
     if (command === "channels_events") return Promise.resolve({ events: options.events ?? [] });
@@ -83,6 +95,13 @@ function mockChannels(options: {
     return Promise.resolve(null);
   });
 }
+
+const MANUAL_EXPOSURE: ExposureStatus = {
+  mode: "manual",
+  state: "not_configured",
+  credentialStored: false,
+  restarts: 0,
+};
 
 function mockAccounts(accounts: ChannelAccount[]) {
   mockChannels({ accounts });
@@ -476,5 +495,314 @@ describe("route management", () => {
         enabled: false,
       }),
     );
+  });
+});
+
+describe("ChannelsPanel state matrix", () => {
+  it("says there is nothing configured rather than showing an empty list", async () => {
+    mockAccounts([]);
+    render(<ChannelsPanel />);
+    expect(await screen.findByText(/no accounts yet/i)).toBeTruthy();
+  });
+
+  it("says it is loading before the first answer, not that there is nothing", async () => {
+    let release: (value: unknown) => void = () => {};
+    invoke.mockImplementation((command: string) => {
+      if (command === "channels_list")
+        return new Promise((resolve) => (release = resolve));
+      return Promise.resolve(null);
+    });
+    render(<ChannelsPanel />);
+    // The distinction that matters: "still asking" must not read as "none".
+    expect(screen.queryByText(/no accounts yet/i)).toBeNull();
+    expect(screen.getByText(/loading messaging channels/i)).toBeTruthy();
+    release({ accounts: [] });
+    await waitFor(() =>
+      expect(screen.queryByText(/no accounts yet/i)).toBeTruthy(),
+    );
+  });
+
+  it("renders each health state as its own word", async () => {
+    // The panel's own words, which is the point: five states that render the
+    // same sentence are five states an operator cannot tell apart.
+    const states: Array<[ChannelAccount["health"], RegExp]> = [
+      ["connected", /^Connected$/],
+      ["connecting", /^Connecting$/],
+      ["degraded", /^Degraded$/],
+      ["disconnected", /^Not checked yet$/],
+      ["unsupported", /^Not supported here$/],
+      ["unconfigured", /^Not set up$/],
+      ["error", /^Error$/],
+    ];
+    for (const [health, shown] of states) {
+      cleanup();
+      mockAccounts([{ ...BASE, enabled: true, health }]);
+      render(<ChannelsPanel />);
+      expect(await screen.findByText(shown)).toBeTruthy();
+    }
+  });
+
+  it("asks for the credential it is missing instead of reporting a failure", async () => {
+    mockAccounts([
+      {
+        ...BASE,
+        kind: "telegram",
+        label: "Team Telegram",
+        enabled: true,
+        credential_required: true,
+        has_credential: false,
+        non_secret_config: {},
+      },
+    ]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Team Telegram"));
+
+    await waitFor(() =>
+      expect(screen.getByText(/No credential saved yet/)).toBeTruthy(),
+    );
+    // And the box to put one in, so the state is actionable rather than a
+    // statement about itself.
+    expect(screen.getByText("Save credential")).toBeTruthy();
+  });
+
+  it("offers a retry that reaches the provider, not just a red line", async () => {
+    mockAccounts([
+      {
+        ...BASE,
+        enabled: true,
+        health: "error",
+        last_error: "gateway refused",
+      },
+    ]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+    expect(await screen.findByText("gateway refused")).toBeTruthy();
+    const probe = await screen.findByRole("button", {
+      name: /test connection/i,
+    });
+    fireEvent.click(probe);
+    await waitFor(() =>
+      expect(
+        invoke.mock.calls.some(([command]) => command === "channels_probe"),
+      ).toBe(true),
+    );
+  });
+
+  it("offers disable and remove on an account that has one", async () => {
+    mockAccounts([{ ...BASE, enabled: true }]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+    // `Disable` is also a policy value in this panel, so the account's own
+    // control is asserted by presence rather than by uniqueness.
+    await waitFor(() =>
+      expect(
+        screen.getAllByRole("button", { name: "Disable" }).length,
+      ).toBeGreaterThan(0),
+    );
+    expect(
+      screen.getAllByRole("button", { name: "Remove" }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  /**
+   * The state this PR added, and the reason it had to exist: a provider whose
+   * deliveries stop authenticating produces no event, no health change and no
+   * error — the messages simply stop. Without this banner the page is honest
+   * about everything except the one thing that is wrong.
+   */
+  it("names a run of refused deliveries and what to check", async () => {
+    mockAccounts([
+      {
+        ...BASE,
+        kind: "whatsapp",
+        enabled: true,
+        health: "connected",
+        callback_rejections: {
+          count: 4,
+          last_reason: "WhatsApp webhook signature verification failed",
+          last_at_ms: 1_800_000_000_000,
+        },
+      },
+    ]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+    expect(await screen.findByText(/4 delivery attempt/i)).toBeTruthy();
+    expect(screen.getByText(/signature verification failed/i)).toBeTruthy();
+    // Actionable: the banner itself names the two things to compare, rather
+    // than only saying that something failed.
+    expect(
+      screen.getByText(
+        /callback URL in the provider's console matches the one shown here/i,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("says nothing about refusals when there have been none", async () => {
+    mockAccounts([{ ...BASE, enabled: true, health: "connected" }]);
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+    await screen.findByText(/^Connected$/);
+    expect(screen.queryByText(/delivery attempt/i)).toBeNull();
+  });
+});
+
+/**
+ * The public-callback card, and what it may never claim.
+ *
+ * A tunnel that is configured and dead is the exact failure this whole feature
+ * exists to make visible, so the interesting assertions are all about the panel
+ * refusing to render "fine" — and about the secret having nowhere to appear.
+ */
+describe("the public callback card", () => {
+  const MANAGED: ExposureStatus = {
+    mode: "managed_tunnel",
+    provider: "cloudflared",
+    state: "connected",
+    publicBase: "https://monkey.example.com",
+    credentialStored: true,
+    executable: "/usr/local/bin/cloudflared",
+    restarts: 0,
+  };
+
+  it("shows the URL in force and the state the daemon reported", async () => {
+    mockChannels({ accounts: [BASE], exposure: MANAGED });
+    render(<ChannelsPanel />);
+
+    await waitFor(() => expect(screen.getByTestId("exposure")).toBeTruthy());
+    const shown = screen.getByTestId("exposure-state").textContent ?? "";
+    // The transport, and only the transport. `/ready` says the client holds a
+    // connection to its provider's edge; whether a request to the hostname
+    // arrives at this machine also needs that hostname's route and origin
+    // service to be right, and both are set in the operator's dashboard where
+    // nothing here can look. A card that promised the end-to-end path from the
+    // half it can see would be the same false confidence as calling a dead
+    // tunnel healthy.
+    expect(shown).toMatch(/Tunnel connected to its provider's edge/);
+    expect(shown).toMatch(/hostname must also point at this machine/);
+    expect(shown).not.toMatch(/reach this machine/);
+    expect(screen.getByText("https://monkey.example.com")).toBeTruthy();
+  });
+
+  it("names each failure as the thing the operator has to fix", async () => {
+    const cases: Array<[ExposureStatus["state"], RegExp]> = [
+      ["helper_missing", /tunnel client is not at the path/],
+      ["credential_missing", /No tunnel token is stored/],
+      ["authentication_failed", /rejected the stored token/],
+      ["public_url_unavailable", /No hostname is set/],
+      ["reconnecting", /Reconnecting after 2 restarts/],
+      ["degraded", /has not reported a live connection/],
+      ["stopped", /Nothing is exposing this machine/],
+      ["connecting", /Starting your tunnel/],
+    ];
+    for (const [state, expected] of cases) {
+      cleanup();
+      mockChannels({
+        accounts: [BASE],
+        exposure: { ...MANAGED, state, restarts: 2 },
+      });
+      render(<ChannelsPanel />);
+      await waitFor(() => expect(screen.getByTestId("exposure-state").textContent).toMatch(expected));
+    }
+  });
+
+  it("never renders a credential, and never asks React to hold one", async () => {
+    mockChannels({
+      accounts: [BASE],
+      exposure: { ...MANAGED, state: "authentication_failed", lastError: "401 Unauthorized" },
+    });
+    render(<ChannelsPanel />);
+
+    await waitFor(() => expect(screen.getByTestId("exposure-error").textContent).toBe("401 Unauthorized"));
+    // The whole rendered panel, searched for anything token-shaped. The status
+    // type has no field for one, and this is the assertion that keeps it that
+    // way if somebody adds one.
+    expect(document.body.textContent).not.toMatch(/eyJ|token=|secret/i);
+  });
+
+  it("does not take the panel down when the background service cannot answer", async () => {
+    mockChannels({ accounts: [BASE], exposure: null });
+    render(<ChannelsPanel />);
+
+    await waitFor(() => expect(screen.getByText("Family Signal")).toBeTruthy());
+    expect(screen.queryByTestId("exposure")).toBeNull();
+  });
+
+  it("sends a fixed provider name and nothing that could be a command", async () => {
+    const calls: Array<[string, unknown]> = [];
+    mockChannels({
+      accounts: [BASE],
+      exposure: { ...MANAGED, mode: "manual", state: "not_configured" },
+      onCommand: (command, args) => {
+        if (command.startsWith("channels_exposure_set")) {
+          calls.push([command, args]);
+          return Promise.resolve(null);
+        }
+        return undefined;
+      },
+    });
+    render(<ChannelsPanel />);
+
+    await waitFor(() => expect(screen.getByTestId("exposure")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText(/Tunnel hostname/), {
+      target: { value: "monkey.example.com" },
+    });
+    fireEvent.change(screen.getByLabelText(/Path to cloudflared/), {
+      target: { value: "/usr/local/bin/cloudflared" },
+    });
+    fireEvent.click(screen.getByText("Connect"));
+
+    await waitFor(() => expect(calls.length).toBe(1));
+    expect(calls[0][0]).toBe("channels_exposure_set_tunnel");
+    expect(calls[0][1]).toEqual({
+      provider: "cloudflared",
+      hostname: "monkey.example.com",
+      executable: "/usr/local/bin/cloudflared",
+      metricsPort: null,
+    });
+  });
+});
+
+/**
+ * An extension-backed account that cannot recognise its own echo.
+ *
+ * The two loop-capable settings are refused by the daemon whatever the panel
+ * does; what the panel owes the operator is saying so, rather than rendering a
+ * dropdown whose selection is silently narrowed.
+ */
+describe("an account that cannot recognise its own messages", () => {
+  const EXTENSION: ChannelAccount = {
+    ...BASE,
+    account_id: "chan-ext",
+    kind: "extension",
+    label: "Fixture channel",
+    enabled: true,
+    credential_required: false,
+    non_secret_config: { extension_id: "dev.example.chat", capability_id: "room" },
+    echo_correlation: "unsupported",
+    reply_policy_restricted: false,
+  };
+
+  it("says why, and refuses the two settings that could loop", async () => {
+    mockChannels({ accounts: [EXTENSION] });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Fixture channel"));
+
+    await waitFor(() => expect(screen.getByTestId("echo-blind")).toBeTruthy());
+    const open = screen.getAllByRole("option", { name: "Anyone" }) as HTMLOptionElement[];
+    expect(open.length).toBeGreaterThan(0);
+    expect(open.every((option) => option.disabled)).toBe(true);
+    const always = screen.getByRole("option", { name: "Every message" }) as HTMLOptionElement;
+    expect(always.disabled).toBe(true);
+  });
+
+  it("says nothing at all about a built-in provider", async () => {
+    mockChannels({ accounts: [{ ...BASE, enabled: true }] });
+    render(<ChannelsPanel />);
+    fireEvent.click(await screen.findByText("Family Signal"));
+
+    await waitFor(() => expect(screen.getByText(/Direct messages/)).toBeTruthy());
+    expect(screen.queryByTestId("echo-blind")).toBeNull();
+    const always = screen.getByRole("option", { name: "Every message" }) as HTMLOptionElement;
+    expect(always.disabled).toBe(false);
   });
 });

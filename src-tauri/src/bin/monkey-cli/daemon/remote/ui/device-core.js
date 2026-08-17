@@ -321,7 +321,7 @@ export function prunableEntries(entries, nowMs, limits = JOURNAL_LIMITS) {
  * cleared or migrated — an existing pairing keeps its key, its sequence and its
  * cache, and nobody has to pair a phone again to get a journal.
  */
-export function journalUpgrade(database, controllerStore, journalStore) {
+export function journalUpgrade(database, controllerStore, journalStore, talkStore) {
   const created = [];
   if (!database.objectStoreNames.contains(controllerStore)) {
     database.createObjectStore(controllerStore, { keyPath: "id" });
@@ -330,6 +330,13 @@ export function journalUpgrade(database, controllerStore, journalStore) {
   if (!database.objectStoreNames.contains(journalStore)) {
     database.createObjectStore(journalStore, { keyPath: "commandId" });
     created.push(journalStore);
+  }
+  // v2 → v3, and additive in the same way: a device that already holds a
+  // pairing and a command journal keeps both, and gains somewhere to retain an
+  // utterance the runner has not confirmed.
+  if (talkStore && !database.objectStoreNames.contains(talkStore)) {
+    database.createObjectStore(talkStore, { keyPath: "utteranceId" });
+    created.push(talkStore);
   }
   return created;
 }

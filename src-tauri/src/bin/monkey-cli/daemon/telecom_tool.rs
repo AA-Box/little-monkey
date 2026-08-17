@@ -165,15 +165,14 @@ pub(crate) async fn place_call(
         &super::channel_adapter::KeyringChannelSecrets,
         account.credential_ref.as_deref(),
     )?;
-    let provider = provider_for_account(&account, secret)?;
-
     // The carrier calls us back on this account's own callback path under the
-    // operator's configured public URL. Without one there is nowhere for the
-    // audio to be directed, so the call is refused rather than placed blind.
-    let base = account
-        .public_base_url
-        .clone()
+    // operator's configured public URL — its own if it has one, otherwise the
+    // machine's exposure. Without one there is nowhere for the audio to be
+    // directed, so the call is refused rather than placed blind.
+    let base = store
+        .telecom_callback_base(&account)
         .ok_or_else(|| "This account has no public callback URL configured, so a call would have nowhere to connect.".to_string())?;
+    let provider = provider_for_account(&account, secret, Some(base.clone()))?;
     let answer_url = callback_url(&base, &account.account_id);
 
     match provider

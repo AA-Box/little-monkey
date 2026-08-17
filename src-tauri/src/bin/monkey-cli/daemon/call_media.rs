@@ -548,6 +548,7 @@ impl CallTurnSink for QueuedCallTurns<'_> {
                     filename: Some(format!("{}.wav", turn.call_id)),
                     mime_type: Some("audio/wav".to_string()),
                     declared_size_bytes: None,
+                    stored_size_bytes: None,
                     source: little_monkey_lib::channels::types::AttachmentSource::ProviderHandle {
                         handle: artifact_id.to_string(),
                     },

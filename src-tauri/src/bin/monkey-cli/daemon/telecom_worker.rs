@@ -49,6 +49,42 @@ pub(crate) fn handle_carrier_event(
     now_ms: i64,
 ) -> Result<CarrierOutcome, String> {
     match event {
+        TelecomEvent::InboundSms(envelope) if !envelope.attachments.is_empty() => {
+            // An MMS. Its media has to be downloaded from the carrier with the
+            // account's own credential, and that download must not happen
+            // inside the carrier's request: a slow media host would run the
+            // callback past the carrier's timeout, and a carrier that times out
+            // redelivers — which is how one picture becomes two conversations.
+            //
+            // So the message takes the same shape every delivered-to messaging
+            // provider takes: durably accepted here, and finished by
+            // `process_pending_channel_ingress`, which downloads the file with
+            // this account's `SmsAdapter` and only then routes and queues it.
+            // A crash in between costs nothing, because that pass is also what
+            // resumes after one.
+            //
+            // Before this, an MMS was ingested inline with nothing ever
+            // fetching its media, so it reached the agent with neither bytes
+            // nor a reason — which reads as "there was no attachment".
+            ensure_sms_channel_account(store, account, now_ms)?;
+            match crate::daemon::webhook::record_accepted_event(store, &envelope) {
+                Ok(super::channel_store::EventRecording::Recorded { .. }) => {
+                    Ok(CarrierOutcome::Message {
+                        accepted: 1,
+                        ignored: 0,
+                    })
+                }
+                // The carrier is redelivering something already committed. It
+                // may be acknowledged; the pending pass owns it either way.
+                Ok(super::channel_store::EventRecording::Duplicate { .. }) => {
+                    Ok(CarrierOutcome::Message {
+                        accepted: 0,
+                        ignored: 1,
+                    })
+                }
+                Err(_) => Err("The message could not be durably accepted".to_string()),
+            }
+        }
         TelecomEvent::InboundSms(envelope) => {
             ensure_sms_channel_account(store, account, now_ms)?;
             let report = ingest_batch(store, queue, std::slice::from_ref(&*envelope), now_ms);
@@ -417,7 +453,8 @@ fn load_carriers(
                     continue;
                 }
             };
-        if let Ok(provider) = super::telephony::provider_for_account(&account, secret) {
+        let base = store.telecom_callback_base(&account);
+        if let Ok(provider) = super::telephony::provider_for_account(&account, secret, base) {
             carriers.insert(account.account_id.clone(), provider);
         }
     }
@@ -519,6 +556,7 @@ mod tests {
             account_id: "tel-1".into(),
             kind: ChannelKind::Sms,
             provider_event_id: id.into(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct("+15551234567"),
             sender: ChannelSender::new("+15551234567"),
             text: body.into(),

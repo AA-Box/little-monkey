@@ -438,6 +438,104 @@ impl ProcessIdentity {
     }
 }
 
+/// The program a pid is running, as the kernel reports it right now.
+///
+/// The third thing a durable ownership record can carry, alongside the pid and
+/// its start time. Those two are already unambiguous within one boot — a pid
+/// cannot be reissued while the process holding it still exists, so a match on
+/// both is the same process — and this exists for the case they cannot cover:
+/// a record whose *provenance* is in doubt. A stored identity that has been
+/// hand-edited, restored from a backup, or carried between machines can name a
+/// live pid with a plausible start time, and the only thing that then says "and
+/// it is running the program we started" is the program itself.
+///
+/// `None` where the platform will not answer, which the callers must read as
+/// "unverified" rather than "matches" — the whole value of an identity is that
+/// it can refuse.
+///
+/// Reported verbatim, not canonicalised: both sides of any comparison come from
+/// this same call, so the platform's own normalisation is the only one needed,
+/// and `canonicalize` on Windows would return a `\\?\` path this project has
+/// been bitten by before. A Linux binary that was replaced after it started
+/// reports `… (deleted)`, which is a difference worth seeing rather than
+/// smoothing away.
+#[must_use]
+pub fn process_image_path(pid: u32) -> Option<String> {
+    process_image_path_platform(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn process_image_path_platform(pid: u32) -> Option<String> {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()?
+        .to_str()
+        .map(str::to_string)
+}
+
+#[cfg(target_os = "macos")]
+fn process_image_path_platform(pid: u32) -> Option<String> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // Safe: writes at most `buffer.len()` bytes into a buffer of exactly that
+    // size, and returns how many it wrote. Zero or less is a refusal — the
+    // process is gone, or is one this user may not ask about.
+    let written = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    buffer.truncate(written as usize);
+    String::from_utf8(buffer).ok()
+}
+
+/// `PROCESS_NAME_WIN32` rather than the native form: a DOS path is what every
+/// other path in this project is, and the native `\Device\HarddiskVolume…` form
+/// would compare unequal to itself across a remount.
+#[cfg(windows)]
+fn process_image_path_platform(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // Safe: opens a query handle, or null on refusal.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut buffer = vec![0u16; 32_768];
+    let mut length = buffer.len() as u32;
+    // Safe: writes at most `length` wide characters into a buffer of exactly
+    // that length, and writes back how many it wrote.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            buffer.as_mut_ptr(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    // Safe: closes the handle this function opened, exactly once.
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(String::from_utf16_lossy(&buffer))
+}
+
+/// A platform that will not name a running program says so, and an ownership
+/// record built on this one carries no image to check.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn process_image_path_platform(_pid: u32) -> Option<String> {
+    None
+}
+
 /// Every owned member of the tree rooted at `root_pid`, as identities.
 ///
 /// Identities rather than bare pids because capture and signal are separated in
@@ -885,6 +983,23 @@ mod tests {
         }
     }
 
+    /// A running process is named by its own program.
+    ///
+    /// Asserted against `current_exe` rather than a fixture, because the
+    /// property that matters is that the answer is the *same string* the record
+    /// side of an ownership check would have written — a path that differed by
+    /// normalisation would compare unequal to itself and silently refuse every
+    /// legitimate reap.
+    #[test]
+    fn a_running_process_is_named_by_its_own_program() {
+        let ours = process_image_path(std::process::id()).expect("this platform names a program");
+        assert_eq!(
+            std::path::Path::new(&ours),
+            std::env::current_exe().expect("a test binary has a path"),
+            "the path the kernel reports has to be the one a record would store"
+        );
+    }
+
     #[test]
     fn a_grandchild_is_a_member_of_the_tree() {
         let nodes = [node(10, 1, 10), node(11, 10, 10), node(12, 11, 10)];
@@ -1049,6 +1164,14 @@ mod tests {
             .spawn()
             .expect("sleep spawns");
         let identity = ProcessIdentity::of(child.id()).expect("the child has an identity");
+        // The other half of an ownership record, taken here rather than in a
+        // test of its own so the suite spawns no extra process: a live child is
+        // named by *its* program, not by the caller's.
+        let named = process_image_path(child.id()).expect("a live child is named");
+        assert!(
+            named.ends_with("sleep"),
+            "the program the pid is running, not this test binary: {named}"
+        );
         child.kill().expect("kill");
         // Deliberately not reaped yet: this is the zombie window.
         for _ in 0..200 {
@@ -1074,6 +1197,12 @@ mod tests {
             "an unreaped process still exists on Linux"
         );
         child.wait().expect("reaped");
+        assert_eq!(
+            process_image_path(identity.pid),
+            None,
+            "a pid the kernel is no longer holding names nothing, so an ownership check on it \
+             can only refuse"
+        );
     }
 
     /// Windows' zombie, which is the handle this app is itself holding.

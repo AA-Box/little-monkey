@@ -347,6 +347,7 @@ fn ingress_for(
             filename: receipt.filename.clone(),
             mime_type: receipt.media_type.clone(),
             declared_size_bytes: Some(receipt.size_bytes),
+            stored_size_bytes: None,
             // A handle, not a URL: nothing here can name a path on this
             // machine, and there is nothing left to fetch — the sender handed
             // the bytes over before it referenced them, so the content store

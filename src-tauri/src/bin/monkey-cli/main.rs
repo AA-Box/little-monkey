@@ -44,6 +44,7 @@ mod security_cli;
 mod skills_cli;
 mod sse;
 mod stacks_cli;
+mod support_bundle_cli;
 mod task;
 mod telecom_audit;
 mod telecom_cli;

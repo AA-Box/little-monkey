@@ -96,13 +96,22 @@ pub struct DiagnosticReport {
     pub findings: Vec<DiagnosticFinding>,
 }
 
-/// A redacted support bundle: the same report `diagnostics_run` returns,
-/// plus coarse non-identifying environment context. Findings never carry
-/// prompts, chat content, tokens, or secrets in the first place (`id`/
-/// `subsystem`/`title`/`detail`/`remediation` are all either static strings
-/// or app-owned ids such as an MCP server id or stack id), so no separate
-/// scrubbing pass is needed to hold the same "no prompts, no secrets, by
-/// default" bar `security_audit` holds for its own reports.
+/// A redacted support bundle: the same report `diagnostics_run` returns, plus
+/// coarse non-identifying environment context, plus a redacted trace of what
+/// the daemon-owned subsystems have actually been doing.
+///
+/// Findings never carry prompts, chat content, tokens, or secrets in the first
+/// place (`id`/`subsystem`/`title`/`detail`/`remediation` are all either static
+/// strings or app-owned ids such as an MCP server id or stack id), so no
+/// separate scrubbing pass is needed for them.
+///
+/// The trace is the part that needed a design rather than an assurance: it
+/// summarizes messaging, telephony, peer and device activity, which is exactly
+/// where private messages, other people's phone numbers, encryption state and
+/// recorded audio live. See `support_bundle`'s module doc for why none of those
+/// have a field to travel in, and why an identifier can only ever be a
+/// pseudonym. A findings-only bundle held the bar by having nothing in it; this
+/// one holds it by construction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticsBundle {
@@ -111,6 +120,13 @@ pub struct DiagnosticsBundle {
     pub app_version: String,
     pub platform: String,
     pub report: DiagnosticReport,
+    /// Absent when the background service could not be asked, with the reason
+    /// in `trace_unavailable`. Not an empty trace: "nothing happened" and
+    /// "nothing could be read" send a reader to different places.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::support_bundle::SupportBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_unavailable: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -857,22 +873,46 @@ pub async fn diagnostics_apply_fix(
     ))
 }
 
-/// A redacted support bundle: the current diagnostic report plus coarse,
-/// non-identifying environment context. See `DiagnosticsBundle`'s doc
-/// comment for why no separate redaction pass is needed.
+/// A redacted support bundle: the current diagnostic report, coarse
+/// non-identifying environment context, and a redacted trace of the
+/// daemon-owned subsystems. See `DiagnosticsBundle`'s doc comment.
 #[tauri::command]
 pub async fn diagnostics_export_bundle(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<DiagnosticsBundle, String> {
     let report = diagnostics_run(state).await?;
+    // Built by the bundled CLI, because the stores it reads belong to that
+    // binary. A failure to reach it is reported rather than swallowed: a bundle
+    // that quietly omits the half somebody is debugging is worse than one that
+    // says it could not read it.
+    let (trace, trace_unavailable) = match support_trace().await {
+        Ok(trace) => (Some(trace), None),
+        Err(error) => (None, Some(error)),
+    };
     Ok(DiagnosticsBundle {
         schema_version: DIAGNOSTICS_SCHEMA_VERSION,
         generated_at_ms: now_ms(),
         app_version: app.package_info().version.to_string(),
         platform: std::env::consts::OS.to_string(),
         report,
+        trace,
+        trace_unavailable,
     })
+}
+
+async fn support_trace() -> Result<crate::support_bundle::SupportBundle, String> {
+    let output =
+        crate::daemon_commands::command(vec!["security".into(), "support-bundle".into()]).await?;
+    let trace: crate::support_bundle::SupportBundle = serde_json::from_str(output.trim())
+        .map_err(|error| format!("Could not read the background service's trace: {error}"))?;
+    if trace.schema_version > crate::support_bundle::SUPPORT_BUNDLE_SCHEMA_VERSION {
+        return Err(format!(
+            "the background service produced a newer trace format (v{}) than this app understands",
+            trace.schema_version
+        ));
+    }
+    Ok(trace)
 }
 
 // ---------------------------------------------------------------------

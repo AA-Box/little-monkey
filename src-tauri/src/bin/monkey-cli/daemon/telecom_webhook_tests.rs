@@ -674,3 +674,394 @@ async fn the_sms_side_of_a_number_carries_the_messaging_defaults() {
         "a text from a stranger starts a pairing handshake, exactly as on every other channel"
     );
 }
+
+/// A picture somebody texted actually arrives.
+///
+/// This is the whole MMS path and it used to end in nothing: an inbound text
+/// was ingested inline, and nothing on that path ever downloaded media. The
+/// attachment reached the agent with no bytes and — worse — no error, which
+/// reads as "there was no attachment".
+///
+/// The two halves this asserts are the ones that matter:
+///
+/// 1. **The carrier's request downloads nothing.** A media host that is slow
+///    would otherwise run the callback past the carrier's timeout, and a
+///    carrier that times out redelivers: one picture, two conversations.
+/// 2. **The pending pass fetches it with the account's own carrier
+///    credential** and stores the bytes, exactly as every delivered-to
+///    messaging provider does.
+#[tokio::test]
+async fn an_inbound_picture_is_acknowledged_first_and_downloaded_afterwards() {
+    let (media_base, media_requests) =
+        super::channel_adapter::test_http::serve(vec![(200, "the picture bytes".to_string())]);
+    let (paths, account) = seeded(InboundCallPolicy::Reject);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551234567");
+    let carrier = carrier();
+    let (headers, body) = carrier.sign_inbound_mms(
+        "+15551234567",
+        NUMBER,
+        "look at this",
+        &[(format!("{media_base}/media-1"), "image/png".to_string())],
+    );
+
+    let response = test_route::post(&paths, &path(), &headers, &body).await;
+    assert_eq!(response.status, 202);
+    assert!(
+        media_requests.try_recv().is_err(),
+        "the carrier's own request must not wait on a media download"
+    );
+
+    // The event is durable and unfinished: that is what makes the
+    // acknowledgement honest and a crash here free.
+    let mut store = store(&paths);
+    let pending = store
+        .recent_channel_events(ACCOUNT, 10)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.envelope_json.contains("look at this"))
+        .expect("the message is durable before the carrier is answered");
+    assert!(
+        pending.job_id.is_none(),
+        "nothing runs from inside the carrier's request"
+    );
+
+    // Now the pass that finishes it, with the real SMS adapter — the same one
+    // the supervisor loads for this account.
+    let adapter: std::sync::Arc<dyn super::channel_adapter::ChannelAdapter> = std::sync::Arc::new(
+        super::adapters::sms::SmsAdapter::new(
+            &account,
+            SECRET.to_string(),
+            paths.root.clone(),
+            account.public_base_url.clone(),
+        )
+        .expect("sms adapter"),
+    );
+    let fetchers = std::collections::BTreeMap::from([(ACCOUNT.to_string(), adapter)]);
+    let queue = super::channel_restart_tests::FakeQueue::default();
+    super::channel_worker::process_pending_channel_ingress(
+        &mut store,
+        &queue,
+        &fetchers,
+        &super::channel_adapter::DaemonBlobs,
+        NOW,
+    )
+    .await
+    .expect("a pass over the accepted events");
+
+    let request =
+        String::from_utf8_lossy(&media_requests.recv().expect("the media download")).to_string();
+    assert!(
+        request.starts_with("GET /media-1"),
+        "the carrier's media URL is what gets fetched: {request}"
+    );
+    let stored = store
+        .recent_channel_events(ACCOUNT, 10)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.envelope_json.contains("look at this"))
+        .expect("the message");
+    let envelope: little_monkey_lib::channels::types::ChannelEnvelope =
+        serde_json::from_str(&stored.envelope_json).expect("envelope");
+    let attachment = &envelope.attachments[0];
+    assert!(
+        attachment.stored_artifact_id.is_some(),
+        "the picture's bytes are on disk: {attachment:?}"
+    );
+    assert_eq!(
+        attachment.stored_size_bytes,
+        Some("the picture bytes".len() as u64)
+    );
+    assert!(attachment.fetch_error.is_none(), "{attachment:?}");
+    // And the provenance survives: the URL the carrier named is still there.
+    assert!(matches!(
+        attachment.source,
+        little_monkey_lib::channels::types::AttachmentSource::Url { .. }
+    ));
+}
+
+/// A text that crashed between its event row and its turn, then arrived again.
+///
+/// The carrier's redelivery is the only thing that can repair this gap — nobody
+/// is going to send the message a second time by hand — so the rollback has to
+/// be total. A half-committed acceptance would make the redelivery look like a
+/// duplicate of something that never ran, and the text would be lost with the
+/// carrier told it arrived.
+///
+/// Every `post` here opens the daemon store from disk and closes it again, so
+/// the two lives really are two lives.
+#[tokio::test]
+async fn a_text_that_crashed_mid_acceptance_runs_exactly_once_when_the_carrier_retries() {
+    let (paths, _) = seeded(InboundCallPolicy::Reject);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551234567");
+    let carrier = carrier();
+    let (headers, body) = carrier.sign_inbound_sms("+15551234567", NUMBER, "did you get this");
+
+    // First life: the acceptance transaction rolls back after the event row
+    // and before the turn.
+    super::fail_points::arm(super::fail_points::FailPoint::AfterEventInsert);
+    let crashed = test_route::post(&paths, &path(), &headers, &body).await;
+    assert!(super::fail_points::fired());
+    assert_ne!(
+        crashed.status, 202,
+        "a text that left no durable trace must not be acknowledged, or the carrier never \
+         sends it again"
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .len(),
+        0,
+        "the rollback has to be total: a half-committed acceptance turns the carrier's retry \
+         into a duplicate of something that never ran"
+    );
+
+    // Second life: the carrier retries, and this time it commits.
+    let retried = test_route::post(&paths, &path(), &headers, &body).await;
+    assert_eq!(retried.status, 202);
+    let inbound: Vec<_> = store(&paths)
+        .recent_telecom_messages(ACCOUNT, 10)
+        .expect("recent")
+        .into_iter()
+        .filter(|message| matches!(message.direction, CallDirection::Inbound))
+        .collect();
+    assert_eq!(
+        inbound.len(),
+        1,
+        "one text, however many attempts: {inbound:?}"
+    );
+
+    // And a third delivery of the same text -- a carrier that retried once too
+    // often -- adds nothing.
+    assert_eq!(
+        test_route::post(&paths, &path(), &headers, &body)
+            .await
+            .status,
+        202
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .into_iter()
+            .filter(|message| matches!(message.direction, CallDirection::Inbound))
+            .count(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Managed public exposure
+// ---------------------------------------------------------------------------
+//
+// A tunnel is transport. These prove it changes what can *reach* the listener
+// and nothing at all about what the listener then believes: the same signature
+// check, over the same URL, against a base that comes from configuration.
+
+/// Where a Twilio number's callbacks arrive, when the machine runs a tunnel.
+const TUNNEL_HOST: &str = "monkey.example.test";
+
+/// A Twilio account with no public URL of its own, so it inherits whatever the
+/// machine's exposure resolves to. This is the configuration a managed tunnel
+/// produces: one hostname, and numbers that do not each repeat it.
+fn twilio_account() -> TelecomAccountRecord {
+    TelecomAccountRecord {
+        kind: TelecomKind::Twilio,
+        public_base_url: None,
+        ..account(InboundCallPolicy::Answer)
+    }
+}
+
+fn seed_managed_tunnel(paths: &DaemonPaths, record: &TelecomAccountRecord) {
+    use super::callback_exposure::{ExposureConfig, ExposureMode, TunnelProvider};
+    super::channel_adapter::test_secrets::put(CREDENTIAL_REF, SECRET);
+    let mut store = DaemonStore::open(paths).expect("open store");
+    store.upsert_telecom_account(record).expect("seed account");
+    // The messaging side of the number, as `telecom add` creates it: an
+    // inbound text is an ordinary channel message and needs an account to be.
+    super::telecom_worker::ensure_sms_channel_account(&mut store, record, NOW)
+        .expect("sms account");
+    super::callback_exposure::write_config(
+        &mut store,
+        &ExposureConfig {
+            mode: ExposureMode::ManagedTunnel,
+            provider: Some(TunnelProvider::Cloudflared),
+            hostname: Some(TUNNEL_HOST.to_string()),
+            // The executable is irrelevant here: what is under test is the URL
+            // a *verifier* rebuilds, which must not depend on a process at all.
+            executable: Some("/nonexistent/cloudflared".to_string()),
+            metrics_port: None,
+        },
+    )
+    .expect("exposure");
+}
+
+/// Twilio's own scheme: HMAC-SHA1 over the URL with sorted params appended.
+fn twilio_signature(url: &str, params: &[(&str, &str)]) -> String {
+    use base64::Engine as _;
+    let mut sorted: Vec<(&str, &str)> = params.to_vec();
+    sorted.sort_by(|left, right| left.0.cmp(right.0));
+    let mut payload = url.to_string();
+    for (name, value) in sorted {
+        payload.push_str(name);
+        payload.push_str(value);
+    }
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, SECRET.as_bytes());
+    base64::engine::general_purpose::STANDARD
+        .encode(ring::hmac::sign(&key, payload.as_bytes()).as_ref())
+}
+
+fn twilio_body(params: &[(&str, &str)]) -> Vec<u8> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in params {
+        serializer.append_pair(name, value);
+    }
+    serializer.finish().into_bytes()
+}
+
+#[tokio::test]
+async fn a_number_behind_a_managed_tunnel_verifies_against_the_configured_hostname() {
+    let record = twilio_account();
+    let paths = temp_daemon_paths();
+    seed_managed_tunnel(&paths, &record);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551230000");
+
+    let params = [
+        ("MessageSid", "SM-tunnel-1"),
+        ("From", "+15551230000"),
+        ("To", NUMBER),
+        ("Body", "through the tunnel"),
+    ];
+    // The URL the carrier posted to, as the *operator* configured it. Nothing
+    // about this string is observable from the request.
+    let url = super::telephony::callback_url(&format!("https://{TUNNEL_HOST}"), ACCOUNT);
+    let headers = vec![(
+        "X-Twilio-Signature".to_string(),
+        twilio_signature(&url, &params),
+    )];
+
+    let response = test_route::post(&paths, &path(), &headers, &twilio_body(&params)).await;
+    assert_eq!(
+        response.status, 202,
+        "a number with no URL of its own inherits the machine's exposure, and its carrier's \
+         signature verifies against it: {response:?}"
+    );
+    assert_eq!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .into_iter()
+            .filter(|message| matches!(message.direction, CallDirection::Inbound))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_forwarded_header_cannot_move_the_url_a_signature_is_checked_against() {
+    let record = twilio_account();
+    let paths = temp_daemon_paths();
+    seed_managed_tunnel(&paths, &record);
+    add_default_route(&paths);
+
+    let params = [
+        ("MessageSid", "SM-spoof-1"),
+        ("From", "+15551230000"),
+        ("To", NUMBER),
+        ("Body", "let me in"),
+    ];
+    // Signed for a host of the attacker's choosing, and *announced* as that
+    // host through every header a proxy would normally be trusted for. A
+    // verifier that rebuilt its URL from the request would accept this.
+    let attacker = "attacker.example.invalid";
+    let forged_url = super::telephony::callback_url(&format!("https://{attacker}"), ACCOUNT);
+    let headers = vec![
+        (
+            "X-Twilio-Signature".to_string(),
+            twilio_signature(&forged_url, &params),
+        ),
+        ("X-Forwarded-Host".to_string(), attacker.to_string()),
+        ("X-Forwarded-Proto".to_string(), "https".to_string()),
+        (
+            "Forwarded".to_string(),
+            format!("host={attacker};proto=https"),
+        ),
+        ("Host".to_string(), attacker.to_string()),
+    ];
+
+    let response = test_route::post(&paths, &path(), &headers, &twilio_body(&params)).await;
+    assert_eq!(
+        response.status, 401,
+        "the verification URL comes from the exposure the operator configured, never from a \
+         header the caller sets: {response:?}"
+    );
+    assert!(
+        store(&paths)
+            .recent_telecom_messages(ACCOUNT, 10)
+            .expect("recent")
+            .is_empty(),
+        "an unverified body earns no durable row"
+    );
+    // And it is counted, because a number whose callbacks stop verifying is
+    // otherwise indistinguishable from a carrier that has gone quiet.
+    assert!(
+        store(&paths)
+            .callback_rejections(ACCOUNT)
+            .expect("rejections")
+            .count
+            >= 1
+    );
+}
+
+/// Every real carrier's inbound text, not just the fixture's.
+///
+/// Twilio, Plivo and Telnyx each normalize an inbound message without an
+/// account id — a `ChannelEnvelope` built inside a provider has no way to know
+/// which of the operator's numbers it arrived on — and the ingress refuses an
+/// envelope whose account is empty. Only the mock provider set it, so the whole
+/// suite was green while no real carrier could deliver a text at all.
+///
+/// The account is stamped by the route, which is the one place that cannot be
+/// wrong about it: it is the account whose credential the signature was just
+/// checked with.
+#[tokio::test]
+async fn an_inbound_text_from_a_real_carrier_knows_which_number_it_arrived_on() {
+    let record = twilio_account();
+    let paths = temp_daemon_paths();
+    seed_managed_tunnel(&paths, &record);
+    add_default_route(&paths);
+    approve_sender(&paths, "+15551230000");
+
+    let params = [
+        ("MessageSid", "SM-stamped-1"),
+        ("From", "+15551230000"),
+        ("To", NUMBER),
+        ("Body", "which number is this"),
+    ];
+    let url = super::telephony::callback_url(&format!("https://{TUNNEL_HOST}"), ACCOUNT);
+    let headers = vec![(
+        "X-Twilio-Signature".to_string(),
+        twilio_signature(&url, &params),
+    )];
+    assert_eq!(
+        test_route::post(&paths, &path(), &headers, &twilio_body(&params))
+            .await
+            .status,
+        202
+    );
+
+    // The durable row exists and belongs to this number. Before the fix the
+    // route answered 500 and the carrier retried into the same wall forever.
+    let events = store(&paths)
+        .recent_channel_events(ACCOUNT, 10)
+        .expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|event| event.provider_event_id == "SM-stamped-1"),
+        "the text is filed against the account that received it: {events:?}"
+    );
+}
