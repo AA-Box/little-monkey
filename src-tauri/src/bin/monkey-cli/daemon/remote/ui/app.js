@@ -23,7 +23,6 @@ import {
 } from "./device-core.js";
 import {
   TALK_PROTOCOL_VERSION,
-  TALK_UTTERANCE,
   chooseTalkMediaType,
   clampTalkChannels,
   clampTalkSampleRateHz,
