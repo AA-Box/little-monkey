@@ -856,6 +856,25 @@ mod tests {
                 .contains("journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE, TALK_STORE)"),
             "one upgrade function creates whichever stores are absent and touches nothing else"
         );
+        // Retention gates the upload rather than merely preceding it. An
+        // utterance the journal refused has one copy and it would be on the
+        // wire, so a socket that drops mid-flight loses it with no Retry to
+        // offer — which is the exact gap the journal exists to close. Pinned as
+        // an ordering because the failing version is a plausible edit: keep the
+        // retain call, keep the message, drop the early return.
+        let onstop = javascript
+            .split_once("recorder.onstop = async () => {")
+            .and_then(|(_, tail)| tail.split_once("\n  };"))
+            .map(|(body, _)| body)
+            .expect("the recorder's stop handler");
+        let refused_at = onstop
+            .find("if (!retained) return;")
+            .expect("a refused retention must stop the send");
+        assert!(
+            refused_at < onstop.find("talkSendFrame").expect("the send"),
+            "nothing may leave this device before the journal has agreed to hold it"
+        );
+
         // One executor per profile, holding the lock across the whole loop —
         // not merely around each signed request.
         assert!(javascript.contains("const EXECUTOR_LOCK = \"little-monkey-device-executor-v1\""));

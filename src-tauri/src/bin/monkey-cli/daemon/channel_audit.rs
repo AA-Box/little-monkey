@@ -110,6 +110,12 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
                 sent,
             ));
         }
+        if store
+            .echo_correlation_degraded(&account.account_id, now_ms)
+            .unwrap_or(false)
+        {
+            findings.extend(echo_degraded_finding(account, &describe(account)));
+        }
         if let Ok(rejections) = store.channel_callback_rejections(&account.account_id) {
             if rejections.count >= REJECTED_CALLBACK_THRESHOLD {
                 findings.push(f(
@@ -183,11 +189,16 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
 /// What the machine's public exposure is doing, in the terms an operator can
 /// act on.
 ///
-/// One finding, because there is one exposure and one question: would a
-/// provider posting to the advertised URL right now reach this machine? Every
-/// state maps to a different answer and a different fix, and none of them is
-/// inferred from configuration existing — a tunnel that is configured and dead
-/// is the exact failure this whole subsystem was added to make visible.
+/// One finding, because there is one exposure and one question: is the
+/// transport that carries a provider's delivery to this machine up? Every state
+/// maps to a different answer and a different fix, and none of them is inferred
+/// from configuration existing — a tunnel that is configured and dead is the
+/// exact failure this whole subsystem was added to make visible.
+///
+/// The `Connected` answer is deliberately bounded to the transport. Whether the
+/// operator's hostname *routes* to this machine is set in their provider's
+/// dashboard, and a security page that reported an unverified half as proven
+/// would be doing the thing this page exists to catch.
 fn exposure_findings(store: &DaemonStore, webhook_accounts: usize) -> Vec<SecurityFinding> {
     use super::callback_exposure::{ExposureMode, ExposureState};
     let status =
@@ -238,8 +249,10 @@ fn exposure_findings(store: &DaemonStore, webhook_accounts: usize) -> Vec<Securi
     let (title, detail, status_level, remedy) = match status.state {
         ExposureState::Connected => (
             "The managed tunnel is connected",
-            "Your own tunnel client is running and reports a live connection to its provider, so \
-             deliveries to the public URL reach this machine."
+            "Your own tunnel client is running and reports a live connection to its provider's \
+             edge, so the transport a delivery would travel over is up. Whether a request to your \
+             hostname arrives at this machine also depends on that hostname's route and origin \
+             service, which are set in your provider's dashboard and cannot be checked from here."
                 .to_string(),
             FindingStatus::Pass,
             None,
@@ -579,6 +592,47 @@ fn echo_ledger_finding(
     ))
 }
 
+/// A send that went out and whose id this machine failed to write down.
+///
+/// Distinct from the finding above, and the difference is what the operator can
+/// do about it. An empty ledger is an extension not returning ids, and the fix
+/// is in the extension. This one is the host's own write failing after the
+/// provider already accepted the message: the message cannot be unsent and
+/// re-sending it would post it twice, so nothing recovers the id and the only
+/// safe response is to stop claiming the guarantee until the window in which
+/// that id could still come back has passed.
+///
+/// Reported as a warning rather than a critical because the response has
+/// already happened — the account is clamped at the ingress for the duration,
+/// so the loop this protects against cannot occur. What the operator needs to
+/// know is why an account they configured to answer anybody has stopped, and
+/// that a database on this machine is why.
+fn echo_degraded_finding(account: &ChannelAccountRecord, label: &str) -> Option<SecurityFinding> {
+    if !matches!(
+        echo_correlation_for(account),
+        EchoCorrelation::ProviderMessageId
+    ) {
+        return None;
+    }
+    Some(f(
+        &format!("channels.echo_degraded.{}", account.account_id),
+        "An account sent a message whose id could not be recorded",
+        &format!(
+            "{label} sent a message and this machine could not write its provider message id to \
+             the echo ledger, so that one message would not be recognised if the provider echoes \
+             it back. Until the id could no longer arrive, the account is treated as though it \
+             cannot correlate its own echo at all: it answers approved senders only, when \
+             addressed."
+        ),
+        FindingStatus::Warning,
+        Some(
+            "Check this machine's disk space and the daemon's data directory, then look for \
+             'outbound message id not recorded' in the daemon log. The account returns to its \
+             configured policy on its own once the unrecorded message is too old to come back.",
+        ),
+    ))
+}
+
 /// A helper transport whose binary is not where the account says it is.
 ///
 /// Checked as a path rather than by asking the adapter, because the adapter
@@ -701,6 +755,47 @@ mod tests {
         let (_root, paths) = store();
         let findings = channel_findings(&paths, NOW);
         assert_eq!(ids(&findings), vec!["channels.none"]);
+    }
+
+    /// The one thing an operator cannot learn from the account's own settings.
+    ///
+    /// Nothing the extension declares changed — what changed is that this
+    /// machine failed to write down an id it had already sent, so the account is
+    /// narrower than its settings say and the page is the only place that
+    /// difference is visible. It clears itself with the window it was taken for,
+    /// which is asserted here because a warning nobody can clear is the failure
+    /// mode this design was chosen to avoid.
+    #[test]
+    fn an_unrecorded_send_is_reported_until_its_id_could_no_longer_come_back() {
+        let (_root, paths) = store();
+        let mut record = account("acct-1", ChannelKind::Extension);
+        record.non_secret_config = serde_json::json!({
+            "extension_id": "dev.example.chat",
+            "capability_id": "room",
+            "echo_correlation": "provider_message_id",
+        });
+        seed(&paths, &record);
+        let degraded = "channels.echo_degraded.acct-1";
+        assert!(!ids(&channel_findings(&paths, NOW)).contains(&degraded));
+
+        let mut store = DaemonStore::open(&paths).expect("open");
+        store
+            .mark_echo_correlation_degraded("acct-1", NOW)
+            .expect("mark");
+        drop(store);
+
+        assert!(
+            ids(&channel_findings(&paths, NOW)).contains(&degraded),
+            "a hole in the echo ledger has to reach the page that reports what can reach an agent"
+        );
+        assert!(
+            !ids(&channel_findings(
+                &paths,
+                NOW + DaemonStore::ECHO_RETENTION_MS + 1
+            ))
+            .contains(&degraded),
+            "and it goes when the unrecorded id can no longer be echoed back"
+        );
     }
 
     #[test]

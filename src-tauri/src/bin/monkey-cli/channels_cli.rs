@@ -344,15 +344,19 @@ fn exposure(command: &ExposureCmd) -> Result<(), String> {
                 println!("Last failure: {error}");
             }
             // Said outright, because every other line here describes what is
-            // *configured* and this is the only one that answers the question
-            // somebody actually has. A manual URL is never reported as reachable:
-            // this machine cannot see the far side of a proxy it does not run.
+            // *configured* and this is the nearest thing to the question
+            // somebody actually has. Nearest, not the same: a live tunnel is the
+            // transport, and whether the hostname routes to this machine is set
+            // in the provider's dashboard where nothing local can look. A manual
+            // URL is never reported as connected at all — this machine cannot
+            // see the far side of a proxy it does not run.
             println!(
-                "A provider posting to the public URL right now {}.",
-                if status.state.is_reachable() {
-                    "would reach this machine"
+                "The tunnel {}.",
+                if status.state.is_tunnel_connected() {
+                    "reports a live connection to its provider's edge; its hostname must also route \
+                     to this machine's webhook listener"
                 } else {
-                    "is not known to reach this machine"
+                    "does not report a live connection, so nothing is arriving through it"
                 }
             );
             Ok(())

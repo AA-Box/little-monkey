@@ -3281,7 +3281,12 @@ function talkBeginUtterance(speechDetectionMs) {
         sampleRateHz: talk.frames.sampleRateHz,
         channels: talk.frames.channels,
       });
-      if (retained) showTalkError("");
+      // Nothing leaves this device that this device cannot send again. A bound
+      // that refused the recording has already said so, and said what to clear;
+      // uploading it regardless would put the one copy on a socket that may not
+      // survive the trip.
+      if (!retained) return;
+      showTalkError("");
       // Ninety seconds of Opus is far more than one frame may carry, so the
       // utterance goes out as however many frames it takes; the runner
       // reassembles them and only the last one closes it.
@@ -3352,12 +3357,18 @@ function talkFinishUtterance() {
 // --- What is still owed ------------------------------------------------------
 
 /**
- * Retain one recording, and say plainly when a bound refused to.
+ * Retain one recording, and refuse the send when it cannot be held.
  *
- * A refusal is surfaced rather than swallowed: the utterance is still uploaded
- * — it may well be answered — but the person has to know it is not being held,
- * because otherwise "Retry" simply would not be there and nobody would know
- * why.
+ * The caller treats `false` as "do not upload this", which is the whole reason
+ * the check happens here rather than after the frames are out. An utterance that
+ * is not journalled has exactly one copy and it is on the wire: if the socket
+ * drops before the runner confirms, it is gone, and the page has nothing to
+ * offer a Retry for. That is the failure the journal was added to remove, so
+ * hitting a storage bound must not quietly reproduce it.
+ *
+ * Failing closed costs the person that one sentence, and every message says so
+ * and says what to clear. Failing open would cost them the sentence *and* the
+ * knowledge that they had lost it.
  */
 async function talkRetain(entry) {
   try {
@@ -3367,7 +3378,12 @@ async function talkRetain(entry) {
       return false;
     }
   } catch (error) {
-    showTalkError(`That recording could not be held for a retry: ${String(error?.message || error)}`);
+    // A device whose storage will not take the recording at all: same rule, and
+    // the reason is worth quoting because it is the one case the bounds above
+    // cannot explain.
+    showTalkError(
+      `That recording could not be held for a retry, so it was not sent: ${String(error?.message || error)}`,
+    );
     return false;
   }
   await renderTalkPending();

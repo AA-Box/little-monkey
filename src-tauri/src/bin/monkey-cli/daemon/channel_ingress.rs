@@ -206,7 +206,10 @@ pub(crate) fn accept_channel_envelope_with(
     // is the id of the *delivery*, which a provider may mint fresh on a
     // redelivery. Matching on the wrong one would either miss every echo or
     // suppress a real message.
-    let correlation = super::channel_adapter::echo_correlation_for(&account);
+    // What the account can prove today, not only what its transport declares:
+    // an outbound id this machine failed to record leaves a hole the declaration
+    // cannot see, and the ingress is where that difference has to be believed.
+    let correlation = super::channel_adapter::effective_echo_correlation(store, &account, now_ms);
     let own_outbound_echo = match (
         correlation == EchoCorrelation::ProviderMessageId,
         envelope.provider_message_id.as_deref(),
@@ -2330,6 +2333,61 @@ mod tests {
         assert_eq!(
             ignored_reason(&plan(&mut store, &group)),
             IgnoreReason::SenderNotAllowed
+        );
+    }
+
+    /// A declaration this machine can no longer back up is not believed.
+    ///
+    /// The account declares message-id correlation and the extension really
+    /// does return ids — but one send's id never made it into the ledger,
+    /// because the write failed after the provider had already accepted the
+    /// message. There is no retry for that: the message is out. So for as long
+    /// as that id could still be echoed back, the account is held to exactly
+    /// the policy an account that cannot correlate at all is held to, and then
+    /// it recovers on its own.
+    #[test]
+    fn a_send_whose_id_was_not_recorded_clamps_the_account_until_it_could_no_longer_come_back() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        assert_eq!(
+            ignored_or_run(&plan(
+                &mut store,
+                &extension_inbound("evt-1", Some("m-1"), false)
+            )),
+            "run",
+            "a whole ledger is what the open policy rests on"
+        );
+
+        // What `drain_outbox_once` does when `record_outbound_echo` fails on a
+        // message the provider has already taken.
+        store
+            .mark_echo_correlation_degraded("acct-1", NOW)
+            .expect("mark");
+
+        assert_eq!(
+            ignored_reason(&plan(
+                &mut store,
+                &extension_inbound("evt-2", Some("m-2"), false)
+            )),
+            IgnoreReason::SenderNotAllowed,
+            "a hole in the evidence clamps the account exactly as declaring `unsupported` does"
+        );
+
+        // Past the window a recorded id would have been pruned in, the hole
+        // cannot matter any more, so the account is its configured self again
+        // with nothing for an operator to clear.
+        let later = NOW + DaemonStore::ECHO_RETENTION_MS + 1;
+        let recovered = accept_channel_envelope_with(
+            &mut store,
+            &FakeQueue::default(),
+            &extension_inbound("evt-3", Some("m-3"), false),
+            later,
+            "PAIR1234".to_string(),
+        )
+        .expect("accept");
+        assert_eq!(
+            ignored_or_run(&recovered),
+            "run",
+            "the clamp expires with the window it was taken for"
         );
     }
 

@@ -669,7 +669,17 @@ describe("the public callback card", () => {
     render(<ChannelsPanel />);
 
     await waitFor(() => expect(screen.getByTestId("exposure")).toBeTruthy());
-    expect(screen.getByTestId("exposure-state").textContent).toMatch(/Connected/);
+    const shown = screen.getByTestId("exposure-state").textContent ?? "";
+    // The transport, and only the transport. `/ready` says the client holds a
+    // connection to its provider's edge; whether a request to the hostname
+    // arrives at this machine also needs that hostname's route and origin
+    // service to be right, and both are set in the operator's dashboard where
+    // nothing here can look. A card that promised the end-to-end path from the
+    // half it can see would be the same false confidence as calling a dead
+    // tunnel healthy.
+    expect(shown).toMatch(/Tunnel connected to its provider's edge/);
+    expect(shown).toMatch(/hostname must also point at this machine/);
+    expect(shown).not.toMatch(/reach this machine/);
     expect(screen.getByText("https://monkey.example.com")).toBeTruthy();
   });
 

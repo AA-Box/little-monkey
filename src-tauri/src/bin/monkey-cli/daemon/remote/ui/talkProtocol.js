@@ -372,22 +372,25 @@ export function talkUtterancePending(entry) {
 /**
  * Why this recording may not be kept, or `null` when it may.
  *
- * Checked *before* the upload rather than after it fails, so the person is told
- * at the end of the sentence they just spoke instead of discovering later that
- * nothing was retained.
+ * Checked *before* the upload rather than after it fails, and a refusal stops
+ * the upload: an utterance that is not being held is one whose only copy is in
+ * flight, and a socket that drops mid-flight would lose it with no Retry to
+ * offer. Sending it anyway would leave exactly the gap this journal exists to
+ * close, so each message below says the recording was **not** sent and what to
+ * clear to make room for it.
  */
 export function talkJournalRefusal(entries, bytes, limits = TALK_JOURNAL_LIMITS) {
   const size = Number(bytes) || 0;
   if (size > limits.maxUtteranceBytes) {
-    return "That was too long to keep for a retry — it was sent, but it is not being held.";
+    return "That recording is too large to hold for a retry, so it was not sent. Say it again, more briefly.";
   }
   const pending = entries.filter(talkUtterancePending);
   if (pending.length >= limits.maxPending) {
-    return "There are already unconfirmed recordings waiting. Retry or discard one before speaking again.";
+    return "There are already unconfirmed recordings waiting, so this one was not sent. Retry or discard one first.";
   }
   const held = pending.reduce((total, entry) => total + (Number(entry.bytes) || 0), 0);
   if (held + size > limits.maxTotalBytes) {
-    return "This device is holding as much unconfirmed audio as it may. Retry or discard one before speaking again.";
+    return "This device is holding as much unconfirmed audio as it may, so this recording was not sent. Retry or discard one first.";
   }
   return null;
 }

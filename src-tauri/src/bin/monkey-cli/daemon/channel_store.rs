@@ -575,6 +575,47 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Note that this account's ledger has a hole in it.
+    ///
+    /// Called when a send succeeded and recording its provider id did not. The
+    /// message is out — it cannot be unsent, and retrying the send would post it
+    /// twice — so the only honest response is to stop claiming an echo guarantee
+    /// this account no longer has, until it does again.
+    ///
+    /// The window is the ledger's own retention, and for the same reason: an id
+    /// this machine failed to record can only come back inside the window in
+    /// which a *recorded* one would still have been matchable. Past that the row
+    /// would have been pruned anyway, so nothing is lost by the account
+    /// recovering on its own. That is the reconciliation — there is no flag for
+    /// an operator to find and clear, because a flag nobody clears is a
+    /// permanently narrowed account nobody can explain.
+    ///
+    /// In `daemon_meta` rather than a column, because the value is a deadline
+    /// this daemon observed and not part of what the account *is*: the
+    /// extension's declared capability is unchanged, and overwriting its
+    /// declaration with a runtime fault would lose the difference between an
+    /// extension that cannot correlate and one whose host failed to write a row.
+    pub fn mark_echo_correlation_degraded(
+        &mut self,
+        account_id: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let until = now_ms.saturating_add(Self::ECHO_RETENTION_MS);
+        self.set_meta(&echo_degraded_key(account_id), &until.to_string())
+    }
+
+    /// Whether this account is inside such a window.
+    ///
+    /// An unreadable answer counts as degraded. The question is "can this
+    /// machine prove it remembers everything it sent", and a store it cannot
+    /// read is not a store that proves anything.
+    pub fn echo_correlation_degraded(&self, account_id: &str, now_ms: i64) -> Result<bool, String> {
+        Ok(self
+            .get_meta(&echo_degraded_key(account_id))?
+            .and_then(|raw| raw.trim().parse::<i64>().ok())
+            .is_some_and(|until| until > now_ms))
+    }
+
     /// Did *we* send this exact provider message, here, in this conversation?
     ///
     /// The whole of self-echo determination for a provider whose sender
@@ -2411,6 +2452,13 @@ fn insert_outbox_message(
 /// `daemon_meta` key holding the operator's public base URL for webhook
 /// callbacks. A KV row rather than a schema column: one value, daemon-wide.
 const CHANNEL_PUBLIC_BASE_URL_KEY: &str = "channels.public_base_url";
+
+/// `daemon_meta` key holding when one account's echo ledger stops being
+/// suspect. Per account, because a write that failed for one says nothing about
+/// any other.
+fn echo_degraded_key(account_id: &str) -> String {
+    format!("channels.echo_degraded.{account_id}")
+}
 
 /// A thread id as the echo ledger's key sees it.
 ///

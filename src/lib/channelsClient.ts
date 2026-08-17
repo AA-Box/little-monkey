@@ -448,7 +448,9 @@ export type TunnelProvider = "cloudflared";
  * Every value is a different thing to do about it, which is why they are not
  * collapsed into "ok" and "broken": a missing helper, a missing credential and
  * a rejected credential need three different sentences. Only `connected` means
- * a provider posting to the public URL would reach this machine. */
+ * the tunnel client holds a live connection to its provider's edge — the
+ * transport half. Whether the operator's hostname routes to this machine is set
+ * in their provider's dashboard and is not observable from here. */
 export type ExposureState =
   | "not_configured"
   | "helper_missing"
@@ -507,7 +509,12 @@ export const channelsExposureClearToken = () => invoke<void>("channels_exposure_
 export function describeExposure(status: ExposureStatus): { tone: "ok" | "warn" | "bad"; text: string } {
   switch (status.state) {
     case "connected":
-      return { tone: "ok", text: "Connected. Deliveries to the public URL reach this machine." };
+      // The transport, and only the transport. Whether the hostname routes here
+      // is set in the operator's own dashboard and nothing local can see it.
+      return {
+        tone: "ok",
+        text: "Tunnel connected to its provider's edge. Its hostname must also point at this machine's webhook port.",
+      };
     case "connecting":
       return { tone: "warn", text: "Starting your tunnel…" };
     case "reconnecting":

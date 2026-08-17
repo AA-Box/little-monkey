@@ -443,7 +443,7 @@ describe("the Talk pending-utterance journal", () => {
 
   it("refuses to hold more than its bounds allow, and says which bound", async () => {
     const oversized = "x".repeat(TALK_JOURNAL_LIMITS.maxUtteranceBytes + 1);
-    expect(talkJournalRefusal([], oversized.length)).toMatch(/too long/u);
+    expect(talkJournalRefusal([], oversized.length)).toMatch(/too large/u);
 
     const pending = Array.from({ length: TALK_JOURNAL_LIMITS.maxPending }, (_unused, at) => ({
       utteranceId: `utt-${at}`,
@@ -456,12 +456,48 @@ describe("the Talk pending-utterance journal", () => {
     const heavy = [{ utteranceId: "utt-big", state: TALK_UTTERANCE.pending, bytes: TALK_JOURNAL_LIMITS.maxTotalBytes, createdAtMs: 0 }];
     expect(talkJournalRefusal(heavy, 1)).toMatch(/as much unconfirmed audio/u);
 
-    // And a refusal is an answer, not an exception: the caller still uploads.
+    // A refusal is an answer, not an exception — and it is a refusal of the
+    // *send*, not only of the storage. Nothing is retained, so the caller has
+    // nothing it could offer a Retry for, so it must not upload.
     const { journal, rows } = memoryJournal();
     const { refused, record } = await journal.retain({ ...RECORDING, audioBase64: oversized });
-    expect(refused).toMatch(/too long/u);
+    expect(refused).toMatch(/too large/u);
     expect(record).toBeUndefined();
     expect(rows.size).toBe(0);
+  });
+
+  /**
+   * Every bound says the recording was not sent.
+   *
+   * The client fails closed on a refusal, and the one thing that must never
+   * happen is a message telling somebody their sentence went out when the page
+   * has just dropped it. Asserted over all three bounds together rather than
+   * one at a time, because the failure this catches is a message added later
+   * that forgets.
+   */
+  it("tells the speaker their recording was not sent, whichever bound refused it", () => {
+    const full = Array.from({ length: TALK_JOURNAL_LIMITS.maxPending }, (_unused, at) => ({
+      utteranceId: `utt-${at}`,
+      state: TALK_UTTERANCE.pending,
+      bytes: 1,
+      createdAtMs: at,
+    }));
+    const heavy = [
+      {
+        utteranceId: "utt-big",
+        state: TALK_UTTERANCE.pending,
+        bytes: TALK_JOURNAL_LIMITS.maxTotalBytes,
+        createdAtMs: 0,
+      },
+    ];
+    for (const refusal of [
+      talkJournalRefusal([], TALK_JOURNAL_LIMITS.maxUtteranceBytes + 1),
+      talkJournalRefusal(full, 1),
+      talkJournalRefusal(heavy, 1),
+    ]) {
+      expect(refusal).toMatch(/not sent/u);
+      expect(refusal).not.toMatch(/it was sent/u);
+    }
   });
 
   it("prunes accepted notes and expired recordings, never a fresh unconfirmed one", () => {

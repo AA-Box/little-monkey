@@ -602,14 +602,49 @@ pub(crate) async fn drain_outbox_once(
                     EchoCorrelation::ProviderMessageId
                 );
                 if let (true, Some(provider_message_id)) = (correlates, provider_message_id) {
-                    let _ = store.record_outbound_echo(
+                    if let Err(error) = store.record_outbound_echo(
                         &row.account_id,
                         &row.conversation_id,
                         row.thread_id.as_deref(),
                         provider_message_id,
                         &row.outbox_id,
                         now_ms,
-                    );
+                    ) {
+                        // The message is already out. It cannot be unsent, and
+                        // re-sending it would post it twice — so there is no
+                        // retry here, and the id is simply not remembered.
+                        //
+                        // That is a hole in the only evidence this account uses
+                        // to recognise its own echo, and the one thing that must
+                        // not happen is for it to go unnoticed: the provider is
+                        // about to echo a message back that nothing will match,
+                        // and an account set to answer everyone would answer
+                        // itself. So the account stops claiming a guarantee it
+                        // no longer has, for as long as the unrecorded id could
+                        // still come back.
+                        eprintln!(
+                            "monkey daemon: outbound message id not recorded for account {}: \
+                             {error}",
+                            row.account_id
+                        );
+                        if let Err(error) =
+                            store.mark_echo_correlation_degraded(&row.account_id, now_ms)
+                        {
+                            // Both writes went to the same database, so this
+                            // failing too is the expected shape of a store that
+                            // is wholly unavailable rather than a second
+                            // surprise. It is still said out loud, because the
+                            // ingress's own fallback — an unreadable answer
+                            // counts as degraded — is what covers it, and a
+                            // silent `let _` here is what would leave nobody
+                            // able to tell the two apart.
+                            eprintln!(
+                                "monkey daemon: account {} could not be marked echo-degraded: \
+                                 {error}",
+                                row.account_id
+                            );
+                        }
+                    }
                 }
                 // The outbound event log is what an operator reads to see what
                 // Little Monkey said, and what the inbound side matches a
@@ -1668,6 +1703,38 @@ mod tests {
                 .is_own_outbound_echo("acct-1", "chat-7", None, "provider-1")
                 .expect("query"),
             "the id the provider gave our message is what an inbound echo is matched against"
+        );
+    }
+
+    /// And when that write fails, the send has already happened.
+    ///
+    /// The one case with no retry in it: the provider has taken the message, so
+    /// re-sending would post it twice, and the id is simply lost. What must not
+    /// also be lost is the knowledge that it is — the account's echo evidence
+    /// now has a hole the ingress cannot see from the account's declaration, so
+    /// the send path has to say so out loud. The ledger is dropped outright
+    /// here because the cause on a real machine (a full disk, a corrupt page)
+    /// is not reproducible and is not what is being tested: the branch is.
+    #[tokio::test]
+    async fn a_send_whose_id_cannot_be_recorded_degrades_the_account_instead_of_passing_silently() {
+        let mut store = seeded_store();
+        queue_reply(&mut store, "reply-1");
+        let adapter = Arc::new(FakeAdapter::correlating());
+        store
+            .connection
+            .execute("DROP TABLE channel_outbound_echo", [])
+            .expect("drop the ledger");
+
+        let report = drain_outbox_once(&mut store, &adapters_with(adapter.clone()), NOW)
+            .await
+            .expect("drain");
+        assert_eq!(report.sent, 1, "the message went out and is not sent again");
+        assert_eq!(adapter.sent.lock().unwrap().len(), 1);
+        assert!(
+            store
+                .echo_correlation_degraded("acct-1", NOW)
+                .expect("query"),
+            "an id nothing wrote down is a hole the ingress has to be told about"
         );
     }
 

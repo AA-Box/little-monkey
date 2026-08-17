@@ -35,6 +35,23 @@
 //! [`ExposureConfig::public_base`] is derived from the *configured* hostname and
 //! not from anything the running tunnel reports: a verification URL that moved
 //! when a process restarted would be a verification URL an attacker could move.
+//!
+//! # What "connected" is, and what it is not
+//!
+//! [`ExposureState::Connected`] comes from the tunnel client's own loopback
+//! readiness endpoint, and it means one thing: that client holds a live
+//! connection to its provider's edge. It is **not** an end-to-end statement that
+//! a request to the configured hostname arrives at this machine's listener. That
+//! needs the hostname's route and its origin service to be right as well, and
+//! both of those live in the operator's provider dashboard where nothing here
+//! can see them. A tunnel can be perfectly connected while a mistyped origin
+//! sends every delivery somewhere else.
+//!
+//! So the state is reported as what it is — the transport is up — and
+//! [`TunnelProvider::prerequisite`] is what tells the operator about the half
+//! this process cannot check. Claiming reachability from a connection would be
+//! the same class of false confidence as reporting a dead tunnel as healthy,
+//! which is the failure this module was added to end.
 
 use std::path::{Path, PathBuf};
 
@@ -51,12 +68,17 @@ pub(crate) const EXPOSURE_CONFIG_KEY: &str = "channels.exposure_config";
 /// process: `monkey channels exposure` and the desktop bridge both shell the
 /// CLI, which never shares an address space with the daemon.
 pub(crate) const EXPOSURE_STATE_KEY: &str = "channels.exposure_state";
-/// `daemon_meta` key holding the pid of the tunnel this daemon started.
+/// `daemon_meta` key holding the identity of the tunnel this daemon started.
 ///
 /// Written so a daemon that was killed rather than stopped does not leave a
-/// second tunnel behind on the next start. A pid alone is not proof of identity
-/// — pids are reused — so it is only ever used to *stop* something, and only
-/// when this daemon is the one that wrote it.
+/// second tunnel behind on the next start. It holds a [`TunnelOwnership`], not a
+/// bare pid: a pid on its own names whatever the kernel handed it next, and the
+/// thing this record authorizes is a kill.
+///
+/// The key is unchanged from when the value *was* a bare pid. A record written
+/// by that version no longer parses, so the one and only consequence of the
+/// upgrade is that a tunnel orphaned across it is not reaped — which is the safe
+/// direction, and self-correcting on the following start.
 const EXPOSURE_PID_KEY: &str = "channels.exposure_pid";
 
 /// The keychain entry a managed tunnel's credential lives under.
@@ -268,9 +290,16 @@ impl ExposureState {
         }
     }
 
-    /// Whether a provider posting to the public URL right now would reach this
-    /// machine. Only one value means yes, and "configured" is not it.
-    pub fn is_reachable(self) -> bool {
+    /// Whether the tunnel client currently holds a connection to its provider's
+    /// edge. Only one value means yes, and "configured" is not it.
+    ///
+    /// Deliberately **not** "a provider's request reaches this machine". The
+    /// readiness endpoint this is derived from is the client's own report about
+    /// its transport; whether a request to the configured hostname arrives here
+    /// also depends on that hostname's route and origin service, which live in
+    /// the operator's provider dashboard and which nothing local can observe.
+    /// Both halves have to be right, and this is one of them.
+    pub fn is_tunnel_connected(self) -> bool {
         matches!(self, ExposureState::Connected)
     }
 }
@@ -448,6 +477,10 @@ pub(crate) fn tunnel_token_env(provider: TunnelProvider) -> &'static str {
 }
 
 /// The loopback URL whose 200 means "connected to the provider's edge".
+///
+/// That, and only that. It says the client has a live tunnel; it does not say
+/// the operator's hostname routes to this machine's listener, which is
+/// configured in their dashboard and is not observable from here.
 pub(crate) fn readiness_url(plan: &StartPlan) -> String {
     match plan.provider {
         TunnelProvider::Cloudflared => format!("http://127.0.0.1:{}/ready", plan.metrics_port),
@@ -462,25 +495,83 @@ pub(crate) fn backoff_ms(restarts: u32) -> u64 {
         .min(BACKOFF_MAX_MS)
 }
 
-/// Kill a tunnel this daemon started and did not stop.
+/// Enough to name one process across a daemon restart, and refuse to name any
+/// other.
+///
+/// A pid is not an identity. The kernel reuses them, so a record written before
+/// a crash can, by the time it is read, be the pid of somebody's editor. The
+/// start time is fixed for the life of a process and is what makes the pair
+/// unambiguous — the same pairing [`crate::daemon`]'s sibling subsystems use to
+/// decide whether an orphaned worker is still the worker they recorded.
+///
+/// The boot marker covers the one case the pair does not. Linux reports a start
+/// time as jiffies *since boot*, so pid 1234 started 500 jiffies into yesterday's
+/// boot and pid 1234 started 500 jiffies into today's are indistinguishable —
+/// and a machine that rebooted is exactly the machine whose daemon did not exit
+/// cleanly. `boot_marker` is `None` where the platform's clock is already
+/// absolute, so on macOS and Windows this compares `None` to `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TunnelOwnership {
+    pid: u32,
+    start_time: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_marker: Option<String>,
+}
+
+/// Record what was spawned, so a later start can prove it is still there.
+///
+/// A platform that will not report a start time records **nothing**: an
+/// unverifiable record is worse than no record, because the only thing a record
+/// is ever used for is to send a kill.
+fn record_ownership(store: &mut DaemonStore, pid: u32) {
+    let Some(identity) = little_monkey_lib::process_tree::ProcessIdentity::of(pid) else {
+        let _ = store.set_meta(EXPOSURE_PID_KEY, "");
+        return;
+    };
+    let owned = TunnelOwnership {
+        pid: identity.pid,
+        start_time: identity.start_time,
+        boot_marker: little_monkey_lib::process_tree::boot_marker(),
+    };
+    if let Ok(encoded) = serde_json::to_string(&owned) {
+        let _ = store.set_meta(EXPOSURE_PID_KEY, &encoded);
+    }
+}
+
+/// Kill a tunnel this daemon started and did not stop — and nothing else.
 ///
 /// A daemon that was killed rather than asked to stop leaves its child running,
 /// and the next start would put a second tunnel in front of the same listener.
-/// The pid is only ever used to stop something, and only when this process
-/// wrote it — a reused pid could name anything, so the worst case has to be
-/// bounded by never using it to *decide* that a tunnel is healthy.
+///
+/// Every step here is a reason *not* to signal. The record is cleared first and
+/// unconditionally, so a reap that cannot complete is not retried against an
+/// ever-staler pid. Then the host must be the same boot, and the pid must still
+/// carry the start time that was recorded with it. A mismatch means the pid was
+/// reused and this daemon has no claim on it, so the record goes and nothing is
+/// signalled: failing to reap one stale tunnel costs a duplicate connection the
+/// operator can see, and killing a stranger's process cannot be undone.
 fn reap_orphan(store: &mut DaemonStore) {
     let Some(recorded) = store.get_meta(EXPOSURE_PID_KEY).ok().flatten() else {
         return;
     };
     let _ = store.set_meta(EXPOSURE_PID_KEY, "");
-    let Ok(pid) = recorded.trim().parse::<u32>() else {
+    let Ok(owned) = serde_json::from_str::<TunnelOwnership>(&recorded) else {
         return;
     };
-    if pid == 0 {
+    if owned.boot_marker != little_monkey_lib::process_tree::boot_marker() {
         return;
     }
-    kill_pid(pid);
+    let identity = little_monkey_lib::process_tree::ProcessIdentity {
+        pid: owned.pid,
+        start_time: owned.start_time,
+    };
+    // `is_running` rather than `is_still_alive`: a corpse its parent has not
+    // reaped still answers to a start-time lookup, and signalling one is a
+    // no-op that reads as success.
+    if !identity.is_running() {
+        return;
+    }
+    kill_pid(owned.pid);
 }
 
 #[cfg(unix)]
@@ -607,7 +698,9 @@ async fn run_once(paths: &DaemonPaths, plan: &StartPlan, token: &str, restarts: 
         Err(error) => return format!("The tunnel client could not be started: {error}"),
     };
     if let (Ok(mut store), Some(pid)) = (DaemonStore::open(paths), child.id()) {
-        let _ = store.set_meta(EXPOSURE_PID_KEY, &pid.to_string());
+        // Read back from the kernel rather than assumed: what is stored has to
+        // be an identity a later process can re-check, not a number.
+        record_ownership(&mut store, pid);
         write_state(
             &mut store,
             &StoredState {
@@ -996,8 +1089,8 @@ mod tests {
     /// Readiness is a real HTTP question asked of a real socket.
     ///
     /// The tunnel client's `/ready` is the only thing that turns "we started a
-    /// process" into "a provider would reach this machine", so the probe has to
-    /// be exercised against something that answers and something that does not.
+    /// process" into "that process has a live tunnel", so the probe has to be
+    /// exercised against something that answers and something that does not.
     #[tokio::test]
     async fn readiness_is_true_only_when_something_answers_on_loopback() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1041,7 +1134,8 @@ mod tests {
                 &managed("monkey.example.com", &client.to_string_lossy()),
             )
             .expect("config");
-            // A daemon that was killed leaves this behind.
+            // What a daemon from before identities were recorded leaves behind:
+            // a bare pid, which no longer parses and therefore names nothing.
             store.set_meta(EXPOSURE_PID_KEY, "999999").expect("pid");
         }
 
@@ -1060,6 +1154,160 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pid whose start time does not match is not ours, and is not signalled.
+    ///
+    /// The record names **this test process**, with a start time deliberately
+    /// one off from its real one. That is the whole point: a pid alone would
+    /// make the code below send this process a `SIGTERM` — so if the identity
+    /// check ever goes away, this test does not fail politely, it takes the
+    /// runner down with it. Which is the correct amount of noise for a bug that
+    /// kills whatever inherited a pid.
+    #[test]
+    fn a_recorded_pid_that_now_names_another_process_is_never_signalled() {
+        let (root, paths) = test_paths();
+        let mut store = DaemonStore::open(&paths).expect("store");
+        let us = std::process::id();
+        let real = little_monkey_lib::process_tree::ProcessIdentity::of(us)
+            .map(|identity| identity.start_time)
+            .unwrap_or_default();
+
+        store
+            .set_meta(
+                EXPOSURE_PID_KEY,
+                &serde_json::to_string(&TunnelOwnership {
+                    pid: us,
+                    // Off by one: the pid was reused, so what is there now
+                    // started at a different moment than what we recorded.
+                    start_time: real.wrapping_add(1),
+                    boot_marker: little_monkey_lib::process_tree::boot_marker(),
+                })
+                .expect("encode"),
+            )
+            .expect("meta");
+
+        reap_orphan(&mut store);
+
+        assert!(
+            little_monkey_lib::process_tree::ProcessIdentity::of(us).is_some(),
+            "reaping a stale record must not signal whatever now holds that pid"
+        );
+        assert_eq!(
+            store.get_meta(EXPOSURE_PID_KEY).expect("meta"),
+            Some(String::new()),
+            "and the record it could not verify is dropped rather than retried"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A record from a previous boot names nothing on this one.
+    ///
+    /// Linux start times are counted from boot, so the pair alone repeats across
+    /// one — and a rebooted machine is precisely the machine whose daemon did
+    /// not get to stop its tunnel. Written with this process's *real* start
+    /// time, so the boot marker is the only thing standing between the code
+    /// below and a `SIGTERM` to the test runner.
+    #[test]
+    fn a_record_from_a_previous_boot_is_never_signalled() {
+        let (root, paths) = test_paths();
+        let mut store = DaemonStore::open(&paths).expect("store");
+        let us = std::process::id();
+        let real = little_monkey_lib::process_tree::ProcessIdentity::of(us)
+            .map(|identity| identity.start_time)
+            .unwrap_or_default();
+
+        store
+            .set_meta(
+                EXPOSURE_PID_KEY,
+                &serde_json::to_string(&TunnelOwnership {
+                    pid: us,
+                    start_time: real,
+                    // Never what this host reports: `None` on the platforms
+                    // whose clock is absolute, and a btime nobody booted at on
+                    // the one whose clock is not.
+                    boot_marker: Some("linux-btime:1".to_string()),
+                })
+                .expect("encode"),
+            )
+            .expect("meta");
+
+        reap_orphan(&mut store);
+
+        assert!(
+            little_monkey_lib::process_tree::ProcessIdentity::of(us).is_some(),
+            "a start time from another boot must not authorize a kill on this one"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// And the tunnel this daemon really did start is really reaped.
+    ///
+    /// The whole path against a real child: spawn it, record what the production
+    /// writer records, then reap through a *reopened* store, which is what a
+    /// restart is. The child is this test binary running one test that waits, so
+    /// there is no script to write, no exec bit to set and no shell involved.
+    #[test]
+    fn a_tunnel_this_daemon_started_is_reaped_after_a_restart() {
+        let (root, paths) = test_paths();
+        let mut child = std::process::Command::new(real_client())
+            .args([
+                "--exact",
+                "daemon::callback_exposure::tests::a_child_that_waits_to_be_reaped",
+            ])
+            .env(REAP_CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a child to reap");
+        let pid = child.id();
+
+        {
+            let mut store = DaemonStore::open(&paths).expect("store");
+            record_ownership(&mut store, pid);
+            assert_ne!(
+                store.get_meta(EXPOSURE_PID_KEY).expect("meta"),
+                Some(String::new()),
+                "a live child must leave an identity a later start can verify"
+            );
+        }
+
+        let mut store = DaemonStore::open(&paths).expect("reopen");
+        reap_orphan(&mut store);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                _ => break false,
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            exited,
+            "the child this daemon recorded must actually be reaped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Not a test: the child the reap test spawns. It does nothing at all unless
+    /// that test asked for it by name *and* set the variable, so an ordinary run
+    /// of the suite returns immediately.
+    const REAP_CHILD_ENV: &str = "LITTLE_MONKEY_EXPOSURE_REAP_CHILD";
+
+    #[test]
+    fn a_child_that_waits_to_be_reaped() {
+        if std::env::var(REAP_CHILD_ENV).is_err() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(60));
     }
 
     /// A configuration problem always beats a stale success.
@@ -1165,8 +1413,8 @@ mod tests {
     }
 
     #[test]
-    fn only_connected_means_a_provider_would_reach_this_machine() {
-        assert!(ExposureState::Connected.is_reachable());
+    fn only_connected_means_the_tunnel_holds_a_connection() {
+        assert!(ExposureState::Connected.is_tunnel_connected());
         for state in [
             ExposureState::NotConfigured,
             ExposureState::HelperMissing,
@@ -1178,7 +1426,7 @@ mod tests {
             ExposureState::PublicUrlUnavailable,
             ExposureState::Stopped,
         ] {
-            assert!(!state.is_reachable(), "{}", state.as_str());
+            assert!(!state.is_tunnel_connected(), "{}", state.as_str());
         }
     }
 }

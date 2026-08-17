@@ -329,6 +329,37 @@ pub(crate) fn echo_correlation_for(
         .unwrap_or_default()
 }
 
+/// What the account can actually do right now, as opposed to what it declares.
+///
+/// The two differ when a send succeeded and writing its provider id to the echo
+/// ledger did not. That message is out and its id is not remembered, so for as
+/// long as it could come back, this account's causal evidence is incomplete —
+/// and an incomplete ledger is indistinguishable, at the ingress, from having
+/// none. So it is treated as having none.
+///
+/// Only a declared `ProviderMessageId` can be degraded. A built-in adapter's
+/// echo is decided by host code that does not consult the ledger, and an account
+/// that already declares `Unsupported` has nothing left to lose.
+///
+/// A store that will not answer degrades the account too: the question is
+/// whether this machine can prove it remembers what it sent, and a read that
+/// failed proves nothing.
+pub(crate) fn effective_echo_correlation(
+    store: &crate::daemon::store::DaemonStore,
+    account: &crate::daemon::channel_store::ChannelAccountRecord,
+    now_ms: i64,
+) -> EchoCorrelation {
+    let declared = echo_correlation_for(account);
+    if declared == EchoCorrelation::ProviderMessageId
+        && store
+            .echo_correlation_degraded(&account.account_id, now_ms)
+            .unwrap_or(true)
+    {
+        return EchoCorrelation::Unsupported;
+    }
+    declared
+}
+
 /// The beginning of a file's text, when the bytes are text at all.
 ///
 /// A file that is not valid UTF-8 has no excerpt rather than a mangled one —
