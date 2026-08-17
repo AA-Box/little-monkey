@@ -2869,14 +2869,15 @@ const talk = {
   player: null,
   running: false,
   /**
-   * Whether a socket is currently open only to re-send a retained recording.
+   * The utterance a socket is currently open only to re-send, or null.
    *
    * A retry does everything a session does except the one thing that matters:
-   * it never calls `getUserMedia`. This flag is what the capture path reads to
-   * stay shut, so the difference is a property of the code rather than of the
-   * order somebody clicked things in.
+   * it never calls `getUserMedia`. Holding the id rather than a boolean is what
+   * lets the acknowledgement close the session it belongs to — a re-send has no
+   * microphone and nothing further to do, so leaving the socket open would
+   * leave the panel saying "End Talk" over a conversation nobody is having.
    */
-  retrying: false,
+  resending: null,
   /** What the journal last held, for rendering. Never the audio itself. */
   pending: [],
 };
@@ -3056,6 +3057,15 @@ async function talkAccept(utteranceId, runId) {
     // A journal that cannot be written is not a reason to break the
     // conversation: the worst outcome is audio kept longer than it had to be,
     // and the TTL still collects it.
+  }
+  // A session opened solely to re-send this recording has now done the only
+  // thing it was for. Closed here rather than left running: there is no
+  // microphone behind it, so what would otherwise happen is a live socket and
+  // an "End Talk" button over a conversation nobody started.
+  if (talk.resending === utteranceId) {
+    talk.resending = null;
+    await stopTalk("That recording was accepted. Its answer will appear in the conversation.");
+    return;
   }
   await renderTalkPending();
 }
@@ -3373,7 +3383,7 @@ async function retryPendingUtterance(utteranceId) {
     showTalkError("End the current conversation before re-sending an earlier recording.");
     return;
   }
-  talk.retrying = true;
+  talk.resending = utteranceId;
   showTalkError("");
   setTalkState("Re-sending", "starting");
   try {
@@ -3401,10 +3411,9 @@ async function retryPendingUtterance(utteranceId) {
     setTalkState("Waiting for confirmation", "thinking");
   } catch (error) {
     await talkJournal.failed(utteranceId, error?.message || error).catch(() => undefined);
+    talk.resending = null;
     await stopTalk();
     handleError(error, "That recording could not be re-sent");
-  } finally {
-    talk.retrying = false;
   }
 }
 
