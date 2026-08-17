@@ -9373,6 +9373,9 @@ mod tests {
             "https://10.0.0.1/component.tar.gz",
             "https://100.64.0.1/component.tar.gz",
             "https://198.18.0.1/component.tar.gz",
+            "https://[::ffff:100.64.0.1]/component.tar.gz",
+            "https://[64:ff9b::6440:1]/component.tar.gz",
+            "https://[::ffff:198.18.0.1]/component.tar.gz",
         ] {
             assert!(validate_download_url(url, false).is_err(), "{url}");
         }

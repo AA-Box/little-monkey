@@ -578,7 +578,10 @@ fn non_public_download_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
 fn non_public_download_ip_rule(address: std::net::IpAddr) -> Option<EgressRule> {
     non_public_ip_rule(address).or_else(|| match address {
         std::net::IpAddr::V4(address) => non_public_download_ipv4_rule(address),
-        std::net::IpAddr::V6(_) => None,
+        std::net::IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .or_else(|| nat64_embedded_ipv4(&address))
+            .and_then(non_public_download_ipv4_rule),
     })
 }
 
@@ -773,8 +776,13 @@ pub(crate) fn classify_public_download_url(
 ) -> Result<(), EgressDenial> {
     classify_public_destination(url, destinations)?;
     if destinations == PublicDestinations::Only {
-        if let Some(url::Host::Ipv4(address)) = url.host() {
-            if let Some(rule) = non_public_download_ipv4_rule(address) {
+        let literal = match url.host() {
+            Some(url::Host::Ipv4(address)) => Some(std::net::IpAddr::V4(address)),
+            Some(url::Host::Ipv6(address)) => Some(std::net::IpAddr::V6(address)),
+            _ => None,
+        };
+        if let Some(address) = literal {
+            if let Some(rule) = non_public_download_ip_rule(address) {
                 return Err(EgressDenial::about(rule, address.to_string()));
             }
         }
