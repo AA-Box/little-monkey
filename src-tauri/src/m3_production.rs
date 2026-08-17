@@ -3998,6 +3998,19 @@ pub fn install_mlx_from_artifact(
     app_data_dir: &Path,
     artifact_path: &Path,
 ) -> M3HubResult<MlxInstalledPackageView> {
+    install_mlx_from_artifact_with_verifier(
+        app_data_dir,
+        artifact_path,
+        Arc::new(ProductionMlxSignatureVerifier),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_mlx_from_artifact_with_verifier(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+    verifier: Arc<dyn MlxSignatureVerifier>,
+) -> M3HubResult<MlxInstalledPackageView> {
     let limits = MlxInstallLimits::default();
     let staging = std::env::temp_dir().join(format!("mlx-unpack-{}", uuid::Uuid::new_v4()));
     let unpacked = (|| {
@@ -4011,7 +4024,13 @@ pub fn install_mlx_from_artifact(
             return Err(M3HubError::Runtime(error.to_string()));
         }
     };
-    let installed = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?
+    let installer = MlxPackageInstaller::new(
+        app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx"),
+        verifier,
+        limits,
+    )
+    .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installed = installer
         .install_and_activate(&bundle, &MlxHostCapabilities::current())
         .map_err(|error| M3HubError::Runtime(error.to_string()));
     let _ = fs::remove_dir_all(&staging);
@@ -4020,6 +4039,15 @@ pub fn install_mlx_from_artifact(
         package_version: installed.package_version,
         manifest_sha256: installed.manifest_sha256,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn install_mlx_from_artifact_for_test(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+    verifier: Arc<dyn MlxSignatureVerifier>,
+) -> M3HubResult<MlxInstalledPackageView> {
+    install_mlx_from_artifact_with_verifier(app_data_dir, artifact_path, verifier)
 }
 
 #[cfg(target_os = "macos")]

@@ -29,11 +29,11 @@ use crate::m3_runtime_hub::{
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
-    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
-    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
-    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
-    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
-    M3VerifyProjectorRequest,
+    M3HubError, M3HubResult, M3InstallComponentRequest, M3InstalledComponentView,
+    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
+    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
+    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
+    M3UnloadModelRequest, M3VerifyProjectorRequest,
 };
 use crate::profiles::ProfileScopedPaths;
 use crate::quantization::{
@@ -1586,8 +1586,37 @@ pub async fn m3_component_install(
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
+    #[cfg(target_os = "macos")]
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| command_error(M3HubError::Runtime(error.to_string())))?;
+    component_install_impl(&state, operation_id, timeout_ms, request, |artifact| {
+        #[cfg(target_os = "macos")]
+        {
+            return crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact)
+                .map(|_| ());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = artifact;
+            Ok(())
+        }
+    })
+    .await
+}
+
+async fn component_install_impl<F>(
+    state: &M3CommandState,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+    mlx_precommit: F,
+) -> Result<M3InstalledComponentView, String>
+where
+    F: Fn(&Path) -> M3HubResult<()>,
+{
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = async {
+    let result: M3HubResult<M3InstalledComponentView> = async {
         if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
             return Err(M3HubError::Unsupported(
                 "MLX runtime components require macOS".to_string(),
@@ -1595,14 +1624,10 @@ pub async fn m3_component_install(
         }
         #[cfg(target_os = "macos")]
         if request.entry.kind == M3ComponentKind::MlxRuntime {
-            let app_data_dir = app
-                .profile_data_dir()
-                .map_err(|error| M3HubError::Runtime(error.to_string()))?;
             return state
                 .component_hub
                 .install_component_with_precommit(&request, &context, |artifact| {
-                    crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact)
-                        .map(|_| ())
+                    mlx_precommit(artifact)
                 })
                 .await;
         }
