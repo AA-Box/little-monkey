@@ -351,13 +351,48 @@ pub(crate) fn effective_echo_correlation(
 ) -> EchoCorrelation {
     let declared = echo_correlation_for(account);
     if declared == EchoCorrelation::ProviderMessageId
-        && store
-            .echo_correlation_degraded(&account.account_id, now_ms)
-            .unwrap_or(true)
+        && echo_evidence_incomplete(store, &account.account_id, now_ms)
     {
         return EchoCorrelation::Unsupported;
     }
     declared
+}
+
+/// Whether this account has a message out whose id this machine cannot prove it
+/// holds.
+///
+/// Two independent answers, because one of them is a write and writes fail.
+///
+/// The marker is what a *reported* failure leaves behind: the send succeeded,
+/// the ledger write did not, and the worker said so. It is exact, and it is
+/// the only one of the two that survives a store which recovers before the
+/// window closes.
+///
+/// The unresolved outbound row is what a store that would take **no** write
+/// leaves behind, and it needs no write at all: the row was claimed `sending`
+/// before the request went out, so it is already durable by the time anything
+/// can fail. That covers the sequence the marker cannot — ledger write fails,
+/// marker write fails too, the daemon crashes, the database comes back — where
+/// there is otherwise nothing at all to say a message escaped unrecorded.
+///
+/// Either one means the same thing at the ingress: somewhere in the last
+/// retention window this account may have sent a message whose id would not
+/// match if the provider echoed it. Both are bounded by that window, so both
+/// clear on their own.
+///
+/// An unreadable store answers `true`. The question is whether this machine can
+/// prove it remembers what it sent, and a read that failed proves nothing.
+pub(crate) fn echo_evidence_incomplete(
+    store: &crate::daemon::store::DaemonStore,
+    account_id: &str,
+    now_ms: i64,
+) -> bool {
+    store
+        .echo_correlation_degraded(account_id, now_ms)
+        .unwrap_or(true)
+        || store
+            .has_unresolved_outbound(account_id, now_ms)
+            .unwrap_or(true)
 }
 
 /// The beginning of a file's text, when the bytes are text at all.

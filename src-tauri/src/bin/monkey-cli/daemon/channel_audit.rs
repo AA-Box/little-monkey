@@ -110,10 +110,10 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
                 sent,
             ));
         }
-        if store
-            .echo_correlation_degraded(&account.account_id, now_ms)
-            .unwrap_or(false)
-        {
+        // The same predicate the ingress clamps on, deliberately: a page that
+        // reported an account as unrestricted while the ingress was restricting
+        // it would be worse than no page.
+        if super::channel_adapter::echo_evidence_incomplete(&store, &account.account_id, now_ms) {
             findings.extend(echo_degraded_finding(account, &describe(account)));
         }
         if let Ok(rejections) = store.channel_callback_rejections(&account.account_id) {
@@ -592,21 +592,26 @@ fn echo_ledger_finding(
     ))
 }
 
-/// A send that went out and whose id this machine failed to write down.
+/// A send this machine cannot prove it recorded the id of.
 ///
 /// Distinct from the finding above, and the difference is what the operator can
 /// do about it. An empty ledger is an extension not returning ids, and the fix
-/// is in the extension. This one is the host's own write failing after the
-/// provider already accepted the message: the message cannot be unsent and
+/// is in the extension. This one is the host's own bookkeeping failing after
+/// the provider already accepted the message: the message cannot be unsent and
 /// re-sending it would post it twice, so nothing recovers the id and the only
 /// safe response is to stop claiming the guarantee until the window in which
 /// that id could still come back has passed.
 ///
+/// Two causes, one finding, because the operator's question is the same either
+/// way — why has an account they configured to answer anybody stopped? — and so
+/// is the answer: something on this machine did not finish recording a send.
+/// One is a reported ledger failure; the other is a send left `sending` or
+/// `needs_reconciliation`, which is what remains when the store would not take
+/// the report either.
+///
 /// Reported as a warning rather than a critical because the response has
 /// already happened — the account is clamped at the ingress for the duration,
-/// so the loop this protects against cannot occur. What the operator needs to
-/// know is why an account they configured to answer anybody has stopped, and
-/// that a database on this machine is why.
+/// so the loop this protects against cannot occur.
 fn echo_degraded_finding(account: &ChannelAccountRecord, label: &str) -> Option<SecurityFinding> {
     if !matches!(
         echo_correlation_for(account),
@@ -618,17 +623,19 @@ fn echo_degraded_finding(account: &ChannelAccountRecord, label: &str) -> Option<
         &format!("channels.echo_degraded.{}", account.account_id),
         "An account sent a message whose id could not be recorded",
         &format!(
-            "{label} sent a message and this machine could not write its provider message id to \
-             the echo ledger, so that one message would not be recognised if the provider echoes \
-             it back. Until the id could no longer arrive, the account is treated as though it \
-             cannot correlate its own echo at all: it answers approved senders only, when \
-             addressed."
+            "{label} has a sent message whose provider message id this machine cannot prove it \
+             holds — either the write to the echo ledger failed, or a send is still unresolved \
+             from a daemon that stopped mid-request. That message would not be recognised if the \
+             provider echoes it back, so until it is too old to arrive the account is treated as \
+             though it cannot correlate its own echo at all: it answers approved senders only, \
+             when addressed."
         ),
         FindingStatus::Warning,
         Some(
             "Check this machine's disk space and the daemon's data directory, then look for \
-             'outbound message id not recorded' in the daemon log. The account returns to its \
-             configured policy on its own once the unrecorded message is too old to come back.",
+             'outbound message id not recorded' in the daemon log and for messages awaiting \
+             reconciliation in Settings > Channels. The account returns to its configured policy \
+             on its own once no unrecorded message could still come back.",
         ),
     ))
 }

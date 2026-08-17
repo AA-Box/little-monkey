@@ -2391,6 +2391,113 @@ mod tests {
         );
     }
 
+    /// The evidence that needs no second write to survive.
+    ///
+    /// `mark_echo_correlation_degraded` is itself a write, so the sequence it
+    /// cannot cover is the one where the store takes none: the send succeeds,
+    /// the ledger write fails, the marker write fails too, and the daemon then
+    /// crashes or the store recovers. Nothing was recorded, and the account
+    /// would come back claiming a guarantee a message escaped from.
+    ///
+    /// What *is* already durable is the outbox row, because it was claimed
+    /// `sending` before the request left. This walks that row through every
+    /// state the sequence produces and asserts what the ingress does with each.
+    #[test]
+    fn a_send_left_unresolved_clamps_the_account_even_though_no_marker_was_written() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        let outbox_id = queue_one_outbound(&mut store);
+        assert!(
+            !store
+                .echo_correlation_degraded("acct-1", NOW)
+                .expect("read"),
+            "precondition: no marker was written, so only the row can carry the doubt"
+        );
+
+        // 1. Claimed, and the request is in flight *right now*. Every healthy
+        //    send looks like this, so it must not narrow anything — an account
+        //    clamped by its own traffic would be clamped for as long as it
+        //    works.
+        store.claim_outbox_batch(NOW, 10).expect("claim");
+        assert_eq!(
+            ignored_or_run(&plan(
+                &mut store,
+                &extension_inbound("evt-1", Some("m-1"), false)
+            )),
+            "run",
+            "a send in progress is not evidence that a send was lost"
+        );
+
+        // 2. Same row, long after any provider request could still be open.
+        //    The daemon never restarted — this is the store that recovered
+        //    without one — and the row is the only thing that says a message
+        //    may have gone out unrecorded.
+        let stale = NOW + DaemonStore::SENDING_STALE_MS + 1;
+        assert_eq!(
+            ignored_reason(&accept_at(&mut store, "evt-2", stale)),
+            IgnoreReason::SenderNotAllowed,
+            "a send nobody finished writing down is treated as an echo this machine cannot match"
+        );
+
+        // 3. And the restart path, which parks the row deliberately rather than
+        //    retrying it. Same answer, reached without waiting.
+        store.requeue_stuck_sending(NOW).expect("park");
+        assert_eq!(
+            ignored_reason(&plan(
+                &mut store,
+                &extension_inbound("evt-3", Some("m-3"), false)
+            )),
+            IgnoreReason::SenderNotAllowed,
+            "a parked send is an unresolved send"
+        );
+
+        // 4. Past the window in which an unrecorded id could still have been
+        //    matched, the row stops meaning anything about echo and the account
+        //    is its configured self again — with no marker to clear, because
+        //    none was ever written.
+        let later = NOW + DaemonStore::ECHO_RETENTION_MS + 1;
+        assert_eq!(
+            ignored_or_run(&accept_at(&mut store, "evt-4", later)),
+            "run",
+            "the clamp expires with the window it was taken for"
+        );
+        assert!(!outbox_id.is_empty());
+    }
+
+    /// One outbound row for `acct-1`, queued and nothing more.
+    fn queue_one_outbound(store: &mut DaemonStore) -> String {
+        match store
+            .enqueue_channel_message(&super::super::channel_store::NewOutboxMessage {
+                account_id: "acct-1".into(),
+                conversation_id: "room-1".into(),
+                thread_id: None,
+                reply_to_provider_id: None,
+                payload_json: "{}".into(),
+                payload_digest: "digest".into(),
+                idempotency_key: "reply-1".into(),
+                invocation_id: None,
+                max_attempts: 3,
+                job_id: None,
+                created_at_ms: NOW,
+            })
+            .expect("enqueue")
+        {
+            super::super::channel_store::OutboxEnqueue::Queued { outbox_id }
+            | super::super::channel_store::OutboxEnqueue::AlreadyQueued { outbox_id } => outbox_id,
+        }
+    }
+
+    /// `plan`, at a time of the caller's choosing.
+    fn accept_at(store: &mut DaemonStore, event_id: &str, now_ms: i64) -> ChannelAcceptance {
+        accept_channel_envelope_with(
+            store,
+            &FakeQueue::default(),
+            &extension_inbound(event_id, Some(event_id), false),
+            now_ms,
+            "PAIR1234".to_string(),
+        )
+        .expect("accept")
+    }
+
     #[test]
     fn an_account_that_declares_nothing_is_treated_as_unable_to_correlate() {
         // The compatibility case: an extension installed before this contract
