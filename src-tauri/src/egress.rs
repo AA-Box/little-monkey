@@ -530,19 +530,6 @@ pub fn nat64_embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
 /// keep their own, deliberately different, blocklists.
 #[must_use]
 pub(crate) fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
-    let octets = address.octets();
-    if octets[0] == 0 || octets[0] >= 240 {
-        return Some(EgressRule::Unspecified);
-    }
-    if octets[0] == 100 && (64..128).contains(&octets[1]) {
-        return Some(EgressRule::PrivateV4);
-    }
-    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
-        return Some(EgressRule::TestNet);
-    }
-    if octets[0] == 198 && (18..20).contains(&octets[1]) {
-        return Some(EgressRule::PrivateV4);
-    }
     if address.is_private() {
         return Some(EgressRule::PrivateV4);
     }
@@ -565,6 +552,34 @@ pub(crate) fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
         return Some(EgressRule::Multicast);
     }
     None
+}
+
+/// Additional non-global ranges refused only by public component downloads.
+fn non_public_download_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    let [a, b, c, d] = address.octets();
+    if a == 0 && (b != 0 || c != 0 || d != 0) {
+        return Some(EgressRule::ThisNetwork);
+    }
+    if a == 100 && (64..128).contains(&b) {
+        return Some(EgressRule::Cgnat);
+    }
+    if a == 192 && b == 0 && c == 0 {
+        return Some(EgressRule::ProtocolAssignments);
+    }
+    if a == 198 && (18..20).contains(&b) {
+        return Some(EgressRule::Benchmarking);
+    }
+    if a >= 240 && !address.is_broadcast() {
+        return Some(EgressRule::ReservedRange);
+    }
+    None
+}
+
+fn non_public_download_ip_rule(address: std::net::IpAddr) -> Option<EgressRule> {
+    non_public_ip_rule(address).or_else(|| match address {
+        std::net::IpAddr::V4(address) => non_public_download_ipv4_rule(address),
+        std::net::IpAddr::V6(_) => None,
+    })
 }
 
 /// The IPv6 counterpart of [`non_public_ipv4_rule`], with the same guarantee: the
@@ -646,7 +661,11 @@ fn refused_answer_rule(
     address: std::net::IpAddr,
     destinations: PublicDestinations,
 ) -> Option<EgressRule> {
-    match non_public_ip_rule(address) {
+    match if destinations == PublicDestinations::Only {
+        non_public_download_ip_rule(address)
+    } else {
+        non_public_ip_rule(address)
+    } {
         Some(EgressRule::Loopback) if destinations.allows_loopback() => None,
         other => other,
     }
@@ -744,6 +763,21 @@ pub(crate) fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
         // deleted or `unwrap`ped, because "no host, so nothing to check" is the
         // wrong direction for a destination gate to fail in.
         None => return Err(EgressDenial::new(EgressRule::HostMissing)),
+    }
+    Ok(())
+}
+
+pub(crate) fn classify_public_download_url(
+    url: &Url,
+    destinations: PublicDestinations,
+) -> Result<(), EgressDenial> {
+    classify_public_destination(url, destinations)?;
+    if destinations == PublicDestinations::Only {
+        if let Some(url::Host::Ipv4(address)) = url.host() {
+            if let Some(rule) = non_public_download_ipv4_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
+        }
     }
     Ok(())
 }
@@ -890,7 +924,7 @@ fn public_redirect_policy(
         if let Err(denial) = check_run_allowlist(attempt.url()) {
             return attempt.error(refused(denial));
         }
-        match classify_public_destination(attempt.url(), destinations) {
+        match classify_public_download_url(attempt.url(), destinations) {
             Ok(()) => {
                 note_allowed_redirect_destination(attempt.url());
                 attempt.follow()

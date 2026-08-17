@@ -6337,8 +6337,11 @@ fn validate_relative_path(value: &str) -> M3HubResult<()> {
 fn validate_download_url(value: &str, allow_loopback_http: bool) -> M3HubResult<()> {
     let parsed = Url::parse(value).map_err(|error| invalid("downloadUrl", error.to_string()))?;
     if !allow_loopback_http {
-        crate::egress::classify_public_https_url(&parsed)
-            .map_err(|denial| invalid("downloadUrl", denial.to_string()))?;
+        crate::egress::classify_public_download_url(
+            &parsed,
+            crate::egress::PublicDestinations::Only,
+        )
+        .map_err(|denial| invalid("downloadUrl", denial.to_string()))?;
     }
     validate_https_url(value, "downloadUrl", allow_loopback_http)
 }
