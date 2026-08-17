@@ -2772,6 +2772,7 @@ async fn matrix_replaying_a_room_event_after_a_restart_runs_it_once() {
         account_id: "acct-mx".into(),
         kind: ChannelKind::Matrix,
         provider_event_id: "$abcdef123456:example.org".into(),
+        provider_message_id: None,
         conversation: ChannelConversation::direct("!room:example.org"),
         sender: ChannelSender::new("@ada:example.org"),
         text: "are we deploying today".into(),

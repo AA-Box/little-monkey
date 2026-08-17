@@ -12,6 +12,7 @@
 //! a long-lived system-user access token.
 
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, DeliveryReceipt, DeliveryState, InboundTransport,
@@ -268,6 +269,7 @@ impl ChannelAdapter for WhatsAppAdapter {
             supports_mention_metadata: false,
             supports_idempotency_key: false,
             supports_delivery_receipts: true,
+            echo_correlation: EchoCorrelation::HostAdapter,
             ..ProviderCapabilities::minimal(ChannelKind::WhatsApp, InboundTransport::Webhook)
         }
     }
@@ -750,6 +752,7 @@ fn normalize_message(
         account_id: account_id.to_string(),
         kind: ChannelKind::WhatsApp,
         provider_event_id,
+        provider_message_id: None,
         // The Cloud API has no group support: every conversation is the
         // customer's own phone number as a direct message.
         conversation: ChannelConversation::direct(from),

@@ -148,6 +148,7 @@ fn telegram_dm(text: &str, event_id: &str) -> ChannelEnvelope {
         account_id: "acct-1".into(),
         kind: ChannelKind::Telegram,
         provider_event_id: event_id.into(),
+        provider_message_id: None,
         conversation: ChannelConversation::direct("chat-7"),
         sender: ChannelSender::new("user-3"),
         text: text.into(),

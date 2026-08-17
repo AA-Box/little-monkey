@@ -28,12 +28,12 @@
 //! is the operator's own words and is quoted; nothing that arrived over the wire
 //! ever is.
 
-use little_monkey_lib::channels::policy::{AccessPolicy, GroupActivation};
+use little_monkey_lib::channels::policy::{AccessPolicy, EchoCorrelation, GroupActivation};
 use little_monkey_lib::channels::types::{ChannelKind, HealthState, InboundTransport};
 use little_monkey_lib::security_doctor::{FindingStatus, SecurityFinding};
 
 use super::adapters::inbound_transport_for;
-use super::channel_adapter::AttachmentLimits;
+use super::channel_adapter::{echo_correlation_for, AttachmentLimits};
 use super::channel_store::ChannelAccountRecord;
 use super::store::{DaemonPaths, DaemonStore};
 
@@ -97,6 +97,19 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
     let mut findings = Vec::new();
     for account in accounts.iter().filter(|account| account.enabled) {
         findings.extend(audit_account(account, public_base_url.as_deref(), now_ms));
+        // Read from the store rather than passed in: only an account claiming
+        // correlation is asked about, and asking is two counts.
+        if let (Ok(recorded), Ok(sent)) = (
+            store.outbound_echo_count(&account.account_id),
+            store.sent_outbox_count(&account.account_id),
+        ) {
+            findings.extend(echo_ledger_finding(
+                account,
+                &describe(account),
+                recorded,
+                sent,
+            ));
+        }
         if let Ok(rejections) = store.channel_callback_rejections(&account.account_id) {
             if rejections.count >= REJECTED_CALLBACK_THRESHOLD {
                 findings.push(f(
@@ -122,6 +135,18 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
             }
         }
     }
+
+    // How the listener is reached at all. Read once for the machine rather than
+    // per account, because there is one exposure in front of one listener — and
+    // reported only when something actually needs it, since a node driven
+    // entirely by long polls and sockets has nothing to expose.
+    let webhook_accounts = accounts
+        .iter()
+        .filter(|account| {
+            account.enabled && inbound_transport_for(account.kind) == InboundTransport::Webhook
+        })
+        .count();
+    findings.extend(exposure_findings(&store, webhook_accounts));
 
     if findings.is_empty() {
         // Three different situations, and each gets said. An account switched
@@ -152,6 +177,151 @@ pub(crate) fn channel_findings(paths: &DaemonPaths, now_ms: i64) -> Vec<Security
             )
         });
     }
+    findings
+}
+
+/// What the machine's public exposure is doing, in the terms an operator can
+/// act on.
+///
+/// One finding, because there is one exposure and one question: would a
+/// provider posting to the advertised URL right now reach this machine? Every
+/// state maps to a different answer and a different fix, and none of them is
+/// inferred from configuration existing — a tunnel that is configured and dead
+/// is the exact failure this whole subsystem was added to make visible.
+fn exposure_findings(store: &DaemonStore, webhook_accounts: usize) -> Vec<SecurityFinding> {
+    use super::callback_exposure::{ExposureMode, ExposureState};
+    let status =
+        super::callback_exposure::status(store, &super::channel_adapter::KeyringChannelSecrets);
+    let mut findings = Vec::new();
+
+    if status.mode == ExposureMode::Manual {
+        // Nothing to supervise. The one thing worth saying is when accounts
+        // need a URL and none is configured, which otherwise looks like a
+        // provider that has gone quiet.
+        if webhook_accounts > 0 && status.public_base.is_none() {
+            findings.push(f(
+                "channels.exposure_absent",
+                "Accounts are waiting for deliveries with nowhere to receive them",
+                &format!(
+                    "{webhook_accounts} enabled account(s) are delivered to by their provider \
+                     posting to a URL, and no public base URL is configured. Nothing will arrive, \
+                     and nothing will report an error."
+                ),
+                FindingStatus::Warning,
+                Some(
+                    "Publish a URL for this machine's webhook listener and set it in Settings > \
+                     Channels, or let Little Monkey run your own tunnel.",
+                ),
+            ));
+        }
+        return findings;
+    }
+
+    // A managed tunnel over plain HTTP cannot happen — the base is composed as
+    // https — but a manual base can, and telephony's audit already reports its
+    // own. This checks the composed value regardless of where it came from.
+    if status
+        .public_base
+        .as_deref()
+        .is_some_and(|base| base.starts_with("http://"))
+    {
+        findings.push(f(
+            "channels.exposure_plaintext",
+            "The public callback URL is not HTTPS",
+            "Provider deliveries — and the signatures that authenticate them — would cross the \
+             network in the clear.",
+            FindingStatus::Critical,
+            Some("Publish this machine over HTTPS and update the public base URL."),
+        ));
+    }
+
+    let (title, detail, status_level, remedy) = match status.state {
+        ExposureState::Connected => (
+            "The managed tunnel is connected",
+            "Your own tunnel client is running and reports a live connection to its provider, so \
+             deliveries to the public URL reach this machine."
+                .to_string(),
+            FindingStatus::Pass,
+            None,
+        ),
+        ExposureState::HelperMissing => (
+            "The tunnel client is missing",
+            format!(
+                "This machine is configured to run {} for its public callbacks, and there is no \
+                 usable executable at the configured path. Nothing is listening on the public URL.",
+                status
+                    .provider
+                    .map(|provider| provider.as_str())
+                    .unwrap_or("a tunnel")
+            ),
+            FindingStatus::Warning,
+            Some("Install the tunnel client and give its full path in Settings > Channels."),
+        ),
+        ExposureState::CredentialMissing => (
+            "The tunnel has no credential",
+            "A managed tunnel is configured and no token is stored for it, so it cannot connect \
+             to your tunnel provider."
+                .to_string(),
+            FindingStatus::Warning,
+            Some("Paste your own tunnel token in Settings > Channels; it goes to the OS keychain."),
+        ),
+        ExposureState::AuthenticationFailed => (
+            "The tunnel's credential was rejected",
+            format!(
+                "Your tunnel provider refused the stored token, so the public URL is unreachable. \
+                 {}",
+                status.last_error.as_deref().unwrap_or("No detail recorded.")
+            ),
+            FindingStatus::Critical,
+            Some("Issue a fresh token in your tunnel provider's console and store it again."),
+        ),
+        ExposureState::PublicUrlUnavailable => (
+            "The managed tunnel has no hostname",
+            "A managed tunnel is selected with no hostname, so there is no URL to give a provider \
+             and no URL to verify a signature against."
+                .to_string(),
+            FindingStatus::Warning,
+            Some("Set the hostname you configured in your tunnel provider's console."),
+        ),
+        ExposureState::Reconnecting | ExposureState::Degraded => (
+            "The managed tunnel is not currently carrying traffic",
+            format!(
+                "It has restarted {} time(s) without settling. Deliveries made while it is down \
+                 are the provider's to retry, and some providers do not. {}",
+                status.restarts,
+                status.last_error.as_deref().unwrap_or("")
+            ),
+            FindingStatus::Warning,
+            Some("Check the tunnel client's own status with your provider, and that the hostname still routes to this machine."),
+        ),
+        ExposureState::Stopped => (
+            "The managed tunnel is stopped while accounts still expect it",
+            "Nothing is exposing this machine's webhook listener.".to_string(),
+            if webhook_accounts > 0 {
+                FindingStatus::Warning
+            } else {
+                FindingStatus::Info
+            },
+            Some("Start it again, or switch those accounts to a URL you publish yourself."),
+        ),
+        ExposureState::Connecting => (
+            "The managed tunnel is still connecting",
+            "It was started recently and has not reported a live connection yet.".to_string(),
+            FindingStatus::Info,
+            None,
+        ),
+        // A managed mode whose readiness reported `NotConfigured` means the
+        // provider was never chosen, which the mode check above already
+        // excludes; saying nothing is more honest than inventing a state.
+        ExposureState::NotConfigured => return findings,
+    };
+    findings.push(f(
+        "channels.exposure",
+        title,
+        detail.trim(),
+        status_level,
+        remedy,
+    ));
     findings
 }
 
@@ -328,68 +498,85 @@ fn audit_account(
 /// account that answers only when addressed cannot start one, whatever it can or
 /// cannot recognize.
 fn own_echo_finding(account: &ChannelAccountRecord, label: &str) -> Option<SecurityFinding> {
-    if !recognizes_own_echo(account.kind) {
-        let exposed = account.access_policy.group_activation == GroupActivation::Always
-            || account.access_policy.direct == AccessPolicy::Open;
-        return Some(f(
-            &format!("channels.own_echo_blind.{}", account.account_id),
-            "An account cannot always recognize its own messages",
-            &format!(
-                "{label} cannot tell every message it sent apart from one it received, so a \
-                 message of its own coming back could be answered as if somebody had sent it.{}",
-                if exposed {
-                    " Its current settings would answer such a message."
-                } else {
-                    " Its current settings answer only when it is addressed, which prevents this \
-                      today."
-                }
-            ),
-            if exposed {
-                FindingStatus::Warning
-            } else {
-                FindingStatus::Info
-            },
-            Some("Keep this account answering only when it is addressed, and keep direct messages behind pairing."),
-        ));
+    let correlation = echo_correlation_for(account);
+    if correlation.is_host_verifiable() {
+        return None;
     }
-    None
+    // The stored setting versus the one in force. `clamped_for` already
+    // narrowed this account at the ingress, so the risk is not that it will
+    // loop — it is that the operator's Settings page shows something the
+    // account is not doing, and the only place that difference is visible is
+    // here.
+    let restricted = account.access_policy.unsafe_without_echo_correlation();
+    Some(f(
+        &format!("channels.own_echo_blind.{}", account.account_id),
+        if restricted {
+            "An account's reply policy is restricted because it cannot recognize its own messages"
+        } else {
+            "An account cannot recognize its own messages"
+        },
+        &format!(
+            "{label} is served by an extension whose transport does not report the provider's \
+             own message id, so this machine cannot match an inbound message against one it sent. \
+             A sender flag from a sandboxed extension is the extension's word about itself and is \
+             not treated as proof.{}",
+            if restricted {
+                " Its stored settings would answer anyone, or answer every message in a group; \
+                  both are refused for this account and it is running under the narrower policy \
+                  instead."
+            } else {
+                " Its settings answer only approved senders, and only when addressed, which is \
+                  what this account may do."
+            }
+        ),
+        if restricted {
+            FindingStatus::Warning
+        } else {
+            FindingStatus::Info
+        },
+        Some(
+            "Update the extension so its channel transport returns and reports provider message \
+             ids, then set `echo_correlation` to `provider_message_id` on the account. Until then, \
+             set this account to answer approved senders only, when addressed.",
+        ),
+    ))
 }
 
-/// Whether this provider's adapter can identify a message as our own.
+/// A ledger that has learned nothing for an account that has been sending.
 ///
-/// True where the adapter resolves its own identity and compares it, or where
-/// the source filters our own messages before they are ever parsed. False where
-/// the wire format this build reads carries no such signal — which is a real
-/// property of the integration, not an oversight, and is why the audit reports
-/// it rather than the code pretending otherwise.
-fn recognizes_own_echo(kind: ChannelKind) -> bool {
-    match kind {
-        // Each of these resolves its own account/bot/nick at connect time and
-        // compares the sender against it.
-        ChannelKind::Telegram
-        | ChannelKind::Discord
-        | ChannelKind::Slack
-        | ChannelKind::Mattermost
-        | ChannelKind::Irc
-        | ChannelKind::Matrix => true,
-        // The helper filters on `is_from_me` in the query itself, so our own
-        // messages never reach the parser.
-        ChannelKind::IMessage => true,
-        // A webhook delivery is inbound by construction: these providers do not
-        // post our own outbound messages back to the callback.
-        ChannelKind::WhatsApp
-        | ChannelKind::Teams
-        | ChannelKind::GoogleChat
-        | ChannelKind::Line => true,
-        // A carrier does not deliver our own outbound text to the inbound
-        // webhook either, and telephony's own audit covers the number.
-        ChannelKind::Sms => true,
-        // signal-cli reports a linked device's own sends as a sync
-        // notification rather than a `dataMessage`, and the parser reads both.
-        ChannelKind::Signal => true,
-        // The guest decides what it reports and the host cannot verify it.
-        ChannelKind::Extension => false,
+/// Only meaningful for an account that *claims* correlation: one that does not
+/// is covered by the finding above. An empty ledger beside a non-empty outbox
+/// means the extension is returning no id on send, so every echo suppression
+/// this account believes it has is not happening.
+fn echo_ledger_finding(
+    account: &ChannelAccountRecord,
+    label: &str,
+    recorded_ids: u32,
+    sent_messages: u32,
+) -> Option<SecurityFinding> {
+    if !matches!(
+        echo_correlation_for(account),
+        EchoCorrelation::ProviderMessageId
+    ) {
+        return None;
     }
+    if sent_messages == 0 || recorded_ids > 0 {
+        return None;
+    }
+    Some(f(
+        &format!("channels.echo_ledger_empty.{}", account.account_id),
+        "An account claims message-id correlation but has recorded none",
+        &format!(
+            "{label} has sent {sent_messages} message(s) and this machine holds no provider \
+             message id for any of them, so it has nothing to match an echo against. The \
+             extension is declaring a capability its send path is not delivering."
+        ),
+        FindingStatus::Warning,
+        Some(
+            "Check that the extension's send result includes `provider_message_id`, or set the \
+             account's `echo_correlation` to `unsupported` so it is restricted accordingly.",
+        ),
+    ))
 }
 
 /// A helper transport whose binary is not where the account says it is.

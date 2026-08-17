@@ -425,6 +425,12 @@ fn extension_account(extension_id: &str, capability_id: &str) -> ChannelAccountR
         non_secret_config: serde_json::json!({
             "extension_id": extension_id,
             "capability_id": capability_id,
+            // An extension whose transport reports the provider's own message
+            // ids, which is what lets the host recognise its own echo causally.
+            // Declared here because these tests drive the *durable path*; an
+            // account that declares nothing is held to a narrower reply policy,
+            // and that restriction has its own tests in `channel_ingress`.
+            "echo_correlation": "provider_message_id",
         }),
         credential_ref: None,
         access_policy: ChannelAccessPolicy::default(),

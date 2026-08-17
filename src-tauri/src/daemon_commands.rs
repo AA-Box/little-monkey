@@ -1810,6 +1810,48 @@ mod tests {
         assert!(validate_token("recipe", "recipe.json\0--purge", 100).is_err());
     }
 
+    /// The desktop writes the tunnel credential and the daemon reads it. They
+    /// are separate processes and separate constants, so nothing but a test
+    /// stops them naming different keychain entries — a drift whose only
+    /// symptom is "the tunnel says it has no credential" while the settings
+    /// page says one is stored.
+    #[test]
+    fn the_desktop_and_the_daemon_agree_on_the_tunnel_keychain_entry() {
+        assert_eq!(
+            TUNNEL_CREDENTIAL_REF, "channel-exposure:tunnel-token",
+            "if this changes, change `daemon::callback_exposure::TUNNEL_CREDENTIAL_REF` with it"
+        );
+    }
+
+    /// React names a provider from a closed set and nothing else. There is no
+    /// argument on any exposure command that could become a program to run.
+    #[test]
+    fn the_exposure_bridge_takes_no_command_from_the_frontend() {
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(channels_exposure_set_tunnel(
+                "/bin/sh".to_string(),
+                "monkey.example.com".to_string(),
+                "/usr/local/bin/cloudflared".to_string(),
+                None,
+            ));
+        assert!(refused.is_err(), "an arbitrary program is not a provider");
+
+        // And a value that would be read as a flag by the CLI's own parser is
+        // refused before it can become one.
+        let dashed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(channels_exposure_set_tunnel(
+                "cloudflared".to_string(),
+                "--clear".to_string(),
+                "/usr/local/bin/cloudflared".to_string(),
+                None,
+            ));
+        assert!(dashed.is_err());
+    }
+
     #[test]
     fn remote_pairing_is_bounded_before_cli_dispatch() {
         let valid = RemotePairRequest {
@@ -2845,6 +2887,117 @@ pub async fn channels_set_credential(account_id: String, secret: String) -> Resu
     .await
     .map(|_| ())
 }
+
+// --- Public callback exposure ------------------------------------------------
+//
+// How this machine is reached from the internet, as five fixed-argument
+// commands. Note what React cannot express through any of them: it names a
+// tunnel provider from a closed set, a hostname, and a path — never an argv,
+// never a flag, never a command to run. The daemon builds what it executes from
+// its own template, and the credential goes from here straight to the keychain
+// without passing through a CLI argument at all.
+
+/// What the exposure is configured as and what it is doing. Never a credential:
+/// the status type has no field for one.
+#[tauri::command]
+pub async fn channels_exposure_status() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "exposure".into(),
+            "status".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Go back to publishing the URL yourself.
+#[tauri::command]
+pub async fn channels_exposure_manual() -> Result<(), String> {
+    command(vec!["channels".into(), "exposure".into(), "manual".into()])
+        .await
+        .map(|_| ())
+}
+
+/// Configure the daemon to run the operator's own tunnel client.
+///
+/// Every value is validated here as well as in the CLI, because this is the
+/// boundary a browser reaches: a hostname that is really a URL, or a path that
+/// is really a flag, must be refused before it becomes an argument.
+#[tauri::command]
+pub async fn channels_exposure_set_tunnel(
+    provider: String,
+    hostname: String,
+    executable: String,
+    metrics_port: Option<u16>,
+) -> Result<(), String> {
+    // A closed set, checked here rather than passed through. React naming an
+    // arbitrary program is the thing this whole shape exists to prevent.
+    if provider != "cloudflared" {
+        return Err(format!(
+            "'{provider}' is not a tunnel provider this build knows how to run."
+        ));
+    }
+    validate_token("tunnel hostname", &hostname, 253)?;
+    validate_token("tunnel client path", &executable, 4096)?;
+    // Both are positional, so a leading dash would be read as a flag by the
+    // CLI's own parser — the same trap `set-public-url` guards against.
+    if hostname.starts_with('-') || executable.starts_with('-') {
+        return Err("A hostname or path may not begin with '-'.".to_string());
+    }
+    let mut args = vec![
+        "channels".into(),
+        "exposure".into(),
+        "tunnel".into(),
+        provider,
+        "--hostname".into(),
+        hostname,
+        "--executable".into(),
+        executable,
+    ];
+    if let Some(port) = metrics_port {
+        args.push("--metrics-port".into());
+        args.push(port.to_string());
+    }
+    command(args).await.map(|_| ())
+}
+
+/// Store the tunnel credential.
+///
+/// Written straight to the keychain here rather than handed to the CLI, for
+/// the same reason an account's credential is: an argument is visible in a
+/// process listing, and there is no reason for the secret to exist in a second
+/// process at all.
+#[tauri::command]
+pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
+    if token.is_empty() || token.len() > 8192 {
+        return Err("A tunnel credential must contain 1-8192 bytes".to_string());
+    }
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, TUNNEL_CREDENTIAL_REF)
+        .map_err(|error| format!("Failed to open the tunnel keychain entry: {error}"))?
+        .set_password(&token)
+        .map_err(|error| format!("Failed to save the tunnel credential: {error}"))
+}
+
+/// Forget the tunnel credential.
+#[tauri::command]
+pub async fn channels_exposure_clear_token() -> Result<(), String> {
+    command(vec![
+        "channels".into(),
+        "exposure".into(),
+        "clear-token".into(),
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// The keychain entry the daemon reads a managed tunnel's credential from.
+///
+/// Spelled once, here and in `daemon::callback_exposure`, and asserted equal by
+/// a contract test — the desktop and the daemon writing different entry names
+/// is the failure mode this constant exists to make impossible.
+const TUNNEL_CREDENTIAL_REF: &str = "channel-exposure:tunnel-token";
 
 // --- Peers -----------------------------------------------------------------
 //

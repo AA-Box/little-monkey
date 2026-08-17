@@ -223,9 +223,15 @@
             <p id="talkAnswer" class="talk-text">—</p>
           </div>
           <p id="talkError" class="field-help talk-error" hidden></p>
+          <section id="talkPendingPanel" class="talk-pending" aria-labelledby="talkPendingTitle" hidden>
+            <p class="field-label" id="talkPendingTitle">Unfinished</p>
+            <ul id="talkPendingList" class="talk-pending-list"></ul>
+          </section>
           <p class="field-help">
             Talk needs this page open and in the foreground. Locking the phone or switching apps
-            ends the conversation; nothing keeps listening in the background.
+            ends the conversation; nothing keeps listening in the background. A recording the
+            runner never confirmed is kept here so you can send it again without saying it
+            twice — the microphone is never reopened without you asking.
           </p>
         </section>
 

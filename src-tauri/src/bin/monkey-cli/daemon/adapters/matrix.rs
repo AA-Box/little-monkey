@@ -70,6 +70,7 @@ use crate::daemon::channel_adapter::{
     load_attachments, AdapterConfig, BlobSource, ChannelAdapter, DaemonBlobs, InboundBatch,
     LoadedAttachment, TransportStatus,
 };
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, ChannelAttachment, ChannelConversation, ChannelEnvelope,
     ChannelHealth, ChannelKind, ChannelSender, HealthState, InboundTransport, OutboundMessage,
@@ -730,6 +731,7 @@ fn normalize_message(
         account_id: String::new(),
         kind: ChannelKind::Matrix,
         provider_event_id: event.event_id.to_string(),
+        provider_message_id: None,
         conversation,
         sender: ChannelSender {
             sender_id: event.sender.to_string(),
@@ -818,6 +820,7 @@ impl ChannelAdapter for MatrixAdapter {
             // key the homeserver dedupes on.
             supports_idempotency_key: true,
             supports_delivery_receipts: false,
+            echo_correlation: EchoCorrelation::HostAdapter,
         }
     }
 

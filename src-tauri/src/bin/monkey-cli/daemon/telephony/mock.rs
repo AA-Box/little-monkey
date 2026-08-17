@@ -461,6 +461,7 @@ impl TelecomProvider for MockProvider {
                     account_id: self.account_id.clone(),
                     kind: ChannelKind::Sms,
                     provider_event_id: message_id,
+                    provider_message_id: None,
                     conversation: ChannelConversation::direct(from.clone()),
                     sender: ChannelSender::new(from),
                     text,

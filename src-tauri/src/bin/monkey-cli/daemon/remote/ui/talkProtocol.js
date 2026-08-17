@@ -15,11 +15,11 @@
 // `hello`, and `mobileTalkProtocol.test.ts` drives a whole session through
 // them.
 
-// v2: a closing audio frame carries `utterance_id`. The runner refuses v1
-// outright rather than accepting a frame it cannot key a turn under — see the
-// Rust constant's own note for why the old behaviour is not kept as a
-// fallback.
-export const TALK_PROTOCOL_VERSION = 2;
+// v2: a closing audio frame carries `utterance_id`. v3: the runner answers a
+// durably accepted utterance with `turn_accepted`, and that frame is the only
+// thing this client deletes a recording on. Both sides are pinned to v3 — see
+// the Rust constant's own note for why an additive frame was not enough.
+export const TALK_PROTOCOL_VERSION = 3;
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the
@@ -158,7 +158,7 @@ export function normalizeUtteranceId(value) {
  * utterances that collide are two different things somebody said arriving as
  * one turn.
  */
-function defaultUtteranceId() {
+export function defaultUtteranceId() {
   const bytes = globalThis.crypto?.getRandomValues?.(new Uint8Array(12));
   if (!bytes) {
     throw new Error("This browser has no secure random source, so Talk cannot name an utterance");
@@ -318,6 +318,178 @@ export function createTalkFrames({ sessionId, sessionGeneration, mediaType, samp
         if (span !== undefined) frame[name] = span;
       }
       return envelope(frame);
+    },
+  };
+}
+
+// --- The pending-utterance journal ------------------------------------------
+//
+// What somebody said is held here from the moment it is encoded until the
+// runner says the turn exists durably. Before this, a socket that dropped
+// between "recording finished" and "answer arrived" simply lost the utterance:
+// the blob was a local in a closure and went with the session.
+//
+// Three states, and the difference between the first two is the whole design:
+//
+//   pending  — uploaded or not, nobody has confirmed a durable turn exists.
+//              The audio is still here and re-sending it is safe, because the
+//              runner keys the turn on `utteranceId` and a second arrival
+//              collapses onto the first.
+//   accepted — `turn_accepted` was received. The turn exists; the audio is
+//              deleted. What may still be missing is the *answer*, and that is
+//              recovered from the conversation, never by speaking again.
+//   (gone)   — discarded by the person, or aged out.
+//
+// Bounds are counts and bytes rather than a quota, for the same reason the
+// command journal's are: no page can read its own IndexedDB quota, so a bound
+// nobody can measure is not a bound.
+
+export const TALK_JOURNAL_LIMITS = {
+  /** Recordings held at once. Past this the oldest *accepted* ones go first. */
+  maxPending: 8,
+  /** One utterance. The detector caps a recording at 90 s; Opus at that length
+   * is well under this, and a container that is not is refused rather than
+   * stored. */
+  maxUtteranceBytes: 8 * 1024 * 1024,
+  /** Everything unsent, together. */
+  maxTotalBytes: 32 * 1024 * 1024,
+  /** How long an unconfirmed recording is offered for. A day is long enough to
+   * cover a runner that was down overnight and short enough that nobody is
+   * surprised to find their voice still on the device. */
+  ttlMs: 24 * 60 * 60 * 1_000,
+};
+
+export const TALK_UTTERANCE = {
+  pending: "pending",
+  accepted: "accepted",
+};
+
+/** Whether this entry still holds audio somebody might re-send. */
+export function talkUtterancePending(entry) {
+  return entry?.state === TALK_UTTERANCE.pending;
+}
+
+/**
+ * Why this recording may not be kept, or `null` when it may.
+ *
+ * Checked *before* the upload rather than after it fails, so the person is told
+ * at the end of the sentence they just spoke instead of discovering later that
+ * nothing was retained.
+ */
+export function talkJournalRefusal(entries, bytes, limits = TALK_JOURNAL_LIMITS) {
+  const size = Number(bytes) || 0;
+  if (size > limits.maxUtteranceBytes) {
+    return "That was too long to keep for a retry — it was sent, but it is not being held.";
+  }
+  const pending = entries.filter(talkUtterancePending);
+  if (pending.length >= limits.maxPending) {
+    return "There are already unconfirmed recordings waiting. Retry or discard one before speaking again.";
+  }
+  const held = pending.reduce((total, entry) => total + (Number(entry.bytes) || 0), 0);
+  if (held + size > limits.maxTotalBytes) {
+    return "This device is holding as much unconfirmed audio as it may. Retry or discard one before speaking again.";
+  }
+  return null;
+}
+
+/**
+ * Which entries may be dropped, oldest first.
+ *
+ * A `pending` entry is dropped only once it is older than the TTL: it is the
+ * one thing here that cannot be reconstructed from anywhere else, so evicting
+ * it to make room for a newer one would turn a storage bound into losing what
+ * somebody said. An `accepted` entry holds no audio and is only a note about
+ * an answer still being recovered, so it goes first.
+ */
+export function prunableTalkUtterances(entries, nowMs, limits = TALK_JOURNAL_LIMITS) {
+  const age = (entry) => nowMs - (Number(entry.createdAtMs) || 0);
+  const expired = entries.filter((entry) => age(entry) > limits.ttlMs);
+  const accepted = entries
+    .filter((entry) => !talkUtterancePending(entry))
+    .sort((left, right) => (left.createdAtMs || 0) - (right.createdAtMs || 0));
+  const overCount = Math.max(0, entries.length - limits.maxPending);
+  const ids = new Set(
+    [...expired, ...accepted.slice(0, overCount)].map((entry) => entry.utteranceId),
+  );
+  return [...ids];
+}
+
+/**
+ * The journal's operations over an injected store, exactly as the command
+ * journal does it: `adapter` supplies `all()`, `put(record)` and `remove(ids)`,
+ * and `now` is injected so a TTL can be tested without waiting a day.
+ */
+export function createTalkJournal(adapter, { now = () => Date.now(), limits = TALK_JOURNAL_LIMITS } = {}) {
+  return {
+    all: () => adapter.all(),
+    /**
+     * Hold one recording, or refuse to.
+     *
+     * Returns the record on success and `{ refused }` when a bound says no —
+     * never throws, because the caller's alternative is to drop the utterance
+     * silently.
+     */
+    async retain({ utteranceId, sessionId, mediaType, sampleRateHz, channels, audioBase64 }) {
+      const bytes = String(audioBase64 || "").length;
+      const entries = await adapter.all();
+      const refused = talkJournalRefusal(entries, bytes, limits);
+      if (refused) return { refused };
+      const record = {
+        utteranceId,
+        sessionId,
+        mediaType,
+        sampleRateHz,
+        channels,
+        audioBase64,
+        bytes,
+        createdAtMs: now(),
+        state: TALK_UTTERANCE.pending,
+        attempts: 1,
+        lastError: null,
+        runId: null,
+      };
+      await adapter.put(record);
+      return { record };
+    },
+    /**
+     * The runner confirmed a durable turn: drop the audio, keep the note.
+     *
+     * The record is not deleted outright because the *answer* may still be
+     * missing, and an entry that says "accepted, run r" is what stops the next
+     * reconnect offering to re-send something already running.
+     */
+    async accept(utteranceId, runId) {
+      const entry = (await adapter.all()).find((row) => row.utteranceId === utteranceId);
+      if (!entry) return null;
+      const record = {
+        ...entry,
+        state: TALK_UTTERANCE.accepted,
+        audioBase64: null,
+        bytes: 0,
+        runId: runId || entry.runId || null,
+        lastError: null,
+      };
+      await adapter.put(record);
+      return record;
+    },
+    /** A failed attempt: the audio stays exactly where it is. */
+    async failed(utteranceId, reason) {
+      const entry = (await adapter.all()).find((row) => row.utteranceId === utteranceId);
+      if (!entry) return null;
+      const record = {
+        ...entry,
+        attempts: (Number(entry.attempts) || 0) + 1,
+        lastError: reason ? String(reason).slice(0, 512) : null,
+      };
+      await adapter.put(record);
+      return record;
+    },
+    remove: (utteranceIds) => (utteranceIds.length ? adapter.remove(utteranceIds) : Promise.resolve()),
+    async prune() {
+      const entries = await adapter.all();
+      const dropping = prunableTalkUtterances(entries, now(), limits);
+      if (dropping.length) await adapter.remove(dropping);
+      return dropping;
     },
   };
 }

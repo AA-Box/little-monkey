@@ -51,7 +51,7 @@ pub(crate) fn collect(app_version: &str) -> Result<SupportBundle, String> {
     match DaemonPaths::resolve() {
         Err(error) => {
             let reason = bounded_reason(&error);
-            for name in ["channels", "telephony", "peers"] {
+            for name in ["channels", "telephony", "peers", "callback_exposure"] {
                 sections.insert(name.to_string(), TraceSection::unavailable(reason.clone()));
             }
             sections.insert(
@@ -63,7 +63,7 @@ pub(crate) fn collect(app_version: &str) -> Result<SupportBundle, String> {
             match DaemonStore::open(&paths) {
                 Err(error) => {
                     let reason = bounded_reason(&error);
-                    for name in ["channels", "telephony", "peers"] {
+                    for name in ["channels", "telephony", "peers", "callback_exposure"] {
                         sections
                             .insert(name.to_string(), TraceSection::unavailable(reason.clone()));
                     }
@@ -75,6 +75,7 @@ pub(crate) fn collect(app_version: &str) -> Result<SupportBundle, String> {
                         telephony_section(&store, &redactor),
                     );
                     sections.insert("peers".to_string(), peer_section(&store, &redactor));
+                    sections.insert("callback_exposure".to_string(), exposure_section(&store));
                 }
             }
             sections.insert("devices".to_string(), device_section(&paths, &redactor));
@@ -89,6 +90,58 @@ pub(crate) fn collect(app_version: &str) -> Result<SupportBundle, String> {
         redaction: Default::default(),
         sections,
     })
+}
+
+/// How this machine is reachable from the internet, and what its tunnel is
+/// doing.
+///
+/// Takes no redactor, and that is not an oversight: there is nothing here to
+/// pseudonymize. The hostname is the operator's own published address — it is
+/// already in a provider console and on the settings page — and everything else
+/// is a state name, a count and a bounded failure reason the supervisor already
+/// stripped the credential out of. The token itself has no field to travel in.
+fn exposure_section(store: &DaemonStore) -> TraceSection {
+    let status = crate::daemon::callback_exposure::status(
+        store,
+        &crate::daemon::channel_adapter::KeyringChannelSecrets,
+    );
+    TraceSection::from_events(vec![TraceEvent {
+        at_ms: status.since_ms.unwrap_or(0),
+        event: match status.state {
+            crate::daemon::callback_exposure::ExposureState::Connected => {
+                "callback_exposure_connected"
+            }
+            crate::daemon::callback_exposure::ExposureState::Stopped
+            | crate::daemon::callback_exposure::ExposureState::NotConfigured => {
+                "callback_exposure_stopped"
+            }
+            crate::daemon::callback_exposure::ExposureState::Connecting => {
+                "callback_exposure_starting"
+            }
+            _ => "callback_exposure_failed",
+        }
+        .to_string(),
+        // No subject and no context: both are `Pseudonym`, which is the type
+        // system enforcing that anything identifying has been through the
+        // redactor. There is nothing identifying here to put in one -- the
+        // mode, the state and the restart count are this codebase's own
+        // vocabulary, so they belong in `outcome` and `reason`.
+        subject: None,
+        context: None,
+        outcome: Some(format!(
+            "{}/{} after {} restart(s)",
+            match status.mode {
+                crate::daemon::callback_exposure::ExposureMode::Manual => "manual",
+                crate::daemon::callback_exposure::ExposureMode::ManagedTunnel => status
+                    .provider
+                    .map(|provider| provider.as_str())
+                    .unwrap_or("managed"),
+            },
+            status.state.as_str(),
+            status.restarts,
+        )),
+        reason: status.last_error.as_deref().map(bounded_reason),
+    }])
 }
 
 /// Inbound normalization, access, routing and the outbox, per account.
@@ -112,6 +165,30 @@ fn channel_section(store: &DaemonStore, redactor: &Redactor) -> TraceSection {
             context: None,
             outcome: Some(account.health.state.as_str().to_string()),
             reason: account.health.last_error.as_deref().map(bounded_reason),
+        });
+        // How this account decides one of its own messages coming back, and
+        // how many ids it is holding to do it with. A *count*, never an id: a
+        // provider message id names a specific message in a specific
+        // conversation, which is the kind of thing this format has no field
+        // for on purpose.
+        let correlation = crate::daemon::channel_adapter::echo_correlation_for(account);
+        events.push(TraceEvent {
+            at_ms: account.updated_at_ms,
+            event: "extension_echo_correlation".to_string(),
+            subject: Some(account_token.clone()),
+            // A count, never an id: a provider message id names one specific
+            // message in one specific conversation, and this format has no
+            // field it could travel in.
+            context: None,
+            outcome: Some(format!(
+                "{} ({} id(s) recorded)",
+                correlation.as_str(),
+                store
+                    .outbound_echo_count(&account.account_id)
+                    .unwrap_or_default()
+            )),
+            reason: (!correlation.is_host_verifiable())
+                .then(|| "reply policy is restricted".to_string()),
         });
         let Ok(rows) = store.recent_channel_events(&account.account_id, READ_LIMIT) else {
             continue;

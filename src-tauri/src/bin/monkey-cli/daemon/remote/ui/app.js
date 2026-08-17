@@ -28,20 +28,28 @@ import {
   clampTalkSampleRateHz,
   createTalkDetector,
   createTalkFrames,
+  createTalkJournal,
+  defaultUtteranceId,
   normalizeTalkMediaType,
   splitTalkAudioBase64,
+  talkUtterancePending,
 } from "./talkProtocol.js";
 
 const PROTOCOL_VERSION = 1;
 const DB_NAME = "little-monkey-remote-v1";
-// v2 adds the durable command journal. Additive: the controller store keeps its
-// name, its key path and every record in it, so an upgrade never re-pairs.
-const DB_VERSION = 2;
+// v2 adds the durable command journal, v3 the Talk pending-utterance journal.
+// Both additive: the controller store keeps its name, its key path and every
+// record in it, so an upgrade never re-pairs.
+const DB_VERSION = 3;
 const STORE_NAME = "controllers";
 // Artifact bytes live here, not in the controller record. A profile row that
 // carried multi-megabyte stills would be rewritten in full on every sequence
 // allocation, which is the hottest write this client makes.
 const JOURNAL_STORE = "device_command_journal";
+// Recordings the runner has not confirmed a durable turn for. Its own store
+// rather than a field on the controller record, for the same reason: audio
+// rewritten on every sequence allocation would be the hottest write here.
+const TALK_STORE = "talk_utterance_journal";
 const ACTIVE_RECORD = "active";
 const MAX_INVITATION_BYTES = 256 * 1024;
 // Every `RemoteAction` the runner can grant. `pause` and `control_desktop`
@@ -273,6 +281,8 @@ const ui = Object.fromEntries(
     "talkTranscript",
     "talkAnswer",
     "talkError",
+    "talkPendingPanel",
+    "talkPendingList",
     "chatPanel",
     "chatEmpty",
     "chatForm",
@@ -316,7 +326,8 @@ function openDatabase() {
     // The upgrade lives in `device-core.js` so it can be exercised without a
     // browser: it adds the journal store and leaves an existing pairing's key,
     // sequence and cache exactly where they were.
-    request.onupgradeneeded = () => journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE);
+    request.onupgradeneeded = () =>
+      journalUpgrade(request.result, STORE_NAME, JOURNAL_STORE, TALK_STORE);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Browser storage could not be opened"));
     request.onblocked = () => reject(new Error("Browser storage upgrade is blocked by another tab"));
@@ -2856,6 +2867,18 @@ const talk = {
   playbackGeneration: 0,
   player: null,
   running: false,
+  /**
+   * The utterance a socket is currently open only to re-send, or null.
+   *
+   * A retry does everything a session does except the one thing that matters:
+   * it never calls `getUserMedia`. Holding the id rather than a boolean is what
+   * lets the acknowledgement close the session it belongs to — a re-send has no
+   * microphone and nothing further to do, so leaving the socket open would
+   * leave the panel saying "End Talk" over a conversation nobody is having.
+   */
+  resending: null,
+  /** What the journal last held, for rendering. Never the audio itself. */
+  pending: [],
 };
 
 function talkSupported() {
@@ -2887,6 +2910,10 @@ function renderTalkPanel() {
   const permitted = effective.includes("voice_stream");
   ui.talkPanel.hidden = !state.profile;
   ui.talkButton.disabled = !permitted || state.stale;
+  // Before every early return below. A device that has lost the grant, or is
+  // in a browser that cannot record at all, may still be holding a recording
+  // from when it could — and must still be able to see it and discard it.
+  void renderTalkPending();
   if (!talkSupported()) {
     ui.talkUnavailable.hidden = false;
     ui.talkUnavailable.textContent =
@@ -3005,6 +3032,12 @@ function talkHandleFrame(raw) {
     case "output_audio":
       talkQueueAudio(frame.audio_base64, frame.media_type);
       break;
+    case "turn_accepted":
+      // The one frame a recording may be deleted on. Everything before it —
+      // "we have your audio", "we transcribed it" — is a claim about a process
+      // that a crash erases; this is a claim about a row that survives one.
+      void talkAccept(frame.utterance_id, frame.run_id);
+      break;
     case "error":
       showTalkError(frame.message);
       if (!frame.retryable) void stopTalk();
@@ -3012,6 +3045,28 @@ function talkHandleFrame(raw) {
     default:
       break;
   }
+}
+
+/** Mark one utterance durably accepted and stop holding its audio. */
+async function talkAccept(utteranceId, runId) {
+  if (!utteranceId) return;
+  try {
+    await talkJournal.accept(utteranceId, runId);
+  } catch {
+    // A journal that cannot be written is not a reason to break the
+    // conversation: the worst outcome is audio kept longer than it had to be,
+    // and the TTL still collects it.
+  }
+  // A session opened solely to re-send this recording has now done the only
+  // thing it was for. Closed here rather than left running: there is no
+  // microphone behind it, so what would otherwise happen is a live socket and
+  // an "End Talk" button over a conversation nobody started.
+  if (talk.resending === utteranceId) {
+    talk.resending = null;
+    await stopTalk("That recording was accepted. Its answer will appear in the conversation.");
+    return;
+  }
+  await renderTalkPending();
 }
 
 async function startTalk() {
@@ -3062,52 +3117,7 @@ async function startTalk() {
     const sampleRateHz = clampTalkSampleRateHz(context.sampleRate);
     const channels = clampTalkChannels(settings.channelCount);
 
-    const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", {
-      protocol_version: TALK_PROTOCOL_VERSION,
-      session_id: sessionId,
-    });
-    talk.sessionId = ticket.session_id;
-    talk.sessionGeneration = ticket.session_generation;
-    // Same origin as this page, by construction: pairing already refused an
-    // invitation whose runner URL was not this origin, so there is no second
-    // host a socket could be pointed at.
-    const url = new URL(ticket.websocket_path, location.origin);
-    url.protocol = "wss:";
-    url.searchParams.set("ticket", ticket.ticket);
-    const socket = new WebSocket(url.toString());
-    talk.socket = socket;
-    await new Promise((resolve, reject) => {
-      socket.onopen = resolve;
-      socket.onerror = () => reject(new RemoteError("The Talk socket could not be opened", 0));
-    });
-    socket.onmessage = (event) => talkHandleFrame(event.data);
-    socket.onclose = () => {
-      if (!talk.running) return;
-      // Whether a turn was in flight changes what the person needs to know.
-      // The recording is gone with the socket and this client does not resend
-      // it, so an utterance that was being answered was simply lost — saying
-      // only "the runner closed the conversation" leaves them to guess whether
-      // it was heard.
-      void stopTalk(
-        talk.answering
-          ? "Talk ended before that answer arrived — say it again when you reconnect"
-          : "The runner closed the conversation",
-      );
-    };
-    talk.running = true;
-    talk.answering = false;
-    ui.talkButton.textContent = "End Talk";
-    // Frame 1 is the hello, before anything can produce a frame 2: the runner
-    // refuses any other opening frame with `retryable: false`, which this
-    // client's own error handler turns into a torn-down session.
-    talk.frames = createTalkFrames({
-      sessionId: ticket.session_id,
-      sessionGeneration: ticket.session_generation,
-      mediaType,
-      sampleRateHz,
-      channels,
-    });
-    talkSendFrame(talk.frames.hello());
+    await talkConnect({ sessionId, mediaType, sampleRateHz, channels });
     // Only now: the detector and the recorder it arms cannot run before the
     // greeting they belong to.
     talkStartCapture(context);
@@ -3119,6 +3129,75 @@ async function startTalk() {
     setButtonBusy(ui.talkButton, false);
     if (talk.running) ui.talkButton.textContent = "End Talk";
   }
+}
+
+/**
+ * One ticket, one socket, one hello — and nothing about a microphone.
+ *
+ * Split out of `startTalk` so re-sending a retained recording can take exactly
+ * this path. A retry needs a *fresh* ticket (they are one-use and expire in
+ * thirty seconds) and therefore a fresh session generation, which is precisely
+ * why the utterance's identity cannot come from either: only the id the device
+ * already wrote down survives the reconnect, and it is what makes the second
+ * arrival collapse onto the first turn instead of becoming another one.
+ */
+async function talkConnect({ sessionId, mediaType, sampleRateHz, channels }) {
+  const ticket = await signedRequest("POST", "/v1/remote/device/talk/ticket", {
+    protocol_version: TALK_PROTOCOL_VERSION,
+    session_id: sessionId,
+  });
+  talk.sessionId = ticket.session_id;
+  talk.sessionGeneration = ticket.session_generation;
+  // Same origin as this page, by construction: pairing already refused an
+  // invitation whose runner URL was not this origin, so there is no second
+  // host a socket could be pointed at.
+  const url = new URL(ticket.websocket_path, location.origin);
+  url.protocol = "wss:";
+  url.searchParams.set("ticket", ticket.ticket);
+  const socket = new WebSocket(url.toString());
+  talk.socket = socket;
+  await new Promise((resolve, reject) => {
+    socket.onopen = resolve;
+    socket.onerror = () => reject(new RemoteError("The Talk socket could not be opened", 0));
+  });
+  socket.onmessage = (event) => talkHandleFrame(event.data);
+  socket.onclose = () => {
+    if (!talk.running) return;
+    void stopTalk(talkClosedReason());
+  };
+  talk.running = true;
+  talk.answering = false;
+  ui.talkButton.textContent = "End Talk";
+  // Frame 1 is the hello, before anything can produce a frame 2: the runner
+  // refuses any other opening frame with `retryable: false`, which this
+  // client's own error handler turns into a torn-down session.
+  talk.frames = createTalkFrames({
+    sessionId: ticket.session_id,
+    sessionGeneration: ticket.session_generation,
+    mediaType,
+    sampleRateHz,
+    channels,
+  });
+  talkSendFrame(talk.frames.hello());
+  return ticket;
+}
+
+/**
+ * What to say when the socket goes away, which depends on what is retained.
+ *
+ * An unconfirmed recording is the case that used to read as "say it again":
+ * the audio is still here, so the honest sentence names the button rather than
+ * asking somebody to repeat themselves. An accepted turn whose answer never
+ * arrived is the opposite — repeating it would run it twice.
+ */
+function talkClosedReason() {
+  if (talk.pending.some(talkUtterancePending)) {
+    return "Connection lost before that was confirmed — it is still here, and you can send it again.";
+  }
+  if (talk.pending.length) {
+    return "Connection lost after your question was accepted. It is still running; the answer will appear in the conversation.";
+  }
+  return "The runner closed the conversation";
 }
 
 function talkStartCapture(context) {
@@ -3190,6 +3269,19 @@ function talkBeginUtterance(speechDetectionMs) {
     const blob = new Blob(chunks, { type: talk.frames?.mediaType || "audio/webm" });
     if (blob.size > 0 && talk.running && talk.frames) {
       const audioBase64 = await blobToBase64(blob);
+      // Named and written down BEFORE a single byte goes out. That order is
+      // the whole recovery story: a socket that dies during the upload leaves
+      // a recording somebody can send again, and a socket that dies after the
+      // runner confirmed leaves a note saying not to.
+      const utteranceId = defaultUtteranceId();
+      const retained = await talkRetain({
+        utteranceId,
+        audioBase64,
+        mediaType: talk.frames.mediaType,
+        sampleRateHz: talk.frames.sampleRateHz,
+        channels: talk.frames.channels,
+      });
+      if (retained) showTalkError("");
       // Ninety seconds of Opus is far more than one frame may carry, so the
       // utterance goes out as however many frames it takes; the runner
       // reassembles them and only the last one closes it.
@@ -3211,7 +3303,13 @@ function talkBeginUtterance(speechDetectionMs) {
           }),
         );
         chunks.forEach((chunk, at) => {
-          talkSendFrame(talk.frames.audio({ audioBase64: chunk, last: at === chunks.length - 1 }));
+          talkSendFrame(
+            talk.frames.audio({
+              audioBase64: chunk,
+              last: at === chunks.length - 1,
+              utteranceId,
+            }),
+          );
         });
       } catch (error) {
         // Refused here rather than by the runner, whose refusal is not
@@ -3251,6 +3349,147 @@ function talkFinishUtterance() {
   recorder.stop();
 }
 
+// --- What is still owed ------------------------------------------------------
+
+/**
+ * Retain one recording, and say plainly when a bound refused to.
+ *
+ * A refusal is surfaced rather than swallowed: the utterance is still uploaded
+ * — it may well be answered — but the person has to know it is not being held,
+ * because otherwise "Retry" simply would not be there and nobody would know
+ * why.
+ */
+async function talkRetain(entry) {
+  try {
+    const { refused } = await talkJournal.retain({ ...entry, sessionId: talk.sessionId });
+    if (refused) {
+      showTalkError(refused);
+      return false;
+    }
+  } catch (error) {
+    showTalkError(`That recording could not be held for a retry: ${String(error?.message || error)}`);
+    return false;
+  }
+  await renderTalkPending();
+  return true;
+}
+
+/** Re-send a recording the runner never confirmed. Never opens a microphone. */
+async function retryPendingUtterance(utteranceId) {
+  const entry = talk.pending.find((row) => row.utteranceId === utteranceId);
+  if (!entry || !talkUtterancePending(entry) || !entry.audioBase64) return;
+  if (talk.running) {
+    showTalkError("End the current conversation before re-sending an earlier recording.");
+    return;
+  }
+  talk.resending = utteranceId;
+  showTalkError("");
+  setTalkState("Re-sending", "starting");
+  try {
+    // The original session, so the turn lands in the conversation it belongs
+    // to, and the original media description, so the runner is told what the
+    // bytes actually are rather than what this page would record today.
+    await talkConnect({
+      sessionId: entry.sessionId,
+      mediaType: entry.mediaType,
+      sampleRateHz: entry.sampleRateHz,
+      channels: entry.channels,
+    });
+    const chunks = splitTalkAudioBase64(entry.audioBase64);
+    chunks.forEach((chunk, at) => {
+      talkSendFrame(
+        talk.frames.audio({
+          audioBase64: chunk,
+          last: at === chunks.length - 1,
+          // The original name. A fresh one would be a second turn saying the
+          // same thing, which is the duplicate this whole path exists to avoid.
+          utteranceId: entry.utteranceId,
+        }),
+      );
+    });
+    setTalkState("Waiting for confirmation", "thinking");
+  } catch (error) {
+    await talkJournal.failed(utteranceId, error?.message || error).catch(() => undefined);
+    talk.resending = null;
+    await stopTalk();
+    handleError(error, "That recording could not be re-sent");
+  }
+}
+
+/** Forget one recording on purpose. There is no undo, and no later retry. */
+async function discardPendingUtterance(utteranceId) {
+  await talkJournal.remove([utteranceId]).catch(() => undefined);
+  await renderTalkPending();
+}
+
+/**
+ * Draw what this device is still holding.
+ *
+ * Two rows with different offers, because the two states need opposite advice:
+ * an unconfirmed recording can be sent again, and an accepted one must not be.
+ */
+async function renderTalkPending() {
+  if (!ui.talkPendingPanel || !ui.talkPendingList) return;
+  let entries = [];
+  try {
+    await talkJournal.prune();
+    entries = await talkJournal.all();
+  } catch {
+    // A device whose storage is unreadable still gets to Talk; it simply
+    // cannot offer to re-send anything.
+  }
+  entries.sort((left, right) => (left.createdAtMs || 0) - (right.createdAtMs || 0));
+  talk.pending = entries;
+  ui.talkPendingPanel.hidden = entries.length === 0;
+  // The button says what starting it would mean. A reload that lands on a
+  // device still holding a recording gets "Resume Talk" here rather than only
+  // after a session has ended, because a page that has just been opened is
+  // exactly when nobody remembers what was left unfinished.
+  if (!talk.running) {
+    ui.talkButton.textContent = entries.some(talkUtterancePending)
+      ? "Resume Talk"
+      : "Start Talk";
+  }
+  ui.talkPendingList.replaceChildren(
+    ...entries.map((entry) => {
+      const item = document.createElement("li");
+      item.className = "talk-pending-item";
+      item.dataset.state = entry.state;
+      const said = document.createElement("p");
+      said.className = "field-help";
+      said.textContent = talkUtterancePending(entry)
+        ? `Recorded ${relativeTime(entry.createdAtMs)} — not confirmed by the runner.`
+        : `Accepted ${relativeTime(entry.createdAtMs)}. Recovering the answer from the conversation…`;
+      item.append(said);
+      if (entry.lastError) {
+        const failure = document.createElement("p");
+        failure.className = "field-help talk-error";
+        failure.textContent = `Last attempt: ${entry.lastError}`;
+        item.append(failure);
+      }
+      const actions = document.createElement("div");
+      actions.className = "talk-controls";
+      if (talkUtterancePending(entry)) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "button primary";
+        retry.textContent = "Retry upload";
+        retry.disabled = talk.running;
+        retry.addEventListener("click", () => void retryPendingUtterance(entry.utteranceId));
+        actions.append(retry);
+      }
+      const discard = document.createElement("button");
+      discard.type = "button";
+      discard.className = "button";
+      discard.textContent = talkUtterancePending(entry) ? "Discard" : "Dismiss";
+      discard.addEventListener("click", () => void discardPendingUtterance(entry.utteranceId));
+      actions.append(discard);
+      item.append(actions);
+      return item;
+    }),
+  );
+}
+
 async function stopTalk(reason) {
   talk.running = false;
   talk.answering = false;
@@ -3279,9 +3518,11 @@ async function stopTalk(reason) {
   }
   talk.sessionId = null;
   talk.sessionGeneration = null;
-  ui.talkButton.textContent = "Start Talk";
   setTalkState(reason || "Not connected", "idle");
   if (reason) showTalkError(reason);
+  // Last, and always: the buttons that offer a retry only exist while nothing
+  // is running, and this is the moment that becomes true.
+  await renderTalkPending();
 }
 
 // A page that is hidden has no microphone on either mobile platform. Ending the
@@ -3382,6 +3623,55 @@ const journalAdapter = {
 };
 
 const journal = createJournal(journalAdapter, { limits: JOURNAL_LIMITS });
+
+// The same three lines again for the Talk store. Not folded into one factory:
+// the two journals key on different fields and the generic version would take
+// a store name and a key path as parameters, which is more machinery than the
+// duplication costs.
+async function withTalkStore(mode, operation) {
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(TALK_STORE, mode);
+      const store = transaction.objectStore(TALK_STORE);
+      let result;
+      let failure;
+      try {
+        result = operation(store);
+      } catch (error) {
+        failure = error;
+        transaction.abort();
+      }
+      transaction.oncomplete = () => resolve(result);
+      transaction.onerror = () => reject(failure || transaction.error || new Error("The Talk journal failed"));
+      transaction.onabort = () => reject(failure || transaction.error || new Error("The Talk journal was aborted"));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+const talkJournalAdapter = {
+  async all() {
+    const database = await openDatabase();
+    try {
+      const transaction = database.transaction(TALK_STORE, "readonly");
+      return (await requestValue(transaction.objectStore(TALK_STORE).getAll())) || [];
+    } finally {
+      database.close();
+    }
+  },
+  put(record) {
+    return withTalkStore("readwrite", (store) => store.put(record));
+  },
+  remove(utteranceIds) {
+    return withTalkStore("readwrite", (store) => {
+      for (const utteranceId of utteranceIds) store.delete(utteranceId);
+    });
+  },
+};
+
+const talkJournal = createTalkJournal(talkJournalAdapter);
 
 const journalEntry = (commandId) => journal.get(commandId);
 const journalEntries = () => journal.all();

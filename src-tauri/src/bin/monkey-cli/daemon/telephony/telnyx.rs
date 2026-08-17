@@ -559,6 +559,7 @@ fn normalize_telnyx_event(data: &TelnyxData, received_at_ms: i64) -> Result<Tele
                 account_id: String::new(),
                 kind: ChannelKind::Sms,
                 provider_event_id: payload.id.clone(),
+                provider_message_id: None,
                 conversation: ChannelConversation::direct(from.clone()),
                 sender: ChannelSender::new(from),
                 text: payload.text.clone().unwrap_or_default(),

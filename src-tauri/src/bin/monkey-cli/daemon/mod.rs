@@ -3,6 +3,7 @@ mod admission;
 mod call_audio;
 pub(crate) mod call_media;
 pub(crate) mod call_socket;
+pub(crate) mod callback_exposure;
 pub(crate) mod channel_adapter;
 #[cfg(test)]
 mod channel_agent_e2e;
@@ -2937,6 +2938,12 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
         webhook::spawn_local_listener(paths.clone(), port).await?;
+        // And, if the operator asked for one, their own tunnel in front of it.
+        // After the listener rather than before: a tunnel that connected to a
+        // port nothing was serving would advertise a public URL that answers
+        // nothing, which is worse than not being up. Does nothing at all for
+        // the default manual mode.
+        callback_exposure::spawn_supervisor(paths.clone());
     }
     let mut workflow_trigger_sync = WorkflowBatchSynchronizer::default();
     // Roadmap K17 S4: the heartbeat. Every machine's daemon is both a node and a

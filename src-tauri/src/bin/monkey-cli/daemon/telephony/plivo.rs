@@ -565,6 +565,7 @@ fn normalize_plivo_params(
             account_id: String::new(),
             kind: ChannelKind::Sms,
             provider_event_id: message_uuid.clone(),
+            provider_message_id: None,
             conversation: ChannelConversation::direct(from.clone()),
             sender: ChannelSender::new(from),
             text,

@@ -526,6 +526,145 @@ impl DaemonStore {
             .map(Option::unwrap_or_default)
     }
 
+    // -- The outbound echo ledger --------------------------------------------
+
+    /// How long a sent message's provider id is remembered.
+    ///
+    /// A provider echoes our own message back within seconds; a day is three
+    /// orders of magnitude of headroom for a provider that was down, and it
+    /// bounds a busy account's ledger to what one day of sending produced.
+    pub const ECHO_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
+    /// And a second bound that does not depend on the clock: an account that
+    /// sends a million messages in an hour is bounded by this rather than by
+    /// the TTL.
+    pub const ECHO_MAX_ROWS_PER_ACCOUNT: usize = 5_000;
+
+    /// Remember that the provider called one of *our* messages this.
+    ///
+    /// Written after a send reports delivery, and the only thing that later
+    /// authorizes suppressing an inbound message as our own echo. Nothing about
+    /// what was said is stored: the question this table answers is "did we send
+    /// this", and the outbound event log already answers the other one.
+    pub fn record_outbound_echo(
+        &mut self,
+        account_id: &str,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        provider_message_id: &str,
+        outbox_id: &str,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO channel_outbound_echo (
+                    account_id, conversation_id, thread_key, provider_message_id,
+                    outbox_id, sent_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_id, conversation_id, thread_key, provider_message_id)
+                 DO NOTHING",
+                params![
+                    account_id,
+                    conversation_id,
+                    thread_key(thread_id),
+                    provider_message_id,
+                    outbox_id,
+                    now_ms.max(1),
+                ],
+            )
+            .map_err(|error| format!("Failed to record an outbound message id: {error}"))?;
+        Ok(())
+    }
+
+    /// Did *we* send this exact provider message, here, in this conversation?
+    ///
+    /// The whole of self-echo determination for a provider whose sender
+    /// identity the host cannot verify. It is a causal question with a durable
+    /// answer, rather than a claim on an envelope.
+    pub fn is_own_outbound_echo(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        thread_id: Option<&str>,
+        provider_message_id: &str,
+    ) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM channel_outbound_echo
+                 WHERE account_id=?1 AND conversation_id=?2 AND thread_key=?3
+                   AND provider_message_id=?4",
+                params![
+                    account_id,
+                    conversation_id,
+                    thread_key(thread_id),
+                    provider_message_id
+                ],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map(|found| found.is_some())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Drop what is too old or too numerous to matter, and say how much went.
+    ///
+    /// Both bounds in one statement per account, so a pass is deterministic:
+    /// the same ledger and the same clock always prune the same rows.
+    pub fn prune_outbound_echo(&mut self, now_ms: i64) -> Result<u32, String> {
+        let cutoff = now_ms.saturating_sub(Self::ECHO_RETENTION_MS);
+        let by_age = self
+            .connection
+            .execute(
+                "DELETE FROM channel_outbound_echo WHERE sent_at_ms < ?1",
+                [cutoff],
+            )
+            .map_err(|error| error.to_string())?;
+        let by_count = self
+            .connection
+            .execute(
+                "DELETE FROM channel_outbound_echo
+                 WHERE rowid IN (
+                    SELECT rowid FROM channel_outbound_echo AS outer_row
+                    WHERE (
+                        SELECT COUNT(*) FROM channel_outbound_echo AS newer
+                        WHERE newer.account_id = outer_row.account_id
+                          AND (newer.sent_at_ms, newer.rowid) > (outer_row.sent_at_ms, outer_row.rowid)
+                    ) >= ?1
+                 )",
+                [i64::try_from(Self::ECHO_MAX_ROWS_PER_ACCOUNT).unwrap_or(i64::MAX)],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(u32::try_from(by_age + by_count).unwrap_or(u32::MAX))
+    }
+
+    /// How many messages this account has actually got out of the door.
+    ///
+    /// The denominator for the ledger check: an empty ledger proves nothing on
+    /// an account that has never sent anything, and everything on one that has.
+    pub fn sent_outbox_count(&self, account_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox WHERE account_id=?1 AND state='sent'",
+                [account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
+    /// How many ids this account is currently remembering. Read by the audit,
+    /// which is the only thing that can tell an operator the ledger is empty
+    /// for an account that has been sending.
+    pub fn outbound_echo_count(&self, account_id: &str) -> Result<u32, String> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbound_echo WHERE account_id=?1",
+                [account_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(|error| error.to_string())
+    }
+
     pub fn delete_channel_account(&mut self, account_id: &str) -> Result<bool, String> {
         self.connection
             .execute(
@@ -634,7 +773,25 @@ impl DaemonStore {
         }
     }
 
+    /// The base every callback URL is composed from, whichever way the operator
+    /// exposes this listener.
+    ///
+    /// One function, because there is one answer: every provider — messaging
+    /// and carrier alike — has to be told the same URL the signature verifier
+    /// will later reconstruct. Routing managed exposure through here rather
+    /// than through each provider is what keeps a tunnel from becoming a
+    /// thirteenth place a public URL can come from.
     pub fn channel_public_base_url(&self) -> Result<Option<String>, String> {
+        let manual = self.channel_public_base_url_manual()?;
+        Ok(super::callback_exposure::read_config(self).public_base(manual.as_deref()))
+    }
+
+    /// The value the operator typed in, ignoring any managed exposure.
+    ///
+    /// Kept separate so switching to a managed tunnel and back does not lose
+    /// the URL somebody configured, and so the settings form can show what is
+    /// stored rather than what is in force.
+    pub fn channel_public_base_url_manual(&self) -> Result<Option<String>, String> {
         self.get_meta(CHANNEL_PUBLIC_BASE_URL_KEY)
     }
 
@@ -2255,6 +2412,16 @@ fn insert_outbox_message(
 /// callbacks. A KV row rather than a schema column: one value, daemon-wide.
 const CHANNEL_PUBLIC_BASE_URL_KEY: &str = "channels.public_base_url";
 
+/// A thread id as the echo ledger's key sees it.
+///
+/// `NULL` is not equal to itself in SQL, so a nullable column inside a UNIQUE
+/// constraint silently permits duplicates and matches none of them. Folding
+/// "no thread" to the empty string — which no provider uses as a thread id —
+/// makes the key total.
+fn thread_key(thread_id: Option<&str>) -> &str {
+    thread_id.unwrap_or("")
+}
+
 /// The listener-relative path one account's webhook deliveries arrive on.
 pub fn channel_callback_path(account_id: &str) -> String {
     format!("/v1/channels/{account_id}")
@@ -2436,6 +2603,7 @@ mod tests {
                 account_id: "acct-1".into(),
                 kind: ChannelKind::Telegram,
                 provider_event_id: provider_event_id.into(),
+                provider_message_id: None,
                 conversation: ChannelConversation::group("conv-1"),
                 sender,
                 text: "hello".into(),
@@ -2694,6 +2862,7 @@ mod tests {
             account_id: "acct-1".into(),
             kind: ChannelKind::Telegram,
             provider_event_id: "evt-1".into(),
+            provider_message_id: None,
             conversation: ChannelConversation {
                 conversation_id: "C1".into(),
                 kind: ConversationKind::Channel,

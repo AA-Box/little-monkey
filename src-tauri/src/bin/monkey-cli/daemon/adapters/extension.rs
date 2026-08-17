@@ -34,6 +34,7 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
+use little_monkey_lib::channels::policy::EchoCorrelation;
 use little_monkey_lib::channels::types::{
     AttachmentKind, AttachmentSource, BoundedMetadata, ChannelAttachment, ChannelConversation,
     ChannelEnvelope, ChannelHealth, ChannelKind, ChannelSender, ConversationKind, HealthState,
@@ -65,6 +66,10 @@ pub(crate) struct ExtensionChannelAdapter {
     /// its own declared secret slots inside the sandbox, so this process never
     /// holds the provider's token at all.
     settings: JsonValue,
+    /// What this account declares about supplying stable provider message ids.
+    /// Read once at construction from the same non-secret configuration the
+    /// ingress reads, so the two halves cannot disagree about it.
+    echo_correlation: EchoCorrelation,
 }
 
 impl ExtensionChannelAdapter {
@@ -92,6 +97,7 @@ impl ExtensionChannelAdapter {
             extension_id,
             capability_id,
             settings: config.account.non_secret_config.clone(),
+            echo_correlation: crate::daemon::channel_adapter::echo_correlation_for(config.account),
         })
     }
 
@@ -165,6 +171,14 @@ impl ChannelAdapter for ExtensionChannelAdapter {
             supports_mention_metadata: true,
             supports_idempotency_key: true,
             supports_delivery_receipts: false,
+            // The one adapter that cannot inherit the built-in answer. What
+            // normalizes a message here is sandboxed guest code, so the host
+            // must not treat its sender flag as a determination — and an
+            // extension built before this contract existed declares nothing
+            // and is read as unable to correlate. Never inferred from the fact
+            // that a send once returned an id: one provider call proving
+            // capable does not make the transport's *inbound* half carry it.
+            echo_correlation: self.echo_correlation,
         }
     }
 
@@ -313,6 +327,20 @@ pub(crate) struct ExtensionMessage {
     /// The provider's own event id. Half of the dedupe key, so it must be
     /// stable across a redelivery and must never be random.
     pub provider_event_id: String,
+    /// The provider's own immutable id for the *message*.
+    ///
+    /// Optional on the wire because not every provider has one, and absent
+    /// rather than defaulted for extensions built before this field existed.
+    /// It is what the host matches against its outbound echo ledger, so an
+    /// account whose transport cannot supply it has no host-verifiable
+    /// self-echo protection and is restricted accordingly — see
+    /// [`EchoCorrelation`](little_monkey_lib::channels::policy::EchoCorrelation).
+    ///
+    /// Deliberately not defaulted to `provider_event_id`: those identify
+    /// different things, and quietly substituting one would claim a guarantee
+    /// the host cannot actually make.
+    #[serde(default)]
+    pub provider_message_id: Option<String>,
     pub conversation_id: String,
     #[serde(default)]
     pub conversation_kind: Option<String>,
@@ -482,6 +510,9 @@ pub(crate) fn normalize_envelopes(
             account_id: account_id.to_string(),
             kind: ChannelKind::Extension,
             provider_event_id: message.provider_event_id,
+            provider_message_id: message
+                .provider_message_id
+                .filter(|id| !id.is_empty() && id.len() <= 512),
             conversation: ChannelConversation {
                 conversation_id: message.conversation_id,
                 kind,
