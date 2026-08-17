@@ -6335,6 +6335,11 @@ fn validate_relative_path(value: &str) -> M3HubResult<()> {
 }
 
 fn validate_download_url(value: &str, allow_loopback_http: bool) -> M3HubResult<()> {
+    let parsed = Url::parse(value).map_err(|error| invalid("downloadUrl", error.to_string()))?;
+    if !allow_loopback_http {
+        crate::egress::classify_public_https_url(&parsed)
+            .map_err(|denial| invalid("downloadUrl", denial.to_string()))?;
+    }
     validate_https_url(value, "downloadUrl", allow_loopback_http)
 }
 
@@ -6932,9 +6937,8 @@ pub async fn fetch_component_catalog(
     } else {
         crate::egress::PublicDestinations::Only
     };
-    validate_https_url(
+    validate_download_url(
         endpoint,
-        "componentCatalog.url",
         destinations == crate::egress::PublicDestinations::LoopbackAllowed,
     )?;
     let client = crate::egress::public_download_client(destinations, COMPONENT_EGRESS_GUARD)
@@ -8900,7 +8904,7 @@ mod tests {
     /// digest check actually passing rather than on it being skipped. Longer than
     /// one download chunk on purpose, so the install below reads several ranges.
     fn fixture_artifact() -> Vec<u8> {
-        (0..16_384_u32).map(|index| (index % 251) as u8).collect()
+        (0..196_608_u32).map(|index| (index % 251) as u8).collect()
     }
 
     /// The validator the fixture answers with, and the one a resumed range must
@@ -9357,6 +9361,18 @@ mod tests {
         let error = parse_component_catalog(&serde_json::to_vec(&over).expect("serialize"))
             .expect_err("the cap is a cap");
         assert!(error.to_string().contains("at most"), "{error}");
+    }
+
+    #[test]
+    fn an_initial_component_download_url_must_be_public() {
+        for url in [
+            "https://127.0.0.1/component.tar.gz",
+            "https://10.0.0.1/component.tar.gz",
+            "https://100.64.0.1/component.tar.gz",
+            "https://198.18.0.1/component.tar.gz",
+        ] {
+            assert!(validate_download_url(url, false).is_err(), "{url}");
+        }
     }
 
     /// The body cap has to hold before the allocation, not after it: a peer that

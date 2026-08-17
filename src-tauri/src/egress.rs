@@ -530,6 +530,19 @@ pub fn nat64_embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
 /// keep their own, deliberately different, blocklists.
 #[must_use]
 pub(crate) fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    let octets = address.octets();
+    if octets[0] == 0 || octets[0] >= 240 {
+        return Some(EgressRule::Unspecified);
+    }
+    if octets[0] == 100 && (64..128).contains(&octets[1]) {
+        return Some(EgressRule::PrivateV4);
+    }
+    if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+        return Some(EgressRule::TestNet);
+    }
+    if octets[0] == 198 && (18..20).contains(&octets[1]) {
+        return Some(EgressRule::PrivateV4);
+    }
     if address.is_private() {
         return Some(EgressRule::PrivateV4);
     }
