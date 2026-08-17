@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -383,13 +383,22 @@ describe("the frames the runner will actually receive", () => {
       ),
     );
     const serialized = `${JSON.stringify(generated, null, 2)}\n`;
-    const previous = existsSync(fixture) ? readFileSync(fixture, "utf8") : "";
+    // Read once and act on what that read returned. Asking whether the file
+    // exists and then reading it is two answers about a file that can change in
+    // between — the failure is only ever a confusing error here, but it is a
+    // real race and a scanner is right to say so.
+    let previous = "";
+    try {
+      previous = readFileSync(fixture, "utf8");
+    } catch {
+      // No fixture yet: the first run writes one and fails, which is the same
+      // outcome as a stale one.
+    }
     if (previous !== serialized) writeFileSync(fixture, serialized);
 
     // Regenerating is not the assertion — the assertion is that what the
-    // builder produces is what the committed fixture says, so a change that is
-    // never committed fails in CI where the tree is clean.
-    expect(readFileSync(fixture, "utf8")).toBe(serialized);
+    // builder produces is what the *committed* fixture says, so a change that
+    // was never committed fails in CI, where the tree is clean.
     expect(previous).toBe(serialized);
   });
 });
