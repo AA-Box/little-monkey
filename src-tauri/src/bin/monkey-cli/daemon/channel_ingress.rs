@@ -2413,54 +2413,95 @@ mod tests {
             "precondition: no marker was written, so only the row can carry the doubt"
         );
 
-        // 1. Claimed, and the request is in flight *right now*. Every healthy
-        //    send looks like this, so it must not narrow anything — an account
-        //    clamped by its own traffic would be clamped for as long as it
-        //    works.
+        // 1. Claimed, and the request in flight *right now* — one second in,
+        //    which is when a full disk would be refusing the write that records
+        //    the id. There is no age at which this row is safe, so it counts
+        //    immediately: a grace period would only choose how long the hole
+        //    lasts.
         store.claim_outbox_batch(NOW, 10).expect("claim");
         assert_eq!(
-            ignored_or_run(&plan(
-                &mut store,
-                &extension_inbound("evt-1", Some("m-1"), false)
-            )),
-            "run",
-            "a send in progress is not evidence that a send was lost"
-        );
-
-        // 2. Same row, long after any provider request could still be open.
-        //    The daemon never restarted — this is the store that recovered
-        //    without one — and the row is the only thing that says a message
-        //    may have gone out unrecorded.
-        let stale = NOW + DaemonStore::SENDING_STALE_MS + 1;
-        assert_eq!(
-            ignored_reason(&accept_at(&mut store, "evt-2", stale)),
+            ignored_reason(&accept_at(&mut store, "evt-1", NOW + 1_000)),
             IgnoreReason::SenderNotAllowed,
-            "a send nobody finished writing down is treated as an echo this machine cannot match"
+            "a send whose outcome is not yet written down is an echo this machine cannot match"
         );
 
-        // 3. And the restart path, which parks the row deliberately rather than
-        //    retrying it. Same answer, reached without waiting.
+        // 2. The restart path, which parks the row deliberately rather than
+        //    retrying it, because the provider may already have taken it.
         store.requeue_stuck_sending(NOW).expect("park");
         assert_eq!(
             ignored_reason(&plan(
                 &mut store,
-                &extension_inbound("evt-3", Some("m-3"), false)
+                &extension_inbound("evt-2", Some("m-2"), false)
             )),
             IgnoreReason::SenderNotAllowed,
             "a parked send is an unresolved send"
         );
 
-        // 4. Past the window in which an unrecorded id could still have been
+        // 3. Past the window in which an unrecorded id could still have been
         //    matched, the row stops meaning anything about echo and the account
         //    is its configured self again — with no marker to clear, because
         //    none was ever written.
         let later = NOW + DaemonStore::ECHO_RETENTION_MS + 1;
         assert_eq!(
-            ignored_or_run(&accept_at(&mut store, "evt-4", later)),
+            ignored_or_run(&accept_at(&mut store, "evt-3", later)),
             "run",
             "the clamp expires with the window it was taken for"
         );
         assert!(!outbox_id.is_empty());
+    }
+
+    /// And the send that completes normally lifts it again.
+    ///
+    /// The other half of counting a live `sending` row: the narrowing has to
+    /// end when the send does, or an account would be restricted from its first
+    /// message onwards. The write that ends it is the same one that puts the
+    /// provider's id where an echo would be matched against it, which is why
+    /// there is nothing left to doubt the moment it lands.
+    #[test]
+    fn a_send_that_completes_hands_the_account_its_configured_policy_back() {
+        let mut store = extension_store(open_policy(), "provider_message_id");
+        let outbox_id = queue_one_outbound(&mut store);
+        store.claim_outbox_batch(NOW, 10).expect("claim");
+        assert_eq!(
+            ignored_reason(&plan(
+                &mut store,
+                &extension_inbound("evt-1", Some("m-1"), false)
+            )),
+            IgnoreReason::SenderNotAllowed,
+            "in flight, and so not yet provable"
+        );
+
+        // What `drain_outbox_once` does on a successful send, in the order it
+        // does it: the id into the ledger, then the row settled.
+        store
+            .record_outbound_echo("acct-1", "room-1", None, "m-sent", &outbox_id, NOW)
+            .expect("record");
+        store
+            .complete_outbox_send(
+                &outbox_id,
+                &little_monkey_lib::channels::types::SendOutcome::Sent {
+                    provider_message_id: Some("m-sent".into()),
+                },
+                NOW,
+            )
+            .expect("settle");
+
+        assert_eq!(
+            ignored_or_run(&plan(
+                &mut store,
+                &extension_inbound("evt-2", Some("m-2"), false)
+            )),
+            "run",
+            "nothing is unresolved, so the account answers as configured again"
+        );
+        // And the message it did send is still recognised as its own.
+        assert_eq!(
+            ignored_reason(&plan(
+                &mut store,
+                &extension_inbound("evt-3", Some("m-sent"), false)
+            )),
+            IgnoreReason::OwnMessage,
+        );
     }
 
     /// One outbound row for `acct-1`, queued and nothing more.

@@ -534,20 +534,6 @@ impl DaemonStore {
     /// orders of magnitude of headroom for a provider that was down, and it
     /// bounds a busy account's ledger to what one day of sending produced.
     pub const ECHO_RETENTION_MS: i64 = 24 * 60 * 60 * 1_000;
-    /// How long a row may sit in `sending` before it stops looking like a send
-    /// in progress and starts looking like one nobody finished writing down.
-    ///
-    /// Every send passes through `sending`, so without this bound a busy
-    /// account would be treated as having incomplete echo evidence during each
-    /// of its own sends — narrowing a correctly-working account for as long as
-    /// it keeps working. The longest request any adapter here will wait on is a
-    /// minute, so five is generous enough that a live send is never mistaken
-    /// for a stranded one, and short enough to be a rounding error against the
-    /// day-long window this feeds.
-    ///
-    /// A crash needs no such wait: the runtime parks every `sending` row on
-    /// startup, before a worker exists.
-    pub const SENDING_STALE_MS: i64 = 5 * 60 * 1_000;
     /// And a second bound that does not depend on the clock: an account that
     /// sends a million messages in an hour is bounded by this rather than by
     /// the TTL.
@@ -640,34 +626,43 @@ impl DaemonStore {
     /// durable **before** the network request: the outbox row was claimed
     /// `sending` first, precisely so a send in flight is never invisible.
     ///
-    /// `needs_reconciliation` counts at once: a restart puts a row there
-    /// *because* the request may already have reached the provider, which is
-    /// exactly the doubt this answers. `sending` counts only once it is stale,
-    /// because every healthy send passes through `sending` too — see
-    /// [`Self::SENDING_STALE_MS`] for why treating those as doubt would narrow
-    /// a working account for as long as it keeps working.
+    /// Both states count from the moment they appear, and `sending` counting is
+    /// the whole point rather than an over-reach. There is no age at which a
+    /// `sending` row is safe: the request may have been accepted a millisecond
+    /// ago and the write that would record its id may be failing right now. A
+    /// grace period would only choose a length of hole — a full disk that
+    /// empties again in ten seconds is an ordinary event, and the provider's
+    /// echo arrives well inside any wait worth calling a wait.
     ///
-    /// Both are bounded by the ledger's own retention for the same reason the
-    /// marker is: past it, an id that was never recorded could no longer have
-    /// been matched against one that was, so the row stops meaning anything
-    /// about echo. A row an operator never reconciles therefore stops narrowing
-    /// the account by itself — it is still theirs to resolve, but it does not
-    /// become a permanent restriction nobody can explain.
+    /// The cost is that an account is narrowed while its own request is in
+    /// flight, which is the milliseconds between claiming a row and completing
+    /// it. That is the right side of this trade: the alternative is answering
+    /// strangers during a window in which this machine cannot recognise its own
+    /// message coming back.
+    ///
+    /// [`Self::complete_outbox_send`] is what ends it — the row becomes `sent`
+    /// with its provider id, which is the same write that puts the id in the
+    /// ledger's reach. A send that ends any other way leaves a row that is no
+    /// longer `sending`, and the account is unrestricted again the moment it
+    /// does.
+    ///
+    /// Bounded by the ledger's own retention: past it, an id that was never
+    /// recorded could no longer have been matched against one that was, so the
+    /// row stops meaning anything about echo. A row an operator never
+    /// reconciles therefore stops narrowing the account by itself — it is still
+    /// theirs to resolve, but it does not become a permanent restriction nobody
+    /// can explain.
     pub fn has_unresolved_outbound(&self, account_id: &str, now_ms: i64) -> Result<bool, String> {
         let since = now_ms.saturating_sub(Self::ECHO_RETENTION_MS);
-        let stale_before = now_ms.saturating_sub(Self::SENDING_STALE_MS);
         self.connection
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM channel_outbox
                     WHERE account_id=?1
+                      AND state IN ('sending', 'needs_reconciliation')
                       AND updated_at_ms > ?2
-                      AND (
-                        state='needs_reconciliation'
-                        OR (state='sending' AND updated_at_ms <= ?3)
-                      )
                  )",
-                params![account_id, since, stale_before],
+                params![account_id, since],
                 |row| row.get::<_, i64>(0),
             )
             .map(|exists| exists != 0)

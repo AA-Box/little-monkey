@@ -372,13 +372,20 @@ pub(crate) fn effective_echo_correlation(
 /// leaves behind, and it needs no write at all: the row was claimed `sending`
 /// before the request went out, so it is already durable by the time anything
 /// can fail. That covers the sequence the marker cannot — ledger write fails,
-/// marker write fails too, the daemon crashes, the database comes back — where
-/// there is otherwise nothing at all to say a message escaped unrecorded.
+/// marker write fails too, and then either the daemon crashes or the store
+/// simply recovers — where there is otherwise nothing at all to say a message
+/// escaped unrecorded.
 ///
-/// Either one means the same thing at the ingress: somewhere in the last
-/// retention window this account may have sent a message whose id would not
-/// match if the provider echoed it. Both are bounded by that window, so both
-/// clear on their own.
+/// A row counts from the instant it is claimed, with no grace period, because
+/// a send that is one second old is a send whose id may be failing to record
+/// one second from now. Waiting would only pick a length of hole. So an
+/// account is narrowed while its own request is in flight, and unnarrowed by
+/// the write that completes it.
+///
+/// Either one means the same thing at the ingress: within the last retention
+/// window this account may have sent a message whose id would not match if the
+/// provider echoed it. Both are bounded by that window, so both clear on their
+/// own.
 ///
 /// An unreadable store answers `true`. The question is whether this machine can
 /// prove it remembers what it sent, and a read that failed proves nothing.
