@@ -96,8 +96,8 @@ jobs:
     # code — a single-OS CI job would silently never compile the arms that
     # don't match its own target at all (cfg-gated blocks that don't match
     # the runner's target are stripped before the compiler looks at them).
-    # Mirrors release.yml's platform set (minus the ARM runners, which only
-    # matter for release artifacts, not for compiling/testing).
+    # Mirrors release.yml's platform set. `macos-latest` runs on Apple Silicon,
+    # so this matrix also compiles and tests its ARM-only paths.
     strategy:
       fail-fast: false
       matrix:
