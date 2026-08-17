@@ -7333,6 +7333,19 @@ impl M3ComponentHub {
         request: &M3InstallComponentRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<M3InstalledComponentView> {
+        self.install_component_with_precommit(request, context, |_| Ok(()))
+            .await
+    }
+
+    pub async fn install_component_with_precommit<F>(
+        &self,
+        request: &M3InstallComponentRequest,
+        context: &M3OperationContext,
+        precommit: F,
+    ) -> M3HubResult<M3InstalledComponentView>
+    where
+        F: FnOnce(&Path) -> M3HubResult<()>,
+    {
         context.preflight("install component")?;
         request.entry.validate()?;
         let _mutation = self.mutation_lock.lock().await;
@@ -7468,6 +7481,7 @@ impl M3ComponentHub {
             sync_directory(&asset_root)?;
         }
         remove_owned_file(&resume_path)?;
+        precommit(&final_root.join(COMPONENT_PAYLOAD_FILE))?;
         let artifact_relative_path = relative_component_payload(&asset_key, &version_key);
         let installed_at_ms = self.clock.now_ms()?;
 

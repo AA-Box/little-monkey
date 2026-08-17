@@ -1586,51 +1586,32 @@ pub async fn m3_component_install(
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
-    if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
-        return Err("MLX runtime components require macOS".to_string());
-    }
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let existing = state
-        .component_hub
-        .list_installed()
-        .map_err(command_error)?
-        .into_iter()
-        .any(|item| {
-            item.component_id == request.entry.component_id
-                && item.active_version_key == request.entry.version_key()
-        });
-    let result = state
-        .component_hub
-        .install_component(&request, &context)
-        .await
-        .map_err(command_error)?;
-    #[cfg(target_os = "macos")]
-    if request.entry.kind == M3ComponentKind::MlxRuntime {
-        let artifact = result
-            .versions
-            .iter()
-            .find(|version| version.active)
-            .ok_or("MLX component has no active version")?
-            .artifact_path
-            .clone();
-        let app_data_dir = app.profile_data_dir().map_err(|error| error.to_string())?;
-        if let Err(error) =
-            crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact)
-        {
-            if !existing {
-                state
-                    .component_hub
-                    .rollback_new_component_version(
-                        &request.entry.component_id,
-                        &request.entry.version_key(),
-                    )
-                    .await
-                    .map_err(command_error)?;
-            }
-            return Err(command_error(error));
+    let result = async {
+        if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
+            return Err(M3HubError::Unsupported(
+                "MLX runtime components require macOS".to_string(),
+            ));
         }
+        #[cfg(target_os = "macos")]
+        if request.entry.kind == M3ComponentKind::MlxRuntime {
+            let app_data_dir = app
+                .profile_data_dir()
+                .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+            return state
+                .component_hub
+                .install_component_with_precommit(&request, &context, |artifact| {
+                    crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact)
+                        .map(|_| ())
+                })
+                .await;
+        }
+        state
+            .component_hub
+            .install_component(&request, &context)
+            .await
     }
-    let result = Ok(result);
+    .await;
     finish(&state, &operation_id, result).await
 }
 
