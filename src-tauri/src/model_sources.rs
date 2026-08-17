@@ -20,12 +20,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+// Only the address-class tests name these now; the rules they feed moved to
+// `egress.rs` (see the import beside `classify_public_https_url` below).
+#[cfg(test)]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
-use url::{Host, Url};
+use url::Url;
 use uuid::Uuid;
 
 const USER_AGENT: &str = "LittleMonkey-Desktop/1.0";
@@ -2453,69 +2456,13 @@ fn validate_public_https_url(url: &Url) -> Result<(), EgressDenial> {
 const MODEL_SOURCE_GUARD: &str = "model-sources.url";
 
 /// [`validate_public_https_url`]'s decision, without the recording.
-fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
-    if url.scheme() != "https" {
-        return Err(EgressDenial::about(
-            EgressRule::SchemeNotAllowed,
-            url.scheme().to_string(),
-        ));
-    }
-    // Username and password are one rule rather than two: both are `userinfo`,
-    // and what the rule says is that the URL carries a credential at all.
-    if !url.username().is_empty() || url.password().is_some() {
-        // Deliberately detail-free. This is the rule `redacts_target` singles
-        // out, and the detail field is the one place the secret could reappear.
-        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
-    }
-    if url.fragment().is_some() {
-        return Err(EgressDenial::new(EgressRule::FragmentNotAllowed));
-    }
-    if url.host().is_none() {
-        // Unreachable in practice, and kept anyway: `https` is a special scheme,
-        // so `Url` guarantees a non-empty host for anything that got past the
-        // scheme check above (`https:///x` does not parse at all). Deleting the
-        // check would make that a property of the `url` crate instead of a
-        // property of this gate, which is not a trade a destination gate should
-        // make.
-        return Err(EgressDenial::new(EgressRule::HostMissing));
-    }
-    // Every `Host` variant is handled and there is no wildcard arm: if the `url`
-    // crate ever adds a host kind, that must be a compile error here rather than
-    // a new shape of host quietly treated as public.
-    match url.host() {
-        Some(Host::Domain(domain)) => {
-            let trimmed = domain.trim_end_matches('.');
-            if trimmed.is_empty()
-                || trimmed.eq_ignore_ascii_case("localhost")
-                || trimmed.to_ascii_lowercase().ends_with(".localhost")
-            {
-                // One rule for all three spellings: a name that is nothing but
-                // dots, `localhost`, and `anything.localhost` are the same
-                // destination by policy — this machine — and RFC 6761 reserves
-                // the whole `.localhost` tree for loopback. The untrimmed name is
-                // the detail so that the `.`-only case still says something.
-                return Err(EgressDenial::about(EgressRule::Loopback, domain));
-            }
-        }
-        Some(Host::Ipv4(address)) => {
-            if let Some(rule) = non_public_ipv4_rule(address) {
-                return Err(EgressDenial::about(rule, address.to_string()));
-            }
-        }
-        Some(Host::Ipv6(address)) => {
-            if let Some(rule) = non_public_ipv6_rule(address) {
-                return Err(EgressDenial::about(rule, address.to_string()));
-            }
-        }
-        // Unreachable for the same reason as the `host().is_none()` check above,
-        // which has already refused this case. Kept refusing rather than deleted
-        // or `unwrap`ped: a hostless URL reaching here would mean the invariant
-        // this gate depends on has changed, and "no host, so nothing to check" is
-        // the wrong direction for a guard to fail in.
-        None => return Err(EgressDenial::new(EgressRule::HostMissing)),
-    }
-    Ok(())
-}
+///
+/// Now [`crate::egress::classify_public_https_url`], moved there so the
+/// component/catalog download path holds every redirect hop to *this* rule instead
+/// of a weaker parallel one. Nothing about the verdict changed in the move — the
+/// checks, their order, and the rule each one names are the same, which is what
+/// keeps this file's thirteen call sites and their tests meaningful.
+use crate::egress::classify_public_https_url;
 
 /// [`validate_public_https_url`] plus the one origin allowlist in this file.
 ///
@@ -2602,96 +2549,18 @@ fn classify_ollama_auth_url(url: &Url) -> Result<(), EgressDenial> {
     Ok(())
 }
 
-/// The rule that makes `address` non-public, or `None` if it is publicly
-/// routable.
+/// The two address-class rules this file used to own, now
+/// [`crate::egress::non_public_ipv4_rule`] and its v6 counterpart.
 ///
-/// The predicates and their order are exactly the `||` chain this replaces, so
-/// the set of refused addresses is unchanged — not one range is added, removed,
-/// widened or narrowed. What changes is that the verdict now says *which* class
-/// matched, where before seven distinct classes shared the single sentence
-/// "Model-source URL cannot target a private IPv4 address" — which was literally
-/// true of exactly one of them. None of these seven ranges overlap, so the order
-/// below cannot affect which rule is reported either; it is preserved because a
-/// future range that *does* overlap should inherit the chain's original
-/// precedence rather than a new one.
-fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
-    if address.is_private() {
-        return Some(EgressRule::PrivateV4);
-    }
-    if address.is_loopback() {
-        return Some(EgressRule::Loopback);
-    }
-    if address.is_link_local() {
-        return Some(EgressRule::LinkLocal);
-    }
-    if address.is_broadcast() {
-        return Some(EgressRule::Broadcast);
-    }
-    if address.is_documentation() {
-        return Some(EgressRule::TestNet);
-    }
-    if address.is_unspecified() {
-        return Some(EgressRule::Unspecified);
-    }
-    if address.is_multicast() {
-        return Some(EgressRule::Multicast);
-    }
-    None
-}
-
-/// The IPv6 counterpart of [`non_public_ipv4_rule`], with the same guarantee: the
-/// same addresses are refused as before, and only the naming is new.
-fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
-    // Checked before the mapped unwrap: `::a.b.c.d` is not `::ffff:a.b.c.d`, and
-    // without this it was reported as public. See `egress::is_ipv4_compatible`,
-    // whose doc also explains why the range is refused outright instead of being
-    // unwrapped and re-classified — doing that would turn `::1` into `0.0.0.1`,
-    // which every predicate above calls public.
-    if crate::egress::is_ipv4_compatible(&address) {
-        return Some(EgressRule::Ipv4Compatible);
-    }
-    if let Some(address) = address.to_ipv4_mapped() {
-        // A mapped address keeps whichever v4 rule its inner address reports, so
-        // `::ffff:127.0.0.1` is `Loopback` and `::ffff:10.0.0.1` is `PrivateV4`
-        // rather than both being some v6-flavoured approximation.
-        return non_public_ipv4_rule(address);
-    }
-    // The third spelling, handled the same way: `64:ff9b::7f00:1` is `127.0.0.1`
-    // wherever a NAT64/CLAT path exists. Unwrapped rather than refused as a range,
-    // because `64:ff9b::` plus a public v4 address is a legitimate way to reach a
-    // v4-only model host from a v6-only network. See `egress::nat64_embedded_ipv4`.
-    if let Some(address) = crate::egress::nat64_embedded_ipv4(&address) {
-        return non_public_ipv4_rule(address);
-    }
-    let segments = address.segments();
-    if address.is_loopback() {
-        return Some(EgressRule::Loopback);
-    }
-    if address.is_unspecified() {
-        return Some(EgressRule::Unspecified);
-    }
-    if address.is_multicast() {
-        return Some(EgressRule::Multicast);
-    }
-    if address.is_unique_local() {
-        return Some(EgressRule::UniqueLocalV6);
-    }
-    if address.is_unicast_link_local() {
-        return Some(EgressRule::LinkLocal);
-    }
-    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
-        return Some(EgressRule::TestNet);
-    }
-    // Site-local, `fec0::/10`. Reported as `UniqueLocalV6` rather than getting a
-    // rule of its own: RFC 3879 deprecated site-local *in favour of* unique-local
-    // `fc00::/7`, so the two are the same policy about the same kind of
-    // destination, and `EgressRule` has no site-local variant to invent one from.
-    // The range itself is untouched — this arm still refuses exactly `fec0::/10`.
-    if (segments[0] & 0xffc0) == 0xfec0 {
-        return Some(EgressRule::UniqueLocalV6);
-    }
-    None
-}
+/// Moved there without changing a range, so the component/catalog download path
+/// could hold every redirect hop to *this* file's rule rather than growing a
+/// fifth, weaker one of its own. Imported under the local names purely so the
+/// address-class tests below keep reading as tests of this file's guarantee, which
+/// is what makes them evidence that the move changed nothing. Nothing outside the
+/// tests names them any more — [`classify_public_https_url`] is the caller, and it
+/// moved with them.
+#[cfg(test)]
+use crate::egress::{non_public_ipv4_rule, non_public_ipv6_rule};
 
 fn require_success(
     response: Response,

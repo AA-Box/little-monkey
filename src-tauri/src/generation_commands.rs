@@ -234,10 +234,7 @@ fn total_ram_bytes() -> u64 {
 /// disjoint file formats — an MLX conversion is unreadable to
 /// stable-diffusion.cpp and a GGUF is unreadable to MLX — so which program to
 /// start is a property of the weights, not of the host.
-fn engine_command(
-    app: &AppHandle,
-    spec: &GenerationModelSpec,
-) -> Result<EngineCommand, String> {
+fn engine_command(app: &AppHandle, spec: &GenerationModelSpec) -> Result<EngineCommand, String> {
     // K22: refuse to hand out an executable path at all while the startup
     // integrity check reports a tampered component.
     crate::self_integrity::ensure_loadable()?;
@@ -1407,9 +1404,9 @@ pub fn studio_tool_stop(
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_starts, merge_tool_catalog, Duration, Path, SystemTime, Uuid};
     #[cfg(target_os = "macos")]
     use super::MLX_VIDEO_SERVICE_ENTRY;
+    use super::{binary_starts, merge_tool_catalog, Duration, Path, SystemTime, Uuid};
     use crate::m3_runtime_hub::{M3ComponentCatalogEntry, M3ComponentChannel, M3ComponentKind};
 
     fn entry(id: &str, version: &str, kind: M3ComponentKind) -> M3ComponentCatalogEntry {
