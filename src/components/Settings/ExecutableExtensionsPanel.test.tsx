@@ -287,7 +287,9 @@ describe("ExecutableExtensionsPanel", () => {
     open.mockResolvedValue("/tmp/fixture-update");
     render(<ExecutableExtensionsPanel />);
     await screen.findAllByText("Fixture extension");
-    fireEvent.click(screen.getByText("Update"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    });
 
     const review = await screen.findByLabelText("Review extension");
     expect(within(review).getByText("d".repeat(64))).toBeTruthy();
@@ -343,7 +345,9 @@ describe("ExecutableExtensionsPanel", () => {
     });
     render(<ExecutableExtensionsPanel />);
     await screen.findAllByText("Fixture extension");
-    fireEvent.click(screen.getByText("Update"));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    });
 
     const review = await screen.findByLabelText("Review extension");
     const apply = within(review).getByRole("button", { name: "Update" }) as HTMLButtonElement;
