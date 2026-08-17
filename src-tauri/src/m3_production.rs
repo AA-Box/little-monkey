@@ -1293,6 +1293,52 @@ fn load_component_sources(root: &Path) -> M3HubResult<Vec<Arc<dyn M3ComponentSou
     component_sources_from_entries(&component_registry_entries(root)?)
 }
 
+/// Folds `incoming` into whatever the registry holds **right now** and persists
+/// the result.
+///
+/// # Why the merge is here and not in the panel
+///
+/// [`replace_component_registry_entries`] swaps the whole file, so adopting a
+/// catalog has to be a read-modify-write. Done in the frontend that is a lost
+/// update waiting to happen, and the window is not theoretical: opening the
+/// Components panel starts a registry load and a catalog fetch at the same time,
+/// so the fetch's merge could read a registry state older than the one already on
+/// disk and write it back — deleting a locally registered component to add a
+/// published one. Reading the file inside the same critical section that writes it
+/// closes that: the only state a merge can be based on is the state it is about to
+/// replace.
+///
+/// The caller holds the command-level mutation lock (see
+/// `m3_commands::m3_component_sync_catalog`), which is what makes "read, merge,
+/// write" one step against every other registry mutation in the app.
+///
+/// Incoming entries win a key collision, which is how a publisher corrects a note
+/// or a URL for a version already registered. Identity is
+/// [`M3ComponentCatalogEntry::registry_key`] — the backend's one definition, so a
+/// fetched catalog and an imported file cannot be adopted by two subtly different
+/// rules.
+pub fn merge_component_registry_entries(
+    hub: &M3ComponentHub,
+    incoming: Vec<M3ComponentCatalogEntry>,
+) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    let held = component_registry_entries(hub.root())?;
+    // A `BTreeMap` rather than insertion order: the file is rewritten on every
+    // adoption, and a stable order is what keeps two idempotent syncs from
+    // producing two different files. `list_registry` sorts for display anyway.
+    let mut merged: BTreeMap<String, M3ComponentCatalogEntry> = held
+        .into_iter()
+        .map(|entry| (entry.registry_key(), entry))
+        .collect();
+    // Restamped first, so a key is computed from the entry as it will be stored.
+    // `registry_key` does not read `source_id`, but computing it before and after
+    // the same rewrite is the kind of difference that stops being harmless the
+    // moment someone adds a field to it.
+    for entry in adopt_into_registry(incoming) {
+        merged.insert(entry.registry_key(), entry);
+    }
+    replace_component_registry_entries(hub, merged.into_values().collect())
+}
+
 /// Replaces the local component registry file and the hub's in-memory
 /// sources together, mirroring `replace_catalog_source_configs`'s
 /// validate-then-atomically-publish shape.

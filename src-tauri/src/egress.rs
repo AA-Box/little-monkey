@@ -34,6 +34,7 @@
 //! closed, and `PinnedResolver` for what pinning costs a rotating CDN.
 
 use std::collections::BTreeMap;
+use std::error::Error as _;
 use std::fmt;
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -511,6 +512,471 @@ pub fn nat64_embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
     }
     let [.., a, b, c, d] = address.octets();
     Some(Ipv4Addr::new(a, b, c, d))
+}
+
+/// The rule that makes `address` non-public, or `None` if it is publicly
+/// routable.
+///
+/// Moved here from `model_sources.rs`, which had the broadest of the four
+/// address blocklists and is the nearest sibling of the paths that now share it:
+/// a download whose integrity comes from a digest rather than from an origin
+/// pin. Not one range is added, removed, widened or narrowed by the move, and
+/// the order is preserved for the reason that file gave — none of these ranges
+/// overlap today, so order cannot change which rule is reported, and a future
+/// range that *does* overlap should inherit the original precedence.
+///
+/// This is a *spelling* of the shared subset this module exists for, not the
+/// wholesale unification its own doc declines: `web.rs` and `browser_worker.rs`
+/// keep their own, deliberately different, blocklists.
+#[must_use]
+pub(crate) fn non_public_ipv4_rule(address: Ipv4Addr) -> Option<EgressRule> {
+    if address.is_private() {
+        return Some(EgressRule::PrivateV4);
+    }
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if address.is_broadcast() {
+        return Some(EgressRule::Broadcast);
+    }
+    if address.is_documentation() {
+        return Some(EgressRule::TestNet);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    None
+}
+
+/// The IPv6 counterpart of [`non_public_ipv4_rule`], with the same guarantee: the
+/// same addresses are refused as before the move, and only the location is new.
+#[must_use]
+pub(crate) fn non_public_ipv6_rule(address: Ipv6Addr) -> Option<EgressRule> {
+    // Checked before the mapped unwrap: `::a.b.c.d` is not `::ffff:a.b.c.d`, and
+    // without this it was reported as public. See [`is_ipv4_compatible`], whose
+    // doc also explains why the range is refused outright instead of being
+    // unwrapped and re-classified — doing that would turn `::1` into `0.0.0.1`,
+    // which every predicate above calls public.
+    if is_ipv4_compatible(&address) {
+        return Some(EgressRule::Ipv4Compatible);
+    }
+    if let Some(address) = address.to_ipv4_mapped() {
+        // A mapped address keeps whichever v4 rule its inner address reports, so
+        // `::ffff:127.0.0.1` is `Loopback` and `::ffff:10.0.0.1` is `PrivateV4`
+        // rather than both being some v6-flavoured approximation.
+        return non_public_ipv4_rule(address);
+    }
+    // The third spelling, handled the same way: `64:ff9b::7f00:1` is `127.0.0.1`
+    // wherever a NAT64/CLAT path exists. Unwrapped rather than refused as a
+    // range, because `64:ff9b::` plus a public v4 address is a legitimate way to
+    // reach a v4-only host from a v6-only network. See [`nat64_embedded_ipv4`].
+    if let Some(address) = nat64_embedded_ipv4(&address) {
+        return non_public_ipv4_rule(address);
+    }
+    let segments = address.segments();
+    if address.is_loopback() {
+        return Some(EgressRule::Loopback);
+    }
+    if address.is_unspecified() {
+        return Some(EgressRule::Unspecified);
+    }
+    if address.is_multicast() {
+        return Some(EgressRule::Multicast);
+    }
+    if address.is_unique_local() {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    if address.is_unicast_link_local() {
+        return Some(EgressRule::LinkLocal);
+    }
+    if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+        return Some(EgressRule::TestNet);
+    }
+    // Site-local, `fec0::/10`. Reported as `UniqueLocalV6` rather than getting a
+    // rule of its own: RFC 3879 deprecated site-local *in favour of* unique-local
+    // `fc00::/7`, so the two are the same policy about the same kind of
+    // destination, and [`EgressRule`] has no site-local variant to invent one
+    // from. The range itself is untouched — this arm still refuses exactly
+    // `fec0::/10`.
+    if (segments[0] & 0xffc0) == 0xfec0 {
+        return Some(EgressRule::UniqueLocalV6);
+    }
+    None
+}
+
+/// [`non_public_ipv4_rule`]/[`non_public_ipv6_rule`] over either family.
+///
+/// Exists because the resolver in [`public_download_client`] classifies whatever
+/// a name answered with, and a `SocketAddr` does not say which family it is until
+/// it is matched on.
+#[must_use]
+pub(crate) fn non_public_ip_rule(address: std::net::IpAddr) -> Option<EgressRule> {
+    match address {
+        std::net::IpAddr::V4(address) => non_public_ipv4_rule(address),
+        std::net::IpAddr::V6(address) => non_public_ipv6_rule(address),
+    }
+}
+
+/// Whether `address` may be connected to under [`PublicDestinations`].
+///
+/// A single place for the one difference between the two modes, rather than the
+/// two-branch prune it replaces: [`PublicDestinations::LoopbackAllowed`] permits
+/// exactly the loopback class and nothing else, so a self-hosted catalog on this
+/// machine still cannot be redirected onto the LAN.
+fn refused_answer_rule(
+    address: std::net::IpAddr,
+    destinations: PublicDestinations,
+) -> Option<EgressRule> {
+    match non_public_ip_rule(address) {
+        Some(EgressRule::Loopback) if destinations.allows_loopback() => None,
+        other => other,
+    }
+}
+
+/// Which destinations a component/catalog request may reach.
+///
+/// Two values rather than a `bool` because the permissive one is not "local
+/// network allowed" — it is *loopback* allowed, and only because the endpoint the
+/// user configured was itself loopback. `web.rs`'s `allow_local_network` is a
+/// user-facing setting covering the whole private network; this is narrower and
+/// derived, never configured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicDestinations {
+    /// Only publicly routable HTTPS destinations. The production default for a
+    /// published catalog and for every artifact download.
+    Only,
+    /// Publicly routable HTTPS, plus loopback over `http`, because the request
+    /// was aimed at loopback to begin with — a catalog served by something on
+    /// this machine, and the shape the fixtures in this tree can produce.
+    LoopbackAllowed,
+}
+
+impl PublicDestinations {
+    const fn allows_loopback(self) -> bool {
+        matches!(self, Self::LoopbackAllowed)
+    }
+}
+
+/// Whether `url` is a destination [`PublicDestinations::Only`] accepts: public
+/// HTTPS, no credential in the URL, no fragment, and not an address that points
+/// back at this machine or its network.
+///
+/// Moved here from `model_sources.rs` together with the address rules above, so
+/// the component/catalog path reuses the tree's strongest public-URL gate instead
+/// of adding a fifth. Every reason names its own [`EgressRule`], which is what
+/// lets a refused redirect hop report `egress.loopback` rather than a sentence
+/// covering ten classes at once.
+///
+/// # What this cannot decide
+///
+/// A hostname. `https://attacker.example/x` passes here and may still resolve to
+/// `127.0.0.1`; the name is exactly what a rebind can move. The resolver in
+/// [`public_download_client`] is the enforcement point for that, and this stays a
+/// layer rather than being folded into it because it is the only gate for a URL
+/// that never reaches a resolver at all — every literal-address arm below.
+pub(crate) fn classify_public_https_url(url: &Url) -> Result<(), EgressDenial> {
+    if url.scheme() != "https" {
+        return Err(EgressDenial::about(
+            EgressRule::SchemeNotAllowed,
+            url.scheme().to_string(),
+        ));
+    }
+    // Username and password are one rule rather than two: both are `userinfo`,
+    // and what the rule says is that the URL carries a credential at all.
+    if !url.username().is_empty() || url.password().is_some() {
+        // Deliberately detail-free. This is the rule `redacts_target` singles
+        // out, and the detail field is the one place the secret could reappear.
+        return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
+    }
+    if url.fragment().is_some() {
+        return Err(EgressDenial::new(EgressRule::FragmentNotAllowed));
+    }
+    // Every `Host` variant is handled and there is no wildcard arm: if the `url`
+    // crate ever adds a host kind, that must be a compile error here rather than
+    // a new shape of host quietly treated as public.
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            let trimmed = domain.trim_end_matches('.');
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("localhost")
+                || trimmed.to_ascii_lowercase().ends_with(".localhost")
+            {
+                // One rule for all three spellings: a name that is nothing but
+                // dots, `localhost`, and `anything.localhost` are the same
+                // destination by policy — this machine — and RFC 6761 reserves
+                // the whole `.localhost` tree for loopback. The untrimmed name is
+                // the detail so that the `.`-only case still says something.
+                return Err(EgressDenial::about(EgressRule::Loopback, domain));
+            }
+        }
+        Some(url::Host::Ipv4(address)) => {
+            if let Some(rule) = non_public_ipv4_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
+        }
+        Some(url::Host::Ipv6(address)) => {
+            if let Some(rule) = non_public_ipv6_rule(address) {
+                return Err(EgressDenial::about(rule, address.to_string()));
+            }
+        }
+        // Unreachable in practice: `https` is a special scheme, so `Url`
+        // guarantees a non-empty host for anything that got past the scheme check
+        // above (`https:///x` does not parse at all). Kept refusing rather than
+        // deleted or `unwrap`ped, because "no host, so nothing to check" is the
+        // wrong direction for a destination gate to fail in.
+        None => return Err(EgressDenial::new(EgressRule::HostMissing)),
+    }
+    Ok(())
+}
+
+/// [`classify_public_https_url`], plus the loopback exception when the request
+/// was aimed at loopback to begin with.
+///
+/// The exception is scheme-and-class narrow: `http` is accepted only for a
+/// destination that *is* loopback. So a catalog served from this machine may
+/// redirect within it, while a hop to plain `http` on any other host is still
+/// refused — the permission a local endpoint earns is not a licence to walk the
+/// request off the machine in cleartext.
+fn classify_public_destination(
+    url: &Url,
+    destinations: PublicDestinations,
+) -> Result<(), EgressDenial> {
+    match classify_public_https_url(url) {
+        Ok(()) => Ok(()),
+        Err(denial) if destinations.allows_loopback() => {
+            if (url.scheme() == "http" || url.scheme() == "https") && is_loopback_target(url) {
+                // Re-checked rather than skipped: a loopback URL can still carry a
+                // credential or a fragment, and those two rules are not about
+                // where the request goes.
+                if !url.username().is_empty() || url.password().is_some() {
+                    return Err(EgressDenial::new(EgressRule::EmbeddedCredentials));
+                }
+                if url.fragment().is_some() {
+                    return Err(EgressDenial::new(EgressRule::FragmentNotAllowed));
+                }
+                return Ok(());
+            }
+            Err(denial)
+        }
+        Err(denial) => Err(denial),
+    }
+}
+
+/// Hop cap for [`public_download_client`]. Three, not [`MAX_REDIRECT_HOPS`]:
+/// what this exists for is a release asset answering its stable URL with one
+/// signed-CDN hop, and a chain longer than three is not that.
+const MAX_PUBLIC_DOWNLOAD_HOPS: usize = 3;
+
+/// A client for fetching public artifacts whose integrity comes from a digest
+/// rather than from an origin pin, with every redirect hop and every resolved
+/// address held to [`classify_public_https_url`].
+///
+/// # Why this exists rather than [`hardened`] alone
+///
+/// [`hardened`]'s [`same_origin_redirect_policy`] is right for a credentialed
+/// path and wrong for this one. A published release asset has exactly one stable
+/// URL — `releases/download/<tag>/<asset>` — and it answers with a `302` to a
+/// signed, expiring URL on a different host. That hop is cross-origin by
+/// construction, so a same-origin policy refuses the only way to reach the
+/// artifact. Following it is safe *here* and would not be safe as a client
+/// default, because of three properties this path has and a credentialed path
+/// does not:
+///
+/// 1. the requests carry no credential of their own, so there is nothing for a
+///    hop to forward;
+/// 2. every hop is independently re-checked against the same public-destination
+///    rule the initial URL had to pass, so a hop cannot lower the bar; and
+/// 3. what is downloaded is verified against a SHA-256 the caller already held —
+///    and, for a signed component, against a publisher key this app pins — so
+///    the origin is not what establishes trust.
+///
+/// # Why the resolver, and not just the policy
+///
+/// A URL check decides on a *name*; the connection is opened against an
+/// *address*, resolved afterwards. Whoever controls DNS for a name that passed
+/// can answer the two lookups differently, so the place that passed the check and
+/// the place that gets connected to need not be the same. The resolver installed
+/// here removes the second lookup: it resolves through [`resolve_pinned`] — the
+/// same per-run pin every [`hardened`] client uses — then hands the connector only
+/// the answers that pass [`non_public_ip_rule`]. Those are exactly what reqwest
+/// connects to, not a hint compared against a later answer, so there is no second
+/// resolution left to race. `web.rs`'s `SsrfGuardedResolver` composes the same two
+/// pieces for `web_fetch`; this is its public-only sibling.
+///
+/// # The one honest gap
+///
+/// [`hardened`] deliberately still inherits `HTTP(S)_PROXY`, and this does too. A
+/// request that goes through a proxy is not resolved by this app at all — the
+/// proxy resolves it — so the resolver below is never consulted and the pin does
+/// not apply. That is not a second lookup this code could win; it is the whole
+/// destination decision moving to the proxy. Kept rather than closed with
+/// `no_proxy()`, because a corporate-proxy user losing the ability to install a
+/// component is a worse outcome than a threat model (a hostile proxy) that already
+/// applies to every other egress path in this tree — and on this path what is
+/// downloaded is verified against a digest the caller already held, and for a
+/// signed component against a key this app pins, neither of which a proxy can
+/// forge.
+pub(crate) fn public_download_client(
+    destinations: PublicDestinations,
+    guard: &'static str,
+) -> reqwest::ClientBuilder {
+    hardened()
+        .redirect(public_redirect_policy(destinations, guard))
+        .dns_resolver(std::sync::Arc::new(PublicOnlyResolver {
+            destinations,
+            guard,
+            lookup: system_lookup,
+        }))
+}
+
+/// Follows a redirect only when its target passes the same check the initial URL
+/// had to pass, and only for [`MAX_PUBLIC_DOWNLOAD_HOPS`] hops.
+///
+/// `reqwest` owns the mechanics this deliberately does not reimplement: resolving
+/// a relative `Location` against the URL that answered, re-issuing the request
+/// with its headers — `Range` and `If-Range` among them, which a ranged download
+/// depends on and which reqwest keeps because they are not in its cross-origin
+/// strip list (`Authorization`, `Cookie`, `Proxy-Authorization`,
+/// `WWW-Authenticate`) — and the method rules for 301/302/303/307/308, all of
+/// which agree for the `GET` and `HEAD` this path sends. What is left, and all
+/// that is left, is the verdict on each hop's target.
+///
+/// A refused hop errors the whole request rather than stopping at the last good
+/// URL, for the reason `web.rs` and `model_sources.rs` both give: a caller must
+/// not be able to mistake a blocked redirect for a successful fetch of the
+/// pre-redirect page.
+///
+/// A `3xx` reqwest cannot follow — no `Location`, or one that will not parse —
+/// never reaches this closure at all; it arrives at the caller as the `3xx`
+/// response itself, which every caller on this path already refuses for not being
+/// the status it required.
+fn public_redirect_policy(
+    destinations: PublicDestinations,
+    guard: &'static str,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_PUBLIC_DOWNLOAD_HOPS {
+            return attempt.error(refused(record(
+                guard,
+                EgressDenial::about(
+                    EgressRule::RedirectHopLimit,
+                    format!("refusing to follow more than {MAX_PUBLIC_DOWNLOAD_HOPS} redirects"),
+                ),
+            )));
+        }
+        // The run's frozen allowlist before the destination rule, in that order and
+        // for `web.rs`'s reason: the destination rule can resolve a hostname, and a
+        // name the run never allowed must not reach DNS at all. `send` checks the
+        // initial URL; an automatic redirect never passes through `send` again.
+        if let Err(denial) = check_run_allowlist(attempt.url()) {
+            return attempt.error(refused(denial));
+        }
+        match classify_public_destination(attempt.url(), destinations) {
+            Ok(()) => {
+                note_allowed_redirect_destination(attempt.url());
+                attempt.follow()
+            }
+            // The hop's own rule, not a rule about redirects: a hop refused for
+            // pointing at loopback says `egress.loopback`, so the reason reads the
+            // same whether the address arrived in the request or in a `302`.
+            Err(denial) => attempt.error(refused(record(guard, denial))),
+        }
+    })
+}
+
+/// Records a denial and hands it back, so a refusal inside a redirect closure is
+/// attributable without the closure growing a second statement per branch.
+fn record(guard: &'static str, denial: EgressDenial) -> EgressDenial {
+    crate::denial_sink::record(guard, &denial, None);
+    denial
+}
+
+/// Returns the typed denial embedded in a reqwest failure, when a policy refused
+/// the request. Callers use this to preserve the actionable egress code instead
+/// of flattening a redirect refusal into reqwest's generic transport wording.
+pub(crate) fn denial_from_error(error: &reqwest::Error) -> Option<&EgressDenial> {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(denial) = current.downcast_ref::<EgressDenial>() {
+            return Some(denial);
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            if let Some(denial) = io
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<EgressDenial>())
+            {
+                return Some(denial);
+            }
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// The connect-time half of [`public_download_client`]: resolve through the
+/// per-run pin, then hand the connector only the answers a public destination rule
+/// accepts.
+///
+/// `lookup` is a field for the reason [`HostLookup`] exists at all — a test that
+/// has to prove "a name resolving to `127.0.0.1` is refused" cannot say so through
+/// the system resolver without owning a domain that does it. Production always
+/// passes [`system_lookup`].
+struct PublicOnlyResolver {
+    destinations: PublicDestinations,
+    guard: &'static str,
+    lookup: HostLookup,
+}
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let destinations = self.destinations;
+        let guard = self.guard;
+        let host = name.as_str().to_string();
+        // Taken while this task's run scope is active, like `web.rs` does: the pin
+        // is keyed to the run, and the future below may be polled elsewhere.
+        let pinned = <PinnedResolver as reqwest::dns::Resolve>::resolve(
+            &PinnedResolver {
+                lookup: self.lookup,
+            },
+            name,
+        );
+        Box::pin(async move {
+            let resolved = pinned.await?;
+            let mut refused_rule = None;
+            let allowed: Vec<SocketAddr> = resolved
+                .filter(
+                    |address| match refused_answer_rule(address.ip(), destinations) {
+                        Some(rule) => {
+                            refused_rule = Some(rule);
+                            false
+                        }
+                        None => true,
+                    },
+                )
+                .collect();
+            if allowed.is_empty() {
+                // Two cases and not one: "the lookup came back empty", which no
+                // rule refused, and "every answer is refused", which names the rule
+                // that accounted for the last one.
+                let denial = match refused_rule {
+                    Some(rule) => EgressDenial::about(
+                        rule,
+                        format!("{host} resolves only to addresses this rule refuses"),
+                    ),
+                    None => EgressDenial::about(EgressRule::DnsNoAddresses, host.clone()),
+                };
+                crate::denial_sink::record(guard, &denial, None);
+                return Err(Box::new(denial) as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 /// How long a connection may take to establish. Matches `model_sources.rs`'s
@@ -1731,6 +2197,241 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::str::FromStr;
+
+    /// The two halves of [`public_download_client`]'s guarantee, driven directly.
+    ///
+    /// # Why not through a fixture server
+    ///
+    /// Because the properties that matter cannot be shown that way. A fixture
+    /// listens on loopback, so a test that drives a real request through the real
+    /// client has to run in [`PublicDestinations::LoopbackAllowed`] — which is the
+    /// one mode where loopback is *supposed* to be reachable. Such a test proves
+    /// that redirects are followed; it says nothing about whether a public request
+    /// could be walked onto this machine, which is the actual claim.
+    ///
+    /// Both enforcement points are reachable as values instead, which is why they
+    /// were written as values: [`classify_public_destination`] is the per-hop
+    /// verdict the redirect policy returns, and [`PublicOnlyResolver`] is the
+    /// object reqwest asks for addresses — with its lookup injected, a name that
+    /// answers `127.0.0.1` is something a test can state rather than something it
+    /// has to own a domain to demonstrate.
+    mod public_destinations {
+        use super::*;
+
+        fn hop(url: &str) -> Result<(), EgressDenial> {
+            classify_public_destination(&Url::parse(url).expect("test URL parses"), Only)
+        }
+
+        use PublicDestinations::{LoopbackAllowed, Only};
+
+        /// A hop out of a public chain must clear the same bar the endpoint did.
+        /// Each case here is a way a `302` could have moved a request somewhere the
+        /// user's URL could never have named, and the rule reported is the hop's own
+        /// so a log says which one fired.
+        #[test]
+        fn a_public_hop_cannot_reach_anything_a_public_url_could_not() {
+            for (url, expected) in [
+                // Cleartext, at all, even to a public host: a downgrade is how a
+                // network attacker gets to see and rewrite the rest of the chain.
+                ("http://public.example/asset", EgressRule::SchemeNotAllowed),
+                ("ftp://public.example/asset", EgressRule::SchemeNotAllowed),
+                // The four spellings of "this machine".
+                ("https://127.0.0.1/asset", EgressRule::Loopback),
+                ("https://127.9.9.9/asset", EgressRule::Loopback),
+                ("https://[::1]/asset", EgressRule::Loopback),
+                ("https://localhost/asset", EgressRule::Loopback),
+                ("https://anything.localhost/asset", EgressRule::Loopback),
+                // The private network the machine sits on, including the address
+                // every cloud metadata service answers on.
+                ("https://10.0.0.1/asset", EgressRule::PrivateV4),
+                ("https://192.168.1.1/asset", EgressRule::PrivateV4),
+                ("https://172.16.0.1/asset", EgressRule::PrivateV4),
+                ("https://169.254.169.254/asset", EgressRule::LinkLocal),
+                ("https://[fe80::1]/asset", EgressRule::LinkLocal),
+                ("https://[fc00::1]/asset", EgressRule::UniqueLocalV6),
+                ("https://0.0.0.0/asset", EgressRule::Unspecified),
+                ("https://[::]/asset", EgressRule::Unspecified),
+                ("https://255.255.255.255/asset", EgressRule::Broadcast),
+                ("https://239.0.0.1/asset", EgressRule::Multicast),
+                // The two spellings that read as public and are not: a v4-mapped
+                // and a NAT64-embedded loopback.
+                ("https://[::ffff:127.0.0.1]/asset", EgressRule::Loopback),
+                ("https://[64:ff9b::7f00:1]/asset", EgressRule::Loopback),
+                ("https://[::127.0.0.1]/asset", EgressRule::Ipv4Compatible),
+                // Not a destination rule, but a hop must not be able to introduce
+                // either: a credential in the URL would be sent to whoever the
+                // response named, and a fragment is never meaningful to a server.
+                (
+                    "https://user:secret@public.example/asset",
+                    EgressRule::EmbeddedCredentials,
+                ),
+                (
+                    "https://public.example/asset#frag",
+                    EgressRule::FragmentNotAllowed,
+                ),
+            ] {
+                let denial = hop(url).expect_err("{url} must be refused");
+                assert_eq!(denial.rule(), expected, "wrong rule for {url}");
+            }
+        }
+
+        /// The hop that has to keep working, and the reason the policy is not just
+        /// "same origin": a release asset's only stable URL answers with a
+        /// cross-origin redirect to a signed CDN URL carrying a query string.
+        #[test]
+        fn a_public_hop_to_another_public_host_is_followed() {
+            hop("https://release-assets.example/github-production-release-asset/1/2?sig=abc&jwt=def")
+                .expect("a cross-origin public HTTPS hop is the case this exists for");
+            hop("https://public.example:8443/asset").expect("a non-default port is still public");
+        }
+
+        /// A catalog served from this machine may redirect within it — otherwise
+        /// self-hosting is what broke — but the permission is loopback, not
+        /// cleartext-anywhere. This is the composition the old implementation got
+        /// right and is the one most easily lost when the flag becomes a bool named
+        /// after the network rather than after the address class.
+        #[test]
+        fn a_loopback_endpoint_earns_loopback_and_not_the_open_network() {
+            let hop = |url: &str| {
+                classify_public_destination(
+                    &Url::parse(url).expect("test URL parses"),
+                    LoopbackAllowed,
+                )
+            };
+            hop("http://127.0.0.1:8080/catalog.json").expect("loopback http is the whole point");
+            hop("http://localhost:8080/catalog.json").expect("so is the name for it");
+            hop("https://public.example/catalog.json").expect("and public HTTPS still passes");
+            // The three that must still be refused: cleartext off this machine, the
+            // LAN, and a credential.
+            assert_eq!(
+                hop("http://public.example/catalog.json")
+                    .expect_err("a cleartext hop to another host is not loopback")
+                    .rule(),
+                EgressRule::SchemeNotAllowed
+            );
+            assert_eq!(
+                hop("http://192.168.1.10/catalog.json")
+                    .expect_err("the LAN is not this machine")
+                    .rule(),
+                EgressRule::PrivateV4
+            );
+            assert_eq!(
+                hop("http://user:secret@127.0.0.1:8080/catalog.json")
+                    .expect_err("loopback does not excuse a credential")
+                    .rule(),
+                EgressRule::EmbeddedCredentials
+            );
+        }
+
+        fn answering(addresses: &'static [&'static str]) -> HostLookup {
+            // A `HostLookup` is a plain `fn` pointer, so the answer has to come from
+            // a `static` rather than from a captured argument. One indirection buys
+            // a resolver that is otherwise exactly the production one.
+            static ANSWERS: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
+            *ANSWERS.lock().expect("answers lock") = addresses
+                .iter()
+                .map(|text| SocketAddr::new(text.parse().expect("test address parses"), 0))
+                .collect();
+            fn lookup(
+                _host: String,
+            ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>
+            {
+                let answers = ANSWERS.lock().expect("answers lock").clone();
+                Box::pin(async move { Ok(answers) })
+            }
+            lookup
+        }
+
+        async fn resolved(
+            addresses: &'static [&'static str],
+            destinations: PublicDestinations,
+        ) -> Result<Vec<SocketAddr>, EgressRule> {
+            let resolver = PublicOnlyResolver {
+                destinations,
+                guard: "test",
+                lookup: answering(addresses),
+            };
+            match reqwest::dns::Resolve::resolve(
+                &resolver,
+                reqwest::dns::Name::from_str("catalog.test").expect("test name parses"),
+            )
+            .await
+            {
+                Ok(addresses) => Ok(addresses.collect()),
+                Err(error) => Err(error
+                    .downcast_ref::<EgressDenial>()
+                    .expect("a refused answer arrives as an EgressDenial")
+                    .rule()),
+            }
+        }
+
+        /// The gap a URL check cannot close, closed at the only place that can: a
+        /// name is what a rebind moves, and the addresses handed back here are
+        /// exactly the ones reqwest connects to — not a hint compared against a
+        /// second lookup that could answer differently.
+        #[tokio::test]
+        async fn a_name_that_resolves_into_this_machine_or_its_network_is_refused() {
+            for (answers, expected) in [
+                (&["127.0.0.1"][..], EgressRule::Loopback),
+                (&["::1"][..], EgressRule::Loopback),
+                (&["10.1.2.3"][..], EgressRule::PrivateV4),
+                (&["192.168.0.5"][..], EgressRule::PrivateV4),
+                (&["169.254.169.254"][..], EgressRule::LinkLocal),
+                (&["fe80::1"][..], EgressRule::LinkLocal),
+                (&["fc00::1"][..], EgressRule::UniqueLocalV6),
+                (&["0.0.0.0"][..], EgressRule::Unspecified),
+                (&["::ffff:127.0.0.1"][..], EgressRule::Loopback),
+                (&["64:ff9b::7f00:1"][..], EgressRule::Loopback),
+            ] {
+                assert_eq!(
+                    resolved(answers, Only).await.expect_err("must be refused"),
+                    expected,
+                    "wrong rule for {answers:?}"
+                );
+            }
+            // An empty answer is its own fact, and not the same one as "every
+            // answer is refused".
+            assert_eq!(
+                resolved(&[], Only).await.expect_err("nothing answered"),
+                EgressRule::DnsNoAddresses
+            );
+        }
+
+        /// The refusal is a prune, not an all-or-nothing verdict: an ordinary
+        /// dual-stack or split-horizon host that answers with one public and one
+        /// private address connects through the public one, and the private answer
+        /// never reaches the connector.
+        #[tokio::test]
+        async fn a_mixed_answer_keeps_only_what_may_be_connected_to() {
+            let allowed = resolved(&["10.0.0.1", "93.184.216.34"], Only)
+                .await
+                .expect("a public answer survives beside a private one");
+            assert_eq!(
+                allowed
+                    .iter()
+                    .map(|address| address.ip().to_string())
+                    .collect::<Vec<_>>(),
+                vec!["93.184.216.34"]
+            );
+        }
+
+        /// The loopback exception reaches the resolver too, or a self-hosted
+        /// catalog at `http://localhost:8080` would pass the URL check and then fail
+        /// to connect. It reaches *only* loopback: the LAN is still pruned.
+        #[tokio::test]
+        async fn a_loopback_endpoint_may_resolve_to_loopback_and_nothing_further() {
+            assert!(!resolved(&["127.0.0.1"], LoopbackAllowed)
+                .await
+                .expect("loopback resolves under the loopback exception")
+                .is_empty());
+            assert_eq!(
+                resolved(&["10.0.0.1"], LoopbackAllowed)
+                    .await
+                    .expect_err("the LAN is not covered by it"),
+                EgressRule::PrivateV4
+            );
+        }
+    }
 
     mod rule {
         use super::*;

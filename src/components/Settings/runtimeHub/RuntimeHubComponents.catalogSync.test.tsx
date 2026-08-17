@@ -6,9 +6,10 @@
  * component published as a release asset used to be reachable only by
  * downloading its catalog in a browser and picking the file, so opening the
  * panel now fetches it — and that fetch must not become a way to lose the
- * registry. It merges against what the store holds rather than what the panel
- * rendered with, and an unreachable catalog leaves the versions already known
- * to this machine exactly where they were.
+ * registry. Adoption is one backend call that reads, merges and writes under a
+ * lock, so this panel never holds a registry it is about to overwrite; an
+ * unreachable catalog leaves the versions already known to this machine exactly
+ * where they were, and two syncs cannot be in flight at once.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -73,47 +74,51 @@ afterEach(() => {
 });
 
 describe("refreshing the registry from the published catalog", () => {
-  it("merges what the catalog publishes into what this machine already knew", async () => {
-    // The panel mounts before the registry has loaded and the fetch lands after
-    // it has, which is the ordering the real panel sees: `refreshComponents`
-    // and this fetch are both in flight while the first render happens. Held
-    // open on purpose so the merge is forced to read the later value.
-    let deliverCatalog: (entries: M3ComponentCatalogEntry[]) => void = () => {};
-    const catalog = new Promise<M3ComponentCatalogEntry[]>((resolve) => {
-      deliverCatalog = resolve;
+  it("adopts the catalog through one backend call and renders what came back", async () => {
+    // The panel mounts before the registry has loaded and the sync lands after it
+    // has, which is the ordering the real panel sees: `refreshComponents` and this
+    // sync are both in flight while the first render happens. Held open on purpose,
+    // because the frontend read-modify-write this replaced would have merged
+    // against the empty list the panel rendered with and written the local
+    // component out of existence.
+    let deliverRegistry: (entries: M3ComponentCatalogEntry[]) => void = () => {};
+    const adopted = new Promise<M3ComponentCatalogEntry[]>((resolve) => {
+      deliverRegistry = resolve;
     });
     seedStore([]);
-    invoke.mockImplementation(async (command: string, args: { entries?: M3ComponentCatalogEntry[] }) => {
-      if (command === "m3_component_fetch_catalog") return await catalog;
-      if (command === "m3_component_replace_registry_entries") return args.entries;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "m3_component_sync_catalog") return await adopted;
+      // Whatever the panel did while the sync was in flight, adopting must not be
+      // expressed as a replace from this process: the merge is the backend's, and
+      // this is the call that used to lose the race.
+      if (command === "m3_component_replace_registry_entries") {
+        throw new Error("the panel must not write the registry itself");
+      }
       return [];
     });
 
     render(<RuntimeHubComponents />);
     seedStore([entry()]);
-    deliverCatalog([published]);
+    deliverRegistry([entry(), published]);
 
     await waitFor(() => {
-      expect(
-        invoke.mock.calls.some(([command]) => command === "m3_component_replace_registry_entries"),
-      ).toBe(true);
+      expect(screen.getByText("MLX runtime (Apple silicon)")).toBeTruthy();
     });
-    const [, args] = invoke.mock.calls.find(
-      ([command]) => command === "m3_component_replace_registry_entries",
-    ) as [string, { entries: M3ComponentCatalogEntry[] }];
-    // Both, in one write: the backend replaces the registry file wholesale, so
-    // a merge against the empty list this panel first rendered with would have
-    // deleted the locally registered component instead of adding to it.
-    expect(args.entries.map((held) => held.componentId).sort()).toEqual([
-      "llama-cpp-server-metal",
-      "mlx-runtime-apple-silicon",
-    ]);
+    expect(screen.getByText("llama.cpp server (Metal)")).toBeTruthy();
+    // One sync per mount, and it carries no entries: the panel sends a URL at
+    // most, never a registry it computed.
+    const syncs = invoke.mock.calls.filter(([command]) => command === "m3_component_sync_catalog");
+    expect(syncs).toHaveLength(1);
+    expect((syncs[0][1] as { entries?: unknown }).entries).toBeUndefined();
   });
 
   it("keeps the versions already known when the catalog cannot be reached", async () => {
     invoke.mockImplementation(async (command: string) => {
-      if (command === "m3_component_fetch_catalog") throw new Error("offline");
-      if (command === "m3_component_replace_registry_entries") {
+      if (command === "m3_component_sync_catalog") throw new Error("offline");
+      if (
+        command === "m3_component_replace_registry_entries" ||
+        command === "m3_component_merge_registry_entries"
+      ) {
         throw new Error("the registry must not be rewritten from a failed fetch");
       }
       return [];
@@ -122,11 +127,37 @@ describe("refreshing the registry from the published catalog", () => {
     render(<RuntimeHubComponents />);
 
     expect(await screen.findByText(/could not be reached/)).toBeTruthy();
-    expect(
-      invoke.mock.calls.some(([command]) => command === "m3_component_replace_registry_entries"),
-    ).toBe(false);
     // The panel still lists what is on disk, which is the whole reason an
     // unreachable catalog is a notice rather than an error.
     expect(screen.getByText("llama.cpp server (Metal)")).toBeTruthy();
+  });
+
+  it("does not start a second sync while one is still running", async () => {
+    let deliverRegistry: (entries: M3ComponentCatalogEntry[]) => void = () => {};
+    const adopted = new Promise<M3ComponentCatalogEntry[]>((resolve) => {
+      deliverRegistry = resolve;
+    });
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "m3_component_sync_catalog") return await adopted;
+      return [];
+    });
+
+    render(<RuntimeHubComponents />);
+    // The mount sync is still in flight, so the button's click must be dropped
+    // rather than queued behind it: two adoptions in flight are two writes, and
+    // the loser's notice would overwrite the winner's.
+    const check = await screen.findByRole("button", { name: /check for new versions/i });
+    check.click();
+    check.click();
+    deliverRegistry([entry()]);
+
+    await waitFor(() => {
+      expect(invoke.mock.calls.some(([command]) => command === "m3_component_sync_catalog")).toBe(
+        true,
+      );
+    });
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "m3_component_sync_catalog"),
+    ).toHaveLength(1);
   });
 });

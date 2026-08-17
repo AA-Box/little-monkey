@@ -1490,15 +1490,29 @@ pub fn m3_component_replace_registry_entries(
         .map_err(command_error)
 }
 
+/// Folds a caller-supplied catalog into the registry, atomically.
+///
+/// This is what **Import catalog** calls. It is the same adoption path
+/// [`m3_component_sync_catalog`] uses — one merge rule, one identity, one write —
+/// so a file the user picked and a catalog the app fetched cannot end up adopted
+/// by two subtly different sets of rules.
+#[tauri::command]
+pub fn m3_component_merge_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::merge_component_registry_entries(&state.component_hub, entries)
+        .map_err(command_error)
+}
+
 /// Fetches a component catalog and returns what it lists, without persisting
 /// any of it.
 ///
-/// The caller merges the result into the local registry through
-/// [`m3_component_replace_registry_entries`] — the same path the file importer
-/// uses — so a fetched catalog and an imported file cannot end up adopted by
-/// two different rules. Defaults to the catalog this project publishes, and
-/// takes a URL so a self-hosted or air-gapped mirror is a setting rather than a
-/// rebuild.
+/// Kept as its own command because fetching and adopting are separate acts and
+/// only the second one writes: this is what a diagnostic or a test asks for when
+/// the question is "what does the published catalog say?". The panel calls
+/// [`m3_component_sync_catalog`], which is this plus the merge, under the lock.
 #[tauri::command]
 pub async fn m3_component_fetch_catalog(
     state: tauri::State<'_, M3CommandState>,
@@ -1511,6 +1525,38 @@ pub async fn m3_component_fetch_catalog(
         url.unwrap_or_else(|| crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL.to_string());
     let result = crate::m3_runtime_hub::fetch_component_catalog(&url, &context).await;
     finish(&state, &operation_id, result).await
+}
+
+/// Fetches the published catalog and adopts it, returning the registry that
+/// resulted.
+///
+/// One command rather than a fetch the frontend then merges and writes back, for
+/// the reason `m3_production::merge_component_registry_entries` gives: a
+/// read-modify-write split across the IPC boundary can lose a concurrent import or
+/// a hand edit, and the backend is the authority on registry integrity. The whole
+/// catalog is validated before the lock is taken, so an invalid catalog cannot
+/// even reach the file — it is adopted whole or not at all.
+///
+/// Defaults to the catalog this project publishes, and takes a URL so a
+/// self-hosted or air-gapped mirror is a setting rather than a rebuild.
+#[tauri::command]
+pub async fn m3_component_sync_catalog(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    url: Option<String>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let endpoint =
+        url.unwrap_or_else(|| crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL.to_string());
+    let fetched = crate::m3_runtime_hub::fetch_component_catalog(&endpoint, &context).await;
+    // The operation is finished before the lock is taken: a fetch that failed must
+    // release its operation slot, and the merge below is disk work that the
+    // network deadline has nothing to say about.
+    let fetched = finish(&state, &operation_id, fetched).await?;
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::merge_component_registry_entries(&state.component_hub, fetched)
+        .map_err(command_error)
 }
 
 #[tauri::command]

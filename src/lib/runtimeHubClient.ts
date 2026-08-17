@@ -1394,10 +1394,16 @@ export const runtimeHubClient = {
   componentRegistryEntries: () => invoke<M3ComponentCatalogEntry[]>("m3_component_registry_entries"),
   componentReplaceRegistryEntries: (entries: M3ComponentCatalogEntry[]) =>
     invoke<M3ComponentCatalogEntry[]>("m3_component_replace_registry_entries", { entries }),
-  /** Fetches a published catalog. Returns what it lists; persists nothing, so
-   *  the caller still merges it into the registry like an imported file. */
-  componentFetchCatalog: (args: OperationArgs & { url?: string }) =>
-    invoke<M3ComponentCatalogEntry[]>("m3_component_fetch_catalog", args),
+  /** Folds a catalog into the registry under the backend's lock, and returns the
+   *  registry that resulted. The merge is not done here on purpose: a
+   *  read-modify-write across this boundary can lose a concurrent import. */
+  componentMergeRegistryEntries: (entries: M3ComponentCatalogEntry[]) =>
+    invoke<M3ComponentCatalogEntry[]>("m3_component_merge_registry_entries", { entries }),
+  /** Fetches the published catalog and adopts it, returning the resulting
+   *  registry. Fetch, validate, lock, reload, merge and persist are one backend
+   *  step; nothing about the merge happens in this process. */
+  componentSyncCatalog: (args: OperationArgs & { url?: string }) =>
+    invoke<M3ComponentCatalogEntry[]>("m3_component_sync_catalog", args),
   componentListRegistry: (args: OperationArgs) =>
     invoke<M3ComponentCatalogEntry[]>("m3_component_list_registry", args),
   componentCheckUpdates: (args: OperationArgs) =>

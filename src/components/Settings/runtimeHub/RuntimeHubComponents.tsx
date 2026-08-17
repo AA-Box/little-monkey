@@ -191,28 +191,22 @@ function RegistryEntryCard({ entry }: { entry: M3ComponentCatalogEntry }) {
   );
 }
 
-/** One registry row's identity. Two entries are the same known version when
- *  all three match — the same key `RegistryEntryCard` is listed by. */
-function entryKey(entry: M3ComponentCatalogEntry): string {
-  return `${entry.componentId}:${entry.version}:${entry.sha256}`;
-}
-
 /**
- * Folds an imported catalog into the registry the app already holds.
+ * One registry row's React key.
  *
- * A merge rather than a replace: `m3_component_replace_registry_entries` swaps
- * the whole file atomically, so importing an MLX catalog over a registry that
- * already lists a llama.cpp build would otherwise delete it. Imported entries
- * win on a key collision, which is how a publisher corrects a bad URL or note
- * for a version already registered.
+ * The four fields are the backend's `M3ComponentCatalogEntry::registry_key` —
+ * component, version, digest and download URL — mirrored here so a list key and a
+ * registry row mean the same thing. The URL is in it for the same reason it is
+ * there: without it, two entries that differ only in where their bytes come from
+ * collide, and a React key that collides renders one row for two things.
+ *
+ * The backend remains the authority. Nothing in this file merges or dedupes on
+ * this any more — that moved behind `m3_component_merge_registry_entries` — so a
+ * drift between the two definitions can cost a duplicate React key and nothing
+ * else. `entryKeyFieldsMatchTheBackend` in the tests pins the four fields.
  */
-export function mergeRegistryEntries(
-  existing: M3ComponentCatalogEntry[],
-  imported: M3ComponentCatalogEntry[],
-): M3ComponentCatalogEntry[] {
-  const merged = new Map(existing.map((entry) => [entryKey(entry), entry]));
-  for (const entry of imported) merged.set(entryKey(entry), entry);
-  return [...merged.values()];
+export function entryKey(entry: M3ComponentCatalogEntry): string {
+  return [entry.componentId, entry.version, entry.sha256, entry.downloadUrl].join("\n");
 }
 
 /**
@@ -265,8 +259,8 @@ export function RuntimeHubComponents() {
   const refreshComponents = useRuntimeHubStore((state) => state.refreshComponents);
   const refreshing = useRuntimeHubStore((state) => state.busy.components);
   const error = useRuntimeHubStore((state) => state.errors.components);
-  const replaceComponentRegistry = useRuntimeHubStore((state) => state.replaceComponentRegistry);
-  const fetchComponentCatalog = useRuntimeHubStore((state) => state.fetchComponentCatalog);
+  const mergeComponentRegistry = useRuntimeHubStore((state) => state.mergeComponentRegistry);
+  const syncComponentCatalog = useRuntimeHubStore((state) => state.syncComponentCatalog);
   const [showInstalledOnly, setShowInstalledOnly] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
@@ -279,8 +273,10 @@ export function RuntimeHubComponents() {
     setImportError(null);
     setImporting(true);
     try {
-      const imported = parseCatalogText(await file.text());
-      await replaceComponentRegistry(mergeRegistryEntries(componentRegistry, imported));
+      // Read here, merged in the backend. The panel does not hold the registry it
+      // is adding to, which is what stops an import from writing back a state
+      // that was current when this component rendered and stale by now.
+      await mergeComponentRegistry(parseCatalogText(await file.text()));
     } catch (reason) {
       setImportError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -288,18 +284,18 @@ export function RuntimeHubComponents() {
     }
   };
 
-  /** Merges the published catalog into the registry, the same way an imported
-   *  file is merged — the fetch replaces the file picker, not the merge rules. */
+  /** Fetches the published catalog and adopts it, through the same backend merge
+   *  an imported file goes through — the fetch replaces the file picker, not the
+   *  rules. */
   const syncPublishedCatalog = async () => {
+    // Two clicks on Check for new versions, or a click landing on top of the
+    // mount refresh, must not both run: each would fetch and adopt, and the
+    // second's notice would overwrite the first's.
+    if (syncing) return;
     setCatalogNotice(null);
     setSyncing(true);
     try {
-      const fetched = await fetchComponentCatalog();
-      // Read through the store rather than the closed-over prop: this also runs
-      // from a mount effect, where the captured registry is the empty list the
-      // panel rendered with and merging against it would drop every local entry.
-      const held = useRuntimeHubStore.getState().componentRegistry;
-      await replaceComponentRegistry(mergeRegistryEntries(held, fetched));
+      await syncComponentCatalog();
     } catch (reason) {
       // Deliberately a notice rather than an error: the registry on disk is
       // what the list is rendered from, so an unreachable catalog costs the
@@ -311,8 +307,8 @@ export function RuntimeHubComponents() {
   };
 
   // Once per mount, so opening the panel is enough to see a newly published
-  // component. Guarded by a ref because React 18's strict mode mounts twice and
-  // a second fetch would race the first one's registry write.
+  // component. Guarded by a ref because React 18's strict mode mounts twice, and
+  // by `syncing` above for the same reason a second click is.
   useEffect(() => {
     if (syncedThisMount.current) return;
     syncedThisMount.current = true;
