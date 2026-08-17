@@ -444,7 +444,7 @@ impl M3CatalogModel {
         sha256_hex(self.asset_id().as_bytes())
     }
 
-    fn version_key(&self) -> String {
+    pub(crate) fn version_key(&self) -> String {
         sha256_hex(format!("{}\n{}\n{}", self.revision, self.sha256, self.download_url).as_bytes())
     }
 
@@ -6722,7 +6722,7 @@ impl M3ComponentCatalogEntry {
         sha256_hex(self.component_id.as_bytes())
     }
 
-    fn version_key(&self) -> String {
+    pub(crate) fn version_key(&self) -> String {
         sha256_hex(format!("{}\n{}\n{}", self.version, self.sha256, self.download_url).as_bytes())
     }
 
@@ -7236,6 +7236,47 @@ impl M3ComponentHub {
         let _guard = lock(&self.state_lock)?;
         let state = load_component_state(&self.state_root, &self.blobs_root)?;
         component_state_to_views(&state, &self.blobs_root)
+    }
+
+    /// Removes a newly committed version after a backend-owned post-download
+    /// authenticity check fails. Existing versions are never removed by callers.
+    pub async fn rollback_new_component_version(
+        &self,
+        component_id: &str,
+        version_key: &str,
+    ) -> M3HubResult<()> {
+        let _mutation = self.mutation_lock.lock().await;
+        let mut state = {
+            let _guard = lock(&self.state_lock)?;
+            load_component_state(&self.state_root, &self.blobs_root)?
+        };
+        let Some(index) = state
+            .components
+            .iter()
+            .position(|item| item.component_id == component_id)
+        else {
+            return Ok(());
+        };
+        let asset_key = state.components[index].asset_key.clone();
+        let versions = &mut state.components[index].versions;
+        let Some(version_index) = versions
+            .iter()
+            .position(|item| item.version_key == version_key)
+        else {
+            return Ok(());
+        };
+        versions.remove(version_index);
+        if versions.is_empty() {
+            state.components.remove(index);
+        } else if state.components[index].active_version_key == version_key {
+            state.components[index].active_version_key =
+                state.components[index].versions[0].version_key.clone();
+        }
+        {
+            let _guard = lock(&self.state_lock)?;
+            save_next_component_state(&self.state_root, &mut state, self.clock.now_ms()?)?;
+        }
+        remove_owned_directory(&self.blobs_root.join(asset_key).join(version_key))
     }
 
     pub async fn check_updates(

@@ -632,13 +632,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           timeoutMs: null,
           request: { entry },
         });
-        // An MLX component arrives as an archive rather than the single blob
-        // every other kind is: downloading it leaves nothing runnable until
-        // it is unpacked through the signature-verifying installer. Chained
-        // here so one click installs, rather than leaving the user with a
-        // downloaded component and a runtime still reporting Not Installed.
         if (entry.kind === "mlx_runtime") {
-          await runtimeHubClient.mlxInstallComponent(entry.componentId);
           await get().refreshRuntime("mlx");
         }
         await get().refreshComponents();
