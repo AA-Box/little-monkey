@@ -595,33 +595,46 @@ mod tests {
         // and the Rust tests drove a server that agreed with itself. Only a
         // check that reads both can see them disagree.
         //
-        // Proved for real, not by string matching alone: the frame this module
-        // builds is parsed and validated below by the runner's own
-        // `TalkClientFrame`.
+        // Proved by parsing the bytes the module really produces, not by
+        // matching a string and then hand-writing the JSON I expected it to
+        // make. `mobileTalkProtocol.test.ts` runs the shipped builder and
+        // writes every frame shape to this fixture; the runner's own
+        // `TalkClientFrame` parses and validates them here.
+        //
+        // That closes the gap that let the last defect ship: both suites were
+        // green because each drove a side that agreed with itself. A Rust test
+        // that constructs its own JSON has the same blind spot, because the
+        // thing that drifts is the JSON the client actually sends.
+        const CLIENT_FRAMES: &str = include_str!("../../fixtures/talk_client_frames.json");
+        let frames: Vec<serde_json::Value> =
+            serde_json::from_str(CLIENT_FRAMES).expect("the generated client frames must parse");
         assert!(
-            protocol.contains("utterance_id: utteranceId,"),
-            "the closing audio frame must carry the device's own name for the utterance"
+            frames.len() >= 4,
+            "the fixture must cover a whole session, not one frame"
         );
-
-        let closing = serde_json::json!({
-            "protocol_version": crate::daemon::remote::protocol::TALK_PROTOCOL_VERSION,
-            "session_id": "session-one",
-            // The same fixture value `mobileTalkProtocol.test.ts` uses: 18
-            // random bytes as base64url, which is what a real ticket mints.
-            "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
-            "frame_sequence": 2,
-            "type": "audio",
-            "audio_sequence": 1,
-            "media_type": "audio/webm;codecs=opus",
-            "audio_base64": "AAECAwQ=",
-            "last": true,
-            "utterance_id": "utt-abc123",
-        });
-        let frame: crate::daemon::remote::protocol::TalkClientFrame =
-            serde_json::from_value(closing).expect("the client's closing frame must parse");
-        frame
-            .validate()
-            .expect("the client's closing frame must satisfy the runner's own validation");
+        let mut saw_closing_audio = false;
+        for value in frames {
+            let described = value.to_string();
+            let frame: crate::daemon::remote::protocol::TalkClientFrame =
+                serde_json::from_value(value).unwrap_or_else(|error| {
+                    panic!("the client sends a frame the runner cannot parse: {described}: {error}")
+                });
+            frame.validate().unwrap_or_else(|error| {
+                panic!("the client sends a frame the runner refuses: {described}: {error}")
+            });
+            if described.contains(r#""last":true"#) {
+                saw_closing_audio = true;
+                assert!(
+                    described.contains(r#""utterance_id""#),
+                    "a closing audio frame must name its utterance: {described}"
+                );
+            }
+        }
+        assert!(
+            saw_closing_audio,
+            "the fixture must contain the frame that closes an utterance -- it is the one the \
+             runner keys a turn on"
+        );
 
         // Local detection, and only a finished utterance leaves the device.
         assert!(protocol.contains("export function createTalkDetector("));

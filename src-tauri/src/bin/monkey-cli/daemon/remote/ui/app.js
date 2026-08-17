@@ -3082,7 +3082,17 @@ async function startTalk() {
     });
     socket.onmessage = (event) => talkHandleFrame(event.data);
     socket.onclose = () => {
-      if (talk.running) void stopTalk("The runner closed the conversation");
+      if (!talk.running) return;
+      // Whether a turn was in flight changes what the person needs to know.
+      // The recording is gone with the socket and this client does not resend
+      // it, so an utterance that was being answered was simply lost — saying
+      // only "the runner closed the conversation" leaves them to guess whether
+      // it was heard.
+      void stopTalk(
+        talk.answering
+          ? "Talk ended before that answer arrived — say it again when you reconnect"
+          : "The runner closed the conversation",
+      );
     };
     talk.running = true;
     talk.answering = false;

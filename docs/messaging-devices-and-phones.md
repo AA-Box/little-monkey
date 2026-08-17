@@ -153,8 +153,12 @@ phone. Speech recognition and synthesis use whatever backend you configured;
 a number set to answer calls with no transcription backend is a critical finding
 rather than a line that silently drops every word.
 
-An utterance is an ordinary durable turn keyed by its own identity, so a
-resubmitted one lands on the run the first attempt made. Wake-phrase and
+An utterance is an ordinary durable turn keyed by a name the *device* gives it,
+so re-sending one lands on the run the first attempt made rather than starting a
+second. The runner cannot mint that name itself — its session identity is minted
+fresh with every ticket — which is why a closing audio frame that carries none is
+refused. The shipped client does not re-send: when the socket drops it ends the
+session and says so. The name makes a retransmission safe, not automatic. Wake-phrase and
 always-listening are off unless you turn them on, and Security Doctor reports
 both — and separately reports any path that would send audio off this machine.
 

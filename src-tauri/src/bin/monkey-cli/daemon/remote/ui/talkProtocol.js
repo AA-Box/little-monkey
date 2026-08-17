@@ -15,7 +15,11 @@
 // `hello`, and `mobileTalkProtocol.test.ts` drives a whole session through
 // them.
 
-export const TALK_PROTOCOL_VERSION = 1;
+// v2: a closing audio frame carries `utterance_id`. The runner refuses v1
+// outright rather than accepting a frame it cannot key a turn under — see the
+// Rust constant's own note for why the old behaviour is not kept as a
+// fallback.
+export const TALK_PROTOCOL_VERSION = 2;
 
 /// Exactly `TALK_MEDIA_TYPES` in `protocol.rs`. A container that is not on this
 /// list is refused outright, so guessing one is the same as dropping the

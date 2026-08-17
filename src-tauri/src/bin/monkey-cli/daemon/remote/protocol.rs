@@ -19,7 +19,26 @@ pub const MAX_REMOTE_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Dedicated Talk frames are versioned independently so their WebSocket wire
 /// shape can evolve without changing the signed HTTP remote plane.
-pub const TALK_PROTOCOL_VERSION: u32 = 1;
+///
+/// # v2 — a closing audio frame must name its utterance
+///
+/// v1 accepted a `last: true` audio frame with no `utterance_id`; v2 refuses
+/// one. That is a semantic change to what a v1 frame means, so it gets a
+/// version rather than being made quietly under the old number: a client that
+/// still speaks v1 is refused *once, by version*, with something it can act on
+/// — reload — instead of having every utterance rejected by a field-level
+/// error it cannot interpret.
+///
+/// The old behaviour is deliberately not kept as a fallback. Minting the
+/// identity here is what caused the duplicate-after-restart it was added to
+/// close, so accepting a frame without one would reintroduce it under a
+/// compatibility flag.
+pub const TALK_PROTOCOL_VERSION: u32 = 2;
+
+/// The version whose only difference from [`TALK_PROTOCOL_VERSION`] is the
+/// missing utterance id — so a client speaking it can be told precisely what is
+/// wrong rather than being handed an opaque refusal.
+const TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID: u32 = 1;
 pub const MAX_TALK_AUDIO_BYTES: usize = MAX_VOICE_CHUNK_BYTES;
 pub const MAX_TALK_AUDIO_BASE64_BYTES: usize = MAX_TALK_AUDIO_BYTES.div_ceil(3) * 4;
 pub const MAX_TALK_FRAME_BYTES: usize = MAX_TALK_AUDIO_BASE64_BYTES + 16 * 1024;
@@ -1942,12 +1961,21 @@ impl TalkSequenceTracker {
 }
 
 fn validate_talk_protocol_version(protocol_version: u32) -> Result<(), String> {
-    if protocol_version != TALK_PROTOCOL_VERSION {
-        return Err(format!(
-            "Unsupported Talk protocol version {protocol_version}"
-        ));
+    if protocol_version == TALK_PROTOCOL_VERSION {
+        return Ok(());
     }
-    Ok(())
+    // A page that was already open when this runner was upgraded. Named
+    // exactly, because the fix is one the person can perform and an opaque
+    // "unsupported version" would not tell them to.
+    if protocol_version == TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID {
+        return Err(
+            "This Talk client is from an older version of the app; reload the page to continue"
+                .to_string(),
+        );
+    }
+    Err(format!(
+        "Unsupported Talk protocol version {protocol_version}"
+    ))
 }
 
 fn validate_talk_session_id(session_id: &str) -> Result<(), String> {
@@ -2805,6 +2833,39 @@ mod tests {
         assert!(validate_capabilities(&capabilities, &scopes).is_err());
         capabilities.insert(DeviceCapability::MicrophoneCapture);
         assert!(validate_capabilities(&capabilities, &scopes).is_ok());
+    }
+
+    /// A page that was open across the upgrade is told what to do about it.
+    ///
+    /// v1 accepted a closing audio frame with no utterance id and v2 refuses
+    /// one, which is a change to what a v1 frame *means* rather than an
+    /// addition to it. Without the version bump such a client would keep
+    /// speaking v1 and have every utterance refused by a field-level error it
+    /// cannot interpret; with it, the session is refused once, by version, with
+    /// the one instruction that fixes it.
+    #[test]
+    fn a_client_from_before_the_utterance_id_is_told_to_reload() {
+        let mut frame = client_talk_frame(
+            1,
+            TalkClientFrameKind::Hello {
+                media_type: "audio/webm;codecs=opus".into(),
+                sample_rate_hz: 48_000,
+                channels: 1,
+            },
+        );
+        frame.protocol_version = TALK_PROTOCOL_VERSION_WITHOUT_UTTERANCE_ID;
+        let error = frame.validate().expect_err("a v1 client must be refused");
+        assert!(error.contains("reload the page"), "{error}");
+
+        // A version this build has never spoken gets the generic refusal —
+        // telling somebody to reload would not help them.
+        frame.protocol_version = 99;
+        let error = frame.validate().expect_err("an unknown version is refused");
+        assert!(
+            error.contains("Unsupported Talk protocol version 99"),
+            "{error}"
+        );
+        assert!(!error.contains("reload"), "{error}");
     }
 
     fn talk_generation() -> String {

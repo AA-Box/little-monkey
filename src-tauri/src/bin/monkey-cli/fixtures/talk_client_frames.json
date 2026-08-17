@@ -1,0 +1,55 @@
+[
+  {
+    "protocol_version": 2,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 1,
+    "type": "hello",
+    "media_type": "audio/webm;codecs=opus",
+    "sample_rate_hz": 48000,
+    "channels": 1
+  },
+  {
+    "protocol_version": 2,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 2,
+    "type": "metrics",
+    "audio_sequence": 1,
+    "speech_detection_ms": 184,
+    "capture_ms": 1240,
+    "upload_ms": 96
+  },
+  {
+    "protocol_version": 2,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 3,
+    "type": "audio",
+    "audio_sequence": 1,
+    "media_type": "audio/webm;codecs=opus",
+    "audio_base64": "AAECAwQ=",
+    "last": false,
+    "utterance_id": "utt-fixed-for-tests"
+  },
+  {
+    "protocol_version": 2,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 4,
+    "type": "audio",
+    "audio_sequence": 2,
+    "media_type": "audio/webm;codecs=opus",
+    "audio_base64": "BQYHCA==",
+    "last": true,
+    "utterance_id": "utt-fixed-for-tests"
+  },
+  {
+    "protocol_version": 2,
+    "session_id": "mobile-device-Ab_3-xY",
+    "session_generation": "aBcDeFgHiJkLmNoPqRsTuVwX",
+    "frame_sequence": 5,
+    "type": "interrupt",
+    "reason": "barge_in"
+  }
+]
