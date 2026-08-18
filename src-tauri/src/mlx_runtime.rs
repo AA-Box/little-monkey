@@ -1753,6 +1753,13 @@ fn reject_unexpected_install_entries(
             .ok_or_else(|| invalid("install", "entry path is not UTF-8"))?
             .replace(std::path::MAIN_SEPARATOR, "/");
         if metadata.is_dir() {
+            // Python creates bytecode caches while the verified service is
+            // running. They are derived, untrusted files and are not part of
+            // the signed package manifest, so they must not make a healthy
+            // installation fail its next startup verification.
+            if entry.file_name() == "__pycache__" {
+                continue;
+            }
             reject_unexpected_install_entries(root, &path, expected_paths)?;
         } else if metadata.is_file()
             && relative_text != INSTALL_MANIFEST_FILE
@@ -2516,6 +2523,30 @@ pub(crate) mod tests {
         assert!(matches!(
             installer.verify_active(),
             Err(MlxError::Invalid { .. }) | Err(MlxError::DigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verifier_ignores_python_bytecode_caches_but_rejects_other_unexpected_files() {
+        let directory = TestDirectory::new("bytecode-cache");
+        let installer = installer(&directory.0);
+        let installed = installer
+            .install_and_activate(&package(), &supported_host())
+            .expect("verified install");
+
+        let cache = installed.version_directory.join("service/__pycache__");
+        fs::create_dir_all(&cache).expect("create Python cache");
+        fs::write(cache.join("mlx_server.cpython-314.pyc"), b"derived bytecode")
+            .expect("write Python cache");
+        installer
+            .verify_active()
+            .expect("bytecode cache is not package content");
+
+        fs::write(installed.version_directory.join("service/unexpected.py"), b"unexpected")
+            .expect("write unexpected file");
+        assert!(matches!(
+            installer.verify_active(),
+            Err(MlxError::Invalid { .. })
         ));
     }
 

@@ -64,6 +64,17 @@ interface LlamaStatusPayload {
 async function resolveBaseUrl(): Promise<string> {
   try {
     const status = await invoke<LlamaStatusPayload>('llama_status');
+    // `llama_status` is the native source of truth. Keep the model store in
+    // step with it before the target inventory is frozen; otherwise a server
+    // that is already ready can still look stopped to the chat path during
+    // startup or immediately after a model switch.
+    const installed = useModelStore.getState().installed;
+    useModelStore.setState((state) => ({
+      llamaStatus: status.status,
+      active: status.model_path
+        ? installed.find((model) => model.path === status.model_path) ?? state.active
+        : state.active,
+    }));
     const port =
       typeof status?.port === 'number' && Number.isFinite(status.port) && status.port > 0
         ? status.port
@@ -100,18 +111,43 @@ export async function resolveTarget(): Promise<ResolvedTarget> {
     if (!target.providerId || !target.model) {
       throw new Error('No AI provider model selected');
     }
-    return { kind: 'provider', providerId: target.providerId, model: target.model };
+    const resolved = { kind: 'provider', providerId: target.providerId, model: target.model } as const;
+    await refreshTargetInventoryIfMissing(resolved);
+    return resolved;
   }
 
   if (target.kind === 'ollama') {
     if (!target.model) {
       throw new Error('No Ollama model selected');
     }
-    return { kind: 'ollama', baseUrl: target.baseUrl, model: target.model };
+    const resolved = { kind: 'ollama', baseUrl: target.baseUrl, model: target.model } as const;
+    await refreshTargetInventoryIfMissing(resolved);
+    return resolved;
   }
 
   const baseUrl = await resolveBaseUrl();
-  return { kind: 'local', baseUrl, modelLabel: useModelStore.getState().active?.name ?? 'Local model' };
+  const resolved = { kind: 'local', baseUrl, modelLabel: useModelStore.getState().active?.name ?? 'Local model' } as const;
+  await refreshTargetInventoryIfMissing(resolved);
+  return resolved;
+}
+
+/** Reconcile a stale in-memory model inventory before a resident turn freezes
+ * its execution target. The normal path remains synchronous; this is only a
+ * recovery pass for startup, model-switch, or daemon-refresh races. */
+async function refreshTargetInventoryIfMissing(target: ResolvedTarget): Promise<void> {
+  if (snapshotForResolvedTarget(target)) return;
+  try {
+    if (target.kind === 'local') {
+      await useModelStore.getState().refresh();
+    } else if (target.kind === 'ollama') {
+      await useModelStore.getState().refreshOllama();
+    } else {
+      await useModelStore.getState().refreshProviderModels(target.providerId);
+    }
+  } catch {
+    // The caller still performs the final snapshot check and reports the
+    // target-specific failure; inventory refresh is best effort here.
+  }
 }
 
 /** Resolves a streaming target back to the immutable inventory record that
