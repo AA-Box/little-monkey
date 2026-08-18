@@ -248,8 +248,7 @@ pub async fn unload_mlx_for_studio(state: &M3CommandState) -> Result<(), String>
     let result = async {
         match state.hub.runtime_status("mlx", &context).await? {
             M3RuntimeStatusView::Mlx {
-                status:
-                    crate::mlx_runtime::MlxRuntimeStatus::Running { handle, .. },
+                status: crate::mlx_runtime::MlxRuntimeStatus::Running { handle, .. },
             } => {
                 state
                     .hub

@@ -979,18 +979,27 @@ pub fn run() {
             // opens the ledger — the closure reads it on demand and caches per run.
             run_commands::install_run_egress_policy_source(app.handle());
 
-            // Verify and copy the bundled llama.cpp runtime into app data at
-            // launch so the separately installed `monkey` CLI can use the
-            // same app-owned runtime without Ollama or a system install.
-            // A source/dev build may intentionally have no staged bundle;
-            // model start still fails closed if a present bundle is invalid.
+            // Verify and copy every bundled native runtime into app data at
+            // launch so the separately installed `monkey` CLI and the desktop
+            // process use the same app-owned runtimes. This is also the repair
+            // pass for a previous app version that used the same runtime
+            // version directory but shipped different signed bytes. A
+            // source/dev build may intentionally have no staged bundle; model
+            // start still fails closed if a present bundle is invalid.
             if let Ok(runtime_app_data) = app.profile_data_dir() {
                 let resource_dir = app.path().resource_dir().ok();
-                if let Err(error) = managed_runtime::materialize_bundled_runtime(
-                    resource_dir.as_deref(),
-                    &runtime_app_data,
-                ) {
-                    eprintln!("Managed llama.cpp runtime setup failed: {error}");
+                for spec in [
+                    &managed_runtime::LLAMA,
+                    &managed_runtime::LLAMA_TTS,
+                    &managed_runtime::STABLE_DIFFUSION,
+                ] {
+                    if let Err(error) = managed_runtime::materialize_bundled_runtime_for(
+                        spec,
+                        resource_dir.as_deref(),
+                        &runtime_app_data,
+                    ) {
+                        eprintln!("Managed {} runtime setup failed: {error}", spec.id);
+                    }
                 }
             }
 
