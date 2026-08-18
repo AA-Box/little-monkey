@@ -23,6 +23,7 @@ import {
 import {
   modelTargetToRunWire,
   permissionPolicyForRun,
+  protocolRootId,
   workspaceToRunWire,
 } from "./durableRun";
 import { ingressTurnResume, ingressTurnShow, isRefusedResume } from "./ingressClient";
@@ -344,7 +345,7 @@ export async function buildDaemonDesktopRecipe(
       target: modelTargetToRunWire(options.targetSnapshot),
       workspace,
       execution_roots: options.roots.map((root) => ({
-        root_id: root.id,
+        root_id: protocolRootId(root),
         canonical_path: root.path,
         label: root.label,
         is_primary: root.is_primary,
