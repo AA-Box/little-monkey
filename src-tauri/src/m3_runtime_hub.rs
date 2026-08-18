@@ -6612,16 +6612,15 @@ fn io_at(operation: &'static str, path: &Path, source: io::Error) -> M3HubError 
 // storage root and mutation lock so a component install/rollback can never
 // block or be blocked by a model operation.
 //
-// There is no upstream binary registry/CDN for these artifacts, so — mirroring
-// the pluggable `M3CatalogSource` pattern used for model catalogs —
-// `M3ComponentSource` is a trait with a local, operator-editable
-// implementation (`StaticM3ComponentSource`) rather than a hardcoded call to a
-// registry this environment cannot confirm works. See
-// `m3_production::component_registry_entries` for how production wiring loads
-// that local registry, and the crate-level PR notes for why.
+// The component registry is local and operator-editable — mirroring the
+// pluggable `M3CatalogSource` pattern used for model catalogs — while the
+// published MLX catalog is fetched and merged into it by the Runtime Hub.
+// `M3ComponentSource` therefore stays a local implementation
+// (`StaticM3ComponentSource`), so offline operation and explicit imports remain
+// deterministic after the network catalog has been adopted.
 //
 // What this project publishes for itself reaches that registry through
-// `fetch_component_catalog`: the panel fetches a catalog document by URL and
+// `fetch_component_catalog`: Runtime Hub fetches a catalog document by URL and
 // merges it in, so a published component is installable without the user
 // downloading a JSON file and importing it by hand. The listing path stays
 // local on purpose — entries are read from disk, so an unreachable catalog
@@ -6651,7 +6650,7 @@ const MAX_COMPATIBILITY_NOTE_BYTES: usize = 4 * 1024;
 /// through, rather than in each caller.
 pub(crate) fn component_kind_runs_here(kind: M3ComponentKind) -> bool {
     match kind {
-        M3ComponentKind::MlxRuntime => cfg!(target_os = "macos"),
+        M3ComponentKind::MlxRuntime => cfg!(all(target_os = "macos", target_arch = "aarch64")),
         _ => true,
     }
 }
@@ -8909,15 +8908,14 @@ mod tests {
     /// The component feed is platform-agnostic, so this is what keeps a build
     /// from offering an install whose second half it does not carry. Asserted
     /// against the real `cfg!` rather than a fixture so it fails on whichever
-    /// platform drifts: on macOS `mlx_runtime` must stay offered, and on Windows
-    /// and Linux it must not, since `m3_mlx_install_component` is compiled only
-    /// into the macOS build.
+    /// platform drifts: only a macOS/aarch64 build can run the packaged MLX
+    /// service.
     #[test]
-    fn only_macos_is_offered_an_mlx_runtime_component() {
+    fn only_apple_silicon_macos_is_offered_an_mlx_runtime_component() {
         assert_eq!(
             component_kind_runs_here(M3ComponentKind::MlxRuntime),
-            cfg!(target_os = "macos"),
-            "an MLX component may only be offered where the MLX installer exists"
+            cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            "an MLX component may only be offered where the packaged runtime can run"
         );
         for kind in [
             M3ComponentKind::LlamaCppServer,

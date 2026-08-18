@@ -17,6 +17,7 @@ import {
   discoverDurableArtifacts,
   modelTargetToRunWire,
   permissionPolicyForRun,
+  protocolToolCallId,
   redactPrivatePaths,
   redactSensitiveText,
   sanitizeToolArguments,
@@ -213,6 +214,42 @@ describe("discoverDurableArtifacts", () => {
 });
 
 describe("DurableRunRecorder evidence", () => {
+  it("preserves the production run_program outer identity for nested evidence", async () => {
+    mocks.appendRunEvent.mockClear();
+    const turnId = "turn-production";
+    const modelToolCallId = "call-run-program";
+    const outerId = protocolToolCallId(`${turnId}:${modelToolCallId}`);
+    const nestedId = `${outerId}:nested:1`;
+    const recorder = new DurableRunRecorder("run-production");
+
+    await recorder.recordToolProposed(outerId, "run_program", JSON.stringify({ source: "return 1" }));
+    recorder.recordToolStarted(outerId);
+    await recorder.recordToolProposed(nestedId, "write_file", JSON.stringify({ path: "nested.txt", content: "x" }));
+    recorder.recordToolStarted(nestedId);
+    await recorder.recordToolFinished(nestedId, "Wrote 1 byte to nested.txt", 1);
+    await recorder.recordToolFinished(outerId, JSON.stringify({ status: "succeeded" }), 2);
+    await recorder.flush();
+
+    const events = mocks.appendRunEvent.mock.calls.map((call) => call[1] as RunEventWire);
+    const toolEvents = events.filter(
+      (event): event is Extract<RunEventWire, { type: "tool_proposed" | "tool_started" | "tool_finished" }> =>
+        event.type === "tool_proposed" || event.type === "tool_started" || event.type === "tool_finished",
+    );
+    expect(toolEvents.map((event) => event.payload.tool_call_id)).toEqual([
+      outerId,
+      outerId,
+      nestedId,
+      nestedId,
+      nestedId,
+      outerId,
+    ]);
+    const outerProposal = toolEvents.find(
+      (event): event is Extract<RunEventWire, { type: "tool_proposed" }> =>
+        event.type === "tool_proposed" && event.payload.tool_name === "run_program",
+    );
+    expect(outerProposal?.payload.tool_call_id).toBe(outerId);
+  });
+
   it("bounds tool output excerpts and links discovered artifacts", async () => {
     mocks.appendRunEvent.mockClear();
     const recorder = new DurableRunRecorder("run-evidence", null, ["/Users/tester/projects/demo"]);

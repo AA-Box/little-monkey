@@ -256,6 +256,11 @@ function stableProtocolId(prefix: string, value: string): string {
 }
 
 export function protocolToolCallId(value: string): string {
+  // Programmatic nested calls are derived from an already-canonical outer
+  // execution id (`tool-...:nested:N`). Preserve that identity when the
+  // durable recorder sees it again; normalizing it a second time severs the
+  // durable evidence link back to the outer `run_program` call.
+  if (/^tool-[A-Za-z0-9_.:-]+-[0-9a-f]{8}(?::nested:[1-9][0-9]*)?$/.test(value)) return value;
   return stableProtocolId("tool", value);
 }
 
