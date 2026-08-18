@@ -27,7 +27,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
@@ -2858,20 +2858,24 @@ async function runAgentTurnBody(
   // in tools.ts for why (webview-rasterized wire shape; monkey-cli can't
   // offer it). The result lives in private app storage, not the workspace,
   // so it has no edit-permission or selected-folder dependency.
-  const baseToolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
-    settings.memoryEnabled,
-    settings.webToolsEnabled,
-    // Ultracode force-offers the `task` tool even when the subagents toggle
-    // is off: selecting Ultracode is itself the user's explicit opt-in to
-    // multi-agent orchestration for this turn (see ULTRACODE_SYSTEM_SECTION).
-    settings.subagentsEnabled || ultracode,
-    skillToolEnabled,
-    readSkillResourceToolEnabled,
-    // The learning tool is a capability, so an unknown backend mode means
-    // "not offered" — see `cachedLearningMode`. It also needs a durable run:
-    // without one there is no evidence chain for a proposal to append to.
-    cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
+  const hasWorkspace = primaryRoot(useWorkspaceStore.getState().roots) !== null;
+  const baseToolsForTurn: ToolDef[] = toolsForWorkspace(
+    toolsForSettings(
+      toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
+      settings.memoryEnabled,
+      settings.webToolsEnabled,
+      // Ultracode force-offers the `task` tool even when the subagents toggle
+      // is off: selecting Ultracode is itself the user's explicit opt-in to
+      // multi-agent orchestration for this turn (see ULTRACODE_SYSTEM_SECTION).
+      settings.subagentsEnabled || ultracode,
+      skillToolEnabled,
+      readSkillResourceToolEnabled,
+      // The learning tool is a capability, so an unknown backend mode means
+      // "not offered" — see `cachedLearningMode`. It also needs a durable run:
+      // without one there is no evidence chain for a proposal to append to.
+      cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
+    ),
+    hasWorkspace,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {

@@ -9,12 +9,12 @@ and where the code lives.
 - Desktop releases include a pinned, checksum-verified `llama.cpp` runtime. Source builds stage the same official runtime before `tauri dev` and `tauri build`; a system `llama-server` is a development fallback only.
 - Studio generation (optional): the managed `sd-server` and `llama-tts` runtimes, staged with `pnpm stage:runtime:sd` and `pnpm stage:runtime:tts`. `sd-server` exists for Apple Silicon (Metal), x86_64 Linux (Vulkan), and x86_64 Windows (Vulkan) only. Model weights are yours to supply.
 - Ollama runtime (optional): reachable at `http://127.0.0.1:11434` for the explicit Ollama provider or daemon-management commands.
-- MLX runtime (optional): supported Apple Silicon plus the configured MLX Python environment.
+- MLX runtime (optional): supported Apple Silicon; Runtime Hub downloads and verifies the signed package automatically.
 - Browser verification (optional): a supported Chromium or Chrome binary.
 - GitHub delivery (optional): Git and an authenticated GitHub CLI (`gh`).
 - Local OCR, transcription, image generation, IDE extensions, and remote handoff (optional): their configured worker, model, endpoint, SDK, or TLS identity.
 
-On macOS, the unmanaged fallback is `brew install llama.cpp`. The Runtime Hub can also install checksum-pinned artifacts from a configured catalog; this repository does not provide a publisher-operated feed for every platform and runtime.
+On macOS, the unmanaged fallback is `brew install llama.cpp`. Runtime Hub installs the published, signed MLX package automatically on Apple Silicon and keeps the local component registry available for offline or self-hosted catalogs.
 
 ## Storage and agent home
 
@@ -74,7 +74,7 @@ LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completion
 1. **App-owned local model** — **Settings → Local Models → Add custom model**: enter an Ollama tag such as `llama3.2:3b` or a Hugging Face reference such as `hf.co/Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q4_K_M`, review the resolved file, size, license, and digest metadata, then install and start. No Ollama installation required.
 2. **User-managed Ollama** — **Settings → Ollama**: confirm the daemon is reachable, pull or import a model, and select it.
 3. **Cloud or BYOK** — **Settings → AI Providers**: store the key, refresh the model list, and select a model.
-4. **MLX** — **Settings → Runtime Hub → Runtimes**: configure the supported Apple Silicon MLX runtime.
+4. **MLX** — **Settings → Runtime Hub → Runtimes**: the signed Apple Silicon runtime is fetched and installed automatically when needed.
 
 Other Settings surfaces: **Security Doctor**, **Companion**, **Portability**, **Knowledge**, **Ecosystem**, **Browser Verification**, **Git Delivery**, **Background Agents**, **MCP**, **Prompts/Skills**, **API Server**, **Tasks**, **Rules**, **Automation**, **Usage**, and **Keyboard Shortcuts**.
 
