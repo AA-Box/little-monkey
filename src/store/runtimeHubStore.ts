@@ -449,7 +449,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           runtimeHubClient.storageStatus(),
           runtimeHubClient.installedModels(),
           runtimeHubClient.catalogSources(),
-        ]);
+          ]);
         set({ hardware, profile, storage, installedModels, catalogSources, runtimes, loaded: true });
       } catch (error) {
         fail(key, error);
@@ -939,12 +939,11 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           ]);
         if (statusResult.status === "rejected") throw statusResult.reason;
         if (inventoryResult.status === "rejected") throw inventoryResult.reason;
-        if (logsResult.status === "rejected") throw logsResult.reason;
-        if (metricsResult.status === "rejected") throw metricsResult.reason;
         if (configResult.status === "rejected") throw configResult.reason;
-        // Context/cache state is diagnostic, additive information (like the
-        // Hardware Compatibility report): a failure here must never block
-        // the rest of the runtime card from refreshing.
+        // Status, inventory, and config are the runtime snapshot. Logs,
+        // metrics, and context/cache state are additive diagnostics: a stopped
+        // managed service may legitimately reject those calls, and that must
+        // not hide the installed/stopped state from the card.
         const contextCache = contextCacheResult.status === "fulfilled" ? contextCacheResult.value : undefined;
         set((state) => ({
           runtimeDetails: {
@@ -953,8 +952,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
               ...state.runtimeDetails[runtimeId],
               status: statusResult.value,
               inventory: inventoryResult.value,
-              logs: logsResult.value,
-              metrics: metricsResult.value,
+              logs: logsResult.status === "fulfilled" ? logsResult.value : state.runtimeDetails[runtimeId]?.logs,
+              metrics: metricsResult.status === "fulfilled" ? metricsResult.value : state.runtimeDetails[runtimeId]?.metrics,
               config: configResult.value ?? undefined,
               contextCache,
               refreshedAt: Date.now(),
