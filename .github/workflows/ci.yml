@@ -288,10 +288,13 @@ jobs:
           set -euo pipefail
           echo "runner architecture: $(uname -m)"
           test "$(uname -m)" = "arm64"
-          cargo test --manifest-path src-tauri/Cargo.toml -- --list | \
+          cargo test --manifest-path src-tauri/Cargo.toml --lib \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --list | \
             grep 'm3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional'
           cargo test \
             --manifest-path src-tauri/Cargo.toml \
+            --lib \
             m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
             -- --exact --nocapture
 
