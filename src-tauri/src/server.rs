@@ -3757,6 +3757,7 @@ fn runtime_for_spec(
     hub: Arc<crate::m3_runtime_hub::M3RuntimeHub>,
     spec: &UnifiedGenerationSpec,
     studio_engine: crate::generation::GenerationEngineState,
+    mlx_ownership: crate::mlx_ownership::MlxOwnershipCoordinator,
 ) -> Result<ServerRuntime, String> {
     let cloud_client = crate::egress::hardened()
         .build()
@@ -3774,7 +3775,8 @@ fn runtime_for_spec(
         model_service: model_service.clone(),
         m3_service: Some(
             M3HttpRequestService::with_model_service(hub, model_service)
-                .with_studio_engine(studio_engine),
+                .with_studio_engine(studio_engine)
+                .with_mlx_ownership(mlx_ownership),
         ),
         m3_policy: None,
     })
@@ -3948,8 +3950,16 @@ async fn reconcile_unified_server_locked(
         }
     };
     let studio_engine = app.state::<crate::AppState>().generation_engine.clone();
-    let desired_runtime = match runtime_for_spec(hub.clone(), &desired_spec, studio_engine.clone())
-    {
+    let mlx_ownership = app
+        .state::<crate::m3_commands::M3CommandState>()
+        .mlx_ownership
+        .clone();
+    let desired_runtime = match runtime_for_spec(
+        hub.clone(),
+        &desired_spec,
+        studio_engine.clone(),
+        mlx_ownership.clone(),
+    ) {
         Ok(runtime) => runtime,
         Err(error) => {
             record_unified_error(&state, &error)?;
@@ -3993,7 +4003,7 @@ async fn reconcile_unified_server_locked(
                 return Err(format!("Could not prepare a safe HTTP rollback: {error}"));
             }
         };
-        let runtime = match runtime_for_spec(hub, spec, studio_engine) {
+        let runtime = match runtime_for_spec(hub, spec, studio_engine, mlx_ownership) {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 record_unified_error(&state, &error)?;

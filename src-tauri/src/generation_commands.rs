@@ -824,6 +824,11 @@ pub async fn generation_run(
             // After the overrides, because a ControlNet or IP-Adapter can be
             // chosen for this run rather than belonging to the model entry.
             generation::validate_conditioning(&spec, &validated)?;
+            let _mlx_owner = if spec.engine == GenerationEngineKind::MlxVideo {
+                Some(m3.mlx_ownership.acquire().await)
+            } else {
+                None
+            };
             let media = if validated.task.is_speech() {
                 let _ = app.emit(
                     "studio://progress",
@@ -832,7 +837,7 @@ pub async fn generation_run(
                 vec![run_speech(&app, &spec, &validated).await?]
             } else {
                 if spec.engine == GenerationEngineKind::MlxVideo {
-                    crate::m3_commands::unload_mlx_for_studio(&m3).await?;
+                    crate::m3_commands::unload_mlx_for_studio_locked(&m3).await?;
                 }
                 run_diffusion(&app, &state, &spec, &validated).await?
             };

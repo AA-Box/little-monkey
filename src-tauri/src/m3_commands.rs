@@ -132,6 +132,9 @@ pub trait M3OwnedProcessShutdown: Send + Sync {
 
 pub struct M3CommandState {
     pub hub: Arc<M3RuntimeHub>,
+    /// Shared application-level arbitration between Studio's MLX video
+    /// process and Runtime Hub's MLX chat process.
+    pub(crate) mlx_ownership: crate::mlx_ownership::MlxOwnershipCoordinator,
     /// Runtime component (llama.cpp/MLX/tokenizer/converter/projector/
     /// accelerator-support) version manager. Kept as a separate hub from
     /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
@@ -152,6 +155,7 @@ impl M3CommandState {
     pub fn new(hub: Arc<M3RuntimeHub>, component_hub: Arc<M3ComponentHub>) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -167,6 +171,7 @@ impl M3CommandState {
     ) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -233,6 +238,14 @@ impl M3CommandState {
 /// process, but they must not keep both tens-of-gigabytes weight sets alive.
 #[cfg(target_os = "macos")]
 pub async fn unload_mlx_for_studio(state: &M3CommandState) -> Result<(), String> {
+    let _owner = state.mlx_ownership.acquire().await;
+    unload_mlx_for_studio_locked(state).await
+}
+
+/// Unloads Runtime Hub's MLX resident while the caller already holds the
+/// application-wide MLX ownership guard. Studio uses this form because it
+/// keeps the guard through `ensure_ready` and the complete generation.
+pub(crate) async fn unload_mlx_for_studio_locked(state: &M3CommandState) -> Result<(), String> {
     let has_mlx = state
         .hub
         .list_runtimes()
@@ -909,6 +922,11 @@ pub async fn m3_runtime_load_model(
     timeout_ms: Option<u64>,
     request: M3LoadModelRequest,
 ) -> Result<(), String> {
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
     if request.runtime_id == "mlx" {
         if let Some(app_state) = app.try_state::<crate::AppState>() {
             app_state.generation_engine.stop()?;

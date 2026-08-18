@@ -109,6 +109,7 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+pub mod mlx_ownership;
 // Local Agent Integration Launcher (ROADMAP.md, Phase 8, item 13): generates
 // safe external-tool (Continue.dev/aider/OpenAI-SDK-compatible) config
 // pointed at the M3 HTTP server's real endpoint, and detects drift in a

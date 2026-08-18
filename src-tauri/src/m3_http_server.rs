@@ -303,6 +303,9 @@ pub(crate) struct M3HttpRequestService {
     /// The desktop's Studio engine, when this service runs inside the app.
     /// CLI/test hosts do not have a Studio process to hand off from.
     studio_engine: Option<crate::generation::GenerationEngineState>,
+    /// The same application-level transition lock used by Studio and IPC
+    /// Runtime Hub model loads. CLI/test hosts leave it unset.
+    mlx_ownership: Option<crate::mlx_ownership::MlxOwnershipCoordinator>,
 }
 
 #[derive(Clone, Default)]
@@ -321,6 +324,7 @@ impl M3HttpRequestService {
             model_service,
             model_extensions: M3HttpModelExtensions::default(),
             studio_engine: None,
+            mlx_ownership: None,
         }
     }
 
@@ -333,6 +337,7 @@ impl M3HttpRequestService {
             model_service,
             model_extensions: M3HttpModelExtensions::default(),
             studio_engine: None,
+            mlx_ownership: None,
         }
     }
 
@@ -341,6 +346,14 @@ impl M3HttpRequestService {
         studio_engine: crate::generation::GenerationEngineState,
     ) -> Self {
         self.studio_engine = Some(studio_engine);
+        self
+    }
+
+    pub(crate) fn with_mlx_ownership(
+        mut self,
+        mlx_ownership: crate::mlx_ownership::MlxOwnershipCoordinator,
+    ) -> Self {
+        self.mlx_ownership = Some(mlx_ownership);
         self
     }
 
@@ -1823,6 +1836,7 @@ fn ollama_tags_from_models(list: &Value) -> Value {
 async fn lifecycle_response(
     hub: &M3RuntimeHub,
     studio_engine: Option<&crate::generation::GenerationEngineState>,
+    mlx_ownership: Option<&crate::mlx_ownership::MlxOwnershipCoordinator>,
     route: RouteId,
     auth: &HttpAuth,
     body: &Bytes,
@@ -1879,6 +1893,14 @@ async fn lifecycle_response(
                     Ok(runtime) => runtime,
                     Err(error) => return hub_error_response(error),
                 };
+            let _owner = if request.runtime_id == "mlx" {
+                match mlx_ownership {
+                    Some(mlx_ownership) => Some(mlx_ownership.acquire().await),
+                    None => None,
+                }
+            } else {
+                None
+            };
             if request.runtime_id == "mlx" {
                 if let Some(studio_engine) = studio_engine {
                     if let Err(error) = studio_engine.stop() {
@@ -2223,6 +2245,7 @@ impl M3HttpRequestService {
                     lifecycle_response(
                         &self.hub,
                         self.studio_engine.as_ref(),
+                        self.mlx_ownership.as_ref(),
                         route,
                         &auth,
                         &body,
