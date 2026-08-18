@@ -23,6 +23,23 @@ Programmatic execution therefore owns only the untrusted program runtime and its
 
 The programmatic capability is excluded from its own generated SDK, is offered only when the runtime reports healthy, and remains optional so ordinary individual tool calls continue unchanged.
 
+## Real-path integration coverage
+
+`src-tauri/src/programmatic_tool_e2e.rs` is the native integration suite. It
+uses `test_support::build`, a real Tauri `MockRuntime` window, and an
+in-memory `RunLedger`; it does not mock the Tauri command boundary. The suite
+drives the real workspace resolver and native commands for ordinary reads,
+workspace escapes, allowed and denied permission prompts, and checkpointed
+mutations. It also invokes the real Component Model extension host and asserts
+outer/nested tool events, permission decisions, run evidence, and chain
+verification for a nested call.
+
+The Vitest coverage in `src/lib/turnEngine.test.ts` remains the QuickJS binding
+and dispatcher-boundary test. Vitest cannot host the native Tauri runtime, so
+the two suites provide complementary proof: QuickJS → dispatcher in TypeScript
+and dispatcher → permission/workspace/checkpoint/ledger/extension infrastructure
+in Rust, with the same production command implementations on the native side.
+
 ## Threat model and limits
 
 The source is untrusted. QuickJS has no host standard library or imports; host functions receive and return JSON-compatible values only. Source, arguments, nested-call count/concurrency, logs, return serialization, memory, stack, instruction interrupts, wall time, and cancellation are bounded. Each nested call still passes normal schema/IPC decoding, permission/risk policy, workspace and egress policy, checkpoint handling, extension/MCP authorization, and audit/run recording.
@@ -34,6 +51,9 @@ The runtime is intentionally provider-neutral: a future provider implements the 
 The program source is intentionally dynamic, but it is JSON-stringified before insertion into the generated wrapper. The wrapper is evaluated only inside the isolated QuickJS WebAssembly context; the host application never calls `eval` or `Function` on the program source. Host bridge handles are removed from the guest global before the program runs, and the program receives only frozen, null-prototype tool bindings plus bounded JSON console logging.
 
 Every nested call is re-authorized against the current turn state and routed through the canonical dispatcher. That dispatcher owns schema validation, plan/settings gates, permission handling, workspace-root resolution, checkpoint injection, cancellation, hooks, and durable completion evidence. CodeQL's dynamic-code finding at the guest `Function` construction is therefore an intentional isolated-runtime sink; the finding should be closed with this justification and the accompanying security comment, not suppressed as an ordinary host-code exception.
+
+The formal disposition is recorded in
+[`docs/security/programmatic-runtime-codeql.md`](security/programmatic-runtime-codeql.md).
 
 ## Current runtime limitations
 
