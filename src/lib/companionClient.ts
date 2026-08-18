@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type CaptureKind = "text" | "file" | "window" | "screen" | "microphone" | "meeting";
-export type TranscriptionBackendKind = "local_whisper" | "provider";
+export type TranscriptionBackendKind = "local_whisper" | "provider" | "executable_extension";
 export type ImageEndpointKind = "comfy_ui" | "open_ai_compatible";
 
 export interface CaptureGrant {
@@ -26,15 +26,42 @@ export interface CompanionArtifact {
   createdAtMs: number;
 }
 
+/** Which synthesizer speaks. `system` is this machine's own voice; an
+ * executable extension is a sandboxed provider the operator installed. */
+export type SpeechBackendKind = 'system' | 'executable_extension';
+
 export interface VoiceConfig {
   backend: TranscriptionBackendKind;
   whisperBinary: string | null;
   whisperModel: string | null;
   providerId: string | null;
   providerModel: string;
+  extensionId: string | null;
+  extensionCapabilityId: string | null;
   language: string;
   ttsVoice: string | null;
+  ttsBackend: SpeechBackendKind;
+  ttsExtensionId: string | null;
+  ttsExtensionCapabilityId: string | null;
+  /** Which backend serves a live phone call, which is a session rather than a
+   * clip and is therefore chosen separately from `ttsBackend`. */
+  realtimeBackend: SpeechBackendKind;
+  realtimeExtensionId: string | null;
+  realtimeExtensionCapabilityId: string | null;
   saveRawAudio: boolean;
+  /** `MediaDeviceInfo.deviceId` of the chosen microphone, or null for the
+   * system default. Talk and the companion overlay both honour it. */
+  inputDeviceId: string | null;
+  outputDeviceId: string | null;
+  vadMinSpeechMs: number;
+  vadSilenceMs: number;
+  vadMaxUtteranceMs: number;
+  /** Local wake-phrase detection. Off by default; the Rust side refuses to
+   * enable it unless transcription runs on this machine. */
+  wakePhraseEnabled: boolean;
+  wakePhrase: string;
+  /** Continuous local listening for the wake phrase. Requires the phrase. */
+  alwaysListening: boolean;
 }
 
 export interface ImageEndpointConfig {
@@ -119,6 +146,11 @@ export interface CompanionComposePayload {
   text: string;
   imageDataUrl: string | null;
   source: string;
+  /** Set only for a finalized hands-free utterance. The chat sends that turn
+   * immediately, as a voice turn, using this as its stable id — so a retried
+   * submission collapses onto the run the first attempt made. Null means the
+   * text lands in the composer for the operator to read and send. */
+  utteranceId: string | null;
 }
 
 export interface ImageProgressPayload {
@@ -130,8 +162,12 @@ export interface ImageProgressPayload {
 export const companionClient = {
   showOverlay: () => invoke<void>("m7_overlay_show"),
   hideOverlay: () => invoke<void>("m7_overlay_hide"),
-  submitOverlay: (text: string, source: string, imageDataUrl: string | null = null) =>
-    invoke<void>("m7_overlay_submit", { text, source, imageDataUrl }),
+  submitOverlay: (
+    text: string,
+    source: string,
+    imageDataUrl: string | null = null,
+    utteranceId: string | null = null,
+  ) => invoke<void>("m7_overlay_submit", { text, source, imageDataUrl, utteranceId }),
   config: () => invoke<CompanionConfig>("m7_config_get"),
   saveConfig: (config: CompanionConfig) => invoke<CompanionConfig>("m7_config_save", { config }),
   grant: (kind: CaptureKind, lifetimeMs = 15 * 60_000, applicationId: string | null = null) =>

@@ -20,10 +20,16 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::artifact_store::{ArtifactBlob, ArtifactStore};
+use crate::executable_extensions::{CapabilityKind, ExtensionManager};
 
 const CONFIG_SCHEMA_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "companion-config-v1.json";
 const GALLERY_FILE: &str = "image-gallery-v1.json";
+const TALK_METRICS_FILE: &str = "talk-metrics-v1.json";
+const MAX_TALK_METRICS: usize = 100;
+const MAX_TALK_LATENCY_MS: u64 = 10 * 60 * 1_000;
+const MAX_TALK_TTS_TEXT_BYTES: usize = 32 * 1024;
+const MAX_TALK_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CAPTURE_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MEDIA_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 8 * 1024 * 1024;
@@ -68,19 +74,98 @@ pub struct CompanionArtifact {
 pub enum TranscriptionBackendKind {
     LocalWhisper,
     Provider,
+    ExecutableExtension,
+}
+
+/// Which synthesizer speaks. `System` is this machine's own voice — `say`,
+/// `espeak-ng`, SAPI — and is the default so an installation that predates
+/// extension providers keeps the voice it had.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechBackendKind {
+    #[default]
+    System,
+    ExecutableExtension,
+}
+
+fn default_provider_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_language() -> String {
+    "auto".to_string()
+}
+
+fn default_vad_min_speech_ms() -> u64 {
+    180
+}
+
+fn default_vad_silence_ms() -> u64 {
+    800
+}
+
+fn default_vad_max_utterance_ms() -> u64 {
+    90_000
+}
+
+fn default_wake_phrase() -> String {
+    "hey little monkey".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VoiceConfig {
     pub backend: TranscriptionBackendKind,
+    #[serde(default)]
     pub whisper_binary: Option<String>,
+    #[serde(default)]
     pub whisper_model: Option<String>,
+    #[serde(default)]
     pub provider_id: Option<String>,
+    #[serde(default = "default_provider_model")]
     pub provider_model: String,
+    #[serde(default)]
+    pub extension_id: Option<String>,
+    #[serde(default)]
+    pub extension_capability_id: Option<String>,
+    #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default)]
     pub tts_voice: Option<String>,
+    #[serde(default)]
+    pub tts_extension_id: Option<String>,
+    #[serde(default)]
+    pub tts_extension_capability_id: Option<String>,
+    /// Which backend serves a *live* call. Separate from `tts_backend`
+    /// because the two are different jobs: one synthesizes a clip, the other
+    /// holds a conversation open. An operator may well want the system voice
+    /// on the desktop and a realtime provider on the phone line.
+    #[serde(default)]
+    pub realtime_backend: SpeechBackendKind,
+    #[serde(default)]
+    pub realtime_extension_id: Option<String>,
+    #[serde(default)]
+    pub realtime_extension_capability_id: Option<String>,
+    #[serde(default)]
     pub save_raw_audio: bool,
+    #[serde(default)]
+    pub input_device_id: Option<String>,
+    #[serde(default)]
+    pub output_device_id: Option<String>,
+    #[serde(default)]
+    pub tts_backend: SpeechBackendKind,
+    #[serde(default = "default_vad_min_speech_ms")]
+    pub vad_min_speech_ms: u64,
+    #[serde(default = "default_vad_silence_ms")]
+    pub vad_silence_ms: u64,
+    #[serde(default = "default_vad_max_utterance_ms")]
+    pub vad_max_utterance_ms: u64,
+    #[serde(default)]
+    pub wake_phrase_enabled: bool,
+    #[serde(default = "default_wake_phrase")]
+    pub wake_phrase: String,
+    #[serde(default)]
+    pub always_listening: bool,
 }
 
 impl Default for VoiceConfig {
@@ -91,11 +176,83 @@ impl Default for VoiceConfig {
             whisper_model: None,
             provider_id: None,
             provider_model: "whisper-1".to_string(),
+            extension_id: None,
+            extension_capability_id: None,
             language: "auto".to_string(),
             tts_voice: None,
+            tts_backend: SpeechBackendKind::System,
+            tts_extension_id: None,
+            tts_extension_capability_id: None,
+            realtime_backend: SpeechBackendKind::System,
+            realtime_extension_id: None,
+            realtime_extension_capability_id: None,
             save_raw_audio: false,
+            input_device_id: None,
+            output_device_id: None,
+            vad_min_speech_ms: default_vad_min_speech_ms(),
+            vad_silence_ms: default_vad_silence_ms(),
+            vad_max_utterance_ms: default_vad_max_utterance_ms(),
+            wake_phrase_enabled: false,
+            wake_phrase: default_wake_phrase(),
+            always_listening: false,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TalkMetric {
+    pub created_at_ms: u64,
+    pub speech_detection_ms: Option<u64>,
+    pub stt_ms: Option<u64>,
+    pub model_first_token_ms: Option<u64>,
+    pub tts_first_audio_ms: Option<u64>,
+    pub end_to_end_ms: Option<u64>,
+    pub interrupted: bool,
+    pub fallback: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkMetricsSnapshot {
+    pub metrics: Vec<TalkMetric>,
+    pub interrupt_count: usize,
+    pub fallback_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkStatus {
+    pub configured: bool,
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    pub backend: TranscriptionBackendKind,
+    pub active_jobs: usize,
+    pub active_microphone_grants: usize,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechAudioResult {
+    pub job_id: String,
+    pub media_type: String,
+    pub audio_base64: String,
+}
+
+/// What Talk's transcription returns: the words, and no handle to anything kept,
+/// because nothing was kept.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TalkTranscript {
+    pub job_id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VoicePrivacySnapshot {
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    pub local_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -206,12 +363,101 @@ struct ImageProgressEvent {
 }
 
 pub struct M7CompanionState {
+    app_data_dir: PathBuf,
     root: PathBuf,
     config: Mutex<CompanionConfig>,
     grants: Mutex<BTreeMap<String, CaptureGrant>>,
     jobs: Mutex<BTreeMap<String, CancellationToken>>,
     gallery: Mutex<Vec<ImageGalleryEntry>>,
+    talk_metrics: Mutex<Vec<TalkMetric>>,
     artifacts: ArtifactStore,
+}
+
+struct TemporaryArtifactRoot {
+    path: PathBuf,
+}
+
+impl TemporaryArtifactRoot {
+    fn new(parent: &Path) -> Result<Self, String> {
+        let path = parent.join(format!("stt-artifacts-{}", Uuid::new_v4().simple()));
+        ensure_private_directory(&path)?;
+        Ok(Self { path })
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.path.clear();
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not inspect temporary STT artifact store {}: {error}",
+                    self.path.display()
+                ));
+            }
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Temporary STT artifact store {} is no longer a real directory",
+                self.path.display()
+            ));
+        }
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove temporary STT artifact store {}: {error}",
+                    self.path.display()
+                ));
+            }
+        }
+        self.path.clear();
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryArtifactRoot {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+struct ExtensionAudioArtifacts {
+    store: ArtifactStore,
+    temporary_root: Option<TemporaryArtifactRoot>,
+}
+
+impl ExtensionAudioArtifacts {
+    fn cleanup(&mut self) -> Result<(), String> {
+        self.temporary_root
+            .as_mut()
+            .map_or(Ok(()), TemporaryArtifactRoot::cleanup)
+    }
+}
+
+fn extension_audio_artifacts(
+    state: &M7CompanionState,
+    persist_raw_audio: bool,
+) -> Result<ExtensionAudioArtifacts, String> {
+    if persist_raw_audio {
+        return Ok(ExtensionAudioArtifacts {
+            store: state.artifacts.clone(),
+            temporary_root: None,
+        });
+    }
+    let temporary_root = TemporaryArtifactRoot::new(&state.root.join("tmp"))?;
+    let store = ArtifactStore::with_max_blob_size(&temporary_root.path, MAX_MEDIA_BYTES)
+        .map_err(|error| error.to_string())?;
+    Ok(ExtensionAudioArtifacts {
+        store,
+        temporary_root: Some(temporary_root),
+    })
 }
 
 impl M7CompanionState {
@@ -223,18 +469,41 @@ impl M7CompanionState {
         validate_config(&config)?;
         let gallery =
             load_json::<Vec<ImageGalleryEntry>>(&root.join(GALLERY_FILE))?.unwrap_or_default();
+        let mut talk_metrics =
+            load_json::<Vec<TalkMetric>>(&root.join(TALK_METRICS_FILE))?.unwrap_or_default();
+        talk_metrics.retain(|metric| validate_talk_metric(metric).is_ok());
+        if talk_metrics.len() > MAX_TALK_METRICS {
+            talk_metrics.drain(..talk_metrics.len() - MAX_TALK_METRICS);
+        }
         Ok(Self {
+            app_data_dir: app_data_dir.to_path_buf(),
             root,
             config: Mutex::new(config),
             grants: Mutex::new(BTreeMap::new()),
             jobs: Mutex::new(BTreeMap::new()),
             gallery: Mutex::new(gallery),
+            talk_metrics: Mutex::new(talk_metrics),
             artifacts: ArtifactStore::with_max_blob_size(
                 app_data_dir.join("content-v1"),
                 MAX_MEDIA_BYTES,
             )
             .map_err(|error| error.to_string())?,
         })
+    }
+
+    /// The companion configuration, for a test that needs to select a
+    /// provider before driving a normal entry point. Panics rather than
+    /// returning a result: a fixture whose own state directory cannot be read
+    /// has nothing left to assert.
+    #[cfg(test)]
+    pub(crate) fn config_for_test(&self) -> CompanionConfig {
+        self.config().expect("fixture companion state is readable")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_config_for_test(&self, config: CompanionConfig) {
+        self.save_config(config)
+            .expect("fixture companion configuration is valid");
     }
 
     fn config(&self) -> Result<CompanionConfig, String> {
@@ -268,6 +537,50 @@ impl M7CompanionState {
                 grant
             })
             .collect())
+    }
+
+    pub fn security_voice_privacy(&self) -> Result<VoicePrivacySnapshot, String> {
+        let voice = self.config()?.voice;
+        Ok(VoicePrivacySnapshot {
+            wake_phrase_enabled: voice.wake_phrase_enabled,
+            always_listening: voice.always_listening,
+            local_only: voice.backend == TranscriptionBackendKind::LocalWhisper,
+        })
+    }
+
+    fn talk_metrics(&self) -> Result<TalkMetricsSnapshot, String> {
+        let metrics = lock(&self.talk_metrics, "talk metrics")?.clone();
+        Ok(TalkMetricsSnapshot {
+            interrupt_count: metrics.iter().filter(|metric| metric.interrupted).count(),
+            fallback_count: metrics.iter().filter(|metric| metric.fallback).count(),
+            metrics,
+        })
+    }
+
+    fn record_talk_metric(&self, metric: TalkMetric) -> Result<TalkMetricsSnapshot, String> {
+        validate_talk_metric(&metric)?;
+        let snapshot = {
+            let mut metrics = lock(&self.talk_metrics, "talk metrics")?;
+            metrics.push(metric);
+            if metrics.len() > MAX_TALK_METRICS {
+                let remove = metrics.len() - MAX_TALK_METRICS;
+                metrics.drain(..remove);
+            }
+            atomic_write_json(&self.root.join(TALK_METRICS_FILE), metrics.as_slice())?;
+            metrics.clone()
+        };
+        Ok(TalkMetricsSnapshot {
+            interrupt_count: snapshot.iter().filter(|metric| metric.interrupted).count(),
+            fallback_count: snapshot.iter().filter(|metric| metric.fallback).count(),
+            metrics: snapshot,
+        })
+    }
+
+    fn clear_talk_metrics(&self) -> Result<(), String> {
+        let mut metrics = lock(&self.talk_metrics, "talk metrics")?;
+        atomic_write_json(&self.root.join(TALK_METRICS_FILE), &[] as &[TalkMetric])?;
+        metrics.clear();
+        Ok(())
     }
 
     fn require_grant(
@@ -464,8 +777,38 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || config.voice.provider_model.is_empty()
         || config.voice.provider_model.len() > 256
         || config.voice.language.len() > 32
+        || !(50..=2_000).contains(&config.voice.vad_min_speech_ms)
+        || !(400..=2_000).contains(&config.voice.vad_silence_ms)
+        || !(1_000..=90_000).contains(&config.voice.vad_max_utterance_ms)
+        || config.voice.vad_min_speech_ms >= config.voice.vad_max_utterance_ms
     {
         return Err("Companion configuration is invalid".to_string());
+    }
+    for device_id in [
+        config.voice.input_device_id.as_deref(),
+        config.voice.output_device_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if device_id.is_empty() || device_id.len() > 512 || device_id.chars().any(char::is_control)
+        {
+            return Err("Voice device selection is invalid".to_string());
+        }
+    }
+    if config.voice.wake_phrase.is_empty()
+        || config.voice.wake_phrase.len() > 128
+        || config.voice.wake_phrase.chars().any(char::is_control)
+    {
+        return Err("Wake phrase is invalid".to_string());
+    }
+    if config.voice.always_listening && !config.voice.wake_phrase_enabled {
+        return Err("Always-listening requires the wake phrase to be enabled".to_string());
+    }
+    if (config.voice.wake_phrase_enabled || config.voice.always_listening)
+        && config.voice.backend != TranscriptionBackendKind::LocalWhisper
+    {
+        return Err("Wake phrase listening is local-only and requires local Whisper".to_string());
     }
     config
         .overlay_shortcut
@@ -476,6 +819,43 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
     }
     if let Some(model) = &config.voice.whisper_model {
         validate_absolute_regular(model, false)?;
+    }
+    if let Some(extension_id) = &config.voice.extension_id {
+        validate_id("extensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.extension_capability_id {
+        validate_id("extensionCapabilityId", capability_id)?;
+    }
+    if let Some(extension_id) = &config.voice.tts_extension_id {
+        validate_id("ttsExtensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.tts_extension_capability_id {
+        validate_id("ttsExtensionCapabilityId", capability_id)?;
+    }
+    if config.voice.tts_backend == SpeechBackendKind::ExecutableExtension
+        && (config.voice.tts_extension_id.is_none()
+            || config.voice.tts_extension_capability_id.is_none())
+    {
+        return Err(
+            "An executable speech provider needs both its owning extension and its capability"
+                .to_string(),
+        );
+    }
+    if let Some(extension_id) = &config.voice.realtime_extension_id {
+        validate_id("realtimeExtensionId", extension_id)?;
+    }
+    if let Some(capability_id) = &config.voice.realtime_extension_capability_id {
+        validate_id("realtimeExtensionCapabilityId", capability_id)?;
+    }
+    if config.voice.realtime_backend == SpeechBackendKind::ExecutableExtension
+        && (config.voice.realtime_extension_id.is_none()
+            || config.voice.realtime_extension_capability_id.is_none())
+    {
+        return Err(
+            "An executable realtime voice provider needs both its owning extension and its \
+             capability"
+                .to_string(),
+        );
     }
     let mut ids = BTreeSet::new();
     for endpoint in &config.image_endpoints {
@@ -489,6 +869,27 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         validate_url(&endpoint.base_url)?;
         if endpoint.kind == ImageEndpointKind::ComfyUi && endpoint.workflow_template.is_none() {
             return Err("ComfyUI endpoints require a workflow template".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_talk_metric(metric: &TalkMetric) -> Result<(), String> {
+    if metric.created_at_ms == 0 {
+        return Err("Talk metric timestamp is invalid".to_string());
+    }
+    for value in [
+        metric.speech_detection_ms,
+        metric.stt_ms,
+        metric.model_first_token_ms,
+        metric.tts_first_audio_ms,
+        metric.end_to_end_ms,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value > MAX_TALK_LATENCY_MS {
+            return Err("Talk latency metric exceeds its limit".to_string());
         }
     }
     Ok(())
@@ -523,6 +924,10 @@ fn load_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, Str
 
 fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
+    atomic_write_file(path, &bytes)
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -534,10 +939,13 @@ fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
     let mut file = options
         .open(&temp)
         .map_err(|error| format!("Could not stage {}: {error}", path.display()))?;
-    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
-    fs::rename(&temp, path)
-        .map_err(|error| format!("Could not publish {}: {error}", path.display()))
+    drop(file);
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("Could not publish {}: {error}", path.display())
+    })
 }
 
 fn bounded_file(path: &str) -> Result<(PathBuf, Vec<u8>), String> {
@@ -613,9 +1021,28 @@ pub fn m7_overlay_submit(
     text: String,
     image_data_url: Option<String>,
     source: String,
+    // Present only for a finalized hands-free utterance: the id of the
+    // recognition job that produced this text.
+    //
+    // It is what makes the spoken turn durable *and* exactly-once — it becomes
+    // the turn's ingress dedupe identity, so a submission retried after a
+    // timeout lands on the run the first attempt made. Absent means the text
+    // goes to the composer for the operator to read and send, which is the
+    // push-to-talk behavior and stays unchanged.
+    utterance_id: Option<String>,
 ) -> Result<(), String> {
     if window.label() != "companion-overlay" {
         return Err("Only the companion overlay can submit companion context".to_string());
+    }
+    if let Some(utterance_id) = &utterance_id {
+        if utterance_id.is_empty()
+            || utterance_id.len() > 128
+            || !utterance_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        {
+            return Err("Companion utterance id is invalid".to_string());
+        }
     }
     let text = text.trim().to_string();
     if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
@@ -632,7 +1059,12 @@ pub fn m7_overlay_submit(
     app.emit_to(
         "main",
         "m7://compose",
-        json!({"text": text, "imageDataUrl": image_data_url, "source": source}),
+        json!({
+            "text": text,
+            "imageDataUrl": image_data_url,
+            "source": source,
+            "utteranceId": utterance_id,
+        }),
     )
     .map_err(|error| error.to_string())?;
     window.hide().map_err(|error| error.to_string())?;
@@ -679,6 +1111,74 @@ pub fn m7_config_save(
         ));
     }
     Ok(state.config()?)
+}
+
+#[tauri::command]
+pub fn m7_talk_status(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkStatus, String> {
+    ensure_main_window(&window)?;
+    let voice = state.config()?.voice;
+    let configured = match voice.backend {
+        TranscriptionBackendKind::LocalWhisper => {
+            voice.whisper_binary.is_some() && voice.whisper_model.is_some()
+        }
+        TranscriptionBackendKind::Provider => voice.provider_id.is_some(),
+        // Both halves, because either one alone resolves to nothing: the
+        // capability names what to run and the extension id names whose copy
+        // of it, and Talk would otherwise report itself ready and then fail on
+        // the first utterance.
+        TranscriptionBackendKind::ExecutableExtension => {
+            voice.extension_id.is_some() && voice.extension_capability_id.is_some()
+        }
+    };
+    let now = now_ms();
+    let active_microphone_grants = lock(&state.grants, "capture grants")?
+        .values()
+        .filter(|grant| {
+            grant.active
+                && grant.expires_at_ms > now
+                && matches!(grant.kind, CaptureKind::Microphone | CaptureKind::Meeting)
+        })
+        .count();
+    Ok(TalkStatus {
+        configured,
+        wake_phrase_enabled: voice.wake_phrase_enabled,
+        always_listening: voice.always_listening,
+        backend: voice.backend,
+        active_jobs: lock(&state.jobs, "companion jobs")?.len(),
+        active_microphone_grants,
+    })
+}
+
+#[tauri::command]
+pub fn m7_talk_metrics(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.talk_metrics()
+}
+
+#[tauri::command]
+pub fn m7_talk_metric_record(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    metric: TalkMetric,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.record_talk_metric(metric)
+}
+
+#[tauri::command]
+pub fn m7_talk_metrics_clear(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+) -> Result<TalkMetricsSnapshot, String> {
+    ensure_main_window(&window)?;
+    state.clear_talk_metrics()?;
+    state.talk_metrics()
 }
 
 #[tauri::command]
@@ -894,6 +1394,29 @@ fn extract_speaker_segments(value: &Value) -> Vec<SpeakerSegment> {
         .collect()
 }
 
+fn extension_transcription_input(audio: &ArtifactBlob, language: &str) -> String {
+    json!({
+        "artifact_id": audio.id.as_str(),
+        "language": if language == "auto" { None } else { Some(language) },
+    })
+    .to_string()
+}
+
+fn normalize_extension_transcript(
+    output_json: &str,
+) -> Result<(String, Vec<SpeakerSegment>), String> {
+    if output_json.is_empty() || output_json.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("Extension transcript is empty or exceeds its byte limit".to_string());
+    }
+    let value: Value = serde_json::from_str(output_json)
+        .map_err(|error| format!("Decode extension transcript: {error}"))?;
+    let text = extract_transcript(&value);
+    if text.is_empty() || text.len() > MAX_TRANSCRIPT_BYTES {
+        return Err("Extension returned an empty or oversized transcript".to_string());
+    }
+    Ok((text, extract_speaker_segments(&value)))
+}
+
 async fn transcribe_path(
     state: &M7CompanionState,
     job_id: &str,
@@ -1030,6 +1553,59 @@ async fn transcribe_path(
             let segments = extract_speaker_segments(&value);
             Ok((text, format!("provider:{provider}"), segments))
         }
+        TranscriptionBackendKind::ExecutableExtension => {
+            let extension_id = config
+                .extension_id
+                .as_deref()
+                .ok_or("Choose the owning executable STT extension first")?;
+            let capability_id = config
+                .extension_capability_id
+                .as_deref()
+                .ok_or("Choose a healthy executable STT capability first")?;
+            let mut artifacts = extension_audio_artifacts(state, config.save_raw_audio)?;
+            let outcome = async {
+                let audio = artifacts
+                    .store
+                    .import_file(path)
+                    .map_err(|error| format!("Publish extension audio input: {error}"))?;
+                let input_json = extension_transcription_input(&audio, &config.language);
+                let invocation_id = format!("m7-stt-{}", Uuid::new_v4().simple());
+                let manager = ExtensionManager::new(&state.app_data_dir)?
+                    .with_artifact_root(artifacts.store.root())?;
+                let invocation = manager.invoke_owned_active_capability(
+                    CapabilityKind::Stt,
+                    extension_id,
+                    capability_id,
+                    input_json,
+                    Some(invocation_id.clone()),
+                    vec![audio.id],
+                );
+                tokio::pin!(invocation);
+                let result = tokio::select! {
+                    biased;
+                    result = &mut invocation => result,
+                    _ = cancellation.cancelled() => {
+                        let _ = crate::executable_extensions::cancel(&invocation_id);
+                        let _ = invocation.await;
+                        Err("Transcription cancelled".to_string())
+                    }
+                }?;
+                let (text, segments) = normalize_extension_transcript(&result.output_json)?;
+                Ok((
+                    text,
+                    format!("extension:{extension_id}:{capability_id}"),
+                    segments,
+                ))
+            }
+            .await;
+            let cleanup = artifacts.cleanup();
+            match (outcome, cleanup) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+                (Err(error), Err(cleanup_error)) => Err(format!("{error}; {cleanup_error}")),
+            }
+        }
     }
 }
 
@@ -1150,6 +1726,607 @@ pub async fn m7_transcribe_audio(
     })
 }
 
+/// Transcribe one spoken Talk utterance and keep nothing.
+///
+/// **Why this is not `m7_transcribe_audio`.** That command exists to turn a
+/// recording into artifacts: it publishes the transcript, and when the operator
+/// asked for raw audio to be kept, the audio too. Those are the right semantics
+/// for a meeting somebody chose to record. They are the wrong semantics for a
+/// conversation: a spoken turn is a sentence, not a recording, and Talk promises
+/// that what is kept is the transcript in the session and bounded durations —
+/// nothing else.
+///
+/// It also makes the wake phrase honest. A fragment that turns out not to
+/// contain the phrase is dropped by the engine without ever becoming a turn; if
+/// transcription had already published it, "the detection stops on this machine"
+/// would be a claim contradicted by an artifact on disk.
+///
+/// The capture grant is still required — the microphone is still the
+/// microphone.
+#[tauri::command]
+pub async fn m7_talk_transcribe(
+    window: tauri::Window,
+    state: tauri::State<'_, M7CompanionState>,
+    grant_id: String,
+    job_id: String,
+    audio_base64: String,
+    media_type: String,
+) -> Result<TalkTranscript, String> {
+    ensure_main_window(&window)?;
+    let grant = state.require_grant(
+        &grant_id,
+        &BTreeSet::from([CaptureKind::Microphone, CaptureKind::Meeting]),
+    )?;
+    if !media_type.starts_with("audio/")
+        || audio_base64.len() as u64 > MAX_MEDIA_BYTES.saturating_mul(2)
+    {
+        return Err("Recorded audio media type or size is invalid".to_string());
+    }
+    let bytes = STANDARD
+        .decode(audio_base64)
+        .map_err(|_| "Recorded audio is not valid base64")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MEDIA_BYTES {
+        return Err("Recorded audio is empty or exceeds its limit".to_string());
+    }
+    let extension = if media_type.contains("wav") {
+        "wav"
+    } else {
+        "webm"
+    };
+    let path =
+        state
+            .root
+            .join("tmp")
+            .join(format!("talk-{}.{}", Uuid::new_v4().simple(), extension));
+    fs::write(&path, &bytes).map_err(|error| error.to_string())?;
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(
+        &state,
+        &job_id,
+        &path,
+        &cancellation,
+        grant.kind == CaptureKind::Meeting,
+    )
+    .await;
+    state.finish_job(&job_id);
+    // On every exit: success, provider failure, cancellation and timeout all
+    // come through here, because the utterance's audio outliving the utterance
+    // is the one thing this path must never do.
+    let _ = fs::remove_file(&path);
+    let (text, _backend, _segments) = result?;
+    Ok(TalkTranscript { job_id, text })
+}
+
+/// Whether this machine can turn call audio into text at all.
+///
+/// Answering the phone with no transcription backend configured is a feature
+/// that looks enabled and does nothing: the caller talks, and every turn is
+/// dropped. Callers of the telephony surface ask this so they can say so
+/// before somebody discovers it on a live call.
+pub fn call_speech_readiness(app_data_dir: &Path) -> Result<(), String> {
+    let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    match voice.backend {
+        TranscriptionBackendKind::LocalWhisper => {
+            if voice
+                .whisper_binary
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                || voice
+                    .whisper_model
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(
+                    "Local transcription has no whisper binary or model configured, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+        TranscriptionBackendKind::Provider => {
+            if voice.provider_id.as_deref().unwrap_or_default().is_empty() {
+                return Err(
+                    "Transcription is set to a hosted provider, but no provider is chosen, so nothing said on a call can be understood."
+                        .to_string(),
+                );
+            }
+        }
+        TranscriptionBackendKind::ExecutableExtension => {
+            let extension_id = voice
+                .extension_id
+                .as_deref()
+                .ok_or(
+                    "Transcription is set to an executable extension, but its owning extension is not selected, so nothing said on a call can be understood.",
+                )?;
+            let capability_id = voice
+                .extension_capability_id
+                .as_deref()
+                .ok_or(
+                    "Transcription is set to an executable extension, but no STT capability is chosen, so nothing said on a call can be understood.",
+                )?;
+            let active = ExtensionManager::new(app_data_dir)?
+                .resolve_active_capability(CapabilityKind::Stt, capability_id)
+                .map_err(|error| {
+                    format!(
+                        "The configured executable STT capability is not healthy and active: {error}"
+                    )
+                })?;
+            if active.extension_id != extension_id {
+                return Err(
+                    "The configured executable STT capability is now owned by a different extension; reselect it in Settings"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Transcribe an audio file with the operator's own configured backend.
+///
+/// The entry point for callers outside the desktop command layer — today the
+/// phone-call pipeline in the daemon. It deliberately goes through the same
+/// [`M7CompanionState`] and the same `transcribe_path` as the desktop does: a
+/// phone call must not get a speech stack of its own, or an operator who
+/// configured local Whisper would find their calls quietly sent to a hosted
+/// provider instead.
+///
+/// No capture grant is involved because no capture happens: the audio is
+/// already in hand, having arrived from the carrier the operator configured.
+/// Transcribe audio already in memory with the operator's own backend.
+///
+/// The Talk sockets' entry point. Same [`M7CompanionState`], same
+/// `transcribe_path`, same rule as [`transcribe_call_audio`]: a spoken turn must
+/// not get a speech stack of its own. The bytes are written to a private
+/// temporary file because that is what both backends take — whisper.cpp reads a
+/// path, and the provider upload needs a filename whose extension tells it what
+/// the container is — and the file is removed on every exit path.
+///
+/// No capture grant is involved because no capture happens here: the audio
+/// arrived from a device the operator paired and granted `voice_stream`.
+pub async fn transcribe_audio_bytes(
+    app_data_dir: &Path,
+    audio: &[u8],
+    media_type: &str,
+) -> Result<String, String> {
+    if audio.is_empty() || audio.len() as u64 > MAX_MEDIA_BYTES {
+        return Err("Spoken audio is empty or exceeds its limit".to_string());
+    }
+    let extension = match media_type {
+        value if value.contains("wav") => "wav",
+        value if value.contains("ogg") => "ogg",
+        value if value.contains("mp4") => "m4a",
+        value if value.contains("mpeg") => "mp3",
+        _ => "webm",
+    };
+    let state = M7CompanionState::production(app_data_dir)?;
+    let directory = state.root.join("tmp");
+    ensure_private_directory(&directory)?;
+    let path = directory.join(format!("talk-{}.{extension}", Uuid::new_v4().simple()));
+    fs::write(&path, audio).map_err(|error| format!("Could not stage spoken audio: {error}"))?;
+    let job_id = format!("talk-stt-{}", Uuid::new_v4().simple());
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(&state, &job_id, &path, &cancellation, false).await;
+    state.finish_job(&job_id);
+    let _ = fs::remove_file(&path);
+    result.map(|(text, _backend, _segments)| text)
+}
+
+pub async fn transcribe_call_audio(app_data_dir: &Path, path: &Path) -> Result<String, String> {
+    let state = M7CompanionState::production(app_data_dir)?;
+    let job_id = format!("call-stt-{}", Uuid::new_v4().simple());
+    let cancellation = state.begin_job(&job_id)?;
+    let result = transcribe_path(&state, &job_id, path, &cancellation, false).await;
+    state.finish_job(&job_id);
+    result.map(|(text, _backend, _segments)| text)
+}
+
+/// The largest synthesized clip an extension may hand back. Generous enough
+/// for a long spoken turn at 16-bit/16 kHz and far below the runtime's own
+/// output ceiling, so an oversized answer is refused here with a sentence an
+/// operator can act on rather than as a generic runtime failure.
+const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ExtensionSpeechOutput {
+    artifact_id: String,
+    #[serde(default)]
+    media_type: Option<String>,
+}
+
+/// Synthesize `text` through the extension TTS provider the operator selected.
+///
+/// The audio comes back as an artifact id, never a path: a guest that could
+/// name a file would be choosing what the host reads. The id is then checked
+/// against the set of artifacts *this invocation actually wrote* — the store
+/// is content-addressed and shared, so a guessed or previously-seen id would
+/// otherwise resolve to somebody else's content.
+async fn synthesize_via_extension(
+    app_data_dir: &Path,
+    text: &str,
+    voice: Option<&str>,
+    cancellation: Option<&CancellationToken>,
+) -> Result<Vec<u8>, String> {
+    let config = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    let extension_id = config
+        .tts_extension_id
+        .as_deref()
+        .ok_or("Choose the owning executable speech extension first")?;
+    let capability_id = config
+        .tts_extension_capability_id
+        .as_deref()
+        .ok_or("Choose a healthy executable speech capability first")?;
+    let input_json = json!({
+        "text": text,
+        "voice": voice,
+        // The one format every consumer in this app can read. A provider that
+        // synthesizes something else has to convert before it answers.
+        "format": "wav",
+    })
+    .to_string();
+    let invocation_id = format!("m7-tts-{}", Uuid::new_v4().simple());
+    let store = ArtifactStore::with_max_blob_size(
+        app_data_dir.join("content-v1"),
+        MAX_SYNTHESIZED_AUDIO_BYTES as u64,
+    )
+    .map_err(|error| format!("Cannot open the artifact store: {error}"))?;
+    let manager = ExtensionManager::new(app_data_dir)?.with_artifact_root(store.root())?;
+    let invocation = manager.invoke_owned_active_capability(
+        CapabilityKind::Tts,
+        extension_id,
+        capability_id,
+        input_json,
+        Some(invocation_id.clone()),
+        Vec::new(),
+    );
+    tokio::pin!(invocation);
+    let result = match cancellation {
+        Some(cancellation) => tokio::select! {
+            biased;
+            result = &mut invocation => result,
+            _ = cancellation.cancelled() => {
+                let _ = crate::executable_extensions::cancel(&invocation_id);
+                let _ = invocation.await;
+                Err("Speech synthesis cancelled".to_string())
+            }
+        },
+        None => invocation.await,
+    }?;
+    let output: ExtensionSpeechOutput = serde_json::from_str(&result.output_json)
+        .map_err(|error| format!("The speech extension returned invalid output: {error}"))?;
+    if !result.written_artifact_ids.contains(&output.artifact_id) {
+        return Err(
+            "The speech extension named an artifact it did not write; audio refused".to_string(),
+        );
+    }
+    if let Some(media_type) = output
+        .media_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if !media_type.eq_ignore_ascii_case("audio/wav")
+            && !media_type.eq_ignore_ascii_case("audio/x-wav")
+            && !media_type.eq_ignore_ascii_case("audio/wave")
+        {
+            return Err(format!(
+                "The speech extension returned '{media_type}' rather than WAV audio"
+            ));
+        }
+    }
+    let bytes = store
+        .read(&output.artifact_id)
+        .map_err(|error| format!("Cannot read the synthesized audio: {error}"))?;
+    if bytes.len() > MAX_SYNTHESIZED_AUDIO_BYTES {
+        return Err("The speech extension returned oversized audio".to_string());
+    }
+    // Cheapest honest check that this is the container it claims to be: the
+    // consumers downstream parse a RIFF/WAVE header and a caller deserves the
+    // failure named here rather than "could not decode" three layers on.
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err("The speech extension did not return WAV audio".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Speak `text` on this machine's speakers with an extension's voice.
+///
+/// The system backend hands text to a synthesizer that also plays it. An
+/// extension only produces audio, so the two halves are separate here: the
+/// clip is synthesized into a private temporary file and handed to the
+/// platform's own player, which is the same program in each case that a user
+/// double-clicking a WAV would reach.
+async fn speak_via_extension(
+    app_data_dir: &Path,
+    temp_root: &Path,
+    text: &str,
+    voice: Option<&str>,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let bytes = synthesize_via_extension(app_data_dir, text, voice, Some(cancellation)).await?;
+    ensure_private_directory(temp_root)?;
+    let path = temp_root.join(format!("speech-{}.wav", Uuid::new_v4().simple()));
+    atomic_write_file(&path, &bytes)?;
+    let played = play_wav_file(&path, cancellation).await;
+    let _ = fs::remove_file(&path);
+    played
+}
+
+/// Hand one WAV file to the platform's audio player and wait for it, killing
+/// it the moment the job is cancelled.
+async fn play_wav_file(path: &Path, cancellation: &CancellationToken) -> Result<(), String> {
+    let path_arg = path.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/usr/bin/afplay");
+        command.arg(&path_arg);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        // `aplay` ships with alsa-utils and is what every desktop image with
+        // working audio already has; `paplay` is the PulseAudio equivalent and
+        // is tried only if the first is absent.
+        let program = if which_exists("aplay") {
+            "aplay"
+        } else {
+            "paplay"
+        };
+        let mut command = tokio::process::Command::new(program);
+        command.arg(&path_arg);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let escaped = path_arg.replace('\'', "''");
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "$p = New-Object System.Media.SoundPlayer '{escaped}'; $p.PlaySync(); $p.Dispose()"
+            ),
+        ]);
+        command
+    };
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("Could not start audio playback: {error}"))?;
+    tokio::select! {
+        _ = cancellation.cancelled() => {
+            let _ = child.kill().await;
+            Err("Speech playback cancelled".to_string())
+        }
+        status = child.wait() => {
+            let status = status.map_err(|error| error.to_string())?;
+            if status.success() {
+                Ok(())
+            } else {
+                Err(format!("Audio playback exited with {status}"))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn which_exists(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+    })
+}
+
+/// The extension-backed selections the companion currently holds, for the
+/// Security Doctor's orphaned-provider check.
+///
+/// Read-only and total: a machine whose companion state has never been written
+/// simply has no selections, which is not a finding.
+#[derive(Debug, Default, Clone)]
+pub struct PersistedVoiceSelections {
+    pub transcription: Option<(String, String)>,
+    pub speech: Option<(String, String)>,
+    pub realtime: Option<(String, String)>,
+}
+
+pub fn persisted_voice_selections(app_data_dir: &Path) -> PersistedVoiceSelections {
+    let Ok(voice) = call_voice_config(app_data_dir) else {
+        return PersistedVoiceSelections::default();
+    };
+    let pair = |enabled: bool, extension: &Option<String>, capability: &Option<String>| {
+        if !enabled {
+            return None;
+        }
+        Some((extension.clone()?, capability.clone()?))
+    };
+    PersistedVoiceSelections {
+        transcription: pair(
+            voice.backend == TranscriptionBackendKind::ExecutableExtension,
+            &voice.extension_id,
+            &voice.extension_capability_id,
+        ),
+        speech: pair(
+            voice.tts_backend == SpeechBackendKind::ExecutableExtension,
+            &voice.tts_extension_id,
+            &voice.tts_extension_capability_id,
+        ),
+        realtime: pair(
+            voice.realtime_backend == SpeechBackendKind::ExecutableExtension,
+            &voice.realtime_extension_id,
+            &voice.realtime_extension_capability_id,
+        ),
+    }
+}
+
+/// The voice configuration a call needs, read through the same companion
+/// state the desktop writes.
+///
+/// Exposed because the daemon serves phone calls in its own process and must
+/// use the operator's actual selection rather than a default it invented.
+pub fn call_voice_config(app_data_dir: &Path) -> Result<VoiceConfig, String> {
+    Ok(M7CompanionState::production(app_data_dir)?.config()?.voice)
+}
+
+/// Synthesize `text` to a WAV file with the operator's system voice.
+///
+/// The speaking half of the same rule: [`m7_tts_speak`] plays to this machine's
+/// speakers, which is the wrong destination for a call, so this writes the same
+/// system synthesizer's output to a file the caller can send to the carrier.
+/// Same voice setting, same synthesizer, different destination.
+pub async fn synthesize_speech_to_wav(
+    app_data_dir: &Path,
+    text: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    let voice = M7CompanionState::production(app_data_dir)?.config()?.voice;
+    synthesize_speech_to_wav_with_voice(
+        app_data_dir,
+        &voice,
+        voice.tts_voice.clone().filter(|value| !value.is_empty()),
+        text,
+        destination,
+    )
+    .await
+}
+
+/// The synthesis both entry points share, with the backend decision made once.
+///
+/// Talk and a phone call reach speech through different commands, and the
+/// operator chose one synthesizer for both. Branching here rather than in each
+/// caller is what stops a provider that is selected in Settings from serving
+/// one of them and not the other.
+async fn synthesize_speech_to_wav_with_voice(
+    app_data_dir: &Path,
+    config: &VoiceConfig,
+    voice: Option<String>,
+    text: &str,
+    destination: &Path,
+) -> Result<(), String> {
+    if text.is_empty() || text.len() > MAX_CAPTURE_TEXT_BYTES {
+        return Err("Speech text is empty or exceeds its limit".to_string());
+    }
+    if config.tts_backend == SpeechBackendKind::ExecutableExtension {
+        let bytes = synthesize_via_extension(app_data_dir, text, voice.as_deref(), None).await?;
+        return atomic_write_file(destination, &bytes);
+    }
+    let destination_arg = destination.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = tokio::process::Command::new("/usr/bin/say");
+        if let Some(voice) = voice {
+            command.args(["-v", &voice]);
+        }
+        // 16-bit little-endian at the rate every carrier stream uses, so the
+        // call side has nothing to resample.
+        command.args(["--data-format=LEI16@8000", "-o", &destination_arg]);
+        command.arg(text);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        // espeak-ng writes a WAV; spd-say (used for desktop playback) cannot,
+        // which is why this is the one place the two diverge.
+        let mut command = tokio::process::Command::new("espeak-ng");
+        if let Some(voice) = voice {
+            command.args(["-v", &voice]);
+        }
+        command.args(["-w", &destination_arg, "--", text]);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let escaped_text = text.replace('\'', "''");
+        let escaped_path = destination_arg.replace('\'', "''");
+        let select_voice = voice
+            .map(|voice| format!("$s.SelectVoice('{}');", voice.replace('\'', "''")))
+            .unwrap_or_default();
+        let mut command = tokio::process::Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; {select_voice} $s.SetOutputToWaveFile('{escaped_path}'); $s.Speak('{escaped_text}'); $s.Dispose()"
+            ),
+        ]);
+        command
+    };
+
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .status()
+        .await
+        .map_err(|error| format!("Could not start system speech: {error}"))?;
+    if !status.success() {
+        return Err(format!("System speech exited with {status}"));
+    }
+    if !destination.is_file() {
+        return Err("System speech produced no audio".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn m7_tts_synthesize(
+    state: tauri::State<'_, M7CompanionState>,
+    job_id: String,
+    text: String,
+) -> Result<SpeechAudioResult, String> {
+    if text.is_empty() || text.len() > MAX_TALK_TTS_TEXT_BYTES {
+        return Err("Speech text is empty or exceeds its Talk limit".to_string());
+    }
+    let cancellation = state.begin_job(&job_id)?;
+    let destination = state
+        .root
+        .join("tmp")
+        .join(format!("talk-speech-{}.wav", Uuid::new_v4().simple()));
+    let voice_config = state.config()?.voice;
+    let synthesis = synthesize_speech_to_wav_with_voice(
+        &state.app_data_dir,
+        &voice_config,
+        voice_config
+            .tts_voice
+            .clone()
+            .filter(|value| !value.is_empty()),
+        &text,
+        &destination,
+    );
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err("Speech synthesis cancelled".to_string()),
+        result = synthesis => result,
+    };
+    state.finish_job(&job_id);
+    let output = match result {
+        Ok(()) => (|| {
+            let metadata = fs::metadata(&destination)
+                .map_err(|error| format!("Could not inspect synthesized speech: {error}"))?;
+            if metadata.len() > MAX_TALK_AUDIO_BYTES {
+                Err("Synthesized speech exceeds its Talk limit".to_string())
+            } else {
+                fs::read(&destination)
+                    .map_err(|error| format!("Could not read synthesized speech: {error}"))
+                    .map(|bytes| SpeechAudioResult {
+                        job_id: job_id.clone(),
+                        media_type: "audio/wav".to_string(),
+                        audio_base64: STANDARD.encode(bytes),
+                    })
+            }
+        })(),
+        Err(error) => Err(error),
+    };
+    let _ = fs::remove_file(destination);
+    output
+}
+
 #[tauri::command]
 pub async fn m7_tts_speak(
     state: tauri::State<'_, M7CompanionState>,
@@ -1160,7 +2337,20 @@ pub async fn m7_tts_speak(
         return Err("Speech text is empty or exceeds its limit".to_string());
     }
     let cancellation = state.begin_job(&job_id)?;
-    let voice = state.config()?.voice.tts_voice;
+    let voice_config = state.config()?.voice;
+    let voice = voice_config.tts_voice.clone();
+    if voice_config.tts_backend == SpeechBackendKind::ExecutableExtension {
+        let result = speak_via_extension(
+            &state.app_data_dir,
+            &state.root.join("tmp"),
+            &text,
+            voice.as_deref().filter(|value| !value.is_empty()),
+            &cancellation,
+        )
+        .await;
+        state.finish_job(&job_id);
+        return result;
+    }
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = tokio::process::Command::new("/usr/bin/say");
@@ -1689,6 +2879,85 @@ mod tests {
     }
 
     #[test]
+    fn extension_transcripts_are_normalized_and_bounded() {
+        let (text, segments) = normalize_extension_transcript(
+            r#"{"text":"  Hello there  ","segments":[{"speaker":"Agent","start":0.5,"text":"Hello there"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(text, "Hello there");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].start_ms, Some(500));
+
+        let oversized = format!(r#"{{"text":"{}"}}"#, "x".repeat(MAX_TRANSCRIPT_BYTES));
+        assert!(normalize_extension_transcript(&oversized).is_err());
+        assert!(normalize_extension_transcript(r#"{"language":"en"}"#).is_err());
+    }
+
+    #[test]
+    fn extension_audio_input_uses_the_host_published_artifact() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let audio = b"trusted audio bytes";
+        let blob = state.artifacts.put(audio).unwrap();
+        let input: Value =
+            serde_json::from_str(&extension_transcription_input(&blob, "auto")).unwrap();
+
+        assert_eq!(input, json!({"artifact_id": blob.id, "language": null}));
+        assert_eq!(state.artifacts.read(&blob.id).unwrap(), audio);
+    }
+
+    #[test]
+    fn extension_audio_artifacts_are_temporary_unless_raw_audio_is_opted_in() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let audio = b"private transient audio";
+        let temporary_root;
+        let temporary_id;
+        {
+            let mut artifacts = extension_audio_artifacts(&state, false).unwrap();
+            temporary_root = artifacts.store.root().to_path_buf();
+            let blob = artifacts.store.put(audio).unwrap();
+            temporary_id = blob.id;
+            assert!(temporary_root.starts_with(state.root.join("tmp")));
+            assert!(temporary_root.exists());
+            assert!(state.artifacts.read(&temporary_id).is_err());
+            artifacts.cleanup().unwrap();
+            assert!(!temporary_root.exists());
+        }
+        assert!(!temporary_root.exists());
+
+        let durable = extension_audio_artifacts(&state, true).unwrap();
+        let blob = durable.store.put(audio).unwrap();
+        assert_eq!(durable.store.root(), state.artifacts.root());
+        drop(durable);
+        assert_eq!(state.artifacts.read(&blob.id).unwrap(), audio);
+    }
+
+    #[test]
+    fn call_readiness_requires_the_selected_extension_to_be_active() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        let mut config = state.config().unwrap();
+        config.voice.backend = TranscriptionBackendKind::ExecutableExtension;
+        state.save_config(config.clone()).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("owning extension is not selected"));
+
+        config.voice.extension_id = Some("dev.example.stt".to_string());
+        state.save_config(config.clone()).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("no STT capability is chosen"));
+
+        config.voice.extension_capability_id = Some("transcribe".to_string());
+        state.save_config(config).unwrap();
+        assert!(call_speech_readiness(&root.0)
+            .unwrap_err()
+            .contains("not healthy and active"));
+    }
+
+    #[test]
     fn config_roundtrips_atomically_and_rejects_duplicate_endpoints() {
         let root = TempRoot::new();
         let state = M7CompanionState::production(&root.0).unwrap();
@@ -1704,6 +2973,9 @@ mod tests {
             enabled: true,
         };
         config.image_endpoints = vec![endpoint.clone()];
+        config.voice.backend = TranscriptionBackendKind::ExecutableExtension;
+        config.voice.extension_id = Some("dev.example.stt".to_string());
+        config.voice.extension_capability_id = Some("transcribe".to_string());
         state.save_config(config.clone()).unwrap();
         assert_eq!(state.config().unwrap(), config);
         config.image_endpoints.push(endpoint);
@@ -1712,5 +2984,127 @@ mod tests {
         let mut invalid_shortcut = state.config().unwrap();
         invalid_shortcut.overlay_shortcut = "definitely not a shortcut".to_string();
         assert!(state.save_config(invalid_shortcut).is_err());
+
+        let mut invalid_capability = state.config().unwrap();
+        invalid_capability.voice.extension_capability_id = Some("not a capability".to_string());
+        assert!(state.save_config(invalid_capability).is_err());
+
+        let mut invalid_extension = state.config().unwrap();
+        invalid_extension.voice.extension_id = Some("not an extension".to_string());
+        assert!(state.save_config(invalid_extension).is_err());
+    }
+
+    #[test]
+    fn legacy_voice_config_gets_private_talk_defaults() {
+        let config: CompanionConfig = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "overlayShortcut": "CommandOrControl+Shift+Space",
+            "voice": {
+                "backend": "local_whisper",
+                "whisperBinary": null,
+                "whisperModel": null,
+                "providerId": null,
+                "providerModel": "whisper-1",
+                "language": "auto",
+                "ttsVoice": null,
+                "saveRawAudio": false
+            },
+            "imageEndpoints": []
+        }))
+        .unwrap();
+        assert_eq!(config.voice.vad_min_speech_ms, 180);
+        assert_eq!(config.voice.vad_silence_ms, 800);
+        assert_eq!(config.voice.vad_max_utterance_ms, 90_000);
+        assert!(!config.voice.wake_phrase_enabled);
+        assert!(!config.voice.always_listening);
+        assert_eq!(config.voice.tts_backend, SpeechBackendKind::System);
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn wake_phrase_is_opt_in_and_local_only() {
+        let mut config = CompanionConfig::default();
+        config.voice.backend = TranscriptionBackendKind::Provider;
+        config.voice.provider_id = Some("operator-provider".to_string());
+        config.voice.wake_phrase_enabled = true;
+        assert!(validate_config(&config).is_err());
+
+        config.voice.backend = TranscriptionBackendKind::LocalWhisper;
+        config.voice.always_listening = true;
+        assert!(validate_config(&config).is_ok());
+
+        config.voice.wake_phrase_enabled = false;
+        assert!(validate_config(&config).is_err());
+    }
+
+    /// **A spoken turn leaves no artifact, whatever `saveRawAudio` says.**
+    ///
+    /// That switch means "keep the recordings I asked you to make" — a meeting
+    /// capture, a push-to-talk clip — and `m7_transcribe_audio` honours it by
+    /// publishing the transcript and, when it is on, the audio. A conversation
+    /// is not a recording somebody asked for, so Talk transcribes through its
+    /// own command, which publishes nothing at all. It is also what makes the
+    /// wake phrase's promise true: a fragment that turns out not to contain the
+    /// phrase is dropped by the engine, and if transcription had already
+    /// published it, "the detection stops on this machine" would be false.
+    ///
+    /// Scanned rather than executed because the alternative needs a whisper
+    /// build and a window. The defect class is a call site that looks fine on
+    /// its own, which is the same reason `egress.rs` and `web.rs` scan.
+    #[test]
+    fn talk_transcription_publishes_nothing_whatever_the_artifact_setting_says() {
+        const SOURCE: &str = include_str!("m7_companion.rs");
+        let body = SOURCE
+            .split_once("pub async fn m7_talk_transcribe(")
+            .expect("Talk has its own transcription command")
+            .1
+            .split_once("\n}\n")
+            .expect("its body ends")
+            .0;
+        assert!(
+            !body.contains("publish("),
+            "Talk's transcription must not publish an artifact: {body}"
+        );
+        assert!(
+            !body.contains("save_raw_audio"),
+            "Talk does not consult the keep-recordings setting at all"
+        );
+        assert!(
+            body.contains("fs::remove_file(&path)"),
+            "the utterance's audio must not outlive the utterance"
+        );
+        assert!(
+            body.contains("require_grant("),
+            "the microphone is still gated on a capture grant"
+        );
+    }
+
+    #[test]
+    fn talk_metrics_are_bounded_and_contain_no_audio() {
+        let root = TempRoot::new();
+        let state = M7CompanionState::production(&root.0).unwrap();
+        for offset in 0..105 {
+            state
+                .record_talk_metric(TalkMetric {
+                    created_at_ms: 1_000 + offset,
+                    speech_detection_ms: Some(180),
+                    stt_ms: Some(240),
+                    model_first_token_ms: Some(320),
+                    tts_first_audio_ms: Some(410),
+                    end_to_end_ms: Some(720),
+                    interrupted: offset % 2 == 0,
+                    fallback: offset % 3 == 0,
+                })
+                .unwrap();
+        }
+        let snapshot = state.talk_metrics().unwrap();
+        assert_eq!(snapshot.metrics.len(), MAX_TALK_METRICS);
+        assert_eq!(snapshot.metrics[0].created_at_ms, 1_005);
+        let persisted = fs::read_to_string(state.root.join(TALK_METRICS_FILE)).unwrap();
+        assert!(!persisted.contains("audio"));
+        assert!(!persisted.contains("transcript"));
+
+        state.clear_talk_metrics().unwrap();
+        assert!(state.talk_metrics().unwrap().metrics.is_empty());
     }
 }

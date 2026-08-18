@@ -55,10 +55,10 @@ pub enum ProfilesCmd {
         #[arg(long)]
         clear: bool,
     },
-    /// Delete a profile and everything under its data root.
+    /// Delete a profile and everything under its managed and authored roots.
     Delete {
         id: String,
-        /// Required: this removes run history, artifacts and settings.
+        /// Required: this removes run history, artifacts and authored settings.
         #[arg(long)]
         yes: bool,
     },
@@ -158,11 +158,12 @@ pub fn run(action: &ProfilesCmd, base: &Path) -> Result<(), String> {
         ProfilesCmd::Delete { id, yes } => {
             if !yes {
                 return Err(format!(
-                    "refusing to delete '{id}' and its entire data root without --yes"
+                    "refusing to delete '{id}' and its managed and authored roots without --yes"
                 ));
             }
-            profiles::delete_profile(base, id).map_err(|error| error.to_string())?;
-            println!("Deleted profile '{id}' and its data root.");
+            let agent_home = little_monkey_lib::app_paths::agent_home_dir()?;
+            profiles::delete_profile(base, &agent_home, id).map_err(|error| error.to_string())?;
+            println!("Deleted profile '{id}' and its managed and authored roots.");
             Ok(())
         }
         ProfilesCmd::Current { json } => {

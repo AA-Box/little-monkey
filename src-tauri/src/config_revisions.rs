@@ -112,7 +112,24 @@ pub struct Revision {
     /// The entity this revision belongs to, kept on every record so the log
     /// file is self-describing after the path has been slugified.
     pub entity_id: String,
+    /// The write that produced this revision, shared by every revision the same
+    /// save wrote — across entities *and* across kinds. This is what makes
+    /// "what did that change touch" answerable ([`changes`]).
+    ///
+    /// `None` on every revision written before this field existed, and it stays
+    /// `None`: correlating those by timestamp would be a guess dressed up as a
+    /// record, and two saves a second apart would merge into one change that
+    /// never happened. An old revision reads as uncorrelated instead.
+    #[serde(default)]
+    pub change_id: Option<String>,
     pub content: String,
+}
+
+/// A fresh id for one logical change, to be passed to every [`record`] call a
+/// single save makes. Callers that touch one entity pass one too — a change
+/// that touched exactly one thing is still a recorded fact.
+pub fn new_change_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// A revision without its snapshot — what the history list renders. Sending
@@ -129,6 +146,9 @@ pub struct RevisionMeta {
     pub label: String,
     pub content_sha256: String,
     pub bytes: usize,
+    /// See [`Revision::change_id`]. Carried into the list so a history row can
+    /// ask what else the same change touched without fetching a snapshot.
+    pub change_id: Option<String>,
 }
 
 impl From<&Revision> for RevisionMeta {
@@ -142,8 +162,30 @@ impl From<&Revision> for RevisionMeta {
             label: revision.label.clone(),
             content_sha256: revision.content_sha256.clone(),
             bytes: revision.content.len(),
+            change_id: revision.change_id.clone(),
         }
     }
+}
+
+/// One entity's part in a change — which kind, which entity, which revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeEntry {
+    pub kind: String,
+    pub entity_id: String,
+    pub revision: RevisionMeta,
+}
+
+/// Everything one write touched, across entities and kinds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeSet {
+    /// `None` when this revision predates change ids — the set then holds that
+    /// one revision and says so, rather than being grouped with its neighbours.
+    pub change_id: Option<String>,
+    /// The newest revision in the set.
+    pub created_at: u64,
+    pub entries: Vec<ChangeEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -166,6 +208,10 @@ pub struct RecordRequest {
     pub base_revision_id: Option<String>,
     pub label: String,
     pub content: String,
+    /// The write this record belongs to — one [`new_change_id`] shared by every
+    /// `record` call the same save makes. `None` leaves the revision
+    /// uncorrelated, which is what a caller that genuinely cannot say should do.
+    pub change_id: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -431,6 +477,7 @@ pub fn record(
         },
         content_sha256,
         entity_id: entity_id.to_string(),
+        change_id: request.change_id,
         content: request.content,
     };
 
@@ -511,6 +558,10 @@ pub fn branch_from(
         label: format!("Branched from r{}", source.sequence),
         content_sha256: source.content_sha256.clone(),
         entity_id: entity_id.to_string(),
+        // Its own change: forking a branch touches this entity and nothing
+        // else, and inheriting the source's id would enlarge a past change
+        // with something that happened later.
+        change_id: Some(new_change_id()),
         content: source.content,
     };
     append_line(root, kind, entity_id, &revision)?;
@@ -585,6 +636,123 @@ pub fn entities(root: &Path, kind: &str) -> Result<Vec<String>, RevisionError> {
     Ok(found.into_iter().map(|(_, id)| id).collect())
 }
 
+/// Largest number of change sets [`changes`] will return, however large a limit
+/// the caller asks for.
+const MAX_CHANGE_SETS: usize = 500;
+
+/// Recovers a kind from its directory name — but only when the recovery is
+/// *provable*.
+///
+/// `slug` is lossy (`a/b` and `a_b` both read back as `a_b`), so the candidate
+/// is accepted only if it slugs back to exactly this directory. When it does
+/// not, the directory name is reported as-is rather than a plausible-looking
+/// kind that was never written.
+fn kind_from_dir(dir_name: &str) -> String {
+    match dir_name.rsplit_once('-') {
+        Some((candidate, _hash)) if slug(candidate) == dir_name => candidate.to_string(),
+        _ => dir_name.to_string(),
+    }
+}
+
+/// What one change touched, across every entity *and every kind* — the read
+/// `history`/`entities` cannot do, since both are scoped to a single entity or
+/// a single kind.
+///
+/// `change_id` filters to one change; `None` returns the most recent `limit`
+/// changes. Revisions written before change ids existed are each returned as
+/// their own set with `change_id: None`: they are reported as uncorrelated
+/// rather than bundled by proximity in time, which would invent a change.
+///
+/// ponytail: full scan of the revision tree, no index. The store holds tens of
+/// small JSONL files (one per persona, rules file, MCP server); add an index
+/// only if that stops being true.
+pub fn changes(
+    root: &Path,
+    change_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ChangeSet>, RevisionError> {
+    let kind_dirs = match std::fs::read_dir(root) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(RevisionError::Io(format!("failed to list revisions: {e}"))),
+    };
+
+    let mut sets: Vec<ChangeSet> = Vec::new();
+    // Where each correlated change already sits in `sets`, so entries join the
+    // set they belong to instead of a linear search per revision.
+    let mut by_change: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for kind_dir in kind_dirs.flatten() {
+        if !kind_dir.path().is_dir() {
+            continue;
+        }
+        let kind = kind_from_dir(&kind_dir.file_name().to_string_lossy());
+        let Ok(logs) = std::fs::read_dir(kind_dir.path()) else {
+            continue;
+        };
+        for log in logs.flatten() {
+            if log.path().extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(log.path()) else {
+                continue;
+            };
+            for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                let Ok(revision) = serde_json::from_str::<Revision>(line) else {
+                    continue;
+                };
+                if let Some(wanted) = change_id {
+                    if revision.change_id.as_deref() != Some(wanted) {
+                        continue;
+                    }
+                }
+                let entry = ChangeEntry {
+                    kind: kind.clone(),
+                    entity_id: revision.entity_id.clone(),
+                    revision: RevisionMeta::from(&revision),
+                };
+                match revision.change_id.clone() {
+                    Some(id) => match by_change.get(&id) {
+                        Some(&index) => {
+                            let set: &mut ChangeSet = &mut sets[index];
+                            set.created_at = set.created_at.max(entry.revision.created_at);
+                            set.entries.push(entry);
+                        }
+                        None => {
+                            by_change.insert(id.clone(), sets.len());
+                            sets.push(ChangeSet {
+                                change_id: Some(id),
+                                created_at: entry.revision.created_at,
+                                entries: vec![entry],
+                            });
+                        }
+                    },
+                    None => sets.push(ChangeSet {
+                        change_id: None,
+                        created_at: entry.revision.created_at,
+                        entries: vec![entry],
+                    }),
+                }
+            }
+        }
+    }
+
+    // Newest change first; within a change, oldest write first so the entries
+    // read in the order the save made them.
+    for set in &mut sets {
+        set.entries.sort_by(|a, b| {
+            a.revision
+                .created_at
+                .cmp(&b.revision.created_at)
+                .then_with(|| a.kind.cmp(&b.kind))
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+        });
+    }
+    sets.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sets.truncate(limit.min(MAX_CHANGE_SETS));
+    Ok(sets)
+}
+
 // ---------------------------------------------------------------------------
 // Tauri command layer
 // ---------------------------------------------------------------------------
@@ -605,6 +773,11 @@ fn root_for(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(revision_root(&dir))
 }
 
+/// `change_id` is supplied when this call is one of several a single save
+/// makes, so [`changes`] can report them as the one change they were. Omitted,
+/// the record still gets an id of its own: a save that touched one entity is a
+/// change that touched one entity, which is a different fact from a revision
+/// written before ids existed.
 #[tauri::command]
 pub fn config_revisions_record(
     app: tauri::AppHandle,
@@ -614,6 +787,7 @@ pub fn config_revisions_record(
     content: String,
     branch: Option<String>,
     base_revision_id: Option<String>,
+    change_id: Option<String>,
 ) -> Result<Revision, String> {
     record(
         &root_for(&app)?,
@@ -624,6 +798,7 @@ pub fn config_revisions_record(
             base_revision_id,
             label,
             content,
+            change_id: Some(change_id.unwrap_or_else(new_change_id)),
         },
     )
     .map_err(|e| e.to_string())
@@ -694,6 +869,22 @@ pub fn config_revisions_entities(
     entities(&root_for(&app)?, &kind).map_err(|e| e.to_string())
 }
 
+/// What a change touched, across kinds. `limit` is only consulted when no
+/// `change_id` is given, since a change id already selects at most one set.
+#[tauri::command]
+pub fn config_revisions_changes(
+    app: tauri::AppHandle,
+    change_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<ChangeSet>, String> {
+    changes(
+        &root_for(&app)?,
+        change_id.as_deref(),
+        limit.unwrap_or(50).max(1),
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +927,93 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(head(&root, "prompt", "persona-1", None).unwrap().is_none());
+    }
+
+    /// The property the whole design rests on: a log written before this field
+    /// existed still parses, and reads as **uncorrelated** rather than being
+    /// grouped with whatever was saved around the same moment.
+    ///
+    /// The line below is a real pre-change-id record, byte for byte, including
+    /// its field order and its absent `changeId`. Grouping these by proximity in
+    /// time is the one thing this feature must not do: two unrelated saves a
+    /// second apart would be reported as one change that never happened.
+    #[test]
+    fn a_revision_written_before_change_ids_reads_as_uncorrelated() {
+        let root = temp_root();
+        let dir = root.join(slug("prompt"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"revisionId":"11111111-1111-4111-8111-111111111111","parentId":null,"branch":"main","sequence":1,"createdAt":1700000000000,"label":"Edited","contentSha256":"abc","entityId":"persona-old","content":"before"}"#;
+        // Two of them, a second apart, from two different entities — the exact
+        // shape a timestamp heuristic would merge.
+        let second = old
+            .replace("persona-old", "persona-older")
+            .replace("1700000000000", "1700000001000")
+            .replace(
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            );
+        std::fs::write(dir.join(format!("{}.jsonl", slug("persona-old"))), old).unwrap();
+        std::fs::write(dir.join(format!("{}.jsonl", slug("persona-older"))), second).unwrap();
+
+        // It parses at all — `#[serde(default)]` on a field added to a shipped
+        // on-disk format.
+        let log = history(&root, "prompt", "persona-old", None).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].change_id, None);
+
+        let sets = changes(&root, None, 50).unwrap();
+        assert_eq!(sets.len(), 2, "two uncorrelated revisions are two changes");
+        for set in &sets {
+            assert_eq!(set.change_id, None);
+            assert_eq!(set.entries.len(), 1);
+        }
+    }
+
+    /// The read `history` and `entities` cannot do: one save, several entities,
+    /// more than one kind.
+    #[test]
+    fn one_save_reads_back_as_one_change_across_kinds() {
+        let root = temp_root();
+        let change_id = new_change_id();
+        for (kind, entity) in [
+            ("mcp", "document"),
+            ("mcp", "server-a"),
+            ("prompt", "persona-1"),
+        ] {
+            record(
+                &root,
+                kind,
+                entity,
+                RecordRequest {
+                    label: "Saved".to_string(),
+                    content: format!("{kind}/{entity}"),
+                    change_id: Some(change_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        // A later, unrelated save must not join it.
+        write(&root, "unrelated");
+
+        let one = changes(&root, Some(&change_id), 50).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].change_id.as_deref(), Some(change_id.as_str()));
+        assert_eq!(one[0].entries.len(), 3);
+        let kinds: Vec<&str> = one[0]
+            .entries
+            .iter()
+            .map(|entry| entry.kind.as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"mcp") && kinds.contains(&"prompt"),
+            "a change set must cross kinds, got {kinds:?}"
+        );
+
+        // Unfiltered, the two are separate and the newest comes first.
+        let all = changes(&root, None, 50).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all[0].created_at >= all[1].created_at);
     }
 
     #[test]
@@ -1144,6 +1422,7 @@ mod tests {
                     base_revision_id: None,
                     label: format!("seed {index}"),
                     content: format!("content {index}"),
+                    change_id: None,
                 },
             )
             .expect("seeding the log");
@@ -1165,6 +1444,7 @@ mod tests {
                                 base_revision_id: None,
                                 label: format!("writer {writer} round {round}"),
                                 content: format!("concurrent {writer}-{round}"),
+                                change_id: None,
                             },
                         ) {
                             failures.lock().expect("lock").push(error.to_string());

@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Square, Trash2 } from "lucide-react";
+import { Activity, Ban, Cloud, KeyRound, Loader2, Play, Power, RefreshCw, RotateCw, ShieldAlert, Smartphone, Square, Trash2, Wrench } from "lucide-react";
 import {
   backpressureGate,
   backpressureMessage,
   backpressureOf,
   type BackpressureState,
+  daemonEnsure,
   daemonInstall,
   daemonKillSwitch,
   daemonQueue,
@@ -16,14 +17,26 @@ import {
   daemonTriggers,
   daemonUninstall,
   MAX_REMOTE_ARTIFACT_BYTES,
+  DEVICE_CAPABILITIES,
   remoteAudit,
+  remoteDeviceCancel,
+  remoteDeviceGrant,
+  remoteDeviceList,
+  type RemoteDeviceCommandRow,
+  type RemoteDeviceRow,
   remoteHostConfigure,
   remoteHostDisable,
   remoteHostStatus,
   remotePairCreate,
+  type RemotePairCreated,
   remotePairList,
   remotePairRevoke,
   remotePairRotate,
+  remotePushConfigure,
+  remotePushDisable,
+  remotePushStatus,
+  type RemotePushStatus,
+  remotePushTest,
   type DaemonQueueRequest,
   type DaemonStatus,
   validateDaemonQueuePolicy,
@@ -36,6 +49,43 @@ import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
 
 function errorText(error: unknown) { return errorMessage(error); }
+
+// The wire tokens in the operator's words. Kept as a lookup rather than
+// prettified from the token, because "promptable" reads as jargon and
+// "not_required" reads as a bug.
+const PERMISSION_WORDS: Record<string, string> = {
+  granted: "Granted",
+  denied: "Denied",
+  promptable: "Needs permission",
+  undetermined: "Needs permission",
+  not_required: "Not required",
+  unsupported: "Unsupported",
+};
+
+const READINESS_WORDS: Record<string, string> = {
+  ready: "Ready",
+  foreground_required: "Needs the device in front",
+  interaction_required: "Needs user interaction",
+  armed_required: "Needs screen sharing armed",
+  unavailable: "Unavailable",
+};
+
+/** What a command is actually doing, in words that do not overclaim.
+ *
+ * `running` with a cancellation asked for is not "cancelled" — the effect may
+ * already have happened — and a command whose device started it and never
+ * reported is not a plain failure, it is an outcome nobody can prove. */
+function commandStateWord(command: RemoteDeviceCommandRow): string {
+  if (command.state === "running" && command.cancel_requested) return "running — cancellation asked for";
+  if (command.state === "running" && command.execution_id) return "running on the device";
+  if (command.state === "failed" && command.error?.includes("execution_outcome_unknown_after_restart")) {
+    return "outcome unknown — the action was not repeated";
+  }
+  if (command.state === "failed" && command.error?.includes("unproven")) {
+    return "outcome unknown — the action was not repeated";
+  }
+  return command.state;
+}
 
 function backpressureStateLabel(t: ReturnType<typeof useT>["t"], state: BackpressureState): string {
   if (state === "closed") return t("BackgroundAgentsPanel.backpressureClosed");
@@ -69,9 +119,19 @@ export function BackgroundAgentsPanel() {
   const [remote, setRemote] = useState({ listen: "127.0.0.1:48321", advertiseUrl: "https://127.0.0.1:48321", tlsCertificate: "", tlsPrivateKey: "" });
   const [remoteStatus, setRemoteStatus] = useState<Record<string, unknown> | null>(null);
   const [devices, setDevices] = useState("");
-  const [pair, setPair] = useState({ expiresMinutes: 15, actions: ["view-runs", "view-events", "read-artifacts"], mobileCapabilities: [] as string[], runIds: "", workspaceIds: "", maxArtifactBytes: 8 * 1024 * 1024 });
+  const [pair, setPair] = useState({ expiresMinutes: 15, actions: ["view-runs", "view-events", "read-artifacts"], mobileCapabilities: [] as string[], deviceCapabilities: [] as string[], runIds: "", workspaceIds: "", maxArtifactBytes: 8 * 1024 * 1024 });
   const [audit, setAudit] = useState<unknown>(null);
   const [deviceId, setDeviceId] = useState("");
+  const [deviceRows, setDeviceRows] = useState<RemoteDeviceRow[] | null>(null);
+  // The last invitation created in this session, so its compact code can be
+  // scanned. Held in memory only and cleared by hand: it carries a one-time
+  // token, and persisting it would leave a live pairing secret in app state.
+  const [created, setCreated] = useState<RemotePairCreated | null>(null);
+  const [push, setPush] = useState<RemotePushStatus | null>(null);
+  const [pushForm, setPushForm] = useState({ webPush: true, vapidSubject: "", projectId: "", serviceAccount: "", includeDetail: false });
+  // Edits in progress, keyed by device. Applied only on Save, so a mis-click
+  // on a checkbox never grants a camera.
+  const [grantDraft, setGrantDraft] = useState<Record<string, string[]>>({});
 
   // Absent on an older daemon, which `backpressureOf` reads as accepting — a
   // signal this build cannot see must never become a refusal.
@@ -95,6 +155,7 @@ export function BackgroundAgentsPanel() {
     workspaceIds: [...new Set(pair.workspaceIds.split(",").map((value) => value.trim()).filter(Boolean))],
     maxArtifactBytes: pair.maxArtifactBytes,
     mobileCapabilities: pair.mobileCapabilities,
+    deviceCapabilities: pair.deviceCapabilities,
   }), [pair]);
   const pairWarnings = useMemo(() => validateRemotePairRequest(pairRequest), [pairRequest]);
 
@@ -123,6 +184,16 @@ export function BackgroundAgentsPanel() {
   }
 
   const enabledActions = ["view-runs", "view-events", "read-artifacts", "approve", "cancel", "kill", "control-desktop"];
+  async function refreshDevices() {
+    await act("devices", remoteDeviceList, (value) => {
+      const rows = (value as { devices?: RemoteDeviceRow[] })?.devices ?? [];
+      setDeviceRows(rows);
+      setGrantDraft(Object.fromEntries(rows.map((row) => [row.device_id, row.granted.filter((capability) => (DEVICE_CAPABILITIES as readonly string[]).includes(capability))])));
+    });
+  }
+  async function refreshPush() {
+    await act("push status", remotePushStatus, (value) => setPush(value as RemotePushStatus));
+  }
   // Must stay in sync with `daemon_commands.rs`'s `allowed_mobile` list and
   // the CLI's `PairMobileCapability`.
   const MOBILE_CAPABILITIES = ["view-sessions", "chat", "view-tasks", "run-workflows", "capture"];
@@ -130,19 +201,31 @@ export function BackgroundAgentsPanel() {
 
   return (
     <section className="flex flex-col gap-4">
-      <div><h3 className="text-sm font-semibold text-foreground">Background agents and user-owned handoff</h3><p className="mt-1 text-xs leading-5 text-muted">The installed daemon is the authoritative engine for background, CLI, ACP, scheduler, and workflow runs. Remote control is opt-in and keeps inference, provider keys, tools, and repository access on your runner.</p></div>
+      <div><h3 className="text-sm font-semibold text-foreground">Background agents and user-owned handoff</h3><p className="mt-1 text-xs leading-5 text-muted">The resident execution service is part of Little Monkey&apos;s runtime, not an add-on: desktop chat runs on it, as do background, CLI, ACP, scheduler, and workflow runs. The app installs it, keeps it on the shipped build, and starts it at launch — this panel is for managing it afterwards. Remote control is opt-in and keeps inference, provider keys, tools, and repository access on your runner.</p></div>
       <Tabs tabs={[{ id: "daemon", label: "Service" }, { id: "queue", label: "Queue a run" }, { id: "remote", label: "Remote handoff" }]} active={tab} onChange={(id) => setTab(id as typeof tab)} />
 
       {tab === "daemon" && <>
         <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
           {[["Service", status?.serviceRunning ? "Running" : status?.installed ? "Stopped" : "Not installed"], ["Heartbeat", status?.heartbeatFresh ? "Healthy" : "Offline"], ["Active", status?.active ?? 0], ["Waiting approval", status?.waitingApproval ?? 0], ["Queued", status?.queued ?? 0], ["Paused", status?.paused ?? 0], ["PID", status?.pid ?? "—"], ["Kill switch", status?.killSwitch ? "Engaged" : "Released"], [t("BackgroundAgentsPanel.backpressureLabel"), backpressureStateLabel(t, backpressure.state)], [t("BackgroundAgentsPanel.backpressureQueueLabel"), `${backpressure.queueDepth}/${backpressure.queueCapacity || "—"}`]].map(([label, value]) => <div key={String(label)} className="rounded-lg border border-border bg-surface p-3"><p className="text-[11px] text-faint">{label}</p><p className="mt-1 text-sm font-medium text-foreground">{value}</p></div>)}
         </div>
+        {/* The same repair the app runs at launch and chat offers when a turn
+            cannot be routed: install if missing, republish and restart if the
+            service was left behind by a previous app version, start if
+            stopped, nothing if healthy. Always available, because "it is
+            installed and running" is exactly what an operator comes here to
+            re-establish. */}
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface p-3">
+          <Button variant="primary" disabled={busy !== null} onClick={() => void act("repair", daemonEnsure)}><Wrench size={14} /> Repair service</Button>
+          <p className="text-[11px] leading-4 text-muted">Restores the service to the version this app ships and starts it. Safe to run at any time — a healthy service is left untouched.</p>
+        </div>
         {!status?.installed ? <div className="rounded-lg border border-border bg-surface p-3">
-          <h4 className="text-xs font-semibold text-foreground">Install current-user service</h4>
+          <h4 className="text-xs font-semibold text-foreground">Install with custom limits</h4>
+          <p className="mt-1 text-[11px] leading-4 text-muted">Repair above installs with defaults. Use this only to choose concurrency, queue and retention up front.</p>
           <div className="mt-3 grid gap-2 sm:grid-cols-2"><label className="text-xs text-muted">Concurrency<input type="number" min={1} max={32} value={install.concurrency} onChange={(event) => setInstall({ ...install, concurrency: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Max queue<input type="number" min={1} value={install.maxQueue} onChange={(event) => setInstall({ ...install, maxQueue: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Retention days<input type="number" min={1} value={install.retentionDays} onChange={(event) => setInstall({ ...install, retentionDays: Number(event.target.value) })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label><label className="text-xs text-muted">Loopback webhook port (optional)<input value={install.webhookPort} onChange={(event) => setInstall({ ...install, webhookPort: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label></div>
           <label className="mt-3 flex gap-2 text-xs text-muted"><input type="checkbox" checked={install.notifications} onChange={(event) => setInstall({ ...install, notifications: event.target.checked })} /> Notifications</label>
           <Button className="mt-3" variant="primary" disabled={busy !== null} onClick={() => void act("install", () => daemonInstall({ concurrency: install.concurrency, maxQueue: install.maxQueue, retentionDays: install.retentionDays, webhookPort: install.webhookPort ? Number(install.webhookPort) : null, notifications: install.notifications }))}><Power size={14} /> Install service</Button>
         </div> : <div className="flex flex-wrap gap-2"><Button disabled={busy !== null || Boolean(status.serviceRunning)} onClick={() => void act("start", daemonStart)}><Play size={14} /> Start</Button><Button disabled={busy !== null || !status.serviceRunning} onClick={() => void act("stop", daemonStop)}><Square size={14} /> Stop safely</Button><Button variant={status.killSwitch ? "secondary" : "danger"} disabled={busy !== null} onClick={() => void act("kill switch", () => daemonKillSwitch(!status.killSwitch))}><ShieldAlert size={14} /> {status.killSwitch ? "Release kill switch" : "Engage kill switch"}</Button><Button variant="danger" disabled={busy !== null || status.serviceRunning} onClick={() => { if (window.confirm("Uninstall the current-user daemon service? Durable run history will be retained.")) void act("uninstall", () => daemonUninstall(false)); }}><Trash2 size={14} /> Uninstall service</Button><Button disabled={busy !== null} onClick={() => void act("triggers", daemonTriggers, setTriggers)}><RefreshCw size={14} /> Inspect triggers</Button></div>}
+        {status?.installed && <p className="text-[11px] leading-4 text-muted">Stopping the service also stops desktop chat, and the next app launch starts it again — the durable way to hold all work is the kill switch, which survives restarts and is honoured by every producer.</p>}
         {triggers !== null && <pre className="max-h-64 overflow-auto rounded-lg border border-border bg-surface p-3 text-[10px] text-muted">{JSON.stringify(triggers, null, 2)}</pre>}
       </>}
 
@@ -211,10 +294,175 @@ export function BackgroundAgentsPanel() {
               ))}
             </div>
           </div>
+          <div className="mt-3 rounded-md border border-border bg-background/40 p-2">
+            <p className="text-[11px] font-medium text-foreground">Device hardware grants</p>
+            <p className="mt-0.5 text-[10px] leading-4 text-faint">What this runner may ask the device&apos;s own hardware for. None of these is implied by any other, and a grant alone does nothing: the device must also support the capability and hold the matching operating-system permission. Leave them all off for a controller that only watches runs.</p>
+            <div className="mt-2 flex flex-wrap gap-3">
+              {DEVICE_CAPABILITIES.map((capability) => (
+                <label key={capability} className="flex gap-1 text-xs text-muted">
+                  <input
+                    type="checkbox"
+                    checked={pair.deviceCapabilities.includes(capability)}
+                    onChange={(event) => {
+                      const next = new Set(pair.deviceCapabilities);
+                      if (event.target.checked) {
+                        next.add(capability);
+                        // Mirrors the node's own rule: a continuous stream
+                        // cannot be the only microphone grant, or revoking
+                        // microphone capture would leave the microphone open.
+                        if (capability === "voice_stream") next.add("microphone_capture");
+                      } else {
+                        next.delete(capability);
+                        if (capability === "microphone_capture") next.delete("voice_stream");
+                      }
+                      setPair({ ...pair, deviceCapabilities: [...next] });
+                    }}
+                  /> {capability.replace(/_/g, " ")}
+                </label>
+              ))}
+            </div>
+          </div>
           {pairWarnings.map((warning) => <p key={warning} role="alert" className="mt-2 text-xs text-warning">{warning}</p>)}
-          <Button className="mt-3" disabled={pairWarnings.length > 0 || busy !== null} onClick={async () => { const output = await save({ defaultPath: "little-monkey-pairing.json", filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("pair invitation", () => remotePairCreate({ ...pairRequest, output })); }}><KeyRound size={14} /> Create invitation…</Button>
+          <Button className="mt-3" disabled={pairWarnings.length > 0 || busy !== null} onClick={async () => { const output = await save({ defaultPath: "little-monkey-pairing.json", filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("pair invitation", () => remotePairCreate({ ...pairRequest, output }), (value) => setCreated(value as RemotePairCreated)); }}><KeyRound size={14} /> Create invitation…</Button>
+          {/* The same one-time token in three forms, because the three ways to
+              get it onto a device are all legitimate: scan the code with a
+              camera, paste the short URI, or transfer the JSON file. The code
+              pins the certificate by SHA-256 fingerprint rather than carrying
+              the PEM — that is what makes it small enough to scan, and it is
+              the same value the full invitation is checked against. */}
+          {created && <div className="mt-3 rounded-md border border-border bg-background/40 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-[11px] font-medium text-foreground">Scan this on the device</p>
+                <p className="mt-0.5 text-[10px] leading-4 text-faint">One-time and expiring: it stops working once a device pairs with it or {new Date(created.expires_at_ms).toLocaleString()} passes, whichever comes first. The JSON invitation at {created.invitation_path} carries the same token — use whichever is easier to move.</p>
+              </div>
+              <Button size="sm" variant="ghost" onClick={() => setCreated(null)}>Hide code</Button>
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-3">
+              {/* A data-URI image rather than injected markup: this SVG is
+                  rendered by the node, and an <img> cannot execute anything a
+                  future change might put inside it. */}
+              <img
+                src={`data:image/svg+xml;base64,${btoa(created.qr_svg)}`}
+                alt={`Pairing code for ${created.controller_url}, ${created.qr_modules} modules square`}
+                width={196}
+                height={196}
+                className="rounded bg-white p-1"
+              />
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] text-faint">Or paste this into the controller&apos;s pairing field ({created.bootstrap_bytes} bytes):</p>
+                <p className="mt-1 break-all font-mono text-[10px] text-muted">{created.bootstrap_uri}</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button size="sm" onClick={() => void navigator.clipboard.writeText(created.bootstrap_uri).then(() => setNotice("Pairing code copied. It is one-time — paste it into the device now."))}>Copy code</Button>
+                  <Button size="sm" variant="ghost" onClick={() => void openUrl(created.controller_url)}>Open controller</Button>
+                </div>
+              </div>
+            </div>
+          </div>}
+        </div>
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="flex items-center justify-between"><h4 className="text-xs font-semibold text-foreground">Notifications to paired devices</h4><Button size="sm" disabled={busy !== null} onClick={() => void refreshPush()}><RefreshCw size={12} /> Refresh</Button></div>
+          {/* Everything here is the operator's own configuration. Little Monkey
+              ships no push project, no key and no relay, and there is nowhere
+              for a notification to go that this machine did not choose. */}
+          <p className="mt-1 text-[11px] leading-4 text-muted">A push wakes a device so it can reconnect; it grants nothing on its own — the woken device still makes an ordinary signed request. <strong>Web Push needs no account anywhere</strong>: this runner mints its own VAPID identity, keeps the private half in the system keychain, and seals each notification to the device before the browser&apos;s push service carries it. Firebase is for a native client holding its own registration token, against <em>your</em> project.</p>
+          {push === null ? <p className="mt-2 text-[11px] text-faint">Refresh to read this runner&apos;s push configuration.</p> : <>
+            <dl className="mt-2 grid gap-1 text-[11px] sm:grid-cols-2">
+              <div><dt className="text-faint">State</dt><dd className={push.enabled ? "text-foreground" : "text-muted"}>{!push.configured ? "not configured" : push.enabled ? `enabled · ${push.backend}` : `configured but off · ${push.backend}`}</dd></div>
+              <div><dt className="text-faint">Content on a lock screen</dt><dd className={push.include_detail ? "text-warning" : "text-muted"}>{push.include_detail ? "specifics included" : "withheld — kind and id only"}</dd></div>
+              <div><dt className="text-faint">Registered devices</dt><dd className="text-muted">{push.registered_devices.length === 0 ? "none" : push.registered_devices.map((entry) => `${entry.device_id} (${entry.backend})`).join(", ")}</dd></div>
+              <div><dt className="text-faint">Application server key</dt><dd className="break-all font-mono text-[10px] text-faint">{push.application_server_key ? `${push.application_server_key.slice(0, 24)}…` : "none — the browser is offered no key"}</dd></div>
+            </dl>
+            {push.registered_devices.length > 0 && <div className="mt-2 flex flex-wrap gap-2">
+              {push.registered_devices.map((entry) => <Button key={entry.device_id} size="sm" disabled={busy !== null || !push.enabled} onClick={() => void act("push test", () => remotePushTest(entry.device_id))}>Test push to {entry.device_id}</Button>)}
+            </div>}
+          </>}
+          <div className="mt-3 rounded-md border border-border bg-background/40 p-2">
+            <div className="flex flex-wrap gap-4 text-xs text-muted">
+              <label className="flex gap-2"><input type="radio" name="pushBackend" checked={pushForm.webPush} onChange={() => setPushForm({ ...pushForm, webPush: true })} /> Web Push (no account)</label>
+              <label className="flex gap-2"><input type="radio" name="pushBackend" checked={!pushForm.webPush} onChange={() => setPushForm({ ...pushForm, webPush: false })} /> Your own Firebase project</label>
+            </div>
+            {pushForm.webPush
+              ? <label className="mt-2 block text-xs text-muted">Contact for your push service (optional)<input value={pushForm.vapidSubject} placeholder="mailto:you@example.com — defaults to this runner&apos;s advertised URL" onChange={(event) => setPushForm({ ...pushForm, vapidSubject: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label>
+              : <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                <label className="text-xs text-muted">Firebase project ID<input value={pushForm.projectId} onChange={(event) => setPushForm({ ...pushForm, projectId: event.target.value })} className="mt-1 w-full rounded-md border border-border bg-background p-2" /></label>
+                <div className="flex items-end gap-2"><Button size="sm" onClick={async () => { const path = await open({ multiple: false, directory: false, filters: [{ name: "JSON", extensions: ["json"] }] }); if (typeof path === "string") setPushForm({ ...pushForm, serviceAccount: path }); }}>Service account key…</Button><span className="max-w-[12rem] truncate text-[10px] text-faint">{pushForm.serviceAccount || "None"}</span></div>
+              </div>}
+            <label className="mt-2 flex gap-2 text-xs text-muted"><input type="checkbox" checked={pushForm.includeDetail} onChange={(event) => setPushForm({ ...pushForm, includeDetail: event.target.checked })} /> Let notifications carry run and message specifics onto a lock screen</label>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="primary" disabled={busy !== null || (!pushForm.webPush && (!pushForm.projectId || !pushForm.serviceAccount))} onClick={() => { if (window.confirm(pushForm.includeDetail ? "Turn on push with specifics on the lock screen of every registered device?" : "Turn on push? Notifications will say what kind of thing happened, never what it said.")) void act("push configure", () => remotePushConfigure({ webPush: pushForm.webPush, vapidSubject: pushForm.vapidSubject || null, projectId: pushForm.projectId || null, serviceAccount: pushForm.serviceAccount || null, includeDetail: pushForm.includeDetail }), () => void refreshPush()); }}>Save push settings</Button>
+              <Button size="sm" variant="danger" disabled={busy !== null || !push?.enabled} onClick={() => { if (window.confirm("Stop sending notifications? Devices will only see updates while the controller is open.")) void act("push disable", remotePushDisable, () => void refreshPush()); }}>Turn off</Button>
+            </div>
+          </div>
         </div>
         <div className="rounded-lg border border-border bg-surface p-3"><div className="flex flex-wrap gap-2"><Button size="sm" onClick={() => void act("devices", remotePairList, (value) => setDevices(String(value)))}>List devices</Button><input placeholder="Device ID" value={deviceId} onChange={(event) => setDeviceId(event.target.value)} className="rounded-md border border-border bg-background px-2 text-xs" /><Button size="sm" variant="danger" disabled={!deviceId} onClick={() => { if (window.confirm(`Revoke ${deviceId} immediately?`)) void act("revoke", () => remotePairRevoke(deviceId, "revoked from desktop")); }}><Ban size={12} /> Revoke</Button><Button size="sm" disabled={!deviceId} onClick={async () => { const output = await save({ defaultPath: `${deviceId}-rotation.json`, filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("rotate", () => remotePairRotate(deviceId, output)); }}><RotateCw size={12} /> Rotate key</Button><Button size="sm" onClick={() => void act("audit", () => remoteAudit(100), setAudit)}>Audit</Button></div>{devices && <pre className="mt-2 whitespace-pre-wrap rounded-md bg-background p-2 text-[10px] text-muted">{devices}</pre>}{audit !== null && <pre className="mt-2 max-h-52 overflow-auto rounded-md bg-background p-2 text-[10px] text-muted">{JSON.stringify(audit, null, 2)}</pre>}</div>
+        <div className="rounded-lg border border-border bg-surface p-3">
+          <div className="flex items-center justify-between"><h4 className="flex items-center gap-1 text-xs font-semibold text-foreground"><Smartphone size={13} /> Paired devices</h4><Button size="sm" disabled={busy !== null} onClick={() => void refreshDevices()}><RefreshCw size={12} /> Refresh</Button></div>
+          <p className="mt-1 text-[11px] leading-4 text-muted">An action needs all four: Little Monkey must have granted it, the device build must support it, the device&apos;s operating system must permit it, and the device must be ready right now. Anything not <em>Effective</em> is refused with the one reason that applies, and <em>Supported</em> on its own is not availability.</p>
+          {deviceRows === null ? <p className="mt-2 text-[11px] text-faint">Refresh to list paired devices.</p>
+            : deviceRows.length === 0 ? <p className="mt-2 text-[11px] text-faint">No devices are paired with this runner.</p>
+            : <ul className="mt-2 space-y-2">
+              {deviceRows.map((row) => {
+                const draft = grantDraft[row.device_id] ?? [];
+                const changed = [...draft].sort().join(",") !== [...row.granted.filter((capability) => (DEVICE_CAPABILITIES as readonly string[]).includes(capability))].sort().join(",");
+                // "Online" is a claim with a shelf life: a surface report older
+                // than five minutes is reported as a last-seen time rather than
+                // as presence, measured against the daemon's clock.
+                const seenAgoMs = row.last_seen_at_ms === null ? null : row.now_ms - row.last_seen_at_ms;
+                const online = seenAgoMs !== null && seenAgoMs < 5 * 60_000;
+                const pending = row.recent_commands.filter((command) => ["queued", "leased", "running"].includes(command.state));
+                return <li key={row.device_id} className="rounded-md border border-border bg-background p-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-foreground">{row.device_name}{row.revoked && <span className="ml-2 text-danger">revoked</span>}</span>
+                    <span className="text-[10px] text-faint">{online ? "online" : row.last_seen_at_ms === null ? "never reported" : `last seen ${new Date(row.last_seen_at_ms).toLocaleString()}`}</span>
+                  </div>
+                  <p className="mt-0.5 font-mono text-[10px] text-faint">{row.device_id} · {row.platform ?? "unknown platform"} {row.platform_version ?? ""} · app {row.app_version ?? "?"} · key generation {row.secret_generation}</p>
+                  <dl className="mt-2 grid gap-1 text-[11px] sm:grid-cols-2">
+                    <div><dt className="text-faint">Little Monkey granted</dt><dd className="text-muted">{row.granted.join(", ") || "none"}</dd></div>
+                    <div><dt className="text-faint">Device supports</dt><dd className="text-muted">{row.advertised === null ? "not reported yet" : row.advertised.join(", ") || "none"}</dd></div>
+                    <div><dt className="text-faint">OS permits</dt><dd className="text-muted">{row.os_permissions === null ? "not reported yet" : Object.entries(row.os_permissions).map(([capability, permission]) => `${capability}=${permission}`).join(", ") || "none"}</dd></div>
+                    <div><dt className="text-faint">Effective</dt><dd className="text-foreground">{row.effective.join(", ") || "none"}</dd></div>
+                  </dl>
+                  {/* The four axes per capability, never collapsed: a camera
+                      that is granted, supported and denied by the OS needs a
+                      different action from one waiting to be brought to the
+                      foreground, and one line cannot say which. */}
+                  {row.physical.filter((entry) => entry.granted).length > 0 && <ul className="mt-2 space-y-1">
+                    {row.physical.filter((entry) => entry.granted).map((entry) => <li key={entry.capability} className="rounded-md border border-border px-2 py-1 text-[11px]">
+                      <span className="text-foreground">{entry.capability.replace(/_/g, " ")}</span>
+                      <span className="ml-2 text-muted">Granted: yes · Supported: {entry.supported ? "yes" : "no"} · Permission: {PERMISSION_WORDS[entry.permission ?? ""] ?? entry.permission ?? "not reported"} · Readiness: {READINESS_WORDS[entry.readiness ?? ""] ?? entry.readiness ?? "not reported"} · Effective: {entry.effective ? "yes" : "no"}</span>
+                      {entry.reason && <p className="mt-0.5 text-[10px] leading-4 text-faint">{entry.reason}</p>}
+                    </li>)}
+                  </ul>}
+                  {!row.revoked && <div className="mt-2 rounded-md border border-border p-2">
+                    <p className="text-[10px] text-faint">Hardware grants (run access stays exactly as it was paired)</p>
+                    <div className="mt-1 flex flex-wrap gap-3">
+                      {DEVICE_CAPABILITIES.map((capability) => <label key={capability} className="flex gap-1 text-[11px] text-muted">
+                        <input type="checkbox" checked={draft.includes(capability)} onChange={(event) => {
+                          const next = new Set(draft);
+                          if (event.target.checked) { next.add(capability); if (capability === "voice_stream") next.add("microphone_capture"); }
+                          else { next.delete(capability); if (capability === "microphone_capture") next.delete("voice_stream"); }
+                          setGrantDraft({ ...grantDraft, [row.device_id]: [...next] });
+                        }} /> {capability.replace(/_/g, " ")}
+                      </label>)}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <Button size="sm" disabled={!changed || busy !== null} onClick={() => { if (window.confirm(`Set ${row.device_name}'s hardware grants to: ${draft.join(", ") || "none"}?`)) void act("grant", () => remoteDeviceGrant(row.device_id, draft), () => void refreshDevices()); }}>Save grants</Button>
+                      <Button size="sm" variant="danger" disabled={busy !== null} onClick={() => { if (window.confirm(`Revoke ${row.device_name} immediately? Its key stops working at once and any live session is force-stopped.`)) void act("revoke", () => remotePairRevoke(row.device_id, "revoked from desktop"), () => void refreshDevices()); }}><Ban size={12} /> Revoke device</Button>
+                      <Button size="sm" disabled={busy !== null} onClick={async () => { const output = await save({ defaultPath: `${row.device_id}-rotation.json`, filters: [{ name: "JSON", extensions: ["json"] }] }); if (output) void act("rotate", () => remotePairRotate(row.device_id, output)); }}><RotateCw size={12} /> Rotate key</Button>
+                    </div>
+                  </div>}
+                  {row.recent_commands.length > 0 && <ul className="mt-2 space-y-1">
+                    {row.recent_commands.map((command) => <li key={command.command_id} className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                      <span className="text-muted">{command.capability.replace(/_/g, " ")} · <span className="text-foreground">{commandStateWord(command)}</span>{command.error && <span className="text-faint"> — {command.error}</span>}</span>
+                      {["queued", "leased", "running"].includes(command.state) && <Button size="sm" variant="danger" disabled={busy !== null} onClick={() => { if (window.confirm(command.state === "running" ? "This command has already started on the device. Cancelling stops what has not happened yet; anything already captured stays captured. Continue?" : "Cancel this queued command?")) void act("cancel command", () => remoteDeviceCancel(command.command_id), () => void refreshDevices()); }}>Cancel</Button>}
+                    </li>)}
+                  </ul>}
+                  {pending.length > 0 && <p className="mt-1 text-[10px] text-warning">{pending.length} command(s) waiting on this device.</p>}
+                </li>;
+              })}
+            </ul>}
+        </div>
         <div className="rounded-lg border border-border bg-surface p-3">
           <div className="flex items-center justify-between"><h4 className="text-xs font-semibold text-foreground">Remote desktop-control sessions</h4><Button size="sm" onClick={() => void refreshRuns()}><RefreshCw size={12} /> Refresh</Button></div>
           <p className="mt-1 text-[11px] leading-4 text-muted">Every remote desktop-control session is recorded here with start, periodic, and stop screenshots as tamper-evident evidence. Control requires local on-screen consent on this runner, and can be stopped instantly with <code>monkey daemon desktop-control emergency-stop</code>, the kill switch, or revoking the device.</p>

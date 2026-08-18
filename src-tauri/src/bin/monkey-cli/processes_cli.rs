@@ -16,7 +16,7 @@ use std::path::Path;
 
 use clap::Subcommand;
 use little_monkey_lib::process_table::{
-    ProcessFilter, ProcessKind, ProcessRecord, ProcessSignal, DEFAULT_LIST_LIMIT,
+    ProcessFilter, ProcessKind, ProcessLimitKind, ProcessRecord, ProcessSignal, DEFAULT_LIST_LIMIT,
 };
 use little_monkey_lib::run_ledger::RunLedger;
 
@@ -76,6 +76,19 @@ pub enum ProcessesCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print who enforces each declared limit, and why nobody does for the rest.
+    ///
+    /// The counterpart to `signals`, for the other half of what a process row
+    /// claims. A `ProcessLimits` field is a declaration, and this says whether
+    /// anything reads it: `enforced` means the owner reads this row's field and
+    /// a caller-supplied value takes effect, `owner-sourced` means a real bound
+    /// exists but its number comes from a recipe, a workflow definition or the
+    /// owner's own settings, and `unavailable` names the mechanism that is
+    /// missing.
+    Limits {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
@@ -83,6 +96,9 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
     // machine where the app has never run.
     if let ProcessesCmd::Signals { json } = action {
         return print_signal_matrix(*json);
+    }
+    if let ProcessesCmd::Limits { json } = action {
+        return print_limit_matrix(*json);
     }
 
     let path = data_dir.join(LEDGER_FILE);
@@ -150,7 +166,9 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             }
             Ok(())
         }
-        ProcessesCmd::Signals { .. } => unreachable!("handled before the ledger is opened"),
+        ProcessesCmd::Signals { .. } | ProcessesCmd::Limits { .. } => {
+            unreachable!("handled before the ledger is opened")
+        }
         ProcessesCmd::Signal {
             process_id,
             signal,
@@ -203,6 +221,94 @@ pub fn run(action: &ProcessesCmd, data_dir: &Path) -> Result<(), String> {
             }
             Ok(())
         }
+    }
+}
+
+/// Prints who enforces each declared limit for each kind, and why nobody does
+/// for the rest.
+///
+/// The `unavailable` rows are the useful half, the same way refusals are in the
+/// signal matrix: they say which mechanism is missing rather than leaving a
+/// reader to infer that an absent number means an absent bound.
+fn print_limit_matrix(json: bool) -> Result<(), String> {
+    if json {
+        let rows: Vec<serde_json::Value> = ProcessKind::ALL
+            .iter()
+            .flat_map(|kind| {
+                ProcessLimitKind::ALL.iter().map(move |limit| {
+                    let support = kind.limit_support(*limit);
+                    serde_json::json!({
+                        "kind": kind.as_str(),
+                        "limit": limit.as_str(),
+                        "status": support.status(),
+                        "honoursCallerValue": support.honours_caller_value(),
+                        "detail": support.detail(),
+                    })
+                })
+            })
+            .collect();
+        return print_json(&rows);
+    }
+
+    println!(
+        "{:<18} {:<20} {:<14} {}",
+        "KIND", "LIMIT", "STATUS", "DETAIL"
+    );
+    for kind in ProcessKind::ALL {
+        for limit in ProcessLimitKind::ALL {
+            let support = kind.limit_support(*limit);
+            println!(
+                "{:<18} {:<20} {:<14} {}",
+                kind.as_str(),
+                limit.as_str(),
+                support.status(),
+                support.detail()
+            );
+        }
+    }
+    println!();
+    println!(
+        "enforced      = the owner reads this row's field; a value you set takes effect\n\
+         owner-sourced = a real bound, but its number comes from the owner, not from you\n\
+         unavailable   = nothing enforces it for this kind; the detail names what is missing"
+    );
+    println!();
+    print_host_enforcement();
+    Ok(())
+}
+
+/// What this *host* would actually hold a native workload with, right now.
+///
+/// The matrix above is static — it answers on a machine where the app has never
+/// run, which is what makes it a contract. This is the other half: whether that
+/// contract is met here by the kernel or by a supervisor, which depends on the
+/// machine (a Linux box with no delegated cgroup falls back, and says so). Two
+/// questions, so two blocks, rather than one table that would be wrong about one
+/// of them.
+fn print_host_enforcement() {
+    use little_monkey_lib::resource_control::{probe_limits, ResourceController};
+
+    // Asked with the bounds a real workload carries, never with an empty set: a
+    // backend installs only what it was asked for, so a cgroup scope with nothing
+    // to enforce declines and this would report the supervisor on a machine whose
+    // every shell runs under `memory.max`. See `resource_control::probe_limits`.
+    let capabilities = ResourceController::new(probe_limits()).capabilities();
+    println!("this host: {}", capabilities.backend);
+    println!("tree owned by: {}", capabilities.tree_primitive);
+    for limit in ProcessLimitKind::ALL {
+        let capability = capabilities.for_limit(*limit);
+        let (status, detail) = match capability {
+            little_monkey_lib::resource_control::LimitCapability::Enforced { level, mechanism } => {
+                (level.as_str().to_string(), mechanism.clone())
+            }
+            little_monkey_lib::resource_control::LimitCapability::NotApplicable { reason } => {
+                ("not-applicable".to_string(), reason.clone())
+            }
+            little_monkey_lib::resource_control::LimitCapability::Unavailable { reason } => {
+                ("unavailable".to_string(), reason.clone())
+            }
+        };
+        println!("  {:<20} {:<14} {detail}", limit.as_str(), status);
     }
 }
 
@@ -278,10 +384,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<(), String> {
 
 fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
     if records.is_empty() {
-        println!(
-            "no {}agent processes",
-            if live_only { "live " } else { "" }
-        );
+        println!("no {}agent processes", if live_only { "live " } else { "" });
         return;
     }
     println!(
@@ -307,28 +410,62 @@ fn print_table(records: &[ProcessRecord], live_only: bool, limit: u32) {
         );
     }
     if records.len() as u32 >= limit {
-        println!(
-            "\n(showing {limit} rows — pass --limit to widen; listings are always bounded)"
-        );
+        println!("\n(showing {limit} rows — pass --limit to widen; listings are always bounded)");
     }
 }
 
-fn print_detail(record: &ProcessRecord) {
-    println!("process      {}", record.process_id);
-    println!("kind         {}", record.kind.as_str());
-    println!("state        {}", record.state.as_str());
-    println!("external id  {}", record.external_id);
-    println!(
+/// Wall time a reader can act on: elapsed for a live process, final for a
+/// finished one.
+///
+/// `None` only where the process never started — reporting a running process's
+/// wall as unmeasured is the report refusing a question it can answer.
+fn elapsed_ms(record: &ProcessRecord) -> Option<i64> {
+    let started = record.started_at_ms?;
+    match record.exited_at_ms {
+        Some(exited) => Some(exited - started),
+        None => {
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis(),
+            )
+            .ok()?;
+            Some(now - started)
+        }
+    }
+}
+
+/// The detail block, as text.
+///
+/// Built into a `String` rather than printed as it goes, so a test can assert
+/// what a reader is told. The part worth asserting is new: which mechanism
+/// actually held this process, and what it was measured holding — both read off
+/// the row rather than recomputed on the machine running the command.
+fn detail_text(record: &ProcessRecord) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    macro_rules! line {
+        ($($arg:tt)*) => {{
+            let _ = writeln!(out, $($arg)*);
+        }};
+    }
+
+    line!("process      {}", record.process_id);
+    line!("kind         {}", record.kind.as_str());
+    line!("state        {}", record.state.as_str());
+    line!("external id  {}", record.external_id);
+    line!(
         "parent       {}",
         record.parent_process_id.as_deref().unwrap_or("-")
     );
-    println!("run          {}", record.run_id.as_deref().unwrap_or("-"));
-    println!(
+    line!("run          {}", record.run_id.as_deref().unwrap_or("-"));
+    line!(
         "workspace    {}",
         record.workspace.as_deref().unwrap_or("-")
     );
-    println!("profile      {}", record.profile.as_deref().unwrap_or("-"));
-    println!(
+    line!("profile      {}", record.profile.as_deref().unwrap_or("-"));
+    line!(
         "native pid   {}",
         record
             .native_pid
@@ -336,34 +473,150 @@ fn print_detail(record: &ProcessRecord) {
             .unwrap_or_else(|| "-".to_string())
     );
     if record.limits.is_unbounded() {
-        println!("limits       none declared");
+        line!("limits       none declared");
     } else {
-        println!(
-            "limits       wall={} memory={} output={} children={}",
-            option_or_dash(record.limits.max_wall_ms),
-            option_or_dash(record.limits.max_memory_bytes),
-            option_or_dash(record.limits.max_output_bytes),
-            option_or_dash(record.limits.max_child_processes),
-        );
+        // Each limit with the mechanism that holds it, because the number alone
+        // does not say whether anything is holding it. A reader auditing what
+        // this app promised needs "4 GiB · enforced · Windows job object", not
+        // "4 GiB" — the second is true of a bound nobody reads too.
+        line!("limits");
+        for (limit, value) in [
+            (ProcessLimitKind::Wall, record.limits.max_wall_ms),
+            (ProcessLimitKind::Memory, record.limits.max_memory_bytes),
+            (ProcessLimitKind::Output, record.limits.max_output_bytes),
+            (
+                ProcessLimitKind::ChildProcesses,
+                record.limits.max_child_processes.map(u64::from),
+            ),
+            (
+                ProcessLimitKind::ContextTokens,
+                record.limits.max_context_tokens,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            let support = record.kind.limit_support(limit);
+            line!(
+                "  {:<20} {:<16} {:<14} {}",
+                limit.as_str(),
+                value,
+                support.status(),
+                support.detail()
+            );
+            // What *this* process ran under, from its own row — never from a
+            // controller built on the machine reading it, which is a different
+            // question and was for a long time silently given as the answer to
+            // this one.
+            if let Some(capability) = record
+                .containment
+                .as_ref()
+                .and_then(|containment| containment.for_limit(limit))
+            {
+                let (level, detail) = match capability {
+                    little_monkey_lib::resource_control::LimitCapability::Enforced {
+                        level,
+                        mechanism,
+                    } => (level.as_str(), mechanism.as_str()),
+                    little_monkey_lib::resource_control::LimitCapability::NotApplicable {
+                        reason,
+                    } => ("not-applicable", reason.as_str()),
+                    little_monkey_lib::resource_control::LimitCapability::Unavailable {
+                        reason,
+                    } => ("unavailable", reason.as_str()),
+                };
+                line!("  {:<20} {:<16} {:<14} {}", "", "held by", level, detail);
+            }
+        }
+    }
+    // The mechanism that actually enforced this process, and the durable handle a
+    // later session could reclaim it by. Absent on a row written before either was
+    // recorded, which is reported as the gap it is rather than filled in.
+    match &record.containment {
+        Some(containment) => {
+            line!("backend      {}", containment.backend);
+            line!("tree         {}", containment.tree_primitive);
+            line!(
+                "scope        {}",
+                containment.scope.as_deref().unwrap_or("-")
+            );
+        }
+        None => line!("backend      not recorded for this process"),
+    }
+    // What it was last measured holding. Current and peak both, because a process
+    // now sitting idle is exactly the case where only the peak says whether a
+    // limit was nearly hit.
+    match &record.usage {
+        Some(usage) => {
+            let render = |value: Option<u64>| {
+                value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
+            };
+            line!("usage");
+            for (name, current, peak) in [
+                ("rss_bytes", usage.rss_bytes, usage.peak_rss_bytes),
+                (
+                    "process_count",
+                    usage.process_count.map(u64::from),
+                    usage.peak_process_count.map(u64::from),
+                ),
+            ] {
+                line!(
+                    "  {:<20} current={:<16} peak={}",
+                    name,
+                    render(current),
+                    render(peak)
+                );
+            }
+            // One number: retained output has no separate high-water mark, and
+            // printing the same figure twice invites a reader to look for a
+            // difference that cannot exist.
+            line!(
+                "  {:<20} {}",
+                "output_bytes",
+                usage
+                    .output_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
+            );
+            line!(
+                "  {:<20} {}",
+                "wall_ms",
+                elapsed_ms(record)
+                    .map(|elapsed| elapsed.to_string())
+                    .unwrap_or_else(|| "not measured".to_string())
+            );
+        }
+        None => line!("usage        nothing sampled this process"),
     }
     match &record.exit {
-        Some(exit) => println!(
-            "exit         {} code={} signal={} reason={}",
-            exit.status.as_str(),
-            exit.code
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            exit.signal.as_deref().unwrap_or("-"),
-            exit.reason.as_deref().unwrap_or("-"),
-        ),
-        None => println!("exit         -"),
+        Some(exit) => {
+            line!(
+                "exit         {} code={} signal={} reason={}",
+                exit.status.as_str(),
+                exit.code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                exit.signal.as_deref().unwrap_or("-"),
+                exit.reason.as_deref().unwrap_or("-"),
+            );
+            // The typed breach, when a resource controller made the kill. Printed
+            // as its own block rather than folded into the reason: the two
+            // numbers beside each other are what tell a reader whether the budget
+            // was wrong or the workload was.
+            if let Some(breach) = &exit.breach {
+                line!("limit fired  {}", breach.limit);
+                line!("  configured {}", breach.configured);
+                line!("  observed   {}", breach.observed);
+                line!("  enforced by {} ({})", breach.backend, breach.level);
+            }
+        }
+        None => line!("exit         -"),
     }
+    out
 }
 
-fn option_or_dash<T: std::fmt::Display>(value: Option<T>) -> String {
-    value
-        .map(|inner| inner.to_string())
-        .unwrap_or_else(|| "-".to_string())
+fn print_detail(record: &ProcessRecord) {
+    print!("{}", detail_text(record));
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -399,6 +652,131 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `monkey processes show` must tell a reader what actually held this
+    /// process, and what it was measured holding.
+    ///
+    /// Both come off the row. The mechanism used to be recomputed on whichever
+    /// machine ran the command, so a workload the Linux kernel had held printed
+    /// `supervisor` on a Mac — this test runs on all three platform legs and
+    /// asserts the row's own answer survives every one of them.
+    #[test]
+    fn processes_show_names_the_mechanism_that_held_this_process_and_what_it_held() {
+        use little_monkey_lib::process_table::{ProcessState, SignalIntent};
+        use little_monkey_lib::resource_control::{
+            Containment, EnforcementLevel, LimitCapability, RecordedUsage,
+        };
+
+        let record = ProcessRecord {
+            process_id: "fgsh-show".to_string(),
+            parent_process_id: None,
+            kind: ProcessKind::ForegroundShell,
+            external_id: "ext".to_string(),
+            state: ProcessState::Running,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: Some(4242),
+            native_start_time: Some(99),
+            limits: ProcessKind::ForegroundShell.default_limits(),
+            containment: Some(Containment {
+                backend: "cgroup v2".to_string(),
+                tree_primitive: "cgroup v2 scope at /sys/fs/cgroup/little-monkey-abc".to_string(),
+                scope: Some("cgroup2:/sys/fs/cgroup/little-monkey-abc".to_string()),
+                enforcement: [(
+                    ProcessLimitKind::Memory.as_str().to_string(),
+                    LimitCapability::Enforced {
+                        level: EnforcementLevel::Kernel,
+                        mechanism: "cgroup v2 `memory.max`".to_string(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            supervised_session_id: None,
+            native_boot_marker: None,
+            usage: Some(RecordedUsage {
+                rss_bytes: Some(2_000),
+                peak_rss_bytes: Some(6_000),
+                process_count: Some(3),
+                peak_process_count: Some(41),
+                output_bytes: Some(1_700),
+            }),
+            usage_sampled_at_ms: Some(1_800_000_000_000),
+            signal_intent: SignalIntent::default(),
+            signal_reason: None,
+            signal_requested_at_ms: None,
+            exit: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            exited_at_ms: None,
+        };
+
+        let text = detail_text(&record);
+        assert!(text.contains("backend      cgroup v2"), "{text}");
+        assert!(
+            text.contains("scope        cgroup2:/sys/fs/cgroup/little-monkey-abc"),
+            "{text}"
+        );
+        // The named mechanism, beside the limit it holds — a level alone would
+        // not tell a reader what to go and look at.
+        assert!(text.contains("cgroup v2 `memory.max`"), "{text}");
+        assert!(text.contains("held by"), "{text}");
+        // Current and peak, separately: a process now idle at 2 KB that peaked
+        // at 6 KB is the case where only the second number says anything.
+        assert!(text.contains("current=2000"), "{text}");
+        assert!(text.contains("peak=6000"), "{text}");
+        assert!(text.contains("current=3"), "{text}");
+        assert!(text.contains("peak=41"), "{text}");
+        // And a live process's wall time is answerable, which is the measurement
+        // that used to be reported as unavailable for not being final.
+        assert!(text.contains("wall_ms"), "{text}");
+    }
+
+    /// A row that recorded no mechanism says so, rather than being handed a
+    /// plausible one by whichever machine is reading it.
+    #[test]
+    fn processes_show_refuses_to_invent_a_mechanism_it_was_never_told() {
+        use little_monkey_lib::process_table::{ProcessState, SignalIntent};
+
+        let record = ProcessRecord {
+            process_id: "turn-show".to_string(),
+            parent_process_id: None,
+            kind: ProcessKind::ChatTurn,
+            external_id: "ext".to_string(),
+            state: ProcessState::Running,
+            run_id: None,
+            workspace: None,
+            profile: None,
+            native_pid: None,
+            native_start_time: None,
+            limits: ProcessKind::ChatTurn.default_limits(),
+            containment: None,
+            supervised_session_id: None,
+            native_boot_marker: None,
+            usage: None,
+            usage_sampled_at_ms: None,
+            signal_intent: SignalIntent::default(),
+            signal_reason: None,
+            signal_requested_at_ms: None,
+            exit: None,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            started_at_ms: Some(1_000),
+            exited_at_ms: None,
+        };
+
+        let text = detail_text(&record);
+        assert!(
+            text.contains("backend      not recorded for this process"),
+            "{text}"
+        );
+        assert!(
+            text.contains("usage        nothing sampled this process"),
+            "{text}"
+        );
     }
 
     #[test]

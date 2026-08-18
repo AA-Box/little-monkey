@@ -28,6 +28,10 @@ use uuid::Uuid;
 #[cfg(unix)]
 use walkdir::WalkDir;
 
+use crate::executable_extensions::{
+    extension_security_snapshots, CapabilityKind, ExtensionSecuritySnapshot, HealthState,
+    PermissionKind, PermissionRisk, TrustState,
+};
 use crate::sandbox::SandboxEnforcement;
 
 pub const SECURITY_AUDIT_SCHEMA_VERSION: u32 = 1;
@@ -79,6 +83,147 @@ pub struct SecurityAuditReport {
     pub findings: Vec<SecurityFinding>,
 }
 
+/// One paired physical device, as the runner's own state describes it.
+///
+/// Passed in rather than read here: the queue and the grants live in the
+/// daemon's SQLite database, whose schema `monkey-cli` owns. A second reader in
+/// this library would be a second copy of that schema, and the first migration
+/// would make the audit quietly wrong. The CLI, which already owns the store,
+/// collects this and hands it over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceGrantSnapshot {
+    pub device_id: String,
+    pub device_name: String,
+    /// Physical capabilities the operator granted, as wire tokens.
+    pub granted_physical: Vec<String>,
+    /// Of those, the ones currently effective.
+    pub effective_physical: Vec<String>,
+    pub revoked: bool,
+    /// When the device last reported its surface, if ever.
+    pub last_seen_at_ms: Option<u64>,
+    /// Whether this device can be woken by push.
+    pub push_registered: bool,
+}
+
+/// One device command that has not finished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceCommandSnapshot {
+    pub command_id: String,
+    pub device_id: String,
+    pub capability: String,
+    pub state: String,
+}
+
+/// The operator's push configuration, reduced to what the audit asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushPrivacySnapshot {
+    pub configured: bool,
+    pub enabled: bool,
+    /// True when notifications are allowed to carry specifics onto a lock
+    /// screen.
+    pub include_detail: bool,
+    pub registered_devices: usize,
+}
+
+/// The operator's voice configuration, reduced to the three questions the audit
+/// asks: is anything listening without being asked, is it opt-in, and could
+/// what it hears leave the machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoicePrivacySnapshot {
+    pub wake_phrase_enabled: bool,
+    pub always_listening: bool,
+    /// True when transcription runs on this machine. False means audio is
+    /// uploaded to a provider the operator configured.
+    pub local_only: bool,
+}
+
+/// Everything about the machine's security posture that only the daemon can
+/// see, as one value.
+///
+/// # Why this type exists at all
+///
+/// Three subsystems — paired devices, messaging accounts, phone numbers and
+/// peers — keep their state in databases whose schemas `monkey-cli` owns, and
+/// [`run_security_audit`] runs in this library, which cannot open them. The CLI
+/// therefore collected that half itself and appended it to its own report,
+/// which meant `monkey security audit` and the desktop Security Doctor were
+/// answering different questions: the desktop panel saw no device, no channel,
+/// no number and no peer, and said so by omission rather than by saying
+/// anything. An operator reading a clean page had no way to know a whole class
+/// of check had not run.
+///
+/// So the daemon-owned half became a value with a wire form. The CLI produces
+/// it in one place (`monkey security daemon-state --json`), the desktop reads
+/// exactly that, and both then run the same audit over the same inputs. Adding
+/// a daemon-owned check now reaches both surfaces or neither.
+///
+/// # Findings, not just inputs
+///
+/// Two kinds of thing travel here and they are deliberately not merged. The
+/// snapshot fields are *inputs* the library's own audit functions reason about.
+/// `findings` are already-decided results from the audits that live in the CLI
+/// because their state does. Asking the library to re-derive those would mean
+/// teaching it the schemas this type exists to avoid teaching it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonSecurityState {
+    pub schema_version: u32,
+    pub devices: Vec<DeviceGrantSnapshot>,
+    #[serde(default)]
+    pub device_commands: Vec<DeviceCommandSnapshot>,
+    pub device_state_observed: bool,
+    #[serde(default)]
+    pub device_state_error: Option<String>,
+    #[serde(default)]
+    pub push: Option<PushPrivacySnapshot>,
+    #[serde(default)]
+    pub transport: Option<TransportSnapshot>,
+    /// Findings the daemon's own audits produced: channels, telephony, peers.
+    #[serde(default)]
+    pub findings: Vec<SecurityFinding>,
+}
+
+impl DaemonSecurityState {
+    /// Fold the input half into a runtime snapshot, and hand back the findings.
+    ///
+    /// Returns the findings rather than swallowing them so the caller decides
+    /// when they join the report — they must be appended *after*
+    /// [`run_security_audit`] has produced its summary, and
+    /// [`append_findings`] is what keeps that summary honest.
+    #[must_use]
+    pub fn apply(self, runtime: &mut SecurityRuntimeSnapshot) -> Vec<SecurityFinding> {
+        runtime.devices = self.devices;
+        runtime.device_commands = self.device_commands;
+        runtime.device_state_observed = self.device_state_observed;
+        runtime.device_state_error = self.device_state_error;
+        runtime.push = self.push;
+        runtime.transport = self.transport;
+        self.findings
+    }
+}
+
+/// Add findings produced outside [`run_security_audit`] to its report, keeping
+/// the summary counts true.
+///
+/// Shared rather than copied into each caller: a summary that disagrees with
+/// the list under it is the one bug in a report nobody notices, because both
+/// halves look plausible on their own.
+pub fn append_findings(report: &mut SecurityAuditReport, findings: Vec<SecurityFinding>) {
+    for finding in findings {
+        match finding.status {
+            FindingStatus::Pass => report.summary.passed += 1,
+            FindingStatus::Info => report.summary.informational += 1,
+            FindingStatus::Warning => report.summary.warnings += 1,
+            FindingStatus::Critical => report.summary.critical += 1,
+            FindingStatus::Fixed => report.summary.fixed += 1,
+        }
+        report.findings.push(finding);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SecurityRuntimeSnapshot {
     pub browser_grants: Vec<BrowserGrantSnapshot>,
@@ -89,6 +234,31 @@ pub struct SecurityRuntimeSnapshot {
     pub companion_error: Option<String>,
     pub native_skills: Vec<NativeSkillSnapshot>,
     pub native_skills_error: Option<String>,
+    pub devices: Vec<DeviceGrantSnapshot>,
+    pub device_commands: Vec<DeviceCommandSnapshot>,
+    pub device_state_observed: bool,
+    pub device_state_error: Option<String>,
+    pub push: Option<PushPrivacySnapshot>,
+    /// How a device reaches this runner, as the runner advertises it.
+    ///
+    /// Separate from `audit_remote_host`'s own checks because the question this
+    /// answers is a different one: that function asks whether the *listener* is
+    /// configured safely, and this asks whether the transport a phone with a
+    /// camera grant is talking over is pinned at all. A development listener on
+    /// plain loopback is a reasonable thing to have and an unreasonable thing to
+    /// hand a microphone.
+    pub transport: Option<TransportSnapshot>,
+    pub voice: Option<VoicePrivacySnapshot>,
+}
+
+/// The advertised transport, reduced to what the device audit asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportSnapshot {
+    pub enabled: bool,
+    pub advertise_url: String,
+    /// Whether the runner holds a certificate fingerprint for devices to pin.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,8 +321,11 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
     audit_loopback_services(app_data, &mut findings);
     audit_remote_host(app_data, request.deep, request.fix, &mut findings);
     audit_mcp_origins(app_data, request.fix, &mut findings);
+    audit_executable_extensions(app_data, &mut findings);
     audit_native_skills(&request.runtime, &mut findings);
     audit_runtime_grants(&request.runtime, &mut findings);
+    audit_paired_devices(&request.runtime, &mut findings);
+    audit_voice_privacy(&request.runtime, &mut findings);
     audit_workspace_skill_root(request.workspace.as_deref(), &mut findings);
     audit_sandbox_enforcement(&mut findings);
 
@@ -165,6 +338,319 @@ pub fn run_security_audit(request: &SecurityAuditRequest) -> Result<SecurityAudi
         summary,
         findings,
     })
+}
+
+fn audit_executable_extensions(app_data: &Path, findings: &mut Vec<SecurityFinding>) {
+    match extension_security_snapshots(app_data) {
+        Ok(snapshots) => {
+            audit_extension_snapshots(&snapshots, findings);
+            audit_extension_provider_selections(app_data, &snapshots, findings);
+        }
+        Err(error) => findings.push(finding(
+            "extensions.store_invalid",
+            "extensions",
+            "Executable extension state failed closed",
+            &error,
+            FindingStatus::Critical,
+            false,
+            None,
+            Some("Keep executable extensions disabled and repair or remove the corrupt app-owned extension registry."),
+        )),
+    }
+}
+
+/// Persisted provider selections that no longer resolve to an owner.
+///
+/// Every native subsystem that can be pointed at an extension records *which
+/// installation* it chose, and re-checks that ownership on every use — so a
+/// stale selection is safe: it fails closed. Safe is not the same as
+/// harmless, though. A transcription backend that silently stopped
+/// transcribing, or a knowledge stack that will not re-embed, reads to an
+/// operator as a broken feature rather than as an uninstalled extension, and
+/// this is the one place that says which it is.
+fn audit_extension_provider_selections(
+    app_data: &Path,
+    snapshots: &[ExtensionSecuritySnapshot],
+    findings: &mut Vec<SecurityFinding>,
+) {
+    let owned: std::collections::BTreeSet<(CapabilityKind, String)> = snapshots
+        .iter()
+        // Only a healthy extension actually serves a provider registry, so an
+        // unhealthy owner is an orphaned selection too.
+        .filter(|snapshot| snapshot.health.state == HealthState::Healthy)
+        .flat_map(|snapshot| snapshot.capabilities.iter().cloned())
+        .collect();
+
+    let mut orphaned: Vec<String> = Vec::new();
+    let mut check = |kind: CapabilityKind, selection: Option<(String, String)>, label: &str| {
+        if let Some((extension_id, capability_id)) = selection {
+            if !owned.contains(&(kind, capability_id.clone())) {
+                orphaned.push(format!("{label} → {extension_id}:{capability_id}"));
+            }
+        }
+    };
+
+    let voice = crate::m7_companion::persisted_voice_selections(app_data);
+    check(CapabilityKind::Stt, voice.transcription, "Transcription");
+    check(CapabilityKind::Tts, voice.speech, "Speech synthesis");
+    check(
+        CapabilityKind::RealtimeVoice,
+        voice.realtime,
+        "Realtime voice",
+    );
+    let web = crate::web::persisted_extension_selections(app_data);
+    check(CapabilityKind::WebSearch, web.search, "Web search");
+    check(CapabilityKind::WebFetch, web.fetch, "Web fetch");
+    for (label, selection) in crate::knowledge_core::persisted_embedding_selections(app_data) {
+        check(CapabilityKind::EmbeddingProvider, Some(selection), &label);
+    }
+
+    if orphaned.is_empty() {
+        return;
+    }
+    findings.push(finding(
+        "extensions.provider_orphaned",
+        "extensions",
+        "A feature is pointed at an extension that no longer owns its capability",
+        &format!(
+            "These selections resolve to nothing healthy and therefore do nothing: {}.",
+            orphaned.join("; ")
+        ),
+        FindingStatus::Warning,
+        false,
+        None,
+        Some("Reinstall or re-enable the owning extension, or choose a different provider in that feature's settings."),
+    ));
+}
+
+fn audit_extension_snapshots(
+    snapshots: &[ExtensionSecuritySnapshot],
+    findings: &mut Vec<SecurityFinding>,
+) {
+    if snapshots.is_empty() {
+        findings.push(finding(
+            "extensions.none",
+            "extensions",
+            "No executable extensions are installed",
+            "The Wasm extension runtime has no installed third-party components.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    for snapshot in snapshots {
+        let suffix = short_hash(snapshot.extension_id.as_bytes());
+        match snapshot.trust {
+            TrustState::Verified => findings.push(finding(
+                &format!("extensions.trust.{suffix}"),
+                "extensions",
+                "Extension signature is verified",
+                &format!(
+                    "{} {} was verified against an authorized publisher key.",
+                    snapshot.extension_id, snapshot.version
+                ),
+                FindingStatus::Pass,
+                false,
+                None,
+                None,
+            )),
+            TrustState::Unsigned => findings.push(finding(
+                &format!("extensions.unsigned.{suffix}"),
+                "extensions",
+                "Unsigned executable extension is installed",
+                &format!(
+                    "{} {} is unsigned: {}",
+                    snapshot.extension_id, snapshot.version, snapshot.trust_reason
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Install a publisher-signed build from a trusted source, or disable and uninstall this extension."),
+            )),
+            TrustState::Untrusted | TrustState::Invalid => findings.push(finding(
+                &format!("extensions.untrusted.{suffix}"),
+                "extensions",
+                "Executable extension is not trusted",
+                &format!(
+                    "{} {}: {}",
+                    snapshot.extension_id, snapshot.version, snapshot.trust_reason
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Disable the extension and verify its publisher, provenance, signature, and checksums before use."),
+            )),
+        }
+
+        if !snapshot.compatible {
+            findings.push(finding(
+                &format!("extensions.incompatible.{suffix}"),
+                "extensions",
+                "Installed extension is incompatible",
+                snapshot
+                    .compatibility_reason
+                    .as_deref()
+                    .unwrap_or("The host compatibility contract does not match."),
+                if snapshot.health.enabled {
+                    FindingStatus::Critical
+                } else {
+                    FindingStatus::Warning
+                },
+                false,
+                None,
+                Some("Keep the extension disabled and install a host-compatible version."),
+            ));
+        }
+
+        let elevated = snapshot
+            .permissions
+            .iter()
+            .filter(|permission| {
+                permission.granted
+                    && matches!(
+                        permission.risk,
+                        PermissionRisk::High | PermissionRisk::Critical
+                    )
+            })
+            .count();
+        if elevated > 0 {
+            findings.push(finding(
+                &format!("extensions.elevated_grants.{suffix}"),
+                "extensions",
+                "Extension has elevated resource grants",
+                &format!(
+                    "{} has {elevated} exact high/critical-risk grant(s). Review each origin, workspace handle, secret slot, and device capability in Settings.",
+                    snapshot.extension_id
+                ),
+                if snapshot.health.enabled {
+                    FindingStatus::Warning
+                } else {
+                    FindingStatus::Info
+                },
+                false,
+                None,
+                Some("Remove grants that are no longer required; permission-expanding updates require a new exact approval."),
+            ));
+        }
+
+        let insecure_origins = snapshot
+            .permissions
+            .iter()
+            .filter(|permission| {
+                permission.granted
+                    && permission.kind == PermissionKind::NetworkOrigin
+                    && Url::parse(&permission.scope).is_ok_and(|url| url.scheme() == "http")
+            })
+            .count();
+        if insecure_origins > 0 {
+            findings.push(finding(
+                &format!("extensions.plaintext_origins.{suffix}"),
+                "extensions",
+                "Extension can use plaintext HTTP origins",
+                &format!(
+                    "{} has {insecure_origins} exact plaintext origin grant(s).",
+                    snapshot.extension_id
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Prefer exact HTTPS origins and remove plaintext grants."),
+            ));
+        }
+
+        let has_network = snapshot.permissions.iter().any(|permission| {
+            permission.granted && permission.kind == PermissionKind::NetworkOrigin
+        });
+        let has_secret = snapshot.configured_secret_slots > 0
+            && snapshot.permissions.iter().any(|permission| {
+                permission.granted && permission.kind == PermissionKind::SecretUse
+            });
+        if has_network && has_secret {
+            findings.push(finding(
+                &format!("extensions.secret_network.{suffix}"),
+                "extensions",
+                "Extension combines secret-backed authentication with network access",
+                &format!(
+                    "{} has configured secret slots and exact network origins. Secret bytes remain host-owned, but this combined authority deserves review.",
+                    snapshot.extension_id
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Confirm every origin and secret slot is required and remove stale credentials."),
+            ));
+        }
+
+        if snapshot.health.undeclared_attempts > 0 {
+            findings.push(finding(
+                &format!("extensions.undeclared.{suffix}"),
+                "extensions",
+                "Extension attempted undeclared resource access",
+                &format!(
+                    "{} recorded {} denied undeclared attempt(s).",
+                    snapshot.extension_id, snapshot.health.undeclared_attempts
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Disable the extension and inspect its bounded runtime logs before trusting it again."),
+            ));
+        }
+
+        if !snapshot.component_intact {
+            findings.push(finding(
+                &format!("extensions.component_missing.{suffix}"),
+                "extensions",
+                "Installed extension component is missing or modified",
+                &format!(
+                    "{} {} is registered, but its component file is absent or no longer matches the digest its manifest promised.",
+                    snapshot.extension_id, snapshot.version
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Nothing will run from this version — every invocation re-verifies the digest. Reinstall the extension from a verified bundle, or uninstall it."),
+            ));
+        }
+
+        match snapshot.health.state {
+            HealthState::ProtectiveDisabled | HealthState::Unhealthy => findings.push(finding(
+                &format!("extensions.health.{suffix}"),
+                "extensions",
+                "Extension runtime is unhealthy",
+                &format!(
+                    "{} is {:?} after {} consecutive failure(s) and {} trap(s).",
+                    snapshot.extension_id,
+                    snapshot.health.state,
+                    snapshot.health.consecutive_failures,
+                    snapshot.health.trap_count
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Keep it stopped; validate or roll back to a previously verified cached version before re-enabling."),
+            )),
+            HealthState::Degraded => findings.push(finding(
+                &format!("extensions.health.{suffix}"),
+                "extensions",
+                "Extension runtime is degraded",
+                &format!(
+                    "{} has {} consecutive failure(s) and {} trap(s).",
+                    snapshot.extension_id,
+                    snapshot.health.consecutive_failures,
+                    snapshot.health.trap_count
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Review the bounded logs and stop or roll back the extension if failures continue."),
+            )),
+            _ => {}
+        }
+    }
 }
 
 fn audit_owned_permissions(
@@ -1017,6 +1503,254 @@ fn audit_runtime_grants(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<Se
     }
 }
 
+/// How long a paired device may go without reporting itself before its grants
+/// are treated as stale. A phone that has not been seen in a month may have
+/// been sold, wiped, or simply lost; either way the operator should be told
+/// that a camera grant is still sitting on it.
+const STALE_DEVICE_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+/// The physical capabilities that see or hear the room the device is in. A
+/// grant of any of these is worth naming individually rather than counting.
+const INTIMATE_CAPABILITIES: &[&str] = &["microphone_capture", "screen_capture", "voice_stream"];
+
+/// Paired phones and tablets: what they may do to their own hardware, whether
+/// anything is doing it right now, and whether push would carry private text.
+fn audit_paired_devices(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
+    if let Some(error) = &runtime.device_state_error {
+        findings.push(finding(
+            "devices.unreadable",
+            "devices",
+            "Paired device state could not be read",
+            error,
+            FindingStatus::Warning,
+            false,
+            None,
+            Some("Run `monkey daemon remote device-list` to see the underlying error."),
+        ));
+        return;
+    }
+    if !runtime.device_state_observed {
+        return;
+    }
+    let active: Vec<&DeviceGrantSnapshot> = runtime
+        .devices
+        .iter()
+        .filter(|device| !device.revoked)
+        .collect();
+    if active.is_empty() {
+        findings.push(finding(
+            "devices.none_paired",
+            "devices",
+            "No paired physical devices",
+            "Nothing on this machine can reach a phone's camera, microphone, screen or location.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+
+    for device in &active {
+        let intimate: Vec<&str> = device
+            .granted_physical
+            .iter()
+            .map(String::as_str)
+            .filter(|capability| INTIMATE_CAPABILITIES.contains(capability))
+            .collect();
+        if !intimate.is_empty() {
+            findings.push(finding(
+                "devices.intimate_grant",
+                "devices",
+                "A device may capture its surroundings",
+                &format!(
+                    "'{}' ({}) is granted {}. Anything that can drive a run on this machine can ask for it.",
+                    device.device_name,
+                    device.device_id,
+                    intimate.join(", ")
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Withdraw what is not in use: `monkey daemon remote device-grant <device-id> --capability <kept>…`, listing only the capabilities to keep."),
+            ));
+        }
+        if device.granted_physical.len() >= 4 {
+            findings.push(finding(
+                "devices.broad_grant",
+                "devices",
+                "A device holds a broad hardware grant",
+                &format!(
+                    "'{}' ({}) is granted {} physical capabilities: {}.",
+                    device.device_name,
+                    device.device_id,
+                    device.granted_physical.len(),
+                    device.granted_physical.join(", ")
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("Grant only what a workflow actually uses; each capability is independent and none implies another."),
+            ));
+        }
+        let stale = match device.last_seen_at_ms {
+            None => !device.granted_physical.is_empty(),
+            Some(last_seen) => now_ms().saturating_sub(last_seen) > STALE_DEVICE_MS,
+        };
+        if stale {
+            findings.push(finding(
+                "devices.stale_grant",
+                "devices",
+                "A device holds grants but has not been seen",
+                &format!(
+                    "'{}' ({}) still holds {} and {}.",
+                    device.device_name,
+                    device.device_id,
+                    if device.granted_physical.is_empty() {
+                        "no hardware grant".to_string()
+                    } else {
+                        device.granted_physical.join(", ")
+                    },
+                    match device.last_seen_at_ms {
+                        None => "has never reported what it is".to_string(),
+                        Some(last_seen) => format!("last reported at {last_seen} ms"),
+                    }
+                ),
+                FindingStatus::Warning,
+                false,
+                None,
+                Some("If that device is gone, revoke it: `monkey daemon remote pair-revoke <device-id>`."),
+            ));
+        }
+    }
+
+    // The transport those grants are exercised over.
+    //
+    // A hardware grant is only as private as the connection that carries the
+    // photograph back. `pair-create` refuses a non-HTTPS advertised URL, so this
+    // is not a hole an operator can open by accident — but a certificate can be
+    // replaced, a fingerprint can go missing from the configuration, and a
+    // development listener set up for a laptop can outlive the afternoon it was
+    // meant for. The finding names the devices, because "your transport is
+    // unpinned" and "your transport is unpinned and three phones can hear the
+    // room over it" are different sentences.
+    if let Some(transport) = &runtime.transport {
+        let hardware: Vec<&str> = active
+            .iter()
+            .filter(|device| !device.granted_physical.is_empty())
+            .map(|device| device.device_name.as_str())
+            .collect();
+        let insecure = !transport.advertise_url.starts_with("https://");
+        if transport.enabled && !hardware.is_empty() && (insecure || !transport.pinned) {
+            findings.push(finding(
+                "devices.transport_unpinned",
+                "devices",
+                "Hardware grants are reachable over an unpinned transport",
+                &format!(
+                    "{} is {}, and {} hold hardware grants over it.",
+                    transport.advertise_url,
+                    if insecure {
+                        "not HTTPS"
+                    } else {
+                        "advertised without a certificate fingerprint for devices to pin"
+                    },
+                    hardware.join(", ")
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Reconfigure the remote host with a certificate valid for the advertised name, then re-pair: `monkey daemon remote host-configure --advertise-url https://… --tls-certificate … --tls-private-key …`."),
+            ));
+        }
+    }
+
+    // A revoked device keeps nothing, including an address. This catches the
+    // one row that could outlive a revocation and quietly keep a wiped phone
+    // on the notification list.
+    for device in runtime.devices.iter().filter(|device| device.revoked) {
+        if device.push_registered {
+            findings.push(finding(
+                "devices.revoked_still_reachable",
+                "devices",
+                "A revoked device still has a push address",
+                &format!(
+                    "'{}' ({}) is revoked but still has a registered push token.",
+                    device.device_name, device.device_id
+                ),
+                FindingStatus::Critical,
+                false,
+                None,
+                Some("Re-run the revocation so the registration is cleared."),
+            ));
+        }
+    }
+
+    // Something happening right now, on hardware, in a room.
+    for command in &runtime.device_commands {
+        if !INTIMATE_CAPABILITIES.contains(&command.capability.as_str()) {
+            continue;
+        }
+        findings.push(finding(
+            "devices.capture_in_flight",
+            "devices",
+            "A capture is in progress on a device",
+            &format!(
+                "Command {} on {} is {} and is a {}.",
+                command.command_id, command.device_id, command.state, command.capability
+            ),
+            if command.state == "running" {
+                FindingStatus::Critical
+            } else {
+                FindingStatus::Warning
+            },
+            false,
+            None,
+            Some("Stop it with `monkey daemon remote device-cancel <command-id>`. A capture already taken cannot be untaken."),
+        ));
+    }
+
+    match &runtime.push {
+        None => {}
+        Some(push) if !push.configured => findings.push(finding(
+            "devices.push_absent",
+            "devices",
+            "Push is not configured",
+            "Devices are only reachable while the app is open. Little Monkey ships no push project of its own.",
+            FindingStatus::Info,
+            false,
+            None,
+            None,
+        )),
+        Some(push) => {
+            if push.enabled && push.include_detail {
+                findings.push(finding(
+                    "devices.push_detail",
+                    "devices",
+                    "Push notifications carry specifics",
+                    &format!(
+                        "Detail is switched on, so run and message specifics reach the lock screens of {} registered device(s) before anyone unlocks them.",
+                        push.registered_devices
+                    ),
+                    FindingStatus::Warning,
+                    false,
+                    None,
+                    Some("Turn detail off unless every registered device is trusted while locked; the app can always fetch the specifics after unlock."),
+                ));
+            } else if push.enabled {
+                findings.push(finding(
+                    "devices.push_private",
+                    "devices",
+                    "Push notifications withhold content",
+                    "Notifications say what kind of thing happened, not what it said.",
+                    FindingStatus::Pass,
+                    false,
+                    None,
+                    None,
+                ));
+            }
+        }
+    }
+}
+
 fn audit_workspace_skill_root(workspace: Option<&Path>, findings: &mut Vec<SecurityFinding>) {
     let Some(workspace) = workspace else {
         findings.push(finding(
@@ -1311,6 +2045,88 @@ fn summarize(findings: &[SecurityFinding]) -> SecuritySummary {
     summary
 }
 
+/// The voice surface: a microphone that opens itself, and where what it hears
+/// goes.
+///
+/// **Why this is its own audit rather than a line in the device one.** The
+/// device audit asks what a *phone* was granted. This asks what *this machine*
+/// does on its own — a wake phrase and always-listening are desktop settings,
+/// not grants, and nothing in the grant model would ever surface them. The
+/// combination that matters most is the one neither half sees alone:
+/// always-listening plus a hosted transcription provider is a room whose audio
+/// leaves the machine without anyone pressing anything.
+fn audit_voice_privacy(runtime: &SecurityRuntimeSnapshot, findings: &mut Vec<SecurityFinding>) {
+    let Some(voice) = &runtime.voice else {
+        return;
+    };
+    if voice.always_listening && !voice.local_only {
+        findings.push(finding(
+            "voice.passive_cloud_upload",
+            "voice",
+            "An always-on microphone is uploading to a provider",
+            "Always-listening is on and transcription is a hosted provider, so audio captured \
+             without anyone pressing anything can leave this machine.",
+            FindingStatus::Critical,
+            false,
+            None,
+            Some(
+                "Either turn always-listening off, or switch transcription to local Whisper in \
+                 Settings → Companion → Voice.",
+            ),
+        ));
+    } else if voice.always_listening {
+        findings.push(finding(
+            "voice.always_listening",
+            "voice",
+            "The microphone is always listening",
+            "This machine listens for a wake phrase continuously. Detection is local and no \
+             audio is uploaded until the phrase is heard, but the microphone is open.",
+            FindingStatus::Warning,
+            false,
+            None,
+            Some(
+                "Turn always-listening off in Settings → Companion → Voice when it is not in use.",
+            ),
+        ));
+    } else if voice.wake_phrase_enabled {
+        findings.push(finding(
+            "voice.wake_phrase_enabled",
+            "voice",
+            "A wake phrase is enabled",
+            "The wake phrase is armed but the microphone only opens when Talk is started.",
+            FindingStatus::Info,
+            false,
+            None,
+            None,
+        ));
+    } else {
+        findings.push(finding(
+            "voice.wake_disabled",
+            "voice",
+            "Nothing is listening on its own",
+            "The wake phrase and always-listening are both off; the microphone opens only when \
+             it is pressed.",
+            FindingStatus::Pass,
+            false,
+            None,
+            None,
+        ));
+    }
+    if !voice.local_only {
+        findings.push(finding(
+            "voice.hosted_transcription",
+            "voice",
+            "Speech is transcribed by a hosted provider",
+            "What is said into Talk, the companion overlay and answered calls is uploaded to the \
+             transcription provider configured in Settings.",
+            FindingStatus::Info,
+            false,
+            None,
+            Some("Local Whisper keeps every recording on this machine."),
+        ));
+    }
+}
+
 fn finding(
     id: &str,
     category: &str,
@@ -1384,6 +2200,336 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
+    }
+
+    fn device(name: &str, granted: &[&str], last_seen_at_ms: Option<u64>) -> DeviceGrantSnapshot {
+        DeviceGrantSnapshot {
+            device_id: format!("device-{name}"),
+            device_name: name.to_string(),
+            granted_physical: granted.iter().map(|value| value.to_string()).collect(),
+            effective_physical: granted.iter().map(|value| value.to_string()).collect(),
+            revoked: false,
+            last_seen_at_ms,
+            push_registered: false,
+        }
+    }
+
+    fn device_findings(runtime: SecurityRuntimeSnapshot) -> Vec<SecurityFinding> {
+        let mut findings = Vec::new();
+        audit_paired_devices(&runtime, &mut findings);
+        findings
+    }
+
+    fn has(findings: &[SecurityFinding], id: &str) -> bool {
+        findings.iter().any(|finding| finding.id == id)
+    }
+
+    fn voice_findings(voice: Option<VoicePrivacySnapshot>) -> Vec<SecurityFinding> {
+        let mut findings = Vec::new();
+        audit_voice_privacy(
+            &SecurityRuntimeSnapshot {
+                voice,
+                ..SecurityRuntimeSnapshot::default()
+            },
+            &mut findings,
+        );
+        findings
+    }
+
+    /// The voice surface graded by what it can actually do, worst case first.
+    ///
+    /// The combination the operator most needs named is always-listening plus a
+    /// hosted transcription backend: neither is alarming alone, and together
+    /// they are a microphone that uploads a room nobody opened.
+    #[test]
+    fn the_doctor_grades_always_listening_by_where_the_audio_goes() {
+        let leaking = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: false,
+        }));
+        assert!(has(&leaking, "voice.passive_cloud_upload"));
+        assert_eq!(
+            leaking
+                .iter()
+                .find(|finding| finding.id == "voice.passive_cloud_upload")
+                .unwrap()
+                .status,
+            FindingStatus::Critical
+        );
+
+        // The same setting, kept on this machine, is a warning rather than a
+        // critical: the microphone is open, but nothing leaves.
+        let local = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: true,
+            local_only: true,
+        }));
+        assert!(has(&local, "voice.always_listening"));
+        assert!(!has(&local, "voice.passive_cloud_upload"));
+        assert!(!has(&local, "voice.hosted_transcription"));
+
+        // Armed but not listening, and the default: neither is a problem, and
+        // both are stated rather than left silent.
+        let armed = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: true,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&armed, "voice.wake_phrase_enabled"));
+        let quiet = voice_findings(Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: false,
+            always_listening: false,
+            local_only: true,
+        }));
+        assert!(has(&quiet, "voice.wake_disabled"));
+        assert_eq!(quiet[0].status, FindingStatus::Pass);
+
+        // Nothing observed says nothing, rather than claiming the microphone is
+        // quiet on evidence it does not have.
+        assert!(voice_findings(None).is_empty());
+    }
+
+    /// An open Talk socket is a running `voice_stream` command, so the device
+    /// audit already names it. This pins that, because the property is what
+    /// makes "an unexpected active stream" visible at all.
+    #[test]
+    fn a_live_voice_stream_is_reported_as_a_capture_in_flight() {
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![device("phone", &["voice_stream"], Some(now_ms()))],
+            device_commands: vec![DeviceCommandSnapshot {
+                command_id: "cmd-1".into(),
+                device_id: "device-phone".into(),
+                capability: "voice_stream".into(),
+                state: "running".into(),
+            }],
+            ..SecurityRuntimeSnapshot::default()
+        });
+        let in_flight = findings
+            .iter()
+            .find(|finding| finding.id == "devices.capture_in_flight")
+            .expect("a running stream is named");
+        assert_eq!(in_flight.status, FindingStatus::Critical);
+        assert!(in_flight.detail.contains("voice_stream"));
+        assert!(has(&findings, "devices.intimate_grant"));
+    }
+
+    #[test]
+    fn the_doctor_reports_extension_trust_authority_and_protective_disable() {
+        let mut findings = Vec::new();
+        audit_extension_snapshots(
+            &[ExtensionSecuritySnapshot {
+                extension_id: "dev.example.risky".into(),
+                version: "1.0.0".into(),
+                trust: TrustState::Unsigned,
+                trust_reason: "local unsigned bundle".into(),
+                compatible: true,
+                compatibility_reason: None,
+                permissions: vec![
+                    crate::executable_extensions::PermissionView {
+                        permission_id: "network".into(),
+                        kind: PermissionKind::NetworkOrigin,
+                        scope: "http://example.com".into(),
+                        reason: "fixture".into(),
+                        risk: PermissionRisk::High,
+                        granted: true,
+                        binding_label: None,
+                    },
+                    crate::executable_extensions::PermissionView {
+                        permission_id: "api_token".into(),
+                        kind: PermissionKind::SecretUse,
+                        scope: "api_token".into(),
+                        reason: "fixture".into(),
+                        risk: PermissionRisk::High,
+                        granted: true,
+                        binding_label: None,
+                    },
+                ],
+                configured_secret_slots: 1,
+                health: crate::executable_extensions::RuntimeHealth {
+                    state: HealthState::ProtectiveDisabled,
+                    validated: true,
+                    enabled: false,
+                    running: false,
+                    consecutive_failures: 3,
+                    trap_count: 3,
+                    undeclared_attempts: 1,
+                    last_error: Some("guest trapped".into()),
+                    last_invocation_at_ms: Some(now_ms()),
+                },
+                component_intact: false,
+                capabilities: vec![(CapabilityKind::Tool, "risky".into())],
+            }],
+            &mut findings,
+        );
+
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect::<Vec<_>>();
+        for prefix in [
+            "extensions.unsigned.",
+            "extensions.elevated_grants.",
+            "extensions.plaintext_origins.",
+            "extensions.secret_network.",
+            "extensions.undeclared.",
+            "extensions.component_missing.",
+            "extensions.health.",
+        ] {
+            assert!(
+                ids.iter().any(|id| id.starts_with(prefix)),
+                "missing {prefix}"
+            );
+        }
+        assert!(findings.iter().any(|finding| {
+            finding.id.starts_with("extensions.health.")
+                && finding.status == FindingStatus::Critical
+        }));
+    }
+
+    /// The four things an operator most needs told about a phone they granted
+    /// hardware to: it can hear the room, it can do a lot, it has not been seen
+    /// in a month, and something is capturing right now.
+    #[test]
+    fn the_doctor_names_broad_stale_and_in_flight_device_grants() {
+        let now = now_ms();
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![
+                device("kitchen tablet", &["microphone_capture"], Some(now)),
+                device(
+                    "old phone",
+                    &[
+                        "camera_capture",
+                        "location_read",
+                        "notification_post",
+                        "audio_playback",
+                    ],
+                    Some(now - STALE_DEVICE_MS - 1),
+                ),
+            ],
+            device_commands: vec![DeviceCommandSnapshot {
+                command_id: "dcmd-one".into(),
+                device_id: "device-kitchen tablet".into(),
+                capability: "microphone_capture".into(),
+                state: "running".into(),
+            }],
+            ..Default::default()
+        });
+        assert!(has(&findings, "devices.intimate_grant"));
+        assert!(has(&findings, "devices.broad_grant"));
+        assert!(has(&findings, "devices.stale_grant"));
+        let capture = findings
+            .iter()
+            .find(|finding| finding.id == "devices.capture_in_flight")
+            .expect("a running microphone must be reported");
+        assert_eq!(capture.status, FindingStatus::Critical);
+        assert!(capture
+            .remediation
+            .as_ref()
+            .is_some_and(|text| text.contains("cannot be untaken")));
+
+        // A quiet, narrowly-granted, recently-seen device produces none of them.
+        let quiet = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![device("phone", &["notification_post"], Some(now))],
+            ..Default::default()
+        });
+        assert!(!has(&quiet, "devices.intimate_grant"));
+        assert!(!has(&quiet, "devices.broad_grant"));
+        assert!(!has(&quiet, "devices.stale_grant"));
+    }
+
+    /// A hardware grant is only as private as the connection carrying the
+    /// photograph back, and a development listener can outlive the afternoon it
+    /// was set up for.
+    #[test]
+    fn the_doctor_flags_hardware_grants_reachable_over_an_unpinned_transport() {
+        let now = now_ms();
+        let with_transport = |advertise_url: &str, pinned: bool, granted: &[&str]| {
+            device_findings(SecurityRuntimeSnapshot {
+                device_state_observed: true,
+                devices: vec![device("phone", granted, Some(now))],
+                transport: Some(TransportSnapshot {
+                    enabled: true,
+                    advertise_url: advertise_url.to_string(),
+                    pinned,
+                }),
+                ..Default::default()
+            })
+        };
+        let plain = with_transport("http://192.168.1.4:8443", true, &["camera_capture"]);
+        let finding = plain
+            .iter()
+            .find(|finding| finding.id == "devices.transport_unpinned")
+            .expect("an unencrypted transport carrying a camera grant must be reported");
+        assert_eq!(finding.status, FindingStatus::Critical);
+        // The devices are named: "unpinned" and "unpinned, and this phone can
+        // see through its camera over it" are different sentences.
+        assert!(finding.detail.contains("phone"));
+
+        assert!(has(
+            &with_transport("https://runner.example.net", false, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        // A pinned HTTPS transport, and a plain one that no hardware grant is
+        // reachable over, are both silent — the second because a development
+        // listener is a reasonable thing to have until a camera is behind it.
+        assert!(!has(
+            &with_transport("https://runner.example.net", true, &["camera_capture"]),
+            "devices.transport_unpinned"
+        ));
+        assert!(!has(
+            &with_transport("http://127.0.0.1:8443", false, &[]),
+            "devices.transport_unpinned"
+        ));
+    }
+
+    /// A revoked device must keep nothing, an address included.
+    #[test]
+    fn the_doctor_flags_a_revoked_device_that_can_still_be_woken() {
+        let mut revoked = device("sold phone", &[], Some(now_ms()));
+        revoked.revoked = true;
+        revoked.push_registered = true;
+        let findings = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            devices: vec![revoked],
+            ..Default::default()
+        });
+        let finding = findings
+            .iter()
+            .find(|finding| finding.id == "devices.revoked_still_reachable")
+            .expect("a revoked device with a push address must be reported");
+        assert_eq!(finding.status, FindingStatus::Critical);
+    }
+
+    #[test]
+    fn the_doctor_reports_whether_push_would_put_specifics_on_a_lock_screen() {
+        let leaky = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            push: Some(PushPrivacySnapshot {
+                configured: true,
+                enabled: true,
+                include_detail: true,
+                registered_devices: 2,
+            }),
+            ..Default::default()
+        });
+        assert!(has(&leaky, "devices.push_detail"));
+
+        let private = device_findings(SecurityRuntimeSnapshot {
+            device_state_observed: true,
+            push: Some(PushPrivacySnapshot {
+                configured: true,
+                enabled: true,
+                include_detail: false,
+                registered_devices: 2,
+            }),
+            ..Default::default()
+        });
+        assert!(has(&private, "devices.push_private"));
+        assert!(!has(&private, "devices.push_detail"));
     }
 
     impl Drop for TestDirectory {

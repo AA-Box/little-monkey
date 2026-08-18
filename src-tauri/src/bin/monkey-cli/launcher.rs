@@ -36,7 +36,8 @@ struct RawMode;
 
 impl RawMode {
     fn enter() -> Result<Self, String> {
-        terminal::enable_raw_mode().map_err(|error| format!("Could not enter raw mode: {error}"))?;
+        terminal::enable_raw_mode()
+            .map_err(|error| format!("Could not enter raw mode: {error}"))?;
         Ok(Self)
     }
 }
@@ -93,14 +94,7 @@ impl Default for Settings {
     }
 }
 
-const PERMISSION_MODES: [&str; 6] = [
-    "manual",
-    "smart",
-    "acceptEdits",
-    "plan",
-    "auto",
-    "bypass",
-];
+const PERMISSION_MODES: [&str; 6] = ["manual", "smart", "acceptEdits", "plan", "auto", "bypass"];
 
 /// What one keypress did to the screen we're on.
 enum Nav {
@@ -325,9 +319,7 @@ fn menu(settings: &Settings, agents: &[Option<PathBuf>]) -> Result<Nav, String> 
             if settings.rules { "with" } else { "no" },
             if settings.mcp { "with" } else { "no" },
         )));
-        lines.push(dim(
-            "↑/↓ navigate • enter launch • → configure • esc quit",
-        ));
+        lines.push(dim("↑/↓ navigate • enter launch • → configure • esc quit"));
         drawn = draw(&lines, drawn)?;
 
         match read_key()? {
@@ -375,9 +367,7 @@ fn configure(settings: &mut Settings) -> Result<(), String> {
             });
         }
         lines.push(String::new());
-        lines.push(dim(
-            "↑/↓ navigate • enter/→ change • ← back • esc back",
-        ));
+        lines.push(dim("↑/↓ navigate • enter/→ change • ← back • esc back"));
         drawn = draw(&lines, drawn)?;
 
         match read_key()? {
@@ -432,12 +422,7 @@ fn pick_model(choices: &[ModelChoice]) -> Result<Nav, String> {
         let matches: Vec<usize> = choices
             .iter()
             .enumerate()
-            .filter(|(_, choice)| {
-                choice
-                    .label
-                    .to_lowercase()
-                    .contains(&filter.to_lowercase())
-            })
+            .filter(|(_, choice)| choice.label.to_lowercase().contains(&filter.to_lowercase()))
             .map(|(index, _)| index)
             .collect();
         selected = selected.min(matches.len().saturating_sub(1));
@@ -540,10 +525,7 @@ fn launch_agent(agent: &Agent, found: Option<&PathBuf>) -> ! {
 /// the user quit or picked a screen that just prints. Screens that hand the
 /// terminal to something else (another agent CLI) exit the process directly.
 pub async fn run(client: &reqwest::Client) -> Result<Option<Launch>, String> {
-    let agents: Vec<Option<PathBuf>> = AGENTS
-        .iter()
-        .map(|agent| on_path(agent.binary))
-        .collect();
+    let agents: Vec<Option<PathBuf>> = AGENTS.iter().map(|agent| on_path(agent.binary)).collect();
     let mut settings = Settings::default();
     loop {
         match menu(&settings, &agents)? {
@@ -645,9 +627,7 @@ async fn model_choices(client: &reqwest::Client) -> Result<Vec<ModelChoice>, Str
     }
 
     if choices.is_empty() {
-        return Err(
-            "No models are available. Pull one with `monkey pull qwen3:4b`.".to_string(),
-        );
+        return Err("No models are available. Pull one with `monkey pull qwen3:4b`.".to_string());
     }
     Ok(choices)
 }
@@ -714,7 +694,10 @@ mod tests {
         assert_eq!(settings.permission_mode, "manual", "cycle must wrap");
         // Every mode offered here must be one `--permission-mode` accepts.
         for mode in seen {
-            assert!(crate::permission::PermissionMode::parse(mode).is_ok(), "{mode}");
+            assert!(
+                crate::permission::PermissionMode::parse(mode).is_ok(),
+                "{mode}"
+            );
         }
     }
 

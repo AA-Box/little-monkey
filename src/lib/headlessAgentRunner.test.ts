@@ -136,6 +136,15 @@ describe('runHeadlessAgent', () => {
       outcome: 'completed',
       summary: 'Implemented and verified.',
       durableRunId: 'durable-run-1',
+      // What the run actually did, as opposed to what the model asked for.
+      // No tool ran here, so nothing is claimed to have.
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 12,
+        completionTokens: 4,
+      },
     });
     expect(mocks.beginDurableRun).toHaveBeenCalledWith(expect.objectContaining({
       runId: 'run-1',
@@ -236,6 +245,9 @@ describe('runHeadlessAgent', () => {
     const result = await runHeadlessAgent(params);
 
     expect(result.outcome).toBe('completed');
+    // Only a call that reached the executor is reported as having run.
+    expect(result.evidence.executedTools).toEqual([call.function.name]);
+    expect(result.evidence.toolFailures).toEqual([]);
     expect(mocks.executeToolCall).toHaveBeenCalledWith(
       call,
       null,
@@ -246,6 +258,11 @@ describe('runHeadlessAgent', () => {
       undefined,
       undefined,
       'test-source',
+      undefined,
+      undefined,
+      // No workspace override configured for this run, so the call resolves
+      // against the primary workspace exactly as before.
+      undefined,
     );
     expect(onToolActivity).toHaveBeenCalledWith('run_shell');
     expect(recorder.recordToolProposed).toHaveBeenCalledWith(
@@ -280,6 +297,43 @@ describe('runHeadlessAgent', () => {
       .toContain('Tool \\"task\\" was not offered to this run.');
   });
 
+  it('narrows the run to an allowed-tools list, and refuses a call outside it', async () => {
+    // The learning loop's candidate arm runs under the staged skill's own
+    // list, so it cannot pass an evaluation using a tool the skill will not
+    // have once installed. Structural, not advisory: absent from the schema
+    // AND refused at execution.
+    mocks.attemptStream
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [toolCall('run_shell', 'call-shell', '{"command":"pnpm test"}')],
+        streamError: null,
+        contentStarted: true,
+      })
+      .mockResolvedValueOnce({ content: 'Stopped.', toolCalls: [], streamError: null, contentStarted: true });
+
+    const result = await runHeadlessAgent(baseParams({ allowedTools: ['read_file'] }));
+
+    expect(result.outcome).toBe('completed');
+    expect(mocks.executeToolCall).not.toHaveBeenCalled();
+    const offered = mocks.attemptStream.mock.calls[0][2] as Array<{ function: { name: string } }>;
+    expect(offered.map((tool) => tool.function.name)).toEqual(['read_file']);
+    expect(result.evidence.executedTools).toEqual([]);
+  });
+
+  it('leaves the profile alone when no allowed-tools list is given', async () => {
+    mocks.attemptStream.mockResolvedValue({
+      content: 'Done.',
+      toolCalls: [],
+      streamError: null,
+      contentStarted: true,
+    });
+
+    await runHeadlessAgent(baseParams({ allowedTools: [] }));
+
+    const offered = mocks.attemptStream.mock.calls[0][2] as Array<{ function: { name: string } }>;
+    expect(offered.map((tool) => tool.function.name)).toEqual(['read_file', 'run_shell']);
+  });
+
   it('denies tools that omit or escape a required attached worktree root', async () => {
     const call = toolCall('run_shell', 'call-root', '{"command":"pnpm test","cwd":"workspace"}');
     mocks.attemptStream
@@ -305,6 +359,13 @@ describe('runHeadlessAgent', () => {
       outcome: 'cancelled',
       summary: 'Cancelled by the user.',
       durableRunId: 'durable-run-1',
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 0,
+        completionTokens: 0,
+      },
     });
     expect(mocks.attemptStream).not.toHaveBeenCalled();
     expect(recorder.cancel).toHaveBeenCalledWith('Cancelled by the user.');
@@ -324,6 +385,13 @@ describe('runHeadlessAgent', () => {
       outcome: 'error',
       summary: 'provider unavailable',
       durableRunId: 'durable-run-1',
+      evidence: {
+        executedTools: [],
+        toolFailures: [],
+        permissionRequests: [],
+        promptTokens: 0,
+        completionTokens: 0,
+      },
     });
     expect(recorder.fail).toHaveBeenCalledWith('provider unavailable');
   });
@@ -345,6 +413,7 @@ describe('runHeadlessAgent', () => {
     );
     expect(mocks.attemptStream).toHaveBeenCalledTimes(2);
     expect(mocks.executeToolCall).toHaveBeenCalledTimes(2);
+    expect(result.evidence.executedTools).toEqual(['read_file', 'read_file']);
     expect(recorder.fail).toHaveBeenCalledWith(result.summary);
   });
 });

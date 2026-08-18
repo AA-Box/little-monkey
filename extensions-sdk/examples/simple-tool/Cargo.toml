@@ -1,0 +1,15 @@
+[package]
+name = "little-monkey-example-simple-tool"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+little-monkey-extension-sdk.workspace = true
+serde.workspace = true
+wit-bindgen.workspace = true

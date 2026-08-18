@@ -1,11 +1,16 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  executableExtensionsClient,
+  type ActiveCapability,
+} from "../lib/executableExtensionsClient";
 
 /** Mirrors the Rust `SearchProvider` enum (src-tauri/src/web.rs) exactly —
  * `#[serde(rename_all = "snake_case")]` on that enum's single-uppercase-run
  * variant names (`Duckduckgo`/`Brave`/`Searxng`) serializes to exactly these
  * three lowercase strings. */
-export type SearchProvider = "duckduckgo" | "brave" | "searxng";
+export type SearchProvider = "duckduckgo" | "brave" | "searxng" | "executable_extension";
+export type FetchProvider = "builtin" | "executable_extension";
 
 /**
  * Mirrors the Rust `WebSettings` struct (src-tauri/src/web.rs) exactly —
@@ -18,6 +23,8 @@ export type SearchProvider = "duckduckgo" | "brave" | "searxng";
  */
 export interface WebSettings {
   search_provider: SearchProvider;
+  search_extension_id: string | null;
+  search_extension_capability_id: string | null;
   /** Required when `search_provider === "searxng"`; `null` (never an empty
    * string) is the "unset" state — the backend normalizes a blank input back
    * to `null` before persisting. */
@@ -29,6 +36,9 @@ export interface WebSettings {
   /** Char-window size `web_fetch` uses when the model doesn't pass its own
    * `max_chars`. */
   fetch_max_chars: number;
+  fetch_provider: FetchProvider;
+  fetch_extension_id: string | null;
+  fetch_extension_capability_id: string | null;
 }
 
 /**
@@ -41,9 +51,14 @@ export interface WebSettings {
  */
 export const DEFAULT_WEB_SETTINGS: WebSettings = {
   search_provider: "duckduckgo",
+  search_extension_id: null,
+  search_extension_capability_id: null,
   searxng_base_url: null,
   allow_local_network: false,
   fetch_max_chars: 20_000,
+  fetch_provider: "builtin",
+  fetch_extension_id: null,
+  fetch_extension_capability_id: null,
 };
 
 export interface WebStore {
@@ -58,6 +73,8 @@ export interface WebStore {
   /** Whether `refresh()` has resolved at least once, so `AutomationPanel.tsx`'s Web section can
    * avoid flashing "no key saved" before the first load completes. */
   loaded: boolean;
+  searchCapabilities: ActiveCapability[];
+  fetchCapabilities: ActiveCapability[];
 
   /** Re-fetch `settings` + `hasBraveKey` from the backend. */
   refresh: () => Promise<void>;
@@ -76,13 +93,17 @@ export const useWebStore = create<WebStore>((set, get) => ({
   settings: DEFAULT_WEB_SETTINGS,
   hasBraveKey: false,
   loaded: false,
+  searchCapabilities: [],
+  fetchCapabilities: [],
 
   refresh: async () => {
-    const [settings, hasBraveKey] = await Promise.all([
+    const [settings, hasBraveKey, searchCapabilities, fetchCapabilities] = await Promise.all([
       invoke<WebSettings>("web_get_settings"),
       invoke<boolean>("web_has_brave_key"),
+      executableExtensionsClient.activeCapabilities("web_search").catch(() => []),
+      executableExtensionsClient.activeCapabilities("web_fetch").catch(() => []),
     ]);
-    set({ settings, hasBraveKey, loaded: true });
+    set({ settings, hasBraveKey, searchCapabilities, fetchCapabilities, loaded: true });
   },
 
   setSettings: async (settings) => {

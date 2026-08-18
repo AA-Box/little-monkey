@@ -23,11 +23,23 @@
  * "session affinity" (keep using whatever just worked) falls out of the
  * same mechanism a manual model switch uses — no separate sticky field.
  */
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, isTauri } from '@tauri-apps/api/core';
+import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools } from './tools';
+import {
+  candidateNotice,
+  finalizeLearningForRun,
+  formatLearningNotice,
+  learnFromFinishedRun,
+  type InvokedSkillUse,
+  type ReflectionCall,
+} from './skillLearning';
+import { cachedLearningMode } from './skillLearningClient';
+import type { NativeSkillScope } from './nativeSkillsClient';
 import { mcpToolDefs } from './mcpTools';
+import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
 import { applyContextCompaction, renderForSummary, shouldTrim } from './contextTrimmer';
 import {
@@ -78,6 +90,7 @@ import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRu
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import {
+  describeRedactions,
   gatePrivacyWireMessages,
   type PrivacyWireCache,
 } from './privacyWire';
@@ -124,7 +137,10 @@ import {
   saveActiveDaemonTurn,
   submitDaemonDesktopTurn,
   watchDaemonDesktopTurn,
+  type AcceptedResume,
   type ActiveDaemonDesktopTurn,
+  type ConversationRoute,
+  type DesktopTurnSource,
   type FrozenAttachmentInput,
 } from './daemonDesktopTurn';
 import {
@@ -157,14 +173,32 @@ export const SWITCH_NOTE_PREFIX = '[Model switch]';
 export const RESUME_NOTE_PREFIX = '[Resume]';
 
 /** A re-entry into a turn frozen at a tool boundary (roadmap K13), passed to
- * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else. */
+ * {@link runAgentTurn} by `frozenTurn.ts` and by nothing else.
+ *
+ * Every field describes something that has *already happened*. Nothing in this
+ * type is a request to submit a Resume — by the time one of these exists, the
+ * backend holds the continuation durably, and the only thing left is to watch
+ * it. That ordering is the whole point: submission has to be the step the frozen
+ * image outlives, so it cannot be the step this loop performs. */
 export interface ResumedTurn {
-  /** The image being continued. Already cleared by the caller — held here for
-   * the transcript notice and for anything that later wants to name it. */
+  /** The image that was continued. Cleared by the caller once the continuation
+   * below was durably accepted — held here for the transcript notice and for
+   * anything that later wants to name it. */
   resumedFromCheckpointId: string;
   /** `checkpoint_restorability`'s statement of what a resume does *not*
    * reproduce, written into the transcript beside the continuation. */
   determinismCaveats: string[];
+  /** The turn the frozen image belongs to — the `chat_turn` process's own
+   * external id.
+   *
+   * This is what makes a resume a *continuation* rather than a new turn: it is
+   * half of the accepted turn's durable identity, and it is what the backend
+   * found the row by. A watcher reconnects by asking about *this* turn, because
+   * the continuation's own id is the backend's business. */
+  parentTurnId: string;
+  /** The continuation the backend accepted, as it answered. Its run is what
+   * this loop attaches the transcript to. */
+  accepted: AcceptedResume;
 }
 
 export function isSwitchNotice(message: ChatMessage): boolean {
@@ -574,6 +608,7 @@ export function toolsForSettings(
   subagentsEnabled = false,
   skillToolEnabled = false,
   readSkillResourceToolEnabled = false,
+  skillLearningToolEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -585,6 +620,7 @@ export function toolsForSettings(
     ...(subagentsEnabled ? [TASK_TOOL, WORKFLOW_TOOL] : []),
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
+    ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
   ];
 }
 
@@ -598,30 +634,12 @@ export function toolsForSettings(
  * only when EVERY invoked skill declares one does this return the union of
  * their sets, so stacking a restrictive skill with a permissive one never
  * silently locks the model out of tools the permissive skill actually needs.
+ *
+ * Implemented in `allowedTools.ts` and re-exported here, where every caller
+ * already looks for it: `headlessAgentRunner.ts` applies the same narrowing to
+ * an evaluation arm and cannot import this module.
  */
-export function allowedToolsRestriction(
-  invokedCommands: ReadonlySet<string>,
-  availableSkills: SlashSkill[],
-): ReadonlySet<string> | null {
-  const invoked = availableSkills.filter((candidate) => invokedCommands.has(candidate.command));
-  if (invoked.length === 0 || invoked.some((candidate) => !candidate.allowedTools || candidate.allowedTools.length === 0)) {
-    return null;
-  }
-  return new Set(invoked.flatMap((candidate) => candidate.allowedTools ?? []));
-}
-
-/**
- * Applies `allowedToolsRestriction`'s result (if any) to a per-turn tool
- * list — the `skill` tool itself always stays offered even under a
- * restrictive list (deliberate exception): this app stacks up to
- * `MAX_SKILLS_PER_TURN` skills per turn (unlike a single-skill-at-a-time
- * model), so a restrictive skill must never strand the model unable to
- * invoke a different, less-restricted one.
- */
-export function applyAllowedToolsRestriction(tools: ToolDef[], restriction: ReadonlySet<string> | null): ToolDef[] {
-  if (restriction === null) return tools;
-  return tools.filter((tool) => tool.function.name === 'skill' || restriction.has(tool.function.name));
-}
+export { allowedToolsRestriction, applyAllowedToolsRestriction };
 
 /** Minimal shape `attachedStackPromptInfo` needs from a `stackStore.ts`
  * `KnowledgeStack` — kept local (rather than importing the full interface)
@@ -895,6 +913,53 @@ function buildVerifyOutput(result: VerifyRunResult): string {
   return `… (truncated)\n${combined.slice(combined.length - VERIFY_NOTICE_OUTPUT_CAP)}`;
 }
 
+/**
+ * Runs the workspace's own configured verification commands inside one
+ * learning-evaluation sandbox, and reports whether they passed.
+ *
+ * Same config and same Rust runner the ordinary post-turn phase uses — only
+ * the working directory differs, and Rust accepts that directory only for a
+ * marker-verified sandbox this app created. `null` means the workspace has no
+ * verification configured, which is reported as "no result", never as a pass:
+ * an evaluation may not claim a verification that never ran.
+ */
+export async function runSandboxVerification(
+  sandboxPath: string,
+  turnId: string,
+  signal?: AbortSignal,
+  workspacePath?: string,
+): Promise<{ passed: boolean; detail: string } | null> {
+  let config: VerifyConfig;
+  try {
+    // The commands of the workspace this sandbox is a copy of, which is not
+    // necessarily the one open right now — a candidate learned in A can be
+    // evaluated from B, or with nothing open. `verify_run` independently
+    // derives the same workspace from the sandbox's own marker, so a wrong
+    // value here cannot make it execute another workspace's commands.
+    config = await invoke<VerifyConfig>('verify_get_config', { workspacePath });
+  } catch {
+    return null;
+  }
+  const enabled = config.commands.filter((command) => command.enabled);
+  if (enabled.length === 0) return null;
+  for (const command of enabled) {
+    if (signal?.aborted) return null;
+    try {
+      const result = await invoke<VerifyRunResult>('verify_run', {
+        commandId: command.id,
+        turnId,
+        sandboxPath,
+      });
+      if (result.timedOut || result.code !== 0) {
+        return { passed: false, detail: `${result.label}: ${buildVerifyOutput(result).slice(0, 400)}` };
+      }
+    } catch (err) {
+      return { passed: false, detail: `${command.label}: ${errorMessage(err)}` };
+    }
+  }
+  return { passed: true, detail: `${enabled.length} verification command(s) passed` };
+}
+
 /** The first failed command from a `runVerificationPhase` pass — enough
  * detail to build the feed-back-to-the-model fix instruction in
  * `runAgentTurnBody`. `null` when every command passed (or none ran). */
@@ -1111,10 +1176,10 @@ export async function compactSessionNow(sessionId: string): Promise<{ changed: b
           });
         } else {
           summaryMessages = gated.messages;
-          if (gated.newlyRedactedFindings > 0) {
+          if (gated.newlyRedacted.length > 0) {
             useSessionStore.getState().addMessage(sessionId, {
               role: 'system',
-              content: `${PRIVACY_NOTE_PREFIX} Redacted ${gated.newlyRedactedFindings} sensitive item(s) before cloud summarization.`,
+              content: `${PRIVACY_NOTE_PREFIX} Redacted ${gated.newlyRedacted.length} sensitive item(s) before cloud summarization: ${describeRedactions(gated.newlyRedacted)}.`,
             });
           }
         }
@@ -1427,19 +1492,80 @@ const cancellationDisposers = new Map<AbortController, Array<() => void>>();
  * around the wait. */
 const chatTurnProcesses = new Map<string, string>();
 
-function registerDurableController(runId: string, controller: AbortController): void {
+/** Registers `runId` as cancellable through `controller`, and — same call,
+ * same lifetime — as belonging to `sessionId`, so a permission prompt
+ * arriving from Rust under that id can be attributed to the conversation it
+ * blocks (`sessionStore.turnSessions`). The two are registered together
+ * because they answer the same question about the same ids: every id a
+ * durable run can be cancelled by is an id a prompt can arrive under —
+ * this turn's own, a daemon run's, a failover's fresh recorder run. Both
+ * are released by the same disposer list in `runAgentTurn`'s finally. */
+function registerDurableController(
+  runId: string,
+  controller: AbortController,
+  sessionId: string,
+): void {
   const dispose = registerRunCancellation(runId, () => {
     externallyRequestedCancellations.add(runId);
     controller.abort();
   });
+  useSessionStore.getState().markTurnSession(runId, sessionId);
   const existing = cancellationDisposers.get(controller) ?? [];
-  existing.push(dispose);
+  existing.push(dispose, () => useSessionStore.getState().markTurnSession(runId, null));
   cancellationDisposers.set(controller, existing);
 }
 
 interface DurableTurnContext {
   recorder: DurableRunRecorder | null;
   failure: string | null;
+  /** One-shot model call for the bounded learning reflection pass, built by
+   * `runAgentTurnBody` (which owns the resolved target and the privacy gate)
+   * and consumed by `runAgentTurn`'s `finally` — the learning step can only
+   * run once the durable run is COMPLETE, because the backend classifies the
+   * signal from that run's own terminal events. `null` when the turn never
+   * got as far as resolving a target. */
+  reflect: ReflectionCall | null;
+  /** This turn's live skill context. Held by reference (not a copy) because
+   * `invokedCommands` is mutated in place as the turn runs, so
+   * `runAgentTurn`'s `finally` sees every skill the turn ended up using no
+   * matter which of this loop's early returns it took. */
+  skills: SkillToolContext | null;
+  /** Failing tool results this turn produced, classified exactly as the
+   * durable recorder classifies them. Part of a learned skill's effectiveness
+   * record, and the reason a turn that "completed" with three failed tool
+   * calls is not counted as a success for the skill it used. */
+  toolFailures: string[];
+}
+
+/** Cap on the failing tool results carried into a learned skill's
+ * effectiveness record — the record is a signal, not a log. */
+const MAX_RECORDED_TOOL_FAILURES = 8;
+
+/**
+ * One invoked native skill, paired with the exact content hash it was frozen
+ * at. Local prompt skills and signed packages are excluded: neither can be a
+ * learned skill, and neither carries a content hash an outcome could be
+ * attributed to.
+ *
+ * Scope comes from the descriptor id `nativeSkills` built (`native:<scope>:…`)
+ * rather than from a second lookup, so it always agrees with the root the
+ * skill was actually discovered in.
+ */
+export function skillUse(skill: SlashSkill): InvokedSkillUse | null {
+  if (skill.source !== 'native') return null;
+  const scope = skill.id.split(':')[1];
+  if (scope !== 'global' && scope !== 'workspace') return null;
+  return { command: skill.command, scope, sha256: skill.contentSha256 };
+}
+
+/** Writes the durable `skill_invoked` event for one invocation. The run's own
+ * record of WHICH version it ran — the only thing a later effectiveness,
+ * correction or regression judgement can honestly be keyed to, since the
+ * installed version can have moved on (or been rolled back) by then. */
+function recordSkillInvocation(durable: DurableTurnContext, skill: SlashSkill): void {
+  const use = skillUse(skill);
+  if (!use) return;
+  durable.recorder?.recordSkillInvoked(use.command, use.scope, use.sha256);
 }
 
 /** Aborts the in-flight turn for `sessionId`, if any. The panes' Stop
@@ -1490,6 +1616,12 @@ export async function runAgentTurn(
   // transcript, because whoever reads the continuation is the person who needs
   // to know what a resume does not reproduce.
   resume: ResumedTurn | null = null,
+  // Which of the operator's own surfaces this turn was made on. `voice` is a
+  // finalized hands-free utterance the companion overlay auto-sent; everything
+  // else is the composer. Both are the operator, both take the same durable
+  // ingress path, and the value only decides how the turn is labelled in the
+  // ingress listing — see `ConversationSource` on the Rust side.
+  origin: DesktopTurnSource = 'desktop',
 ): Promise<void> {
   // Hard invariant: at most one turn per session, ever. Two turns streaming
   // into one transcript interleave their `updateLastMessage` patches and
@@ -1505,7 +1637,7 @@ export async function runAgentTurn(
     else signal.addEventListener('abort', () => controller.abort(), { once: true });
   }
   turnControllers.set(sessionId, controller);
-  registerDurableController(turnId, controller);
+  registerDurableController(turnId, controller, sessionId);
   useSessionStore.getState().markTurnRunning(sessionId, true);
   useTurnStatusStore.getState().begin(sessionId);
   const startedAt = Date.now();
@@ -1526,6 +1658,15 @@ export async function runAgentTurn(
   }
   let turnError: unknown;
   try {
+    // A resume is settled before it gets here: the backend already holds the
+    // continuation, so there is nothing left to route, gate or preflight. Asking
+    // `daemonDesktopRoute` again would only add a way for an accepted
+    // continuation to go unwatched because the runner's health changed in the
+    // second between accepting it and attaching to it.
+    if (resume !== null) {
+      await watchResumedDesktopTurn(sessionId, resume, controller, origin);
+      return;
+    }
     const mutationRequired = requiresWorkspaceMutation(
       userText,
       usePermissionStore.getState().mode,
@@ -1563,16 +1704,38 @@ export async function runAgentTurn(
     }
 
     const route = await daemonDesktopRoute();
-    // The resident runner has its own natural-exit loop and cannot yet prove
-    // that a requested write happened. Keep explicit mutation turns on the
-    // in-process desktop loop, where the bounded corrective retry and
-    // mutation-success guard below are enforced.
-    // A resumed turn stays on the in-process loop whatever the route says: the
-    // image it is continuing was written by this loop's own checkpoint, and the
-    // daemon path composes its history Rust-side from a task string it was never
-    // given here.
-    if (route === 'daemon' && !mutationRequired && resume === null) {
-      await runDaemonAgentTurn(sessionId, userText, attachments, controller.signal, turnId, skillInvocations);
+    // Every conversational turn this surface accepts becomes a durable ingress
+    // turn before any agent runs — whatever the turn is.
+    //
+    // There used to be two exceptions here, and both were execution bypasses
+    // rather than features. A turn classified as workspace-mutating stayed local
+    // because only this loop could tell whether a write happened; that proof now
+    // comes from the runtime, and the corrective attempt it justified is a
+    // durable continuation the backend owns (`workspace_mutation_required` in
+    // `daemonDesktopTurn.ts`, and `channels::mutation` on the Rust side). A
+    // resumed turn stayed local because its image was written here; a resume is
+    // now a durable continuation of the accepted turn the image belongs to,
+    // executed from the context frozen when that turn was accepted rather than
+    // from whatever this process is configured with at resume time.
+    //
+    // `browser` is not an exception to that rule either: it is the one
+    // configuration in which no durable execution authority can exist on the
+    // machine at all — a dev profile with no Tauri bridge. There is nothing to
+    // hand the turn to there, so the in-process loop is the only thing that can
+    // run it. A packaged desktop never reaches it: `daemonDesktopRoute` refuses
+    // rather than routing a turn away from a runner that is missing, stopped,
+    // stale or kill-switched, and `runTurnGuarded` refuses again on its own.
+    if (route === 'daemon') {
+      await runDaemonAgentTurn(
+        sessionId,
+        userText,
+        attachments,
+        controller.signal,
+        turnId,
+        skillInvocations,
+        origin,
+        mutationRequired,
+      );
     } else {
       await runTurnGuarded(
         sessionId,
@@ -1584,7 +1747,7 @@ export async function runAgentTurn(
         availableSkills,
         ultracode,
         mutationRequired,
-        resume,
+        route,
       );
     }
   } catch (error) {
@@ -1598,6 +1761,12 @@ export async function runAgentTurn(
     chatTurnProcesses.delete(turnId);
     forgetPause(turnId);
     useSessionStore.getState().markTurnRunning(sessionId, false);
+    // Badge the sidebar row for a session the user has navigated away from.
+    // A cancelled turn records nothing: the user pressed Stop, so there is
+    // no outcome to go back and look at.
+    if (!controller.signal.aborted) {
+      useSessionStore.getState().noteTurnOutcome(sessionId, turnError ? 'error' : 'done');
+    }
     useTurnStatusStore.getState().end(sessionId);
     useUsageHistoryStore.getState().recordTurnCompleted(Date.now() - startedAt);
     if (processId) {
@@ -1666,6 +1835,58 @@ async function attachDaemonTurnToChat(
   }
 }
 
+/**
+ * Attach the transcript to a resumed turn the backend has already accepted.
+ *
+ * Nothing here resolves configuration, nothing here executes, and — since the
+ * lifecycle was straightened out — nothing here *submits* either. The
+ * continuation was accepted before its caller retired anything, because a turn
+ * this loop had to reach the backend for would be a turn whose frozen image had
+ * to be destroyed first to know whether the resume worked. So the submission
+ * belongs to `frozenTurn.ts`, which owns the image, and what is left here is
+ * watching: the run inherits the execution context frozen when the *parent* turn
+ * was accepted — the recipe, model, workspace and permission mode of then, not
+ * of now — and this process only learns which run that is.
+ */
+async function watchResumedDesktopTurn(
+  sessionId: string,
+  resume: ResumedTurn,
+  controller: AbortController,
+  origin: DesktopTurnSource,
+): Promise<void> {
+  const store = useSessionStore.getState();
+  // The caveats are the whole reason `checkpoint_restorability` returns them: a
+  // resumed turn is a fresh generation from the frozen point, not a replay, and
+  // the transcript is where the person reading the continuation will be.
+  store.addMessage(sessionId, {
+    role: 'system',
+    content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join('\n'),
+  });
+  void reconcileProcess({
+    kind: 'daemon_job',
+    externalId: resume.accepted.jobId,
+    state: 'admitted',
+    parentKind: 'chat_turn',
+    parentExternalId: resume.parentTurnId,
+  });
+  const assistantIndex = sessionMessages(sessionId).length;
+  store.addMessage(sessionId, { role: 'assistant', content: '⏳ Continuing the frozen turn…' });
+  const link: ActiveDaemonDesktopTurn = {
+    sessionId,
+    // The continuation's own identity is the backend's; what this link needs is
+    // the accepted turn it belongs to, so a reconnect asks about the same turn.
+    turnId: resume.parentTurnId,
+    runId: resume.accepted.runId,
+    assistantIndex,
+    lastSequence: 0,
+    output: '',
+    source: origin,
+  };
+  saveActiveDaemonTurn(link);
+  registerDurableController(resume.accepted.runId, controller, sessionId);
+  await attachDaemonTurnToChat(link, controller);
+}
+
 async function runDaemonAgentTurn(
   sessionId: string,
   userText: string,
@@ -1673,6 +1894,8 @@ async function runDaemonAgentTurn(
   signal: AbortSignal,
   turnId: string,
   skillInvocations: SkillInvocationSnapshot[],
+  origin: DesktopTurnSource,
+  mutationRequired: boolean,
 ): Promise<void> {
   const store = useSessionStore.getState();
   const priorMessages = sessionMessages(sessionId);
@@ -1808,10 +2031,10 @@ async function runDaemonAgentTurn(
           privacyOutcome.messages[historyLength + index]?.content ?? '',
         ),
       }));
-      if (privacyOutcome.newlyRedactedFindings > 0) {
+      if (privacyOutcome.newlyRedacted.length > 0) {
         store.addMessage(sessionId, {
           role: 'system',
-          content: `${PRIVACY_NOTE_PREFIX} Redacted ${privacyOutcome.newlyRedactedFindings} sensitive item(s) from the resident turn snapshot before cloud submission.`,
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${privacyOutcome.newlyRedacted.length} sensitive item(s) from the resident turn snapshot before cloud submission: ${describeRedactions(privacyOutcome.newlyRedacted)}.`,
         });
       }
     }
@@ -1879,8 +2102,9 @@ async function runDaemonAgentTurn(
     attachedStackIds,
     attachedStackNames: attachedStacks.map((stack) => stack.name),
     attachments: frozenAttachments,
+    workspaceMutationRequired: mutationRequired,
   });
-  const queued = await submitDaemonDesktopTurn(turnId, recipe);
+  const queued = await submitDaemonDesktopTurn(turnId, recipe, origin);
   // Create the daemon job's process record here, with this turn as its parent.
   // The daemon's own per-tick reconcile then finds this record and only moves
   // its state, which is how the lineage edge survives crossing the process
@@ -1915,11 +2139,12 @@ async function runDaemonAgentTurn(
     assistantIndex,
     lastSequence: 0,
     output: '',
+    source: origin,
   };
   saveActiveDaemonTurn(link);
   const controller = turnControllers.get(sessionId);
   if (!controller) throw new Error('Desktop turn controller disappeared before daemon attach.');
-  registerDurableController(queued.run_id, controller);
+  registerDurableController(queued.run_id, controller, sessionId);
   await attachDaemonTurnToChat(link, controller);
   maybeAutoPreviewNewestArtifact(sessionId, anchorIndex);
 }
@@ -1937,7 +2162,7 @@ export function recoverDaemonDesktopTurns(): void {
     const controller = new AbortController();
     turnControllers.set(link.sessionId, controller);
     useSessionStore.getState().markTurnRunning(link.sessionId, true);
-    registerDurableController(link.runId, controller);
+    registerDurableController(link.runId, controller, link.sessionId);
     void attachDaemonTurnToChat(link, controller).finally(() => {
       turnControllers.delete(link.sessionId);
       cancellationDisposers.get(controller)?.forEach((dispose) => dispose());
@@ -1983,7 +2208,18 @@ export function maybeAutoPreviewNewestArtifact(sessionId: string, anchorIndex: n
 }
 
 /** `runAgentTurn` minus the per-session turn registration — the checkpoint
- * lifecycle half of the wrapper. */
+ * lifecycle half of the wrapper.
+ *
+ * This is the in-process conversational loop, and the two checks below are what
+ * keep it from being one on the desktop. It runs a user's turn inside the
+ * webview, which is only defensible where nothing else on the machine can: a
+ * profile with no Tauri bridge. Anywhere the bridge exists, a durable execution
+ * authority is reachable and every accepted turn belongs to it.
+ *
+ * The environment is checked here and not only at the caller on purpose. Routing
+ * already refuses, so this second check is dead code today — which is the point:
+ * it is what a future caller that skips `daemonDesktopRoute` hits, so
+ * reintroducing the bypass takes deleting a guard rather than forgetting one. */
 async function runTurnGuarded(
   sessionId: string,
   userText: string,
@@ -1994,8 +2230,13 @@ async function runTurnGuarded(
   availableSkills: SlashSkill[] = [],
   ultracode = false,
   mutationRequired = false,
-  resume: ResumedTurn | null = null,
+  route: ConversationRoute = 'browser',
 ): Promise<void> {
+  if (route !== 'browser' || isTauri()) {
+    throw new Error(
+      'A conversational turn cannot be executed in the app process. The resident runner owns desktop execution.',
+    );
+  }
   // The index this turn's user message will land at — captured before
   // `addMessage` so it can anchor a later "Rewind conversation" back to the
   // state just before this turn.
@@ -2005,20 +2246,11 @@ async function runTurnGuarded(
   // in the turn body does async file/image reads) — if there's at least one
   // image, it's promoted in place, right after, to a `ChatContentPart[]` so
   // the chat UI actually shows what was attached, not just what was typed.
-  if (resume === null) {
-    useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
-  } else {
-    // The caveats are the whole reason `checkpoint_restorability` returns them
-    // rather than a doc holding them: a resumed turn is a fresh generation from
-    // the frozen point, not a replay of the one that was interrupted, and the
-    // transcript is where the person reading the continuation will be.
-    useSessionStore.getState().addMessage(sessionId, {
-      role: 'system',
-      content: [`${RESUME_NOTE_PREFIX} Resumed from a frozen image.`, ...resume.determinismCaveats].join(
-        '\n',
-      ),
-    });
-  }
+  // No resume arm here, and that absence is load-bearing: a resumed turn is a
+  // continuation of one the durable backend accepted, so it is watched
+  // (`watchResumedDesktopTurn`) and never executed in this process. This
+  // function is only reachable where no durable authority can exist at all.
+  useSessionStore.getState().addMessage(sessionId, { role: 'user', content: userText });
 
   // Open a per-turn file checkpoint (see src-tauri/src/checkpoints.rs) so
   // every write_file/edit_file this turn makes can be reverted in one click.
@@ -2038,7 +2270,7 @@ async function runTurnGuarded(
   }).catch(() => null);
   // Distinct from checkpointId (which can be null): scopes shell,
   // cancellation, permission prompts, and durable run events to this turn.
-  const durable: DurableTurnContext = { recorder: null, failure: null };
+  const durable: DurableTurnContext = { recorder: null, failure: null, reflect: null, skills: null, toolFailures: [] };
   let thrown: unknown = null;
   try {
     await runAgentTurnBody(
@@ -2091,6 +2323,7 @@ async function runTurnGuarded(
           console.error('Failed to record cancellation request', error),
         );
       }
+      const cleanlyCompleted = !signal.aborted && thrown === null && durable.failure === null;
       const terminal = signal.aborted
         ? durable.recorder.cancel('Stopped by the user')
         : thrown !== null
@@ -2099,6 +2332,34 @@ async function runTurnGuarded(
             ? durable.recorder.fail(new Error(durable.failure), true)
             : durable.recorder.complete('Desktop turn completed');
       await terminal.catch((error) => console.error('Failed to finalize durable run', error));
+
+      // Learning runs strictly AFTER the run is durably complete.
+      //
+      // Effectiveness is finalized for EVERY terminal state — a failed or
+      // cancelled turn that used a learned skill is exactly the turn its
+      // history most needs — and the backend reads which versions the run
+      // used from the run's own durable events, so nothing here names a hash.
+      // Detection is the narrower half: only a run that actually completed
+      // can be a candidate. Everything is best-effort — a turn that already
+      // succeeded must never surface a learning failure as its own.
+      await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
+      if (cleanlyCompleted && durable.reflect !== null) {
+        const scope: NativeSkillScope =
+          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
+        const candidate = await learnFromFinishedRun(
+          durable.recorder.runId,
+          userText,
+          scope,
+          durable.reflect,
+          signal,
+        );
+        if (candidate) {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatLearningNotice(candidateNotice(candidate)),
+          });
+        }
+      }
     }
   }
 }
@@ -2276,12 +2537,12 @@ async function runAgentTurnBody(
       // the same approval twice.
       privacyWireCache.set(composedText, { content: gate.content });
       if (gate.content !== composedText) {
-        const redactedCount = gate.report.findings.filter(
+        const redacted = gate.report.findings.filter(
           (finding) => finding.action !== 'allow' && !finding.exempted,
-        ).length;
+        );
         addMessage({
           role: 'system',
-          content: `${PRIVACY_NOTE_PREFIX} Redacted ${redactedCount} sensitive item(s) before sending to ${targetLabel(primaryTarget)}.`,
+          content: `${PRIVACY_NOTE_PREFIX} Redacted ${redacted.length} sensitive item(s) before sending to ${targetLabel(primaryTarget)}: ${describeRedactions(redacted)}.`,
         });
         wireContent = toMessageContent(gate.content, images);
       }
@@ -2423,7 +2684,7 @@ async function runAgentTurnBody(
     });
     if (durable.recorder) {
       const controller = turnControllers.get(sessionId);
-      if (controller) registerDurableController(durable.recorder.runId, controller);
+      if (controller) registerDurableController(durable.recorder.runId, controller, sessionId);
     }
     return local;
   };
@@ -2491,10 +2752,10 @@ async function runAgentTurnBody(
       const local = await switchTurnToLocalForPrivacy(candidate);
       return local ? { target: local, messages } : null;
     }
-    if (outcome.newlyRedactedFindings > 0) {
+    if (outcome.newlyRedacted.length > 0) {
       addMessage({
         role: 'system',
-        content: `${PRIVACY_NOTE_PREFIX} Redacted ${outcome.newlyRedactedFindings} sensitive item(s) from protected context before sending to ${targetLabel(candidate)}.`,
+        content: `${PRIVACY_NOTE_PREFIX} Redacted ${outcome.newlyRedacted.length} sensitive item(s) from protected context before sending to ${targetLabel(candidate)}: ${describeRedactions(outcome.newlyRedacted)}.`,
       });
     }
     surfaceRateLimitWarnings(candidate);
@@ -2516,6 +2777,7 @@ async function runAgentTurnBody(
   // this turn's model was already offered, so it's threaded through to
   // `executeToolCall` explicitly rather than read back out of shared state.
   const { defs: mcpDefs, registry: mcpRegistry } = mcpToolDefs();
+  const { defs: extensionDefs, registry: extensionRegistry } = await executableExtensionToolDefs();
 
   // This session's attached knowledge stacks (see `ChatSession.attachedStackIds`,
   // `StackPicker.tsx`), resolved against the current stack registry once per
@@ -2579,7 +2841,15 @@ async function runAgentTurnBody(
     availableSkills,
     invokedCommands: invokedSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    runId: durable.recorder?.runId,
+    onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
+  durable.skills = skillToolContext;
+  // Explicit `/command` invocations are already frozen into the system prompt
+  // by the time the loop starts, so they are recorded here rather than through
+  // `onInvoked` — the event has to name every version this run used, not only
+  // the ones the model picked itself.
+  for (const invocation of skillInvocations) recordSkillInvocation(durable, invocation.skill);
   const skillToolEnabled =
     settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
@@ -2589,7 +2859,7 @@ async function runAgentTurnBody(
   // offer it). The result lives in private app storage, not the workspace,
   // so it has no edit-permission or selected-folder dependency.
   const baseToolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs], mode),
+    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
     settings.memoryEnabled,
     settings.webToolsEnabled,
     // Ultracode force-offers the `task` tool even when the subagents toggle
@@ -2598,6 +2868,10 @@ async function runAgentTurnBody(
     settings.subagentsEnabled || ultracode,
     skillToolEnabled,
     readSkillResourceToolEnabled,
+    // The learning tool is a capability, so an unknown backend mode means
+    // "not offered" — see `cachedLearningMode`. It also needs a durable run:
+    // without one there is no evidence chain for a proposal to append to.
+    cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
   );
 
   const sendForSummary = async (dropped: ChatMessage[]): Promise<string> => {
@@ -2677,6 +2951,34 @@ async function runAgentTurnBody(
         },
         signal
       ),
+  };
+
+  // The bounded learning reflection pass shares `sendForSummary`/`classify`'s
+  // exact transport — one non-streaming, privacy-gated call against this
+  // turn's own target — and is stashed on the durable context because it can
+  // only run once `runAgentTurn`'s `finally` has completed the run.
+  durable.reflect = async (reflectionMessages, reflectionTools, reflectionSignal) => {
+    const prepared = await privacyGateWireForTarget(target, reflectionMessages);
+    if (!prepared) {
+      throw new Error('Privacy Firewall cancelled the learning reflection.');
+    }
+    const result = await attemptStream(
+      prepared.target,
+      prepared.messages,
+      reflectionTools,
+      reflectionSignal,
+      effort,
+      sessionId,
+      undefined,
+      true,
+      undefined,
+      durable.recorder?.runId,
+      // Side-channel work, like the risk judge — kept out of the turn's own
+      // token status line.
+      false,
+      { preGated: true },
+    );
+    return { content: result.content, toolCalls: result.toolCalls, streamError: result.streamError };
   };
 
   // Absolute paths this turn's `write_file`/`edit_file` calls have
@@ -2945,7 +3247,7 @@ async function runAgentTurnBody(
       });
       if (durable.recorder) {
         const controller = turnControllers.get(sessionId);
-        if (controller) registerDurableController(durable.recorder.runId, controller);
+        if (controller) registerDurableController(durable.recorder.runId, controller, sessionId);
       }
       applyTargetSwitch(target);
       removeLastMessage();
@@ -3109,6 +3411,20 @@ async function runAgentTurnBody(
           Date.now() - toolStartedAt,
           result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
         );
+        // Failing results are also this turn's evidence about any learned
+        // skill it invoked (see `recordSkillUses`). Classified the same way
+        // `durableRun.ts`'s `resultOutcome` classifies it, and bounded so a
+        // pathological round cannot grow the record without limit.
+        if (result !== CANCELLED_TOOL_RESULT && durable.toolFailures.length < MAX_RECORDED_TOOL_FAILURES) {
+          try {
+            const parsed = JSON.parse(result) as { error?: unknown };
+            if (parsed && typeof parsed === 'object' && parsed.error) {
+              durable.toolFailures.push(`${toolCall.function.name}: ${String(parsed.error).slice(0, 200)}`);
+            }
+          } catch {
+            // A plain-text tool result is a success — nothing to record.
+          }
+        }
         return result;
       };
       // Reject (without executing) any call whose name wasn't actually
@@ -3182,6 +3498,8 @@ async function runAgentTurnBody(
         undefined,
         skillToolContext,
         sessionId,
+        undefined,
+        extensionRegistry,
       );
       return finishObservedTool(result);
     });
@@ -3194,7 +3512,7 @@ async function runAgentTurnBody(
       const modelResultContent = protectToolResult(
         toolCall.function.name,
         resultContent,
-        mcpRegistry.has(toolCall.function.name),
+        mcpRegistry.has(toolCall.function.name) || extensionRegistry.has(toolCall.function.name),
       );
       const toolMessage: ChatMessage = {
         role: 'tool',

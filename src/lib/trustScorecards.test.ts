@@ -93,7 +93,7 @@ describe("trustScorecards", () => {
   });
 
   describe("scoreProviderModel", () => {
-    const provider: ProviderConfig = { id: "openai", label: "OpenAI", base_url: "https://api.openai.com", is_custom: false, has_key: true };
+    const provider: ProviderConfig = { id: "openai", label: "OpenAI", base_url: "https://api.openai.com", is_custom: false, has_key: true, is_extension: false };
 
     it("marks cloud provider models fair on privacy (data leaves device) and good security when a key is stored", () => {
       const card = scoreProviderModel(provider, "gpt-4o", emptyUsage, {});

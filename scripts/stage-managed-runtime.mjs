@@ -28,10 +28,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { hostTriple } from "./lib/cliSidecarPlaceholder.mjs";
+import { managedRuntimeArchiveExtractor } from "./lib/managedRuntimeArchive.mjs";
 import {
   managedRuntime,
   serverFileName,
@@ -139,11 +140,10 @@ try {
   // archive"), so zips go through unzip everywhere except Windows, whose
   // images have no unzip. Passing each argument separately avoids a shell and
   // keeps archive paths inert.
-  const [extractCommand, extractArgs] =
-    extname(archivePath).toLowerCase() === ".zip" &&
-    process.platform !== "win32"
-      ? ["unzip", ["-q", archivePath, "-d", extractRoot]]
-      : ["tar", ["-xf", archivePath, "-C", extractRoot]];
+  const [extractCommand, extractArgs] = managedRuntimeArchiveExtractor(
+    archivePath,
+    extractRoot,
+  );
   execFileSync(extractCommand, extractArgs, { stdio: "inherit" });
 
   const candidates = [];

@@ -73,6 +73,14 @@ export interface RawBackpressure {
   held: number;
 }
 
+/** What one `daemonEnsure` call did. `healthy` means the service was already
+ * installed, current and running, so nothing was touched. */
+export interface DaemonEnsureResult {
+  action: "healthy" | "installed" | "reinstalled" | "started";
+  installed: boolean;
+  service_running: boolean;
+}
+
 export interface DaemonInstallRequest {
   concurrency: number;
   maxQueue: number;
@@ -101,6 +109,10 @@ export interface DaemonQueueRequest {
 export interface DaemonTurnSubmitRequest {
   turnId: string;
   recipe: unknown;
+  /** Which of the operator's own surfaces this turn came from. Both take the
+   * same durable ingress path; the difference is what the ingress listing
+   * shows. Omitted means the chat composer. */
+  source?: "desktop" | "voice";
 }
 
 export interface DaemonTurnSubmitResponse {
@@ -126,6 +138,9 @@ export interface RemotePairRequest {
   /** First-party mobile-companion grants. Additive to `actions` and never
    * widening the run scope; omitted/empty means a runner-only controller. */
   mobileCapabilities?: string[];
+  /** Grants over the device's own hardware. Omitted/empty means this runner
+   * can ask the device for nothing physical, whatever it advertises. */
+  deviceCapabilities?: string[];
 }
 
 export const MAX_REMOTE_ARTIFACT_BYTES = 32 * 1024 * 1024;
@@ -153,6 +168,15 @@ const MOBILE_CAPABILITIES = new Set([
 
 export const daemonStatus = () => invoke<DaemonStatus>("daemon_desktop_status");
 export const daemonInstall = (request: DaemonInstallRequest) => invoke<string>("daemon_desktop_install", { request });
+/**
+ * Brings the resident execution service to a usable state and reports what
+ * that took.
+ *
+ * Idempotent: `healthy` means it did nothing. The app already runs this at
+ * launch, so a caller here is a repair — chat's Repair action, or the manual
+ * one in Background Agents — not the normal way the service comes up.
+ */
+export const daemonEnsure = () => invoke<DaemonEnsureResult>("daemon_desktop_ensure");
 export const daemonStart = () => invoke<string>("daemon_desktop_start");
 export const daemonStop = () => invoke<string>("daemon_desktop_stop");
 export const daemonUninstall = (purgeState = false) => invoke<string>("daemon_desktop_uninstall", { purgeState });
@@ -169,11 +193,166 @@ export const daemonDesktopTurnSubmit = (request: DaemonTurnSubmitRequest) =>
 export const remoteHostStatus = () => invoke<Record<string, unknown> | null>("remote_host_status");
 export const remoteHostConfigure = (request: RemoteHostConfigureRequest) => invoke<string>("remote_host_configure", { request });
 export const remoteHostDisable = () => invoke<string>("remote_host_disable");
-export const remotePairCreate = (request: RemotePairRequest) => invoke<string>("remote_pair_create", { request });
+/** What one created invitation gives the pairing panel.
+ *
+ * The compact bootstrap is returned beside the file because both are the *same*
+ * one-time token: an operator who scans the code and an operator who transfers
+ * the JSON are doing the same pairing, and asking for the code afterwards would
+ * mean creating a second invitation and stranding the first. `qr_svg` is a
+ * self-contained SVG document with its own quiet zone — the node renders it so
+ * the module geometry has one implementation. */
+export interface RemotePairCreated {
+  invitation_path: string;
+  controller_url: string;
+  expires_at_ms: number;
+  /** `littlemonkey://pair/…` — the same string the code encodes, for pasting. */
+  bootstrap_uri: string;
+  bootstrap_bytes: number;
+  qr_svg: string;
+  qr_modules: number;
+}
+
+export const remotePairCreate = (request: RemotePairRequest) => invoke<RemotePairCreated>("remote_pair_create", { request });
 export const remotePairList = () => invoke<string>("remote_pair_list");
 export const remotePairRevoke = (deviceId: string, reason: string) => invoke<string>("remote_pair_revoke", { deviceId, reason });
 export const remotePairRotate = (deviceId: string, output: string) => invoke<string>("remote_pair_rotate", { deviceId, output });
 export const remoteAudit = (limit = 100) => invoke<unknown>("remote_audit", { limit });
+
+/** Whether this runner can wake a phone, and which devices registered for it.
+ *
+ * Every field describes the operator's own configuration: Little Monkey ships
+ * no push project, no key and no relay. `application_server_key` is the public
+ * half of a VAPID identity this runner minted itself — never the private half,
+ * which stays in the system keychain, and never a device token, which is an
+ * address rather than a diagnostic. */
+export interface RemotePushStatus {
+  configured: boolean;
+  enabled: boolean;
+  /** `web_push` | `fcm_http_v1`, or `null` when nothing is configured. */
+  backend: string | null;
+  project_id: string | null;
+  application_server_key: string | null;
+  include_detail: boolean;
+  registered_devices: { device_id: string; backend: string }[];
+}
+
+export interface RemotePushConfigureRequest {
+  /** Mint this runner's own VAPID identity — no account with anyone. */
+  webPush: boolean;
+  vapidSubject?: string | null;
+  projectId?: string | null;
+  serviceAccount?: string | null;
+  /** Let a notification carry run and message specifics onto a lock screen. */
+  includeDetail: boolean;
+}
+
+export const remotePushStatus = () => invoke<RemotePushStatus>("remote_push_status");
+export const remotePushConfigure = (request: RemotePushConfigureRequest) =>
+  invoke<string>("remote_push_configure", {
+    webPush: request.webPush,
+    vapidSubject: request.vapidSubject ?? null,
+    projectId: request.projectId ?? null,
+    serviceAccount: request.serviceAccount ?? null,
+    includeDetail: request.includeDetail,
+  });
+export const remotePushDisable = () => invoke<string>("remote_push_disable");
+export const remotePushTest = (deviceId: string) => invoke<string>("remote_push_test", { deviceId });
+
+/** Physical capabilities an operator may grant a paired device over its own
+ * hardware — see `protocol::PHYSICAL_DEVICE_CAPABILITIES` on the node. Ordered
+ * weakest-first, matching the CLI's own picker order. */
+export const DEVICE_CAPABILITIES = [
+  "device_info",
+  "notification_post",
+  "location_read",
+  "audio_playback",
+  "camera_capture",
+  "microphone_capture",
+  "screen_capture",
+  "voice_stream",
+] as const;
+
+/** One command queued for a device, as `device-list`/`device-commands` report it. */
+export interface RemoteDeviceCommandRow {
+  command_id: string;
+  device_id: string;
+  capability: string;
+  /** `queued` | `leased` | `running` | `succeeded` | `failed` | `cancelled` | `expired`. */
+  state: string;
+  attempt: number;
+  cancel_requested: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+  expires_at_ms: number;
+  source_run_id: string | null;
+  /** Which attempt owns a running command. A reconnect resuming the same
+   * execution keeps this id; a second one is never authorized. */
+  execution_id: string | null;
+  artifact: { sha256: string; bytes: number; media_type: string } | null;
+  error: string | null;
+}
+
+/** One physical capability, with the four axes kept apart.
+ *
+ * `blocked_by` is the single reason it is not effective — `not_granted`,
+ * `unsupported`, `permission_required`, `permission_denied`,
+ * `foreground_required`, `interaction_required`, `screen_capture_not_armed`,
+ * `unavailable` or `no_surface` — and `reason` is that reason in words the
+ * operator can act on. */
+export interface RemoteDevicePhysicalRow {
+  capability: string;
+  granted: boolean;
+  supported: boolean;
+  /** `granted` | `denied` | `promptable` | `not_required` | `unsupported` |
+   * `undetermined`, or `null` before the device has advertised anything. */
+  permission: string | null;
+  /** `ready` | `foreground_required` | `interaction_required` |
+   * `armed_required` | `unavailable`, or `null` before the device has
+   * advertised anything. */
+  readiness: string | null;
+  effective: boolean;
+  blocked_by: string | null;
+  reason: string | null;
+}
+
+/** One paired physical device.
+ *
+ * The four capability fields are deliberately separate rather than merged:
+ * "why can this phone not take a photo" has four different answers — not
+ * granted, not supported by that build, not permitted by its OS, or all three
+ * fine — and an operator has to be able to see which one applies. */
+export interface RemoteDeviceRow {
+  device_id: string;
+  device_name: string;
+  revoked: boolean;
+  secret_generation: number;
+  granted: string[];
+  /** `null` until the device has reported its surface at least once. */
+  advertised: string[] | null;
+  os_permissions: Record<string, string> | null;
+  readiness: Record<string, string> | null;
+  effective: string[];
+  /** Every physical capability, whether granted or not, with the one thing
+   * standing in its way named. */
+  physical: RemoteDevicePhysicalRow[];
+  platform: string | null;
+  platform_version: string | null;
+  app_version: string | null;
+  device_model: string | null;
+  last_seen_at_ms: number | null;
+  /** The daemon's clock when it answered, so "last seen" is measured against
+   * the machine that recorded it rather than this one. */
+  now_ms: number;
+  recent_commands: RemoteDeviceCommandRow[];
+}
+
+export const remoteDeviceList = () => invoke<{ devices: RemoteDeviceRow[] }>("remote_device_list");
+export const remoteDeviceGrant = (deviceId: string, capabilities: string[]) =>
+  invoke<string>("remote_device_grant", { deviceId, capabilities });
+export const remoteDeviceCommands = (deviceId: string, limit = 20) =>
+  invoke<{ commands: RemoteDeviceCommandRow[] }>("remote_device_commands", { deviceId, limit });
+export const remoteDeviceCancel = (commandId: string) =>
+  invoke<string>("remote_device_cancel", { commandId });
 
 /** One node this machine may place work on, as `monkey daemon remote node-list --json` reports it (roadmap K17 S1). */
 export interface RemoteNodeRow {
@@ -420,6 +599,16 @@ export function validateRemotePairRequest(request: RemotePairRequest): string[] 
   }
   if (mobile.includes("run-workflows") && !mobile.includes("view-tasks")) {
     warnings.push("Mobile workflow launch also requires view-tasks.");
+  }
+  const device = request.deviceCapabilities ?? [];
+  if (device.some((capability) => !(DEVICE_CAPABILITIES as readonly string[]).includes(capability))) {
+    warnings.push("Unknown device hardware capability.");
+  }
+  // Same rule the node enforces: a continuous stream cannot be the only
+  // microphone grant, or withdrawing microphone capture would leave the
+  // microphone reachable.
+  if (device.includes("voice_stream") && !device.includes("microphone_capture")) {
+    warnings.push("Streaming voice also requires microphone_capture.");
   }
   return warnings;
 }

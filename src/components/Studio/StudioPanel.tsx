@@ -8,6 +8,7 @@ import {
   ArrowUp,
   ChevronDown,
   Download,
+  Image as ImageIcon,
   Loader2,
   Plus,
   RectangleHorizontal,
@@ -20,6 +21,7 @@ import {
   Undo2,
   Upload,
   Wand2,
+  X,
 } from "lucide-react";
 
 import { Button, IconButton, Listbox, StatusPill } from "../ui";
@@ -32,6 +34,7 @@ import { SettingsCard } from "./SettingsCard";
 import type { StudioMode } from "./StudioNav";
 import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
+import { MAX_STUDIO_QUEUE, useStudioRunStore } from "../../store/studioRunStore";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
 import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
@@ -42,6 +45,7 @@ import {
   formatBytes,
   isSpeechTask,
   isVideoTask,
+  alignDimension,
   needsInitImage,
   normalizeDimension,
   normalizeVideoFrames,
@@ -93,6 +97,20 @@ interface RunSettings {
   hires: HiresSettings | null;
 }
 
+/** A base64 picture's own pixel size, for the "original size" canvas button. */
+async function imageSize(base64: string): Promise<{ width: number; height: number }> {
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("That image could not be read"));
+    image.src = `data:image/png;base64,${base64}`;
+  });
+  if (!image.naturalWidth || !image.naturalHeight) {
+    throw new Error("That image could not be read");
+  }
+  return { width: image.naturalWidth, height: image.naturalHeight };
+}
+
 /** The file extension a saved asset should carry, from its media type. */
 function extensionFor(mediaType: string): string {
   const subtype = mediaType.split("/")[1] ?? "bin";
@@ -108,6 +126,7 @@ function SliderField({
   max,
   step,
   hint,
+  snap,
   onChange,
 }: {
   label: string;
@@ -116,6 +135,10 @@ function SliderField({
   max: number;
   step: number;
   hint?: string;
+  /** Rounds a typed value to one the backend accepts, once the field is left.
+   *  On every keystroke instead would fight the typing: "1024" would be
+   *  rewritten to a valid size after the "1". */
+  snap?: (value: number) => number;
   onChange: (value: number) => void;
 }) {
   return (
@@ -141,6 +164,15 @@ function SliderField({
           step={step}
           value={value}
           onChange={(event) => onChange(Number(event.target.value))}
+          onBlur={snap ? () => onChange(snap(value)) : undefined}
+          // Enter is how a typed size is confirmed without leaving the field.
+          onKeyDown={
+            snap
+              ? (event) => {
+                  if (event.key === "Enter") onChange(snap(value));
+                }
+              : undefined
+          }
           className="w-16 shrink-0 rounded border border-border bg-background px-1.5 py-1 text-center text-xs text-foreground"
         />
       </span>
@@ -484,14 +516,17 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [partsDraft, setPartsDraft] = useState<Record<string, ModelComponent[]>>({});
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
-  const [phase, setPhase] = useState<string | null>(null);
-  const [percent, setPercent] = useState<number | null>(null);
-  // The engine names the job in every progress event; without keeping it there
-  // is nothing to cancel.
-  const [jobId, setJobId] = useState<string | null>(null);
-  const stopped = useRef(false);
+  // The run itself lives in a store, not here: this panel unmounts whenever
+  // the user switches to Chat, and a generation must survive that.
+  const active = useStudioRunStore((state) => state.active);
+  const runQueue = useStudioRunStore((state) => state.queue);
+  const enqueueRun = useStudioRunStore((state) => state.enqueue);
+  const cancelRun = useStudioRunStore((state) => state.cancel);
+  const progress = useStudioRunStore((state) => state.progress);
+  const completions = useStudioRunStore((state) => state.completions);
+  const runError = useStudioRunStore((state) => state.error);
+  const busy = active !== null;
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
@@ -638,27 +673,30 @@ export function StudioPanel({ mode, railSlot }: Props) {
     void refresh();
   }, [refresh]);
 
+  // A finished run put its images in the store the gallery is read from, and
+  // may also have left the engine holding a different model.
+  const firstRender = useRef(true);
   useEffect(() => {
-    const unlisten = studioClient.onProgress((payload) => {
-      setPhase(
-        payload.phase === "running" && payload.queuePosition > 0
-          ? t("Studio.phase.queued", { position: String(payload.queuePosition) })
-          : payload.step !== null && payload.totalSteps !== null
-            ? t("Studio.phase.step", {
-                step: String(payload.step),
-                total: String(payload.totalSteps),
-              })
-            : t(`Studio.phase.${payload.phase}`),
-      );
-      // Weight loading reports no step count, so the bar stays indeterminate
-      // until the first sampling step rather than sitting at a false zero.
-      setPercent(payload.percent);
-      setJobId(payload.jobId || null);
-    });
-    return () => {
-      void unlisten.then((stop) => stop());
-    };
-  }, [t]);
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    void refresh();
+  }, [completions, refresh]);
+
+  const phase = !progress
+    ? null
+    : progress.phase === "running" && progress.queuePosition > 0
+      ? t("Studio.phase.queued", { position: String(progress.queuePosition) })
+      : progress.step !== null && progress.totalSteps !== null
+        ? t("Studio.phase.step", {
+            step: String(progress.step),
+            total: String(progress.totalSteps),
+          })
+        : t(`Studio.phase.${progress.phase}`);
+  // Weight loading reports no step count, so the bar stays indeterminate until
+  // the first sampling step rather than sitting at a false zero.
+  const percent = progress?.percent ?? null;
 
   // The controls follow whichever model is selected, so switching models
   // offers that model's own starting point rather than the last one's.
@@ -666,8 +704,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
     if (!selected) return;
     setOverrides([]);
     setSettings({
-      width: selected.defaults.width,
-      height: selected.defaults.height,
+      // Aligned here as well as on the controls: a model may list defaults the
+      // engine cannot render as given, and the form must not open on a size
+      // that is not the one it would generate.
+      width: alignDimension(selected.defaults.width),
+      height: alignDimension(selected.defaults.height),
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
       sampler: selected.defaults.sampleMethod,
@@ -819,6 +860,36 @@ export function StudioPanel({ mode, railSlot }: Props) {
     }
   };
 
+  /** The one way the canvas size is set from the controls.
+   *
+   *  The engine renders on a 32-pixel grid, so the form holds a size on that
+   *  grid — a field reading 645 beside a picture generated at 672 reports a
+   *  canvas that never existed. Nearest rather than up: the backend rounds up
+   *  because it has to do something with a number it is handed, but a control
+   *  knows what was asked for, and 640 is the closer answer to 645. */
+  const setCanvas = (width: number, height: number) =>
+    setSettings((current) =>
+      current
+        ? {
+            ...current,
+            width: alignDimension(width),
+            height: alignDimension(height),
+          }
+        : current,
+    );
+
+  /** Sizes the canvas to the source picture, so a run redraws it at its own
+   *  resolution instead of the model's default shape. */
+  const useOriginalSize = async () => {
+    if (!initImage) return;
+    try {
+      const { width, height } = await imageSize(initImage);
+      setCanvas(width, height);
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
+
   const pickImage = async (receive: (base64: string) => void) => {
     try {
       const base64 = await pickImageBase64();
@@ -904,105 +975,61 @@ export function StudioPanel({ mode, railSlot }: Props) {
     setOutpaintFuture([]);
   };
 
-  const generate = async () => {
+  const generate = () => {
     if (!selected || !settings) return;
     setError(null);
-    stopped.current = false;
-    setBusy(true);
-    setPercent(null);
-    setPhase(t("Studio.phase.submitted"));
-    try {
-      const entries = await studioClient.run({
-        modelId: selected.id,
-        task,
-        prompt,
-        negativePrompt,
-        width: normalizeDimension(settings.width),
-        height: normalizeDimension(settings.height),
-        steps: settings.steps,
-        cfgScale: settings.cfgScale,
-        sampleMethod: settings.sampler,
-        scheduler: settings.scheduler,
-        clipSkip: settings.clipSkip,
-        eta: settings.eta,
-        strength: needsInitImage(task) ? settings.strength : null,
-        hires: settings.hires,
-        // Blank asks the engine for a fresh seed rather than pinning one.
-        seed: seed.trim() === "" ? -1 : Number(seed),
-        // A clip and an utterance are one artifact per run whatever the
-        // control last said, and the backend normalizes it to 1 regardless.
-        batchCount: isVideoTask(task) || isSpeechTask(task) ? 1 : batchCount,
-        videoFrames: isVideoTask(task)
-          ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
-          : 1,
-        fps: isVideoTask(task) ? selected.defaults.fps : 1,
-        speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
-        language: isSpeechTask(task) ? language.trim() || null : null,
-        initImageBase64: needsInitImage(task) ? initImage : null,
-        // Each conditioning input is sent only where its own control was
-        // offered, so a mask painted before switching task and a control image
-        // chosen before switching model cannot follow the run somewhere they
-        // mean nothing. The backend refuses them again on its own side.
-        maskImageBase64: canMask && initImage ? maskImage : null,
-        // Blank inherits the main prompt inside the engine, so an untouched
-        // field is sent as null rather than as an empty string it would have
-        // to interpret.
-        adPrompt: hasDetector && adPrompt.trim() ? adPrompt.trim() : null,
-        adNegativePrompt:
-          hasDetector && adNegativePrompt.trim() ? adNegativePrompt.trim() : null,
-        controlImageBase64: conditioning.has("control") ? controlImage : null,
-        controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
-        ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
-        ipAdapterStrength:
-          conditioning.has("ip_adapter") && ipAdapterImage ? ipAdapterStrength : null,
-        refImagesBase64: conditioning.has("reference") ? refImages : [],
-        // Only meaningful when there is more than one reference to tell apart,
-        // which is also the only time the control is shown.
-        increaseRefIndex:
-          conditioning.has("reference") && refImages.length > 1 && numberRefImages,
-        // Blank rows are a half-typed path, not a LoRA the user meant.
-        loras: loras.filter((lora) => lora.path.trim().length > 0),
-        componentOverrides: overrides,
-      });
-      // Newest first, and within one batch the engine's own order — which
-      // reversing the run's entries preserves once they are prepended.
-      setGallery((current) => [...[...entries].reverse(), ...current]);
-      // Only the last is previewed: it is the one the gallery shows first, and
-      // decoding eight images to data URLs to show one is eight times the work.
-      const newest = entries[entries.length - 1];
-      if (newest) void loadPreview(newest);
-    } catch (reason) {
-      if (!stopped.current) setError(errorText(reason));
-    } finally {
-      setBusy(false);
-      setPhase(null);
-      setPercent(null);
-      setJobId(null);
-      // The engine holds the model after a run, so whether it is loaded is
-      // only knowable by asking again — and Free memory is what that answer
-      // turns on.
-      void refresh();
-    }
-  };
-
-  /**
-   * Stops the run in flight.
-   *
-   * The engine drops a queued job but cannot interrupt one already sampling
-   * (`cancel_generating: false` in its own capabilities), so stopping a
-   * running generation means stopping the engine running it. That also
-   * releases its weights, which is what the user wanted from a stop anyway.
-   */
-  const stop = async () => {
-    stopped.current = true;
-    setPhase(t("Studio.phase.stopping"));
-    try {
-      if (!jobId || !(await studioClient.cancel(jobId))) {
-        await studioClient.unloadEngine();
-      }
-    } catch (reason) {
-      setError(errorText(reason));
-    }
+    enqueueRun(prompt.trim() || selected.name, {
+      modelId: selected.id,
+      task,
+      prompt,
+      negativePrompt,
+      width: normalizeDimension(settings.width),
+      height: normalizeDimension(settings.height),
+      steps: settings.steps,
+      cfgScale: settings.cfgScale,
+      sampleMethod: settings.sampler,
+      scheduler: settings.scheduler,
+      clipSkip: settings.clipSkip,
+      eta: settings.eta,
+      strength: needsInitImage(task) ? settings.strength : null,
+      hires: settings.hires,
+      // Blank asks the engine for a fresh seed rather than pinning one.
+      seed: seed.trim() === "" ? -1 : Number(seed),
+      // A clip and an utterance are one artifact per run whatever the
+      // control last said, and the backend normalizes it to 1 regardless.
+      batchCount: isVideoTask(task) || isSpeechTask(task) ? 1 : batchCount,
+      videoFrames: isVideoTask(task)
+        ? normalizeVideoFrames(selected.defaults.frameGrid, seconds * selected.defaults.fps)
+        : 1,
+      fps: isVideoTask(task) ? selected.defaults.fps : 1,
+      speakerFile: isSpeechTask(task) ? speakerFile.trim() || null : null,
+      language: isSpeechTask(task) ? language.trim() || null : null,
+      initImageBase64: needsInitImage(task) ? initImage : null,
+      // Each conditioning input is sent only where its own control was
+      // offered, so a mask painted before switching task and a control image
+      // chosen before switching model cannot follow the run somewhere they
+      // mean nothing. The backend refuses them again on its own side.
+      maskImageBase64: canMask && initImage ? maskImage : null,
+      // Blank inherits the main prompt inside the engine, so an untouched
+      // field is sent as null rather than as an empty string it would have
+      // to interpret.
+      adPrompt: hasDetector && adPrompt.trim() ? adPrompt.trim() : null,
+      adNegativePrompt:
+        hasDetector && adNegativePrompt.trim() ? adNegativePrompt.trim() : null,
+      controlImageBase64: conditioning.has("control") ? controlImage : null,
+      controlStrength: conditioning.has("control") && controlImage ? controlStrength : null,
+      ipAdapterImageBase64: conditioning.has("ip_adapter") ? ipAdapterImage : null,
+      ipAdapterStrength:
+        conditioning.has("ip_adapter") && ipAdapterImage ? ipAdapterStrength : null,
+      refImagesBase64: conditioning.has("reference") ? refImages : [],
+      // Only meaningful when there is more than one reference to tell apart,
+      // which is also the only time the control is shown.
+      increaseRefIndex:
+        conditioning.has("reference") && refImages.length > 1 && numberRefImages,
+      // Blank rows are a half-typed path, not a LoRA the user meant.
+      loras: loras.filter((lora) => lora.path.trim().length > 0),
+      componentOverrides: overrides,
+    });
   };
 
   /** Deletes a generation and its bytes. Irreversible — the store keeps no
@@ -1073,7 +1100,9 @@ export function StudioPanel({ mode, railSlot }: Props) {
     !!settings &&
     selected.installed &&
     prompt.trim().length > 0 &&
-    !busy &&
+    // A run in flight no longer blocks the button: the next one queues behind
+    // it, up to the cap that keeps a leaned-on button from queueing forever.
+    runQueue.length + (busy ? 1 : 0) < MAX_STUDIO_QUEUE &&
     (!needsInitImage(task) || !!initImage);
 
   // Tools share nothing with generation — no model, no prompt, no sampler —
@@ -1093,9 +1122,9 @@ export function StudioPanel({ mode, railSlot }: Props) {
         <p className="mt-1 text-xs text-muted">{t(`Studio.${mode}.subtitle`)}</p>
       </header>
 
-      {error && (
+      {(error ?? runError) && (
         <p className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
-          {error}
+          {error ?? runError}
         </p>
       )}
 
@@ -1698,11 +1727,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 step={1}
                 value={seconds}
                 onChange={(event) => setSeconds(Number(event.target.value))}
-                className="flex-1"
+                className="min-w-0 flex-1"
               />
               {/* The backend snaps length to its 4n+1 grid, so show the frame
                   count the clip will really have, not the slider's ask. */}
-              <span className="w-28 shrink-0 text-right font-mono text-[11px] text-faint">
+              <span className="shrink-0 whitespace-nowrap text-right font-mono text-[11px] text-faint">
                 {t("Studio.frames", {
                   frames: String(effectiveFrames),
                   fps: String(selected.defaults.fps),
@@ -1737,14 +1766,24 @@ export function StudioPanel({ mode, railSlot }: Props) {
                         }
                         aria-label={t(`Studio.aspect.${preset.id}`)}
                         title={`${t(`Studio.aspect.${preset.id}`)} · ${preset.width}×${preset.height}`}
-                        onClick={() =>
-                          setSettings({ ...settings, width: preset.width, height: preset.height })
-                        }
+                        onClick={() => setCanvas(preset.width, preset.height)}
                       >
                         <Icon size={13} />
                       </IconButton>
                     );
                   })}
+                  {/* Only offered once there is a picture to take a size from. */}
+                  {initImage && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.aspect.original")}
+                      title={t("Studio.aspect.original")}
+                      onClick={() => void useOriginalSize()}
+                    >
+                      <ImageIcon size={13} />
+                    </IconButton>
+                  )}
                 </div>
               </div>
 
@@ -1755,6 +1794,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   min={64}
                   max={2048}
                   step={32}
+                  snap={alignDimension}
                   onChange={(width) => setSettings({ ...settings, width })}
                 />
                 <SliderField
@@ -1764,8 +1804,10 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   max={2048}
                   step={32}
                   // The engine aligns edges up to a multiple of 32, so show the
-                  // canvas that will really be rendered.
+                  // canvas that will really be rendered — which is what the
+                  // fields hold too, once a typed value has been committed.
                   hint={`${normalizeDimension(settings.width)}×${normalizeDimension(settings.height)}`}
+                  snap={alignDimension}
                   onChange={(height) => setSettings({ ...settings, height })}
                 />
               </div>
@@ -2103,9 +2145,9 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </div>
           )}
 
-          {busy && (
+          {active && (
             <div className="flex shrink-0 items-center gap-2">
-              <Button size="sm" variant="secondary" onClick={() => void stop()}>
+              <Button size="sm" variant="secondary" onClick={() => void cancelRun(active.id)}>
                 <Square size={12} />
                 {t("Studio.stop")}
               </Button>
@@ -2121,6 +2163,34 @@ export function StudioPanel({ mode, railSlot }: Props) {
               {percent !== null && (
                 <span className="shrink-0 font-mono text-[11px] text-muted">{percent}%</span>
               )}
+            </div>
+          )}
+
+          {/* Runs waiting behind the active one. They are submitted one at a
+              time, so this is the app's queue, not the engine's. */}
+          {runQueue.length > 0 && (
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+              <span className="text-[11px] text-muted">
+                {t("Studio.queue.waiting", { count: String(runQueue.length) })}
+              </span>
+              {runQueue.map((item, index) => (
+                <span
+                  key={item.id}
+                  className="flex max-w-48 items-center gap-1 rounded-full border border-border px-2 py-0.5 text-[11px] text-muted"
+                  title={item.label}
+                >
+                  <span className="truncate">
+                    {index + 1}. {item.label}
+                  </span>
+                  <IconButton
+                    size="xs"
+                    aria-label={t("Studio.queue.remove")}
+                    onClick={() => void cancelRun(item.id)}
+                  >
+                    <X size={11} />
+                  </IconButton>
+                </span>
+              ))}
             </div>
           )}
 

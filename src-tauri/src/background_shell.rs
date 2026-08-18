@@ -20,9 +20,11 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::process::{Command, Stdio};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -92,7 +94,21 @@ pub struct BackgroundShellView {
 
 struct BackgroundProcess {
     view: Mutex<BackgroundShellView>,
-    child: Mutex<Child>,
+    child: Mutex<crate::workspace_shell::BackgroundShellChild>,
+    /// What is holding this command's process tree.
+    ///
+    /// Owned here for the same reason the child is: the containment's lifetime
+    /// has to be the command's lifetime. On Windows the job handle carries
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so dropping this kills the tree —
+    /// which is correct at teardown and catastrophic anywhere earlier.
+    controller: Mutex<crate::resource_control::ResourceController>,
+    /// The last measurement the exit watcher took of this command's tree.
+    ///
+    /// Held rather than discarded because that watcher is the only thing that
+    /// samples a background shell — nothing is blocked on it — and until this
+    /// existed its readings ended inside `check_resource_limits`' `match`, so the
+    /// row could state a memory ceiling and never what was held against it.
+    last_sample: Mutex<Option<crate::resource_control::ResourceSample>>,
     /// Byte offset into `view.output` already returned by
     /// `background_shell_output` in draining mode — the "only new output"
     /// cursor the model's polling tool reads through. Kept out of the view so
@@ -182,7 +198,31 @@ impl BackgroundShellManager {
             if let Ok(mut child) = process.child.lock() {
                 let _ = child.kill();
             }
+            // The whole owned tree, not the leader. On shutdown this is the last
+            // chance: anything left after the app exits is an orphan no UI can
+            // ever reach again.
+            reclaim_owned_tree(&process);
         }
+    }
+}
+
+/// Reclaim everything one background command owns, through its controller.
+///
+/// Every deliberate teardown goes through here rather than through the child
+/// handle alone: `BackgroundShellChild::kill` signals the process group, which
+/// covers the ordinary case and misses the one this exists for — a descendant
+/// that left the group, or a Windows tree whose containment is the job rather
+/// than any group at all. The controller recorded that membership while the
+/// ancestry was still readable, which is the only moment it could be recorded.
+///
+/// Idempotent and fail-soft: a tree already gone costs one process-table read,
+/// and a teardown must not fail because one member could not be signalled.
+fn reclaim_owned_tree(process: &Arc<BackgroundProcess>) {
+    let Ok(mut controller) = process.controller.lock() else {
+        return;
+    };
+    if let Err(error) = controller.terminate_tree() {
+        eprintln!("background shell: could not reclaim the whole owned tree: {error}");
     }
 }
 
@@ -224,8 +264,26 @@ fn append_bounded(buffer: &mut String, chunk: &str, truncated: &mut bool) -> usi
 /// reconcile treats as "leave whatever was already recorded alone" rather
 /// than clearing it (see `process_table.rs`'s `reconcile`: it writes
 /// `native_pid` only when the projection supplies `Some`).
-fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView, native_pid: Option<i64>) {
-    project_process(app, &view, native_pid);
+fn emit_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    view: BackgroundShellView,
+    identity: Option<crate::process_tree::ProcessIdentity>,
+) {
+    project_process(app, &view, identity, None);
+    let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
+}
+
+/// [`emit_status`] for the one status change that carries a resource cause.
+///
+/// A separate entry point rather than a parameter on `emit_status` because every
+/// other call site would have to pass `None`, and a `None` at forty call sites is
+/// how a caller eventually passes the wrong thing.
+fn emit_status_with_breach<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    view: BackgroundShellView,
+    breach: Option<crate::resource_control::LimitBreach>,
+) {
+    project_process(app, &view, None, breach);
     let _ = app.emit(STATUS_EVENT, serde_json::json!({ "task": view }));
 }
 
@@ -237,7 +295,12 @@ fn emit_status(app: &tauri::AppHandle, view: BackgroundShellView, native_pid: Op
 ///
 /// Fail-soft, like every other adopter: a shell must not fail to report its
 /// status because a bookkeeping row could not be written.
-fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pid: Option<i64>) {
+fn project_process<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    view: &BackgroundShellView,
+    identity: Option<crate::process_tree::ProcessIdentity>,
+    breach: Option<crate::resource_control::LimitBreach>,
+) {
     use crate::process_table::{
         ExitStatus, ProcessExit, ProcessKind, ProcessProjection, ProcessState,
     };
@@ -253,6 +316,7 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
                 code: view.exit_code,
                 signal: None,
                 reason: None,
+                breach: None,
             }),
         ),
         BackgroundShellStatus::Killed => (
@@ -262,23 +326,55 @@ fn project_process(app: &tauri::AppHandle, view: &BackgroundShellView, native_pi
                 code: view.exit_code,
                 signal: None,
                 reason: Some("killed".to_string()),
+                breach: None,
             }),
         ),
+        // A resource kill also arrives as `Error`, and the two must not look the
+        // same: one is the command's own failure and the other is the system
+        // working. The breach is what tells them apart.
         BackgroundShellStatus::Error => (
             ProcessState::Exited,
-            Some(ProcessExit {
-                status: ExitStatus::Failed,
-                code: view.exit_code,
-                signal: None,
-                reason: None,
+            Some(match &breach {
+                Some(breach) => ProcessExit::limit_exceeded(breach.clone()),
+                None => ProcessExit {
+                    status: ExitStatus::Failed,
+                    code: view.exit_code,
+                    signal: None,
+                    reason: None,
+                    breach: None,
+                },
             }),
         ),
     };
 
+    // What holds this shell and what it was last measured holding, read from the
+    // live process rather than threaded through every status call site. Both are
+    // absent once the shell has left the manager, which is exactly when there is
+    // nothing left to measure — and `reconcile` leaves a `None` alone rather than
+    // clearing what was already recorded.
+    let (containment, usage) = match app
+        .state::<crate::AppState>()
+        .background_shell
+        .get(&view.id)
+    {
+        Ok(process) => (
+            process
+                .controller
+                .lock()
+                .ok()
+                .map(|controller| controller.containment()),
+            process.last_sample.lock().ok().and_then(|held| *held),
+        ),
+        Err(_) => (None, None),
+    };
     let mut projection =
         ProcessProjection::new(ProcessKind::BackgroundShell, view.id.clone(), state)
             .with_workspace(Some(view.cwd.clone()))
-            .with_native_pid(native_pid);
+            // The identity rather than the pid, so a restart can tell this
+            // process from whatever the kernel later gave its pid to.
+            .with_native_identity(identity)
+            .with_containment(containment)
+            .with_usage(usage);
     projection.exit = exit;
 
     let state_handle = app.state::<crate::AppState>();
@@ -320,8 +416,8 @@ fn record_usage(
 
 /// Writes what has been sampled so far. Fail-soft like every other bookkeeping
 /// call here — a command must not die because its ledger row could not be updated.
-fn flush_usage(
-    app: &tauri::AppHandle,
+fn flush_usage<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     external_id: &str,
     usage: &crate::process_usage::ProcessUsageAccumulator,
 ) {
@@ -388,8 +484,8 @@ pub(crate) fn deliver_os_signal<R: tauri::Runtime>(
 /// each chunk to the frontend as it arrives. stdout and stderr each get one
 /// of these; both append to the same buffer, so the panel shows them
 /// interleaved in arrival order exactly like a terminal would.
-fn spawn_reader<R: Read + Send + 'static>(
-    app: tauri::AppHandle,
+fn spawn_reader<Rt: tauri::Runtime, R: Read + Send + 'static>(
+    app: tauri::AppHandle<Rt>,
     process: Arc<BackgroundProcess>,
     mut reader: R,
 ) {
@@ -456,7 +552,101 @@ fn split_event_chunks(chunk: &str) -> Vec<String> {
 /// first to notice. See [`USAGE_FLUSH_TICKS`] for why sampling and writing run at
 /// different rates, and `process_usage` for why sampling has to happen at all
 /// (peak resident size cannot be read from a pid that is gone).
-fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
+/// Ask this command's controller whether a limit has fired.
+///
+/// One call, [`crate::resource_control::ResourceController::check`], rather than
+/// this module's own ordering of the primitives. That ordering is the bug this
+/// wrapper used to carry: it sampled and compared, which is the right test for a
+/// *supervised* bound and is never true for a kernel-held one — a cgroup with
+/// `pids.max = 12` refuses the thirteenth fork and leaves `pids.current` at 12
+/// forever. So a background command killed by a real kernel limit was recorded as
+/// an unexplained error, while the identical foreground command — which went
+/// through `run_under`, which did ask the mechanism — was correctly recorded as
+/// `limit_exceeded`.
+///
+/// `None` covers three different situations on purpose — no limit configured,
+/// nothing measurable, and inside every bound — because the watcher's next action
+/// is the same for all three: keep waiting. Only a breach changes what happens.
+fn check_resource_limits(
+    process: &Arc<BackgroundProcess>,
+) -> Option<crate::resource_control::LimitBreach> {
+    use crate::resource_control::ResourceCheck;
+
+    let mut controller = process.controller.lock().ok()?;
+    let remember = |sample: Option<crate::resource_control::ResourceSample>| {
+        if let (Some(sample), Ok(mut held)) = (sample, process.last_sample.lock()) {
+            *held = Some(sample);
+        }
+    };
+    match controller.check(now_ms().ok()? as i64) {
+        // The tree is already reclaimed by `check`: a bound that reports a breach
+        // and leaves the workload running has reclaimed nothing.
+        Ok(ResourceCheck::Breached { breach, sample }) => {
+            remember(sample);
+            Some(breach)
+        }
+        Ok(ResourceCheck::Running(sample)) => {
+            remember(Some(sample));
+            None
+        }
+        Ok(ResourceCheck::Gone) => None,
+        Err(error) => {
+            eprintln!("background shell: could not check a command against its limits: {error}");
+            None
+        }
+    }
+}
+
+/// Why this command became terminal, when the mechanism has an answer.
+///
+/// Asked *before* the exit status is classified, and that order is the whole
+/// point. A kernel limit fires, refuses the work, and the child becomes terminal
+/// — often inside one poll interval, so the sampling loop above never gets a tick
+/// while the child is still running. Reading the exit status first would call
+/// that ordinary failure, which is the same mistake in a different shape: the
+/// limit worked and the app could not say so.
+///
+/// This is the rule [`crate::resource_control::run_under`] already applies to the
+/// foreground shell, through the same controller call.
+fn terminal_resource_breach(
+    process: &Arc<BackgroundProcess>,
+) -> Option<crate::resource_control::LimitBreach> {
+    let mut controller = process.controller.lock().ok()?;
+    match controller.mechanism_breach(now_ms().ok()? as i64) {
+        Ok(breach) => breach,
+        Err(error) => {
+            eprintln!("background shell: could not ask the mechanism why a command ended: {error}");
+            None
+        }
+    }
+}
+
+/// Close the row out as `limit_exceeded`, naming the limit and both numbers.
+///
+/// Deliberately not `Killed`: a command stopped for holding 9 GiB and a command
+/// a user stopped are different facts, and the panel showing the same word for
+/// both is what made a working budget look like an unexplained disappearance.
+fn record_limit_breach<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    process: &Arc<BackgroundProcess>,
+    usage: &crate::process_usage::ProcessUsageAccumulator,
+    breach: crate::resource_control::LimitBreach,
+) {
+    let external_id = process.view().map(|view| view.id).unwrap_or_default();
+    flush_usage(app, &external_id, usage);
+    if let Ok(mut view) = process.view.lock() {
+        view.status = BackgroundShellStatus::Error;
+        view.finished_at_ms = now_ms().ok();
+        view.output
+            .push_str(&format!("\n[{}]\n", breach.describe()));
+        emit_status_with_breach(app, view.clone(), Some(breach));
+    }
+}
+
+fn spawn_exit_watcher<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    process: Arc<BackgroundProcess>,
+) {
     std::thread::spawn(move || {
         let external_id = process.view().map(|view| view.id).unwrap_or_default();
         // Captured once: `Child::id` keeps answering after the child exits, but
@@ -485,6 +675,15 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
             };
             match waited {
                 Ok(None) => {
+                    // The same tick that samples for the ledger also asks the
+                    // controller whether a bound has been crossed. A background
+                    // command has no caller blocked on it, so this loop is the
+                    // only thing that can notice — and a limit nobody checks is
+                    // a limit that never fires.
+                    if let Some(breach) = check_resource_limits(&process) {
+                        record_limit_breach(&app, &process, &usage, breach);
+                        break;
+                    }
                     ticks = ticks.wrapping_add(1);
                     if ticks % USAGE_FLUSH_TICKS == 0 {
                         flush_usage(&app, &external_id, &usage);
@@ -492,6 +691,13 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
                     std::thread::sleep(EXIT_POLL_INTERVAL)
                 }
                 Ok(Some(status)) => {
+                    // The mechanism gets the first word about *why* this child is
+                    // terminal, before its exit status is read. See
+                    // `terminal_resource_breach`.
+                    if let Some(breach) = terminal_resource_breach(&process) {
+                        record_limit_breach(&app, &process, &usage, breach);
+                        break;
+                    }
                     // Written *before* `emit_status`, and the order is load-bearing:
                     // that call projects the terminal state, and `ProcessTable`'s
                     // terminal transition closes the ledger row out — it records which
@@ -517,7 +723,14 @@ fn spawn_exit_watcher(app: tauri::AppHandle, process: Arc<BackgroundProcess>) {
                     break;
                 }
                 Err(error) => {
-                    // Same ordering rule as the exit branch above.
+                    // Same two ordering rules as the exit branch above: the
+                    // mechanism is asked first, because a `wait` that fails
+                    // against a tree the kernel just reclaimed is a limit kill
+                    // wearing an errno.
+                    if let Some(breach) = terminal_resource_breach(&process) {
+                        record_limit_breach(&app, &process, &usage, breach);
+                        break;
+                    }
                     flush_usage(&app, &external_id, &usage);
                     if let Ok(mut view) = process.view.lock() {
                         if view.status == BackgroundShellStatus::Running {
@@ -563,6 +776,7 @@ pub async fn tool_run_shell_background(
     risk_level: Option<String>,
     risk_reason: Option<String>,
     agent_label: Option<String>,
+    workspace_root_override: Option<String>,
 ) -> Result<BackgroundShellView, String> {
     let risk = permissions::compute_risk(None, risk_level, risk_reason);
     permissions::request_permission(
@@ -587,53 +801,72 @@ pub async fn tool_run_shell_background(
         ));
     }
 
-    let cwd_path = match cwd {
-        Some(ref value) => workspace::resolve_path_and_root(state.inner(), value)?.0,
-        None => workspace::primary_root_canon(state.inner())?,
+    let (cwd_path, workspace_root) = match cwd {
+        Some(ref value) => crate::agent_worktrees::resolve_with_override(
+            state.inner(),
+            value,
+            workspace_root_override.as_deref(),
+        )?,
+        None => match workspace_root_override.as_deref() {
+            Some(root) => {
+                crate::agent_worktrees::resolve_with_override(state.inner(), ".", Some(root))?
+            }
+            None => {
+                let root = workspace::primary_root_canon(state.inner())?;
+                (root.clone(), root)
+            }
+        },
     };
 
-    #[cfg(target_os = "windows")]
-    let (shell, shell_flag) = ("cmd", "/C");
-    #[cfg(not(target_os = "windows"))]
-    let (shell, shell_flag) = ("sh", "-c");
+    let view = start_background_command(
+        &app,
+        state.inner(),
+        command,
+        &workspace_root,
+        &cwd_path,
+        crate::process_table::ProcessLimits::default(),
+    )?;
+    // Committed at the spawn, not at the exit: this command is *meant* to
+    // outlive the call, so waiting for its exit code would leave every
+    // still-running background command looking like one that never started.
+    // What is being committed is that a process exists, which it does.
+    checkpoints::commit_external_effect(
+        state.inner(),
+        checkpoint_id.as_deref(),
+        checkpoints::ExternalEffectKind::Shell,
+    )?;
+    Ok(view)
+}
 
-    let mut command_builder = Command::new(shell);
-    command_builder
-        .arg(shell_flag)
-        .arg(&command)
-        .current_dir(&cwd_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Its own process group, so a later suspend/resume/kill-by-group
-    // (`os_signal::suspend_process_group` et al.) targets exactly this
-    // command's tree rather than whatever group this app itself runs in —
-    // mirrors the daemon's own job spawn (`daemon/engine.rs`).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command_builder.process_group(0);
-    }
-    // Core dumps refused and nothing else, installed between `fork` and `exec`
-    // like the other three spawn sites — `apply_std` because this builder is
-    // `std::process::Command`, not tokio's. No file-size or descriptor ceiling
-    // here on purpose: this child is *meant* to outlive the call that spawned it,
-    // so a number for either would be a judgement about what a command nobody
-    // has classified is for, which is the process class K4 still lacks. Refusing
-    // core dumps carries no such judgement — a dev server that segfaults should
-    // not drop gigabytes into the workspace it was started in, and unlike the
-    // foreground tool there is no timeout here to end it.
-    crate::os_limits::apply_std(
-        crate::os_limits::ChildLimits::baseline(),
-        &mut command_builder,
-    );
-    let mut child = command_builder
-        .spawn()
-        .map_err(|error| format!("Failed to spawn shell: {error}"))?;
-    let native_pid = i64::try_from(child.id()).ok();
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+/// Spawn, register, and start supervising one background command.
+///
+/// Split out of [`tool_run_shell_background`] so that everything after the
+/// permission gate — the confined spawn, the resource controller, the readers,
+/// the exit watcher and the first projection — is one function a test can drive.
+/// The alternative was a test that re-assembled those five pieces itself, which
+/// is a test of the assembly it wrote rather than of the one that ships.
+///
+/// `limits` tightens the background-shell class defaults and can never loosen
+/// them; the tool passes an empty set, and tests pass the bound they are about
+/// to breach.
+pub(crate) fn start_background_command<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    command: String,
+    workspace_root: &std::path::Path,
+    cwd_path: &std::path::Path,
+    limits: crate::process_table::ProcessLimits,
+) -> Result<BackgroundShellView, String> {
+    let spawned =
+        crate::workspace_shell::spawn_background(workspace_root, cwd_path, &command, limits)
+            .map_err(|error| format!("Failed to spawn shell: {error}"))?;
+    let identity = spawned.controller.root();
+    let crate::workspace_shell::BackgroundSpawn {
+        child,
+        controller,
+        stdout,
+        stderr,
+    } = spawned;
 
     let view = BackgroundShellView {
         id: uuid::Uuid::new_v4().to_string(),
@@ -649,6 +882,14 @@ pub async fn tool_run_shell_background(
     let process = Arc::new(BackgroundProcess {
         view: Mutex::new(view.clone()),
         child: Mutex::new(child),
+        // Held for the life of the background process, not dropped at the end of
+        // this function: on Windows the job handle *is* the containment, so
+        // releasing it here would free the tree the moment the command was
+        // registered. Nothing turn-scoped owns it either — this `Arc` lives in
+        // the manager, which outlives every turn, which is what makes a
+        // background command's bounds survive the turn that started it.
+        controller: Mutex::new(controller),
+        last_sample: Mutex::new(None),
         read_cursor: Mutex::new(0),
     });
     state
@@ -661,17 +902,49 @@ pub async fn tool_run_shell_background(
     if let Some(stderr) = stderr {
         spawn_reader(app.clone(), process.clone(), stderr);
     }
+    // Ahead of the exit watcher rather than behind it, which is where this used to
+    // be: the row has to exist before the ownership below can be attributed to it,
+    // and a watcher that samples before the row is written was already recording
+    // usage against nothing.
+    emit_status(app, view.clone(), identity);
+    // Every native process this command's supervisor observes is recorded against
+    // that row from here on, so a descendant that leaves the process group after
+    // being seen is still reclaimable after a restart — which for a background
+    // command is the whole point: it is the kind most likely to outlive the turn
+    // that started it.
+    //
+    // Fail-closed: a command whose ownership cannot be made durable is reclaimed
+    // rather than left running as a tree this app could not find again.
+    let journal = crate::bounded_execution::ProjectedOwnership::shared(
+        crate::bounded_execution::AppProcessProjector::shared(app.clone()),
+        crate::process_table::ProcessKind::BackgroundShell,
+        view.id.clone(),
+    );
+    if let Err(error) = lock(&process.controller)
+        .and_then(|mut controller| controller.persist_ownership_to(journal))
+    {
+        if let Ok(mut controller) = lock(&process.controller) {
+            let _ = controller.terminate_tree();
+        }
+        if let Ok(mut child) = lock(&process.child) {
+            let _ = child.kill();
+        }
+        // The registered entry is moved to `Error` rather than a clone of it: the
+        // manager already holds this process, and a view that stays `Running`
+        // would be a panel row for a command that was reclaimed before it began —
+        // the same phantom the process table's `Drop` backstop exists to prevent.
+        let ended = {
+            let mut registered = lock(&process.view)?;
+            registered.status = BackgroundShellStatus::Error;
+            registered.finished_at_ms = Some(now_ms()?);
+            registered.clone()
+        };
+        emit_status(app, ended, identity);
+        return Err(format!(
+            "Failed to record what this background command owns, so it was not run: {error}"
+        ));
+    }
     spawn_exit_watcher(app.clone(), process);
-    emit_status(&app, view.clone(), native_pid);
-    // Committed at the spawn, not at the exit: this command is *meant* to
-    // outlive the call, so waiting for its exit code would leave every
-    // still-running background command looking like one that never started.
-    // What is being committed is that a process exists, which it does.
-    checkpoints::commit_external_effect(
-        state.inner(),
-        checkpoint_id.as_deref(),
-        checkpoints::ExternalEffectKind::Shell,
-    )?;
     Ok(view)
 }
 
@@ -742,6 +1015,12 @@ pub fn background_shell_kill(
             .kill()
             .map_err(|error| format!("Failed to kill background command: {error}"))?;
     }
+    // And the tree, through the controller. `kill` above signals the process
+    // group, which is the ordinary case and misses the one that matters: a
+    // descendant that left the group is reachable only through the membership the
+    // controller recorded while the ancestry was still readable. The user asked
+    // for this command to stop, not for its leader to stop.
+    reclaim_owned_tree(&process);
     let view = {
         let mut view = lock(&process.view)?;
         view.status = BackgroundShellStatus::Killed;
@@ -911,7 +1190,18 @@ mod tests {
                 shell_id.clone(),
                 Arc::new(BackgroundProcess {
                     view: Mutex::new(view),
-                    child: Mutex::new(child),
+                    child: Mutex::new(
+                        crate::workspace_shell::BackgroundShellChild::unconfined_for_lifecycle_test(
+                            child,
+                        ),
+                    ),
+                    // Unbounded on purpose: this test asserts the *lifecycle*
+                    // (suspend, resume, exit), and a limit here would add a
+                    // second reason the child could disappear.
+                    controller: Mutex::new(crate::resource_control::ResourceController::new(
+                        crate::resource_control::EffectiveLimits::default(),
+                    )),
+                    last_sample: Mutex::new(None),
                     read_cursor: Mutex::new(0),
                 }),
             )
@@ -957,5 +1247,391 @@ mod tests {
             .lock()
             .unwrap()
             .kill();
+    }
+
+    // --- K4 end-to-end: a background command's bounds fire in production -----
+    //
+    // Everything below drives `start_background_command`, which is what the
+    // `run_shell(run_in_background: true)` tool calls once its permission gate
+    // has passed. So each test crosses the whole path: the confined spawn, the
+    // real `ResourceController`, a real child and grandchild, the real exit
+    // watcher thread, breach detection, whole-tree termination, and the typed
+    // `LimitBreach` on the process-table row.
+    //
+    // They exist because the unit tests could not have caught the bug they now
+    // guard: the background watcher sampled and compared, which is the right
+    // test for a supervised bound and is never true for a kernel-held one, so a
+    // command a real cgroup killed was recorded as an unexplained error.
+    #[cfg(unix)]
+    mod end_to_end {
+        use super::*;
+        use crate::process_table::{ExitStatus, ProcessKind, ProcessLimits, ProcessState};
+        use crate::run_ledger::RunLedger;
+        use tauri::Manager;
+
+        struct TestTree(std::path::PathBuf);
+
+        impl TestTree {
+            fn create() -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "little-monkey-bg-limits-{}",
+                    uuid::Uuid::new_v4().simple()
+                ));
+                std::fs::create_dir(&path).expect("create test tree");
+                Self(path)
+            }
+        }
+
+        impl Drop for TestTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Same gate the foreground suite uses: a host without the confinement
+        /// backend cannot run a confined shell at all, and CI must have one.
+        fn confinement_available() -> bool {
+            if crate::sandbox::sandbox_enforcement()
+                == crate::sandbox::SandboxEnforcement::OsEnforced
+            {
+                return true;
+            }
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI platform did not provide its required shell confinement backend"
+            );
+            false
+        }
+
+        fn quote(path: &std::path::Path) -> String {
+            format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+        }
+
+        /// The workload has to be executable from *inside* the grant, so the
+        /// test binary is copied in. Running it from the build tree would be
+        /// denied by the confinement and the command would exit instantly — a
+        /// pass for the wrong reason.
+        fn place_test_binary_in(workspace: &std::path::Path, name: &str) -> std::path::PathBuf {
+            let placed = workspace.join(name);
+            let current = std::env::current_exe().expect("the test binary knows its own path");
+            std::fs::hard_link(&current, &placed)
+                .or_else(|_| std::fs::copy(&current, &placed).map(|_| ()))
+                .expect("place the workload binary inside the selected workspace");
+            placed
+        }
+
+        struct Harness {
+            _app: tauri::App<tauri::test::MockRuntime>,
+            handle: tauri::AppHandle<tauri::test::MockRuntime>,
+            _tree: TestTree,
+            workspace: std::path::PathBuf,
+        }
+
+        impl Harness {
+            /// A mock app that *manages* `AppState`, because the production
+            /// projection reaches for it through `app.state()` rather than being
+            /// handed one.
+            fn create() -> Self {
+                let app = crate::test_support::build(
+                    tauri::test::mock_builder().manage(AppState::default()),
+                );
+                let handle = app.handle().clone();
+                *handle.state::<AppState>().run_ledger.lock().unwrap() =
+                    Some(RunLedger::open_in_memory().expect("an in-memory ledger"));
+                let tree = TestTree::create();
+                let workspace = tree.0.join("workspace");
+                std::fs::create_dir(&workspace).expect("create workspace");
+                let workspace =
+                    crate::sandbox::plain_canonical(&workspace).expect("canonical workspace");
+                Harness {
+                    _app: app,
+                    handle,
+                    _tree: tree,
+                    workspace,
+                }
+            }
+
+            fn start(
+                &self,
+                command: &str,
+                limits: ProcessLimits,
+            ) -> Result<BackgroundShellView, String> {
+                let state = self.handle.state::<AppState>();
+                start_background_command(
+                    &self.handle,
+                    state.inner(),
+                    command.to_string(),
+                    &self.workspace,
+                    &self.workspace,
+                    limits,
+                )
+            }
+
+            fn row(&self, external_id: &str) -> Option<crate::process_table::ProcessRecord> {
+                let state = self.handle.state::<AppState>();
+                crate::process_commands::with_process_table(&self.handle, state.inner(), |table| {
+                    table.find_by_external_id(ProcessKind::BackgroundShell, external_id)
+                })
+                .expect("the process table reads")
+            }
+
+            /// Waits for the watcher thread to close the row out.
+            ///
+            /// Polls rather than sleeps a fixed time: the watcher ticks every
+            /// 100 ms and a memory bound needs a sample or two, so a fixed sleep
+            /// is either slow or flaky. The ceiling is generous for CI.
+            fn wait_for_exit(&self, external_id: &str) -> crate::process_table::ProcessRecord {
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                loop {
+                    if let Some(record) = self.row(external_id) {
+                        if record.state == ProcessState::Exited {
+                            return record;
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the background command never reached a terminal row"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+
+        /// A stored breach must name a real mechanism, and be judged the way
+        /// that mechanism actually reports.
+        ///
+        /// Kernel and supervised report a firing bound differently, and that
+        /// difference is the whole distinction: a supervisor finds a breach by
+        /// comparison, so the observation is above the budget; a kernel exists so
+        /// the observation never passes it, and carries the refusal counter
+        /// instead.
+        fn assert_real_backend(breach: &crate::resource_control::LimitBreach) {
+            assert!(
+                !breach.backend.is_empty(),
+                "a breach must name the mechanism that made it: {breach:?}"
+            );
+            if let Some(required) = crate::resource_control::required_backend() {
+                assert_eq!(
+                    breach.backend, required,
+                    "this host was provisioned to exercise {required}: {breach:?}"
+                );
+            }
+            match breach.level.as_str() {
+                "kernel" => {
+                    assert!(
+                        breach.observed <= breach.configured,
+                        "a kernel bound holds the measurement at the cap: {breach:?}"
+                    );
+                    assert!(
+                        breach.evidence.is_some(),
+                        "a kernel breach must carry the refusal counter that found it: \
+                         {breach:?}"
+                    );
+                }
+                "supervised" => assert!(
+                    breach.observed > breach.configured,
+                    "a supervised bound is found by comparison: {breach:?}"
+                ),
+                other => {
+                    panic!("a limit on this process must be kernel or supervised, not {other}")
+                }
+            }
+        }
+
+        /// A: a grandchild outgrows the budget, the whole tree goes, and the row
+        /// says `limit_exceeded` with both numbers.
+        #[test]
+        fn a_background_grandchild_past_the_memory_budget_ends_the_tree_and_types_the_exit() {
+            if !confinement_available() {
+                return;
+            }
+            let harness = Harness::create();
+            let hog = format!(
+                "LITTLE_MONKEY_MEMORY_HOG_MIB=512 {} --exact \
+                 workspace_shell::tests::memory_hog_child --test-threads=1 >/dev/null 2>&1",
+                quote(&place_test_binary_in(&harness.workspace, "bg-memory-hog"))
+            );
+            let view = harness
+                .start(
+                    &hog,
+                    ProcessLimits {
+                        max_memory_bytes: Some(192 * 1024 * 1024),
+                        ..ProcessLimits::default()
+                    },
+                )
+                .expect("the background command starts");
+            let native_pid = self::native_pid_of(&harness, &view.id);
+
+            let record = harness.wait_for_exit(&view.id);
+            let exit = record.exit.expect("a terminal row carries its exit");
+            assert_eq!(
+                exit.status,
+                ExitStatus::LimitExceeded,
+                "a memory kill must not be recorded as an ordinary failure: {exit:?}"
+            );
+            let breach = exit.breach.expect("a limit kill carries its typed breach");
+            assert_eq!(breach.limit, "max_memory_bytes");
+            assert_eq!(breach.configured, 192 * 1024 * 1024);
+            assert_real_backend(&breach);
+            assert!(
+                crate::process_tree::measure_tree(native_pid)
+                    .expect("snapshot")
+                    .is_none(),
+                "the whole owned tree must be gone once its budget fired"
+            );
+        }
+
+        /// B: a fork-heavy background tree hits its own process ceiling.
+        #[test]
+        fn a_background_tree_past_its_process_ceiling_ends_and_types_the_exit() {
+            if !confinement_available() {
+                return;
+            }
+            let harness = Harness::create();
+            let host_processes = crate::process_tree::snapshot().expect("snapshot").len();
+            assert!(
+                host_processes > 12,
+                "this assertion only means something on a host with real load: {host_processes}"
+            );
+            let view = harness
+                .start(
+                    "i=0; while [ $i -lt 40 ]; do sleep 20 & i=$((i+1)); done; wait",
+                    ProcessLimits {
+                        max_child_processes: Some(12),
+                        ..ProcessLimits::default()
+                    },
+                )
+                .expect("the background command starts");
+            let native_pid = self::native_pid_of(&harness, &view.id);
+
+            let record = harness.wait_for_exit(&view.id);
+            let exit = record.exit.expect("a terminal row carries its exit");
+            assert_eq!(exit.status, ExitStatus::LimitExceeded, "{exit:?}");
+            let breach = exit.breach.expect("a limit kill carries its typed breach");
+            assert_eq!(breach.limit, "max_child_processes");
+            assert_eq!(breach.configured, 12);
+            assert_real_backend(&breach);
+            assert!(
+                breach.observed < u64::try_from(host_processes).unwrap(),
+                "the count must be of the owned tree, not of everything this uid owns: {breach:?}"
+            );
+            assert!(crate::process_tree::measure_tree(native_pid)
+                .expect("snapshot")
+                .is_none());
+        }
+
+        /// C: the counter-test. Without it, "every background command is a
+        /// resource violation" would satisfy A, B and D.
+        #[test]
+        fn a_background_command_inside_every_bound_finishes_with_no_breach() {
+            if !confinement_available() {
+                return;
+            }
+            let harness = Harness::create();
+            let view = harness
+                .start("printf ok", ProcessLimits::default())
+                .expect("the background command starts");
+
+            let record = harness.wait_for_exit(&view.id);
+            let exit = record.exit.expect("a terminal row carries its exit");
+            assert_eq!(
+                exit.status,
+                ExitStatus::Succeeded,
+                "a command that finished on its own terms is not a limit kill: {exit:?}"
+            );
+            assert!(exit.breach.is_none(), "{exit:?}");
+        }
+
+        /// C2: a command that fails on its own is `Failed`, never
+        /// `LimitExceeded`. The other half of the counter-test — a watcher that
+        /// asked the mechanism and believed any answer would pass C and fail
+        /// this.
+        #[test]
+        fn a_background_command_that_fails_on_its_own_is_not_a_resource_kill() {
+            if !confinement_available() {
+                return;
+            }
+            let harness = Harness::create();
+            let view = harness
+                .start("exit 3", ProcessLimits::default())
+                .expect("the background command starts");
+
+            let record = harness.wait_for_exit(&view.id);
+            let exit = record.exit.expect("a terminal row carries its exit");
+            assert_eq!(exit.status, ExitStatus::Failed, "{exit:?}");
+            assert!(exit.breach.is_none(), "{exit:?}");
+            assert_eq!(exit.code, Some(3));
+        }
+
+        /// D: the terminal-before-sample race, and the reason the exit path asks
+        /// the mechanism before it reads the exit status.
+        ///
+        /// With a kernel process ceiling of one, the shell's very first `fork` is
+        /// refused and it dies within milliseconds — long before the watcher's
+        /// 100 ms tick could sample anything. The old code reached `try_wait`
+        /// first and recorded an ordinary non-zero exit; the limit had worked and
+        /// the app could not say so.
+        ///
+        /// Only meaningful where a kernel holds the bound. On a supervised host
+        /// there is no mechanism to ask and a process that dies before the first
+        /// comparison genuinely died on its own — recording that as a limit kill
+        /// would be the opposite lie.
+        #[test]
+        fn a_kernel_refusal_before_the_first_sample_is_still_a_limit_kill() {
+            if !confinement_available() {
+                return;
+            }
+            let probe = crate::resource_control::ResourceController::new(
+                crate::workspace_shell::effective_shell_limits(
+                    ProcessKind::BackgroundShell,
+                    ProcessLimits {
+                        max_child_processes: Some(1),
+                        ..ProcessLimits::default()
+                    },
+                ),
+            );
+            if probe.capabilities().child_processes.level()
+                != Some(crate::resource_control::EnforcementLevel::Kernel)
+            {
+                return;
+            }
+            drop(probe);
+
+            let harness = Harness::create();
+            let view = harness
+                .start(
+                    // One fork, refused at once, and then the shell is done.
+                    "sleep 30 &",
+                    ProcessLimits {
+                        max_child_processes: Some(1),
+                        ..ProcessLimits::default()
+                    },
+                )
+                .expect("the background command starts");
+
+            let record = harness.wait_for_exit(&view.id);
+            let exit = record.exit.expect("a terminal row carries its exit");
+            assert_eq!(
+                exit.status,
+                ExitStatus::LimitExceeded,
+                "a kernel that refused the fork must not read as an ordinary failure: {exit:?}"
+            );
+            let breach = exit.breach.expect("a limit kill carries its typed breach");
+            assert_eq!(breach.limit, "max_child_processes");
+            assert_eq!(breach.level, "kernel");
+            assert!(breach.evidence.is_some(), "{breach:?}");
+        }
+
+        fn native_pid_of(harness: &Harness, external_id: &str) -> u32 {
+            let record = harness
+                .row(external_id)
+                .expect("the spawn projects a row before it returns");
+            u32::try_from(
+                record
+                    .native_pid
+                    .expect("a background shell's row carries its native pid"),
+            )
+            .expect("a pid fits in u32")
+        }
     }
 }

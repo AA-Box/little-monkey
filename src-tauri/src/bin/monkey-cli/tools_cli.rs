@@ -6,7 +6,6 @@
 //! `permission.rs` — since there's no window here to emit a
 //! `permission://request` event to.
 
-use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 use globset::GlobBuilder;
@@ -322,51 +321,105 @@ pub async fn run_shell(
     perms.request("run_shell", command).await?;
     checkpoints::record_shell(state, checkpoint_id)?;
 
-    let cwd_path = match cwd {
-        Some(c) => workspace::resolve_path_and_root(state, c)?.0,
-        None => workspace::primary_root_canon(state)?,
-    };
-
-    // `sh` does not exist on Windows — use the platform's own command
-    // interpreter there. Same rule as the GUI's tool_run_shell.
-    #[cfg(target_os = "windows")]
-    let (shell, shell_flag) = ("cmd", "/C");
-    #[cfg(not(target_os = "windows"))]
-    let (shell, shell_flag) = ("sh", "-c");
-
-    let mut command_builder = tokio::process::Command::new(shell);
-    command_builder
-        .arg(shell_flag)
-        .arg(command)
-        .current_dir(&cwd_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // The timeout below works by DROPPING the in-flight
-        // `wait_with_output` future (and the child with it) — without this,
-        // the spawned process would keep running orphaned after a timeout.
-        .kill_on_drop(true);
-
-    let child = command_builder
-        .spawn()
-        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-
-    let output = match tokio::time::timeout(SHELL_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(format!("Failed to run command: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "Command timed out after {} seconds",
-                SHELL_TIMEOUT.as_secs()
-            ))
+    let (cwd_path, workspace_root) = match cwd {
+        Some(c) => workspace::resolve_path_and_root(state, c)?,
+        None => {
+            let root = workspace::primary_root_canon(state)?;
+            (root.clone(), root)
         }
     };
+
+    let output = little_monkey_lib::workspace_shell::run_to_output(
+        &workspace_root,
+        &cwd_path,
+        command,
+        SHELL_TIMEOUT,
+        // The same ceiling the desktop shell tool uses, and for the same reason:
+        // this output goes straight into a model's context window.
+        Some(little_monkey_lib::output_cap::MODEL_OUTPUT_CAP),
+        // No per-call override from the CLI either, so the shell class defaults
+        // are what apply — the same bounds the desktop tool runs under, which is
+        // the point of both clients sharing this entry point.
+        little_monkey_lib::process_table::ProcessLimits::default(),
+    )
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "Command timed out after {} seconds",
+                SHELL_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("Failed to run command: {error}")
+        }
+    })?;
+
+    record_foreground_shell(&cwd_path, &output);
 
     Ok(serde_json::json!({
         "stdout": String::from_utf8_lossy(&output.stdout),
         "stderr": String::from_utf8_lossy(&output.stderr),
-        "code": output.status.code(),
+        "code": output.exit_code,
     }))
+}
+
+/// Records this CLI shell on the same process table the desktop writes to.
+///
+/// Both clients already share the enforcement — `run_to_output` is one entry
+/// point — and this is the other half of "the authority boundary cannot drift by
+/// client": a `monkey processes list` on a machine where the agent ran from the
+/// terminal shows the same rows, with the same effective limits and the same
+/// typed breach, as one where it ran from the window.
+///
+/// One write rather than the desktop's two, because this client has no separate
+/// spawn and wait to sit between: `run_to_output` returns when the command is
+/// already terminal, so `reconcile` admits and closes the row in a single call.
+///
+/// Fail-soft throughout, and deliberately without creating a ledger that does not
+/// exist: a shell must not fail because bookkeeping could not be written, and a
+/// read-only tool invocation must not leave a database behind as a side effect.
+fn record_foreground_shell(
+    cwd: &std::path::Path,
+    output: &little_monkey_lib::workspace_shell::ShellOutput,
+) {
+    use little_monkey_lib::process_table::{ExitStatus, ProcessExit, ProcessState};
+
+    let Some(data_dir) = crate::app_data_dir() else {
+        return;
+    };
+    let path = data_dir.join("profile-v1.sqlite3");
+    if !path.exists() {
+        return;
+    }
+    let Ok(ledger) = little_monkey_lib::run_ledger::RunLedger::open(&path) else {
+        return;
+    };
+    let mut projection = little_monkey_lib::workspace_shell::foreground_projection(
+        &format!("fgsh-{}", uuid::Uuid::new_v4()),
+        ProcessState::Exited,
+        cwd,
+        output.identity,
+        output.limits,
+        Some(output.containment.clone()),
+        Some(output.usage),
+    );
+    projection.exit = Some(match &output.breach {
+        Some(breach) => ProcessExit::limit_exceeded(breach.clone()),
+        None => ProcessExit {
+            status: match output.exit_code {
+                Some(0) => ExitStatus::Succeeded,
+                _ => ExitStatus::Failed,
+            },
+            code: output.exit_code,
+            signal: None,
+            reason: None,
+            breach: None,
+        },
+    });
+    let now = crate::durable_run::unix_time_ms().unwrap_or(0);
+    let _ = ledger
+        .process_table()
+        .reconcile(&projection, i64::try_from(now).unwrap_or(i64::MAX));
 }
 
 /// Saves a durable fact to `<app-data>/memories.json` for the current

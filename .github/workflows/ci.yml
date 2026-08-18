@@ -33,7 +33,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - name: Install frontend deps
@@ -60,19 +60,49 @@ jobs:
         # there as not being one.
         run: pnpm a11y
 
+      - name: Controller response policy, in a real browser engine
+        # The one gate jsdom cannot be: it enforces neither the permissions
+        # policy nor the CSP, so the headers that once forbade the paired
+        # controller its own camera, microphone, location and audio were
+        # invisible to every frontend test while all of them passed.
+        #
+        # This proves *policy*, never hardware — nothing here opens a device,
+        # and a headless runner has none. Real capture stays the deliberate
+        # manual check on a paired phone: `monkey daemon remote device-check
+        # --dangerous` (docs/paired-devices.md, "Checking a real device").
+        #
+        # REQUIRE_BROWSER=1 turns "no browser engine here" into a failure. The
+        # test skips with a reason when run on a machine without Chrome; a CI
+        # leg that silently skipped would be the same false green this exists to
+        # remove. The runner image ships Chrome, so it runs.
+        env:
+          REQUIRE_BROWSER: "1"
+        run: pnpm test:browser-policy
+
       - name: Install/upgrade smoke-test logic
         # The decision logic only. The install itself runs in `release.yml`,
         # where there are installers to install; this holds the rule that a leg
         # which cannot run reports SKIPPED with a reason and never a pass.
         run: pnpm test:install-smoke
 
+      - name: CLI sidecar staging
+        # tauri-build copies the staged sidecar over `target/<profile>/monkey-cli`
+        # on every build, so a bootstrap placeholder that outlives a real build
+        # replaces a working CLI with a zero-byte file that cargo never rebuilds.
+        run: pnpm test:cli-sidecar
+
+      - name: Managed-runtime archive extraction
+        # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
+        # them. Keep the platform-specific selector covered before release.
+        run: pnpm test:runtime-archive
+
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
     # code — a single-OS CI job would silently never compile the arms that
     # don't match its own target at all (cfg-gated blocks that don't match
     # the runner's target are stripped before the compiler looks at them).
-    # Mirrors release.yml's platform set (minus the ARM runners, which only
-    # matter for release artifacts, not for compiling/testing).
+    # Mirrors release.yml's platform set. `macos-latest` is Apple Silicon, so
+    # its ARM-only test paths are compiled and exercised here too.
     strategy:
       fail-fast: false
       matrix:
@@ -90,6 +120,9 @@ jobs:
       # Keep target/ small enough for the 14 GB hosted-runner disk
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
+      # Linux and Windows must run the native clone path, not silently exercise
+      # only its ordinary-copy fallback.
+      LITTLE_MONKEY_REQUIRE_COW_TESTS: 1
 
     steps:
       - uses: actions/checkout@v4
@@ -104,7 +137,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential dbus-x11 gnome-keyring btrfs-progs
 
       - name: Start a D-Bus Secret Service for keychain-backed tests
         if: startsWith(matrix.os, 'ubuntu')
@@ -121,7 +154,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -134,8 +167,189 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
+      - name: Provision Linux reflink test volume
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          image="$RUNNER_TEMP/little-monkey-btrfs.img"
+          root="$RUNNER_TEMP/little-monkey-btrfs"
+          truncate -s 512M "$image"
+          sudo modprobe btrfs
+          mkfs.btrfs -q "$image"
+          mkdir -p "$root"
+          sudo mount -o loop "$image" "$root"
+          sudo chown "$USER:$(id -gn)" "$root"
+          echo "LITTLE_MONKEY_COW_TEST_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Provision Windows ReFS test volume
+        if: startsWith(matrix.os, 'windows')
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "R:\") {
+            throw "R: is already in use"
+          }
+          $image = Join-Path $env:RUNNER_TEMP "little-monkey-refs.vhdx"
+          $diskpartScript = Join-Path $env:RUNNER_TEMP "little-monkey-refs.txt"
+          @"
+          create vdisk file="$image" maximum=2048 type=expandable
+          select vdisk file="$image"
+          attach vdisk
+          create partition primary
+          format fs=refs quick label=LITTLEMONKEY
+          assign letter=R
+          "@ | Set-Content -Path $diskpartScript -Encoding ascii
+          & diskpart /s $diskpartScript
+          if ($LASTEXITCODE -ne 0) {
+            throw "diskpart failed with exit code $LASTEXITCODE"
+          }
+          $root = "R:\little-monkey-cow-tests"
+          $volume = Get-Volume -DriveLetter R -ErrorAction Stop
+          if ($volume.FileSystem -ne "ReFS") {
+            throw "R: is $($volume.FileSystem), not ReFS"
+          }
+          New-Item -ItemType Directory -Force $root | Out-Null
+          "LITTLE_MONKEY_COW_TEST_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Provision a delegated cgroup so the kernel path runs
+        if: startsWith(matrix.os, 'ubuntu')
+        # Without this the Linux leg proves only that the cgroup code compiles.
+        # A hosted runner's job is not a systemd user session, so nothing has
+        # been delegated to it and `CgroupScope::create` correctly declines and
+        # falls back to the supervisor — which is a legitimate production
+        # outcome, and also means the kernel path never executes anywhere.
+        #
+        # Same move as the btrfs loop mount two steps up, which exists so the
+        # reflink tests exercise the native clone rather than its copy fallback:
+        # provision the environment the production path needs, then let the
+        # production path run unmodified.
+        #
+        # The two-level layout is required by cgroup v2's "no internal
+        # processes" rule: `lm-ci` may enable controllers for its children only
+        # because it holds no processes itself, and this shell moves into
+        # `lm-ci/leaf`. `CgroupScope` then walks up from its own cgroup, finds
+        # `lm-ci`, and creates its scope there.
+        run: |
+          set -euo pipefail
+          root=/sys/fs/cgroup
+          test -f "$root/cgroup.controllers" || { echo "not cgroup v2; leaving the fallback in place"; exit 0; }
+          echo "root controllers: $(cat "$root/cgroup.controllers")"
+          sudo mkdir -p "$root/lm-ci/leaf"
+          # Delegate downward one level at a time; a controller the root does not
+          # have cannot be enabled and is not worth failing the job over.
+          echo "+memory +pids" | sudo tee "$root/cgroup.subtree_control" >/dev/null || true
+          echo "+memory +pids" | sudo tee "$root/lm-ci/cgroup.subtree_control" >/dev/null || true
+          sudo chown -R "$USER" "$root/lm-ci"
+          delegated="$(cat "$root/lm-ci/leaf/cgroup.controllers" 2>/dev/null || echo none)"
+          echo "delegated controllers: $delegated"
+          echo "LITTLE_MONKEY_CI_CGROUP=$root/lm-ci/leaf" >> "$GITHUB_ENV"
+          # Turns the leg from "the kernel path may run" into "the kernel path
+          # ran". Both controllers this backend installs have to be delegated for
+          # the demand to be honest, and when they are, `CgroupScope::create`
+          # succeeding is no longer optional: the tests below refuse a supervised
+          # fallback, so a leg whose whole purpose is to exercise cgroup v2 fails
+          # rather than passing on the same code path the other two legs cover.
+          case "$delegated" in
+            *memory*) case "$delegated" in *pids*)
+              echo "LITTLE_MONKEY_REQUIRE_CGROUP_BACKEND=1" >> "$GITHUB_ENV" ;;
+            esac ;;
+          esac
+
+      - name: Rust tests (Linux, inside the delegated cgroup)
+        if: startsWith(matrix.os, 'ubuntu')
+        # Moves this shell into the delegated leaf before the test binary is
+        # built, so every process it spawns inherits the membership and
+        # `/proc/self/cgroup` points somewhere `CgroupScope` can create under.
+        # Falls through unchanged when the provisioning step found no v2
+        # hierarchy, which keeps the supervised fallback the tested path there.
+        #
+        # The migration goes through `sudo` because cgroup v2 requires write
+        # permission on the *common ancestor* of the source and destination, not
+        # only on the destination: this shell starts in the root cgroup, so the
+        # ancestor is the root, which is root-owned. Chowning the leaf is not
+        # enough and the first attempt failed here with EACCES. Root provisions,
+        # exactly as the btrfs step above needs `sudo mount`; nothing the app
+        # does at runtime is privileged, and it still creates its own scope as
+        # the unprivileged user under a subtree it owns.
+        run: |
+          if [ -n "${LITTLE_MONKEY_CI_CGROUP:-}" ]; then
+            echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
+            echo "running under $(cat /proc/self/cgroup)"
+          fi
+          pnpm test:rust
+
       - name: Rust tests
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: pnpm test:rust
+
+      - name: Apple-Silicon MLX full-ladder transaction
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner architecture: $(uname -m)"
+          test "$(uname -m)" = "arm64"
+          cargo test --manifest-path src-tauri/Cargo.toml --lib \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --list | \
+            grep 'm3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional'
+          cargo test \
+            --manifest-path src-tauri/Cargo.toml \
+            --lib \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --nocapture
+
+      - name: The CLI reports this runner's resource-enforcement backend
+        # Which mechanism actually holds a limit here, per platform, in the log —
+        # and a required gate on the command itself.
+        #
+        # The tests already refuse a limit that no backend enforced, so a green
+        # build cannot mean "skipped". What they cannot say is *which* backend
+        # did it: a Linux host with a delegated cgroup gets a kernel bound and
+        # one without falls back to the supervisor, and both pass. That
+        # distinction decides whether the cgroup path has ever executed at all,
+        # and libtest captures a passing test's output, so it can only be
+        # answered from outside the test binary.
+        #
+        # Uses the shipped `processes limits` surface rather than a bespoke
+        # probe, so what CI reports is exactly what a user reading their own
+        # machine would see.
+        #
+        # After the tests, and through `stage:cli:placeholder`, because a bare
+        # `cargo run` here fails: `build.rs` calls `tauri-build`, which wants a
+        # sidecar binary that does not exist until that script stages a
+        # placeholder.
+        #
+        # This step used to carry `continue-on-error: true`, and that is what
+        # let `monkey-cli` sit broken on Windows: every invocation died with
+        # STATUS_STACK_OVERFLOW before `main`, the step printed nothing, and the
+        # job stayed green. A *fallback backend* is a legitimate environment
+        # outcome and passes here; a command that will not run is not, and now
+        # fails the build. `tests/cli_processes_limits.rs` asserts the same rule
+        # from the test suite so it is not only CI that holds it.
+        run: pnpm stage:cli:placeholder && cargo run --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits
+
+      - name: The delegated-cgroup leg really used cgroup v2
+        if: startsWith(matrix.os, 'ubuntu')
+        # The step above prints which backend this host offers; this one refuses
+        # the wrong answer. Same shell trick as the test step: move into the
+        # delegated leaf first, so what the CLI resolves is the hierarchy the
+        # provisioning step created rather than the root cgroup this job starts
+        # in.
+        #
+        # Skipped, not failed, when provisioning found no v2 hierarchy — that is
+        # a runner without the mechanism, and the supervised fallback it gets is
+        # a production outcome. What must never happen is this leg *silently*
+        # falling back while its whole purpose is to exercise the kernel path.
+        run: |
+          set -euo pipefail
+          if [ -z "${LITTLE_MONKEY_REQUIRE_CGROUP_BACKEND:-}" ]; then
+            echo "no delegated cgroup on this runner; the supervised fallback is the tested path"
+            exit 0
+          fi
+          echo $$ | sudo tee "${LITTLE_MONKEY_CI_CGROUP}/cgroup.procs" >/dev/null
+          backend=$(cargo run --quiet --manifest-path src-tauri/Cargo.toml --bin monkey-cli -- processes limits | sed -n 's/^this host: //p')
+          echo "backend: $backend"
+          test "$backend" = "cgroup v2"
 
       # The K19 gate, named as its own step so a failure reads as "the
       # published ABI changed without a version bump" rather than as one line
@@ -184,7 +398,7 @@ jobs:
       # cache post-step wants to save does not exist and it fails the job.
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
 
       - name: Audit npm dependencies
         # `--prod` because a vulnerable build-time devDependency is not shipped

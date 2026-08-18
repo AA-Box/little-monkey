@@ -15,6 +15,7 @@ use little_monkey_lib::runtime_adapter::MemoryRequirement;
 use crate::durable_run::{bounded_text, CliRunEventSink, DurableRunRecorder};
 
 use super::admission::{self, Fit, Reservation};
+use super::channel_ingress::{self, ReportedMutationOutcome, RunOutcomeSource};
 use super::ledger::{LeaseToken, SharedLedger};
 use super::scheduler::{self, Candidate, ProcessClass, Running};
 use super::store::{
@@ -23,6 +24,65 @@ use super::store::{
 };
 use super::worktree::OwnedWorktree;
 use little_monkey_lib::profiles::ProfileLimits;
+
+/// How many of a run's events are scanned for its reported outcome.
+///
+/// The contract's verification event is written at the very end of a turn, so
+/// this only has to be larger than one turn's event count. A run that somehow
+/// exceeds it reads as "reported nothing", which routes to the safe verdict.
+const MAX_OUTCOME_EVENTS: usize = 10_000;
+
+/// The workspace-mutation outcome of a finished run, read from its own durable
+/// event stream.
+///
+/// Its own handles rather than the engine's, because the policy needs the store
+/// mutably at the same time. Opened only on a tick that actually has an
+/// unsettled contract.
+struct LedgerRunOutcomes {
+    store: DaemonStore,
+    shared: SharedLedger,
+}
+
+impl LedgerRunOutcomes {
+    fn open(paths: &DaemonPaths) -> Result<Self, String> {
+        Ok(Self {
+            store: DaemonStore::open(paths)?,
+            shared: SharedLedger::open(&paths.ledger_db)?,
+        })
+    }
+}
+
+impl RunOutcomeSource for LedgerRunOutcomes {
+    fn terminal_outcome(&self, job_id: &str) -> Result<ReportedMutationOutcome, String> {
+        use little_monkey_lib::channels::mutation::{MutationOutcome, MUTATION_VERIFICATION_NAME};
+
+        // A job that is gone cannot be waited on. Reported as "over, said
+        // nothing", which is the verdict that replays nothing.
+        let Some(job) = self.store.get_job(job_id)? else {
+            return Ok(Some(None));
+        };
+        if !job.state.is_terminal() {
+            return Ok(None);
+        }
+        let Some(run_id) = job.run_id.as_deref() else {
+            return Ok(Some(None));
+        };
+        for envelope in self.shared.events(run_id, 0, MAX_OUTCOME_EVENTS)? {
+            if let RunEvent::VerificationFinished {
+                name,
+                passed,
+                summary,
+                ..
+            } = &envelope.event
+            {
+                if name == MUTATION_VERIFICATION_NAME {
+                    return Ok(Some(Some(MutationOutcome::from_summary(*passed, summary))));
+                }
+            }
+        }
+        Ok(Some(None))
+    }
+}
 
 /// How the engine learns what this machine has.
 ///
@@ -204,8 +264,7 @@ pub struct RealProcessAdapter {
 impl RealProcessAdapter {
     pub fn current() -> Result<Self, String> {
         Ok(Self {
-            executable: std::env::current_exe()
-                .map_err(|error| format!("Could not resolve monkey executable: {error}"))?,
+            executable: super::monkey_executable()?,
         })
     }
 }
@@ -238,6 +297,10 @@ impl ProcessAdapter for RealProcessAdapter {
             .arg("--json")
             .env_remove("LITTLE_MONKEY_TASK_QUEUE_ONLY")
             .env("LITTLE_MONKEY_DAEMON_APPROVAL_WAIT", "1")
+            // The child's own identity in the queue. `send_message` resolves
+            // the conversation to reply to from this — by reading the durable
+            // event that produced the job, never from anything the model said.
+            .env("LITTLE_MONKEY_DAEMON_JOB_ID", &job.job_id)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -674,15 +737,65 @@ impl BudgetLimit {
 const LIMIT_EXCEEDED_PREFIX: &str = "limit_exceeded:";
 
 /// Encode a budget kill for storage in `last_error`.
-fn limit_exceeded_reason(limit: BudgetLimit, detail: &str) -> String {
-    format!("{LIMIT_EXCEEDED_PREFIX}{}: {detail}", limit.field())
+///
+/// The two numbers are encoded structurally rather than left inside the prose.
+/// The prose was all there was, and it meant the only way to answer "how much
+/// memory did it actually hold" was to parse an English sentence — so the
+/// typed columns V21 added would have been populated from a regex over a
+/// message, which is the same fragility one layer down.
+fn limit_exceeded_reason(
+    limit: BudgetLimit,
+    configured: u64,
+    observed: u64,
+    detail: &str,
+) -> String {
+    format!(
+        "{LIMIT_EXCEEDED_PREFIX}{}:{configured}:{observed}: {detail}",
+        limit.field()
+    )
 }
 
-/// The inverse: `Some` for a budget kill, carrying the reason with the marker
-/// stripped but the limit name kept, which is what `ProcessExit::reason` owes
-/// its reader.
-fn parse_limit_exceeded(last_error: &str) -> Option<&str> {
-    last_error.strip_prefix(LIMIT_EXCEEDED_PREFIX)
+/// The inverse: `Some` for a budget kill, as a typed breach plus the human
+/// reason with the marker stripped.
+///
+/// Tolerates the older two-field encoding by answering `None` for the numbers,
+/// because rows written by a previous build are still in the database and a
+/// panic or a wrong number is worse than an honest gap.
+fn parse_limit_exceeded(
+    last_error: &str,
+) -> Option<(
+    Option<little_monkey_lib::resource_control::LimitBreach>,
+    &str,
+)> {
+    let rest = last_error.strip_prefix(LIMIT_EXCEEDED_PREFIX)?;
+    let mut parts = rest.splitn(4, ':');
+    let field = parts.next()?;
+    let configured = parts.next().and_then(|value| value.parse::<u64>().ok());
+    let observed = parts.next().and_then(|value| value.parse::<u64>().ok());
+    let Some((configured, observed)) = configured.zip(observed) else {
+        return Some((None, rest));
+    };
+    let detail = parts.next().unwrap_or("").trim_start();
+    Some((
+        Some(little_monkey_lib::resource_control::LimitBreach {
+            limit: field.to_string(),
+            configured,
+            observed,
+            // Named rather than borrowed from the shared controller: this budget
+            // is the daemon's own sampling watchdog over the job's process group,
+            // and attributing it to a mechanism it does not use would be exactly
+            // the misreporting `EnforcementLevel` exists to prevent.
+            backend: "daemon job watchdog".to_string(),
+            level: little_monkey_lib::resource_control::EnforcementLevel::OwnerSourced
+                .as_str()
+                .to_string(),
+            observed_at_ms: 0,
+            // The watchdog's evidence is the two numbers above it, exactly as for
+            // the supervisor: there is no kernel counter behind this one.
+            evidence: None,
+        }),
+        detail,
+    ))
 }
 
 /// Terminal `JobState` → the unified exit. A non-terminal state reaching here
@@ -709,9 +822,14 @@ fn exit_for(
         status,
         code: None,
         signal: None,
-        // `limit` first so the marker never leaks into a human-facing reason,
-        // whatever state it was found on.
-        reason: limit.or(last_error).map(str::to_string),
+        // The stripped detail first so the marker never leaks into a
+        // human-facing reason, whatever state it was found on.
+        reason: limit
+            .as_ref()
+            .map(|(_, detail)| *detail)
+            .or(last_error)
+            .map(str::to_string),
+        breach: limit.and_then(|(breach, _)| breach),
     }
 }
 
@@ -1007,6 +1125,12 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         self.store.set_meta("heartbeat_ms", &now.to_string())?;
         self.store
             .set_meta("pid", &std::process::id().to_string())?;
+        // The build the resident process is actually running — not the one
+        // installed on disk. An app update replaces the sidecar without
+        // touching the service definition, so the previous build keeps
+        // serving until something restarts it; `daemon ensure` compares this
+        // against its own version to notice exactly that.
+        self.store.set_meta("version", env!("CARGO_PKG_VERSION"))?;
         if self.store.kill_switch()? {
             self.store.request_cancel_all(now)?;
         }
@@ -1037,9 +1161,47 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // daemon restart converges instead of forking a second record.
         self.sync_process_table(now)?;
 
+        // Settled per tick from durable state rather than at each place a job
+        // finishes, for the same reason and with the same payoff: a crash
+        // between a run ending and its contract being settled is just a tick
+        // that did not happen yet. Fail-soft — a turn whose contract could not
+        // be read this tick is read again next tick.
+        if let Err(error) = self.settle_conversation_contracts(now) {
+            eprintln!("monkey daemon: could not settle a conversation contract: {error}");
+        }
+
         if now.saturating_sub(self.last_retention_ms) >= 60 * 60 * 1_000 {
             self.apply_retention(now)?;
             self.last_retention_ms = now;
+        }
+        Ok(())
+    }
+
+    /// Settle the workspace-mutation contract of every accepted conversational
+    /// turn whose run is over.
+    ///
+    /// The decision, the corrective continuation and the record all live in
+    /// [`channel_ingress::settle_mutation_contracts`]; this only supplies the
+    /// two handles it needs and gets out of the way. The indexed emptiness check
+    /// comes first so an idle daemon pays one query per tick rather than opening
+    /// a second connection to the ledger for nothing.
+    fn settle_conversation_contracts(&mut self, now: u64) -> Result<(), String> {
+        if self.store.unsettled_mutation_contracts(1)?.is_empty() {
+            return Ok(());
+        }
+        let outcomes = LedgerRunOutcomes::open(&self.paths)?;
+        let queue = super::DaemonChannelQueue::new(self.paths.clone());
+        let sweep = channel_ingress::settle_mutation_contracts(
+            &mut self.store,
+            &queue,
+            &outcomes,
+            i64::try_from(now).unwrap_or(i64::MAX),
+        )?;
+        if sweep.corrected > 0 || sweep.unmet > 0 || sweep.interrupted > 0 {
+            eprintln!(
+                "monkey daemon: workspace-mutation contracts settled: {} satisfied, {} corrected, {} unmet, {} interrupted",
+                sweep.satisfied, sweep.corrected, sweep.unmet, sweep.interrupted
+            );
         }
         Ok(())
     }
@@ -1896,6 +2058,10 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     reason: Some(job.last_error.clone().unwrap_or_else(|| {
                         format!("superseded by attempt {}", attempt_ordinal(&job))
                     })),
+                    // A superseded attempt failed for whatever reason produced
+                    // the retry; a resource kill is not retried, so it never
+                    // reaches this arm.
+                    breach: None,
                 },
                 // No attempt in the id: a row written before attempt scoping.
                 // Nothing will ever update it again, and the one thing it must
@@ -1905,12 +2071,14 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     code: None,
                     signal: None,
                     reason: Some("process row predates attempt-scoped daemon job ids".to_string()),
+                    breach: None,
                 },
                 None => ProcessExit {
                     status: ExitStatus::Lost,
                     code: None,
                     signal: None,
                     reason: Some("daemon job record is gone".to_string()),
+                    breach: None,
                 },
             };
             table
@@ -2308,6 +2476,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     run_id,
                     now,
                     BudgetLimit::Wall,
+                    budget,
+                    elapsed,
                     &format!("ran for {elapsed} ms against a {budget} ms budget{source}"),
                 )?;
                 return Ok(());
@@ -2326,6 +2496,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                     run_id,
                     now,
                     BudgetLimit::Memory,
+                    max_memory,
+                    used,
                     &format!(
                         "the process group held {used} bytes against a {max_memory} byte budget"
                     ),
@@ -2344,6 +2516,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
                 run_id,
                 now,
                 BudgetLimit::Output,
+                job.max_log_bytes,
+                written,
                 &format!(
                     "the log reached {written} bytes against a {} byte budget",
                     job.max_log_bytes
@@ -2414,6 +2588,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         run_id: &str,
         now: u64,
         limit: BudgetLimit,
+        configured: u64,
+        observed: u64,
         detail: &str,
     ) -> Result<(), String> {
         let announced = format!("daemon {} budget exceeded: {detail}", limit.label());
@@ -2426,7 +2602,7 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             job_id,
             JobState::Cancelled,
             now,
-            Some(&limit_exceeded_reason(limit, detail)),
+            Some(&limit_exceeded_reason(limit, configured, observed, detail)),
         )
     }
 
@@ -2930,6 +3106,7 @@ pub(super) mod tests {
                 allow_network: false,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,
@@ -4699,18 +4876,17 @@ pub(super) mod tests {
         assert_eq!(BudgetLimit::Output.field(), stringify!(max_output_bytes));
 
         for limit in [BudgetLimit::Wall, BudgetLimit::Memory, BudgetLimit::Output] {
-            let stored = limit_exceeded_reason(limit, "held 9 bytes against 4");
+            let stored = limit_exceeded_reason(limit, 4, 9, "held 9 bytes against 4");
             let exit = exit_for(JobState::Cancelled, Some(&stored));
             assert_eq!(
                 exit.status,
                 ExitStatus::LimitExceeded,
                 "{limit:?} must not be projected as an ordinary cancel"
             );
-            let reason = exit.reason.expect("a limit kill must name its limit");
-            assert!(
-                reason.starts_with(limit.field()),
-                "the reason must name the limit that fired, got {reason:?}"
-            );
+            let reason = exit
+                .reason
+                .clone()
+                .expect("a limit kill must name its limit");
             assert!(
                 reason.ends_with("held 9 bytes against 4"),
                 "the measurement must survive, got {reason:?}"
@@ -4719,7 +4895,30 @@ pub(super) mod tests {
                 !reason.contains(LIMIT_EXCEEDED_PREFIX),
                 "the storage marker must not leak into a human-facing reason"
             );
+            // The typed half, which is the point of the encoding change: the
+            // numbers survive as numbers rather than only inside a sentence a
+            // reader would have to parse.
+            let breach = exit.breach.expect("a budget kill carries its measurement");
+            assert_eq!(breach.limit, limit.field());
+            assert_eq!(breach.configured, 4);
+            assert_eq!(breach.observed, 9);
+            assert_eq!(
+                breach.level, "owner-sourced",
+                "the daemon's budget comes from the job's own recipe, not from this row"
+            );
         }
+
+        // A row written by an earlier build carries the two-field encoding. It
+        // must still project as a limit kill with its prose intact, and simply
+        // report no numbers — a wrong number here would be worse than a gap.
+        let legacy = format!("{LIMIT_EXCEEDED_PREFIX}max_memory_bytes: held 9 bytes against 4");
+        let exit = exit_for(JobState::Cancelled, Some(&legacy));
+        assert_eq!(exit.status, ExitStatus::LimitExceeded);
+        assert!(exit.breach.is_none());
+        assert_eq!(
+            exit.reason.as_deref(),
+            Some("max_memory_bytes: held 9 bytes against 4")
+        );
 
         // The other half: an ordinary stop is still an ordinary stop. Without
         // this, "everything is a limit kill" would pass the assertions above.
@@ -4794,10 +4993,14 @@ pub(super) mod tests {
             .expect("the job row survives its kill");
         assert_eq!(job.state, JobState::Cancelled);
         let last_error = job.last_error.expect("a budget kill records why");
+        let (breach, detail) = parse_limit_exceeded(&last_error).expect("got {last_error:?}");
+        let breach = breach.expect("a budget kill records its two numbers");
+        assert_eq!(breach.limit, "max_memory_bytes");
+        assert_eq!(breach.configured, 4096);
+        assert_eq!(breach.observed, 8192);
         assert_eq!(
-            parse_limit_exceeded(&last_error),
-            Some("max_memory_bytes: the process group held 8192 bytes against a 4096 byte budget"),
-            "got {last_error:?}"
+            detail,
+            "the process group held 8192 bytes against a 4096 byte budget"
         );
 
         // ...and the unified table shows the distinguishable exit.
@@ -4812,12 +5015,24 @@ pub(super) mod tests {
             ExitStatus::LimitExceeded,
             "a budget kill recorded as `Cancelled` is indistinguishable from a user pressing Stop"
         );
-        let reason = exit.reason.expect("a limit kill must name its limit");
+        // The limit and its two numbers are now typed rather than parsed back out
+        // of the sentence, which is what V21's columns are for. The prose keeps
+        // both figures because it is what a person reads.
+        let breach = exit
+            .breach
+            .clone()
+            .expect("a budget kill must carry its measurement");
+        assert_eq!(breach.limit, "max_memory_bytes");
+        assert_eq!(breach.configured, 4096);
+        assert_eq!(breach.observed, 8192);
+        let reason = exit.reason.expect("a limit kill must explain itself");
         assert!(
-            reason.starts_with("max_memory_bytes:")
-                && reason.contains("8192")
-                && reason.contains("4096"),
-            "the exit must name the limit and both measurements, got {reason:?}"
+            reason.contains("8192") && reason.contains("4096"),
+            "the reason must let a reader tell a wrong budget from a wrong job, got {reason:?}"
+        );
+        assert!(
+            !reason.contains(LIMIT_EXCEEDED_PREFIX),
+            "the storage marker must not leak into a human-facing reason"
         );
 
         // The run ledger has no `limit_exceeded` status, so the run is cancelled

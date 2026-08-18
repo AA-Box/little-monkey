@@ -137,8 +137,9 @@ export function SecurityDoctorPanel() {
             Security Doctor
           </h3>
           <p className="mt-1 text-xs leading-5 text-muted">
-            Audit local file permissions, remote TLS, API and webhook binding, MCP origins, skill integrity,
-            and active browser or companion grants. Audits are local and do not contact a model.
+            Audit local file permissions, executable-extension trust and grants, remote TLS, API and webhook
+            binding, MCP origins, skill integrity, and active browser or companion grants. Audits are local and
+            do not contact a model.
           </p>
         </div>
       </div>

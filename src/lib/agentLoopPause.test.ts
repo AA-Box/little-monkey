@@ -21,9 +21,11 @@ const mocks = vi.hoisted(() => ({
   reconcileProcess: vi.fn(),
 }));
 
+// A browser/dev profile: no Tauri bridge, so no resident runner can exist and
+// the in-process loop — the one with the pause checkpoints — is what runs.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => mocks.invoke(...args),
-  isTauri: () => true,
+  isTauri: () => false,
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 vi.mock("./turnEngine", async (importOriginal) => {
@@ -33,12 +35,6 @@ vi.mock("./turnEngine", async (importOriginal) => {
     attemptStream: (...args: unknown[]) => mocks.attemptStream(...args),
     executeToolCall: (...args: unknown[]) => mocks.executeToolCall(...args),
   };
-});
-// The turn must take the in-process loop, not the resident runner — that's
-// the path with the pause checkpoints.
-vi.mock("./daemonDesktopTurn", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./daemonDesktopTurn")>();
-  return { ...actual, daemonDesktopRoute: async () => "fallback" as const };
 });
 // A null recorder is a supported state (`durable.recorder` is optional
 // throughout); this keeps the durable ledger out of a pause test.
@@ -187,6 +183,8 @@ beforeEach(() => {
     runningSyntheses: {},
     runningCrews: {},
     runningVerifyLabel: {},
+    turnOutcomes: {},
+    turnSessions: {},
     persistError: null,
   });
   useModelStore.setState({
@@ -275,6 +273,46 @@ describe("chat turn cooperative pause", () => {
 
     await deliver(suspendSignal(false));
     await turn;
+  });
+
+  /**
+   * Turn attribution for the sidebar's status marker: a permission prompt
+   * arrives from Rust carrying only its `turn_id`, and `turnSessions` is what
+   * turns that into "this conversation is waiting on you". A stale entry
+   * would mark the wrong row forever, so the release matters as much as the
+   * registration.
+   *
+   * Lives in this file rather than with the marker's own unit tests because
+   * the pause latch is the only harness that can hold a turn open and look at
+   * it mid-flight.
+   */
+  it("attributes its turn id to the session while it runs, and releases it at the end", async () => {
+    mocks.attemptStream.mockImplementation(async (...args: unknown[]) => stream(args, "ANSWERED"));
+
+    await deliver(suspendSignal(true));
+    const turn = runAgentTurn(SESSION_ID, "Explain this", [], undefined, TURN_ID);
+
+    await vi.waitFor(() => expect(useSessionStore.getState().turnSessions[TURN_ID]).toBe(SESSION_ID), {
+      timeout: 5000,
+    });
+
+    await deliver(suspendSignal(false));
+    await turn;
+
+    expect(useSessionStore.getState().turnSessions).toEqual({});
+    // The session was on screen the whole time, so its outcome is not badged.
+    expect(useSessionStore.getState().turnOutcomes).toEqual({});
+  });
+
+  /** The other half of that rule: a turn that finishes in a conversation the
+   * user has navigated away from is what the "finished" marker is for. */
+  it("badges the outcome of a turn that finished off screen", async () => {
+    mocks.attemptStream.mockImplementation(async (...args: unknown[]) => stream(args, "ANSWERED"));
+    useSessionStore.setState({ activeSessionId: "some-other-session" });
+
+    await runAgentTurn(SESSION_ID, "Explain this", [], undefined, TURN_ID);
+
+    expect(useSessionStore.getState().turnOutcomes).toEqual({ [SESSION_ID]: "done" });
   });
 
   /** A turn that never parks never freezes. The image exists for the moment a

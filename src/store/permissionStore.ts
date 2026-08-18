@@ -35,6 +35,12 @@ export interface PermissionRequest {
    * agent_label` doc comment. `undefined` for every parent-turn call and any
    * `explore`-profile subagent. */
   agent_label?: string;
+  /** The turn this call belongs to, echoed back by Rust — resolved through
+   * `sessionStore`'s `turnSessions` to mark the waiting conversation's
+   * sidebar row. `undefined` for a call made outside any turn (and for a
+   * request that predates the field). Attribution only: nothing about the
+   * decision, the modal's buttons, or `respond` reads it. */
+  turn_id?: string;
 }
 
 /**

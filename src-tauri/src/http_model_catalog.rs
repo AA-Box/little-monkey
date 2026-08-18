@@ -1,7 +1,7 @@
 //! Post-authentication model discovery and resolution for the unified HTTP server.
 //!
-//! D1 in `docs/agent-os-roadmap.md` collapses the legacy proxy and the M3
-//! compatibility listener.  The two implementations currently disagree about
+//! Collapsing the legacy proxy and the M3 compatibility listener into one is
+//! still pending.  The two implementations currently disagree about
 //! model identity: the legacy proxy guesses that every unknown non-empty id is
 //! an Ollama tag, while M3 only trusts its installed-model registry or an
 //! explicit runtime header.  More importantly, discovery must not happen until

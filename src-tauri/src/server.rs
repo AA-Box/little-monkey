@@ -1,32 +1,13 @@
-//! Local OpenAI-compatible API server (phases 1-3 of the local-model-hub
-//! roadmap item — see `docs/roadmap/p1-local-api-server.md`).
+//! Unified local HTTP server for the OpenAI-compatible and paired-device route
+//! families (see `docs/roadmap/p1-local-api-server.md`).
 //!
-//! This is a *routing reverse proxy*, not a new inference engine: it runs a
-//! small hyper-1 HTTP server on a tokio task, bound to `127.0.0.1` only (no
-//! LAN bind — that's an explicitly later, separately-gated phase), and
-//! [`handle_request`] — the `AppHandle`-free, `monkey-cli`-reusable core —
-//! exposes exactly five routes:
-//!
-//!   - `GET  /health`              — unauthenticated liveness probe
-//!   - `GET  /v1/models`           — merged list of servable models
-//!   - `POST /v1/chat/completions` — proxies to llama-server, Ollama, or a
-//!                                   keychain-configured cloud provider
-//!   - `POST /v1/embeddings`       — proxies to Ollama, or to llama-server
-//!                                   only if it was started with `--embeddings`
-//!   - `OPTIONS /v1/*`             — CORS preflight (unauthenticated)
-//!   - everything else            — `404`
-//!
-//! Phase 5 (Private Developer API/Embeddable Chat Widget, ROADMAP.md) layers
-//! three more routes on top, in [`handle_extended_request`] — reachable only
-//! from the GUI's own accept loop (never from `monkey-cli api-serve`, which has
-//! no `AppHandle` to give them):
-//!
-//!   - `POST /v1/knowledge/query`      — [`Scope::Knowledge`], wraps
-//!                                       `knowledge_service::knowledge_v2_query`
-//!   - `GET  /v1/artifacts/{id}`       — [`Scope::ArtifactRead`], wraps
-//!                                       `artifact_commands::artifact_blob_read_base64`
-//!   - `GET  /v1/workflows/runs/{id}`  — [`Scope::WorkflowRun`], wraps
-//!                                       `run_commands::run_get` (status only)
+//! This is a *routing reverse proxy and host-service adapter*, not a new
+//! inference engine. [`run_unified_endpoint`] is the one production
+//! accept/Hyper connection path for both the desktop and `monkey-cli api-serve`;
+//! [`UnifiedEndpoint`] supplies the reconciled loopback or LAN/TLS policy. Route
+//! authority lives in [`crate::http_route_registry::ROUTES`]. [`EndpointHost`]
+//! keeps host-only bookkeeping separate: the desktop supplies an `AppHandle`
+//! for [`handle_extended_request`], while the headless CLI hides those routes.
 //!
 //! SECURITY: this surface is deliberately narrow. It must NEVER grow a route
 //! that reaches the agent's tool-dispatch layer (`tool_run_shell` and
@@ -57,8 +38,8 @@
 //! state (`/v1/models`, `/v1/artifacts/{id}`, `/v1/workflows/runs/{id}`,
 //! `/v1/knowledge/query`), or — in `handle_local_app_run`'s case — emits
 //! `LOCAL_APP_RUN_REQUESTED_EVENT` to the app's own frontend and answers `202`.
-//! None of them reach `daemon::enqueue`, and this module names `monkey-cli` only
-//! to talk about reusing [`handle_request`], never to invoke it.
+//! None of them reach `daemon::enqueue`. The CLI's `api-serve` command invokes
+//! this transport, but that does not turn any route into a daemon-work producer.
 //!
 //! Gating inference on the daemon's job queue would therefore mean spawning
 //! `monkey daemon status --json` on the hot path of every chat completion in order
@@ -80,11 +61,10 @@
 //! [`RequestAdmission`]: crate::http_policy::RequestAdmission
 //!
 //! Structured like `checkpoints.rs`/`web.rs`: an `AppHandle`-free,
-//! independently testable core ([`handle_request`]) plus a
-//! thin `#[tauri::command]` layer that owns the actual listening socket and
-//! `AppState` bookkeeping. `pub` (not `mod`) so a future `monkey-cli` `api-serve`
-//! subcommand (design doc phase 4) can reuse [`handle_request`] directly,
-//! the same reasoning as `web`/`prompts`/`rules` above it in `lib.rs`.
+//! independently testable core ([`handle_request`]) plus [`EndpointHost`]
+//! adapters. The desktop adapter owns `AppState` bookkeeping; the shipped CLI
+//! adapter carries its headless runtime into the same listener and connection
+//! implementation.
 //!
 //! Auth (phase 2): a full multi-token model. Every [`TokenEntry`] is
 //! generated as `lmk-` + 32 hex chars, shown in plaintext exactly once at
@@ -237,22 +217,8 @@ fn cancelled_response() -> Response<ResponseBody> {
     )
 }
 
-/// The one implementation of "this listener admits a request".
-///
-/// Both accept loops call it, which is the point: the legacy listener had two
-/// serving paths and only one of them was admitted. `run_cli_server`
-/// (`monkey-cli api-serve`) spawned an unbounded task per connection with no
-/// permit, no counters and no cancellation, serving the *identical* route set
-/// through the same `serve_one_request` — so every legacy route stayed reachable
-/// with admission control fully bypassed, while the doc comment above
-/// [`run_accept_loop`]'s admission claimed a route could no longer do that.
-///
-/// `serve` returns the response *and* performs the per-request bookkeeping each
-/// loop does differently (token-used records, request logging), so the two loops
-/// share the rule without sharing their `ServerDeps` construction. It receives the
-/// guard's cancellation token, which is how that token reaches `ServerDeps` — a
-/// handler cannot be written that silently ignores it, because there is no way to
-/// build the deps without one.
+/// Test helper for the primary listener's default busy envelope.
+#[cfg(test)]
 async fn serve_with_admission<Fut>(
     admission: &crate::http_policy::RequestAdmission,
     server_shutdown: &tokio_util::sync::CancellationToken,
@@ -269,6 +235,13 @@ where
     serve_with_admission_response(admission, server_shutdown, refused, serve).await
 }
 
+/// The one implementation of "this listener admits a request".
+///
+/// The shared desktop/CLI connection path calls it after selecting the route's
+/// wire-compatible refusal envelope. It receives the guard's cancellation token,
+/// which is how that token reaches `ServerDeps` — a handler cannot be written
+/// that silently ignores it, because there is no way to build the deps without
+/// one.
 async fn serve_with_admission_response<Fut>(
     admission: &crate::http_policy::RequestAdmission,
     server_shutdown: &tokio_util::sync::CancellationToken,
@@ -749,13 +722,17 @@ impl From<&ApiServerConfig> for ApiServerConfigView {
 
 /// Resolves (and creates, if missing) `<app_data_dir>/api_server.json`'s
 /// path — same shape as `providers.rs::providers_file_path`/
-/// `web.rs::settings_file_path`. `pub` so a future `monkey-cli` `api-serve`
-/// subcommand (phase 4) can resolve the same path with its own
+/// `web.rs::settings_file_path`. `pub` so the shipped `monkey-cli api-serve`
+/// subcommand can resolve the same path with its own
 /// APP_IDENTIFIER, the same config-drift concern the design doc flags.
 pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    config_file_path_for_data_dir(&base)
+}
+
+pub(crate) fn config_file_path_for_data_dir(base: &Path) -> Result<PathBuf, String> {
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
             format!(
@@ -882,13 +859,13 @@ struct StoredToken {
     bound_local_app_id: Option<String>,
 }
 
-/// Shared `403` gate for every route (the original five and the phase-5
-/// extended three alike) that requires a specific [`Scope`] — same "`None`
+/// Shared `403` gate for every AppHandle-free or host-only route that requires
+/// a specific [`Scope`] — same "`None`
 /// auth means unrestricted, `Some` must contain the scope" shape every
 /// inline `if let Some(auth) = authed { if !auth.scopes.contains(...) }`
 /// check above already uses; factored out here specifically so it's
 /// directly unit-testable with no `AppHandle` (see the module doc comment on
-/// [`handle_extended_request`]'s three routes needing one to actually run,
+/// [`handle_extended_request`]'s host-only routes needing one to actually run,
 /// which the scope gate itself must not).
 fn require_scope(
     authed: Option<&TokenAuth>,
@@ -905,11 +882,10 @@ fn require_scope(
     Ok(())
 }
 
-/// Which of the three phase-5 extended routes (if any) a method+path pair
-/// matches — pure and `AppHandle`-free so the routing decision itself is
-/// unit-testable independently of the AppHandle-requiring handlers it feeds
-/// into. Mirrors the plain `match` [`handle_request`] uses for the original
-/// five routes.
+/// Which host-only extended route (if any) a method+path pair matches — pure and
+/// `AppHandle`-free so the routing decision itself is unit-testable independently
+/// of the AppHandle-requiring handlers it feeds into. Mirrors the plain `match`
+/// [`handle_request`] uses for the AppHandle-free routes.
 #[derive(Debug, PartialEq, Eq)]
 enum ExtendedRoute {
     KnowledgeQuery,
@@ -994,12 +970,12 @@ pub struct ServerDeps {
     /// before either listing or exact resolution.
     pub providers: Vec<ProviderSummary>,
     tokens: Vec<StoredToken>,
-    /// Where this listener's requests are recorded in the unified subsystem
+    /// Where this request is recorded in the unified subsystem
     /// event stream (roadmap K12).
     ///
     /// Carried on `ServerDeps` rather than threaded as a parameter because the
-    /// two production listeners reach a ledger by different routes — the desktop
-    /// one through `AppState`, the CLI-hosted one through the data directory it
+    /// two production hosts reach a ledger by different routes — the desktop
+    /// host through `AppState`, the CLI host through the data directory it
     /// already derives from `config_path` — and `handle_request` should not have
     /// to know which it is running under. Unit tests build a
     /// [`SubsystemAudit::disabled`] with the reason named, so "no events" in a
@@ -1045,17 +1021,19 @@ pub struct ServerDeps {
     /// **What this is actually for is server shutdown, not client disconnect.**
     /// A disconnecting client is already handled by drop: hyper drops the service
     /// future, which drops the reqwest future with it. Stopping the API server was
-    /// the real hole — `stop_server_core` awaits only the accept loop's task, and
-    /// every connection is a separate `tokio::spawn` that nothing joins, so
-    /// requests it already accepted kept streaming from upstream after the user
-    /// pressed Stop and the UI said "stopped". The accept loop's drop-guard
-    /// cancels the parent token on exit, and every guard's token is a child of it,
-    /// so honouring this is what makes that stop real.
+    /// the real hole — the former accept loop spawned connections that nothing
+    /// joined, so requests it already accepted kept streaming from upstream after
+    /// the user pressed Stop and the UI said "stopped". `stop_running_unified`
+    /// now cancels the endpoint token; `run_unified_endpoint` owns the connection
+    /// tasks, observes that token, and drains their `JoinSet` before the task
+    /// awaited by `stop_server_core` can finish. Every guard's token is a child of
+    /// that parent, so honouring this interrupts in-flight upstream work rather
+    /// than making the drain wait for it indefinitely.
     pub cancel: tokio_util::sync::CancellationToken,
 }
 
 /// A decoded HTTP request. Deliberately not `hyper::Request<Incoming>`
-/// itself, so [`handle_request`]'s tests (and any future CLI reuse) can
+/// itself, so [`handle_request`]'s tests and CLI callers can
 /// build one directly without a real hyper connection — [`serve_one_request`]
 /// is the thin adapter that buffers a real `Incoming` body into `Bytes` and
 /// builds this.
@@ -2103,16 +2081,18 @@ async fn handle_local_app_run(
     {
         return not_found_response();
     }
-    let Ok(app_data_dir) = app.profile_data_dir() else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to resolve the app data directory",
-            "internal_error",
-        );
+    let config_roots = match crate::app_paths::agent_config_roots() {
+        Ok(roots) => roots,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
     };
-    let config = match crate::local_apps::config_file_path(app)
-        .and_then(|path| crate::local_apps::load_config_impl(&path))
-    {
+    let local_apps_config_path =
+        match crate::local_apps::config_file_path_for_data_dir(&config_roots.legacy) {
+            Ok(path) => path,
+            Err(e) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error");
+            }
+        };
+    let config = match crate::local_apps::load_config_impl(&local_apps_config_path) {
         Ok(config) => config,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e, "internal_error"),
     };
@@ -2129,10 +2109,11 @@ async fn handle_local_app_run(
 
     let state = app.state::<AppState>();
     let workspace_root = crate::workspace::primary_root_canon(state.inner()).ok();
+    let global_config_roots = config_roots.ordered();
     let recipe = match crate::recipes::resolve_recipe_with_path(
         &def.recipe_name,
         workspace_root.as_deref(),
-        &app_data_dir,
+        &global_config_roots,
     ) {
         Ok((recipe, _path)) => recipe,
         Err(e) => {
@@ -2204,7 +2185,7 @@ async fn handle_local_app_run(
     )
 }
 
-/// Dispatches the three phase-5 extended routes when `path`/`method` match
+/// Dispatches the host-only extended routes when `path`/`method` match
 /// one (see [`extended_route_for`]), applying the same [`authenticate`] gate
 /// [`handle_request`] uses before returning `None` so unmatched requests
 /// fall through unchanged. Only ever called with `Some(app)` from
@@ -2417,14 +2398,13 @@ fn http_action_worth_recording(method: &Method, path: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------
-// hyper accept loop (AppHandle-owning glue)
+// unified Hyper transport and host-specific request state
 // ---------------------------------------------------------------------
 
-/// The parts of [`ServerDeps`] that don't change for the lifetime of one
-/// server run — built once in [`start_server_core`], then cheaply cloned
-/// into every accepted connection to assemble that connection's per-request
-/// `ServerDeps` (which additionally reads `AppState::llama`'s live status
-/// and `api_server.json`'s live token list — see [`build_deps`]).
+/// The desktop parts of [`ServerDeps`] that stay fixed for one reconciled
+/// generation — built by [`runtime_for_spec`], cloned and policy-specialized for
+/// each prepared endpoint, then shared through [`EndpointHost`]. [`build_deps`]
+/// combines them with the live llama status and token list for each request.
 #[derive(Clone)]
 struct ServerRuntime {
     /// See [`ServerDeps::local_client`] — built once per server, cloned per request.
@@ -2439,6 +2419,32 @@ struct ServerRuntime {
     model_service: HttpModelService,
     m3_service: Option<M3HttpRequestService>,
     m3_policy: Option<Arc<crate::compatibility_hub::LanServerPolicy>>,
+}
+
+type CustomProviderLoader = dyn Fn() -> Vec<providers::CustomProviderEntry> + Send + Sync + 'static;
+
+struct CliServerRuntime {
+    config_path: PathBuf,
+    load_custom_providers: Arc<CustomProviderLoader>,
+    state: Arc<AppState>,
+    local_client: reqwest::Client,
+    cloud_client: reqwest::Client,
+    llama_port: u16,
+    ollama_base_url: String,
+    legacy_rate_limiter: Arc<crate::http_policy::LegacyTokenRateLimiter>,
+    model_service: HttpModelService,
+    m3_service: M3HttpRequestService,
+    m3_policy: Option<Arc<crate::compatibility_hub::LanServerPolicy>>,
+    audit: crate::subsystem_audit::SubsystemAudit,
+}
+
+#[derive(Clone)]
+enum EndpointHost {
+    Desktop {
+        app: AppHandle,
+        runtime: Arc<ServerRuntime>,
+    },
+    Cli(Arc<CliServerRuntime>),
 }
 
 /// Pure merge of built-in presets + a caller-supplied custom-provider list
@@ -2686,14 +2692,135 @@ fn build_deps(
     }
 }
 
-/// The shared capped body read ([`crate::http_policy::read_capped_body`]) in
-/// this listener's own wire bytes.
+impl EndpointHost {
+    fn m3_policy(&self) -> Option<Arc<crate::compatibility_hub::LanServerPolicy>> {
+        match self {
+            Self::Desktop { runtime, .. } => runtime.m3_policy.clone(),
+            Self::Cli(runtime) => runtime.m3_policy.clone(),
+        }
+    }
+
+    fn app_handle(&self) -> Option<&AppHandle> {
+        match self {
+            Self::Desktop { app, .. } => Some(app),
+            Self::Cli(_) => None,
+        }
+    }
+
+    fn build_deps(&self, cancel: tokio_util::sync::CancellationToken) -> ServerDeps {
+        match self {
+            Self::Desktop { app, runtime } => build_deps(app, runtime, cancel),
+            Self::Cli(runtime) => {
+                let config = load_config_impl(&runtime.config_path).unwrap_or_default();
+                let providers = provider_catalog_from((runtime.load_custom_providers)());
+                let llama_models_url = reqwest::Url::parse(&format!(
+                    "http://127.0.0.1:{}/v1/models",
+                    runtime.llama_port
+                ))
+                .expect("loopback llama model URL is valid");
+                let model_extensions = model_extensions(
+                    LegacyLlamaInventory::OpenAiModels(llama_models_url),
+                    config.expose_ollama,
+                    provider_sources_enabled(config.expose_providers, runtime.m3_policy.as_deref()),
+                    &runtime.ollama_base_url,
+                    &providers,
+                    &runtime.local_client,
+                    &runtime.cloud_client,
+                );
+                ServerDeps {
+                    audit: runtime.audit.clone(),
+                    llama_port: runtime.llama_port,
+                    llama_ready: false,
+                    llama_model_stem: None,
+                    // The CLI cannot observe the GUI-only llama embeddings flag.
+                    llama_embeddings_enabled: false,
+                    ollama_base_url: runtime.ollama_base_url.clone(),
+                    require_token: config.require_token,
+                    expose_ollama: config.expose_ollama,
+                    expose_providers: config.expose_providers,
+                    providers,
+                    tokens: tokens_from_config(&config),
+                    local_client: runtime.local_client.clone(),
+                    cloud_client: runtime.cloud_client.clone(),
+                    legacy_rate_limiter: runtime.legacy_rate_limiter.clone(),
+                    model_service: runtime.model_service.clone(),
+                    model_extensions,
+                    m3_service: Some(runtime.m3_service.clone()),
+                    m3_policy: runtime.m3_policy.clone(),
+                    cancel,
+                }
+            }
+        }
+    }
+
+    async fn serve_request(
+        &self,
+        req: Request<Incoming>,
+        endpoint: &UnifiedEndpoint,
+        remote_address: IpAddr,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Response<ResponseBody> {
+        let deps = self.build_deps(cancel);
+        let (response, matched_token_id) = match serve_one_request(
+            deps,
+            req,
+            self.app_handle(),
+            endpoint.exposure,
+            endpoint.primary,
+            remote_address,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(never) => match never {},
+        };
+        match self {
+            Self::Desktop { app, .. } => {
+                if let Some(token_id) = matched_token_id {
+                    record_token_used(app, &token_id);
+                }
+            }
+            Self::Cli(runtime) => {
+                if let Some(token_id) = &matched_token_id {
+                    record_token_used_with_state(&runtime.state, &runtime.config_path, token_id);
+                }
+                eprintln!(
+                    "[api-serve] request {} -> {}",
+                    req_log_hint(matched_token_id.as_deref()),
+                    response.status()
+                );
+            }
+        }
+        response
+    }
+
+    fn after_response_ends(&self, response: Response<ResponseBody>) -> Response<ResponseBody> {
+        match self {
+            Self::Desktop { app, .. } => {
+                let app = app.clone();
+                after_response_ends(response, move || {
+                    let _ = sync_api_server_projection(&app);
+                })
+            }
+            Self::Cli(_) => response,
+        }
+    }
+
+    fn record_hidden_response(&self, status: StatusCode) {
+        if matches!(self, Self::Cli(_)) {
+            eprintln!("[api-serve] request {} -> {status}", req_log_hint(None));
+        }
+    }
+}
+
+/// The shared capped body read ([`crate::http_policy::read_capped_body`]) in the
+/// legacy route family's own wire bytes.
 ///
 /// The read *semantics* — never buffering past the cap, ignoring
 /// `Content-Length`, dropping rather than draining a rejected body — live in
-/// `http_policy.rs` so a change to them cannot take effect on one listener and
-/// silently not on the other. Only the rendering is local, and it has to be:
-/// this listener owes an OpenAI-shaped envelope plus the wildcard CORS header
+/// `http_policy.rs` so a change to them cannot take effect on one route family
+/// and silently not on the other. Only the rendering is local, and it has to be:
+/// the legacy family owes an OpenAI-shaped envelope plus the wildcard CORS header
 /// that `tests/legacy_route_compatibility.rs` pins, where the compatibility
 /// router owes `little_monkey_m3_error` under its own origin allowlist.
 async fn read_capped_body<B>(
@@ -2752,10 +2879,9 @@ async fn dispatch_m3_route(
 
 /// Adapts a real hyper request into the `AppHandle`-free [`handle_request`]
 /// core: reads the body (capped — see [`read_capped_body`]) and hands
-/// everything off unchanged. `app`, when `Some` (the GUI accept loop; never
-/// `monkey-cli`, which has none), also gives [`handle_extended_request`] a
-/// chance to claim one of the three phase-5 extended routes before falling
-/// through to `handle_request`'s original five.
+/// everything off unchanged. `app`, when supplied by the desktop host, also
+/// gives [`handle_extended_request`] a chance to claim a host-only route before
+/// falling through to the AppHandle-free router. The CLI host passes `None`.
 async fn serve_one_request<B>(
     deps: ServerDeps,
     req: Request<B>,
@@ -3031,6 +3157,13 @@ fn endpoint_request_surface(
             EndpointRequestSurface::HiddenM3
         }
         RouteDecision::Denied(_) | RouteDecision::NotFound
+            if endpoint.primary && auth_family != AuthFamily::PairedLanToken =>
+        {
+            // Unknown primary routes still owe the legacy listener's
+            // auth/body/preflight ordering and exact response bytes.
+            EndpointRequestSurface::Legacy
+        }
+        RouteDecision::Denied(_) | RouteDecision::NotFound
             if !endpoint.primary || auth_family == AuthFamily::PairedLanToken =>
         {
             EndpointRequestSurface::HiddenM3
@@ -3060,10 +3193,9 @@ fn endpoint_refusal_response(
     }
 }
 
-async fn serve_desktop_connection<I>(
+async fn serve_endpoint_connection<I>(
     io: I,
-    app: AppHandle,
-    runtime: Arc<ServerRuntime>,
+    host: EndpointHost,
     endpoint: UnifiedEndpoint,
     remote_address: IpAddr,
     admission: Arc<crate::http_policy::RequestAdmission>,
@@ -3072,15 +3204,13 @@ async fn serve_desktop_connection<I>(
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connection_shutdown = shutdown.clone();
-    let endpoint_policy = runtime.m3_policy.clone();
     let service = service_fn(move |req: Request<Incoming>| {
-        let app = app.clone();
-        let runtime = runtime.clone();
+        let host = host.clone();
         let endpoint = endpoint.clone();
-        let endpoint_policy = endpoint_policy.clone();
         let admission = admission.clone();
         let shutdown = shutdown.clone();
         async move {
+            let endpoint_policy = host.m3_policy();
             let surface = endpoint_request_surface(
                 &endpoint,
                 endpoint_policy.is_some(),
@@ -3092,44 +3222,26 @@ async fn serve_desktop_connection<I>(
                 surface,
                 EndpointRequestSurface::HiddenLegacy | EndpointRequestSurface::HiddenM3
             ) {
-                return Ok::<_, Infallible>(endpoint_refusal_response(
-                    surface,
-                    endpoint_policy.as_deref(),
-                    req.headers(),
-                ));
+                let response =
+                    endpoint_refusal_response(surface, endpoint_policy.as_deref(), req.headers());
+                host.record_hidden_response(response.status());
+                return Ok::<_, Infallible>(response);
             }
             let refused =
                 endpoint_refusal_response(surface, endpoint_policy.as_deref(), req.headers());
-            let projection_app = app.clone();
+            let request_host = host.clone();
             let response = serve_with_admission_response(
                 &admission,
                 &shutdown,
                 refused,
                 |cancel| async move {
-                    let deps = build_deps(&app, &runtime, cancel);
-                    let (response, matched_token_id) = match serve_one_request(
-                        deps,
-                        req,
-                        Some(&app),
-                        endpoint.exposure,
-                        endpoint.primary,
-                        remote_address,
-                    )
-                    .await
-                    {
-                        Ok(value) => value,
-                        Err(never) => match never {},
-                    };
-                    if let Some(token_id) = matched_token_id {
-                        record_token_used(&app, &token_id);
-                    }
-                    response
+                    request_host
+                        .serve_request(req, &endpoint, remote_address, cancel)
+                        .await
                 },
             )
             .await;
-            Ok::<_, Infallible>(after_response_ends(response, move || {
-                let _ = sync_api_server_projection(&projection_app);
-            }))
+            Ok::<_, Infallible>(host.after_response_ends(response))
         }
     });
     let connection = http1::Builder::new().serve_connection(TokioIo::new(io), service);
@@ -3147,11 +3259,10 @@ async fn serve_desktop_connection<I>(
 /// creates, so awaiting this handle means both the listening socket and all
 /// already-admitted HTTP work are gone.
 async fn run_unified_endpoint(
-    app: AppHandle,
+    host: EndpointHost,
     listener: TcpListener,
     endpoint: UnifiedEndpoint,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
-    runtime: Arc<ServerRuntime>,
     admission: Arc<crate::http_policy::RequestAdmission>,
     connection_limit: Arc<Semaphore>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -3172,9 +3283,8 @@ async fn run_unified_endpoint(
                     Ok(permit) => permit,
                     Err(_) => continue,
                 };
-                let app = app.clone();
+                let host = host.clone();
                 let endpoint = endpoint.clone();
-                let runtime = runtime.clone();
                 let admission = admission.clone();
                 let shutdown = shutdown.clone();
                 if let Some(acceptor) = tls_acceptor.clone() {
@@ -3185,10 +3295,9 @@ async fn run_unified_endpoint(
                             acceptor.accept(stream),
                         ).await;
                         if let Ok(Ok(stream)) = accepted {
-                            serve_desktop_connection(
+                            serve_endpoint_connection(
                                 stream,
-                                app,
-                                runtime,
+                                host,
                                 endpoint,
                                 remote.ip(),
                                 admission,
@@ -3199,10 +3308,9 @@ async fn run_unified_endpoint(
                 } else {
                     connections.spawn(async move {
                         let _connection_permit = connection_permit;
-                        serve_desktop_connection(
+                        serve_endpoint_connection(
                             stream,
-                            app,
-                            runtime,
+                            host,
                             endpoint,
                             remote.ip(),
                             admission,
@@ -3227,9 +3335,10 @@ async fn run_unified_endpoint(
     }
 }
 
-/// Attempts to bind `port` on loopback only. Split out from
-/// [`start_server_core`] so the "port already in use" failure path is
-/// directly unit-testable without a `#[tauri::command]`/`AppHandle` — see
+/// Binds the headless CLI's loopback endpoint. Desktop generations bind their
+/// reconciled endpoint candidates through [`bind_candidate`]. Keeping this
+/// helper separate also makes the legacy "port already in use" failure path
+/// directly testable without an `AppHandle` — see
 /// `tests::bind_conflict_surfaces_as_status_error`.
 async fn bind_listener(port: u16) -> Result<TcpListener, String> {
     TcpListener::bind(("127.0.0.1", port))
@@ -3247,10 +3356,11 @@ async fn bind_listener(port: u16) -> Result<TcpListener, String> {
 // ---------------------------------------------------------------------
 // monkey-cli `api-serve` (design doc phase 4): the SAME routing/proxy core
 // (`ServerDeps`/`serve_one_request`/`handle_request`/`bind_listener`/
-// `load_config_impl`) the GUI uses, with no `AppHandle`/`AppState` at all —
-// only the surrounding bookkeeping differs (stdout/stderr logging instead
-// of `apiserver://status` events, an HTTP probe instead of reading
-// `AppState::llama` in-process). `monkey-cli`'s `main.rs` resolves the
+// `load_config_impl`) the GUI uses, with no `AppHandle` or GUI state. Its
+// CLI-local `AppState` only serializes token-use config writes; the surrounding
+// bookkeeping differs (stdout/stderr logging instead of `apiserver://status`
+// events, an HTTP probe instead of reading `AppState::llama` in-process).
+// `monkey-cli`'s `main.rs` resolves the
 // `api_server.json`/`providers.json` paths itself (the same
 // `APP_IDENTIFIER`-hardcoding technique `providers_cli.rs`/
 // `checkpoints_cli.rs` already use) and hands them in here — see the design
@@ -3280,7 +3390,7 @@ impl Default for CliRuntimeEndpoints {
 /// `monkey-cli`'s `main` can print it and exit non-zero exactly like every other
 /// subcommand's error path (`fail()`).
 ///
-/// `load_custom_providers` is re-invoked on every accepted connection (not
+/// `load_custom_providers` is re-invoked on every request (not
 /// cached once at startup) for the same "never stale" reasoning
 /// [`build_deps`] applies to tokens — a provider added via the GUI's
 /// Settings while `api-serve` is already running becomes routable
@@ -3406,10 +3516,10 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
         .map_err(|error| format!("Failed to build the cloud-provider HTTP client: {error}"))?;
     let llama_port = endpoints.llama_port;
     let ollama_base_url = endpoints.ollama_base_url;
-    // Built once for the whole listener. The CLI-hosted server has no
-    // `AppState`, only the data directory `config_path` already sits in, so it
+    // Built once for the whole listener. The CLI host does not have the GUI's
+    // audit service; it only has the data directory `config_path` sits in, so it
     // opens the ledger itself — see `subsystem_audit`'s module docs for why the
-    // three contexts differ by what they can reach rather than by taste.
+    // contexts differ by what they can reach rather than by taste.
     let audit = match config_path.parent() {
         Some(app_data_dir) => crate::subsystem_audit::SubsystemAudit::in_data_dir(app_data_dir),
         None => crate::subsystem_audit::SubsystemAudit::disabled(
@@ -3428,9 +3538,8 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
     // leave a caller waiting on a listener that can no longer reach its loop.
     let listener = bind_listener(port).await?;
     println!("Little Monkey API server listening on http://127.0.0.1:{port}/v1 (Ctrl+C to stop)");
-    let load_custom_providers = Arc::new(load_custom_providers);
     // Guards this process's own `api_server.json` read-modify-write cycles
-    // for the `last_used_at` bump below — a fresh, CLI-local `AppState` is
+    // for the `last_used_at` bump — a fresh, CLI-local `AppState` is
     // enough to serialize concurrent requests *within this process*; it
     // does not (and can't, being an in-memory lock) protect against a
     // simultaneously-running GUI process also writing the same file. That
@@ -3438,166 +3547,50 @@ async fn run_cli_server_with_m3_hub_and_connection_limit(
     // the design doc's "config drift" note already flags — the atomic
     // temp+rename write in `save_config_impl` bounds it to "last writer
     // wins", never a torn file.
-    let cli_state = Arc::new(AppState::default());
-    // The same bound the GUI loop has, for the same routes. This loop serves the
-    // identical route set through the same `serve_one_request`, so without this
-    // every legacy route was reachable with admission control bypassed simply by
-    // running `monkey-cli api-serve` — which is what made the GUI loop's "a route
-    // on this listener can no longer bypass admission control" untrue.
-    //
-    // Constructed once, out here: a `RequestAdmission` created inside the
-    // connection task would bound each connection separately, which looks correct
-    // and bounds nothing.
+    let host = EndpointHost::Cli(Arc::new(CliServerRuntime {
+        config_path,
+        load_custom_providers: Arc::new(load_custom_providers),
+        state: Arc::new(AppState::default()),
+        local_client,
+        cloud_client,
+        llama_port,
+        ollama_base_url,
+        legacy_rate_limiter: Arc::new(crate::http_policy::LegacyTokenRateLimiter::default()),
+        model_service,
+        m3_service,
+        m3_policy: m3_policy.clone(),
+        audit,
+    }));
     let admission = Arc::new(crate::http_policy::RequestAdmission::new(
         crate::http_policy::MAX_ACTIVE_REQUESTS,
     ));
-    let legacy_rate_limiter = Arc::new(crate::http_policy::LegacyTokenRateLimiter::default());
     let connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
-    let mut connections = tokio::task::JoinSet::new();
-    // This loop owns its process, so its shutdown token is only ever cancelled by
-    // the process ending. It exists because a guard's token is derived from one;
-    // it is not a claim that `api-serve` has a graceful stop.
-    let server_shutdown = tokio_util::sync::CancellationToken::new();
-
-    loop {
-        let (stream, remote) = tokio::select! {
-            completed = connections.join_next(), if !connections.is_empty() => {
-                let _ = completed;
-                continue;
-            }
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(_) => continue,
-            }
-        };
-        let connection_permit = match connection_limit.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            // Do not allocate a task or buffer headers for a peer beyond the
-            // connection bound. Dropping the stream makes the refusal cheap
-            // and leaves admitted connections unaffected.
-            Err(_) => continue,
-        };
-        let io = TokioIo::new(stream);
-        let local_client = local_client.clone();
-        let cloud_client = cloud_client.clone();
-        let config_path = config_path.clone();
-        let load_custom_providers = load_custom_providers.clone();
-        let cli_state = cli_state.clone();
-        let admission_for_conn = admission.clone();
-        let legacy_rate_limiter_for_conn = legacy_rate_limiter.clone();
-        let model_service_for_conn = model_service.clone();
-        let m3_service_for_conn = m3_service.clone();
-        let m3_policy_for_conn = m3_policy.clone();
-        let ollama_base_url_for_conn = ollama_base_url.clone();
-        let shutdown_for_conn = server_shutdown.clone();
-        let audit_for_conn = audit.clone();
-
-        connections.spawn(async move {
-            let _connection_permit = connection_permit;
-            let service = service_fn(move |req: Request<Incoming>| {
-                let local_client = local_client.clone();
-                let cloud_client = cloud_client.clone();
-                let config_path = config_path.clone();
-                let load_custom_providers = load_custom_providers.clone();
-                let cli_state = cli_state.clone();
-                let admission_for_req = admission_for_conn.clone();
-                let legacy_rate_limiter_for_req = legacy_rate_limiter_for_conn.clone();
-                let model_service_for_req = model_service_for_conn.clone();
-                let m3_service_for_req = Some(m3_service_for_conn.clone());
-                let m3_policy_for_req = m3_policy_for_conn.clone();
-                let ollama_base_url_for_req = ollama_base_url_for_conn.clone();
-                let shutdown_for_req = shutdown_for_conn.clone();
-                // Cloned, never rebuilt: the clones share one lazily-opened
-                // ledger, so the listener pays a SQLite open once rather than
-                // once per request.
-                let audit_for_req = audit_for_conn.clone();
-                async move {
-                    let response = serve_with_admission(
-                        &admission_for_req,
-                        &shutdown_for_req,
-                        |cancel| async move {
-                            let config = load_config_impl(&config_path).unwrap_or_default();
-                            let providers = provider_catalog_from(load_custom_providers());
-                            let llama_models_url = reqwest::Url::parse(&format!(
-                                "http://127.0.0.1:{llama_port}/v1/models"
-                            ))
-                            .expect("loopback llama model URL is valid");
-                            let extensions = model_extensions(
-                                LegacyLlamaInventory::OpenAiModels(llama_models_url),
-                                config.expose_ollama,
-                                provider_sources_enabled(
-                                    config.expose_providers,
-                                    m3_policy_for_req.as_deref(),
-                                ),
-                                &ollama_base_url_for_req,
-                                &providers,
-                                &local_client,
-                                &cloud_client,
-                            );
-                            let deps = ServerDeps {
-                                audit: audit_for_req,
-                                llama_port,
-                                llama_ready: false,
-                                llama_model_stem: None,
-                                // The CLI can't know whether the GUI started
-                                // llama-server with `--embeddings` (that flag lives
-                                // only in the GUI's in-memory `LlamaState`, not on
-                                // disk) — conservatively `false`, so
-                                // `POST /v1/embeddings` 501s with a clear message
-                                // instead of guessing.
-                                llama_embeddings_enabled: false,
-                                ollama_base_url: ollama_base_url_for_req,
-                                require_token: config.require_token,
-                                expose_ollama: config.expose_ollama,
-                                expose_providers: config.expose_providers,
-                                providers,
-                                tokens: tokens_from_config(&config),
-                                local_client,
-                                cloud_client,
-                                legacy_rate_limiter: legacy_rate_limiter_for_req,
-                                model_service: model_service_for_req,
-                                model_extensions: extensions,
-                                m3_service: m3_service_for_req,
-                                m3_policy: m3_policy_for_req,
-                                cancel,
-                            };
-
-                            let (resp, matched_token_id) = match serve_one_request(
-                                deps,
-                                req,
-                                None,
-                                ListenerExposure::Loopback,
-                                true,
-                                remote.ip(),
-                            )
-                            .await
-                            {
-                                Ok(pair) => pair,
-                                // `Infallible`: unreachable, not swallowed.
-                                Err(never) => match never {},
-                            };
-                            if let Some(token_id) = &matched_token_id {
-                                record_token_used_with_state(&cli_state, &config_path, token_id);
-                            }
-                            eprintln!(
-                                "[api-serve] request {} -> {}",
-                                req_log_hint(matched_token_id.as_deref()),
-                                resp.status()
-                            );
-                            resp
-                        },
-                    )
-                    .await;
-                    Ok::<_, Infallible>(response)
-                }
-            });
-            let _ = http1::Builder::new().serve_connection(io, service).await;
-        });
-    }
+    // The CLI has no graceful-stop API, so this token remains live until the
+    // command future (and its owned connection tasks) is dropped.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let endpoint = UnifiedEndpoint {
+        key: format!("http://127.0.0.1:{port}"),
+        bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        port,
+        exposure: ListenerExposure::Loopback,
+        transport: EndpointTransport::Plaintext,
+        primary: true,
+        policy: m3_policy.as_deref().cloned(),
+    };
+    run_unified_endpoint(
+        host,
+        listener,
+        endpoint,
+        None,
+        admission,
+        connection_limit,
+        shutdown,
+    )
+    .await;
+    Ok(())
 }
 
-/// Tiny formatting helper for [`run_cli_server`]'s per-request log line —
-/// split out purely so the `eprintln!` above stays readable.
+/// Tiny formatting helper for [`EndpointHost`]'s CLI request log line.
 fn req_log_hint(token_id: Option<&str>) -> String {
     match token_id {
         Some(id) => format!("(token {id})"),
@@ -3825,11 +3818,13 @@ fn spawn_generation(
         };
         let endpoint = prepared.endpoint.clone();
         let task = tokio::spawn(run_unified_endpoint(
-            app.clone(),
+            EndpointHost::Desktop {
+                app: app.clone(),
+                runtime: Arc::new(runtime),
+            },
             prepared.listener,
             prepared.endpoint,
             prepared.tls_acceptor,
-            Arc::new(runtime),
             admission.clone(),
             connection_limit.clone(),
             shutdown.clone(),
@@ -6966,7 +6961,7 @@ mod tests {
             Some(ExtendedRoute::WorkflowRunStatus("run-1".to_string()))
         );
         // Wrong method for the knowledge route, empty ids, and unrelated
-        // paths must all fall through so `handle_request`'s original five
+        // paths must all fall through so `handle_request`'s AppHandle-free
         // routes (or the final 404) still get a chance at them.
         assert_eq!(
             extended_route_for(&Method::GET, "/v1/knowledge/query"),
@@ -7271,8 +7266,8 @@ mod tests {
     }
 
     /// The cap *semantics* now live in `http_policy.rs` and are tested there
-    /// once, for both listeners. What stays here is this listener's rendering of
-    /// each rejection, because those bytes (OpenAI envelope + wildcard CORS)
+    /// once, for both route families. What stays here is the legacy family's
+    /// rendering of each rejection, because those bytes (OpenAI envelope + wildcard CORS)
     /// are the client-visible half and differ from the compatibility router's
     /// on purpose.
     #[tokio::test]
@@ -7324,16 +7319,14 @@ mod tests {
         assert_eq!(value["error"]["code"], "body_read_error");
     }
 
-    /// Pins down the actual fix for the restart-race finding:
-    /// `stop_server_core` must `.await` the accept loop's `JoinHandle` (which
-    /// only resolves once the task has broken out of its `select!` and
-    /// dropped its `TcpListener`) before a caller attempts to rebind the same
-    /// port — a synchronous `notify_one()` alone is not enough, since the
-    /// spawned task may not even have been polled yet. This mirrors
-    /// `run_accept_loop`'s exact `tokio::select!` shape without needing a
-    /// real `AppHandle`, run several times to make sure it isn't a fluke.
+    /// Pins down the socket-lifecycle precondition behind the restart-race fix:
+    /// the reconciler must await the unified endpoint task (which resolves only
+    /// after its listener is dropped) before rebinding the same port. Cancelling
+    /// without joining is insufficient because the task may not have observed
+    /// the token yet. This isolates that teardown ordering without needing an
+    /// `EndpointHost`, and repeats it to rule out a lucky scheduling order.
     #[tokio::test]
-    async fn awaiting_the_accept_loops_join_handle_before_rebinding_avoids_the_restart_race() {
+    async fn awaiting_the_endpoint_task_before_rebinding_avoids_the_restart_race() {
         for _ in 0..20 {
             // Bind the accept loop's own listener straight to an OS-assigned
             // port (0) and read the port back off THAT listener, rather than
@@ -7358,7 +7351,7 @@ mod tests {
                         _ = listener.accept() => {}
                     }
                 }
-                // `listener` dropped here, exactly like `run_accept_loop`.
+                // `listener` dropped here, as in `run_unified_endpoint`.
             });
 
             // Give the spawned task a chance to actually be polled at least
@@ -7377,7 +7370,7 @@ mod tests {
             // `.await` — a truly external process would need to win a race
             // measured in microseconds to land in it. A regression in
             // `stop_server_core` itself (the actual thing under test: not
-            // awaiting the accept loop's `JoinHandle` before rebinding) would
+            // awaiting the unified endpoint task before rebinding) would
             // fail this deterministically on every attempt, since the OLD
             // listener would still be alive and holding the port — so a
             // bounded retry here only ever absorbs the residual, unrelated
@@ -7392,19 +7385,18 @@ mod tests {
             }
             assert!(
                 rebound.is_ok(),
-                "rebinding after joining the accept loop's task must succeed, not race the old listener's teardown: {rebound:?}"
+                "rebinding after joining the endpoint task must succeed, not race the old listener's teardown: {rebound:?}"
             );
         }
     }
     /// The admission rule, tested where it actually lives.
     ///
-    /// `serve_with_admission` exists as its own function precisely so this is
-    /// reachable without 65 sockets and without standing up either accept loop:
-    /// the loops differ only in how they build `ServerDeps`, and they must not
-    /// differ in whether a request is admitted. That difference is what the bug
-    /// was — `run_cli_server` served the identical route set with no permit at
-    /// all — so the rule being one function is part of the fix, not a test
-    /// convenience.
+    /// `serve_with_admission` is the test-only default-envelope wrapper around
+    /// the production helper, so this is reachable without 65 sockets or an
+    /// `EndpointHost`. Host variants may build `ServerDeps` differently, but the
+    /// shared connection path must not let them differ on whether a request is
+    /// admitted. The CLI's former private path did exactly that, so one helper is
+    /// part of the fix rather than a test convenience.
     mod admission {
         use super::*;
         use crate::http_policy::RequestAdmission;
@@ -7543,13 +7535,9 @@ mod tests {
             );
         }
 
-        /// Structural: the unified desktop endpoint and AppHandle-free CLI
-        /// reach `serve_one_request` only through shared admission.
-        ///
-        /// A behavioural test cannot cover this — it would have to bind a socket
-        /// per loop and saturate a pool — and the defect was exactly a *second*
-        /// serving path that looked fine in isolation. Asserting on the source is
-        /// the cheap guard that a third path cannot be added silently.
+        /// Structural: desktop and CLI have one route call and one connection
+        /// authority. Byte-level listener behaviour is pinned separately by
+        /// `tests/legacy_route_compatibility.rs`.
         #[test]
         fn no_serving_path_reaches_a_route_without_admission() {
             let source = include_str!("server.rs");
@@ -7560,19 +7548,20 @@ mod tests {
 
             assert_eq!(
                 production.matches("serve_one_request(").count(),
-                2,
-                "one call from the unified endpoint and one from the CLI"
-            );
-            assert!(production.contains("async fn serve_with_admission<Fut>("));
-            assert_eq!(
-                production.matches("serve_with_admission(").count(),
                 1,
-                "the CLI uses the legacy-envelope admission wrapper"
+                "EndpointHost must own the only production route call"
             );
+            for authority in ["listener.accept()", "service_fn(", "serve_connection("] {
+                assert_eq!(
+                    production.matches(authority).count(),
+                    1,
+                    "desktop and CLI must share one {authority} authority"
+                );
+            }
             assert_eq!(
                 production.matches("serve_with_admission_response(").count(),
                 2,
-                "the wrapper and unified endpoint share the same guard implementation"
+                "one definition and one shared connection-path call"
             );
             assert!(production.contains("async fn run_unified_endpoint("));
             assert!(!production.contains("async fn run_accept_loop("));
@@ -7587,10 +7576,11 @@ mod tests {
     ///
     /// The target is **server shutdown**, not client disconnect. A disconnecting
     /// client is already handled by drop — hyper drops the service future and the
-    /// reqwest future with it. Stopping the server was the hole:
-    /// `stop_server_core` awaits only the accept loop's task, while every
-    /// connection is a separate `tokio::spawn` nothing joins, so requests already
-    /// accepted kept streaming from upstream after the UI said "stopped".
+    /// reqwest future with it. Stopping the server was the hole: the former accept
+    /// loop spawned connection tasks that nothing joined, so accepted requests
+    /// kept streaming after the UI said "stopped". The lifecycle owner now
+    /// cancels the endpoint token; `run_unified_endpoint` owns, observes and
+    /// drains those tasks before the stop can complete.
     mod cancellation {
         use super::*;
         use crate::http_policy::RequestAdmission;
@@ -7748,8 +7738,8 @@ mod tests {
             .await;
             assert_eq!(streaming.status(), StatusCode::OK);
 
-            // What stopping the server does: the accept loop's drop-guard cancels
-            // the parent, and every guard's token is a child of it.
+            // What stopping the server does: the lifecycle owner cancels the
+            // endpoint token, and every admission token is a child of it.
             server_shutdown.cancel();
 
             let collected = streaming.into_body().collect().await;
@@ -7821,8 +7811,8 @@ mod tests {
 
     /// Pins the two claims the module doc's K8 section makes.
     ///
-    /// The first — that neither HTTP listener produces daemon work — is why those
-    /// listeners have no backpressure refusal to make. It is true today by
+    /// The first — that neither HTTP route family produces daemon work — is why
+    /// the unified listener has no backpressure refusal to make. It is true today by
     /// inspection, which is exactly the kind of fact that rots: a future route
     /// that calls `enqueue` would inherit the obligation silently. So it is
     /// asserted rather than only written down.
@@ -7833,7 +7823,7 @@ mod tests {
     /// because what is being constrained is which calls exist at all, and no
     /// runtime fixture can observe the absence of a call.
     #[test]
-    fn neither_http_listener_produces_daemon_work_and_both_meter_upstream_bytes() {
+    fn neither_http_route_family_produces_daemon_work_and_both_meter_upstream_bytes() {
         fn production<'a>(source: &'a str, label: &str) -> &'a str {
             source
                 .split_once("\n#[cfg(test)]\nmod tests {")
@@ -7844,7 +7834,7 @@ mod tests {
         let legacy = production(include_str!("server.rs"), "server.rs");
         let managed = production(include_str!("m3_http_server.rs"), "m3_http_server.rs");
 
-        // No route on either listener enqueues daemon work, so K8 backpressure has
+        // No route in either family enqueues daemon work, so K8 backpressure has
         // nothing to refuse here. If one of these trips, that route owes the
         // caller a `429` + `Retry-After` built from `backpressure.retry_after_ms`
         // — never the `503`/`server_busy` that bounded admission returns, which is
@@ -7864,13 +7854,13 @@ mod tests {
             ] {
                 assert!(
                     !source.contains(producer),
-                    "{label} reached `{producer}`: this listener now produces daemon work \
+                    "{label} reached `{producer}`: this route family now produces daemon work \
                      and must honour K8 backpressure in its own error envelope"
                 );
             }
         }
 
-        // Upstream model traffic is metered. Both listeners proxy raw SSE, so this
+        // Upstream model traffic is metered. Both route families proxy raw SSE, so this
         // also pins that the meter — not a buffering wrapper — is what sits on the
         // streaming path; `streamed_upstream_sse_bytes_reach_the_client_unmodified`
         // pins the resulting bytes.

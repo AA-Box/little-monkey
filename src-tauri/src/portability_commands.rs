@@ -2827,6 +2827,7 @@ mod tests {
                 dim: 768,
                 query_prefix: "search_query: ".to_string(),
                 doc_prefix: "search_document: ".to_string(),
+                extension_id: None,
             },
             chunk_chars: 1_600,
             chunk_overlap: 200,

@@ -22,11 +22,14 @@ use little_monkey_lib::compatibility_hub::{
     ApiBackend, ApiScope, LanServerPolicy, LanStateProtector, PairingRequest,
 };
 use little_monkey_lib::m3_http_server::{start_compatibility_harness, CompatibilityHarnessServer};
+use little_monkey_lib::m3_production::{OpenAiCompatibleM3InferenceEngine, SystemM3HardwareProbe};
 use little_monkey_lib::m3_runtime_hub::*;
 use little_monkey_lib::runtime_adapter::{
-    EndpointOrigin, EndpointPolicy, HardwareSnapshot, KeepAlive, ModelCapabilities,
-    PlatformCapabilities, RuntimeDescriptor, RuntimeInventory, RuntimeKind, RuntimeLifecycleState,
-    RuntimeLogTail, RuntimeModel, RuntimeStatus, SettingValue,
+    execution_support, AcceleratorKind, EndpointOrigin, EndpointPolicy, ExecutionSupport,
+    HardwareSnapshot, HttpTransport, KeepAlive, ModelCapabilities, OllamaHttpAdapter,
+    PlatformCapabilities, ReqwestHttpTransport, RuntimeAdapter, RuntimeDescriptor,
+    RuntimeInventory, RuntimeKind, RuntimeLifecycleState, RuntimeLogTail, RuntimeModel,
+    RuntimeStatus, SettingValue,
 };
 use little_monkey_lib::server::{
     run_cli_server_with_m3_hub_and_endpoints, save_config_impl, ApiServerConfig, Backend,
@@ -452,6 +455,18 @@ fn test_hub_with_runtimes(
     root: &TestDirectory,
     runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
 ) -> Arc<M3RuntimeHub> {
+    hub_with(root, runtimes, Arc::new(TestHardware))
+}
+
+/// The hub every test in this file runs behind, with the hardware probe left
+/// open: every route here uses the synthetic [`TestHardware`], and the one
+/// opt-in accelerator route below uses the real `SystemM3HardwareProbe`
+/// because its whole point is that the machine, not a fixture, answered.
+fn hub_with(
+    root: &TestDirectory,
+    runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
+    hardware: Arc<dyn M3HardwareProbe>,
+) -> Arc<M3RuntimeHub> {
     let download: Arc<dyn M3DownloadTransport> =
         Arc::new(ReqwestM3DownloadTransport::new().expect("download transport"));
     Arc::new(
@@ -464,7 +479,7 @@ fn test_hub_with_runtimes(
             },
             M3RuntimeHubDependencies {
                 clock: Arc::new(SystemM3Clock),
-                hardware: Arc::new(TestHardware),
+                hardware,
                 download,
                 catalogs: Vec::new(),
                 runtimes,
@@ -1582,4 +1597,265 @@ async fn one_primary_socket_accepts_both_token_families_and_routes_each_to_its_o
 
     server.abort();
     let _ = server.await;
+}
+
+// ---------------------------------------------------------------------------
+// Roadmap K16: which accelerator backends a harness route actually proves.
+// ---------------------------------------------------------------------------
+
+/// The Ollama model the accelerator route below sends. Its presence is the
+/// second gate, after `#[ignore]`: ordinary CI has neither a GPU nor an Ollama
+/// daemon, so the route must be asked for twice before it runs.
+const HARNESS_OLLAMA_MODEL_ENV: &str = "LITTLE_MONKEY_HARNESS_OLLAMA_MODEL";
+
+/// The daemon the accelerator route drives. Loopback, and the same default
+/// `m3_production` wires in production, so the route exercises the shipped
+/// endpoint rather than a test-only one.
+const REAL_OLLAMA_RUNTIME_ID: &str = "ollama";
+const REAL_OLLAMA_ENDPOINT: &str = "http://127.0.0.1:11434";
+
+/// Named once so [`harness_route`] and the route itself cannot drift.
+const REAL_ACCELERATOR_ROUTE: &str = "real_ollama_completion_lands_on_a_detected_accelerator";
+
+/// The compatibility-harness route that proves work reaches `kind`, or `None`
+/// when nothing in this app executes on it.
+///
+/// Exhaustive on `AcceleratorKind` on purpose: a seventh backend cannot be
+/// added without saying which of K16's two states it is *here*, in the file
+/// that holds the routes, and not only in `execution_support`.
+fn harness_route(kind: AcceleratorKind) -> Option<&'static str> {
+    match kind {
+        // Every other route in this file. They mock at the runtime-driver
+        // boundary, so what they prove executes is the HTTP, auth, translation,
+        // and hub path — all of it on the host CPU, which is the only backend
+        // a runner without a GPU can make a claim about.
+        AcceleratorKind::Cpu => Some("every mocked route in this file, on the host CPU"),
+        // The one route that requires a detected accelerator and real work.
+        AcceleratorKind::Metal | AcceleratorKind::Cuda => Some(REAL_ACCELERATOR_ROUTE),
+        AcceleratorKind::Rocm
+        | AcceleratorKind::Vulkan
+        | AcceleratorKind::DirectMl
+        | AcceleratorKind::AppleNeuralEngine => None,
+    }
+}
+
+/// K16's acceptance, restated where the routes live: for each backend, either a
+/// runtime path that executes on it **with a passing compatibility-harness
+/// route**, or a stated reason it is detection-only.
+///
+/// `runtime_adapter.rs`'s `every_backend_either_executes_or_says_why_it_does_not`
+/// pins that `execution_support` answers at all. This pins the parenthetical —
+/// that an `Executes` answer is backed by a route in this file, and that a
+/// `DetectionOnly` answer is not quietly contradicted by one. Runs in ordinary
+/// CI; it reads two `&'static str` tables and touches no hardware.
+#[test]
+fn every_accelerator_backend_has_a_harness_route_or_a_stated_reason() {
+    for kind in [
+        AcceleratorKind::Cpu,
+        AcceleratorKind::Metal,
+        AcceleratorKind::Cuda,
+        AcceleratorKind::Rocm,
+        AcceleratorKind::Vulkan,
+        AcceleratorKind::DirectMl,
+        AcceleratorKind::AppleNeuralEngine,
+    ] {
+        match (execution_support(kind), harness_route(kind)) {
+            (ExecutionSupport::Executes { via }, Some(route)) => {
+                assert!(
+                    !via.trim().is_empty(),
+                    "{kind:?} claims execution without naming what runs it"
+                );
+                assert!(
+                    !route.trim().is_empty(),
+                    "{kind:?} names an empty harness route"
+                );
+            }
+            (ExecutionSupport::DetectionOnly { reason }, None) => assert!(
+                reason.len() > 20,
+                "{kind:?} is detection-only without saying why"
+            ),
+            (ExecutionSupport::Executes { via }, None) => panic!(
+                "{kind:?} executes via {via}, but no compatibility-harness route proves it; \
+                 add one or downgrade it to ExecutionSupport::DetectionOnly"
+            ),
+            (ExecutionSupport::DetectionOnly { reason }, Some(route)) => {
+                panic!("{kind:?} is detection-only ({reason}), but {route} claims to exercise it")
+            }
+        }
+    }
+}
+
+/// The real Ollama driver, built exactly as `m3_production::build_ollama_driver`
+/// builds it, minus the structured-output capability wrapper that route does not
+/// use. Nothing here is a mock: a real HTTP transport against the real daemon.
+fn real_ollama_driver(platform: PlatformCapabilities) -> Arc<dyn M3RuntimeDriver> {
+    let transport: Arc<dyn HttpTransport> =
+        Arc::new(ReqwestHttpTransport::new().expect("real ollama http transport"));
+    let adapter: Arc<dyn RuntimeAdapter> = Arc::new(
+        OllamaHttpAdapter::new(
+            REAL_OLLAMA_RUNTIME_ID,
+            REAL_OLLAMA_ENDPOINT,
+            EndpointPolicy::LoopbackOnly,
+            transport,
+            platform,
+        )
+        .expect("real ollama adapter"),
+    );
+    let inference: Arc<dyn M3InferenceEngine> = Arc::new(
+        OpenAiCompatibleM3InferenceEngine::new(REAL_OLLAMA_ENDPOINT)
+            .expect("real ollama inference engine"),
+    );
+    Arc::new(RuntimeAdapterM3Driver::new(adapter, inference).expect("real ollama driver"))
+}
+
+/// The accelerator route: a real `/v1/chat/completions` through the real
+/// `m3_http_server` listener, into a real Ollama daemon, on a machine whose own
+/// detector reports Metal or CUDA — and then the residency the daemon reports
+/// back, which is the only evidence available that the work did not fall to CPU.
+///
+/// **What this proves and what it cannot.** It proves *an* accelerator ran the
+/// completion: detection says the machine has one, and `RunningModel::vram_bytes`
+/// is nonzero, which a CPU-resident model never reports. It does not prove
+/// *which* one, and no assertion here should imply otherwise — nothing in
+/// Ollama's HTTP surface names a device, which is the same limit K15 hit when a
+/// per-device split had to answer `UnsupportedCapability`. A per-backend claim
+/// needs a runtime whose API names the card.
+///
+/// **Why it is gated twice.** Hosted CI has no GPU and no Ollama, and this repo
+/// cannot make a per-machine hardware claim on a runner it does not own. Running
+/// it needs a native or self-hosted machine with a Metal or CUDA device, a
+/// running `ollama serve` on `127.0.0.1:11434`, and a small model already
+/// pulled:
+///
+/// ```sh
+/// LITTLE_MONKEY_HARNESS_OLLAMA_MODEL=llama3.2:1b \
+///   cargo test --test m3_compatibility_harness -- --ignored
+/// ```
+#[tokio::test]
+#[ignore = "needs a real Ollama daemon on a machine with a detected Metal or CUDA device; set LITTLE_MONKEY_HARNESS_OLLAMA_MODEL"]
+async fn real_ollama_completion_lands_on_a_detected_accelerator() {
+    let model = std::env::var(HARNESS_OLLAMA_MODEL_ENV).unwrap_or_else(|_| {
+        panic!("{HARNESS_OLLAMA_MODEL_ENV} must name a model already pulled into the local Ollama")
+    });
+
+    // Real detection, not `TestHardware`. The route is a claim about this
+    // machine, so the fixture cannot be the one making it.
+    let snapshot = SystemM3HardwareProbe
+        .snapshot()
+        .expect("real hardware snapshot");
+    let accelerator = snapshot
+        .platform
+        .accelerators
+        .iter()
+        .find(|entry| {
+            entry.available && matches!(entry.kind, AcceleratorKind::Metal | AcceleratorKind::Cuda)
+        })
+        .unwrap_or_else(|| {
+            panic!("{REAL_ACCELERATOR_ROUTE} needs a detected Metal or CUDA device; this machine reports none")
+        })
+        .clone();
+    assert!(
+        execution_support(accelerator.kind).executes(),
+        "{:?} is detected but execution_support says nothing executes on it, so this route is \
+         asserting something the app does not claim",
+        accelerator.kind
+    );
+
+    let root = TestDirectory::new("real-accelerator");
+    let hub = hub_with(
+        &root,
+        vec![real_ollama_driver(snapshot.platform.clone())],
+        Arc::new(SystemM3HardwareProbe),
+    );
+    // Reach the daemon before asking the route to. `/v1/chat/completions`
+    // answers a runtime that cannot be listed with one opaque
+    // `model_source_unavailable`, which reads identically whether the daemon is
+    // down, the model was never pulled, or the completion itself failed — three
+    // different bugs behind one 502.
+    let inventory = hub
+        .runtime_inventory(REAL_OLLAMA_RUNTIME_ID, &M3OperationContext::new(30_000))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("{REAL_OLLAMA_ENDPOINT} did not answer an inventory request: {error:?}")
+        });
+    assert!(
+        inventory.models.iter().any(
+            |entry| entry.model_id == model || entry.model_id.starts_with(&format!("{model}:"))
+        ),
+        "{model} is not pulled into the daemon at {REAL_OLLAMA_ENDPOINT}; it reports: {:?}",
+        inventory
+            .models
+            .iter()
+            .map(|entry| entry.model_id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let Some((state, base)) = start_test_server(hub.clone()).await else {
+        return;
+    };
+
+    let response = http_client()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-little-monkey-runtime-id", REAL_OLLAMA_RUNTIME_ID)
+        .json(&json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+            // Generous on purpose: a reasoning-tuned model spends its first
+            // tokens thinking, and a truncated reply arrives as empty content,
+            // which the translation layer correctly refuses as a malformed
+            // response. Sixteen tokens tests the model's brevity, not the route.
+            "max_tokens": 256,
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("real ollama chat completion request");
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .expect("real ollama chat completion JSON");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "real completion failed: {payload}"
+    );
+    assert_eq!(payload["object"], "chat.completion");
+    assert!(
+        !payload["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "a successful completion produced no text: {payload}"
+    );
+
+    // The evidence. Ollama reports per-model residency through the same adapter
+    // status view the Runtime Hub reads, and a model it placed on the CPU
+    // reports `vram_bytes` of zero.
+    let view = hub
+        .runtime_status(REAL_OLLAMA_RUNTIME_ID, &M3OperationContext::new(30_000))
+        .await
+        .expect("real ollama runtime status");
+    let M3RuntimeStatusView::Adapter {
+        running_models: resident,
+        ..
+    } = view
+    else {
+        panic!("an adapter-backed runtime must report the adapter status view");
+    };
+    let loaded = resident
+        .iter()
+        .find(|entry| entry.model_id == model || entry.model_id.starts_with(&format!("{model}:")))
+        .unwrap_or_else(|| {
+            panic!("{model} is not resident after a successful completion; running: {resident:?}")
+        });
+    assert!(
+        loaded.vram_bytes > 0,
+        "{model} answered but reports no VRAM, so the completion ran on the CPU despite {:?} \
+         being detected: {loaded:?}",
+        accelerator.kind
+    );
+
+    state.stop().await;
 }

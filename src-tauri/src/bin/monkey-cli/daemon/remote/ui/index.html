@@ -6,7 +6,12 @@
     <meta name="color-scheme" content="dark light">
     <meta name="theme-color" content="#0f172a">
     <meta name="description" content="Securely inspect and control scoped Little Monkey runs on your own runner.">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
+    <!-- Kept identical to the response header (web.rs CONTROLLER_CSP): both are
+         enforced and the browser applies the intersection, so a directive
+         missing from either one blocks. media-src covers the two audio sources
+         this controller really uses — a blob: URL for a played artifact and a
+         data: URL for the silence that unlocks autoplay. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; worker-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob: data:; manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
     <title>Little Monkey Remote</title>
     <link rel="manifest" href="/v1/remote/ui/manifest.webmanifest">
     <link rel="icon" href="/v1/remote/ui/icon.svg" type="image/svg+xml">
@@ -57,8 +62,12 @@
           <input id="deviceName" name="deviceName" autocomplete="nickname" maxlength="80" required placeholder="Ahmad's phone">
 
           <label for="invitationFile">Pairing invitation</label>
-          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json" required>
+          <input id="invitationFile" name="invitationFile" type="file" accept="application/json,.json">
           <p class="field-help">Choose the protected JSON created by <code>remote pair-create</code>.</p>
+
+          <label for="pairingCode">Or paste a pairing code</label>
+          <input id="pairingCode" name="pairingCode" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="littlemonkey://pair/…">
+          <p class="field-help">The short code from <code>remote pair-create --qr</code>. It carries the same one-time token and the same certificate pin.</p>
 
           <div id="invitationPreview" class="preview-card" hidden>
             <dl>
@@ -78,6 +87,8 @@
       </section>
 
       <section id="dashboardView" hidden>
+        <p id="staleBanner" class="stale-banner" role="status" hidden></p>
+
         <div class="dashboard-toolbar">
           <div>
             <p class="eyebrow">Scoped controller</p>
@@ -90,6 +101,139 @@
             <button id="forgetButton" class="button ghost" type="button">Forget browser</button>
           </div>
         </div>
+
+        <section id="devicePanel" class="panel device-panel" aria-labelledby="deviceTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">This device</p>
+              <h2 id="deviceTitle">Hardware the runner may use</h2>
+            </div>
+          </div>
+          <dl class="device-grid">
+            <div><dt>Little Monkey granted</dt><dd id="deviceGranted">—</dd></div>
+            <div><dt>This device supports</dt><dd id="deviceSupported">—</dd></div>
+            <div><dt>Operating system permits</dt><dd id="devicePermissions">—</dd></div>
+            <div><dt>Effective</dt><dd id="deviceEffective">—</dd></div>
+          </dl>
+          <p class="field-help">
+            An action needs all four: the operator's grant, this build's support, the operating
+            system's permission, and being ready right now. Anything missing from “effective” is
+            refused with the reason, and nothing here can grant itself.
+          </p>
+          <div id="deviceReadiness" class="readiness-list"></div>
+          <p id="journalStatus" class="field-help"></p>
+          <div class="device-push">
+            <button id="pushButton" class="button secondary" type="button">Enable notifications</button>
+            <p id="pushStatus" class="field-help"></p>
+          </div>
+          <div class="device-push">
+            <button id="screenShareButton" class="button secondary" type="button">Allow screen capture</button>
+            <p id="screenShareStatus" class="field-help"></p>
+          </div>
+          <div class="device-push">
+            <button id="revokeSelfButton" class="button danger" type="button">Revoke this device</button>
+            <p class="field-help">
+              Severs this device on the runner itself, not only in this browser. Its key stops
+              working immediately and any live session it owns is force-stopped.
+            </p>
+          </div>
+        </section>
+
+        <section id="chatPanel" class="panel" aria-labelledby="chatTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Paired conversation</p>
+              <h2 id="chatTitle">Sessions</h2>
+            </div>
+            <button id="chatRefreshButton" class="button ghost compact-button" type="button">Check now</button>
+          </div>
+          <label class="search-label" for="sessionSelect">Session</label>
+          <select id="sessionSelect"></select>
+          <p id="chatEmpty" class="empty-state">No sessions are visible yet.</p>
+          <ol id="messageList" class="message-list" aria-live="polite"></ol>
+          <form id="chatForm" class="inline-form" hidden>
+            <label for="chatInput">Message</label>
+            <div class="input-action">
+              <textarea id="chatInput" maxlength="4000" rows="2" placeholder="Ask the runner…"></textarea>
+              <button id="chatSendButton" class="button primary" type="submit">Send</button>
+            </div>
+            <p class="field-help">
+              A message becomes a durable run under the runner&apos;s own recipe and permission
+              policy. Drafts stay on this device until you send them.
+            </p>
+          </form>
+        </section>
+
+        <section id="workflowPanel" class="panel" aria-labelledby="workflowTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">Declared on the runner</p>
+              <h2 id="workflowTitle">Workflows</h2>
+            </div>
+            <button id="workflowRefreshButton" class="button ghost compact-button" type="button">Check now</button>
+          </div>
+          <ul id="workflowList" class="workflow-list"></ul>
+          <p id="workflowEmpty" class="empty-state">No workflows are declared on this runner.</p>
+        </section>
+
+        <section id="capturePanel" class="panel" aria-labelledby="captureTitle" hidden>
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">From this device</p>
+              <h2 id="captureTitle">Send to the runner</h2>
+            </div>
+          </div>
+          <form id="captureForm" class="inline-form">
+            <label for="captureTitleInput">Title</label>
+            <input id="captureTitleInput" maxlength="200" required placeholder="Whiteboard from the standup">
+            <label for="captureText">Note</label>
+            <textarea id="captureText" maxlength="4000" rows="2" placeholder="Optional text to file with it"></textarea>
+            <label for="captureFile">Image or file</label>
+            <input id="captureFile" type="file" accept="image/*,text/*,application/pdf">
+            <button id="captureButton" class="button secondary" type="submit">File this capture</button>
+            <p class="field-help">
+              Bounded by this pairing&apos;s artifact budget and digest-checked by the runner, which
+              refuses anything whose bytes do not match what was declared.
+            </p>
+          </form>
+        </section>
+
+        <section id="talkPanel" class="panel talk-panel" aria-labelledby="talkTitle" hidden>
+          <header class="panel-header">
+            <div class="panel-heading">
+              <span class="talk-dot" id="talkDot" aria-hidden="true"></span>
+              <h2 id="talkTitle">Talk</h2>
+            </div>
+            <span id="talkState" class="count-pill" role="status" aria-live="polite">Not connected</span>
+          </header>
+          <p id="talkUnavailable" class="field-help" hidden></p>
+          <div class="talk-controls">
+            <button id="talkButton" class="button primary" type="button">Start Talk</button>
+            <button id="talkInterruptButton" class="button danger" type="button" disabled>Interrupt</button>
+          </div>
+          <div class="talk-meter" role="meter" aria-label="Microphone level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="talkMeter">
+            <div id="talkMeterFill" class="talk-meter-fill"></div>
+          </div>
+          <div class="talk-transcript">
+            <p class="field-label">What you said</p>
+            <p id="talkTranscript" class="talk-text">—</p>
+          </div>
+          <div class="talk-transcript">
+            <p class="field-label">Answer</p>
+            <p id="talkAnswer" class="talk-text">—</p>
+          </div>
+          <p id="talkError" class="field-help talk-error" hidden></p>
+          <section id="talkPendingPanel" class="talk-pending" aria-labelledby="talkPendingTitle" hidden>
+            <p class="field-label" id="talkPendingTitle">Unfinished</p>
+            <ul id="talkPendingList" class="talk-pending-list"></ul>
+          </section>
+          <p class="field-help">
+            Talk needs this page open and in the foreground. Locking the phone or switching apps
+            ends the conversation; nothing keeps listening in the background. A recording the
+            runner never confirmed is kept here so you can send it again without saying it
+            twice — the microphone is never reopened without you asking.
+          </p>
+        </section>
 
         <div class="workspace-grid">
           <aside class="panel run-sidebar" aria-labelledby="runsTitle">
@@ -124,6 +268,8 @@
                 </div>
                 <dl id="runFacts" class="facts-grid"></dl>
                 <div class="run-actions">
+                  <button id="pauseButton" class="button secondary" type="button" hidden>Pause run</button>
+                  <button id="resumeButton" class="button secondary" type="button" hidden>Resume run</button>
                   <button id="cancelButton" class="button danger" type="button" hidden>Cancel run</button>
                   <button id="reloadRunButton" class="button secondary" type="button">Reload details</button>
                 </div>

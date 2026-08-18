@@ -156,6 +156,16 @@ export interface LicenseGate {
   acceptanceRequired: boolean;
 }
 
+/**
+ * Which engine renders a model.
+ *
+ * `stable_diffusion_cpp` is the bundled engine and the default every model
+ * written before this field existed still deserializes to. `mlx_video` is the
+ * video service inside the installed MLX package: Apple silicon only, and the
+ * only engine that can read an MLX-quantized checkpoint.
+ */
+export type GenerationEngineKind = "stable_diffusion_cpp" | "mlx_video";
+
 /** A model exactly as stored in the user's library. */
 export interface GenerationModelSpec {
   id: string;
@@ -167,6 +177,7 @@ export interface GenerationModelSpec {
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
+  engine: GenerationEngineKind;
 }
 
 export interface GenerationModel {
@@ -179,6 +190,7 @@ export interface GenerationModel {
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
+  engine: GenerationEngineKind;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
@@ -499,6 +511,8 @@ export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
         acceptanceRequired: false,
       },
       extraLaunchArgs: [],
+      // Never launched locally, so the field only has to be a valid one.
+      engine: "stable_diffusion_cpp" as GenerationEngineKind,
       installed: true,
       totalBytes: 0,
       missingBytes: 0,
@@ -600,6 +614,19 @@ export function normalizeVideoFrames(grid: FrameGrid, value: number): number {
 export function normalizeDimension(value: number): number {
   const clamped = Math.min(Math.max(Math.trunc(value), 32), 4096);
   return Math.min(Math.ceil(clamped / 32) * 32, 4096);
+}
+
+/** The same grid, taken to the nearest edge rather than the one above.
+ *
+ *  What the controls set, because a size asked for is a size wanted: 645 is
+ *  answered with 640 rather than the 672 the backend would round it to, which
+ *  is four percent larger than the picture the user was looking at. The two
+ *  never disagree about what gets rendered — the controls only ever hand the
+ *  backend a value already on the grid, and [normalizeDimension] leaves those
+ *  alone. It stays the truth for sizes that arrive from elsewhere. */
+export function alignDimension(value: number): number {
+  const clamped = Math.min(Math.max(Math.trunc(value), 32), 4096);
+  return Math.min(Math.round(clamped / 32) * 32, 4096);
 }
 
 export function formatBytes(bytes: number): string {
@@ -775,5 +802,6 @@ export function emptyModelSpec(): GenerationModelSpec {
       acceptanceRequired: false,
     },
     extraLaunchArgs: [],
+    engine: "stable_diffusion_cpp",
   };
 }
