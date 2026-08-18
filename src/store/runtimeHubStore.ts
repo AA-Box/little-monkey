@@ -177,6 +177,9 @@ interface RuntimeHubStoreState {
   replaceCatalogSources: (sources: M3CatalogSourceConfig[]) => Promise<void>;
   refreshComponents: () => Promise<void>;
   installComponent: (entry: M3ComponentCatalogEntry) => Promise<void>;
+  /** Fetches the trusted MLX catalog and installs its newest package when the
+   * supported MLX runtime is present but has no working package. */
+  ensureMlxRuntime: () => Promise<void>;
   /** Installs a signed MLX service package from a directory on this machine. */
   installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
@@ -250,6 +253,14 @@ function errorMessage(error: unknown): string {
 
 function modelAssetId(match: M3CatalogMatch): string {
   return `${match.model.runtime}:${match.model.modelId}:${match.model.variantId}`;
+}
+
+const MLX_COMPONENT_ID = "mlx-runtime-apple-silicon";
+
+function latestMlxComponent(entries: M3ComponentCatalogEntry[]): M3ComponentCatalogEntry | undefined {
+  return entries
+    .filter((entry) => entry.componentId === MLX_COMPONENT_ID && entry.kind === "mlx_runtime")
+    .sort((left, right) => right.publishedAtMs - left.publishedAtMs)[0];
 }
 
 function omitKey<T>(record: Record<string, T>, key: string): Record<string, T> {
@@ -419,6 +430,11 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
 
     refresh: async () => {
       await Promise.all([get().refreshOverview(), get().refreshLan(), get().refreshComponents()]);
+      // MLX is a managed runtime dependency, not a user-selected folder. On a
+      // supported host, adopt the published catalog and install the verified
+      // package as part of the normal Runtime Hub refresh. Network/package
+      // failures remain visible on the MLX card without blocking the overview.
+      await get().ensureMlxRuntime().catch(() => {});
     },
 
     refreshOverview: async () => {
@@ -633,9 +649,66 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           request: { entry },
         });
         if (entry.kind === "mlx_runtime") {
+          // Runtime capabilities include whether the verified package exists;
+          // refresh that snapshot as well as the live card status so Load model
+          // becomes available without a second manual refresh.
+          await get().refreshOverview();
           await get().refreshRuntime("mlx");
         }
         await get().refreshComponents();
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    ensureMlxRuntime: async () => {
+      const key = "mlx-auto-install";
+      if (get().busy[key]) return;
+      const platform = get().hardware?.platform;
+      const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
+      if (
+        !platform ||
+        platform.os !== "macos" ||
+        !["aarch64", "arm64"].includes(platform.arch) ||
+        !mlxRuntime
+      ) {
+        return;
+      }
+
+      begin(key);
+      try {
+        const installed = get().installedComponents.find(
+          (component) => component.componentId === MLX_COMPONENT_ID,
+        );
+        const active = installed?.versions.find((version) => version.active);
+        if (active && mlxRuntime.canInfer) {
+          return;
+        }
+        if (active) {
+          // The component index can outlive a damaged or manually removed
+          // active MLX tree. Rehydrate it from the already digest-verified
+          // component artifact before downloading anything new.
+          await runtimeHubClient.mlxInstallComponent(MLX_COMPONENT_ID);
+          await get().refreshRuntime("mlx");
+          return;
+        }
+
+        const knownEntry = latestMlxComponent(get().componentRegistry);
+        let entry = knownEntry;
+        try {
+          await get().syncComponentCatalog();
+          entry = latestMlxComponent(get().componentRegistry) ?? knownEntry;
+        } catch (error) {
+          if (!knownEntry) throw error;
+        }
+        if (!entry) {
+          throw new Error("The published MLX runtime is not available in the component catalog.");
+        }
+
+        await get().installComponent(entry);
       } catch (error) {
         fail(key, error);
         throw error;

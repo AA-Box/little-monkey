@@ -96,6 +96,8 @@ import {
   type ActivityCall,
 } from "./activityTimeline";
 import { errorMessage } from "../../lib/errors";
+import { parseProgrammaticExecutionResult, type ProgrammaticNestedCallEvidence } from "../../lib/programmaticExecution";
+import { redactPrivatePaths, redactSensitiveText } from "../../lib/durableRun";
 
 export { resultLooksLikeError } from "./activityTimeline";
 
@@ -454,7 +456,9 @@ const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: Ac
         </div>
       )}
 
-      {result ? (
+      {call.name === "run_program" ? (
+        <ProgrammaticExecutionDetail call={call} />
+      ) : result ? (
         <pre
           className={`mt-1.5 max-h-56 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] ${
             failed ? "text-danger" : "text-muted"
@@ -468,6 +472,80 @@ const ActivityCallDetail = memo(function ActivityCallDetail({ call }: { call: Ac
           {pending ? "Waiting for result…" : ""}
         </div>
       )}
+    </ToolStepRow>
+  );
+});
+
+const ProgrammaticExecutionDetail = memo(function ProgrammaticExecutionDetail({ call }: { call: ActivityCall }) {
+  const parsed = call.result ? parseProgrammaticExecutionResult(call.result) : null;
+  const source = (() => {
+    try {
+      const value = JSON.parse(call.args) as { source?: unknown };
+      return typeof value.source === "string" ? value.source : "";
+    } catch {
+      return "";
+    }
+  })();
+  const sourcePreview = (() => {
+    const redacted = redactPrivatePaths(redactSensitiveText(source));
+    return redacted.length > 4_000 ? `${redacted.slice(0, 4_000)}\n… truncated` : redacted;
+  })();
+  const nestedCalls = parsed?.nestedCalls ?? [];
+  const failed = parsed?.status !== "succeeded" && parsed?.status !== undefined;
+  const status = parsed?.status ?? "running";
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted">
+        <span className={failed ? "text-danger" : "text-muted"}>Status: {status}</span>
+        {parsed && <span>Duration: {parsed.durationMs} ms</span>}
+        <span>Nested calls: {nestedCalls.length}</span>
+      </div>
+      {sourcePreview && (
+        <div>
+          <div className="mb-1 text-faint">Program</div>
+          <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{sourcePreview}</pre>
+        </div>
+      )}
+      {nestedCalls.length > 0 && (
+        <div className={TOOL_STEP_LIST_CLASSES}>
+          {nestedCalls.map((nestedCall) => <ProgrammaticNestedCallRow key={nestedCall.id} call={nestedCall} />)}
+        </div>
+      )}
+      {parsed?.logs.length ? (
+        <div>
+          <div className="mb-1 text-faint">Logs</div>
+          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all">{parsed.logs.join("\n")}</pre>
+        </div>
+      ) : null}
+      {parsed?.failure && (
+        <pre className="whitespace-pre-wrap break-all text-danger">
+          {`${parsed.failure.category}: ${parsed.failure.message}`}
+        </pre>
+      )}
+      {parsed?.value !== undefined && (
+        <div>
+          <div className="mb-1 text-faint">Result</div>
+          <pre className="max-h-56 overflow-auto whitespace-pre-wrap break-all">{formatJson(JSON.stringify(parsed.value))}</pre>
+        </div>
+      )}
+      {!parsed && <div className="flex items-center gap-1.5 font-mono text-[11px] text-muted"><LoaderCircle size={12} className="animate-spin motion-reduce:animate-none" aria-hidden />Waiting for result…</div>}
+    </div>
+  );
+});
+
+const ProgrammaticNestedCallRow = memo(function ProgrammaticNestedCallRow({ call }: { call: ProgrammaticNestedCallEvidence }) {
+  const failed = call.status === "failed" || call.status === "cancelled";
+  const argumentsText = JSON.stringify(call.arguments, null, 2);
+  const details = call.result === undefined && call.failure === undefined
+    ? ""
+    : JSON.stringify(call.failure ?? call.result, null, 2);
+  return (
+    <ToolStepRow title={`${call.toolName} · ${call.status}${call.durationMs === undefined ? "" : ` · ${call.durationMs} ms`}`} failed={failed}>
+      <div className="space-y-1.5">
+        <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted">{argumentsText}</pre>
+        {details ? <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px]">{details}</pre> : <span className="text-xs text-muted">Waiting for result…</span>}
+      </div>
     </ToolStepRow>
   );
 });

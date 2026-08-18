@@ -104,7 +104,7 @@ jobs:
           cat packaging/mlx/mlx-catalog.json
 
       # The catalog names the archive and its digest. The app fetches this asset
-      # by URL when the Runtime Hub's Components panel opens
+      # by URL when the Runtime Hub refreshes its runtimes
       # (`DEFAULT_COMPONENT_CATALOG_URL` in src-tauri/src/m3_production.rs), so
       # the tag is rolling on purpose: the URL has to stay put while its
       # contents move. Importing the file by hand still works and is the
@@ -119,7 +119,7 @@ jobs:
           gh release create mlx-catalog packaging/mlx/mlx-catalog.json \
             --title "MLX catalog" \
             --latest=false \
-            --notes "Component catalog for the MLX runtime. The app fetches this automatically when the Runtime Hub's Components panel opens; download and import it there only if this machine cannot reach GitHub." \
+            --notes "Component catalog for the MLX runtime. The app fetches and installs this automatically on supported Apple Silicon hosts; download and import it only if this machine cannot reach GitHub." \
             || gh release upload mlx-catalog packaging/mlx/mlx-catalog.json --clobber
 
       # Both URLs in one place, because the pair is what a user needs and the
@@ -140,9 +140,9 @@ jobs:
             echo "| Archive | $MLX_DOWNLOAD_URL |"
             echo "| Catalog | $CATALOG_URL |"
             echo
-            echo "Install: open Runtime Hub → Components. The catalog above is fetched on open,"
-            echo "so the new version appears there; **Import catalog** is for machines that cannot"
-            echo "reach GitHub."
+            echo "Install: open Runtime Hub → Runtimes on a supported Apple Silicon Mac. The"
+            echo "catalog is fetched and the signed package is installed automatically; **Import"
+            echo "catalog** is for machines that cannot reach GitHub."
             echo "The archive is only installable if it verifies against the release key pinned in"
             echo '`MLX_RELEASE_PUBLIC_KEY_HEX` (src-tauri/src/m3_production.rs).'
           } >> "$GITHUB_STEP_SUMMARY"

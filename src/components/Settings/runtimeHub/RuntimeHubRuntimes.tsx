@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, FileText, Gauge, Play, RefreshCw, Save, Square, Wrench } from "lucide-react";
 import { Button, StatusPill } from "../../ui";
 import type {
@@ -502,7 +501,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const runtimeDetails = useRuntimeHubStore((state) => state.runtimeDetails);
   const offloadPlan = useRuntimeHubStore((state) => state.offloadPlans[runtimeId]);
   const previewOffloadPlan = useRuntimeHubStore((state) => state.previewOffloadPlan);
-  const installMlxPackage = useRuntimeHubStore((state) => state.installMlxPackage);
+  const ensureMlxRuntime = useRuntimeHubStore((state) => state.ensureMlxRuntime);
   const offloadBusy = busy[`offload-plan:${runtimeId}`];
   const offloadError = errors[`offload-plan:${runtimeId}`];
   const compatibilityReport = useRuntimeHubStore((state) => state.compatibilityReport);
@@ -561,6 +560,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   const draftModelCandidates = settingCapabilities?.draftModelCandidates ?? [];
 
   const state = statusState(detail);
+  const mlxAutoInstallAttempted = useRef(false);
   const resident = runningModels(detail);
   const inventory = detail?.inventory?.models ?? [];
   // Managed llama.cpp owns an explicit process whose lifetime is controlled
@@ -568,6 +568,14 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
   // keep_alive value, so never manufacture one merely because the shared UI
   // happens to expose that control for runtimes which support it.
   const supportsKeepAlive = runtime.descriptor.kind !== "llama_cpp";
+
+  useEffect(() => {
+    if (runtime.descriptor.kind !== "mlx" || state !== "not_installed" || mlxAutoInstallAttempted.current) {
+      return;
+    }
+    mlxAutoInstallAttempted.current = true;
+    void ensureMlxRuntime().catch(() => {});
+  }, [ensureMlxRuntime, runtime.descriptor.kind, state]);
 
   function handleLoad() {
     if (!assetId) return;
@@ -601,30 +609,25 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
       </div>
       <ErrorNotice message={errors[`runtime:${runtimeId}`]} />
 
-      {/* MLX is the one runtime the app does not ship: its service package is
-          installed separately and Ed25519-verified against the pinned release
-          key. Until one is installed there is nothing to load a model into, so
-          the card offers the install rather than an empty model picker. */}
+      {/* The MLX package is published separately from the app. The Runtime Hub
+          fetches its catalog, downloads the archive, checks its digest, and
+          verifies the pinned Ed25519 signature before activation. */}
       {state === "not_installed" && (
         <div className="mt-4 rounded-md border border-border bg-surface-2 p-3">
-          <p className="text-sm text-foreground">No MLX service package is installed.</p>
+          <p className="text-sm text-foreground">Installing the MLX service package…</p>
           <p className="mt-1 text-xs text-muted">
-            Build one with <code className="font-mono">pnpm mlx:package</code>, then choose the
-            resulting folder. It is only installed if the pinned release key signed it.
+            The signed Apple Silicon package is downloaded from the published catalog and
+            verified before it is activated.
           </p>
           <BusyButton
             type="button"
             className="mt-3"
-            busy={busy["mlx-install"]}
-            onClick={() =>
-              void open({ directory: true, multiple: false }).then((path) => {
-                if (typeof path === "string") void installMlxPackage(path).catch(() => {});
-              })
-            }
+            busy={busy["mlx-auto-install"] || busy["component-catalog"] || busy["component-install:mlx-runtime-apple-silicon"]}
+            onClick={() => void ensureMlxRuntime().catch(() => {})}
           >
-            Choose package folder…
+            Retry automatic install
           </BusyButton>
-          <ErrorNotice message={errors["mlx-install"]} />
+          <ErrorNotice message={errors["mlx-auto-install"]} />
         </div>
       )}
 

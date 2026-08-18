@@ -1,5 +1,6 @@
 import type { ToolCall } from "../../lib/llamaClient";
 import { unwrapUntrustedContent } from "../../lib/untrustedContent";
+import { parseProgrammaticExecutionResult } from "../../lib/programmaticExecution";
 
 /** A concrete, transcript-backed tool invocation rendered in an activity row. */
 export interface ActivityCall {
@@ -60,6 +61,8 @@ export function groupAssistantRound(
 export function resultLooksLikeError(raw: string): boolean {
   try {
     const parsed: unknown = JSON.parse(unwrapUntrustedContent(raw));
+    const program = parseProgrammaticExecutionResult(unwrapUntrustedContent(raw));
+    if (program) return program.status !== "succeeded";
     return typeof parsed === "object" && parsed !== null && "error" in parsed;
   } catch {
     return false;
@@ -82,6 +85,7 @@ type SummaryKind =
   | "read-skill-file"
   | "generate-image"
   | "prepare-plan"
+  | "run-program"
   | `tool:${string}`;
 
 function summaryKind(call: ActivityCall): SummaryKind {
@@ -117,6 +121,8 @@ function summaryKind(call: ActivityCall): SummaryKind {
       return "generate-image";
     case "present_plan":
       return "prepare-plan";
+    case "run_program":
+      return "run-program";
     default:
       return `tool:${name}`;
   }
@@ -163,6 +169,8 @@ function formatSummaryRun(kind: SummaryKind, count: number): string {
       return count === 1 ? "Generated an image" : `Generated ${count} images`;
     case "prepare-plan":
       return count === 1 ? "Prepared a plan" : `Prepared ${count} plans`;
+    case "run-program":
+      return count === 1 ? "Ran a program" : `Ran ${count} programs`;
     default: {
       const name = humanizeToolName(kind.slice("tool:".length));
       return count === 1 ? `Used ${name}` : `Used ${name} ${count} times`;
@@ -393,6 +401,8 @@ export function activityCallSubject(call: ActivityCall): string {
           || stringArg(args, "prompt")
           || "Image output",
       );
+    case "run_program":
+      return "Bounded tool program";
     default: {
       for (const key of ["command", "path", "file", "filename", "url", "query", "model", "repo", "title"]) {
         const value = stringArg(args, key);
@@ -435,6 +445,8 @@ export function activityCallLabel(name: string): string {
       return "Generate image";
     case "present_plan":
       return "Prepare plan";
+    case "run_program":
+      return "Run program";
     default:
       return `Use ${humanizeToolName(name)}`;
   }
@@ -562,6 +574,8 @@ export function liveActivityLabel(name: string): string {
       return "Running a subagent";
     case "generate_image":
       return "Generating an image";
+    case "run_program":
+      return "Running a bounded program";
     default:
       return `Using ${humanizeToolName(name)}`;
   }

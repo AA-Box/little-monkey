@@ -89,7 +89,7 @@ interface DesktopTurnRecipe {
     ollama: string | null;
     local_url: string | null;
   };
-  workspace: string;
+  workspace: string | null;
   permission_mode: PermissionMode;
   system: string;
   prompt: string;
@@ -105,7 +105,7 @@ interface DesktopTurnRecipe {
     execution_base_url: string | null;
     history: unknown[];
     target: ModelTargetSnapshotWire;
-    workspace: WorkspaceContextWire;
+    workspace: WorkspaceContextWire | null;
     execution_roots: Array<{
       root_id: string;
       canonical_path: string;
@@ -295,9 +295,6 @@ export async function buildDaemonDesktopRecipe(
 ): Promise<DesktopTurnRecipe> {
   const workspace = workspaceToRunWire(options.roots);
   const primary = options.roots.find((root) => root.is_primary);
-  if (!workspace || !primary) {
-    throw new Error("Daemon-backed turns require an open workspace snapshot.");
-  }
   const attachments: FrozenAttachmentWire[] = await Promise.all(options.attachments.map(async (attachment) => ({
     path: attachment.path,
     kind: attachment.kind,
@@ -329,7 +326,7 @@ export async function buildDaemonDesktopRecipe(
     name: safeRecipeName(options.turnId),
     description: `Immutable desktop turn for session ${options.sessionId}`,
     target: recipeTarget(options.resolvedTarget, options.targetSnapshot),
-    workspace: primary.path,
+    workspace: primary?.path ?? null,
     permission_mode: options.permissionMode,
     system: options.systemPrompt,
     prompt: options.userText.trim() || "Attachment turn",
