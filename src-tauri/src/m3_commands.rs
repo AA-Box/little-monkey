@@ -1191,6 +1191,11 @@ pub async fn m3_api_dispatch(
 ) -> Result<M3ApiDispatchResponse, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let request = request.into_hub_request(trusted_now_ms());
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
     let result = state.hub.dispatch_api(&request, &context).await;
     finish(&state, &operation_id, result).await
 }

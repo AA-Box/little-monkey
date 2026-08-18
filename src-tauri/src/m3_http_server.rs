@@ -413,6 +413,7 @@ impl M3HttpRequestService {
                     canonical.stream,
                     M3RequestPrincipal::Internal,
                     &context,
+                    self.mlx_ownership.clone(),
                 )
                 .await
             }
@@ -1437,7 +1438,9 @@ async fn dispatch_runtime_inference(
     stream: bool,
     principal: M3RequestPrincipal,
     context: &M3OperationContext,
+    mlx_ownership: Option<crate::mlx_ownership::MlxOwnershipCoordinator>,
 ) -> Response<ResponseBody> {
+    let is_mlx = runtime_id == "mlx";
     let request = M3ApiDispatchRequest {
         protocol,
         runtime_id,
@@ -1447,6 +1450,17 @@ async fn dispatch_runtime_inference(
         now_ms: now_ms(),
     };
     if !stream {
+        // Keep the chat service resident for the complete inference. Studio
+        // handoff then waits for active chat work instead of stopping its
+        // process underneath a request that is still producing output.
+        let _owner = if is_mlx {
+            match mlx_ownership.as_ref() {
+                Some(mlx_ownership) => Some(mlx_ownership.acquire().await),
+                None => None,
+            }
+        } else {
+            None
+        };
         return match hub
             .dispatch_pre_authorized_api(&request, principal, context)
             .await
@@ -1466,6 +1480,16 @@ async fn dispatch_runtime_inference(
     };
     let context = context.clone();
     tokio::spawn(async move {
+        // The guard lives in the spawned task so streaming requests retain
+        // ownership until the final frame, not merely until headers are ready.
+        let _owner = if is_mlx {
+            match mlx_ownership.as_ref() {
+                Some(mlx_ownership) => Some(mlx_ownership.acquire().await),
+                None => None,
+            }
+        } else {
+            None
+        };
         if let Err(error) = hub
             .dispatch_pre_authorized_api_stream(
                 &request,
@@ -1533,6 +1557,7 @@ async fn inference_response(
     auth: &HttpAuth,
     body: Bytes,
     context: &M3OperationContext,
+    mlx_ownership: Option<crate::mlx_ownership::MlxOwnershipCoordinator>,
 ) -> Response<ResponseBody> {
     // The route fixes the scope and buffering fixes the exact byte count.
     // Charge that request before parsing an attacker-controlled envelope;
@@ -1597,6 +1622,7 @@ async fn inference_response(
         canonical.stream,
         authorization.principal.clone(),
         context,
+        mlx_ownership,
     )
     .await
 }
@@ -1688,6 +1714,7 @@ async fn ollama_chat_response(
     auth: &HttpAuth,
     body: Bytes,
     context: &M3OperationContext,
+    mlx_ownership: Option<crate::mlx_ownership::MlxOwnershipCoordinator>,
 ) -> Response<ResponseBody> {
     let authorization = match authorize_staged_resolution(
         &hub,
@@ -1735,6 +1762,14 @@ async fn ollama_chat_response(
         body: body.to_vec(),
         caller: M3ApiCaller::Internal,
         now_ms: now_ms(),
+    };
+    let _owner = if request.runtime_id == "mlx" {
+        match mlx_ownership.as_ref() {
+            Some(mlx_ownership) => Some(mlx_ownership.acquire().await),
+            None => None,
+        }
+    } else {
+        None
     };
     match hub
         .dispatch_pre_authorized_ollama_chat(&request, authorization.principal.clone(), context)
@@ -2160,6 +2195,7 @@ impl M3HttpRequestService {
                         &auth,
                         body,
                         &context,
+                        self.mlx_ownership.clone(),
                     )
                     .await
                 }
@@ -2175,6 +2211,7 @@ impl M3HttpRequestService {
                         &auth,
                         body,
                         &context,
+                        self.mlx_ownership.clone(),
                     )
                     .await
                 }
@@ -2190,6 +2227,7 @@ impl M3HttpRequestService {
                         &auth,
                         body,
                         &context,
+                        self.mlx_ownership.clone(),
                     )
                     .await
                 }
@@ -2231,6 +2269,7 @@ impl M3HttpRequestService {
                         &auth,
                         body,
                         &context,
+                        self.mlx_ownership.clone(),
                     )
                     .await
                 }
@@ -2546,13 +2585,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::task::{Context, Poll};
 
+    use crate::compatibility_hub::{CanonicalContent, CanonicalInferenceResponse};
     use crate::compatibility_hub::{LanStateProtector, OsLanEntropy, PairingRequest};
     use crate::m3_runtime_hub::{
-        DefaultM3LanAccessFactory, M3DownloadTransport, M3HardwareProbe, M3HubConfig,
-        M3RuntimeHubDependencies, ReqwestM3DownloadTransport, SystemM3Clock,
+        DefaultM3LanAccessFactory, M3CanonicalStreamSink, M3DownloadTransport, M3HardwareProbe,
+        M3HubConfig, M3HubFuture, M3HubResult, M3ResolvedModel, M3RuntimeCapabilityView,
+        M3RuntimeDescriptor, M3RuntimeDriver, M3RuntimeHubDependencies, M3RuntimeMetricsView,
+        M3RuntimeStatusView, ReqwestM3DownloadTransport, SystemM3Clock,
     };
     use crate::runtime_adapter::{
-        AcceleratorCapability, AcceleratorKind, HardwareSnapshot, PlatformCapabilities,
+        AcceleratorCapability, AcceleratorKind, HardwareSnapshot, KeepAlive, PlatformCapabilities,
+        RuntimeInventory, RuntimeLogTail, SettingValue,
     };
 
     struct TestHardware;
@@ -2635,7 +2678,10 @@ mod tests {
         }
     }
 
-    fn test_hub(root: &TestRoot) -> Arc<M3RuntimeHub> {
+    fn test_hub_with_runtimes(
+        root: &TestRoot,
+        runtimes: Vec<Arc<dyn M3RuntimeDriver>>,
+    ) -> Arc<M3RuntimeHub> {
         let download: Arc<dyn M3DownloadTransport> =
             Arc::new(ReqwestM3DownloadTransport::new().expect("download transport"));
         Arc::new(
@@ -2651,7 +2697,7 @@ mod tests {
                     hardware: Arc::new(TestHardware),
                     download,
                     catalogs: Vec::new(),
-                    runtimes: Vec::new(),
+                    runtimes,
                     runtime_reconciler: None,
                     lan_factory: Some(Arc::new(DefaultM3LanAccessFactory::new(
                         Arc::new(OsLanEntropy),
@@ -2661,6 +2707,231 @@ mod tests {
             )
             .expect("M3 HTTP test hub"),
         )
+    }
+
+    fn test_hub(root: &TestRoot) -> Arc<M3RuntimeHub> {
+        test_hub_with_runtimes(root, Vec::new())
+    }
+
+    struct BlockingChatRuntime {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl M3RuntimeDriver for BlockingChatRuntime {
+        fn descriptor(&self) -> M3RuntimeDescriptor {
+            M3RuntimeDescriptor {
+                runtime_id: "mlx".to_string(),
+                kind: M3RuntimeKind::Mlx,
+                label: "Test MLX".to_string(),
+                managed: true,
+                api_backend: ApiBackend::Mlx,
+            }
+        }
+
+        fn capabilities(&self) -> M3RuntimeCapabilityView {
+            M3RuntimeCapabilityView {
+                descriptor: self.descriptor(),
+                can_load: true,
+                can_unload: true,
+                can_logs: false,
+                can_metrics: false,
+                can_infer: true,
+                can_embed: false,
+                settings: Vec::new(),
+            }
+        }
+
+        fn validate_config(&self, _values: &BTreeMap<String, SettingValue>) -> M3HubResult<()> {
+            Ok(())
+        }
+
+        fn status<'a>(
+            &'a self,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, M3RuntimeStatusView> {
+            Box::pin(async { Err(M3HubError::Unsupported("test status".to_string())) })
+        }
+
+        fn inventory<'a>(
+            &'a self,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, RuntimeInventory> {
+            Box::pin(async { Err(M3HubError::Unsupported("test inventory".to_string())) })
+        }
+
+        fn load<'a>(
+            &'a self,
+            _model: &'a M3ResolvedModel,
+            _settings: &'a BTreeMap<String, SettingValue>,
+            _keep_alive: Option<KeepAlive>,
+            _replace_existing: bool,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn unload<'a>(
+            &'a self,
+            _model_id: &'a str,
+            _force_exact_owner: bool,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn logs<'a>(
+            &'a self,
+            _max_bytes: usize,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, RuntimeLogTail> {
+            Box::pin(async { Err(M3HubError::Unsupported("test logs".to_string())) })
+        }
+
+        fn metrics<'a>(
+            &'a self,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, M3RuntimeMetricsView> {
+            Box::pin(async { Err(M3HubError::Unsupported("test metrics".to_string())) })
+        }
+
+        fn complete<'a>(
+            &'a self,
+            request: &'a crate::compatibility_hub::CanonicalInferenceRequest,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, CanonicalInferenceResponse> {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(CanonicalInferenceResponse {
+                    response_id: "test-response".to_string(),
+                    model: request.model.clone(),
+                    content: vec![CanonicalContent::Text {
+                        text: "hello".to_string(),
+                    }],
+                    finish_reason: "stop".to_string(),
+                    usage: Default::default(),
+                    created_at_seconds: 1_700_000_000,
+                })
+            })
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _request: &'a crate::compatibility_hub::CanonicalInferenceRequest,
+            _sink: &'a mut dyn M3CanonicalStreamSink,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, ()> {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        }
+
+        fn cancel<'a>(
+            &'a self,
+            _request_id: &'a str,
+            _context: &'a M3OperationContext,
+        ) -> M3HubFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    #[tokio::test]
+    async fn http_mlx_chat_inference_holds_ownership_until_complete() {
+        let root = TestRoot::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(BlockingChatRuntime {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let hub = test_hub_with_runtimes(&root, vec![runtime]);
+        let coordinator = crate::mlx_ownership::MlxOwnershipCoordinator::default();
+        let request_body = Bytes::from(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+        );
+        let context = M3OperationContext::new(5_000);
+        let inference_context = context.clone();
+        let inference_coordinator = coordinator.clone();
+        let inference = tokio::spawn(async move {
+            dispatch_runtime_inference(
+                hub,
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "mlx".to_string(),
+                "test-request".to_string(),
+                request_body,
+                false,
+                M3RequestPrincipal::Internal,
+                &inference_context,
+                Some(inference_coordinator),
+            )
+            .await
+        });
+
+        started.notified().await;
+        let studio_handoff = tokio::spawn(async move {
+            let _owner = coordinator.acquire().await;
+            true
+        });
+        tokio::task::yield_now().await;
+        assert!(!studio_handoff.is_finished());
+
+        release.notify_one();
+        assert_eq!(inference.await.unwrap().status(), StatusCode::OK);
+        assert!(studio_handoff.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn http_mlx_streaming_chat_holds_ownership_until_stream_finishes() {
+        let root = TestRoot::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let runtime = Arc::new(BlockingChatRuntime {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let hub = test_hub_with_runtimes(&root, vec![runtime]);
+        let coordinator = crate::mlx_ownership::MlxOwnershipCoordinator::default();
+        let request_body = Bytes::from(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+        );
+        let context = M3OperationContext::new(5_000);
+        let inference_context = context.clone();
+        let inference_coordinator = coordinator.clone();
+        let response = tokio::spawn(async move {
+            dispatch_runtime_inference(
+                hub,
+                CompatibilityProtocol::OpenAiChatCompletions,
+                "mlx".to_string(),
+                "test-stream-request".to_string(),
+                request_body,
+                true,
+                M3RequestPrincipal::Internal,
+                &inference_context,
+                Some(inference_coordinator),
+            )
+            .await
+        });
+
+        started.notified().await;
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let studio_handoff = tokio::spawn(async move {
+            let _owner = coordinator.acquire().await;
+            true
+        });
+        tokio::task::yield_now().await;
+        assert!(!studio_handoff.is_finished());
+
+        release.notify_one();
+        assert!(studio_handoff.await.unwrap());
+        drop(response);
     }
 
     #[test]

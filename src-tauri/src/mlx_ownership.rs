@@ -122,4 +122,25 @@ mod tests {
         drop(active);
         assert!(waiting.await.unwrap());
     }
+
+    #[tokio::test]
+    async fn studio_handoff_waits_for_active_chat_inference() {
+        let coordinator = MlxOwnershipCoordinator::default();
+        // HTTP/IPC chat inference holds this guard until its complete
+        // response, including the streaming case. A Studio transition must
+        // therefore wait instead of unloading the chat process underneath it.
+        let active_chat = coordinator.acquire().await;
+        let studio_handoff = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                let _owner = coordinator.acquire().await;
+                true
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(!studio_handoff.is_finished());
+        drop(active_chat);
+        assert!(studio_handoff.await.unwrap());
+    }
 }
