@@ -161,6 +161,7 @@ export function RuntimeHubStudioModels() {
   return (
     <section className="flex flex-col gap-3" aria-labelledby="studio-models-heading">
       <SectionHeading
+        id="studio-models-heading"
         title={t("RuntimeHub.studioModels.title")}
         description={t("RuntimeHub.studioModels.description")}
         action={(
@@ -189,13 +190,13 @@ export function RuntimeHubStudioModels() {
 
       {error && <p className="text-xs text-danger">{error}</p>}
       {models.length ? (
-        <div id="studio-models-heading" className="grid gap-3 lg:grid-cols-2">
+        <div className="grid gap-3 lg:grid-cols-2">
           {models.map((model) => (
             <StudioModelCard key={model.id} model={model} onChanged={() => void refresh()} />
           ))}
         </div>
       ) : (
-        <div id="studio-models-heading" className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted">
+        <div className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted">
           {t("RuntimeHub.studioModels.empty")}
         </div>
       )}
