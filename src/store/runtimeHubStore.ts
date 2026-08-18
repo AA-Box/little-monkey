@@ -949,7 +949,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         // Status, inventory, and config are the runtime snapshot. Logs,
         // metrics, and context/cache state are additive diagnostics: a stopped
         // managed service may legitimately reject those calls, and that must
-        // not hide the installed/stopped state from the card.
+        // not hide the installed/stopped state from the card. Failed
+        // diagnostics are omitted from this refreshed snapshot so samples
+        // from a previous resident process cannot be rendered as live.
         const contextCache = contextCacheResult.status === "fulfilled" ? contextCacheResult.value : undefined;
         set((state) => ({
           runtimeDetails: {
@@ -958,8 +960,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
               ...state.runtimeDetails[runtimeId],
               status: statusResult.value,
               inventory: inventoryResult.value,
-              logs: logsResult.status === "fulfilled" ? logsResult.value : state.runtimeDetails[runtimeId]?.logs,
-              metrics: metricsResult.status === "fulfilled" ? metricsResult.value : state.runtimeDetails[runtimeId]?.metrics,
+              logs: logsResult.status === "fulfilled" ? logsResult.value : undefined,
+              metrics: metricsResult.status === "fulfilled" ? metricsResult.value : undefined,
               config: configResult.value ?? undefined,
               contextCache,
               refreshedAt: Date.now(),

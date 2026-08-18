@@ -394,6 +394,52 @@ describe("runtimeHubStore", () => {
     expect(useRuntimeHubStore.getState().errors["runtime:mlx"]).toBeUndefined();
   });
 
+  it("does not expose diagnostics from the previous resident MLX state after it stops", async () => {
+    const mlxCapability = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: true,
+      canUnload: true,
+      canLogs: true,
+      canMetrics: true,
+      canInfer: true,
+      canEmbed: false,
+      settings: [],
+    };
+    const previousStatus = { runtimeType: "mlx", status: { state: "running", model_id: "old-model" } };
+    const stoppedStatus = { runtimeType: "mlx", status: { state: "stopped" } };
+    const inventory = { schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 2 };
+    const previousLogs = { text: "old process is still alive", truncated: false };
+    const previousMetrics = { runtimeType: "mlx", metrics: { tokens_per_second: 18.2 }, status: previousStatus.status };
+    useRuntimeHubStore.setState({
+      runtimes: [mlxCapability] as never,
+      runtimeDetails: {
+        mlx: {
+          status: previousStatus,
+          inventory: { ...inventory, captured_at_ms: 1 },
+          logs: previousLogs,
+          metrics: previousMetrics,
+          refreshedAt: 100,
+        },
+      } as never,
+    });
+    mocks.client.runtimeStatus.mockResolvedValue(stoppedStatus);
+    mocks.client.runtimeInventory.mockResolvedValue(inventory);
+    mocks.client.runtimeLogs.mockRejectedValue(new Error("the managed MLX service is not running"));
+    mocks.client.runtimeMetrics.mockRejectedValue(new Error("the managed MLX service is not running"));
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await useRuntimeHubStore.getState().refreshRuntime("mlx");
+
+    const detail = useRuntimeHubStore.getState().runtimeDetails.mlx;
+    expect(detail.status).toEqual(stoppedStatus);
+    expect(detail.inventory).toEqual(inventory);
+    expect(detail.logs).toBeUndefined();
+    expect(detail.metrics).toBeUndefined();
+    expect(detail.refreshedAt).toBeGreaterThan(100);
+    expect(useRuntimeHubStore.getState().errors["runtime:mlx"]).toBeUndefined();
+  });
+
   it("uses the atomic LAN configure transaction before refreshing scoped tokens and audit events", async () => {
     mocks.client.lanValidatePolicy.mockResolvedValue(undefined);
     mocks.client.lanConfigure.mockResolvedValue(policy);
