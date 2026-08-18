@@ -128,8 +128,10 @@ describe("daemon desktop turn snapshot", () => {
       },
       attached_stack_ids: ["stack-one"],
       attached_stack_names: ["Docs"],
-      execution_roots: [{ root_id: "root-one", canonical_path: "/workspace/project", is_primary: true }],
+      execution_roots: [{ canonical_path: "/workspace/project", is_primary: true }],
     });
+    expect(recipe.desktop_turn.execution_roots[0].root_id)
+      .toBe(recipe.desktop_turn.workspace?.roots[0]?.root_id);
     expect(recipe.desktop_turn.mcp_servers).toEqual([{
       id: "docs",
       config_sha256: "df5d5a0b8e06cffe7f147abe9e439633fb80c71bd4a831386fd6406dc1b2bf20",
