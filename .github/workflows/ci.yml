@@ -91,6 +91,11 @@ jobs:
         # replaces a working CLI with a zero-byte file that cargo never rebuilds.
         run: pnpm test:cli-sidecar
 
+      - name: Managed-runtime archive extraction
+        # Linux and macOS ZIP runtime assets require `unzip`; GNU tar rejects
+        # them. Keep the platform-specific selector covered before release.
+        run: pnpm test:runtime-archive
+
   rust-tests:
     # Real per-OS compilation + test coverage for `#[cfg(target_os = ...)]`
     # code — a single-OS CI job would silently never compile the arms that
@@ -283,10 +288,13 @@ jobs:
           set -euo pipefail
           echo "runner architecture: $(uname -m)"
           test "$(uname -m)" = "arm64"
-          cargo test --manifest-path src-tauri/Cargo.toml -- --list | \
+          cargo test --manifest-path src-tauri/Cargo.toml --lib \
+            m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
+            -- --exact --list | \
             grep 'm3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional'
           cargo test \
             --manifest-path src-tauri/Cargo.toml \
+            --lib \
             m3_commands::tests::mlx_full_ladder::catalog_to_signed_mlx_runtime_install_is_transactional \
             -- --exact --nocapture
 

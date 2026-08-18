@@ -196,6 +196,7 @@ fn save_manual_client_record(server_id: &str, json: &str) -> Result<(), String> 
         .map_err(|e| format!("Failed to save OAuth client registration: {e}"))
 }
 
+#[cfg(test)]
 fn save_manual_client(
     server_id: &str,
     registration: &ManualClientRegistration,
@@ -214,6 +215,48 @@ fn remove_manual_client(server_id: &str) -> Result<(), String> {
         Err(e) => Err(format!(
             "Failed to remove saved OAuth client registration: {e}"
         )),
+    }
+}
+
+/// The two durable records that one OAuth exchange stages as a transaction.
+///
+/// The production implementation remains the OS keychain. Keeping this small
+/// boundary private lets the transaction itself be proven without depending on
+/// a platform credential manager's cross-thread ordering guarantees.
+trait OAuthRecordStore: Send + Sync {
+    fn load_credentials(&self, server_id: &str) -> Result<Option<String>, String>;
+    fn save_credentials(&self, server_id: &str, record: &str) -> Result<(), String>;
+    fn remove_credentials(&self, server_id: &str) -> Result<(), String>;
+    fn load_manual_client(&self, server_id: &str) -> Result<Option<String>, String>;
+    fn save_manual_client(&self, server_id: &str, record: &str) -> Result<(), String>;
+    fn remove_manual_client(&self, server_id: &str) -> Result<(), String>;
+}
+
+struct KeychainOAuthRecordStore;
+
+impl OAuthRecordStore for KeychainOAuthRecordStore {
+    fn load_credentials(&self, server_id: &str) -> Result<Option<String>, String> {
+        load_oauth_credentials_record(server_id)
+    }
+
+    fn save_credentials(&self, server_id: &str, record: &str) -> Result<(), String> {
+        save_oauth_credentials_record(server_id, record)
+    }
+
+    fn remove_credentials(&self, server_id: &str) -> Result<(), String> {
+        remove_oauth_credentials_record(server_id)
+    }
+
+    fn load_manual_client(&self, server_id: &str) -> Result<Option<String>, String> {
+        load_manual_client_record(server_id)
+    }
+
+    fn save_manual_client(&self, server_id: &str, record: &str) -> Result<(), String> {
+        save_manual_client_record(server_id, record)
+    }
+
+    fn remove_manual_client(&self, server_id: &str) -> Result<(), String> {
+        remove_manual_client(server_id)
     }
 }
 
@@ -1241,6 +1284,7 @@ async fn run_connect_flow(
 /// rollback if the command future itself is aborted.
 struct StagedOAuthExchange {
     server_id: String,
+    records: std::sync::Arc<dyn OAuthRecordStore>,
     previous_credentials: Option<String>,
     previous_manual_client: Option<Option<String>>,
     armed: bool,
@@ -1248,16 +1292,40 @@ struct StagedOAuthExchange {
 
 impl StagedOAuthExchange {
     fn begin(server_id: &str, pending: Option<&ManualClientRegistration>) -> Result<Self, String> {
-        let previous_credentials = load_oauth_credentials_record(server_id)?;
+        Self::begin_with_record_store(
+            server_id,
+            pending,
+            std::sync::Arc::new(KeychainOAuthRecordStore),
+        )
+    }
+
+    #[cfg(test)]
+    fn begin_with_store(
+        server_id: &str,
+        pending: Option<&ManualClientRegistration>,
+        records: std::sync::Arc<dyn OAuthRecordStore>,
+    ) -> Result<Self, String> {
+        Self::begin_with_record_store(server_id, pending, records)
+    }
+
+    fn begin_with_record_store(
+        server_id: &str,
+        pending: Option<&ManualClientRegistration>,
+        records: std::sync::Arc<dyn OAuthRecordStore>,
+    ) -> Result<Self, String> {
+        let previous_credentials = records.load_credentials(server_id)?;
         let previous_manual_client = if let Some(pending) = pending {
-            let previous = load_manual_client_record(server_id)?;
-            save_manual_client(server_id, pending)?;
+            let previous = records.load_manual_client(server_id)?;
+            let record = serde_json::to_string(pending)
+                .map_err(|e| format!("Failed to serialize OAuth client registration: {e}"))?;
+            records.save_manual_client(server_id, &record)?;
             Some(previous)
         } else {
             None
         };
         Ok(Self {
             server_id: server_id.to_string(),
+            records,
             previous_credentials,
             previous_manual_client,
             armed: true,
@@ -1266,12 +1334,12 @@ impl StagedOAuthExchange {
 
     fn restore_previous(&self) -> Result<(), String> {
         let credentials_result = match self.previous_credentials.as_deref() {
-            Some(record) => save_oauth_credentials_record(&self.server_id, record),
-            None => remove_oauth_credentials_record(&self.server_id),
+            Some(record) => self.records.save_credentials(&self.server_id, record),
+            None => self.records.remove_credentials(&self.server_id),
         };
         let manual_result = match self.previous_manual_client.as_ref() {
-            Some(Some(record)) => save_manual_client_record(&self.server_id, record),
-            Some(None) => remove_manual_client(&self.server_id),
+            Some(Some(record)) => self.records.save_manual_client(&self.server_id, record),
+            Some(None) => self.records.remove_manual_client(&self.server_id),
             None => Ok(()),
         };
 
@@ -1506,6 +1574,73 @@ mod tests {
 
     fn unique_server_id(label: &str) -> String {
         format!("oauth-test-{label}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[derive(Default)]
+    struct InMemoryOAuthRecordStore {
+        credentials: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        manual_clients: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    }
+
+    impl OAuthRecordStore for InMemoryOAuthRecordStore {
+        fn load_credentials(&self, server_id: &str) -> Result<Option<String>, String> {
+            self.credentials
+                .lock()
+                .map_err(|_| "in-memory OAuth credentials lock poisoned".to_string())
+                .map(|records| records.get(server_id).cloned())
+        }
+
+        fn save_credentials(&self, server_id: &str, record: &str) -> Result<(), String> {
+            self.credentials
+                .lock()
+                .map_err(|_| "in-memory OAuth credentials lock poisoned".to_string())?
+                .insert(server_id.to_string(), record.to_string());
+            Ok(())
+        }
+
+        fn remove_credentials(&self, server_id: &str) -> Result<(), String> {
+            self.credentials
+                .lock()
+                .map_err(|_| "in-memory OAuth credentials lock poisoned".to_string())?
+                .remove(server_id);
+            Ok(())
+        }
+
+        fn load_manual_client(&self, server_id: &str) -> Result<Option<String>, String> {
+            self.manual_clients
+                .lock()
+                .map_err(|_| "in-memory OAuth client lock poisoned".to_string())
+                .map(|records| records.get(server_id).cloned())
+        }
+
+        fn save_manual_client(&self, server_id: &str, record: &str) -> Result<(), String> {
+            self.manual_clients
+                .lock()
+                .map_err(|_| "in-memory OAuth client lock poisoned".to_string())?
+                .insert(server_id.to_string(), record.to_string());
+            Ok(())
+        }
+
+        fn remove_manual_client(&self, server_id: &str) -> Result<(), String> {
+            self.manual_clients
+                .lock()
+                .map_err(|_| "in-memory OAuth client lock poisoned".to_string())?
+                .remove(server_id);
+            Ok(())
+        }
+    }
+
+    fn load_test_manual_client(
+        records: &InMemoryOAuthRecordStore,
+        server_id: &str,
+    ) -> ManualClientRegistration {
+        serde_json::from_str(
+            &records
+                .load_manual_client(server_id)
+                .unwrap()
+                .expect("manual client record"),
+        )
+        .unwrap()
     }
 
     // --- KeychainCredentialStore ------------------------------------------
@@ -2477,6 +2612,7 @@ mod tests {
     #[test]
     fn manual_client_persistence_is_transactional_with_token_exchange() {
         let server_id = unique_server_id("manual-client-transaction");
+        let records = std::sync::Arc::new(InMemoryOAuthRecordStore::default());
         let previous = ManualClientRegistration {
             client_id: "previous-valid-client".to_string(),
             client_secret: Some("previous-valid-secret".to_string()),
@@ -2485,46 +2621,54 @@ mod tests {
             client_id: "replacement-client".to_string(),
             client_secret: Some("replacement-secret".to_string()),
         };
-        save_manual_client(&server_id, &previous).unwrap();
-        save_oauth_credentials_record(&server_id, "previous-token-record").unwrap();
+        records
+            .save_manual_client(&server_id, &serde_json::to_string(&previous).unwrap())
+            .unwrap();
+        records
+            .save_credentials(&server_id, "previous-token-record")
+            .unwrap();
 
-        let staged = StagedOAuthExchange::begin(&server_id, Some(&pending)).unwrap();
-        let staged_record = load_manual_client(&server_id).unwrap().unwrap();
+        let staged =
+            StagedOAuthExchange::begin_with_store(&server_id, Some(&pending), records.clone())
+                .unwrap();
+        let staged_record = load_test_manual_client(&records, &server_id);
         assert_eq!(
             staged_record.client_id, pending.client_id,
             "the matching client must be durable before token exchange can save a token"
         );
-        save_oauth_credentials_record(&server_id, "rejected-token-record").unwrap();
+        records
+            .save_credentials(&server_id, "rejected-token-record")
+            .unwrap();
 
         let error = complete_oauth_exchange::<()>(staged, Err("token exchange rejected".into()))
             .unwrap_err();
         assert_eq!(error, "token exchange rejected");
-        let still_saved = load_manual_client(&server_id).unwrap().unwrap();
+        let still_saved = load_test_manual_client(&records, &server_id);
         assert_eq!(still_saved.client_id, previous.client_id);
         assert_eq!(
             still_saved.client_secret.as_deref(),
             previous.client_secret.as_deref()
         );
         assert_eq!(
-            load_oauth_credentials_record(&server_id)
-                .unwrap()
-                .as_deref(),
+            records.load_credentials(&server_id).unwrap().as_deref(),
             Some("previous-token-record")
         );
 
-        let staged = StagedOAuthExchange::begin(&server_id, Some(&pending)).unwrap();
-        save_oauth_credentials_record(&server_id, "committed-token-record").unwrap();
+        let staged =
+            StagedOAuthExchange::begin_with_store(&server_id, Some(&pending), records.clone())
+                .unwrap();
+        records
+            .save_credentials(&server_id, "committed-token-record")
+            .unwrap();
         complete_oauth_exchange(staged, Ok(())).unwrap();
-        let committed = load_manual_client(&server_id).unwrap().unwrap();
+        let committed = load_test_manual_client(&records, &server_id);
         assert_eq!(committed.client_id, pending.client_id);
         assert_eq!(
             committed.client_secret.as_deref(),
             pending.client_secret.as_deref()
         );
         assert_eq!(
-            load_oauth_credentials_record(&server_id)
-                .unwrap()
-                .as_deref(),
+            records.load_credentials(&server_id).unwrap().as_deref(),
             Some("committed-token-record")
         );
 
@@ -2532,39 +2676,41 @@ mod tests {
             client_id: "cancelled-replacement".to_string(),
             client_secret: None,
         };
-        let staged = StagedOAuthExchange::begin(&server_id, Some(&cancelled)).unwrap();
-        save_oauth_credentials_record(&server_id, "cancelled-token-record").unwrap();
+        let staged =
+            StagedOAuthExchange::begin_with_store(&server_id, Some(&cancelled), records.clone())
+                .unwrap();
+        records
+            .save_credentials(&server_id, "cancelled-token-record")
+            .unwrap();
         let cancellation =
             complete_oauth_exchange::<()>(staged, Err(OAUTH_CANCELLED_MESSAGE.to_string()))
                 .unwrap_err();
         assert_eq!(cancellation, OAUTH_CANCELLED_MESSAGE);
-        let restored_after_cancel = load_manual_client(&server_id).unwrap().unwrap();
+        let restored_after_cancel = load_test_manual_client(&records, &server_id);
         assert_eq!(restored_after_cancel.client_id, pending.client_id);
         assert_eq!(
-            load_oauth_credentials_record(&server_id)
-                .unwrap()
-                .as_deref(),
+            records.load_credentials(&server_id).unwrap().as_deref(),
             Some("committed-token-record"),
             "normal cancellation must explicitly restore the committed token"
         );
 
-        let staged = StagedOAuthExchange::begin(&server_id, Some(&cancelled)).unwrap();
-        save_oauth_credentials_record(&server_id, "aborted-token-record").unwrap();
+        let staged =
+            StagedOAuthExchange::begin_with_store(&server_id, Some(&cancelled), records.clone())
+                .unwrap();
+        records
+            .save_credentials(&server_id, "aborted-token-record")
+            .unwrap();
         drop(staged);
-        let restored_after_drop = load_manual_client(&server_id).unwrap().unwrap();
+        let restored_after_drop = load_test_manual_client(&records, &server_id);
         assert_eq!(
             restored_after_drop.client_id, pending.client_id,
             "aborting the command future must still restore the last committed client"
         );
         assert_eq!(
-            load_oauth_credentials_record(&server_id)
-                .unwrap()
-                .as_deref(),
+            records.load_credentials(&server_id).unwrap().as_deref(),
             Some("committed-token-record"),
             "the Drop fallback must restore the committed token too"
         );
-
-        remove_oauth_credentials_impl(&server_id).unwrap();
     }
 
     #[test]
