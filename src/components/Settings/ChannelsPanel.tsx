@@ -45,7 +45,7 @@ import { IngressTurnsSection } from "./IngressTurnsSection";
 import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
 
-const INPUT = "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
+const INPUT = "h-9 w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
 
 /**
  * Health is rendered from what the daemon last probed, never from whether a

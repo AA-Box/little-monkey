@@ -39,6 +39,9 @@ const ACTION_LABEL_KEYS: Record<DraftActionKind, string> = {
   status_update: "TriagePanel.actionStatusUpdate",
 };
 
+const SOURCE_FIELD_CLASS =
+  "h-8 min-w-0 flex-1 rounded-md border border-border bg-surface text-sm leading-5 text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent";
+
 function formatScore(score: number): string {
   return score.toFixed(1);
 }
@@ -58,14 +61,14 @@ function GithubSourceRow({ onAdd }: { onAdd: (spec: TriageSourceSpec) => void })
         value={owner}
         onChange={(event) => setOwner(event.target.value)}
         placeholder={t("TriagePanel.githubOwnerPlaceholder")}
-        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+        className={`${SOURCE_FIELD_CLASS} px-2.5`}
       />
       <input
         type="text"
         value={repo}
         onChange={(event) => setRepo(event.target.value)}
         placeholder={t("TriagePanel.githubRepoPlaceholder")}
-        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+        className={`${SOURCE_FIELD_CLASS} px-2.5`}
       />
       <Button
         size="sm"
@@ -103,7 +106,7 @@ function ConnectorSourceRow({
       <select
         value={accountId}
         onChange={(event) => setAccountId(event.target.value)}
-        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+        className={`${SOURCE_FIELD_CLASS} px-2`}
       >
         <option value="">{t("TriagePanel.selectConnectorPlaceholder")}</option>
         {accounts.map((account) => (
@@ -121,7 +124,7 @@ function ConnectorSourceRow({
             ? t("TriagePanel.slackChannelPlaceholder")
             : t("TriagePanel.jiraProjectPlaceholder")
         }
-        className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground placeholder:text-faint focus:outline-none focus:ring-2 focus:ring-accent"
+        className={`${SOURCE_FIELD_CLASS} px-2.5`}
       />
       <Button
         size="sm"

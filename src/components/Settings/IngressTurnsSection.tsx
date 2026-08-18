@@ -78,7 +78,7 @@ export function IngressTurnsSection() {
         <div className="flex items-center gap-2">
           <select
             aria-label={t("IngressTurns.filter")}
-            className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
+            className="h-9 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
             value={source}
             onChange={(event) => setSource(event.target.value as ConversationSource | "")}
           >
