@@ -978,46 +978,51 @@ async fn run_diffusion(
     let base_url = engine.ensure_ready(&command, spec, &root).await?;
     engine.clear_progress();
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let job_id = generation::submit_job(&client, &base_url, spec, request).await?;
-    let _ = app.emit(
-        "studio://progress",
-        GenerationProgressEvent::new(&job_id, "submitted"),
-    );
+    let result = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let job_id = generation::submit_job(&client, &base_url, spec, request).await?;
+        let _ = app.emit(
+            "studio://progress",
+            GenerationProgressEvent::new(&job_id, "submitted"),
+        );
 
-    let mut moving = (engine.output_mark(), u32::MAX);
-    let mut moved_at = tokio::time::Instant::now();
-    loop {
-        match generation::poll_job(&client, &base_url, &job_id).await? {
-            JobProgress::Running { queue_position } => {
-                let mut event = GenerationProgressEvent::new(&job_id, "running")
-                    .with_progress(engine.progress());
-                event.queue_position = queue_position;
-                let _ = app.emit("studio://progress", event);
-                let now = (engine.output_mark(), queue_position);
-                if now != moving {
-                    moving = now;
-                    moved_at = tokio::time::Instant::now();
-                } else if moved_at.elapsed() >= JOB_STALL_TIMEOUT {
-                    generation::cancel_job(&client, &base_url, &job_id).await;
-                    return Err(format!(
-                        "Generation stopped making progress for {} minutes and was cancelled",
-                        JOB_STALL_TIMEOUT.as_secs() / 60
-                    ));
+        let mut moving = (engine.output_mark(), u32::MAX);
+        let mut moved_at = tokio::time::Instant::now();
+        loop {
+            match generation::poll_job(&client, &base_url, &job_id).await? {
+                JobProgress::Running { queue_position } => {
+                    let mut event = GenerationProgressEvent::new(&job_id, "running")
+                        .with_progress(engine.progress());
+                    event.queue_position = queue_position;
+                    let _ = app.emit("studio://progress", event);
+                    let now = (engine.output_mark(), queue_position);
+                    if now != moving {
+                        moving = now;
+                        moved_at = tokio::time::Instant::now();
+                    } else if moved_at.elapsed() >= JOB_STALL_TIMEOUT {
+                        generation::cancel_job(&client, &base_url, &job_id).await;
+                        return Err(format!(
+                            "Generation stopped making progress for {} minutes and was cancelled",
+                            JOB_STALL_TIMEOUT.as_secs() / 60
+                        ));
+                    }
                 }
+                JobProgress::Completed(media) => return Ok(media),
+                JobProgress::Failed(error) => return Err(error),
+                JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
             }
-            JobProgress::Completed(media) => {
-                engine.schedule_idle_stop(STUDIO_ENGINE_IDLE_TIMEOUT);
-                return Ok(media);
-            }
-            JobProgress::Failed(error) => return Err(error),
-            JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
+            tokio::time::sleep(Duration::from_millis(750)).await;
         }
-        tokio::time::sleep(Duration::from_millis(750)).await;
     }
+    .await;
+    // Once ensure_ready succeeded, this run may have loaded tens of GB even
+    // when submit, polling, cancellation, or generation itself failed. Every
+    // such exit must arm the same idle cleanup used by successful runs.
+    engine.schedule_idle_stop(STUDIO_ENGINE_IDLE_TIMEOUT);
+    result
 }
 
 #[tauri::command]

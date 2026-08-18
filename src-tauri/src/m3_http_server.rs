@@ -300,6 +300,9 @@ pub(crate) struct M3HttpRequestService {
     hub: Arc<M3RuntimeHub>,
     model_service: HttpModelService,
     model_extensions: M3HttpModelExtensions,
+    /// The desktop's Studio engine, when this service runs inside the app.
+    /// CLI/test hosts do not have a Studio process to hand off from.
+    studio_engine: Option<crate::generation::GenerationEngineState>,
 }
 
 #[derive(Clone, Default)]
@@ -317,6 +320,7 @@ impl M3HttpRequestService {
             hub,
             model_service,
             model_extensions: M3HttpModelExtensions::default(),
+            studio_engine: None,
         }
     }
 
@@ -328,7 +332,16 @@ impl M3HttpRequestService {
             hub,
             model_service,
             model_extensions: M3HttpModelExtensions::default(),
+            studio_engine: None,
         }
+    }
+
+    pub(crate) fn with_studio_engine(
+        mut self,
+        studio_engine: crate::generation::GenerationEngineState,
+    ) -> Self {
+        self.studio_engine = Some(studio_engine);
+        self
     }
 
     pub(crate) fn with_model_extensions(mut self, extensions: M3HttpModelExtensions) -> Self {
@@ -1809,6 +1822,7 @@ fn ollama_tags_from_models(list: &Value) -> Value {
 
 async fn lifecycle_response(
     hub: &M3RuntimeHub,
+    studio_engine: Option<&crate::generation::GenerationEngineState>,
     route: RouteId,
     auth: &HttpAuth,
     body: &Bytes,
@@ -1865,6 +1879,15 @@ async fn lifecycle_response(
                     Ok(runtime) => runtime,
                     Err(error) => return hub_error_response(error),
                 };
+            if request.runtime_id == "mlx" {
+                if let Some(studio_engine) = studio_engine {
+                    if let Err(error) = studio_engine.stop() {
+                        return hub_error_response(M3HubError::Runtime(format!(
+                            "Could not release the Studio MLX engine before loading a chat model: {error}"
+                        )));
+                    }
+                }
+            }
             match hub.load_model(&request, context).await {
                 Ok(()) => json_response(StatusCode::OK, json!({ "loaded": true })),
                 Err(error) => hub_error_response(error),
@@ -2196,7 +2219,17 @@ impl M3HttpRequestService {
                     | RouteId::ModelUnload
                     | RouteId::ModelStatus
                     | RouteId::ModelDelete),
-                ) => lifecycle_response(&self.hub, route, &auth, &body, &context).await,
+                ) => {
+                    lifecycle_response(
+                        &self.hub,
+                        self.studio_engine.as_ref(),
+                        route,
+                        &auth,
+                        &body,
+                        &context,
+                    )
+                    .await
+                }
                 (Method::POST, RouteId::RequestCancel) => {
                     cancel_response(&self.hub, &auth, &body, &context).await
                 }
