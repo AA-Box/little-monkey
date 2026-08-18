@@ -63,6 +63,7 @@ const mocks = vi.hoisted(() => ({
     componentCheckUpdates: vi.fn(),
     componentSyncCatalog: vi.fn(),
     componentInstall: vi.fn(),
+    mlxInstallComponent: vi.fn(),
   },
 }));
 
@@ -259,6 +260,139 @@ describe("runtimeHubStore", () => {
     expect(useRuntimeHubStore.getState().errors["mlx-auto-install"]).toBeUndefined();
   });
 
+  it("refreshes MLX readiness after repairing an active component", async () => {
+    const damaged = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: false,
+      canUnload: false,
+      canLogs: false,
+      canMetrics: false,
+      canInfer: false,
+      canEmbed: false,
+      settings: [],
+    };
+    const repaired = { ...damaged, canLoad: true, canUnload: true, canInfer: true };
+    const entry = {
+      schemaVersion: 1,
+      sourceId: "local",
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: "MLX runtime (Apple silicon)",
+      accelerator: null,
+      version: "mlx-lm-0.28.4+video",
+      channel: "beta",
+      downloadUrl: "https://components.example.test/mlx-runtime.tar.gz",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      publishedAtMs: 2,
+      compatibilityNote: null,
+      metadata: {},
+    };
+    const installed = {
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: entry.displayName,
+      accelerator: null,
+      channel: "beta",
+      activeVersionKey: "b".repeat(64),
+      versions: [{
+        versionKey: "b".repeat(64),
+        version: entry.version,
+        channel: "beta",
+        sha256: entry.sha256,
+        sizeBytes: entry.sizeBytes,
+        sourceUrl: entry.downloadUrl,
+        artifactPath: "/managed/mlx",
+        installedAtMs: 1,
+        publishedAtMs: entry.publishedAtMs,
+        active: true,
+        compatibilityNote: null,
+      }],
+    };
+    useRuntimeHubStore.setState({
+      hardware: hardware as never,
+      runtimes: [damaged] as never,
+      componentRegistry: [entry] as never,
+      installedComponents: [installed] as never,
+    });
+    mocks.client.mlxInstallComponent.mockResolvedValue({});
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([repaired]);
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "mlx", status: { state: "stopped" } });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await useRuntimeHubStore.getState().ensureMlxRuntime();
+
+    expect(mocks.client.mlxInstallComponent).toHaveBeenCalledWith("mlx-runtime-apple-silicon");
+    expect(mocks.client.refreshRuntimes).toHaveBeenCalledOnce();
+    expect(useRuntimeHubStore.getState().runtimes[0].canInfer).toBe(true);
+    expect(useRuntimeHubStore.getState().errors["mlx-auto-install"]).toBeUndefined();
+  });
+
+  it("coalesces concurrent MLX setup requests into one installation", async () => {
+    const mlxCapability = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: false,
+      canUnload: false,
+      canLogs: false,
+      canMetrics: false,
+      canInfer: false,
+      canEmbed: false,
+      settings: [],
+    };
+    const entry = {
+      schemaVersion: 1,
+      sourceId: "local",
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: "MLX runtime (Apple silicon)",
+      accelerator: null,
+      version: "mlx-lm-0.28.4+video",
+      channel: "beta",
+      downloadUrl: "https://components.example.test/mlx-runtime.tar.gz",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      publishedAtMs: 2,
+      compatibilityNote: null,
+      metadata: {},
+    };
+    useRuntimeHubStore.setState({
+      hardware: null,
+      runtimes: [],
+      componentRegistry: [],
+    });
+    mocks.client.componentSyncCatalog.mockResolvedValue([entry]);
+    mocks.client.componentInstall.mockResolvedValue({});
+    mocks.client.componentInstalled.mockResolvedValue([]);
+    mocks.client.componentListRegistry.mockResolvedValue([entry]);
+    mocks.client.componentCheckUpdates.mockResolvedValue([]);
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([mlxCapability]);
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "mlx", status: { state: "stopped" } });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await Promise.all([
+      useRuntimeHubStore.getState().ensureMlxRuntime(),
+      useRuntimeHubStore.getState().ensureMlxRuntime(),
+    ]);
+
+    expect(mocks.client.componentInstall).toHaveBeenCalledOnce();
+    expect(mocks.client.refreshRuntimes).toHaveBeenCalledTimes(2);
+    expect(useRuntimeHubStore.getState().busy["mlx-auto-install"]).toBeUndefined();
+  });
+
   it("does not block the rest of the overview refresh when the compatibility report fails", async () => {
     mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
     mocks.client.hardwareProfile.mockResolvedValue(profile);
@@ -391,6 +525,52 @@ describe("runtimeHubStore", () => {
 
     expect(useRuntimeHubStore.getState().runtimeDetails.mlx).toMatchObject({ status, inventory, metrics });
     expect(useRuntimeHubStore.getState().runtimeDetails.mlx.logs).toBeUndefined();
+    expect(useRuntimeHubStore.getState().errors["runtime:mlx"]).toBeUndefined();
+  });
+
+  it("does not expose diagnostics from the previous resident MLX state after it stops", async () => {
+    const mlxCapability = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: true,
+      canUnload: true,
+      canLogs: true,
+      canMetrics: true,
+      canInfer: true,
+      canEmbed: false,
+      settings: [],
+    };
+    const previousStatus = { runtimeType: "mlx", status: { state: "running", model_id: "old-model" } };
+    const stoppedStatus = { runtimeType: "mlx", status: { state: "stopped" } };
+    const inventory = { schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 2 };
+    const previousLogs = { text: "old process is still alive", truncated: false };
+    const previousMetrics = { runtimeType: "mlx", metrics: { tokens_per_second: 18.2 }, status: previousStatus.status };
+    useRuntimeHubStore.setState({
+      runtimes: [mlxCapability] as never,
+      runtimeDetails: {
+        mlx: {
+          status: previousStatus,
+          inventory: { ...inventory, captured_at_ms: 1 },
+          logs: previousLogs,
+          metrics: previousMetrics,
+          refreshedAt: 100,
+        },
+      } as never,
+    });
+    mocks.client.runtimeStatus.mockResolvedValue(stoppedStatus);
+    mocks.client.runtimeInventory.mockResolvedValue(inventory);
+    mocks.client.runtimeLogs.mockRejectedValue(new Error("the managed MLX service is not running"));
+    mocks.client.runtimeMetrics.mockRejectedValue(new Error("the managed MLX service is not running"));
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await useRuntimeHubStore.getState().refreshRuntime("mlx");
+
+    const detail = useRuntimeHubStore.getState().runtimeDetails.mlx;
+    expect(detail.status).toEqual(stoppedStatus);
+    expect(detail.inventory).toEqual(inventory);
+    expect(detail.logs).toBeUndefined();
+    expect(detail.metrics).toBeUndefined();
+    expect(detail.refreshedAt).toBeGreaterThan(100);
     expect(useRuntimeHubStore.getState().errors["runtime:mlx"]).toBeUndefined();
   });
 

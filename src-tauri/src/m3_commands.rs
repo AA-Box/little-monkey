@@ -54,7 +54,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// Bounded per-runtime max for the runtime log tails a support bundle can
 /// embed — mirrors `M3RuntimeHub::runtime_logs`'s own cap on a single
@@ -130,6 +132,9 @@ pub trait M3OwnedProcessShutdown: Send + Sync {
 
 pub struct M3CommandState {
     pub hub: Arc<M3RuntimeHub>,
+    /// Shared application-level arbitration between Studio's MLX video
+    /// process and Runtime Hub's MLX chat process.
+    pub(crate) mlx_ownership: crate::mlx_ownership::MlxOwnershipCoordinator,
     /// Runtime component (llama.cpp/MLX/tokenizer/converter/projector/
     /// accelerator-support) version manager. Kept as a separate hub from
     /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
@@ -150,6 +155,7 @@ impl M3CommandState {
     pub fn new(hub: Arc<M3RuntimeHub>, component_hub: Arc<M3ComponentHub>) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -165,6 +171,7 @@ impl M3CommandState {
     ) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -224,6 +231,67 @@ impl M3CommandState {
             Ok(false)
         }
     }
+}
+
+/// Hands the MLX memory slot to Studio before an MLX video run. Chat and video
+/// use different service entry points, so they cannot share one resident
+/// process, but they must not keep both tens-of-gigabytes weight sets alive.
+#[cfg(target_os = "macos")]
+pub async fn unload_mlx_for_studio(state: &M3CommandState) -> Result<(), String> {
+    let _owner = state.mlx_ownership.acquire().await;
+    unload_mlx_for_studio_locked(state).await
+}
+
+/// Unloads Runtime Hub's MLX resident while the caller already holds the
+/// application-wide MLX ownership guard. Studio uses this form because it
+/// keeps the guard through `ensure_ready` and the complete generation.
+#[cfg(target_os = "macos")]
+pub(crate) async fn unload_mlx_for_studio_locked(state: &M3CommandState) -> Result<(), String> {
+    let has_mlx = state
+        .hub
+        .list_runtimes()
+        .map_err(command_error)?
+        .iter()
+        .any(|runtime| runtime.descriptor.kind == M3RuntimeKind::Mlx);
+    if !has_mlx {
+        return Ok(());
+    }
+
+    let operation_id = format!("studio-mlx-handoff-{}", Uuid::new_v4());
+    let context = state.begin_operation(&operation_id, Some(30_000))?;
+    let result = async {
+        match state.hub.runtime_status("mlx", &context).await? {
+            M3RuntimeStatusView::Mlx {
+                status: crate::mlx_runtime::MlxRuntimeStatus::Running { handle, .. },
+            } => {
+                state
+                    .hub
+                    .unload_model(
+                        &M3UnloadModelRequest {
+                            runtime_id: "mlx".to_string(),
+                            model_id: handle.model_id,
+                            force_exact_owner: true,
+                        },
+                        &context,
+                    )
+                    .await
+            }
+            _ => Ok(()),
+        }
+    }
+    .await;
+    state.finish_operation(&operation_id);
+    result.map_err(command_error)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn unload_mlx_for_studio_locked(_state: &M3CommandState) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn unload_mlx_for_studio(_state: &M3CommandState) -> Result<(), String> {
+    Ok(())
 }
 
 fn command_error(error: M3HubError) -> String {
@@ -854,11 +922,22 @@ pub async fn m3_runtime_inventory(
 
 #[tauri::command]
 pub async fn m3_runtime_load_model(
+    app: tauri::AppHandle,
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
     request: M3LoadModelRequest,
 ) -> Result<(), String> {
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
+    if request.runtime_id == "mlx" {
+        if let Some(app_state) = app.try_state::<crate::AppState>() {
+            app_state.generation_engine.stop()?;
+        }
+    }
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.load_model(&request, &context).await;
     finish(&state, &operation_id, result).await
@@ -1112,6 +1191,11 @@ pub async fn m3_api_dispatch(
 ) -> Result<M3ApiDispatchResponse, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let request = request.into_hub_request(trusted_now_ms());
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
     let result = state.hub.dispatch_api(&request, &context).await;
     finish(&state, &operation_id, result).await
 }

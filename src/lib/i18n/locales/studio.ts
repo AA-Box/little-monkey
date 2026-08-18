@@ -16,6 +16,9 @@ export const studioLocale: Record<string, string> = {
   "Studio.audio.title": "Audio",
   "Studio.audio.subtitle":
     "Speak text in a chosen voice, or clone one from a recording. Nothing leaves this machine.",
+  "Studio.mlx.preparing": "Preparing the MLX video service…",
+  "Studio.mlx.notReady": "The MLX video service is not ready yet.",
+  "Studio.mlx.retry": "Retry MLX setup",
   "Studio.add.speechHint":
     "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",

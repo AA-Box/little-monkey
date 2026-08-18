@@ -46,6 +46,7 @@ import { compareLabLocale } from "./compareLab";
 import { productionDebuggingLocale } from "./productionDebugging";
 import { designToAppLocale } from "./designToApp";
 import { incidentCommanderLocale } from "./incidentCommander";
+import { runtimeHubLocale } from "./runtimeHub";
 
 export const en: Record<string, string> = {
   ...syntheticMonitoringLocale,
@@ -96,6 +97,7 @@ export const en: Record<string, string> = {
   ...productionDebuggingLocale,
   ...designToAppLocale,
   ...incidentCommanderLocale,
+  ...runtimeHubLocale,
   "ComparePicker.toolsBadge": "Tools",
   "AppMenu.browserWorkbench": "Browser Workbench",
   "AppMenu.sideTasks": "Side Tasks",
