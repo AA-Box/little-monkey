@@ -777,12 +777,13 @@ pub async fn diagnostics_apply_fix(
             .map_err(|_| "Llama state lock poisoned".to_string())?
             .model_path
             .clone();
-        crate::llama::llama_stop(state.clone()).await?;
+        crate::llama::llama_stop(app.clone(), state.clone()).await?;
         if let Some(model_path) = model_path {
             crate::llama::llama_start(
                 app.clone(),
                 state.clone(),
                 model_path,
+                None,
                 None,
                 LLAMA_RESTART_GPU_LAYERS,
                 false,

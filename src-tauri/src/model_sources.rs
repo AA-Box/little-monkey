@@ -1,7 +1,7 @@
 //! Direct, app-owned model-source resolution and verified installation.
 //!
-//! This module deliberately supports one portable runtime artifact: a single
-//! GGUF file. Ollama references are resolved against the public Ollama OCI
+//! This module supports one portable model bundle: a primary GGUF with an
+//! optional multimodal projector GGUF. Ollama references are resolved against the public Ollama OCI
 //! registry and Hugging Face references are resolved through the official
 //! model metadata API with blob details enabled. Neither path trusts a
 //! caller-provided URL, size, or checksum: install always re-resolves the
@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -66,7 +67,24 @@ pub enum ModelReferenceSource {
     HuggingFace,
 }
 
-/// Public resolution receipt returned over Tauri IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelArtifactRole {
+    Model,
+    Projector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedModelArtifact {
+    pub role: ModelArtifactRole,
+    pub file_name: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Public model-bundle resolution receipt returned over Tauri IPC.
 ///
 /// The casing is intentionally camelCase while `ModelInfo` stays in its
 /// existing snake_case wire format.
@@ -88,6 +106,14 @@ pub struct ResolvedModelReference {
     pub tool_calling: bool,
     pub license_name: Option<String>,
     pub license_url: Option<String>,
+    /// The immutable artifacts selected for installation. The legacy primary
+    /// fields above remain for old clients and consent receipts.
+    #[serde(default)]
+    pub artifacts: Vec<ResolvedModelArtifact>,
+    /// Plausible HF projector siblings when selection is ambiguous. These are
+    /// candidates only and are never installed until the user selects one.
+    #[serde(default)]
+    pub projector_candidates: Vec<ResolvedModelArtifact>,
 }
 
 /// App-owned metadata stored beside a downloaded GGUF.
@@ -118,6 +144,7 @@ pub struct InstalledModelReference {
     pub resolved: ResolvedModelReference,
     pub provenance: ManagedModelProvenance,
     pub local_path: PathBuf,
+    pub projector_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +152,9 @@ pub struct ModelDownloadProgress {
     pub file: String,
     pub downloaded: u64,
     pub total: u64,
+    pub role: ModelArtifactRole,
+    pub overall_downloaded: u64,
+    pub overall_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +330,63 @@ where
 {
     crate::run_scope::scoped(
         crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
-        install_within_scope(models_dir, reference, expected_sha256, on_progress),
+        install_within_scope(
+            models_dir,
+            reference,
+            expected_sha256,
+            None,
+            None,
+            on_progress,
+        ),
+    )
+    .await
+}
+
+pub async fn install_reference_with_projector<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    expected_projector_sha256: Option<&str>,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        install_within_scope(
+            models_dir,
+            reference,
+            expected_sha256,
+            expected_projector_sha256,
+            None,
+            on_progress,
+        ),
+    )
+    .await
+}
+
+pub async fn install_reference_with_projector_and_cancel<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    expected_projector_sha256: Option<&str>,
+    cancel: &CancellationToken,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    crate::run_scope::scoped(
+        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+        install_within_scope(
+            models_dir,
+            reference,
+            expected_sha256,
+            expected_projector_sha256,
+            Some(cancel),
+            on_progress,
+        ),
     )
     .await
 }
@@ -310,14 +396,32 @@ async fn install_within_scope<F>(
     models_dir: &Path,
     reference: &str,
     expected_sha256: &str,
+    expected_projector_sha256: Option<&str>,
+    cancel: Option<&CancellationToken>,
     mut on_progress: F,
 ) -> Result<InstalledModelReference, String>
 where
     F: FnMut(ModelDownloadProgress),
 {
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
     let client = build_http_client()?;
     let resolution = resolve_reference_with_client(&client, reference).await?;
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
     let expected_sha256 = validate_expected_digest(&resolution.public, expected_sha256)?;
+    let selected_projector =
+        select_projector_artifact(&resolution.public, expected_projector_sha256)?;
+    let projector_size = selected_projector
+        .map(|artifact| artifact.size_bytes)
+        .unwrap_or(0);
+    let overall_total = resolution
+        .public
+        .size_bytes
+        .checked_add(projector_size)
+        .ok_or("Model bundle size overflow")?;
 
     let install_mutex = INSTALL_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()));
     let _process_guard = install_mutex.lock().await;
@@ -349,13 +453,34 @@ where
                 file: destination_file_name,
                 downloaded: resolution.public.size_bytes,
                 total: resolution.public.size_bytes,
+                role: ModelArtifactRole::Model,
+                overall_downloaded: resolution.public.size_bytes,
+                overall_total,
             });
-            let mut installed_resolution = resolution.public;
+            let mut installed_resolution = resolution.public.clone();
             installed_resolution.tool_calling = provenance.tool_calling;
+            let projector_path = if let Some(projector) = selected_projector {
+                Some(
+                    install_projector_artifact(
+                        &client,
+                        &resolution,
+                        projector,
+                        &models_dir,
+                        resolution.public.size_bytes,
+                        overall_total,
+                        cancel,
+                        &mut on_progress,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
             return Ok(InstalledModelReference {
                 resolved: installed_resolution,
                 provenance,
                 local_path: destination,
+                projector_path,
             });
         }
         if !disambiguated {
@@ -377,11 +502,22 @@ where
         &resolution,
         &partial,
         &destination_file_name,
+        ModelArtifactRole::Model,
+        0,
+        overall_total,
+        cancel,
         &mut on_progress,
     )
     .await;
     if let Err(error) = download_result {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            let _ = fs::remove_file(&partial);
+        }
         return Err(error);
+    }
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        let _ = fs::remove_file(&partial);
+        return Err("Model bundle installation cancelled".to_string());
     }
 
     let actual_sha256 = sha256_file_async(partial.clone()).await?;
@@ -402,11 +538,15 @@ where
             return Err(error);
         }
     };
-    if destination.exists() {
+    if !path_entry_is_missing(&destination)? {
         return Err(format!(
             "Managed model destination appeared during install: {}",
             destination.display()
         ));
+    }
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        let _ = fs::remove_file(&partial);
+        return Err("Model bundle installation cancelled".to_string());
     }
     fs::rename(&partial, &destination).map_err(|error| {
         format!(
@@ -427,12 +567,29 @@ where
         return Err(error);
     }
 
-    let mut installed_resolution = resolution.public;
+    let mut installed_resolution = resolution.public.clone();
     installed_resolution.tool_calling = tool_calling;
     Ok(InstalledModelReference {
         resolved: installed_resolution,
         provenance,
         local_path: destination,
+        projector_path: if let Some(projector) = selected_projector {
+            Some(
+                install_projector_artifact(
+                    &client,
+                    &resolution,
+                    projector,
+                    &models_dir,
+                    resolution.public.size_bytes,
+                    overall_total,
+                    cancel,
+                    &mut on_progress,
+                )
+                .await?,
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -597,11 +754,14 @@ pub fn find_installed_reference(
             tool_calling: provenance.tool_calling,
             license_name: provenance.license_name.clone(),
             license_url: provenance.license_url.clone(),
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         return Ok(Some(InstalledModelReference {
             resolved,
             provenance,
             local_path: path,
+            projector_path: None,
         }));
     }
     Ok(None)
@@ -803,7 +963,7 @@ async fn resolve_ollama(
     let bytes = response_bytes_bounded(response, MAX_MANIFEST_BYTES, "Ollama manifest").await?;
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Ollama registry returned an invalid manifest: {error}"))?;
-    let model_layer = select_ollama_model_layer(&manifest)?;
+    let (model_layer, projector_layer) = select_ollama_layers(&manifest)?;
     let sha256 = normalize_sha256(&model_layer.digest, "Ollama model layer digest")?;
     validate_model_size(model_layer.size)?;
     let blob_url = ollama_registry_url(
@@ -813,6 +973,26 @@ async fn resolve_ollama(
         &model_layer.digest,
     )?;
     probe_remote_gguf(client, blob_url.clone(), bearer_token.as_deref()).await?;
+    let projector_artifact = if let Some(layer) = projector_layer {
+        let sha256 = normalize_sha256(&layer.digest, "Ollama projector layer digest")?;
+        validate_model_size(layer.size)?;
+        let download_url = ollama_registry_url(
+            &reference.namespace,
+            &reference.model,
+            "blobs",
+            &layer.digest,
+        )?;
+        probe_remote_gguf(client, download_url.clone(), bearer_token.as_deref()).await?;
+        Some(ResolvedModelArtifact {
+            role: ModelArtifactRole::Projector,
+            file_name: format!("{}-{}-mmproj.gguf", reference.model, reference.tag),
+            download_url: download_url.to_string(),
+            sha256: sha256.clone(),
+            size_bytes: layer.size,
+        })
+    } else {
+        None
+    };
 
     let license_layers = manifest
         .layers
@@ -854,7 +1034,7 @@ async fn resolve_ollama(
             revision: reference.tag.clone(),
             file_name: format!("{}-{}.gguf", reference.model, reference.tag),
             download_url: blob_url.to_string(),
-            sha256,
+            sha256: sha256.clone(),
             size_bytes: model_layer.size,
             // Ollama's separate template layer uses Go-template syntax and
             // cannot be passed to llama.cpp's Jinja renderer. Capability is
@@ -862,6 +1042,20 @@ async fn resolve_ollama(
             tool_calling: false,
             license_name,
             license_url,
+            artifacts: {
+                let mut artifacts = vec![ResolvedModelArtifact {
+                    role: ModelArtifactRole::Model,
+                    file_name: format!("{}-{}.gguf", reference.model, reference.tag),
+                    download_url: blob_url.to_string(),
+                    sha256: sha256.clone(),
+                    size_bytes: model_layer.size,
+                }];
+                if let Some(projector) = projector_artifact.clone() {
+                    artifacts.push(projector);
+                }
+                artifacts
+            },
+            projector_candidates: Vec::new(),
         },
         bearer_token,
     })
@@ -951,6 +1145,21 @@ async fn resolve_hugging_face(
     );
     let selector = format!("#{}", sibling.rfilename);
 
+    let mut projector_candidates = Vec::new();
+    for candidate in metadata
+        .siblings
+        .iter()
+        .filter(|candidate| is_projector_candidate(&candidate.rfilename))
+    {
+        let artifact = hf_artifact(candidate, &reference.repo, revision)?;
+        let download_url = Url::parse(&artifact.download_url)
+            .map_err(|error| format!("Hugging Face projector URL is invalid: {error}"))?;
+        probe_remote_gguf(client, download_url, None).await?;
+        projector_candidates.push(artifact);
+    }
+    let selected_projector =
+        (projector_candidates.len() == 1).then(|| projector_candidates[0].clone());
+
     Ok(InternalResolution {
         public: ResolvedModelReference {
             source: ModelReferenceSource::HuggingFace,
@@ -960,18 +1169,32 @@ async fn resolve_hugging_face(
             revision: revision.to_string(),
             file_name: sibling.rfilename.clone(),
             download_url: download_url.to_string(),
-            sha256,
+            sha256: sha256.clone(),
             size_bytes: lfs.size,
             // A remote filename/repo name never proves tool-call support.
             tool_calling: false,
             license_name,
             license_url,
+            artifacts: {
+                let mut artifacts = vec![ResolvedModelArtifact {
+                    role: ModelArtifactRole::Model,
+                    file_name: sibling.rfilename.clone(),
+                    download_url: download_url.to_string(),
+                    sha256: sha256.clone(),
+                    size_bytes: lfs.size,
+                }];
+                if let Some(projector) = selected_projector {
+                    artifacts.push(projector);
+                }
+                artifacts
+            },
+            projector_candidates,
         },
         bearer_token: None,
     })
 }
 
-fn select_ollama_model_layer(manifest: &OciManifest) -> Result<&OciLayer, String> {
+fn select_ollama_layers(manifest: &OciManifest) -> Result<(&OciLayer, Option<&OciLayer>), String> {
     if manifest.schema_version != 2 {
         return Err(format!(
             "Unsupported Ollama manifest schema version {}",
@@ -984,16 +1207,12 @@ fn select_ollama_model_layer(manifest: &OciManifest) -> Result<&OciLayer, String
     }) {
         return Err("Unsupported Ollama manifest media type".to_string());
     }
-    if manifest.layers.iter().any(|layer| {
-        matches!(
-            layer.media_type.as_str(),
-            OLLAMA_ADAPTER_MEDIA_TYPE | OLLAMA_PROJECTOR_MEDIA_TYPE
-        )
-    }) {
-        return Err(
-            "Ollama tag requires an adapter or projector blob; only standalone one-file GGUF models are supported"
-                .to_string(),
-        );
+    if manifest
+        .layers
+        .iter()
+        .any(|layer| layer.media_type == OLLAMA_ADAPTER_MEDIA_TYPE)
+    {
+        return Err("Ollama tag contains an unsupported adapter configuration".to_string());
     }
     let layers = manifest
         .layers
@@ -1004,7 +1223,16 @@ fn select_ollama_model_layer(manifest: &OciManifest) -> Result<&OciLayer, String
         [layer] => {
             normalize_sha256(&layer.digest, "Ollama model layer digest")?;
             validate_model_size(layer.size)?;
-            Ok(layer)
+            let projectors = manifest
+                .layers
+                .iter()
+                .filter(|layer| layer.media_type == OLLAMA_PROJECTOR_MEDIA_TYPE)
+                .collect::<Vec<_>>();
+            match projectors.as_slice() {
+                [] => Ok((layer, None)),
+                [projector] => Ok((layer, Some(projector))),
+                _ => Err("Ollama tag contains multiple projector layers".to_string()),
+            }
         }
         [] => Err(
             "Ollama tag does not contain a local GGUF model layer (cloud-only and non-GGUF tags are unsupported)"
@@ -1015,6 +1243,220 @@ fn select_ollama_model_layer(manifest: &OciManifest) -> Result<&OciLayer, String
                 .to_string(),
         ),
     }
+}
+
+fn select_ollama_model_layer(manifest: &OciManifest) -> Result<&OciLayer, String> {
+    select_ollama_layers(manifest).map(|(model, _)| model)
+}
+
+fn is_projector_candidate(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    is_gguf_file(file_name)
+        && !is_sharded_gguf(file_name)
+        && (lower.contains("mmproj") || lower.contains("projector"))
+}
+
+fn hf_artifact(
+    sibling: &HfSibling,
+    repo: &str,
+    revision: &str,
+) -> Result<ResolvedModelArtifact, String> {
+    validate_hf_file_path(&sibling.rfilename)?;
+    if !is_gguf_file(&sibling.rfilename) || is_sharded_gguf(&sibling.rfilename) {
+        return Err(format!(
+            "Hugging Face projector '{}' is not a single-file GGUF",
+            sibling.rfilename
+        ));
+    }
+    let lfs = sibling.lfs.as_ref().ok_or_else(|| {
+        format!(
+            "Hugging Face projector '{}' has no verifiable LFS metadata",
+            sibling.rfilename
+        )
+    })?;
+    validate_model_size(lfs.size)?;
+    if sibling.size.is_some_and(|size| size != lfs.size) {
+        return Err(format!(
+            "Hugging Face projector metadata size mismatch for '{}'",
+            sibling.rfilename
+        ));
+    }
+    let download_url = hugging_face_file_url(repo, revision, &sibling.rfilename, "resolve")?;
+    Ok(ResolvedModelArtifact {
+        role: ModelArtifactRole::Projector,
+        file_name: sibling.rfilename.clone(),
+        download_url: download_url.to_string(),
+        sha256: normalize_sha256(&lfs.sha256, "Hugging Face projector SHA-256")?,
+        size_bytes: lfs.size,
+    })
+}
+
+fn select_projector_artifact<'a>(
+    resolved: &'a ResolvedModelReference,
+    expected_sha256: Option<&str>,
+) -> Result<Option<&'a ResolvedModelArtifact>, String> {
+    let selected = resolved
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == ModelArtifactRole::Projector);
+    if let Some(expected) = expected_sha256 {
+        let expected = normalize_sha256(expected, "expectedProjectorSha256")?;
+        return resolved
+            .projector_candidates
+            .iter()
+            .chain(selected)
+            .find(|artifact| artifact.sha256 == expected)
+            .map(Some)
+            .ok_or_else(|| {
+                "The selected projector is no longer part of the resolved model bundle".to_string()
+            });
+    }
+    if resolved.projector_candidates.len() > 1 && selected.is_none() {
+        return Err(
+            "Multiple projector artifacts were found; choose one before installing".to_string(),
+        );
+    }
+    Ok(selected)
+}
+
+async fn install_projector_artifact<F>(
+    client: &Client,
+    resolution: &InternalResolution,
+    artifact: &ResolvedModelArtifact,
+    models_dir: &Path,
+    overall_base: u64,
+    overall_total: u64,
+    cancel: Option<&CancellationToken>,
+    on_progress: &mut F,
+) -> Result<PathBuf, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
+    let components_dir = models_dir.join("components");
+    fs::create_dir_all(&components_dir).map_err(|e| {
+        format!(
+            "Failed to create managed model components directory {}: {e}",
+            components_dir.display()
+        )
+    })?;
+    let components_dir = components_dir.canonicalize().map_err(|e| {
+        format!(
+            "Failed to resolve managed model components directory {}: {e}",
+            components_dir.display()
+        )
+    })?;
+    if components_dir.parent() != Some(models_dir) {
+        return Err(
+            "Managed model components directory must remain inside the models directory"
+                .to_string(),
+        );
+    }
+    let source_name = artifact
+        .file_name
+        .rsplit('/')
+        .next()
+        .unwrap_or("mmproj.gguf");
+    let stem = source_name
+        .strip_suffix(".gguf")
+        .or_else(|| source_name.strip_suffix(".GGUF"))
+        .unwrap_or(source_name);
+    let destination_name =
+        sanitize_file_name(&format!("mmproj-{}-{stem}.gguf", &artifact.sha256[..12]));
+    validate_direct_child(&components_dir, &components_dir.join(&destination_name))?;
+    let destination = components_dir.join(&destination_name);
+    let _lock = acquire_destination_lock(&components_dir, &destination).await?;
+    if !path_entry_is_missing(&destination)? {
+        if destination.is_file()
+            && fs::metadata(&destination)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+                == artifact.size_bytes
+            && validate_local_gguf(&destination, artifact.size_bytes).is_ok()
+            && sha256_file(&destination).is_ok_and(|actual| actual == artifact.sha256)
+        {
+            on_progress(ModelDownloadProgress {
+                file: destination_name,
+                downloaded: artifact.size_bytes,
+                total: artifact.size_bytes,
+                role: ModelArtifactRole::Projector,
+                overall_downloaded: overall_base.saturating_add(artifact.size_bytes),
+                overall_total,
+            });
+            return Ok(destination);
+        }
+        return Err(format!(
+            "Managed projector destination is occupied by an unverified file: {}",
+            destination.display()
+        ));
+    }
+    let partial = append_file_suffix(&destination, ".part")?;
+    prepare_partial_file(&partial, artifact.size_bytes)?;
+    let mut projector_public = resolution.public.clone();
+    projector_public.file_name = artifact.file_name.clone();
+    projector_public.download_url = artifact.download_url.clone();
+    projector_public.sha256 = artifact.sha256.clone();
+    projector_public.size_bytes = artifact.size_bytes;
+    projector_public.artifacts = vec![artifact.clone()];
+    projector_public.projector_candidates = Vec::new();
+    let projector_resolution = InternalResolution {
+        public: projector_public,
+        bearer_token: resolution.bearer_token.clone(),
+    };
+    if let Err(error) = download_resumable(
+        client,
+        &projector_resolution,
+        &partial,
+        &destination_name,
+        ModelArtifactRole::Projector,
+        overall_base,
+        overall_total,
+        cancel,
+        on_progress,
+    )
+    .await
+    {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            let _ = fs::remove_file(&partial);
+        }
+        return Err(error);
+    }
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        let _ = fs::remove_file(&partial);
+        return Err("Model bundle installation cancelled".to_string());
+    }
+    let actual = sha256_file(&partial)?;
+    if actual != artifact.sha256 {
+        let _ = fs::remove_file(&partial);
+        return Err(format!(
+            "Projector download failed SHA-256 verification: expected {}, got {actual}",
+            artifact.sha256
+        ));
+    }
+    if let Err(error) = validate_local_gguf(&partial, artifact.size_bytes) {
+        let _ = fs::remove_file(&partial);
+        return Err(format!("Downloaded projector is invalid: {error}"));
+    }
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        let _ = fs::remove_file(&partial);
+        return Err("Model bundle installation cancelled".to_string());
+    }
+    if !path_entry_is_missing(&destination)? {
+        let _ = fs::remove_file(&partial);
+        return Err(format!(
+            "Managed projector destination appeared during install: {}",
+            destination.display()
+        ));
+    }
+    fs::rename(&partial, &destination).map_err(|e| {
+        format!(
+            "Verified projector could not be published at {}: {e}",
+            destination.display()
+        )
+    })?;
+    Ok(destination)
 }
 
 fn select_hf_sibling<'a>(
@@ -1098,6 +1540,12 @@ fn validate_selected_hf_sibling(sibling: &HfSibling) -> Result<(), String> {
     if !is_gguf_file(&sibling.rfilename) {
         return Err(format!(
             "Hugging Face file '{}' is not a GGUF file",
+            sibling.rfilename
+        ));
+    }
+    if is_projector_candidate(&sibling.rfilename) {
+        return Err(format!(
+            "Hugging Face file '{}' appears to be a multimodal projector; select a language model instead",
             sibling.rfilename
         ));
     }
@@ -1438,11 +1886,18 @@ async fn download_resumable<F>(
     resolution: &InternalResolution,
     partial: &Path,
     local_file_name: &str,
+    role: ModelArtifactRole,
+    overall_base: u64,
+    overall_total: u64,
+    cancel: Option<&CancellationToken>,
     on_progress: &mut F,
 ) -> Result<(), String>
 where
     F: FnMut(ModelDownloadProgress),
 {
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
     let total = resolution.public.size_bytes;
     let mut offset = fs::metadata(partial)
         .map(|metadata| metadata.len())
@@ -1451,6 +1906,9 @@ where
         file: local_file_name.to_string(),
         downloaded: offset,
         total,
+        role,
+        overall_downloaded: overall_base.saturating_add(offset),
+        overall_total,
     });
 
     if offset == total {
@@ -1461,13 +1919,25 @@ where
     validate_public_https_url(&download_url)
         .map_err(|denial| format!("Resolved model download URL refused: {denial}"))?;
     let range_header = (offset > 0).then(|| format!("bytes={offset}-"));
-    let response = send_get(
-        client,
-        download_url,
-        resolution.bearer_token.as_deref(),
-        range_header.as_deref(),
-    )
-    .await?;
+    let response = if let Some(cancel) = cancel {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("Model bundle installation cancelled".to_string()),
+            response = send_get(
+                client,
+                download_url,
+                resolution.bearer_token.as_deref(),
+                range_header.as_deref(),
+            ) => response?,
+        }
+    } else {
+        send_get(
+            client,
+            download_url,
+            resolution.bearer_token.as_deref(),
+            range_header.as_deref(),
+        )
+        .await?
+    };
 
     if offset > 0 && response.status() == StatusCode::RANGE_NOT_SATISFIABLE && offset == total {
         return Ok(());
@@ -1519,7 +1989,14 @@ where
     let mut downloaded = offset;
     let mut last_emit = std::time::Instant::now();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = if let Some(cancel) = cancel {
+        tokio::select! {
+            _ = cancel.cancelled() => return Err("Model bundle installation cancelled".to_string()),
+            chunk = stream.next() => chunk,
+        }
+    } else {
+        stream.next().await
+    } {
         let chunk = chunk.map_err(|error| format!("Model download stream failed: {error}"))?;
         downloaded = downloaded
             .checked_add(chunk.len() as u64)
@@ -1540,6 +2017,9 @@ where
                 file: local_file_name.to_string(),
                 downloaded,
                 total,
+                role,
+                overall_downloaded: overall_base.saturating_add(downloaded),
+                overall_total,
             });
             last_emit = std::time::Instant::now();
         }
@@ -1556,6 +2036,9 @@ where
             partial.display()
         )
     })?;
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        return Err("Model bundle installation cancelled".to_string());
+    }
     if downloaded != total {
         return Err(format!(
             "Model download ended at {downloaded} bytes, expected {total}; retry to resume"
@@ -1565,6 +2048,9 @@ where
         file: local_file_name.to_string(),
         downloaded,
         total,
+        role,
+        overall_downloaded: overall_base.saturating_add(downloaded),
+        overall_total,
     });
     Ok(())
 }
@@ -2726,7 +3212,7 @@ fn unquoted_tag_has_identifier(tag: &str, identifier: &[u8]) -> bool {
     false
 }
 
-fn validate_local_gguf(path: &Path, expected_size: u64) -> Result<(), String> {
+pub fn validate_local_gguf(path: &Path, expected_size: u64) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("Failed to inspect model {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.len() != expected_size {
@@ -2749,7 +3235,7 @@ fn validate_local_gguf(path: &Path, expected_size: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub fn sha256_file(path: &Path) -> Result<String, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() {
@@ -3344,9 +3830,9 @@ mod tests {
                 },
             ],
         };
-        assert!(select_ollama_model_layer(&dependent)
-            .unwrap_err()
-            .contains("projector"));
+        let (model, projector) = select_ollama_layers(&dependent).unwrap();
+        assert_eq!(model.size, 123);
+        assert_eq!(projector.expect("projector layer").size, 456);
 
         let none = OciManifest {
             schema_version: 2,
@@ -4089,6 +4575,8 @@ mod tests {
                 "https://huggingface.co/owner/repo/blob/{}/LICENSE",
                 "a".repeat(40)
             )),
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let provenance = provenance_for(
             &resolved,
@@ -4149,6 +4637,8 @@ mod tests {
             tool_calling: false,
             license_name: None,
             license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let provenance = provenance_for(
             &resolved,
@@ -4198,6 +4688,8 @@ mod tests {
             tool_calling: false,
             license_name: None,
             license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let local_file_name = local_file_name(&resolved, false);
         let model_path = directory.join(&local_file_name);
@@ -4244,6 +4736,8 @@ mod tests {
             tool_calling: false,
             license_name: None,
             license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let first_name = local_file_name(&first, true);
         first.canonical_reference.push_str("-different");
@@ -4283,6 +4777,8 @@ mod tests {
             tool_calling: false,
             license_name: None,
             license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let provenance = provenance_for(
             &resolved,
@@ -4339,6 +4835,8 @@ mod tests {
             tool_calling: false,
             license_name: None,
             license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
         };
         let value = serde_json::to_value(dto).unwrap();
         assert_eq!(value["source"], "ollama_registry");

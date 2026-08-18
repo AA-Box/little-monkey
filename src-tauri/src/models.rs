@@ -16,6 +16,69 @@ use crate::permissions;
 use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
+const BUNDLE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentOwnership {
+    Managed,
+    External,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ProjectorComponent {
+    pub path: String,
+    pub file: String,
+    pub size_bytes: u64,
+    pub ownership: ComponentOwnership,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub missing: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct ModelComponents {
+    #[serde(default)]
+    pub projector: Option<ProjectorComponent>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    #[serde(default = "default_text_capability")]
+    pub text: bool,
+    #[serde(default)]
+    pub image_input: bool,
+}
+
+fn default_text_capability() -> bool {
+    true
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self {
+            text: true,
+            image_input: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelBundleRegistry {
+    schema_version: u32,
+    #[serde(default)]
+    bundles: Vec<LocalModelBundleRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct LocalModelBundleRecord {
+    model_path: String,
+    projector: Option<ProjectorComponent>,
+}
+
 /// Whether a `ModelInfo` is a chat (tool-calling instruct) model or an
 /// embedding model — added for the RAG/Knowledge Stacks feature so
 /// `curated_models()` can list embedding models (nomic-embed-text,
@@ -56,6 +119,10 @@ pub struct ModelInfo {
     /// correct for old data).
     #[serde(default)]
     pub kind: ModelKind,
+    #[serde(default)]
+    pub components: ModelComponents,
+    #[serde(default)]
+    pub capabilities: ModelCapabilities,
 }
 
 /// The curated registry: a small, hand-picked set of instruct models known
@@ -75,6 +142,8 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         },
         ModelInfo {
             id: "qwen2.5-coder-14b".to_string(),
@@ -87,6 +156,8 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         },
         ModelInfo {
             id: "llama-3.1-8b".to_string(),
@@ -99,6 +170,8 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         },
         ModelInfo {
             id: "hermes-3-8b".to_string(),
@@ -111,6 +184,8 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         },
         ModelInfo {
             id: "mistral-nemo-12b".to_string(),
@@ -123,6 +198,8 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         },
         // Embedding models for the RAG/Knowledge Stacks feature
         // (stacks.rs) — the managed-llama embedding backend. Repo/file
@@ -140,6 +217,11 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Embedding,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities {
+                text: true,
+                image_input: false,
+            },
         },
         // Design doc named "bge-m3" without pinning an exact repo/quant;
         // `gpustack/bge-m3-GGUF` (a maintained third-party GGUF conversion —
@@ -158,6 +240,11 @@ pub fn curated_models() -> Vec<ModelInfo> {
             path: None,
             is_external: false,
             kind: ModelKind::Embedding,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities {
+                text: true,
+                image_input: false,
+            },
         },
     ]
 }
@@ -208,6 +295,8 @@ fn managed_model_info(path: &Path, provenance: &ManagedModelProvenance) -> Model
         path: Some(path.to_string_lossy().to_string()),
         is_external: false,
         kind: ModelKind::Chat,
+        components: ModelComponents::default(),
+        capabilities: ModelCapabilities::default(),
     }
 }
 
@@ -224,7 +313,324 @@ fn unverified_managed_model_info(path: &Path, filename: &str, size_gb: f32) -> M
         path: Some(path.to_string_lossy().to_string()),
         is_external: false,
         kind: ModelKind::Chat,
+        components: ModelComponents::default(),
+        capabilities: ModelCapabilities::default(),
     }
+}
+
+fn bundle_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let base = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    if !base.exists() {
+        std::fs::create_dir_all(&base).map_err(|e| {
+            format!(
+                "Failed to create app data directory {}: {e}",
+                base.display()
+            )
+        })?;
+    }
+    Ok(base.join("local_model_bundles.json"))
+}
+
+fn load_bundle_registry(app: &AppHandle) -> Result<LocalModelBundleRegistry, String> {
+    let path = bundle_registry_path(app)?;
+    load_bundle_registry_from_path(&path)
+}
+
+fn load_bundle_registry_from_path(path: &Path) -> Result<LocalModelBundleRegistry, String> {
+    if !path.exists() {
+        return Ok(LocalModelBundleRegistry {
+            schema_version: BUNDLE_REGISTRY_SCHEMA_VERSION,
+            bundles: Vec::new(),
+        });
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let registry: LocalModelBundleRegistry = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "Invalid local model bundle registry {}: {e}",
+            path.display()
+        )
+    })?;
+    if registry.schema_version > BUNDLE_REGISTRY_SCHEMA_VERSION {
+        return Err(format!(
+            "Local model bundle registry version {} is newer than this app supports",
+            registry.schema_version
+        ));
+    }
+    Ok(registry)
+}
+
+/// Reads the profile-scoped projector association without requiring a Tauri
+/// handle. The managed CLI uses this to preserve the desktop app's bundle
+/// metadata when it starts an already-installed model offline.
+pub fn projector_for_model(
+    profile_data_dir: &Path,
+    model_path: &Path,
+) -> Result<Option<ProjectorComponent>, String> {
+    let model_path = model_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize model {}: {e}", model_path.display()))?;
+    let registry =
+        load_bundle_registry_from_path(&profile_data_dir.join("local_model_bundles.json"))?;
+    Ok(registry
+        .bundles
+        .into_iter()
+        .find(|bundle| bundle.model_path == model_path.to_string_lossy())
+        .and_then(|bundle| bundle.projector))
+}
+
+/// Persists a projector association for callers without a Tauri handle, such
+/// as the managed CLI. The profile registry remains the single source of
+/// truth for desktop and CLI bundle starts.
+pub fn set_projector_for_model(
+    profile_data_dir: &Path,
+    models_dir: &Path,
+    model_path: &Path,
+    projector_path: &Path,
+) -> Result<(), String> {
+    let model = regular_gguf(&model_path.to_string_lossy())?;
+    let projector = regular_gguf(&projector_path.to_string_lossy())?;
+    if model == projector {
+        return Err("The language model and projector must be different files".to_string());
+    }
+    let models_root = models_dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve models directory: {e}"))?;
+    let ownership = if managed_component_path(&models_root, &projector) {
+        ComponentOwnership::Managed
+    } else {
+        ComponentOwnership::External
+    };
+    let file = projector
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Projector path has no valid filename")?
+        .to_string();
+    let size_bytes = std::fs::metadata(&projector)
+        .map_err(|e| format!("Failed to inspect projector: {e}"))?
+        .len();
+    model_sources::validate_local_gguf(&projector, size_bytes)
+        .map_err(|e| format!("The selected projector is invalid: {e}"))?;
+    let sha256 = if ownership == ComponentOwnership::Managed {
+        Some(model_sources::sha256_file(&projector)?)
+    } else {
+        None
+    };
+    let mut registry =
+        load_bundle_registry_from_path(&profile_data_dir.join("local_model_bundles.json"))?;
+    let component = ProjectorComponent {
+        path: projector.to_string_lossy().into_owned(),
+        file,
+        size_bytes,
+        ownership,
+        sha256,
+        missing: false,
+    };
+    if let Some(record) = registry
+        .bundles
+        .iter_mut()
+        .find(|record| record.model_path == model.to_string_lossy())
+    {
+        record.projector = Some(component);
+    } else {
+        registry.bundles.push(LocalModelBundleRecord {
+            model_path: model.to_string_lossy().into_owned(),
+            projector: Some(component),
+        });
+    }
+    registry.schema_version = BUNDLE_REGISTRY_SCHEMA_VERSION;
+    save_bundle_registry_to_path(
+        &profile_data_dir.join("local_model_bundles.json"),
+        &registry,
+    )
+}
+
+fn save_bundle_registry(
+    app: &AppHandle,
+    registry: &LocalModelBundleRegistry,
+) -> Result<(), String> {
+    let path = bundle_registry_path(app)?;
+    save_bundle_registry_to_path(&path, registry)
+}
+
+fn save_bundle_registry_to_path(
+    path: &Path,
+    registry: &LocalModelBundleRegistry,
+) -> Result<(), String> {
+    let raw = serde_json::to_vec_pretty(registry)
+        .map_err(|e| format!("Failed to serialize local model bundle registry: {e}"))?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, raw)
+        .map_err(|e| format!("Failed to stage {}: {e}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .map_err(|e| format!("Failed to publish {}: {e}", path.display()))
+}
+
+fn regular_gguf(path: &str) -> Result<PathBuf, String> {
+    let input = PathBuf::from(path);
+    let metadata =
+        std::fs::symlink_metadata(&input).map_err(|e| format!("File not found: {path} ({e})"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("Not a regular file: {path}"));
+    }
+    let canonical = input
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize {path}: {e}"))?;
+    if !canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+    {
+        return Err("Only regular .gguf files are supported".to_string());
+    }
+    Ok(canonical)
+}
+
+fn apply_bundle_record(model: &mut ModelInfo, record: Option<&LocalModelBundleRecord>) {
+    let Some(record) = record else {
+        return;
+    };
+    let Some(projector) = record.projector.clone() else {
+        return;
+    };
+    let missing = !Path::new(&projector.path).is_file();
+    model.components.projector = Some(ProjectorComponent {
+        missing,
+        ..projector
+    });
+    model.capabilities.image_input = !missing;
+}
+
+fn apply_bundle_registry(models: &mut [ModelInfo], registry: &LocalModelBundleRegistry) {
+    for model in models {
+        let Some(path) = model.path.as_deref() else {
+            continue;
+        };
+        let record = registry
+            .bundles
+            .iter()
+            .find(|record| record.model_path == path);
+        apply_bundle_record(model, record);
+    }
+}
+
+fn managed_components_dir(models_dir: &Path) -> PathBuf {
+    models_dir.join("components")
+}
+
+fn managed_component_path(models_dir: &Path, path: &Path) -> bool {
+    path.parent() == Some(managed_components_dir(models_dir).as_path())
+}
+
+fn reconcile_managed_components(
+    models_dir: &Path,
+    registry: &LocalModelBundleRegistry,
+) -> Result<(), String> {
+    let root = managed_components_dir(models_dir);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("Failed to inspect managed components: {error}")),
+    };
+    let referenced = registry
+        .bundles
+        .iter()
+        .filter(|bundle| Path::new(&bundle.model_path).is_file())
+        .filter_map(|bundle| bundle.projector.as_ref())
+        .filter(|projector| projector.ownership == ComponentOwnership::Managed)
+        .map(|projector| projector.path.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let is_component_artifact = name.starts_with("mmproj-")
+            && (name.ends_with(".gguf") || name.ends_with(".gguf.part"));
+        if !is_component_artifact
+            || !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+        let canonical = path.canonicalize().unwrap_or(path.clone());
+        if !referenced.contains(canonical.to_string_lossy().as_ref()) {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "Failed to garbage-collect orphaned projector {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_projector_for_model(
+    profile_data_dir: &Path,
+    model_path: &str,
+    projector_path: &str,
+) -> Result<(), String> {
+    let model = regular_gguf(model_path)?;
+    let projector = regular_gguf(projector_path)?;
+    if model == projector {
+        return Err("The language model and projector must be different files".to_string());
+    }
+    let associated = projector_for_model(profile_data_dir, &model)?
+        .ok_or("The selected language model has no associated multimodal projector")?;
+    if associated.path != projector.to_string_lossy() {
+        return Err(
+            "The selected projector is not associated with this language model".to_string(),
+        );
+    }
+    let size = std::fs::metadata(&projector)
+        .map_err(|e| format!("Failed to inspect projector: {e}"))?
+        .len();
+    if size != associated.size_bytes {
+        return Err(format!(
+            "The configured multimodal projector changed size; expected {} bytes, got {size}",
+            associated.size_bytes
+        ));
+    }
+    model_sources::validate_local_gguf(&projector, size)
+        .map_err(|e| format!("The configured multimodal projector is invalid: {e}"))?;
+    if let Some(expected_sha256) = associated.sha256.as_deref() {
+        let actual_sha256 = model_sources::sha256_file(&projector)?;
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "The configured multimodal projector failed SHA-256 verification: expected {expected_sha256}, got {actual_sha256}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn verify_projector_for_runtime(
+    app: &AppHandle,
+    model_path: &str,
+    projector_path: &str,
+) -> Result<(), String> {
+    let profile_data_dir = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    verify_projector_for_model(&profile_data_dir, model_path, projector_path)
+}
+
+fn known_main_model(app: &AppHandle, path: &Path) -> Result<(), String> {
+    let dir = models_dir(app)?.canonicalize().map_err(|e| e.to_string())?;
+    let is_managed = path.parent() == Some(dir.as_path());
+    let is_external = load_external_registry(app)?
+        .iter()
+        .any(|entry| entry.path == path.to_string_lossy());
+    if !is_managed && !is_external {
+        return Err("The selected language model is not a known installed model".to_string());
+    }
+    Ok(())
 }
 
 /// Scans the models directory on disk and returns every `.gguf` file found
@@ -238,6 +644,13 @@ fn unverified_managed_model_info(path: &Path, filename: &str, size_gb: f32) -> M
 pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
     let dir = models_dir(&app)?;
     let curated = curated_models();
+    let (bundle_registry, bundle_registry_valid) = match load_bundle_registry(&app) {
+        Ok(registry) => (registry, true),
+        Err(error) => {
+            eprintln!("little-monkey: preserving unreadable bundle registry: {error}");
+            (LocalModelBundleRegistry::default(), false)
+        }
+    };
 
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| format!("Failed to read models directory {}: {e}", dir.display()))?;
@@ -313,11 +726,20 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
             path: Some(entry.path.clone()),
             is_external: true,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         });
         live_external.push(entry);
     }
     if live_external.len() != external_len_before {
         let _ = save_external_registry(&app, &live_external);
+    }
+
+    apply_bundle_registry(&mut installed, &bundle_registry);
+    if bundle_registry_valid {
+        if let Err(error) = reconcile_managed_components(&dir, &bundle_registry) {
+            eprintln!("little-monkey: could not reconcile managed components: {error}");
+        }
     }
 
     Ok(installed)
@@ -399,6 +821,13 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("Invalid file name: {path}"))?
         .to_string();
+    let lower_filename = filename.to_ascii_lowercase();
+    if lower_filename.contains("mmproj") || lower_filename.contains("projector") {
+        return Err(
+            "The selected file appears to be a multimodal projector, not a language model."
+                .to_string(),
+        );
+    }
     let canonical = p.to_string_lossy().to_string();
 
     let mut entries = load_external_registry(&app)?;
@@ -414,6 +843,8 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
             path: Some(canonical),
             is_external: true,
             kind: ModelKind::Chat,
+            components: ModelComponents::default(),
+            capabilities: ModelCapabilities::default(),
         });
     }
 
@@ -442,6 +873,8 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         path: Some(canonical),
         is_external: true,
         kind: ModelKind::Chat,
+        components: ModelComponents::default(),
+        capabilities: ModelCapabilities::default(),
     })
 }
 
@@ -450,12 +883,141 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
 #[tauri::command]
 pub fn models_remove_external(app: AppHandle, id: String) -> Result<(), String> {
     let mut entries = load_external_registry(&app)?;
+    let removed_path = entries
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.path.clone());
     let before = entries.len();
     entries.retain(|e| e.id != id);
     if entries.len() == before {
         return Err(format!("No external model registered with id '{id}'"));
     }
-    save_external_registry(&app, &entries)
+    save_external_registry(&app, &entries)?;
+    if let Some(path) = removed_path {
+        let mut registry = load_bundle_registry(&app)?;
+        registry.bundles.retain(|bundle| bundle.model_path != path);
+        save_bundle_registry(&app, &registry)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectorCandidate {
+    pub path: String,
+    pub file: String,
+    pub size_bytes: u64,
+}
+
+/// Finds sibling GGUFs that look like multimodal projector files. This is a
+/// hint for the picker only; binding still requires an explicit user action
+/// and runtime startup remains the compatibility boundary.
+#[tauri::command(rename_all = "camelCase")]
+pub fn models_detect_projectors(
+    app: AppHandle,
+    model_path: String,
+) -> Result<Vec<ProjectorCandidate>, String> {
+    let model = regular_gguf(&model_path)?;
+    known_main_model(&app, &model)?;
+    let Some(parent) = model.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(parent)
+        .map_err(|e| format!("Failed to scan {}: {e}", parent.display()))?
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if path == model || !path.is_file() {
+            continue;
+        }
+        let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let lower = file.to_ascii_lowercase();
+        if !lower.ends_with(".gguf") || !(lower.contains("mmproj") || lower.contains("projector")) {
+            continue;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let size_bytes = match std::fs::metadata(&canonical) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => continue,
+        };
+        candidates.push(ProjectorCandidate {
+            path: canonical.to_string_lossy().into_owned(),
+            file: file.to_string(),
+            size_bytes,
+        });
+    }
+    candidates.sort_by(|left, right| left.file.cmp(&right.file));
+    Ok(candidates)
+}
+
+fn model_info_for_path(app: &AppHandle, path: &Path) -> Result<ModelInfo, String> {
+    let path_string = path.to_string_lossy().into_owned();
+    models_list_installed(app.clone())?
+        .into_iter()
+        .find(|model| model.path.as_deref() == Some(path_string.as_str()))
+        .ok_or_else(|| {
+            format!(
+                "The language model is no longer installed: {}",
+                path.display()
+            )
+        })
+}
+
+/// Associates one explicitly selected projector with one known language model.
+/// The registry stores only the association and provenance, never duplicate
+/// model metadata or copied external bytes.
+#[tauri::command(rename_all = "camelCase")]
+pub fn models_set_projector(
+    app: AppHandle,
+    model_path: String,
+    projector_path: String,
+) -> Result<ModelInfo, String> {
+    let model = regular_gguf(&model_path)?;
+    let projector = regular_gguf(&projector_path)?;
+    known_main_model(&app, &model)?;
+    let profile_data_dir = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    let models_dir = models_dir(&app)?;
+    set_projector_for_model(&profile_data_dir, &models_dir, &model, &projector)?;
+    model_info_for_path(&app, &model)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn models_remove_projector(app: AppHandle, model_path: String) -> Result<ModelInfo, String> {
+    let model = regular_gguf(&model_path)?;
+    known_main_model(&app, &model)?;
+    let mut registry = load_bundle_registry(&app)?;
+    let old = registry
+        .bundles
+        .iter()
+        .find(|record| record.model_path == model.to_string_lossy())
+        .and_then(|record| record.projector.clone());
+    registry
+        .bundles
+        .retain(|record| record.model_path != model.to_string_lossy());
+    save_bundle_registry(&app, &registry)?;
+    if let Some(projector) = old {
+        if projector.ownership == ComponentOwnership::Managed {
+            let root = models_dir(&app)?
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            let path = PathBuf::from(&projector.path);
+            if path.parent() == Some(managed_components_dir(&root).as_path()) && path.is_file() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    model_info_for_path(&app, &model)
 }
 
 /// Returns true if `s` is exactly one path component: non-empty, contains
@@ -617,7 +1179,7 @@ pub fn models_cancel_download(
 }
 
 /// Resolves a public Ollama or Hugging Face reference to immutable,
-/// integrity-checked single-file GGUF metadata without installing it.
+/// integrity-checked GGUF bundle metadata without installing it.
 #[tauri::command]
 pub async fn models_resolve_reference(
     reference: String,
@@ -630,29 +1192,65 @@ pub async fn models_resolve_reference(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn models_install_reference(
     app: AppHandle,
+    state: tauri::State<'_, AppState>,
     reference: String,
     expected_sha256: String,
+    expected_projector_sha256: Option<String>,
 ) -> Result<ModelInfo, String> {
     let dir = models_dir(&app)?;
+    let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+    {
+        let mut installs = state
+            .model_downloads
+            .lock()
+            .map_err(|_| "Model-download-cancel lock poisoned".to_string())?;
+        if installs.contains_key(&reference) {
+            return Err(
+                "A model bundle installation for this reference is already running".to_string(),
+            );
+        }
+        installs.insert(reference.clone(), cancel.clone());
+    }
+    let _cleanup = DownloadCancelCleanup {
+        state: &state,
+        file: reference.clone(),
+    };
     let progress_app = app.clone();
     let progress_reference = reference.clone();
-    let installed =
-        model_sources::install_reference(&dir, &reference, &expected_sha256, move |progress| {
+    let installed = model_sources::install_reference_with_projector_and_cancel(
+        &dir,
+        &reference,
+        &expected_sha256,
+        expected_projector_sha256.as_deref(),
+        &cancel,
+        move |progress| {
             let _ = progress_app.emit(
                 "models://download-progress",
                 serde_json::json!({
                     "file": progress.file,
                     "reference": progress_reference,
-                    "downloaded": progress.downloaded,
-                    "total": progress.total,
+                    "component": match progress.role {
+                        model_sources::ModelArtifactRole::Model => "model",
+                        model_sources::ModelArtifactRole::Projector => "projector",
+                    },
+                    "componentDownloaded": progress.downloaded,
+                    "componentTotal": progress.total,
+                    "downloaded": progress.overall_downloaded,
+                    "total": progress.overall_total,
                 }),
             );
-        })
-        .await?;
-    Ok(managed_model_info(
-        &installed.local_path,
-        &installed.provenance,
-    ))
+        },
+    )
+    .await?;
+    let model = managed_model_info(&installed.local_path, &installed.provenance);
+    if let Some(projector_path) = installed.projector_path {
+        return models_set_projector(
+            app,
+            installed.local_path.to_string_lossy().into_owned(),
+            projector_path.to_string_lossy().into_owned(),
+        );
+    }
+    Ok(model)
 }
 
 /// Performs the actual streaming GET + write-to-disk for `models_download`,
@@ -792,8 +1390,29 @@ pub async fn models_delete(
         None,
     )
     .await?;
-
-    model_sources::delete_installed_model(&dir_canon, &p).await
+    let mut registry = load_bundle_registry(&app)?;
+    let projector = registry
+        .bundles
+        .iter()
+        .find(|bundle| bundle.model_path == p.to_string_lossy())
+        .and_then(|bundle| bundle.projector.clone());
+    registry
+        .bundles
+        .retain(|bundle| bundle.model_path != p.to_string_lossy());
+    let result = model_sources::delete_installed_model(&dir_canon, &p).await;
+    if result.is_ok() {
+        save_bundle_registry(&app, &registry)?;
+        if let Some(projector) = projector {
+            if projector.ownership == ComponentOwnership::Managed {
+                let component_root = managed_components_dir(&dir_canon);
+                let component_path = PathBuf::from(projector.path);
+                if component_path.parent() == Some(component_root.as_path()) {
+                    let _ = std::fs::remove_file(component_path);
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -841,5 +1460,49 @@ mod tests {
     #[test]
     fn validate_filename_accepts_plain_names() {
         assert!(validate_filename("qwen2.5-7b-instruct-q4_k_m.gguf").is_ok());
+    }
+
+    #[test]
+    fn projector_association_round_trips_for_cli_lookups() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-bundle-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("model.gguf");
+        let projector = root.join("mmproj.gguf");
+        std::fs::write(&model, b"model").unwrap();
+        std::fs::write(&projector, b"projector").unwrap();
+        let registry = LocalModelBundleRegistry {
+            schema_version: BUNDLE_REGISTRY_SCHEMA_VERSION,
+            bundles: vec![LocalModelBundleRecord {
+                model_path: model.canonicalize().unwrap().to_string_lossy().into_owned(),
+                projector: Some(ProjectorComponent {
+                    path: projector
+                        .canonicalize()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    file: "mmproj.gguf".to_string(),
+                    size_bytes: 9,
+                    ownership: ComponentOwnership::Managed,
+                    sha256: Some("digest".to_string()),
+                    missing: false,
+                }),
+            }],
+        };
+        std::fs::write(
+            root.join("local_model_bundles.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+
+        let found = projector_for_model(&root, &model).unwrap().unwrap();
+        assert_eq!(
+            found.path,
+            projector.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(found.ownership, ComponentOwnership::Managed);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

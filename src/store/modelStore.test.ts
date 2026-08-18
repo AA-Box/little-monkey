@@ -93,6 +93,28 @@ describe("modelStore.start", () => {
     );
   });
 
+  it("passes an attached projector to the local launcher", async () => {
+    invokeMock.mockResolvedValueOnce(8_192);
+    await useModelStore.getState().start(
+      makeModel({
+        components: {
+          projector: {
+            path: "/models/components/mmproj.gguf",
+            file: "mmproj.gguf",
+            size_bytes: 1_024,
+            ownership: "managed",
+            sha256: "a".repeat(64),
+            missing: false,
+          },
+        },
+      }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith(
+      "llama_start",
+      expect.objectContaining({ projectorPath: "/models/components/mmproj.gguf" }),
+    );
+  });
+
   it("sets the usage-store context limit to whatever llama_start actually resolved, not a fixed guess", async () => {
     invokeMock.mockResolvedValueOnce(16_384);
 
@@ -196,6 +218,9 @@ describe("modelStore model reference install", () => {
     const entries = modelDownloadProgressEntries({
       file: "ollama-llama3.2-aabbccddeeff.gguf",
       reference: "ollama:library/llama3.2:3b",
+      component: "projector",
+      componentDownloaded: 250,
+      componentTotal: 500,
       downloaded: 500,
       total: 1_000,
     });
@@ -203,10 +228,16 @@ describe("modelStore model reference install", () => {
     expect(entries["ollama-llama3.2-aabbccddeeff.gguf"]).toEqual({
       downloaded: 500,
       total: 1_000,
+      component: "projector",
+      componentDownloaded: 250,
+      componentTotal: 500,
     });
     expect(entries["ollama:library/llama3.2:3b"]).toEqual({
       downloaded: 500,
       total: 1_000,
+      component: "projector",
+      componentDownloaded: 250,
+      componentTotal: 500,
     });
   });
 });

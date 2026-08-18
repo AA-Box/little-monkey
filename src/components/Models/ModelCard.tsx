@@ -29,6 +29,8 @@ export interface ModelCardProps {
   onDelete: () => void;
   onStart: () => void;
   onStop: () => void;
+  onAddProjector?: () => void;
+  onRemoveProjector?: () => void;
 }
 
 const ACTIVE_PILL: Record<LlamaStatus, { tone: PillTone; labelKey: string } | null> = {
@@ -49,6 +51,8 @@ export function ModelCard({
   onDelete,
   onStart,
   onStop,
+  onAddProjector,
+  onRemoveProjector,
 }: ModelCardProps) {
   const { t } = useT();
   const isDownloading = !model.installed && downloadProgress !== undefined;
@@ -78,12 +82,22 @@ export function ModelCard({
               {t("ModelCard.toolCallingBadge")}
             </span>
           )}
+          {model.capabilities?.image_input && (
+            <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+              {t("ModelCard.visionBadge")}
+            </span>
+          )}
           {activePill && <StatusPill tone={activePill.tone}>{t(activePill.labelKey)}</StatusPill>}
         </div>
         <p className="mt-0.5 truncate font-mono text-xs text-muted">
           {model.repo ? `${model.repo} · ` : ""}
           {formatSizeGb(model.size_gb)}
         </p>
+        {model.components?.projector && (
+          <p className={`mt-1 truncate text-[11px] ${model.components.projector.missing ? "text-danger" : "text-muted"}`}>
+            {t(model.components.projector.missing ? "ModelCard.projectorMissing" : "ModelCard.projectorLabel")}: {model.components.projector.file}
+          </p>
+        )}
         {isErrored && (
           <p className="mt-1 flex items-start gap-1 text-xs text-danger">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
@@ -147,6 +161,17 @@ export function ModelCard({
               <Button variant="primary" size="sm" onClick={onStart}>
                 <Play size={14} />
                 {t("ModelCard.startButton")}
+              </Button>
+            )}
+
+            {!busy && onAddProjector && (
+              <Button variant="secondary" size="sm" onClick={onAddProjector}>
+                {t("ModelCard.addProjectorButton")}
+              </Button>
+            )}
+            {!busy && model.components?.projector && onRemoveProjector && (
+              <Button variant="secondary" size="sm" onClick={onRemoveProjector}>
+                {t("ModelCard.removeProjectorButton")}
               </Button>
             )}
 

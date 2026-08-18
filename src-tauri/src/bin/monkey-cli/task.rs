@@ -1338,7 +1338,7 @@ async fn run_inner(
                 // Managed llama-server consumes the context size at process
                 // startup, so it is never forwarded as a request option.
                 let context = crate::managed_model_cli::context_tokens(None)?;
-                crate::managed_model_cli::start_server(client, &artifact, context).await
+                crate::managed_model_cli::start_server(client, &artifact, None, context).await
             }
             .await;
             match started {

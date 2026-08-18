@@ -1370,6 +1370,7 @@ async fn run_model(
             let session = match managed_model_cli::start_server(
                 client,
                 &installed.local_path,
+                installed.projector_path.as_deref(),
                 context_tokens,
             )
             .await

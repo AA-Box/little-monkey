@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo } from "react";
 import { ChevronDown, Plus } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { CURATED_MODELS, type ModelInfo } from "../../lib/modelRegistry";
 import { ModelCard } from "./ModelCard";
 import { AddCustomModelForm } from "./AddCustomModelForm";
@@ -15,7 +16,16 @@ function mergeInstalled(curated: ModelInfo[], installed: ModelInfo[]): ModelInfo
   const byFile = new Map(installed.map((model) => [model.file, model]));
   return curated.map((model) => {
     const match = byId.get(model.id) ?? byFile.get(model.file);
-    return match ? { ...model, installed: true, path: match.path } : model;
+    return match
+      ? {
+          ...model,
+          installed: true,
+          path: match.path,
+          components: match.components,
+          capabilities: match.capabilities,
+          is_external: match.is_external,
+        }
+      : model;
   });
 }
 
@@ -47,6 +57,8 @@ export function ModelManager() {
   const start = useModelStore((s) => s.start);
   const stop = useModelStore((s) => s.stop);
   const removeModel = useModelStore((s) => s.removeModel);
+  const setProjector = useModelStore((s) => s.setProjector);
+  const removeProjector = useModelStore((s) => s.removeProjector);
   const { t } = useT();
 
   useEffect(() => {
@@ -88,6 +100,30 @@ export function ModelManager() {
     [active?.id, llamaStatus, removeModel],
   );
 
+  const handleAddProjector = useCallback(async (model: ModelInfo) => {
+    if (!model.path) return;
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: t("ModelManager.projectorFileFilter"), extensions: ["gguf"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    try {
+      await setProjector(model.path, selected);
+    } catch (error) {
+      window.alert(String(error));
+    }
+  }, [setProjector, t]);
+
+  const projectorActions = (model: ModelInfo) => ({
+    onAddProjector: () => void handleAddProjector(model),
+    onRemoveProjector: model.components?.projector
+      ? () => {
+          if (!model.path) return;
+          void removeProjector(model.path).catch((error) => window.alert(String(error)));
+        }
+      : undefined,
+  });
+
   return (
     <div className="flex flex-col gap-2 py-2">
       <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-border bg-background px-3 py-2.5">
@@ -119,6 +155,7 @@ export function ModelManager() {
             onDelete={() => void handleDelete(model)}
             onStart={() => void start(model)}
             onStop={() => void stop()}
+            {...projectorActions(model)}
           />
         ))
       )}
@@ -134,13 +171,14 @@ export function ModelManager() {
               model={model}
               isActive={active?.id === model.id}
               llamaStatus={llamaStatus}
-            startError={llamaError}
+              startError={llamaError}
               downloadProgress={downloadProgress[model.file]}
               onInstall={() => void download(model)}
               onCancelDownload={() => void cancelDownload(model)}
               onDelete={() => void handleDelete(model)}
               onStart={() => void start(model)}
               onStop={() => void stop()}
+              {...projectorActions(model)}
             />
           ))}
         </>

@@ -83,9 +83,9 @@ impl InstallProgress {
 
     fn update(&mut self, event: ModelDownloadProgress) {
         let percent = event
-            .downloaded
+            .overall_downloaded
             .saturating_mul(100)
-            .checked_div(event.total.max(1))
+            .checked_div(event.overall_total.max(1))
             .unwrap_or(0)
             .min(100);
         if self.interactive {
@@ -93,8 +93,8 @@ impl InstallProgress {
                 "\rDownloading {:<36} {:>6.1}%  {} / {}",
                 truncate_label(&event.file, 36),
                 percent as f64,
-                human_bytes(event.downloaded),
-                human_bytes(event.total)
+                human_bytes(event.overall_downloaded),
+                human_bytes(event.overall_total)
             );
             let _ = std::io::stderr().flush();
             self.last_bucket = Some(percent / 10);
@@ -106,8 +106,8 @@ impl InstallProgress {
             eprintln!(
                 "Downloading {}: {percent}% ({} / {})",
                 event.file,
-                human_bytes(event.downloaded),
-                human_bytes(event.total)
+                human_bytes(event.overall_downloaded),
+                human_bytes(event.overall_total)
             );
             self.last_bucket = Some(bucket);
         }
@@ -148,6 +148,18 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
         human_bytes(resolved.size_bytes)
     );
     eprintln!("SHA-256: {}", resolved.sha256);
+    if let Some(projector) = resolved
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == model_sources::ModelArtifactRole::Projector)
+    {
+        eprintln!(
+            "Projector: {} ({})",
+            projector.file_name,
+            human_bytes(projector.size_bytes)
+        );
+        eprintln!("Projector SHA-256: {}", projector.sha256);
+    }
     if let Some(license) = resolved.license_name.as_deref() {
         eprintln!("License: {license}");
     }
@@ -163,6 +175,14 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
         .await;
     progress.finish();
     let installed = installed?;
+    if let Some(projector_path) = installed.projector_path.as_deref() {
+        little_monkey_lib::models::set_projector_for_model(
+            &data,
+            &models,
+            &installed.local_path,
+            projector_path,
+        )?;
+    }
     eprintln!("Installed: {}", installed.local_path.display());
     if !installed.provenance.tool_calling {
         eprintln!(
@@ -179,7 +199,10 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
 pub async fn install_for_run(reference: &str) -> Result<InstalledModelReference, String> {
     let data = app_data_dir()?;
     let models = managed_models_dir(&data)?;
-    if let Some(installed) = model_sources::find_installed_reference(&models, reference)? {
+    if let Some(mut installed) = model_sources::find_installed_reference(&models, reference)? {
+        installed.projector_path =
+            little_monkey_lib::models::projector_for_model(&data, &installed.local_path)?
+                .map(|component| PathBuf::from(component.path));
         eprintln!("Using installed model: {}", installed.local_path.display());
         return Ok(installed);
     }
@@ -238,6 +261,7 @@ pub fn context_tokens(requested: Option<i64>) -> Result<u32, String> {
 
 fn chat_server_args(
     model_path: &Path,
+    projector_path: Option<&Path>,
     port: u16,
     context_tokens: u32,
     alias: &str,
@@ -255,6 +279,12 @@ fn chat_server_args(
         CHAT_GPU_LAYERS.to_string().into(),
         "--jinja".into(),
     ];
+    if let Some(projector_path) = projector_path {
+        args.splice(
+            2..2,
+            ["--mmproj".into(), projector_path.as_os_str().to_owned()],
+        );
+    }
     args.push("--alias".into());
     args.push(alias.into());
     args
@@ -392,15 +422,30 @@ fn models_payload_reports_alias(bytes: &[u8], expected_alias: &str) -> bool {
 pub async fn start_server(
     client: &reqwest::Client,
     model_path: &Path,
+    projector_path: Option<&Path>,
     context_tokens: u32,
 ) -> Result<ManagedServerSession, String> {
     model_sources::verify_managed_model_for_runtime(model_path)?;
+    if let Some(projector_path) = projector_path {
+        let data = app_data_dir()?;
+        little_monkey_lib::models::verify_projector_for_model(
+            &data,
+            &model_path.to_string_lossy(),
+            &projector_path.to_string_lossy(),
+        )?;
+    }
     let data = app_data_dir()?;
     let binary = managed_llama_server(&data)?;
     for attempt in 1..=MAX_START_ATTEMPTS {
         let port = candidate_loopback_port()?;
         let startup_alias = little_monkey_lib::llama::fresh_server_alias();
-        let args = chat_server_args(model_path, port, context_tokens, &startup_alias);
+        let args = chat_server_args(
+            model_path,
+            projector_path,
+            port,
+            context_tokens,
+            &startup_alias,
+        );
         eprintln!("Starting Little Monkey's managed llama-server on 127.0.0.1:{port}...");
 
         let mut command = Command::new(&binary);
@@ -455,6 +500,7 @@ mod tests {
     fn managed_server_args_bind_only_loopback_and_enable_jinja_tools() {
         let args = chat_server_args(
             Path::new("/models/model.gguf"),
+            None,
             32123,
             8192,
             "hf:org/repo@commit#model.gguf",
@@ -480,6 +526,30 @@ mod tests {
                 "hf:org/repo@commit#model.gguf",
             ]
         );
+    }
+
+    #[test]
+    fn managed_server_args_place_projector_before_server_options() {
+        let args = chat_server_args(
+            Path::new("/models/model.gguf"),
+            Some(Path::new("/models/components/mmproj.gguf")),
+            32123,
+            8192,
+            "little-monkey-test",
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..4],
+            &[
+                "-m".to_string(),
+                "/models/model.gguf".to_string(),
+                "--mmproj".to_string(),
+                "/models/components/mmproj.gguf".to_string(),
+            ]
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--jinja", "--alias"]));
     }
 
     #[test]
