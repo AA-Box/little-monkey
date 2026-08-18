@@ -154,6 +154,13 @@ import {
   WORKSPACE_MUTATION_FAILURE,
 } from './workspaceMutation';
 import { errorMessage } from "./errors";
+import {
+  PROGRAMMATIC_SYSTEM_GUIDANCE,
+  PROGRAMMATIC_TOOL,
+  programmaticExecutionService,
+  type ProgrammaticNestedToolResult,
+  type ProgrammaticToolContext,
+} from "./programmaticExecution";
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -2858,8 +2865,18 @@ async function runAgentTurnBody(
   // in tools.ts for why (webview-rasterized wire shape; monkey-cli can't
   // offer it). The result lives in private app storage, not the workspace,
   // so it has no edit-permission or selected-folder dependency.
+  const programmaticCapabilities = await programmaticExecutionService.capabilities();
   const baseToolsForTurn: ToolDef[] = toolsForSettings(
-    toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
+    toolsForMode(
+      [
+        ...buildTools(attachedStackNames),
+        GENERATE_IMAGE_TOOL,
+        ...mcpDefs,
+        ...extensionDefs,
+        ...(programmaticCapabilities.healthy ? [PROGRAMMATIC_TOOL] : []),
+      ],
+      mode,
+    ),
     settings.memoryEnabled,
     settings.webToolsEnabled,
     // Ultracode force-offers the `task` tool even when the subagents toggle
@@ -3095,6 +3112,9 @@ async function runAgentTurnBody(
       baseToolsForTurn,
       allowedToolsRestriction(invokedSkillCommands, availableSkills),
     );
+    const programmaticToolOffered = toolsForTurn.some(
+      (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
+    );
     const systemMessage: ChatMessage = {
       role: 'system',
       content: [
@@ -3103,6 +3123,7 @@ async function runAgentTurnBody(
           skillInvocations,
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
+        ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
@@ -3417,9 +3438,19 @@ async function runAgentTurnBody(
         // pathological round cannot grow the record without limit.
         if (result !== CANCELLED_TOOL_RESULT && durable.toolFailures.length < MAX_RECORDED_TOOL_FAILURES) {
           try {
-            const parsed = JSON.parse(result) as { error?: unknown };
+            const parsed = JSON.parse(result) as { error?: unknown; status?: unknown; failure?: { category?: unknown; message?: unknown } };
+            const programFailure =
+              toolCall.function.name === 'run_program' &&
+              parsed &&
+              typeof parsed === 'object' &&
+              parsed.status !== 'succeeded' &&
+              parsed.failure;
             if (parsed && typeof parsed === 'object' && parsed.error) {
               durable.toolFailures.push(`${toolCall.function.name}: ${String(parsed.error).slice(0, 200)}`);
+            } else if (programFailure) {
+              durable.toolFailures.push(
+                `${toolCall.function.name}: ${String(programFailure.category ?? 'failed')} - ${String(programFailure.message ?? 'Program failed').slice(0, 180)}`,
+              );
             }
           } catch {
             // A plain-text tool result is a success — nothing to record.
@@ -3486,6 +3517,57 @@ async function runAgentTurnBody(
           );
         },
       };
+      const programmaticContext: ProgrammaticToolContext = {
+        toolDefinitions: toolsForTurn,
+        workspaceRoots: useWorkspaceStore.getState().roots.map((root) => root.path),
+        invokeTool: async (nestedToolName, nestedArgs, nestedToolCallId, nestedSignal): Promise<ProgrammaticNestedToolResult> => {
+          const nestedToolCall: ToolCall = {
+            id: nestedToolCallId,
+            type: 'function',
+            function: { name: nestedToolName, arguments: JSON.stringify(nestedArgs) },
+          };
+          const nestedStartedAt = Date.now();
+          await recorder?.recordToolProposed(nestedToolCallId, nestedToolName, nestedToolCall.function.arguments);
+          recorder?.recordToolStarted(nestedToolCallId);
+          const nestedResult = await executeToolCall(
+            nestedToolCall,
+            checkpointId,
+            durable.recorder?.runId ?? turnId,
+            mcpRegistry,
+            nestedSignal,
+            riskAnnotation,
+            attachedStackNames,
+            subagentContext,
+            undefined,
+            skillToolContext,
+            sessionId,
+            undefined,
+            extensionRegistry,
+            undefined,
+          );
+          const cancelled = nestedResult === CANCELLED_TOOL_RESULT || nestedSignal.aborted;
+          await recorder?.recordToolFinished(nestedToolCallId, nestedResult, Date.now() - nestedStartedAt, cancelled);
+          let nestedFailure: ProgrammaticNestedToolResult["failure"];
+          if (cancelled) {
+            nestedFailure = { category: "cancelled", message: "Nested tool call was cancelled.", toolName: nestedToolName };
+          } else {
+            try {
+              const parsed = JSON.parse(nestedResult) as { error?: unknown };
+              if (parsed && typeof parsed === "object" && parsed.error) {
+                const message = String(parsed.error);
+                nestedFailure = {
+                  category: /permission denied|blocked/i.test(message) ? "permission_denied" : "nested_tool_failure",
+                  message,
+                  toolName: nestedToolName,
+                };
+              }
+            } catch {
+              // Plain tool output is a successful result.
+            }
+          }
+          return { content: nestedResult, cancelled, ...(nestedFailure ? { failure: nestedFailure } : {}) };
+        },
+      };
       const result = await executeToolCall(
         toolCall,
         checkpointId,
@@ -3500,6 +3582,7 @@ async function runAgentTurnBody(
         sessionId,
         undefined,
         extensionRegistry,
+        programmaticContext,
       );
       return finishObservedTool(result);
     });

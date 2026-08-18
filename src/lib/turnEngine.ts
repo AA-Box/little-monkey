@@ -51,6 +51,12 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
+import {
+  formatProgrammaticExecutionResult,
+  PROGRAMMATIC_TOOL_NAME,
+  programmaticExecutionService,
+  type ProgrammaticToolContext,
+} from "./programmaticExecution";
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -577,6 +583,7 @@ export async function executeToolCall(
   // `executeToolCallInner`'s param of the same name.
   workspaceRootOverride?: string,
   extensionRegistry?: ExtensionToolRegistry,
+  programmatic?: ProgrammaticToolContext,
 ): Promise<string> {
   const name = toolCall.function.name;
   const sessionId = chatSessionId ?? subagent?.sessionId;
@@ -619,6 +626,7 @@ export async function executeToolCall(
     chatSessionId,
     workspaceRootOverride,
     extensionRegistry,
+    programmatic,
   );
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
@@ -668,6 +676,7 @@ async function executeToolCallInner(
   // RESERVED_ARGS entry for the trust story.
   workspaceRootOverride?: string,
   extensionRegistry?: ExtensionToolRegistry,
+  programmatic?: ProgrammaticToolContext,
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -736,6 +745,25 @@ async function executeToolCallInner(
     workspaceRootOverride,
     learningRunId: skill?.runId,
   });
+
+  if (name === PROGRAMMATIC_TOOL_NAME) {
+    if (!programmatic) {
+      return stringifyToolError(new Error('The programmatic execution capability is not available in this context.'));
+    }
+    const source = typeof args.source === 'string' ? args.source : '';
+    if (!source) {
+      return stringifyToolError(new Error('run_program requires a non-empty "source" string.'));
+    }
+    const result = await programmaticExecutionService.execute({
+      executionId: protocolToolCallId(`${turnId}:${toolCall.id}`),
+      source,
+      toolDefinitions: programmatic.toolDefinitions,
+      signal,
+      workspaceRoots: programmatic.workspaceRoots,
+      invokeTool: programmatic.invokeTool,
+    });
+    return formatProgrammaticExecutionResult(result);
+  }
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
   // doc comment): it never reaches Rust at all, checked BEFORE the
