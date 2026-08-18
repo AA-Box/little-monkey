@@ -1753,9 +1753,12 @@ fn free_port() -> Result<u16, String> {
 }
 
 /// The one running `sd-server`, plus which model it was launched against.
-#[derive(Default)]
+///
+/// The inner process is shared so an idle-unload timer can safely outlive the
+/// command that scheduled it without keeping a second engine state around.
+#[derive(Clone, Default)]
 pub struct GenerationEngineState {
-    inner: Mutex<EngineProcess>,
+    inner: Arc<Mutex<EngineProcess>>,
 }
 
 #[derive(Default)]
@@ -1778,6 +1781,21 @@ struct EngineProcess {
     stderr_tail: Option<Arc<Mutex<String>>>,
     /// Latest `(step, total)` scraped from that same stream.
     sampling: Option<SamplingProgress>,
+    /// Changes whenever a run starts. Idle timers compare this token before
+    /// stopping the process, so a new run of the same model cannot be killed
+    /// by an older timer.
+    activity_token: u64,
+}
+
+fn stop_process(state: &mut EngineProcess) {
+    if let Some(mut child) = state.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    state.model_id = None;
+    state.signature = None;
+    state.port = None;
+    state.ready = false;
 }
 
 impl GenerationEngineState {
@@ -1838,17 +1856,31 @@ impl GenerationEngineState {
     /// never kept warm across a switch.
     pub fn stop(&self) -> Result<(), String> {
         let mut state = self.inner.lock().map_err(|error| error.to_string())?;
-        if let Some(mut child) = state.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        state.model_id = None;
-        state.signature = None;
-        state.port = None;
-        state.ready = false;
+        stop_process(&mut state);
         // Keep the tail: `ensure_ready` stops a failed launch before reporting,
         // and dropping it here would throw away the only useful diagnosis.
         Ok(())
+    }
+
+    /// Releases the loaded weights after a quiet period, unless another run
+    /// has touched this engine in the meantime. Ten minutes matches Runtime
+    /// Hub's default timed keep-alive while avoiding a second manual cleanup
+    /// step for Studio users.
+    pub fn schedule_idle_stop(&self, delay: Duration) {
+        let Ok(state) = self.inner.lock() else {
+            return;
+        };
+        let token = state.activity_token;
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Ok(mut state) = inner.lock() else {
+                return;
+            };
+            if state.activity_token == token && state.child.is_some() {
+                stop_process(&mut state);
+            }
+        });
     }
 
     /// A fingerprint of everything the engine has said so far, used as a
@@ -1945,6 +1977,9 @@ impl GenerationEngineState {
             == Some(signature.as_slice());
         if warm && self.child_exited()?.is_none() {
             if let Some(base_url) = self.base_url() {
+                if let Ok(mut state) = self.inner.lock() {
+                    state.activity_token = state.activity_token.wrapping_add(1);
+                }
                 return Ok(base_url);
             }
         }
@@ -1984,6 +2019,7 @@ impl GenerationEngineState {
         }
         {
             let mut state = self.inner.lock().map_err(|error| error.to_string())?;
+            state.activity_token = state.activity_token.wrapping_add(1);
             state.child = Some(child);
             state.model_id = Some(spec.id.clone());
             state.signature = Some(signature);
@@ -4116,10 +4152,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     fn a_rolling_capped_tail_still_reads_as_the_engine_talking() {
         let tail = Arc::new(Mutex::new(String::new()));
         let engine = GenerationEngineState {
-            inner: Mutex::new(EngineProcess {
+            inner: Arc::new(Mutex::new(EngineProcess {
                 stderr_tail: Some(Arc::clone(&tail)),
                 ..EngineProcess::default()
-            }),
+            })),
         };
         let say = |line: &str| {
             let mut buffer = tail.lock().unwrap();
@@ -4158,10 +4194,10 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
     #[test]
     fn an_engine_that_has_not_answered_yet_is_not_offered_to_readers() {
         let engine = GenerationEngineState {
-            inner: Mutex::new(EngineProcess {
+            inner: Arc::new(Mutex::new(EngineProcess {
                 port: Some(51_234),
                 ..EngineProcess::default()
-            }),
+            })),
         };
         assert_eq!(engine.base_url().as_deref(), Some("http://127.0.0.1:51234"));
         assert!(engine.ready_base_url().is_none());

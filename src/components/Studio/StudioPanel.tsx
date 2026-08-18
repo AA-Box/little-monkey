@@ -35,6 +35,7 @@ import type { StudioMode } from "./StudioNav";
 import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { MAX_STUDIO_QUEUE, useStudioRunStore } from "../../store/studioRunStore";
+import { useRuntimeHubStore } from "../../store/runtimeHubStore";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
 import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
@@ -559,6 +560,22 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // process against weights this app never sees, so those controls are hidden
   // rather than shown and then silently dropped on the way out.
   const remote = isRemoteModelId(selected?.id ?? null);
+  const mlxModelSelected = !remote && selected?.engine === "mlx_video";
+  const mlxRuntimeReady = useRuntimeHubStore((state) =>
+    state.runtimes.some((runtime) => runtime.descriptor.kind === "mlx" && runtime.canInfer),
+  );
+  const mlxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mlx-auto-install"]));
+  const mlxInstallError = useRuntimeHubStore((state) => state.errors["mlx-auto-install"]);
+  const ensureMlxRuntime = useRuntimeHubStore((state) => state.ensureMlxRuntime);
+
+  // MLX is a managed package shared by chat and Studio. Selecting an MLX video
+  // model is enough to prepare it; users should not have to visit Runtime Hub
+  // before the first Studio run.
+  useEffect(() => {
+    if (mlxModelSelected && !mlxRuntimeReady) {
+      void ensureMlxRuntime().catch(() => {});
+    }
+  }, [ensureMlxRuntime, mlxModelSelected, mlxRuntimeReady]);
   // This tab's results, newest first: the newest fills the canvas, the rest is
   // the strip under it.
   const shownGallery = useMemo(
@@ -1103,6 +1120,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
     // A run in flight no longer blocks the button: the next one queues behind
     // it, up to the cap that keeps a leaned-on button from queueing forever.
     runQueue.length + (busy ? 1 : 0) < MAX_STUDIO_QUEUE &&
+    (!mlxModelSelected || mlxRuntimeReady) &&
     (!needsInitImage(task) || !!initImage);
 
   // Tools share nothing with generation — no model, no prompt, no sampler —
@@ -1126,6 +1144,21 @@ export function StudioPanel({ mode, railSlot }: Props) {
         <p className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
           {error ?? runError}
         </p>
+      )}
+
+      {mlxModelSelected && !mlxRuntimeReady && (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          <span>
+            {mlxInstalling
+              ? t("Studio.mlx.preparing")
+              : mlxInstallError ?? t("Studio.mlx.notReady")}
+          </span>
+          {!mlxInstalling && (
+            <Button size="sm" variant="secondary" onClick={() => void ensureMlxRuntime().catch(() => {})}>
+              {t("Studio.mlx.retry")}
+            </Button>
+          )}
+        </div>
       )}
 
       {mode === "models" ? (
