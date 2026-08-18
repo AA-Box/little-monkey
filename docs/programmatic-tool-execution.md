@@ -5,8 +5,8 @@
 The current desktop turn path is:
 
 1. `src/lib/agentLoop.ts` resolves MCP and executable-extension registries, builds the turn-local tool definitions with `buildTools`, `toolsForMode`, and `toolsForSettings`, and sends those exact definitions to the selected model.
-2. Model tool calls are accepted only when `isToolCallAllowed` confirms that the name was offered for this turn.
-3. `src/lib/turnEngine.ts::executeToolCall` parses arguments, removes frontend-owned reserved arguments, classifies risk, injects the current turn/checkpoint/tool-call context, runs hooks, and dispatches frontend-only tools, MCP tools, executable-extension tools, or `invoke('tool_<name>')`.
+2. Model tool calls are accepted only when the dispatcher confirms that the name was offered for this turn and is still available at invocation time.
+3. `src/lib/turnEngine.ts::executeToolCall` parses arguments, removes frontend-owned reserved arguments, validates the offered schema, classifies risk, injects the current turn/checkpoint/tool-call context, runs hooks, and dispatches frontend-only tools, MCP tools, executable-extension tools, or `invoke('tool_<name>')`. Its completion hook is shared by direct and nested calls.
 4. Rust tool commands in `src-tauri/src/tools.rs`, `src-tauri/src/mcp.rs`, and the executable-extension host perform the real operation. Workspace paths go through `agent_worktrees::resolve_with_override`; mutating and network/MCP operations call `permissions::request_permission`; mutation and external-effect commands use `checkpoints`; cancellable shell/MCP work uses `AppState::tool_cancel`.
 5. `agentLoop.ts` records `tool_proposed`, `tool_started`, and `tool_finished` through `DurableRunRecorder`; the recorder redacts arguments/results and links artifacts. The same run id is passed into permission and tool commands.
 6. `runCancellationRegistry`, `tools_cancel_running`, and the existing `AbortSignal` stop path cancel the owning turn and pending/in-flight cancellable tools. `sessionStore` persists the assistant tool-call and matching tool-result messages; `MessageList.tsx` groups ordinary calls into the existing activity timeline.
@@ -28,6 +28,12 @@ The programmatic capability is excluded from its own generated SDK, is offered o
 The source is untrusted. QuickJS has no host standard library or imports; host functions receive and return JSON-compatible values only. Source, arguments, nested-call count/concurrency, logs, return serialization, memory, stack, instruction interrupts, wall time, and cancellation are bounded. Each nested call still passes normal schema/IPC decoding, permission/risk policy, workspace and egress policy, checkpoint handling, extension/MCP authorization, and audit/run recording.
 
 The runtime is intentionally provider-neutral: a future provider implements the same capability contract without changing the generated SDK or model-facing tool.
+
+## Security review
+
+The program source is intentionally dynamic, but it is JSON-stringified before insertion into the generated wrapper. The wrapper is evaluated only inside the isolated QuickJS WebAssembly context; the host application never calls `eval` or `Function` on the program source. Host bridge handles are removed from the guest global before the program runs, and the program receives only frozen, null-prototype tool bindings plus bounded JSON console logging.
+
+Every nested call is re-authorized against the current turn state and routed through the canonical dispatcher. That dispatcher owns schema validation, plan/settings gates, permission handling, workspace-root resolution, checkpoint injection, cancellation, hooks, and durable completion evidence. CodeQL's dynamic-code finding at the guest `Function` construction is therefore an intentional isolated-runtime sink; the finding should be closed with this justification and the accompanying security comment, not suppressed as an ordinary host-code exception.
 
 ## Current runtime limitations
 

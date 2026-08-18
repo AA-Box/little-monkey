@@ -52,6 +52,7 @@ function makeRequest(
     executionId: `test-program-${++executionNumber}`,
     source,
     toolDefinitions: [readTool, lookupTool],
+    isToolAvailable: () => true,
     invokeTool: async (toolName, args): Promise<ProgrammaticNestedToolResult> => ({
       content: JSON.stringify({ toolName, args }),
       cancelled: false,
@@ -88,6 +89,25 @@ describe("QuickJsProgrammaticRuntime", () => {
     expect(result.nestedCalls).toMatchObject([
       { toolName: "read_file", arguments: { path: "src/index.ts" }, status: "succeeded" },
     ]);
+  });
+
+  it("re-checks authorization after SDK generation", async () => {
+    let invokeCount = 0;
+    const result = await runtime.execute(makeRequest(
+      'return await tools.read_file({path: "removed-after-generation"});',
+      {
+        isToolAvailable: () => false,
+        invokeTool: async () => {
+          invokeCount += 1;
+          return { content: "unexpected", cancelled: false };
+        },
+      },
+    ));
+
+    expect(result.status).toBe("failed");
+    expect(result.failure?.category).toBe("nested_tool_failure");
+    expect(result.nestedCalls).toHaveLength(0);
+    expect(invokeCount).toBe(0);
   });
 
   it("runs sequential calls in source order", async () => {
@@ -137,17 +157,16 @@ describe("QuickJsProgrammaticRuntime", () => {
     expect(result.value).toEqual({ toolName: "mcp__server__lookup-v2", args: { id: "42" } });
   });
 
-  it("rejects arguments using the offered tool schema", async () => {
-    const invoke = vi.fn();
+  it("leaves schema enforcement to the canonical dispatcher", async () => {
+    const invoke = vi.fn().mockResolvedValue({ content: JSON.stringify({ accepted: true }), cancelled: false });
     const result = await runtime.execute(makeRequest(
       "return await tools.read_file({});",
       { invokeTool: invoke },
     ));
 
-    expect(result.status).toBe("failed");
-    expect(result.failure?.category).toBe("nested_tool_failure");
-    expect(result.failure?.message).toContain("arguments.path is required");
-    expect(invoke).not.toHaveBeenCalled();
+    expect(result.status).toBe("succeeded");
+    expect(result.value).toEqual({ accepted: true });
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("does not offer recursive execution or untrusted host globals", async () => {
@@ -195,6 +214,7 @@ describe("QuickJsProgrammaticRuntime", () => {
 
     expect(source.failure?.category).toBe("invalid_source");
     expect(nested.failure?.category).toBe("execution_budget");
+    expect(nested.nestedCalls).toHaveLength(1);
     expect(logs.failure?.category).toBe("output_limit");
     expect(output.failure?.category).toBe("output_limit");
   });
@@ -215,6 +235,20 @@ describe("QuickJsProgrammaticRuntime", () => {
     ));
 
     expect(result.status).toBe("failed");
+    expect(result.failure?.category).toBe("execution_timeout");
+  });
+
+  it("does not await a hanging nested host call past the wall-clock limit", async () => {
+    const startedAt = Date.now();
+    const result = await runtime.execute(makeRequest(
+      'return await tools.read_file({path: "hanging"});',
+      {
+        limits: { maxWallMs: 20 },
+        invokeTool: async () => new Promise<ProgrammaticNestedToolResult>(() => {}),
+      },
+    ));
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(result.failure?.category).toBe("execution_timeout");
   });
 

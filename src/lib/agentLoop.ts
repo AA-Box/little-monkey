@@ -51,11 +51,11 @@ import {
   isBlockedInPlanMode,
   isToolCallAllowed,
   PRESENT_PLAN_RESULT,
-  stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
   type SkillToolContext,
   type SubagentContext,
+  type ToolExecutionContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
@@ -773,12 +773,8 @@ export const parseRecipeNotice = recipeNoticeCodec.parse;
 export const formatRecipeNotice = recipeNoticeCodec.format;
 
 /**
- * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
- * `turnEngine.ts` (see that module's doc comment) so `subagent.ts`'s own
- * child tool-calling loop can reuse the exact same gate this loop's own
- * dispatch below applies, rather than a parallel/duplicated check. Re-export
- * of the binding already imported above (not a fresh `export ... from`) so
- * this file's own use of it below and the public export are the same value.
+ * Re-exported for backward compatibility — `isToolCallAllowed` lives in
+ * `turnEngine.ts` so child loops can reuse the same offered-tool gate.
  */
 export { isToolCallAllowed };
 
@@ -3112,6 +3108,68 @@ async function runAgentTurnBody(
       baseToolsForTurn,
       allowedToolsRestriction(invokedSkillCommands, availableSkills),
     );
+    const isToolAvailable = (toolName: string): boolean => {
+      if (!toolsForTurn.some((tool) => tool.function.name === toolName)) return false;
+      const currentSettings = useSettingsStore.getState();
+      if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
+      if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
+      if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {
+        return false;
+      }
+      if (toolName.startsWith('mcp__')) return mcpToolDefs().registry.has(toolName);
+      if (toolName.startsWith('ext__')) return extensionRegistry.has(toolName);
+      return true;
+    };
+    const completeToolCall = async (completedToolCall: ToolCall, resultContent: string): Promise<void> => {
+      if (
+        !signal?.aborted
+        && (completedToolCall.function.name === 'write_file' || completedToolCall.function.name === 'edit_file')
+      ) {
+        if (isSuccessfulMutationResult(resultContent)) {
+          const path = toolCallPathArg(completedToolCall);
+          if (path) {
+            mutatedFiles.add(path);
+            mutationSucceeded = true;
+            unresolvedMutationFailures.delete(path);
+          }
+        } else {
+          const path = toolCallPathArg(completedToolCall);
+          unresolvedMutationFailures.set(
+            path ?? `tool-call:${completedToolCall.id}`,
+            mutationToolFailureReason(resultContent) ?? 'The file-mutation tool returned an error.',
+          );
+        }
+      }
+
+      if (completedToolCall.function.name === 'remember') {
+        const fact = parseRememberedFact(resultContent);
+        if (fact) {
+          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
+          await useRulesStore.getState().refresh();
+        }
+      }
+
+      if (completedToolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
+        const planArgs = toolCallPlanArgs(completedToolCall);
+        if (planArgs) {
+          addMessage({
+            role: 'system',
+            content: formatPlanNotice({
+              id: crypto.randomUUID(),
+              title: planArgs.title,
+              plan: planArgs.plan,
+              openQuestions: planArgs.openQuestions,
+              status: 'proposed',
+            }),
+          });
+        }
+      }
+    };
+    const toolExecutionContext: ToolExecutionContext = {
+      toolDefinitions: toolsForTurn,
+      isToolAvailable,
+      onCompleted: completeToolCall,
+    };
     const programmaticToolOffered = toolsForTurn.some(
       (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
     );
@@ -3458,20 +3516,6 @@ async function runAgentTurnBody(
         }
         return result;
       };
-      // Reject (without executing) any call whose name wasn't actually
-      // offered to the model this turn — e.g. `remember` after
-      // `memoryEnabled` was turned off, or any other tool a local/quantized
-      // model hallucinates outside the schema it was given. `toolsForSettings`
-      // only shapes what's *offered*; this is the enforcement point that
-      // makes that toggle an actual authorization boundary rather than a
-      // polite suggestion the model can ignore. Still gets a result message,
-      // same invariant as the cancelled-call path below.
-      if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        return finishObservedTool(
-          stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
-        );
-      }
-
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
@@ -3520,6 +3564,7 @@ async function runAgentTurnBody(
       const programmaticContext: ProgrammaticToolContext = {
         toolDefinitions: toolsForTurn,
         workspaceRoots: useWorkspaceStore.getState().roots.map((root) => root.path),
+        isToolAvailable,
         invokeTool: async (nestedToolName, nestedArgs, nestedToolCallId, nestedSignal): Promise<ProgrammaticNestedToolResult> => {
           const nestedToolCall: ToolCall = {
             id: nestedToolCallId,
@@ -3544,6 +3589,7 @@ async function runAgentTurnBody(
             undefined,
             extensionRegistry,
             undefined,
+            toolExecutionContext,
           );
           const cancelled = nestedResult === CANCELLED_TOOL_RESULT || nestedSignal.aborted;
           await recorder?.recordToolFinished(nestedToolCallId, nestedResult, Date.now() - nestedStartedAt, cancelled);
@@ -3583,6 +3629,7 @@ async function runAgentTurnBody(
         undefined,
         extensionRegistry,
         programmaticContext,
+        toolExecutionContext,
       );
       return finishObservedTool(result);
     });
@@ -3604,68 +3651,6 @@ async function runAgentTurnBody(
       };
       addMessage(toolMessage);
 
-      // Track this turn's file mutations for `runVerificationPhase` at the
-      // loop's eventual exit — only for calls that actually ran (not
-      // cancelled, not rejected above) and actually succeeded (the
-      // "Wrote…"/"Edited…" string shape, not `{"error": ...}"`).
-      if (
-        !signal?.aborted
-        && (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file')
-      ) {
-        if (isSuccessfulMutationResult(resultContent)) {
-          const path = toolCallPathArg(toolCall);
-          if (path) {
-            mutatedFiles.add(path);
-            mutationSucceeded = true;
-            unresolvedMutationFailures.delete(path);
-          }
-        } else {
-          const path = toolCallPathArg(toolCall);
-          unresolvedMutationFailures.set(
-            path ?? `tool-call:${toolCall.id}`,
-            mutationToolFailureReason(resultContent)
-              ?? 'The file-mutation tool returned an error.',
-          );
-        }
-      }
-
-      // A successful `remember` gets its own transcript notice (with a
-      // Forget button — see MessageList.tsx's MemoryRow), cloned from how
-      // checkpoint_end's summary becomes a checkpoint notice. rulesStore is
-      // refreshed right after so later iterations of THIS turn already see
-      // the new fact in the system prompt, not just the next turn.
-      if (toolCall.function.name === 'remember') {
-        const fact = parseRememberedFact(resultContent);
-        if (fact) {
-          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
-          await useRulesStore.getState().refresh();
-        }
-      }
-
-      // A successful `present_plan` gets its own transcript notice (rendered
-      // as a `PlanCard` with Approve/Keep-planning buttons — see
-      // `MessageList.tsx`), cloned from the `remember` notice pattern just
-      // above. Gated on `resultContent === PRESENT_PLAN_RESULT` — the exact
-      // literal `executeToolCall`/`turnEngine.ts` returns for this tool and
-      // nothing else — rather than just the tool name, so a cancelled call
-      // (`CANCELLED_TOOL_RESULT`) or a call rejected by `isToolCallAllowed`
-      // above (which `continue`s before reaching here at all) never produces
-      // a plan card for a plan that was never actually presented.
-      if (toolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
-        const planArgs = toolCallPlanArgs(toolCall);
-        if (planArgs) {
-          addMessage({
-            role: 'system',
-            content: formatPlanNotice({
-              id: crypto.randomUUID(),
-              title: planArgs.title,
-              plan: planArgs.plan,
-              openQuestions: planArgs.openQuestions,
-              status: 'proposed',
-            }),
-          });
-        }
-      }
     }
 
     if (signal) await parkHere();

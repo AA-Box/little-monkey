@@ -78,6 +78,8 @@ export interface ProgrammaticExecutionRequest {
   signal?: AbortSignal;
   workspaceRoots?: readonly string[];
   limits?: Partial<ProgrammaticExecutionLimits>;
+  /** Current invocation-time authorization, distinct from the SDK snapshot. */
+  isToolAvailable: (toolName: string) => boolean;
   invokeTool: (
     toolName: string,
     args: Record<string, unknown>,
@@ -89,6 +91,7 @@ export interface ProgrammaticExecutionRequest {
 export interface ProgrammaticToolContext {
   toolDefinitions: readonly ToolDef[];
   workspaceRoots?: readonly string[];
+  isToolAvailable: (toolName: string) => boolean;
   invokeTool: ProgrammaticExecutionRequest["invokeTool"];
 }
 

@@ -28,7 +28,9 @@ import {
   type RiskAnnotationContext,
   type SkillToolContext,
   type SubagentContext,
+  type ToolExecutionContext,
 } from "./turnEngine";
+import { QuickJsProgrammaticRuntime } from "./programmaticQuickJsRuntime";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
 import type { ExtensionToolRegistry } from "./executableExtensionTools";
@@ -48,9 +50,122 @@ import { usePermissionStore } from "../store/permissionStore";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
 
+const programmaticReadTool: ToolDef = {
+  type: "function",
+  function: {
+    name: "read_file",
+    description: "Read a file",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+};
+
+const programmaticWriteTool: ToolDef = {
+  type: "function",
+  function: {
+    name: "write_file",
+    description: "Write a file",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+};
+
 function call(name: string, args: Record<string, unknown> = {}): ToolCall {
   return { id: `call-${name}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
 }
+
+describe("executeToolCall / programmatic dispatcher integration", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("routes nested SDK calls through the canonical dispatcher and completion lifecycle", async () => {
+    invokeMock.mockResolvedValue("Wrote 1 byte to a.txt");
+    const completed = vi.fn();
+    const executionContext: ToolExecutionContext = {
+      toolDefinitions: [programmaticWriteTool],
+      isToolAvailable: () => true,
+      onCompleted: completed,
+    };
+    const runtime = new QuickJsProgrammaticRuntime();
+    const result = await runtime.execute({
+      executionId: "integration-program",
+      source: 'return await tools.write_file({path: "a.txt", content: "x"});',
+      toolDefinitions: [programmaticWriteTool],
+      isToolAvailable: () => true,
+      invokeTool: async (name, args, id, signal) => {
+        const nestedCall = call(name, args);
+        nestedCall.id = id;
+        return {
+          content: await executeToolCall(
+          nestedCall,
+          "checkpoint-1",
+          "turn-1",
+          emptyMcpRegistry,
+          signal,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          executionContext,
+          ),
+          cancelled: false,
+        };
+      },
+    });
+
+    expect(result.status).toBe("succeeded");
+    expect(result.value).toBe("Wrote 1 byte to a.txt");
+    expect(invokeMock).toHaveBeenCalledWith("tool_write_file", expect.objectContaining({
+      path: "a.txt",
+      content: "x",
+      checkpoint_id: "checkpoint-1",
+      turn_id: "turn-1",
+    }));
+    expect(completed).toHaveBeenCalledWith(
+      expect.objectContaining({ function: expect.objectContaining({ name: "write_file" }) }),
+      "Wrote 1 byte to a.txt",
+    );
+  });
+
+  it("rejects invalid arguments before the dispatcher invokes the host tool", async () => {
+    const completed = vi.fn();
+    const result = await executeToolCall(
+      call("read_file", { path: 42 }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { toolDefinitions: [programmaticReadTool], onCompleted: completed },
+    );
+
+    expect(JSON.parse(result).error).toContain("Invalid arguments for \"read_file\"");
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(completed).toHaveBeenCalledOnce();
+  });
+});
 
 describe("executeToolCall / present_plan", () => {
   beforeEach(() => {

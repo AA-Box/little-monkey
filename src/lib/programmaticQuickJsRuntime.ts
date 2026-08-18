@@ -102,82 +102,6 @@ function parseToolContent(content: string): unknown {
   }
 }
 
-interface JsonSchemaLike {
-  type?: string | string[];
-  enum?: unknown[];
-  properties?: Record<string, JsonSchemaLike>;
-  required?: string[];
-  additionalProperties?: boolean;
-  items?: JsonSchemaLike;
-  minLength?: number;
-  maxLength?: number;
-  minimum?: number;
-  maximum?: number;
-}
-
-function jsonEqual(left: unknown, right: unknown): boolean {
-  try {
-    return JSON.stringify(left) === JSON.stringify(right);
-  } catch {
-    return false;
-  }
-}
-
-/** Validates against the exact schema offered to the model; no second schema
- * or coercion path is introduced for programmatic calls. */
-function validateToolArguments(value: unknown, schema: object): string | null {
-  const visit = (entry: unknown, current: JsonSchemaLike, path: string): string | null => {
-    if (current.enum && !current.enum.some((candidate) => jsonEqual(candidate, entry))) {
-      return `${path} must match one of the offered values.`;
-    }
-    const types = current.type ? (Array.isArray(current.type) ? current.type : [current.type]) : [];
-    if (types.length > 0) {
-      const matches = types.some((type) => {
-        switch (type) {
-          case "object": return entry !== null && typeof entry === "object" && !Array.isArray(entry);
-          case "array": return Array.isArray(entry);
-          case "string": return typeof entry === "string";
-          case "boolean": return typeof entry === "boolean";
-          case "number": return typeof entry === "number" && Number.isFinite(entry);
-          case "integer": return typeof entry === "number" && Number.isSafeInteger(entry);
-          case "null": return entry === null;
-          default: return true;
-        }
-      });
-      if (!matches) return `${path} has the wrong type.`;
-    }
-    if (typeof entry === "string") {
-      if (current.minLength !== undefined && entry.length < current.minLength) return `${path} is too short.`;
-      if (current.maxLength !== undefined && entry.length > current.maxLength) return `${path} is too long.`;
-    }
-    if (typeof entry === "number") {
-      if (current.minimum !== undefined && entry < current.minimum) return `${path} is below the minimum.`;
-      if (current.maximum !== undefined && entry > current.maximum) return `${path} is above the maximum.`;
-    }
-    if (Array.isArray(entry) && current.items) {
-      for (let index = 0; index < entry.length; index += 1) {
-        const error = visit(entry[index], current.items, `${path}[${index}]`);
-        if (error) return error;
-      }
-    }
-    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-      const object = entry as Record<string, unknown>;
-      for (const required of current.required ?? []) {
-        if (!(required in object)) return `${path}.${required} is required.`;
-      }
-      const properties = current.properties ?? {};
-      for (const [key, child] of Object.entries(object)) {
-        if (current.additionalProperties === false && !(key in properties)) return `${path}.${key} is not allowed.`;
-        const error = properties[key] ? visit(child, properties[key], `${path}.${key}`) : null;
-        if (error) return error;
-      }
-    }
-    return null;
-  };
-
-  return visit(value, schema as JsonSchemaLike, "arguments");
-}
-
 function redactEvidenceValue(value: unknown, workspaceRoots: readonly string[]): unknown {
   if (typeof value === "string") {
     return boundedText(redactPrivatePaths(redactSensitiveText(value), workspaceRoots), 4_000);
@@ -250,6 +174,12 @@ function classifyRuntimeFailure(message: string, stop: StopReason | null): Progr
 }
 
 function createProgramSource(source: string, toolNames: readonly string[]): string {
+  // SECURITY REVIEW: programBody is JSON.stringify-quoted before it is placed
+  // in the generated wrapper. This Function is created by the QuickJS guest
+  // after context.evalCode has entered the isolated WASM runtime; it is never
+  // evaluated by the host JavaScript realm. The guest receives only frozen,
+  // JSON-marshalled tools and console, while the host bridge remains hidden
+  // behind the deleted global handles and the canonical dispatcher.
   const tools = toolNames
     .map(
       (name) =>
@@ -455,6 +385,7 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
     const context: QuickJSContext = runtime.newContext();
     const inFlight = new Set<Promise<void>>();
     const deferredPromises = new Set<QuickJSDeferredPromise>();
+    let runtimeClosed = false;
     let nestedCount = 0;
     let activeNested = 0;
     const waiters: Array<() => void> = [];
@@ -475,6 +406,14 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
       }
       await new Promise<void>((resolve) => waiters.push(resolve));
       return !signal.aborted;
+    };
+    const drainInFlight = async (maxMs: number): Promise<void> => {
+      const pending = [...inFlight];
+      if (pending.length === 0 || maxMs <= 0) return;
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>((resolve) => setTimeout(resolve, maxMs)),
+      ]);
     };
 
     const logHandle = context.newFunction("__lmLog", (serializedHandle) => {
@@ -516,12 +455,19 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
         throw new Error(`${PROGRAM_INVALID_RESULT} invalid nested tool arguments: ${safeErrorMessage(error)}`);
       }
 
-      const definition = request.toolDefinitions.find((candidate) => candidate.function.name === toolName);
-      const schemaError = definition ? validateToolArguments(args, definition.function.parameters) : null;
-
       const offered = request.toolDefinitions.some(
         (definition) => definition.function.name === toolName && definition.function.name !== PROGRAMMATIC_TOOL_NAME,
       );
+      if (!offered) {
+        throw new Error(toPromiseError(failure("nested_tool_failure", `Tool "${toolName}" was not offered this turn.`, toolName)));
+      }
+      if (!request.isToolAvailable(toolName)) {
+        throw new Error(toPromiseError(failure("nested_tool_failure", `Tool "${toolName}" is no longer available.`, toolName)));
+      }
+      if (nestedCount >= limits.maxNestedCalls) {
+        throw new Error(toPromiseError(failure("execution_budget", "The nested tool-call limit was exceeded.", toolName)));
+      }
+
       const evidence: ProgrammaticNestedCallEvidence = {
         id: `${request.executionId}:nested:${nestedCount + 1}`,
         toolName,
@@ -536,6 +482,7 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
       const settleFailure = (nestedFailure: ProgrammaticFailure) => {
         evidence.status = nestedFailure.category === "cancelled" ? "cancelled" : "failed";
         evidence.failure = nestedFailure;
+        if (runtimeClosed) return;
         const errorHandle = context.newError(toPromiseError(nestedFailure));
         deferred.reject(errorHandle);
         errorHandle.dispose();
@@ -544,23 +491,6 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
           deferredPromises.delete(deferred);
         });
       };
-
-      if (!offered) {
-        settleFailure(failure("nested_tool_failure", `Tool "${toolName}" was not offered this turn.`, toolName));
-        return deferred.handle;
-      }
-      if (toolName === PROGRAMMATIC_TOOL_NAME) {
-        settleFailure(failure("nested_tool_failure", "Recursive programmatic execution is not allowed.", toolName));
-        return deferred.handle;
-      }
-      if (nestedCount > limits.maxNestedCalls) {
-        settleFailure(failure("execution_budget", "The nested tool-call limit was exceeded.", toolName));
-        return deferred.handle;
-      }
-      if (schemaError) {
-        settleFailure(failure("nested_tool_failure", `Invalid arguments: ${schemaError}`, toolName));
-        return deferred.handle;
-      }
 
       const nestedToolCallId = evidence.id;
       const work = (async () => {
@@ -571,6 +501,7 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
         }
         const nestedStartedAt = Date.now();
         try {
+          if (runtimeClosed) return;
           const result = await request.invokeTool(toolName, args, nestedToolCallId, signal);
           evidence.durationMs = Date.now() - nestedStartedAt;
           if (result.failure || result.cancelled) {
@@ -585,6 +516,7 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
           }
           evidence.status = "succeeded";
           evidence.result = redactEvidenceValue(value, workspaceRoots);
+          if (runtimeClosed) return;
           const guestValue = context.newString(serializedValue);
           deferred.resolve(guestValue);
           guestValue.dispose();
@@ -600,7 +532,10 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
         }
       })();
       inFlight.add(work);
-      void work.finally(() => inFlight.delete(work));
+      void work.then(
+        () => inFlight.delete(work),
+        () => inFlight.delete(work),
+      );
       return deferred.handle;
     });
     context.setProp(context.global, "__lmInvoke", invokeHandle);
@@ -650,7 +585,11 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
           new Promise((resolveDelay) => setTimeout(resolveDelay, Math.max(1, deadline - Date.now()))),
         ]);
       }
-      await Promise.allSettled([...inFlight]);
+      await drainInFlight(Math.max(0, deadline - Date.now()));
+      if (inFlight.size > 0 && !stopReason) {
+        stopReason = { kind: "timeout" };
+        controller.abort();
+      }
 
       if (stopReason || signal.aborted) {
         const stopped = stopReason ?? { kind: "cancelled" as const };
@@ -725,7 +664,8 @@ export class QuickJsProgrammaticRuntime implements ProgrammaticExecutionRuntime 
     } finally {
       controller.abort();
       for (const resolve of waiters.splice(0)) resolve();
-      await Promise.allSettled([...inFlight]);
+      await drainInFlight(0);
+      runtimeClosed = true;
       for (const deferred of deferredPromises) deferred.dispose();
       deferredPromises.clear();
       resolution = null;
