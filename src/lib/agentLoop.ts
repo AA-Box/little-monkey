@@ -50,6 +50,7 @@ import {
   executeToolCall,
   isBlockedInPlanMode,
   isToolCallAllowed,
+  programmaticToolExecutionId,
   PRESENT_PLAN_RESULT,
   type ResolvedTarget,
   type RiskAnnotationContext,
@@ -3481,15 +3482,18 @@ async function runAgentTurnBody(
     const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       const toolStartedAt = Date.now();
       const recorder = durable.recorder;
+      const recorderToolCallId = toolCall.function.name === PROGRAMMATIC_TOOL.function.name
+        ? programmaticToolExecutionId(recorder?.runId ?? turnId, toolCall.id)
+        : toolCall.id;
       await recorder?.recordToolProposed(
-        toolCall.id,
+        recorderToolCallId,
         toolCall.function.name,
         toolCall.function.arguments ?? '{}',
       );
-      recorder?.recordToolStarted(toolCall.id);
+      recorder?.recordToolStarted(recorderToolCallId);
       const finishObservedTool = async (result: string): Promise<string> => {
         await recorder?.recordToolFinished(
-          toolCall.id,
+          recorderToolCallId,
           result,
           Date.now() - toolStartedAt,
           result === CANCELLED_TOOL_RESULT || signal?.aborted === true,

@@ -213,6 +213,15 @@ fn envelope(run_id: &str, sequence: u64, event_id: &str, event: RunEvent) -> Run
     }
 }
 
+fn protocol_tool_call_id(value: &str) -> String {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in value.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x01000193);
+    }
+    format!("tool-{value}-{hash:08x}")
+}
+
 fn proposed(
     run_id: &str,
     sequence: u64,
@@ -491,7 +500,7 @@ async fn checkpoint_records_real_mutation_and_persists_summary() {
 }
 
 #[tokio::test]
-async fn nested_calls_have_real_run_evidence_and_outer_linkage() {
+async fn nested_ledger_events_preserve_programmatic_identity() {
     let harness = Harness::new();
     let run_id = "programmatic-run";
     let spec = run_spec(&harness, run_id);
@@ -520,23 +529,21 @@ async fn nested_calls_have_real_run_evidence_and_outer_linkage() {
             .unwrap();
     }
 
-    let outer_id = "outer-call";
-    let nested_id = "outer-call:nested:1";
-    harness.append(proposed(run_id, 3, outer_id, "read_file", false));
-    harness.append(started(run_id, 4, outer_id));
-    let read = tools::tool_read_file(harness.state(), "ordinary.txt".to_string(), None).await;
-    assert!(read.is_err());
-    harness.append(finished(run_id, 5, outer_id, ToolOutcome::Failed));
+    let outer_id = protocol_tool_call_id("turn-production:call-run-program");
+    let nested_id = format!("{outer_id}:nested:1");
+    harness.append(proposed(run_id, 3, &outer_id, "run_program", false));
+    harness.append(started(run_id, 4, &outer_id));
+    harness.append(finished(run_id, 5, &outer_id, ToolOutcome::Succeeded));
 
-    harness.append(proposed(run_id, 6, nested_id, "write_file", true));
-    harness.append(started(run_id, 7, nested_id));
+    harness.append(proposed(run_id, 6, &nested_id, "write_file", true));
+    harness.append(started(run_id, 7, &nested_id));
     let nested = write_with_decision(
         &harness,
         "nested.txt",
         "nested result",
         None,
         Some(run_id),
-        Some(nested_id),
+        Some(&nested_id),
         true,
     )
     .await
@@ -546,7 +553,7 @@ async fn nested_calls_have_real_run_evidence_and_outer_linkage() {
         run_id,
         "nested-finished",
         RunEvent::ToolFinished {
-            tool_call_id: nested_id.to_string(),
+            tool_call_id: nested_id.clone(),
             outcome: ToolOutcome::Succeeded,
             output_excerpt: None,
             output_sha256: None,
@@ -557,7 +564,7 @@ async fn nested_calls_have_real_run_evidence_and_outer_linkage() {
         run_id,
         "outer-finished",
         RunEvent::ToolFinished {
-            tool_call_id: outer_id.to_string(),
+            tool_call_id: outer_id.clone(),
             outcome: ToolOutcome::Succeeded,
             output_excerpt: None,
             output_sha256: None,
@@ -584,13 +591,13 @@ async fn nested_calls_have_real_run_evidence_and_outer_linkage() {
     harness.with_ledger(|ledger| {
         let events = ledger.load_events(run_id, 0, 100).unwrap();
         assert!(events.iter().any(|event| {
-            matches!(&event.event, RunEvent::ToolProposed { tool_call_id, .. } if tool_call_id == outer_id)
+            matches!(&event.event, RunEvent::ToolProposed { tool_call_id, tool_name, .. } if tool_call_id == &outer_id && tool_name == "run_program")
         }));
         assert!(events.iter().any(|event| {
-            matches!(&event.event, RunEvent::ToolFinished { tool_call_id, .. } if tool_call_id == nested_id)
+            matches!(&event.event, RunEvent::ToolFinished { tool_call_id, .. } if tool_call_id == &nested_id)
         }));
         let decisions = ledger
-            .permission_decisions_for_tool_call(nested_id)
+            .permission_decisions_for_tool_call(&nested_id)
             .unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].decision, Some(PermissionDecision::AllowOnce));

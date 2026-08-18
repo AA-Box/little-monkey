@@ -31,14 +31,22 @@ in-memory `RunLedger`; it does not mock the Tauri command boundary. The suite
 drives the real workspace resolver and native commands for ordinary reads,
 workspace escapes, allowed and denied permission prompts, and checkpointed
 mutations. It also invokes the real Component Model extension host and asserts
-outer/nested tool events, permission decisions, run evidence, and chain
-verification for a nested call.
+canonical outer/nested event shapes, permission decisions, run evidence, and
+chain verification at the ledger boundary.
 
-The Vitest coverage in `src/lib/turnEngine.test.ts` remains the QuickJS binding
-and dispatcher-boundary test. Vitest cannot host the native Tauri runtime, so
-the two suites provide complementary proof: QuickJS → dispatcher in TypeScript
-and dispatcher → permission/workspace/checkpoint/ledger/extension infrastructure
-in Rust, with the same production command implementations on the native side.
+`src/lib/durableRun.test.ts` additionally runs the production recorder with
+the exact turn-qualified `run_program` execution identity and its derived
+`:nested:1` identity, asserting the IDs emitted for proposed, started, and
+finished events. This closes the frontend runtime → recorder identity seam;
+the native suite verifies the recorder-shaped events at the real ledger and
+permission boundary.
+
+The Vitest coverage in `src/lib/turnEngine.test.ts` drives QuickJS through the
+production dispatcher and recorder boundary. Vitest cannot host the native
+Tauri runtime, so the two suites provide complementary proof: QuickJS →
+dispatcher → recorder in TypeScript and dispatcher →
+permission/workspace/checkpoint/ledger/extension infrastructure in Rust, with
+the same production command implementations on the native side.
 
 ## Threat model and limits
 

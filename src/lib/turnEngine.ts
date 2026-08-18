@@ -67,6 +67,11 @@ export interface ToolExecutionContext {
   onCompleted?: (toolCall: ToolCall, result: string) => void | Promise<void>;
 }
 
+/** The canonical execution identity shared by run_program and its recorder. */
+export function programmaticToolExecutionId(turnId: string, toolCallId: string): string {
+  return protocolToolCallId(`${turnId}:${toolCallId}`);
+}
+
 interface JsonSchemaLike {
   type?: string | string[];
   enum?: unknown[];
@@ -859,7 +864,7 @@ async function executeToolCallInner(
       return stringifyToolError(new Error('run_program requires a non-empty "source" string.'));
     }
     const result = await programmaticExecutionService.execute({
-      executionId: protocolToolCallId(`${turnId}:${toolCall.id}`),
+      executionId: programmaticToolExecutionId(turnId, toolCall.id),
       source,
       toolDefinitions: programmatic.toolDefinitions,
       signal,
