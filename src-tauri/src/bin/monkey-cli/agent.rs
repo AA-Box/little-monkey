@@ -47,6 +47,19 @@ macro_rules! statusln {
 }
 
 const MAX_ITERATIONS: usize = 25;
+const WORKSPACE_TOOL_NAMES: [&str; 11] = [
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "run_shell",
+    "shell_output",
+    "shell_kill",
+    "task",
+    "workflow",
+];
 
 const UNTRUSTED_BEGIN: &str = "--- BEGIN UNTRUSTED DATA ---";
 const UNTRUSTED_END: &str = "--- END UNTRUSTED DATA ---";
@@ -1816,6 +1829,15 @@ async fn run_tool_loop(
     // device can do this" is a worse answer than never having been offered it.
     if crate::daemon::remote::device::any_device_is_capable() {
         tools_vec.push(tools_def::device_action_tool_def());
+    }
+    if workspace::primary_root_canon(state).is_err() {
+        tools_vec.retain(|definition| {
+            let name = definition
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str);
+            !name.is_some_and(|name| WORKSPACE_TOOL_NAMES.contains(&name))
+        });
     }
     let native = target.is_native();
 
