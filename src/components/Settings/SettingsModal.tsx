@@ -114,7 +114,7 @@ interface SettingsModalProps {
   /** Tab to select the moment the modal transitions from closed to open —
    * the deep-link hook `PersonaSelector`'s "Manage prompts…" row (and
    * anything else that wants to jump straight to a tab) uses, via App.tsx.
-   * Left unset for the normal "open on whatever tab was last active" case. */
+   * Left unset for the normal open, which starts on Appearance. */
   initialTab?: SettingsTab;
   /** Changes for every deep-link request, including repeated requests for
    * the same tab while Settings is already open. */
@@ -313,16 +313,14 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
     }
   }, [ollamaConfigured, selectedProvider, selectedProviderId, tab]);
 
-  // Jump to the requested tab whenever the modal opens with one specified
-  // (e.g. PersonaSelector's "Manage prompts…" row) — re-applied on every
-  // open, not just the first, so opening it a second time from a different
-  // deep link still lands on the right tab even if the modal already
-  // remembers a different one from last time.
+  // Select the requested tab for deep links, or reset to Appearance for every
+  // normal open. The modal remains mounted after closing, so this must run on
+  // each transition from closed to open rather than relying on useState's
+  // initial value.
   useEffect(() => {
-    if (open && initialTab) {
-      setTab(initialTab);
-      setQuery("");
-    }
+    if (!open) return;
+    setTab(initialTab ?? "appearance");
+    setQuery("");
   }, [open, initialTab, initialTabRequest]);
 
   useEffect(() => {

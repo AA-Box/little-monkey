@@ -628,13 +628,8 @@ function App() {
       shortcutDisplayLabel(id, detectShortcutPlatform(), shortcutOverrides),
     [shortcutOverrides],
   );
-  // Tab Settings should jump to the moment it opens — set alongside the
-  // active feature panel by anything that deep-links into a specific tab (right
-  // now just `PersonaSelector`'s "Manage prompts…" row); left `undefined`
-  // for the normal "open on whatever tab was last active" path (AppMenu).
-  // Reset back to `undefined` on close (see the `SettingsModal` below) so a
-  // one-off deep link doesn't stick around and hijack every later normal
-  // open too.
+  // Deep links can select a specific Settings tab for one opening; normal
+  // Settings opens start on Appearance.
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab | undefined>(undefined);
   // A sequence number makes repeated requests for the same tab observable
   // even while Settings is already open and the user has navigated away.
