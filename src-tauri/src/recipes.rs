@@ -437,7 +437,9 @@ impl DesktopTurnSnapshot {
         if let Some(workspace) = &self.workspace {
             workspace.validate().map_err(|error| error.to_string())?;
         } else if recipe.workspace.is_some() || !self.execution_roots.is_empty() {
-            return Err("desktop chat-only turns must not carry a workspace or execution roots".to_string());
+            return Err(
+                "desktop chat-only turns must not carry a workspace or execution roots".to_string(),
+            );
         }
         if self.workspace.is_none() && self.workspace_mutation_required {
             return Err("desktop workspace mutation requires an open workspace".to_string());
