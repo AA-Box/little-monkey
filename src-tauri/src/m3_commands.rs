@@ -245,6 +245,7 @@ pub async fn unload_mlx_for_studio(state: &M3CommandState) -> Result<(), String>
 /// Unloads Runtime Hub's MLX resident while the caller already holds the
 /// application-wide MLX ownership guard. Studio uses this form because it
 /// keeps the guard through `ensure_ready` and the complete generation.
+#[cfg(target_os = "macos")]
 pub(crate) async fn unload_mlx_for_studio_locked(state: &M3CommandState) -> Result<(), String> {
     let has_mlx = state
         .hub
@@ -281,6 +282,11 @@ pub(crate) async fn unload_mlx_for_studio_locked(state: &M3CommandState) -> Resu
     .await;
     state.finish_operation(&operation_id);
     result.map_err(command_error)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn unload_mlx_for_studio_locked(_state: &M3CommandState) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
