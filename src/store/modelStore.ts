@@ -583,7 +583,10 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     const [status, models, exampleTags] = await Promise.all([
       invoke<OllamaStatusEvent>("ollama_status"),
       invoke<OllamaModelInfo[]>("ollama_list_models").catch(() => [] as OllamaModelInfo[]),
-      invoke<string[]>("ollama_example_cloud_tags"),
+      // The local tag inventory is still valid when the optional cloud
+      // catalog is unavailable. Do not discard usable local Ollama/MLX
+      // models because that separate catalog request failed.
+      invoke<string[]>("ollama_example_cloud_tags").catch(() => [] as string[]),
     ]);
     set({
       ollamaReachable: status.reachable,
