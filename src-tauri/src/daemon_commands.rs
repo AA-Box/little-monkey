@@ -6,6 +6,7 @@
 //! engine/ledger owner.
 
 use rusqlite::{params, TransactionBehavior};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -244,6 +245,11 @@ pub struct RemotePairRequest {
     /// Empty for a runner-only controller — see the CLI's `--mobile` flag.
     #[serde(default)]
     pub mobile_capabilities: Vec<String>,
+    /// Grants over the device's own hardware (camera, microphone, location, …).
+    /// Empty means this runner can ask the device for nothing physical,
+    /// whatever the device advertises — see the CLI's `--device` flag.
+    #[serde(default)]
+    pub device_capabilities: Vec<String>,
 }
 
 fn cli_path() -> PathBuf {
@@ -261,6 +267,10 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
         .args(&args)
         .output()
         .map_err(|error| format!("Failed to start bundled monkey-cli: {error}"))?;
+    finish_cli_output(output)
+}
+
+fn finish_cli_output(output: std::process::Output) -> Result<String, String> {
     if output.stdout.len() > MAX_CLI_OUTPUT_BYTES || output.stderr.len() > MAX_CLI_OUTPUT_BYTES {
         return Err("Daemon command output exceeded 4 MiB".to_string());
     }
@@ -275,6 +285,15 @@ fn run_cli(args: Vec<String>) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|_| "Daemon output is not valid UTF-8".to_string())
 }
 
+fn run_cli_with_secret(args: Vec<String>, secret: String) -> Result<String, String> {
+    let output = Command::new(cli_path())
+        .args(&args)
+        .env("LM_EXTENSION_WEBHOOK_SECRET", secret)
+        .output()
+        .map_err(|error| format!("Failed to start bundled monkey-cli: {error}"))?;
+    finish_cli_output(output)
+}
+
 pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || run_cli(args))
         .await
@@ -282,6 +301,11 @@ pub(crate) async fn command(args: Vec<String>) -> Result<String, String> {
 }
 
 fn parse_json(output: &str) -> Result<Value, String> {
+    serde_json::from_str(output.trim())
+        .map_err(|error| format!("Invalid daemon JSON output: {error}"))
+}
+
+fn parse_typed_json<T: DeserializeOwned>(output: &str) -> Result<T, String> {
     serde_json::from_str(output.trim())
         .map_err(|error| format!("Invalid daemon JSON output: {error}"))
 }
@@ -346,6 +370,26 @@ fn validate_remote_pair_request(request: &RemotePairRequest) -> Result<(), Strin
         .any(|capability| !allowed_mobile.contains(&capability.as_str()))
     {
         return Err("Unknown mobile companion capability".to_string());
+    }
+    // Must stay in step with `protocol::PHYSICAL_DEVICE_CAPABILITIES`. The CLI
+    // re-checks it against the enum itself, so an unknown value fails there
+    // too; this refuses it before a sidecar process is spawned.
+    let allowed_device = [
+        "device_info",
+        "camera_capture",
+        "microphone_capture",
+        "location_read",
+        "notification_post",
+        "screen_capture",
+        "audio_playback",
+        "voice_stream",
+    ];
+    if request
+        .device_capabilities
+        .iter()
+        .any(|capability| !allowed_device.contains(&capability.as_str()))
+    {
+        return Err("Unknown device hardware capability".to_string());
     }
     if request.run_ids.is_empty() && request.workspace_ids.is_empty() {
         return Err("Pairing requires an exact run id or declared workspace id".to_string());
@@ -484,6 +528,45 @@ pub async fn daemon_desktop_install(
     let output = command(args).await?;
     let _ = app.emit(DAEMON_CHANGED_EVENT, "installed");
     Ok(output)
+}
+
+/// Bring the resident execution service to a usable state.
+///
+/// Every desktop chat turn executes on that service (see
+/// [`crate::m6a_desktop_bridge`]), which makes it runtime infrastructure rather
+/// than a feature: the app installs it, keeps it on the shipped build and
+/// starts it, and the user is never asked to go and do that themselves. This is
+/// called once at launch by [`ensure_resident_service_at_startup`] and again
+/// behind the Repair action chat offers when a turn cannot be routed.
+///
+/// The whole decision — install, republish, start, or nothing — belongs to
+/// `monkey daemon ensure`, which already owns the installed config, the
+/// published manifest and the running build. This is the fixed-argument bridge
+/// to it and nothing more.
+#[tauri::command]
+pub async fn daemon_desktop_ensure(app: tauri::AppHandle) -> Result<Value, String> {
+    let output = command(vec!["daemon".into(), "ensure".into(), "--json".into()]).await?;
+    let value: Value = serde_json::from_str(output.trim()).map_err(|error| error.to_string())?;
+    let _ = app.emit(DAEMON_CHANGED_EVENT, "ensured");
+    Ok(value)
+}
+
+/// Fire-and-forget [`daemon_desktop_ensure`] for the setup hook.
+///
+/// Failure is not fatal to launching and is not reported here: the person is
+/// told where it matters, by the chat surface that could not send, with a
+/// Repair action next to the sentence. This print is for a terminal-attached
+/// launch, matching every other best-effort startup step.
+///
+/// Release-only, with its one caller — see the comment there for why a dev
+/// build must not claim the machine's service definition.
+#[cfg(not(debug_assertions))]
+pub fn ensure_resident_service_at_startup(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = daemon_desktop_ensure(app).await {
+            eprintln!("Resident execution service could not be started: {error}");
+        }
+    });
 }
 
 #[tauri::command]
@@ -678,11 +761,10 @@ fn scheduler_now_ms() -> Result<u64, String> {
 }
 
 fn visible_recipes(state: &crate::AppState) -> Result<HashMap<String, VisibleRecipe>, String> {
-    let app_data = crate::app_paths::data_dir()
-        .ok_or_else(|| "Could not resolve application data directory".to_string())?;
+    let global_config_roots = crate::recipes::global_config_roots()?;
     let workspace = crate::workspace::primary_root_canon(state).ok();
     let mut visible = HashMap::new();
-    for discovered in crate::recipes::discover_recipes(workspace.as_deref(), &app_data) {
+    for discovered in crate::recipes::discover_recipes(workspace.as_deref(), &global_config_roots) {
         let Some(recipe) = discovered.recipe else {
             continue;
         };
@@ -1070,8 +1152,20 @@ pub async fn remote_host_disable() -> Result<String, String> {
     .await
 }
 
+/// Creates one invitation and hands the panel everything it needs to show it.
+///
+/// Returns JSON rather than the CLI's own sentence because the pairing panel
+/// has to *render* the compact code as a scannable image, and a webview cannot
+/// do that from a line of prose. `--qr --json` is always passed: the code costs
+/// nothing to compute, and an operator who has a phone in their hand should not
+/// have to re-run the command with another flag to get it — the invitation is
+/// one-time, so re-running it would strand the first one.
+///
+/// The doc comment sits *above* the attribute deliberately: `lib.rs`'s
+/// reachability guard scans the text between `#[tauri::command` and `fn`, and
+/// anything in that gap makes the command invisible to it.
 #[tauri::command]
-pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, String> {
+pub async fn remote_pair_create(request: RemotePairRequest) -> Result<Value, String> {
     validate_output_path(&request.output)?;
     validate_remote_pair_request(&request)?;
     let mut args = vec![
@@ -1084,6 +1178,8 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
         request.expires_minutes.to_string(),
         "--max-artifact-bytes".into(),
         request.max_artifact_bytes.to_string(),
+        "--qr".into(),
+        "--json".into(),
     ];
     for action in request.actions {
         args.extend(["--action".into(), action]);
@@ -1099,7 +1195,92 @@ pub async fn remote_pair_create(request: RemotePairRequest) -> Result<String, St
     for capability in request.mobile_capabilities {
         args.extend(["--mobile".into(), capability]);
     }
+    for capability in request.device_capabilities {
+        args.extend(["--device".into(), capability]);
+    }
+    parse_json(&command(args).await?)
+}
+
+// --- Push, as the operator's own configuration ------------------------------
+//
+// Little Monkey ships no push project, no key and no relay, so every one of
+// these commands acts on state the operator created on this machine. They are
+// here because the settings panel is where somebody decides whether their phone
+// may be woken at all, and shelling out to a terminal for that decision is how
+// a feature ends up switched on by nobody.
+
+#[tauri::command]
+pub async fn remote_push_status() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "push-status".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Turns push on, either as Web Push (this runner's own VAPID identity, no
+/// account anywhere) or against the operator's own Firebase project.
+///
+/// `include_detail` is passed through rather than defaulted here: it decides
+/// whether run specifics reach a lock screen, and the panel states that in the
+/// sentence beside the checkbox.
+#[tauri::command]
+pub async fn remote_push_configure(
+    web_push: bool,
+    vapid_subject: Option<String>,
+    project_id: Option<String>,
+    service_account: Option<String>,
+    include_detail: bool,
+) -> Result<String, String> {
+    let mut args = vec!["daemon".into(), "remote".into(), "push-configure".into()];
+    if web_push {
+        args.push("--web-push".into());
+        if let Some(subject) = vapid_subject {
+            validate_token("VAPID subject", &subject, 512)?;
+            args.extend(["--vapid-subject".into(), subject]);
+        }
+    } else {
+        let project = project_id.ok_or("A Firebase project id is required")?;
+        validate_token("project id", &project, 256)?;
+        let account = service_account.ok_or("A service account JSON key is required")?;
+        validate_existing_private_input("service account key", &account)?;
+        args.extend([
+            "--project-id".into(),
+            project,
+            "--service-account".into(),
+            account,
+        ]);
+    }
+    if include_detail {
+        args.push("--include-detail".into());
+    }
     command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_push_disable() -> Result<String, String> {
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "push-disable".into(),
+    ])
+    .await
+}
+
+#[tauri::command]
+pub async fn remote_push_test(device_id: String) -> Result<String, String> {
+    validate_id("device id", &device_id)?;
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "push-test".into(),
+        device_id,
+    ])
+    .await
 }
 
 #[tauri::command]
@@ -1221,6 +1402,386 @@ pub async fn remote_node_label(
     command(args).await
 }
 
+// --- Paired physical devices, for the desktop -----------------------------
+
+#[tauri::command]
+pub async fn remote_device_list() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Replaces one device's physical grant. The CLI refuses anything that is not
+/// a physical capability, so this cannot become a way to widen run access from
+/// the desktop.
+#[tauri::command]
+pub async fn remote_device_grant(
+    device_id: String,
+    capabilities: Vec<String>,
+) -> Result<String, String> {
+    validate_id("device id", &device_id)?;
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-grant".into(),
+        device_id,
+    ];
+    for capability in capabilities {
+        validate_token("device capability", &capability, 64)?;
+        args.extend(["--capability".into(), capability]);
+    }
+    command(args).await
+}
+
+#[tauri::command]
+pub async fn remote_device_commands(device_id: String, limit: u32) -> Result<Value, String> {
+    validate_id("device id", &device_id)?;
+    if !(1..=200).contains(&limit) {
+        return Err("Command limit must be 1..=200".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "daemon".into(),
+            "remote".into(),
+            "device-commands".into(),
+            device_id,
+            "--limit".into(),
+            limit.to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn remote_device_cancel(command_id: String) -> Result<String, String> {
+    validate_id("command id", &command_id)?;
+    command(vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-cancel".into(),
+        command_id,
+    ])
+    .await
+}
+
+/// The desktop half of the `device_action` agent tool.
+///
+/// Permission-gated here and then handed to the sidecar, which owns the queue,
+/// the capability intersection and the argument bounds — the desktop does not
+/// get a second, looser copy of any of them. Same division of labour as every
+/// other command in this file, and the reason it is a fixed argument vector
+/// rather than a passthrough: the model's arguments arrive as named parameters
+/// and are re-emitted as named flags, never as a caller-supplied argv.
+// The `allow` precedes the command attribute deliberately: `lib.rs`'s
+// `every_tauri_command_is_reachable_from_the_invoke_handler` scans what sits
+// *between* `#[tauri::command` and `fn`, and anything it does not recognize
+// there makes the command invisible to that guard.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command(rename_all = "snake_case")]
+pub async fn tool_device_action(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::AppState>,
+    action: String,
+    device_id: Option<String>,
+    position: Option<String>,
+    duration_ms: Option<u64>,
+    accuracy: Option<String>,
+    title: Option<String>,
+    body: Option<String>,
+    text: Option<String>,
+    run_id: Option<String>,
+    artifact_id: Option<String>,
+    wait_ms: Option<u64>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<Value, String> {
+    validate_token("device action", &action, 64)?;
+    let detail = match &device_id {
+        Some(device_id) => format!("{action} on {device_id}"),
+        None => action.clone(),
+    };
+    crate::permissions::request_permission(
+        &app,
+        state.inner(),
+        "device_action",
+        detail,
+        turn_id.as_deref(),
+        tool_call_id.as_deref(),
+        None,
+        None,
+    )
+    .await?;
+
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-action".into(),
+        action,
+        "--json".into(),
+    ];
+    if let Some(device_id) = device_id {
+        validate_id("device id", &device_id)?;
+        args.extend(["--device-id".into(), device_id]);
+    }
+    for (flag, value) in [
+        ("--position", position),
+        ("--accuracy", accuracy),
+        ("--title", title),
+        ("--body", body),
+        ("--text", text),
+    ] {
+        if let Some(value) = value {
+            validate_token(flag, &value, 1_024)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    // Ids, not free text: an artifact reference reaches the artifact route, so
+    // it goes through the same validation every other id on this bridge does.
+    for (flag, value) in [("--run-id", run_id), ("--artifact-id", artifact_id)] {
+        if let Some(value) = value {
+            validate_id(flag, &value)?;
+            args.extend([flag.into(), value]);
+        }
+    }
+    if let Some(duration_ms) = duration_ms {
+        args.extend(["--duration-ms".into(), duration_ms.to_string()]);
+    }
+    if let Some(wait_ms) = wait_ms {
+        args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    }
+    // The turn and the call inside it: the desktop's durable identity for this
+    // invocation, and the only thing that stops a replayed turn from taking a
+    // second photograph. Both come from the runtime, never from the model.
+    if let (Some(turn_id), Some(tool_call_id)) = (&turn_id, &tool_call_id) {
+        validate_id("turn id", turn_id)?;
+        validate_id("tool call id", tool_call_id)?;
+        args.extend([
+            "--invocation-id".into(),
+            format!("{turn_id}:{tool_call_id}"),
+        ]);
+    }
+    parse_json(&command(args).await?)
+}
+
+/// Fixed, pre-authorized device bridge for the Wasm permission broker. The
+/// extension host has already intersected the exact manifest grant with the
+/// invocation's artifact set; this function retains the daemon's authoritative
+/// paired-device capability intersection and argument normalization.
+pub(crate) async fn extension_device_action(
+    device_id: &str,
+    action: &str,
+    request: &Value,
+    invocation_id: &str,
+) -> Result<Value, String> {
+    validate_id("device id", device_id)?;
+    validate_id("extension invocation id", invocation_id)?;
+    if !matches!(
+        action,
+        "device_info"
+            | "camera_capture"
+            | "microphone_capture"
+            | "location_read"
+            | "notification_post"
+            | "screen_capture"
+            | "audio_playback"
+    ) {
+        return Err("Unsupported device capability".to_string());
+    }
+    let object = request
+        .as_object()
+        .ok_or_else(|| "Device request must be a JSON object".to_string())?;
+    let allowed = [
+        "position",
+        "duration_ms",
+        "accuracy",
+        "title",
+        "body",
+        "text",
+        "artifact_id",
+        "wait_ms",
+    ];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("Unknown device request field '{field}'"));
+    }
+
+    let mut args = vec![
+        "daemon".into(),
+        "remote".into(),
+        "device-action".into(),
+        action.into(),
+        "--device-id".into(),
+        device_id.into(),
+        "--run-id".into(),
+        invocation_id.into(),
+        "--json".into(),
+    ];
+    for (field, flag, max) in [
+        ("position", "--position", 16usize),
+        ("accuracy", "--accuracy", 16usize),
+        ("title", "--title", 128usize),
+        ("body", "--body", 512usize),
+        ("text", "--text", 4_096usize),
+    ] {
+        if let Some(value) = object.get(field).and_then(Value::as_str) {
+            validate_token(field, value, max)?;
+            args.extend([flag.into(), value.into()]);
+        }
+    }
+    if let Some(value) = object.get("artifact_id").and_then(Value::as_str) {
+        validate_id("artifact id", value)?;
+        args.extend(["--artifact-id".into(), value.into()]);
+    }
+    if let Some(value) = object.get("duration_ms").and_then(Value::as_u64) {
+        if value == 0 || value > 300_000 {
+            return Err("Device duration_ms is out of range".to_string());
+        }
+        args.extend(["--duration-ms".into(), value.to_string()]);
+    }
+    let wait_ms = object
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(10_000);
+    if !(1_000..=20_000).contains(&wait_ms) {
+        return Err("Device wait_ms must be 1000..=20000".to_string());
+    }
+    args.extend(["--wait-ms".into(), wait_ms.to_string()]);
+    parse_json(&command(args).await?)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) struct ExtensionWebhookStatus {
+    pub trigger_id: String,
+    pub handler_id: String,
+    pub version: String,
+    pub enabled: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn extension_webhook_register(
+    trigger_id: &str,
+    extension_id: &str,
+    handler_id: &str,
+    version: &str,
+    manifest_sha256: &str,
+    secret: String,
+    max_skew_ms: u64,
+) -> Result<(), String> {
+    validate_id("trigger id", trigger_id)?;
+    validate_id("extension id", extension_id)?;
+    validate_id("handler id", handler_id)?;
+    validate_id("extension version", version)?;
+    validate_id("extension manifest digest", manifest_sha256)?;
+    if secret.is_empty() || secret.len() > 64 * 1024 {
+        return Err("Webhook secret must contain 1-65536 bytes".to_string());
+    }
+    if !(1_000..=60 * 60 * 1_000).contains(&max_skew_ms) {
+        return Err("Webhook signature skew must be 1000..=3600000 ms".to_string());
+    }
+    let args = vec![
+        "daemon".into(),
+        "trigger".into(),
+        "add-webhook".into(),
+        trigger_id.into(),
+        "--extension-id".into(),
+        extension_id.into(),
+        "--extension-handler-id".into(),
+        handler_id.into(),
+        "--extension-version".into(),
+        version.into(),
+        "--extension-manifest-sha256".into(),
+        manifest_sha256.into(),
+        "--secret-env".into(),
+        "LM_EXTENSION_WEBHOOK_SECRET".into(),
+        "--max-skew-ms".into(),
+        max_skew_ms.to_string(),
+    ];
+    tokio::task::spawn_blocking(move || run_cli_with_secret(args, secret))
+        .await
+        .map_err(|error| error.to_string())??;
+    Ok(())
+}
+
+pub(crate) async fn extension_webhook_remove(
+    trigger_id: &str,
+    extension_id: &str,
+) -> Result<(), String> {
+    validate_id("trigger id", trigger_id)?;
+    validate_id("extension id", extension_id)?;
+    command(vec![
+        "daemon".into(),
+        "trigger".into(),
+        "remove".into(),
+        trigger_id.into(),
+        "--extension-id".into(),
+        extension_id.into(),
+    ])
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn extension_webhooks(
+    extension_id: &str,
+) -> Result<Vec<ExtensionWebhookStatus>, String> {
+    validate_id("extension id", extension_id)?;
+    let value = parse_json(
+        &command(vec![
+            "daemon".into(),
+            "trigger".into(),
+            "list".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "Daemon trigger list is not an array".to_string())?;
+    let mut result = Vec::new();
+    for row in rows {
+        let Some(config) = row.get("config") else {
+            continue;
+        };
+        let Some(target) = config.get("target") else {
+            continue;
+        };
+        if target.get("target_kind").and_then(Value::as_str) != Some("extension")
+            || target.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+        {
+            continue;
+        }
+        let trigger_id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger id is missing".to_string())?;
+        let handler_id = target
+            .get("handler_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger handler is missing".to_string())?;
+        let version = target
+            .get("version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Extension trigger version is missing".to_string())?;
+        result.push(ExtensionWebhookStatus {
+            trigger_id: trigger_id.to_string(),
+            handler_id: handler_id.to_string(),
+            version: version.to_string(),
+            enabled: row.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+        });
+    }
+    result.sort_by(|left, right| left.trigger_id.cmp(&right.trigger_id));
+    Ok(result)
+}
+
 #[tauri::command]
 pub async fn remote_audit(limit: u32) -> Result<Value, String> {
     if !(1..=10_000).contains(&limit) {
@@ -1249,6 +1810,48 @@ mod tests {
         assert!(validate_token("recipe", "recipe.json\0--purge", 100).is_err());
     }
 
+    /// The desktop writes the tunnel credential and the daemon reads it. They
+    /// are separate processes and separate constants, so nothing but a test
+    /// stops them naming different keychain entries — a drift whose only
+    /// symptom is "the tunnel says it has no credential" while the settings
+    /// page says one is stored.
+    #[test]
+    fn the_desktop_and_the_daemon_agree_on_the_tunnel_keychain_entry() {
+        assert_eq!(
+            TUNNEL_CREDENTIAL_REF, "channel-exposure:tunnel-token",
+            "if this changes, change `daemon::callback_exposure::TUNNEL_CREDENTIAL_REF` with it"
+        );
+    }
+
+    /// React names a provider from a closed set and nothing else. There is no
+    /// argument on any exposure command that could become a program to run.
+    #[test]
+    fn the_exposure_bridge_takes_no_command_from_the_frontend() {
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(channels_exposure_set_tunnel(
+                "/bin/sh".to_string(),
+                "monkey.example.com".to_string(),
+                "/usr/local/bin/cloudflared".to_string(),
+                None,
+            ));
+        assert!(refused.is_err(), "an arbitrary program is not a provider");
+
+        // And a value that would be read as a flag by the CLI's own parser is
+        // refused before it can become one.
+        let dashed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(channels_exposure_set_tunnel(
+                "cloudflared".to_string(),
+                "--clear".to_string(),
+                "/usr/local/bin/cloudflared".to_string(),
+                None,
+            ));
+        assert!(dashed.is_err());
+    }
+
     #[test]
     fn remote_pairing_is_bounded_before_cli_dispatch() {
         let valid = RemotePairRequest {
@@ -1259,6 +1862,7 @@ mod tests {
             workspace_ids: Vec::new(),
             max_artifact_bytes: 8 * 1024 * 1024,
             mobile_capabilities: Vec::new(),
+            device_capabilities: Vec::new(),
         };
         assert!(validate_remote_pair_request(&valid).is_ok());
 
@@ -1641,4 +2245,1581 @@ mod tests {
         assert_eq!(manual_enabled, 1);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// The peer bridge, held against a real `monkey peers list --json` payload
+    /// rather than a round trip of these structs' own output.
+    ///
+    /// A round trip would pass with any spelling, including one no CLI has ever
+    /// emitted and no `peersClient.ts` has ever read. What matters is that the
+    /// exact bytes the CLI prints decode here with every field populated, and
+    /// that what goes back out carries the same names the panel indexes by —
+    /// because a silent rename does not fail anywhere, it just renders blank.
+    #[test]
+    fn the_peer_bridge_decodes_the_cli_and_re_emits_what_the_panel_reads() {
+        let payload = r#"{
+            "inbound": [{
+                "device_id": "device-1",
+                "label": "Studio desktop",
+                "grants": ["message"],
+                "advertised_grants": ["message", "task", "artifact"],
+                "requested_grants": ["task"],
+                "state": "active",
+                "peer_only": true,
+                "last_sequence": 4,
+                "last_seen_at_ms": 1700000000000,
+                "presence": "online",
+                "secret_generation": 2
+            }],
+            "outbound": [{
+                "alias": "studio",
+                "peer_id": "runner-two",
+                "peer_url": "https://studio.invalid",
+                "grants": ["message", "task"],
+                "advertised_grants": ["message", "task", "artifact"],
+                "requested_grants": [],
+                "certificate_sha256": "ab",
+                "last_seen_at_ms": null,
+                "presence": "unknown",
+                "secret_generation": 1
+            }]
+        }"#;
+
+        let listed: PeerListResponse = parse_typed_json(payload).expect("decode the CLI payload");
+        let inbound = &listed.inbound[0];
+        assert_eq!(inbound.grants, vec![PeerGrantView::Message]);
+        // What it asked for is decoded, and is not what it holds.
+        assert_eq!(inbound.requested_grants, vec![PeerGrantView::Task]);
+        assert_eq!(inbound.presence, PeerPresenceView::Online);
+        assert_eq!(inbound.state, PeerPairingStateView::Active);
+        assert_eq!(inbound.last_seen_at_ms, Some(1_700_000_000_000));
+        assert_eq!(inbound.secret_generation, 2);
+        let outbound = &listed.outbound[0];
+        assert_eq!(outbound.presence, PeerPresenceView::Unknown);
+        assert_eq!(outbound.last_seen_at_ms, None);
+
+        // Back out under the names `peersClient.ts` declares. These views are
+        // snake_case in *both* directions, unlike the camelCase responses
+        // elsewhere in this file — see the comment above `PeerGrantView`.
+        let value = serde_json::to_value(&listed).unwrap();
+        for field in [
+            "device_id",
+            "advertised_grants",
+            "requested_grants",
+            "peer_only",
+            "last_seen_at_ms",
+            "secret_generation",
+            "presence",
+        ] {
+            assert!(
+                value["inbound"][0].get(field).is_some(),
+                "the panel reads `{field}` and the bridge did not emit it"
+            );
+        }
+        assert!(value["inbound"][0].get("deviceId").is_none());
+        assert_eq!(value["inbound"][0]["presence"], "online");
+        assert_eq!(value["inbound"][0]["requested_grants"][0], "task");
+
+        // An older CLI that has not learned the newer fields still decodes, so
+        // a mid-upgrade desktop shows a peer rather than an error.
+        let older: PeerListResponse = parse_typed_json(
+            r#"{"inbound":[{"device_id":"d","label":"l","grants":[],"state":"revoked",
+                 "peer_only":true,"last_sequence":0,"last_seen_at_ms":null,
+                 "presence":"unknown","secret_generation":1}],"outbound":[]}"#,
+        )
+        .expect("decode without the advertisement fields");
+        assert!(older.inbound[0].advertised_grants.is_empty());
+        assert_eq!(older.inbound[0].state, PeerPairingStateView::Revoked);
+    }
+
+    /// Every other peer command's response, same rule.
+    #[test]
+    fn each_peer_command_decodes_the_shape_its_cli_prints() {
+        let threads: PeerThreadsResponse = parse_typed_json(
+            r#"{"threads":[{"thread_id":"thread-1","peer_device_id":"device-1",
+                 "peer_instance_id":"instance-remote","session_key":"peer:device-1:thread-1",
+                 "created_at_ms":1,"last_activity_at_ms":2,"message_count":1,
+                 "recent":[{"message_id":"msg-1","direction":"inbound","kind":"task_request",
+                 "disposition":"rejected","rejection":"missing_capability","job_id":null,
+                 "correlation_id":"corr-1","created_at_ms":1}]}],"recipe":"peer-task"}"#,
+        )
+        .expect("threads");
+        assert_eq!(threads.recipe, "peer-task");
+        let message = &threads.threads[0].recent[0];
+        assert_eq!(message.disposition, PeerMessageDispositionView::Rejected);
+        assert_eq!(message.direction, PeerMessageDirectionView::Inbound);
+        assert_eq!(message.correlation_id.as_deref(), Some("corr-1"));
+
+        let rotated: PeerRotationResponse = parse_typed_json(
+            r#"{"device_id":"device-1","secret_generation":3,"output":"/tmp/rot.json"}"#,
+        )
+        .expect("rotation");
+        assert_eq!(rotated.secret_generation, 3);
+
+        let accepted: PeerRotationAcceptedResponse = parse_typed_json(
+            r#"{"alias":"studio","secret_generation":3,"certificate_sha256":"ab"}"#,
+        )
+        .expect("rotation accepted");
+        assert_eq!(accepted.alias, "studio");
+
+        let cleared: PeerClearResponse = parse_typed_json(
+            r#"{"device_id":"device-1","threads_removed":2,"grants_cleared":true}"#,
+        )
+        .expect("clear");
+        assert_eq!(cleared.threads_removed, 2);
+        assert!(cleared.grants_cleared);
+
+        // `peers status --json` carries more than the desktop reads. Extra
+        // fields must not break the decode, or adding one to the CLI would
+        // break the app.
+        let status: PeerStatusResponse = parse_typed_json(
+            r#"{"alias":"studio","peer_id":"runner-two","last_seen_at_ms":5,
+                "presence":"online","advertised_grants":["message"],"granted":["message"]}"#,
+        )
+        .expect("status");
+        assert_eq!(status.presence, PeerPresenceView::Online);
+        assert_eq!(status.last_seen_at_ms, Some(5));
+
+        let invited: PeerInvitationResponse = parse_typed_json(
+            r#"{"pairing_id":"pair-1","expires_at_ms":9,"grants":["message"],
+                "output":"/tmp/invite.json"}"#,
+        )
+        .expect("invitation");
+        assert_eq!(invited.grants, vec![PeerGrantView::Message]);
+
+        let paired: PeerAcceptedResponse = parse_typed_json(
+            r#"{"alias":"studio","peer_id":"runner-two","peer_url":"https://studio.invalid",
+                "grants":["message","task"],"certificate_sha256":"ab"}"#,
+        )
+        .expect("accepted");
+        assert_eq!(paired.grants.len(), 2);
+
+        let granted: PeerGrantResponse =
+            parse_typed_json(r#"{"device_id":"device-1","grants":["message","artifact"]}"#)
+                .expect("grant");
+        assert_eq!(
+            granted.grants,
+            vec![PeerGrantView::Message, PeerGrantView::Artifact]
+        );
+
+        // What this installation sent, as `peers outbound --json` and
+        // `peers remote-thread --json` both print it.
+        let outbound: PeerOutboundResponse = parse_typed_json(
+            r#"{"messages":[{"alias":"studio","message_id":"pmsg-1","thread_id":"thread-1",
+                "correlation_id":"corr-1","kind":"task_request","state":"succeeded",
+                "result_text":"the build is red because of a bad migration",
+                "sent_at_ms":1,"checked_at_ms":9}]}"#,
+        )
+        .expect("outbound");
+        assert_eq!(outbound.messages[0].state, "succeeded");
+        assert_eq!(
+            outbound.messages[0].correlation_id.as_deref(),
+            Some("corr-1")
+        );
+        assert_eq!(outbound.messages[0].checked_at_ms, Some(9));
+
+        // A task nobody has polled for yet: no result, no check time.
+        let pending: PeerOutboundResponse = parse_typed_json(
+            r#"{"messages":[{"alias":"studio","message_id":"pmsg-2","thread_id":"thread-1",
+                "correlation_id":null,"kind":"message","state":"queued","result_text":null,
+                "sent_at_ms":2,"checked_at_ms":null}]}"#,
+        )
+        .expect("pending outbound");
+        assert_eq!(pending.messages[0].result_text, None);
+        assert_eq!(pending.messages[0].checked_at_ms, None);
+    }
+
+    /// The remote poll takes an alias and a thread id, and nothing else can be
+    /// smuggled through either of them.
+    #[test]
+    fn the_remote_thread_bridge_refuses_anything_that_is_not_an_identifier() {
+        for forged in [
+            "../../v1/remote/runs",
+            "thread-1/../node",
+            "https://elsewhere.invalid",
+            "thread 1",
+            "",
+        ] {
+            assert!(
+                validate_id("thread id", forged).is_err(),
+                "'{forged}' must not reach a peer route"
+            );
+        }
+        assert!(validate_id("thread id", "thread-9f2c4a").is_ok());
+    }
+
+    /// A grant the peer surface must never hand out is refused at the bridge,
+    /// before an argument is built.
+    #[test]
+    fn the_peer_bridge_refuses_a_grant_that_is_not_a_peer_grant() {
+        assert!(peer_grants(&["message".into(), "task".into()]).is_ok());
+        for forbidden in ["admin", "place_runs", "view_runs", "control_desktop", ""] {
+            assert!(
+                peer_grants(&[forbidden.to_string()]).is_err(),
+                "'{forbidden}' must not be spellable as a peer grant"
+            );
+        }
+    }
+}
+
+// --- Messaging channels ---------------------------------------------------
+//
+// Thin, fixed-argument wrappers over `monkey channels …`. The rules live in the
+// CLI (one implementation, two front ends); these exist so the desktop can call
+// them without an arbitrary command executor, and so every identifier the UI
+// passes is validated before it reaches an argument vector.
+//
+// `channels_set_credential` is the single place a secret crosses this boundary,
+// and it writes straight to the keychain rather than through an argument
+// vector: a credential must never be visible in a process listing.
+
+const MAX_CHANNEL_ID: usize = 128;
+
+fn channel_id(label: &str, value: &str) -> Result<String, String> {
+    validate_id(label, value)?;
+    if value.len() > MAX_CHANNEL_ID || value.starts_with('-') {
+        // A value that starts with a dash would be read as a flag by the CLI's
+        // own parser even though nothing here goes through a shell.
+        return Err(format!("Invalid {label}"));
+    }
+    Ok(value.to_string())
+}
+
+/// Conversations that live outside the desktop app — a paired phone's chat, a
+/// messaging conversation the agent is answering — so the session list can
+/// show them next to this machine's own sessions.
+///
+/// `environment` is optional and validated as a token rather than an id: it is
+/// a fixed vocabulary (`remote_control`, `channel`, `channel:<provider>`) the
+/// CLI itself refuses anything outside of.
+#[tauri::command]
+pub async fn conversations_list(environment: Option<String>, limit: u32) -> Result<Value, String> {
+    let mut args = vec!["conversations".into(), "list".into()];
+    if let Some(environment) = environment {
+        validate_token("environment", &environment, 64)?;
+        if environment.starts_with('-') {
+            return Err("Invalid environment".to_string());
+        }
+        args.push("--environment".into());
+        args.push(environment);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 500).to_string());
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// One outside conversation's transcript, oldest first.
+#[tauri::command]
+pub async fn conversations_show(
+    environment: String,
+    id: String,
+    limit: u32,
+) -> Result<Value, String> {
+    validate_token("environment", &environment, 64)?;
+    let id = channel_id("conversation id", &id)?;
+    if environment.starts_with('-') {
+        return Err("Invalid environment".to_string());
+    }
+    parse_json(
+        &command(vec![
+            "conversations".into(),
+            "show".into(),
+            "--environment".into(),
+            environment,
+            "--id".into(),
+            id,
+            "--limit".into(),
+            limit.clamp(1, 2_000).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn channels_list() -> Result<Value, String> {
+    parse_json(&command(vec!["channels".into(), "list".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn channels_add(
+    kind: String,
+    label: String,
+    config: Option<String>,
+) -> Result<Value, String> {
+    validate_token("provider", &kind, 32)?;
+    validate_token("label", &label, 120)?;
+    let mut args = vec!["channels".into(), "add".into(), kind, label];
+    if let Some(config) = config {
+        // Parsed here as well as in the CLI so a malformed object is refused
+        // before it becomes a process argument.
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Provider settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// Probe an account. The only path that can move an account to `connected`.
+#[tauri::command]
+pub async fn channels_probe(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "probe".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn channels_enable(account_id: String, enabled: bool) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "enable".into(), account_id];
+    if !enabled {
+        args.push("--off".into());
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_set_policy(
+    account_id: String,
+    direct: Option<String>,
+    group: Option<String>,
+    activation: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "policy".into(), account_id];
+    for (flag, value) in [
+        ("--direct", direct),
+        ("--group", group),
+        ("--activation", activation),
+    ] {
+        if let Some(value) = value {
+            validate_token("policy", &value, 32)?;
+            args.push(flag.into());
+            args.push(value);
+        }
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_senders(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "senders".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Approve or block a waiting sender.
+///
+/// Approval is the ability to send messages and nothing else — no tool, device
+/// or telephony authority follows from it.
+#[tauri::command]
+pub async fn channels_decide_sender(
+    account_id: String,
+    sender_id: String,
+    approve: bool,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let sender_id = channel_id("sender id", &sender_id)?;
+    command(vec![
+        "channels".into(),
+        if approve {
+            "approve".into()
+        } else {
+            "block".into()
+        },
+        account_id,
+        sender_id,
+    ])
+    .await
+    .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_routes() -> Result<Value, String> {
+    parse_json(&command(vec!["channels".into(), "routes".into(), "--json".into()]).await?)
+}
+
+/// The scope and target fields `channels_add_route`/`channels_update_route`
+/// share, exactly the CLI's `RouteOptions`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct RouteOptionArgs {
+    pub account_id: Option<String>,
+    pub conversation_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub sender_id: Option<String>,
+    pub kind: Option<String>,
+    pub repository: Option<String>,
+    /// Recipe parameters as `name=value` strings.
+    #[serde(default)]
+    pub params: Vec<String>,
+    pub session_scope: Option<String>,
+    pub priority: Option<i32>,
+    /// Whether runs of this route may answer their conversation. Defaults on.
+    pub reply: Option<bool>,
+    /// Whether the route is active. Defaults on.
+    pub enabled: Option<bool>,
+}
+
+/// Turn the shared route fields into CLI arguments.
+///
+/// Every valued flag is passed as one `--flag=value` token: a provider
+/// conversation id may legitimately begin with a dash (a Telegram group id
+/// does), and as a separate token the CLI's parser would read it as a flag.
+fn route_option_args(options: RouteOptionArgs, args: &mut Vec<String>) -> Result<(), String> {
+    for (flag, value) in [
+        ("--account", options.account_id),
+        ("--conversation", options.conversation_id),
+        ("--thread", options.thread_id),
+        ("--sender", options.sender_id),
+        ("--kind", options.kind),
+    ] {
+        if let Some(value) = value {
+            validate_token("route scope", &value, MAX_CHANNEL_ID)?;
+            args.push(format!("{flag}={value}"));
+        }
+    }
+    if let Some(repository) = options.repository {
+        validate_token("repository", &repository, 512)?;
+        args.push(format!("--repository={repository}"));
+    }
+    for param in options.params {
+        validate_token("route param", &param, 512)?;
+        if !param.contains('=') {
+            return Err("Route parameters must be name=value".to_string());
+        }
+        args.push(format!("--param={param}"));
+    }
+    if let Some(session_scope) = options.session_scope {
+        validate_token("session scope", &session_scope, 32)?;
+        args.push(format!("--session-scope={session_scope}"));
+    }
+    if let Some(priority) = options.priority {
+        args.push(format!("--priority={priority}"));
+    }
+    if options.reply == Some(false) {
+        args.push("--no-reply".into());
+    }
+    if options.enabled == Some(false) {
+        args.push("--disabled".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn channels_add_route(
+    recipe: String,
+    options: Option<RouteOptionArgs>,
+) -> Result<Value, String> {
+    validate_token("recipe", &recipe, 200)?;
+    if recipe.starts_with('-') {
+        return Err("Invalid recipe".to_string());
+    }
+    let mut args = vec!["channels".into(), "add-route".into(), recipe];
+    route_option_args(options.unwrap_or_default(), &mut args)?;
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+#[tauri::command]
+pub async fn channels_update_route(
+    route_id: String,
+    recipe: String,
+    options: Option<RouteOptionArgs>,
+) -> Result<Value, String> {
+    let route_id = channel_id("route id", &route_id)?;
+    validate_token("recipe", &recipe, 200)?;
+    if recipe.starts_with('-') {
+        return Err("Invalid recipe".to_string());
+    }
+    let mut args = vec!["channels".into(), "update-route".into(), route_id, recipe];
+    route_option_args(options.unwrap_or_default(), &mut args)?;
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+#[tauri::command]
+pub async fn channels_enable_route(route_id: String, enabled: bool) -> Result<(), String> {
+    let route_id = channel_id("route id", &route_id)?;
+    let mut args = vec!["channels".into(), "enable-route".into(), route_id];
+    if !enabled {
+        args.push("--off".into());
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_remove_route(route_id: String) -> Result<(), String> {
+    let route_id = channel_id("route id", &route_id)?;
+    command(vec!["channels".into(), "remove-route".into(), route_id])
+        .await
+        .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn channels_events(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "events".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn channels_remove(account_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    command(vec!["channels".into(), "remove".into(), account_id])
+        .await
+        .map(|_| ())
+}
+
+/// Edit an existing account's non-secret settings and label. Secrets cannot
+/// travel through here: the CLI subcommand this wraps writes
+/// `non_secret_config` and `label` and nothing else.
+#[tauri::command]
+pub async fn channels_set_config(
+    account_id: String,
+    config: Option<String>,
+    label: Option<String>,
+) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["channels".into(), "set-config".into(), account_id];
+    if let Some(config) = config {
+        // Parsed here as well as in the CLI so a malformed object is refused
+        // before it becomes a process argument.
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Provider settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    if let Some(label) = label {
+        validate_token("label", &label, 120)?;
+        args.push(format!("--label={label}"));
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// The complete callback URL for a webhook account, or `configured: false`
+/// with the listener path when no public base URL is set. Composed by the
+/// daemon — the one authority on what it is reachable as — never glued
+/// together in the frontend.
+#[tauri::command]
+pub async fn channels_callback_url(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "callback-url".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Set or clear the public base URL webhook callbacks are advertised under.
+#[tauri::command]
+pub async fn channels_set_public_url(url: Option<String>) -> Result<(), String> {
+    let mut args = vec!["channels".into(), "set-public-url".into()];
+    match url {
+        Some(url) => {
+            validate_token("public base URL", &url, 512)?;
+            // A positional argument, so a value starting with a dash would be
+            // read as a flag by the CLI's own parser — `--clear` typed into
+            // the URL box must not clear the setting instead of failing.
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err("The public base URL must start with http:// or https://".to_string());
+            }
+            args.push(url);
+        }
+        None => args.push("--clear".into()),
+    }
+    command(args).await.map(|_| ())
+}
+
+/// Store an account's credential.
+///
+/// Writes to the same keychain entry the daemon's adapters read, named by the
+/// one definition both sides share, so the desktop and the CLI cannot drift
+/// into writing different entries. The value is never echoed back, never
+/// logged, and never returned — the account row only ever learns that a
+/// credential exists.
+#[tauri::command]
+pub async fn channels_set_credential(account_id: String, secret: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if secret.is_empty() || secret.len() > 8192 {
+        return Err("A messaging credential must contain 1-8192 bytes".to_string());
+    }
+    let reference = crate::channels::credential_ref(&account_id);
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
+        .map_err(|error| format!("Failed to open the messaging keychain entry: {error}"))?
+        .set_password(&secret)
+        .map_err(|error| format!("Failed to save the messaging credential: {error}"))?;
+    // The CLI owns the account row; this marks it as having a credential.
+    command(vec![
+        "channels".into(),
+        "mark-credential".into(),
+        account_id,
+    ])
+    .await
+    .map(|_| ())
+}
+
+// --- Public callback exposure ------------------------------------------------
+//
+// How this machine is reached from the internet, as five fixed-argument
+// commands. Note what React cannot express through any of them: it names a
+// tunnel provider from a closed set, a hostname, and a path — never an argv,
+// never a flag, never a command to run. The daemon builds what it executes from
+// its own template, and the credential goes from here straight to the keychain
+// without passing through a CLI argument at all.
+
+/// What the exposure is configured as and what it is doing. Never a credential:
+/// the status type has no field for one.
+#[tauri::command]
+pub async fn channels_exposure_status() -> Result<Value, String> {
+    parse_json(
+        &command(vec![
+            "channels".into(),
+            "exposure".into(),
+            "status".into(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Go back to publishing the URL yourself.
+#[tauri::command]
+pub async fn channels_exposure_manual() -> Result<(), String> {
+    command(vec!["channels".into(), "exposure".into(), "manual".into()])
+        .await
+        .map(|_| ())
+}
+
+/// Configure the daemon to run the operator's own tunnel client.
+///
+/// Every value is validated here as well as in the CLI, because this is the
+/// boundary a browser reaches: a hostname that is really a URL, or a path that
+/// is really a flag, must be refused before it becomes an argument.
+#[tauri::command]
+pub async fn channels_exposure_set_tunnel(
+    provider: String,
+    hostname: String,
+    executable: String,
+    metrics_port: Option<u16>,
+) -> Result<(), String> {
+    // A closed set, checked here rather than passed through. React naming an
+    // arbitrary program is the thing this whole shape exists to prevent.
+    if provider != "cloudflared" {
+        return Err(format!(
+            "'{provider}' is not a tunnel provider this build knows how to run."
+        ));
+    }
+    validate_token("tunnel hostname", &hostname, 253)?;
+    validate_token("tunnel client path", &executable, 4096)?;
+    // Both are positional, so a leading dash would be read as a flag by the
+    // CLI's own parser — the same trap `set-public-url` guards against.
+    if hostname.starts_with('-') || executable.starts_with('-') {
+        return Err("A hostname or path may not begin with '-'.".to_string());
+    }
+    let mut args = vec![
+        "channels".into(),
+        "exposure".into(),
+        "tunnel".into(),
+        provider,
+        "--hostname".into(),
+        hostname,
+        "--executable".into(),
+        executable,
+    ];
+    if let Some(port) = metrics_port {
+        args.push("--metrics-port".into());
+        args.push(port.to_string());
+    }
+    command(args).await.map(|_| ())
+}
+
+/// Store the tunnel credential.
+///
+/// Written straight to the keychain here rather than handed to the CLI, for
+/// the same reason an account's credential is: an argument is visible in a
+/// process listing, and there is no reason for the secret to exist in a second
+/// process at all.
+#[tauri::command]
+pub async fn channels_exposure_set_token(token: String) -> Result<(), String> {
+    if token.is_empty() || token.len() > 8192 {
+        return Err("A tunnel credential must contain 1-8192 bytes".to_string());
+    }
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, TUNNEL_CREDENTIAL_REF)
+        .map_err(|error| format!("Failed to open the tunnel keychain entry: {error}"))?
+        .set_password(&token)
+        .map_err(|error| format!("Failed to save the tunnel credential: {error}"))
+}
+
+/// Forget the tunnel credential.
+#[tauri::command]
+pub async fn channels_exposure_clear_token() -> Result<(), String> {
+    command(vec![
+        "channels".into(),
+        "exposure".into(),
+        "clear-token".into(),
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// The keychain entry the daemon reads a managed tunnel's credential from.
+///
+/// Spelled once, here and in `daemon::callback_exposure`, and asserted equal by
+/// a contract test — the desktop and the daemon writing different entry names
+/// is the failure mode this constant exists to make impossible.
+const TUNNEL_CREDENTIAL_REF: &str = "channel-exposure:tunnel-token";
+
+// --- Peers -----------------------------------------------------------------
+//
+// Thin, fixed-argument wrappers over `monkey peers …`, like the messaging
+// channel commands above. Two things are deliberately absent: any way to name
+// a capability that is not a peer grant (the CLI's parser knows three words),
+// and any way for React to see a pairing token — an invitation is written to a
+// file the operator chooses and moved out of band, exactly as a controller
+// pairing already is.
+
+// --- Peers -----------------------------------------------------------------
+//
+// Every view below is **snake_case in both directions**, unlike the camelCase
+// responses elsewhere in this file. That is deliberate and load-bearing: these
+// types decode `monkey peers … --json`, which emits snake_case, and they are
+// also what `peersClient.ts` reads. Making the two spellings the same means the
+// typed bridge is a validating pass-through — a field the CLI renames fails to
+// decode here rather than reaching the UI as `undefined`.
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerGrantView {
+    Message,
+    Task,
+    Artifact,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerPresenceView {
+    Online,
+    Offline,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerPairingStateView {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct InboundPeerView {
+    pub device_id: String,
+    pub label: String,
+    pub grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub advertised_grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub requested_grants: Vec<PeerGrantView>,
+    pub state: PeerPairingStateView,
+    pub peer_only: bool,
+    pub last_sequence: u64,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+    pub secret_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct OutboundPeerView {
+    pub alias: String,
+    pub peer_id: String,
+    pub peer_url: String,
+    pub grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub advertised_grants: Vec<PeerGrantView>,
+    #[serde(default)]
+    pub requested_grants: Vec<PeerGrantView>,
+    pub certificate_sha256: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+    pub secret_generation: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerListResponse {
+    pub inbound: Vec<InboundPeerView>,
+    pub outbound: Vec<OutboundPeerView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerInvitationResponse {
+    pub pairing_id: String,
+    pub expires_at_ms: u64,
+    pub grants: Vec<PeerGrantView>,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerAcceptedResponse {
+    pub alias: String,
+    pub peer_id: String,
+    pub peer_url: String,
+    pub grants: Vec<PeerGrantView>,
+    pub certificate_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerGrantResponse {
+    pub device_id: String,
+    pub grants: Vec<PeerGrantView>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerMessageDirectionView {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerMessageDispositionView {
+    Accepted,
+    Rejected,
+    Delivered,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadMessageView {
+    pub message_id: String,
+    pub direction: PeerMessageDirectionView,
+    pub kind: String,
+    pub disposition: PeerMessageDispositionView,
+    pub rejection: Option<String>,
+    pub job_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadView {
+    pub thread_id: String,
+    pub peer_device_id: String,
+    pub peer_instance_id: String,
+    pub session_key: String,
+    pub created_at_ms: i64,
+    pub last_activity_at_ms: i64,
+    pub message_count: usize,
+    pub recent: Vec<PeerThreadMessageView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerThreadsResponse {
+    pub threads: Vec<PeerThreadView>,
+    pub recipe: String,
+}
+
+/// One thing this installation sent to a peer, and the last thing it heard
+/// back.
+///
+/// The counterpart of [`PeerThreadView`], which is the inbound side. Both are
+/// needed: an operator who sends a task to another installation cannot see
+/// anything about it on the receiving-side listing, because it is not their
+/// thread — it is one they opened over there.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerOutboundMessageView {
+    pub alias: String,
+    pub message_id: String,
+    pub thread_id: String,
+    pub correlation_id: Option<String>,
+    pub kind: String,
+    /// What the send returned, or what a later poll of that peer's thread
+    /// reported: `queued`, `accepted`, `duplicate`, `rejected`, `succeeded`,
+    /// `failed` or `cancelled`.
+    pub state: String,
+    pub result_text: Option<String>,
+    pub sent_at_ms: i64,
+    pub checked_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerOutboundResponse {
+    pub messages: Vec<PeerOutboundMessageView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerRotationResponse {
+    pub device_id: String,
+    pub secret_generation: u64,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerRotationAcceptedResponse {
+    pub alias: String,
+    pub secret_generation: u64,
+    pub certificate_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerClearResponse {
+    pub device_id: String,
+    pub threads_removed: u32,
+    pub grants_cleared: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PeerStatusResponse {
+    pub alias: String,
+    pub peer_id: String,
+    pub last_seen_at_ms: Option<u64>,
+    pub presence: PeerPresenceView,
+}
+
+/// Peer grants an operator may hand out, spelled once.
+fn peer_grants(allow: &[String]) -> Result<String, String> {
+    let mut tokens = Vec::new();
+    for grant in allow {
+        match grant.as_str() {
+            "message" | "task" | "artifact" => tokens.push(grant.as_str()),
+            other => return Err(format!("Unknown peer grant '{other}'")),
+        }
+    }
+    Ok(tokens.join(","))
+}
+
+#[tauri::command]
+pub async fn peers_list() -> Result<PeerListResponse, String> {
+    parse_typed_json(&command(vec!["peers".into(), "list".into(), "--json".into()]).await?)
+}
+
+/// Offer another installation peer standing on this one. The invitation is
+/// written to `output`; it is one-time and expires.
+#[tauri::command]
+pub async fn peers_invite(
+    label: String,
+    allow: Vec<String>,
+    expires_minutes: u64,
+    output: String,
+) -> Result<PeerInvitationResponse, String> {
+    validate_token("peer label", &label, 120)?;
+    validate_output_path(&output)?;
+    let grants = peer_grants(&allow)?;
+    if grants.is_empty() {
+        return Err(
+            "A peer invitation must grant at least one of message, task or artifact".to_string(),
+        );
+    }
+    if !(1..=24 * 60).contains(&expires_minutes) {
+        return Err("Invitation expiry must be between 1 and 1440 minutes".to_string());
+    }
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "invite".into(),
+            label,
+            "--allow".into(),
+            grants,
+            "--expires-minutes".into(),
+            expires_minutes.to_string(),
+            "--output".into(),
+            output,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Take up another installation's invitation from a file the operator chose.
+#[tauri::command]
+pub async fn peers_accept(
+    invitation: String,
+    alias: String,
+) -> Result<PeerAcceptedResponse, String> {
+    validate_id("peer alias", &alias)?;
+    let path = Path::new(&invitation);
+    if !path.is_absolute() || !path.is_file() {
+        return Err("Choose the invitation file the other installation gave you".to_string());
+    }
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "accept".into(),
+            invitation,
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Replace what one inbound peer may ask for. An empty list leaves it paired
+/// and unable to ask for anything.
+#[tauri::command]
+pub async fn peers_grant(
+    device_id: String,
+    allow: Vec<String>,
+) -> Result<PeerGrantResponse, String> {
+    validate_id("device id", &device_id)?;
+    let grants = peer_grants(&allow)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "grant".into(),
+            device_id,
+            "--allow".into(),
+            grants,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn peers_revoke(device_id: String, reason: String) -> Result<(), String> {
+    validate_id("device id", &device_id)?;
+    validate_token("revoke reason", &reason, 1024)?;
+    command(vec![
+        "peers".into(),
+        "revoke".into(),
+        device_id,
+        "--reason".into(),
+        reason,
+    ])
+    .await
+    .map(|_| ())
+}
+
+/// Rotate an inbound peer's HMAC credential. The old key stops working before
+/// the bundle is returned; the bundle contains the replacement once and is
+/// written only to the operator-selected private path.
+#[tauri::command]
+pub async fn peers_rotate(
+    device_id: String,
+    output: String,
+) -> Result<PeerRotationResponse, String> {
+    validate_id("device id", &device_id)?;
+    validate_output_path(&output)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "rotate".into(),
+            device_id,
+            "--output".into(),
+            output,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Import the bundle produced by the peer that rotated this outbound
+/// pairing. The remote store verifies identity and refuses scope expansion.
+#[tauri::command]
+pub async fn peers_accept_rotation(
+    bundle: String,
+    alias: String,
+) -> Result<PeerRotationAcceptedResponse, String> {
+    validate_id("peer alias", &alias)?;
+    validate_existing_private_input("rotation bundle", &bundle)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "accept-rotation".into(),
+            bundle,
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Clear one peer's operational traffic. For a revoked pairing this also
+/// clears the retained peer grants so it leaves the management list; the
+/// immutable remote audit trail remains intact.
+#[tauri::command]
+pub async fn peers_clear(device_id: String) -> Result<PeerClearResponse, String> {
+    validate_id("device id", &device_id)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "clear".into(),
+            device_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Forget an outbound peer profile and remove its current keychain secret.
+#[tauri::command]
+pub async fn peers_forget(alias: String) -> Result<(), String> {
+    validate_id("peer alias", &alias)?;
+    command(vec!["peers".into(), "forget".into(), alias])
+        .await
+        .map(|_| ())
+}
+
+/// Perform a signed, certificate-pinned liveness check against one outbound
+/// peer. The response contains identity and time only.
+#[tauri::command]
+pub async fn peers_status(alias: String) -> Result<PeerStatusResponse, String> {
+    validate_id("peer alias", &alias)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "status".into(),
+            alias,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Threads inbound peers opened here, with their recent traffic.
+#[tauri::command]
+pub async fn peers_threads(
+    peer: Option<String>,
+    limit: u32,
+) -> Result<PeerThreadsResponse, String> {
+    let mut args = vec!["peers".into(), "threads".into()];
+    if let Some(peer) = peer {
+        validate_id("device id", &peer)?;
+        args.push("--peer".into());
+        args.push(peer);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_typed_json(&command(args).await?)
+}
+
+/// What this installation has sent to peers, newest first.
+///
+/// Local state only: reading it contacts nobody. The remote half is
+/// [`peers_remote_thread`], which the operator asks for explicitly.
+#[tauri::command]
+pub async fn peers_outbound(
+    alias: Option<String>,
+    limit: u32,
+) -> Result<PeerOutboundResponse, String> {
+    let mut args = vec!["peers".into(), "outbound".into()];
+    if let Some(alias) = alias {
+        validate_id("peer alias", &alias)?;
+        args.push("--alias".into());
+        args.push(alias);
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_typed_json(&command(args).await?)
+}
+
+/// Ask one peer about one thread this installation opened.
+///
+/// Two fixed arguments, both validated as identifiers: there is no URL, no
+/// route and no host here, so nothing React sends can reach anywhere other than
+/// a peer's own thread endpoint through the signed, certificate-pinned call the
+/// CLI already makes. The thread must be one this installation has a record of
+/// sending to, which is why there is no "list that peer's threads" command
+/// anywhere — enumerating another node's conversations is not something a peer
+/// should be able to do.
+#[tauri::command]
+pub async fn peers_remote_thread(
+    alias: String,
+    thread_id: String,
+) -> Result<PeerOutboundResponse, String> {
+    validate_id("peer alias", &alias)?;
+    validate_id("thread id", &thread_id)?;
+    parse_typed_json(
+        &command(vec![
+            "peers".into(),
+            "remote-thread".into(),
+            alias,
+            thread_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+// --- Conversation ingress -------------------------------------------------
+
+/// Turns that arrived from outside, across every origin, with the run each one
+/// became.
+///
+/// One command rather than one per subsystem: the desktop asks the same
+/// question about a Telegram message, an inbound call and a peer handover, and
+/// the answer has the same shape. The listing carries identifiers, state and
+/// failure reasons — never message text, and never a credential.
+#[tauri::command]
+pub async fn ingress_turns(source: Option<String>, limit: u32) -> Result<Value, String> {
+    let mut args = vec!["ingress".into(), "list".into()];
+    if let Some(source) = source {
+        // Parsed against the enum rather than pattern-checked, so the only
+        // strings that can become a process argument are the six the durable
+        // contract defines.
+        let source = crate::channels::ingress::ConversationSource::parse(&source)
+            .ok_or_else(|| format!("Unknown conversation source '{source}'"))?;
+        args.push("--source".into());
+        args.push(source.as_str().to_string());
+    }
+    args.push("--limit".into());
+    args.push(limit.clamp(1, 200).to_string());
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// The three arguments that name one turn, validated once.
+///
+/// The origin is parsed against the enum rather than pattern-checked, so the only
+/// strings that reach an argument vector are the six the durable contract
+/// defines; the account and event are the identity a surface submitted under, and
+/// they are already constrained to that shape by the bridge that accepted them.
+fn ingress_turn_args(
+    action: &str,
+    source: &str,
+    account: &str,
+    event: &str,
+) -> Result<Vec<String>, String> {
+    let source = crate::channels::ingress::ConversationSource::parse(source)
+        .ok_or_else(|| format!("Unknown conversation source '{source}'"))?;
+    validate_id("ingress account", account)?;
+    validate_id("ingress event id", event)?;
+    Ok(vec![
+        "ingress".into(),
+        action.into(),
+        "--source".into(),
+        source.as_str().to_string(),
+        "--account".into(),
+        account.to_string(),
+        "--event".into(),
+        event.to_string(),
+        "--json".into(),
+    ])
+}
+
+/// One turn and every continuation it produced.
+///
+/// What a desktop surface asks while it is watching a turn it submitted: an
+/// unmet workspace-mutation contract is answered by a *continuation's* run, and
+/// this is how the UI finds that run without ever executing anything itself.
+#[tauri::command]
+pub async fn ingress_turn_show(
+    source: String,
+    account: String,
+    event: String,
+) -> Result<Value, String> {
+    let args = ingress_turn_args("show", &source, &account, &event)?;
+    parse_json(&command(args).await?)
+}
+
+/// Continue an accepted turn that was frozen at a tool boundary.
+///
+/// The daemon inherits the accepted turn's frozen execution context verbatim, so
+/// nothing about the machine's current configuration can change what the resumed
+/// turn runs. A turn that was never accepted, or was accepted without a frozen
+/// context, is refused there rather than reconstructed here.
+///
+/// `request_id` is the caller's identity for the Resume action itself, and this
+/// command is a pure conduit for it: no id is minted here, so a caller that
+/// retries after a lost response — which is what a timed-out `invoke` is —
+/// reaches the same continuation instead of starting a second one.
+#[tauri::command]
+pub async fn ingress_turn_resume(
+    source: String,
+    account: String,
+    event: String,
+    request_id: String,
+) -> Result<Value, String> {
+    validate_id("ingress resume request id", &request_id)?;
+    let mut args = ingress_turn_args("resume", &source, &account, &event)?;
+    args.push("--request-id".into());
+    args.push(request_id);
+    parse_json(&command(args).await?)
+}
+// --- Telephony ------------------------------------------------------------
+//
+// The same arrangement as the messaging channel commands above: fixed-argument
+// wrappers over `monkey telecom …`, so the rules live in one place and the
+// desktop never gets an arbitrary command executor.
+//
+// `telecom_set_credential` is the only path a carrier secret takes across this
+// boundary, and it goes straight to the keychain rather than through an
+// argument vector.
+
+#[tauri::command]
+pub async fn telecom_list() -> Result<Value, String> {
+    parse_json(&command(vec!["telecom".into(), "list".into(), "--json".into()]).await?)
+}
+
+#[tauri::command]
+pub async fn telecom_add(
+    kind: String,
+    label: String,
+    carrier_account_id: String,
+    from_number: String,
+    public_url: Option<String>,
+    config: Option<String>,
+) -> Result<Value, String> {
+    validate_token("carrier", &kind, 32)?;
+    validate_token("label", &label, 120)?;
+    validate_token("carrier account id", &carrier_account_id, 128)?;
+    validate_token("number", &from_number, 20)?;
+    let mut args = vec![
+        "telecom".into(),
+        "add".into(),
+        kind,
+        label,
+        carrier_account_id,
+        from_number,
+    ];
+    if let Some(url) = public_url {
+        validate_token("public URL", &url, 512)?;
+        args.push("--public-url".into());
+        args.push(url);
+    }
+    if let Some(config) = config {
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Carrier settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    args.push("--json".into());
+    parse_json(&command(args).await?)
+}
+
+/// Probe a carrier account. The only path that can move one to `connected`.
+#[tauri::command]
+pub async fn telecom_probe(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "probe".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn telecom_enable(account_id: String, enabled: bool) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "enable".into(), account_id];
+    if !enabled {
+        args.push("--off".into());
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_set_policy(
+    account_id: String,
+    inbound: Option<String>,
+    outbound: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "policy".into(), account_id];
+    if let Some(value) = inbound {
+        validate_token("inbound policy", &value, 16)?;
+        args.push("--inbound".into());
+        args.push(value);
+    }
+    if let Some(value) = outbound {
+        validate_token("outbound approval", &value, 16)?;
+        args.push("--outbound".into());
+        args.push(value);
+    }
+    command(args).await.map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_set_limits(
+    account_id: String,
+    max_concurrent: Option<u32>,
+    ring_timeout_s: Option<u32>,
+    max_duration_s: Option<u32>,
+    recording: Option<bool>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "limits".into(), account_id];
+    for (flag, value) in [
+        ("--max-concurrent", max_concurrent),
+        ("--ring-timeout-s", ring_timeout_s),
+        ("--max-duration-s", max_duration_s),
+    ] {
+        if let Some(value) = value {
+            args.push(flag.into());
+            args.push(value.to_string());
+        }
+    }
+    if let Some(recording) = recording {
+        args.push("--recording".into());
+        args.push(recording.to_string());
+    }
+    command(args).await.map(|_| ())
+}
+
+/// What the number says when an answered call connects.
+#[tauri::command]
+pub async fn telecom_set_greeting(account_id: String, text: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if text.chars().count() > 600 {
+        return Err("That greeting is too long to say on a phone call".to_string());
+    }
+    command(vec!["telecom".into(), "greeting".into(), account_id, text])
+        .await
+        .map(|_| ())
+}
+
+#[tauri::command]
+pub async fn telecom_calls(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "calls".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// Point an account's carrier somewhere else, or update its non-secret
+/// settings. The public URL is what every signature check is rebuilt from, so
+/// an operator whose tunnel moved fixes it here rather than by re-adding the
+/// number and losing its history.
+#[tauri::command]
+pub async fn telecom_set_public_url(
+    account_id: String,
+    url: Option<String>,
+    config: Option<String>,
+) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    let mut args = vec!["telecom".into(), "set-url".into(), account_id];
+    match url {
+        Some(url) => {
+            validate_token("public URL", &url, 512)?;
+            args.push("--url".into());
+            args.push(url);
+        }
+        None if config.is_none() => args.push("--clear".into()),
+        None => {}
+    }
+    if let Some(config) = config {
+        serde_json::from_str::<Value>(&config)
+            .map_err(|error| format!("Carrier settings must be a JSON object: {error}"))?;
+        args.push("--config".into());
+        args.push(config);
+    }
+    command(args).await.map(|_| ())
+}
+
+/// Recent texts on a number, both directions, with their delivery state.
+#[tauri::command]
+pub async fn telecom_messages(account_id: String, limit: u32) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "messages".into(),
+            account_id,
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+/// The URL the operator pastes into their carrier's console.
+#[tauri::command]
+pub async fn telecom_callback_url(account_id: String) -> Result<Value, String> {
+    let account_id = channel_id("account id", &account_id)?;
+    parse_json(
+        &command(vec![
+            "telecom".into(),
+            "callback-url".into(),
+            account_id,
+            "--json".into(),
+        ])
+        .await?,
+    )
+}
+
+#[tauri::command]
+pub async fn telecom_remove(account_id: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    command(vec!["telecom".into(), "remove".into(), account_id])
+        .await
+        .map(|_| ())
+}
+
+/// Store a carrier credential.
+///
+/// Writes the same keychain entry the daemon reads, named by the one definition
+/// both sides share. The value is never echoed back, never logged and never
+/// returned; the account row only ever learns that a credential exists.
+#[tauri::command]
+pub async fn telecom_set_credential(account_id: String, secret: String) -> Result<(), String> {
+    let account_id = channel_id("account id", &account_id)?;
+    if secret.is_empty() || secret.len() > 8192 {
+        return Err("A carrier credential must contain 1-8192 bytes".to_string());
+    }
+    let reference = crate::channels::telecom_credential_ref(&account_id);
+    keyring::Entry::new(&crate::channels::KEYCHAIN_SERVICE, &reference)
+        .map_err(|error| format!("Failed to open the telephony keychain entry: {error}"))?
+        .set_password(&secret)
+        .map_err(|error| format!("Failed to save the carrier credential: {error}"))?;
+    command(vec!["telecom".into(), "mark-credential".into(), account_id])
+        .await
+        .map(|_| ())
 }

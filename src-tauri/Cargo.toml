@@ -1,6 +1,6 @@
 [package]
 name = "little-monkey"
-version = "1.3.0"
+version = "1.4.0"
 description = "Little Monkey — a local model runner with agentic file/shell tools"
 authors = ["you"]
 license = "MIT"
@@ -15,6 +15,19 @@ default-run = "little-monkey"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "little_monkey_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# The macOS iMessage helper. A separate process on purpose: Full Disk Access
+# and Automation for Messages.app are permissions the *daemon* must never hold,
+# so the code that needs them lives here and talks JSON-RPC over its own stdio.
+# The operator installs and points an account at it; nothing downloads or
+# launches it behind their back.
+#
+# Declared explicitly rather than discovered under `src/bin/` so the name the
+# operator types matches the product. It compiles on every platform and refuses
+# to run anywhere but macOS — see its `main`.
+[[bin]]
+name = "little-monkey-imessage-helper"
+path = "src/imessage_helper/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -172,6 +185,18 @@ ring = "0.17.14"
 # reqwest, so this only makes the server-side API available to the binary.
 tokio-rustls = "0.26.4"
 rustls = "0.23.41"
+# daemon/adapters: Discord's gateway, Slack's Socket Mode and Mattermost's event
+# socket are all plain WebSocket over TLS, so one client covers three providers.
+# Pinned to the rustls backend already resolved above rather than pulling a
+# second TLS stack in behind it.
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# daemon/adapters/irc.rs: `tokio_rustls` (above) verifies a TLS certificate
+# against whatever root store it is handed, but ships with none itself — the
+# IRC adapter opens a raw client TLS socket outside of `reqwest`/tungstenite,
+# so it needs its own root store rather than borrowing theirs. Pinned to
+# 0.26.11, the exact version already resolved by `tokio-tungstenite`'s own
+# `rustls-tls-webpki-roots` feature above, so this adds no new resolution.
+webpki-roots = "0.26"
 # knowledge_adapters.rs: bounded, inert Office Open XML extraction. These are
 # already locked transitively in this workspace; making them direct lets the
 # app decode ZIP/Deflate containers and stream XML without executing macros,
@@ -215,13 +240,50 @@ system-memory = "0.1.7"
 # backup/restore. Bundling avoids depending on whatever SQLite version happens
 # to be installed on a user's machine; backup/limits support bounded portable
 # snapshots and hostile-input guardrails.
-rusqlite = { version = "0.40.1", features = ["bundled", "backup", "limits"] }
+# Held at 0.37 by `matrix-sdk-sqlite`, not by anything in this tree.
+# `libsqlite3-sys` declares `links = "sqlite3"`, so exactly one version of it
+# may exist in a binary: the Matrix crypto store's rusqlite and ours have to
+# be the same. Bumping this without upstream bumping theirs fails at
+# resolution, loudly, which is the failure mode we want. When
+# `matrix-sdk-sqlite` moves to a newer rusqlite, move with it — nothing here
+# depends on 0.37 specifically.
+rusqlite = { version = "0.37", features = ["bundled", "backup", "limits"] }
 # terminal.rs: one cross-platform pseudoterminal implementation for the
 # in-app terminal. The frontend intentionally stays a thin line-oriented
 # terminal surface; process ownership, output bounds, cancellation, and
 # workspace validation all remain in Rust.
 portable-pty = "0.9.0"
 enigo = "0.6.1"
+# Matrix. The whole client — sync, room state, media, threads, and the Olm /
+# Megolm lifecycle — comes from the maintained SDK rather than from hand-built
+# Client-Server requests. `adapters/matrix.rs` owns only normalization into
+# `ChannelEnvelope` and the fail-closed rules around encryption.
+#
+# `e2e-encryption` is what makes an encrypted room work at all; `sqlite` is
+# what makes it survive a restart, by persisting the crypto store *and* the
+# session under the daemon's own private state directory. Without persistence
+# every restart would register a new device against the user's account.
+#
+# Two known costs, both compile-time loud: the SDK's `matrix-sdk-sqlite` is
+# what holds `rusqlite` at 0.37 above, and `matrix-sdk-base` pulls `decancer`,
+# whose `impl Add<_> for String` makes `String + &String` ambiguous tree-wide
+# (write `format!` instead). Its HTTP is this tree's own `egress::hardened()`
+# client, handed to `ClientBuilder::http_client`, so no Matrix request escapes
+# the egress guard.
+#
+# Ruma types are reached through `matrix_sdk::ruma` rather than a second direct
+# `ruma` dependency, so this tree cannot compile against a different feature
+# set from the one the SDK itself was built with.
+matrix-sdk = { version = "0.18", default-features = false, features = ["e2e-encryption", "sqlite"] }
+# `mime::Mime` is the type `Room::send_attachment` takes for a file's content
+# type. Already in the tree via reqwest/matrix-sdk; named here because this is
+# the one place our own code constructs one.
+mime = "0.3"
+# Executable extensions are WebAssembly components only. Keep Wasmtime's
+# optional surface narrow: no cache/profiling/debug-server/native plugin path,
+# and Preview 2 is the sole WASI ABI linked into extension stores.
+wasmtime = { version = "=47.0.3", default-features = false, features = ["async", "cranelift", "component-model", "runtime", "std"] }
+wasmtime-wasi = { version = "=47.0.3", default-features = false, features = ["p2"] }
 
 # model_sources.rs: advisory cross-process install locks on macOS/Linux keep
 # desktop and CLI pulls from mutating the same resumable partial download.
@@ -276,8 +338,9 @@ winreg = "0.56"
 # `Win32_Security_Isolation` is the AppContainer itself, `Win32_Security_Authorization`
 # the one ACE that grants it the sandbox root, and `Win32_System_Pipes` the
 # stdout/stderr pipes `run_confined` has to create by hand now that it calls
-# `CreateProcessW` directly.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+# `CreateProcessW` directly. `Win32_System_IO` and `Win32_System_Ioctl` expose
+# the ReFS block-clone request used by the per-run workspace staging tree.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 default = ["pdf-extraction"]
@@ -287,3 +350,27 @@ pdf-extraction = ["dep:pdf-extract"]
 # The "test" feature exposes tauri::test (mock runtime + IPC dispatch) so the
 # command-macro argument-key matching can be exercised in unit tests.
 tauri = { version = "2", features = ["test"] }
+# The same Matrix SDK as above, plus its `testing` feature, which is only ever
+# compiled for `cargo test`.
+#
+# It brings `matrix_sdk::test_utils::mocks::MatrixMockServer`: a homeserver
+# stand-in that implements the *crypto* endpoints for real — `/keys/upload`,
+# `/keys/query`, `/keys/claim`, `/sendToDevice` — so two SDK clients perform a
+# genuine Olm/Megolm key exchange against it. That is what makes "encryption
+# actually works" provable in CI rather than only "plaintext is refused": a
+# hand-written protocol fixture can prove a refusal, but it cannot decrypt
+# anything, so it can never prove a success.
+#
+# The production `MatrixAdapter` is the client under test in every one of those
+# tests. Nothing here replaces it.
+matrix-sdk = { version = "0.18", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    "testing",
+] }
+# The sync-response builder those helpers take, for putting a room, a timeline
+# event or a to-device message into one `/sync` answer.
+matrix-sdk-test = "0.18"
+# Tiny hostile/limit fixtures compile from WAT during host tests; contributors
+# do not need a guest-language toolchain for the sandbox test suite.
+wat = "1"

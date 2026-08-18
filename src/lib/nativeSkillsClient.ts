@@ -36,6 +36,11 @@ export interface NativeSkillDescriptor {
   allowed_tools: string[];
   /** Every bundled file's relative path except `SKILL.md` itself — named up front for progressive disclosure, read on demand via `readResource`. Always empty for signed packages. */
   resource_files: string[];
+  /** Immutable provenance when this exact content hash was installed by the
+   * learning loop. Only ever populated by `skillLearningClient.discover` —
+   * `nativeSkillsClient.discover` leaves it undefined, since the plain native
+   * runtime does not know where a folder came from. */
+  learned?: import("./skillLearningClient").LearnedProvenance | null;
 }
 
 export interface NativeSkillInstallPreview {

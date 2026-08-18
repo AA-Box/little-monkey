@@ -1,11 +1,27 @@
 pub(crate) mod api;
 mod client;
 mod desktop;
+pub(crate) mod device;
+/// The device plane end to end, against the real store and the real signed
+/// API. Tests only — see the module's own documentation.
+#[cfg(test)]
+mod device_e2e;
 pub(crate) mod migrate;
-mod protocol;
+pub(crate) mod protocol;
+pub(crate) mod push;
+pub(crate) mod qr;
 mod server;
-mod store;
+pub(crate) mod store;
+pub(crate) mod talk;
+pub(crate) mod talk_socket;
+pub(crate) mod voice;
+pub(crate) mod watch;
 mod web;
+
+/// The bound-listener entry point the opt-in peer live-validation test serves
+/// through. Test-only so the module itself stays private.
+#[cfg(test)]
+pub(crate) use server::serve_listener_for_test;
 
 pub use desktop::DesktopControlRuntime;
 
@@ -18,7 +34,10 @@ use reqwest::Method;
 
 use crate::daemon::store::{restrict_file, DaemonPaths};
 
-use self::protocol::{PairingInvitation, RemoteAction, RemoteScopes, REMOTE_PROTOCOL_VERSION};
+use self::protocol::{
+    DeviceCapability, PairingBootstrap, PairingInvitation, RemoteAction, RemoteScopes,
+    REMOTE_PROTOCOL_VERSION,
+};
 use self::store::{KeyringRemoteSecrets, RemoteStore};
 
 #[derive(Subcommand, Debug)]
@@ -53,6 +72,118 @@ pub enum RemoteCmd {
         #[arg(long)]
         output: PathBuf,
     },
+    /// List paired physical devices with what they were granted, what they
+    /// advertise, what their operating system permits, and what is therefore
+    /// effective.
+    DeviceList {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace one device's physical capability grant. Pass no `--capability`
+    /// to withdraw every physical grant while leaving run access untouched.
+    DeviceGrant {
+        device_id: String,
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+    /// Ask a paired device to do something once, and wait for the answer.
+    DeviceAction(RemoteDeviceActionArgs),
+    /// Check a real paired device end to end and exit non-zero if it is not
+    /// working.
+    ///
+    /// Safe by default: it reads the device's own advertised surface and asks
+    /// it to describe itself, which touches no sensor. `--dangerous` adds the
+    /// physical actions — a photograph, a short recording, a location fix, a
+    /// notification — and is opt-in precisely because each of those happens in
+    /// a room somebody is in. Needs no credentials of any kind: it uses the
+    /// pairing the operator already made.
+    DeviceCheck {
+        /// Which paired device. Omit when exactly one is paired.
+        #[arg(long = "device-id")]
+        device_id: Option<String>,
+        /// Also perform the physical actions this device is granted.
+        #[arg(long)]
+        dangerous: bool,
+        #[arg(long, default_value_t = 60_000)]
+        wait_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recent commands queued for one device.
+    DeviceCommands {
+        device_id: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask for a queued or running command to be cancelled.
+    DeviceCancel { command_id: String },
+    /// Open a live microphone stream on a paired device.
+    ///
+    /// Returns as soon as the stream is queued; the audio arrives while it
+    /// runs. `voice-stop` ends it early, and the runner closes it on its own
+    /// deadline whatever the device does.
+    VoiceStart {
+        #[arg(long)]
+        device_id: Option<String>,
+        /// How long to listen for, in milliseconds.
+        #[arg(long, default_value_t = voice::DEFAULT_STREAM_MS)]
+        duration_ms: u64,
+    },
+    /// Stop a live stream. The microphone closes on the device's next chunk.
+    VoiceStop { session_id: String },
+    /// Recent voice streams and how much audio each one holds.
+    VoiceList {
+        #[arg(long)]
+        device_id: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Copy one stream's audio out of app-private state.
+    VoiceSave {
+        session_id: String,
+        #[arg(long, short)]
+        output: PathBuf,
+    },
+    /// Turn on push. Little Monkey ships no push project, no key and no relay:
+    /// this is your configuration, stored in app-private state on this machine.
+    ///
+    /// `--web-push` needs no account anywhere and is what the bundled browser
+    /// controller uses. The Firebase options are for a native client that holds
+    /// its own registration token.
+    PushConfigure {
+        /// Mint this runner's own VAPID identity and send Web Push directly to
+        /// each browser's push service.
+        #[arg(long = "web-push", conflicts_with = "project_id")]
+        web_push: bool,
+        /// How a push service could contact whoever is sending: this runner's
+        /// own advertised HTTPS URL, or a `mailto:` address.
+        #[arg(long = "vapid-subject")]
+        vapid_subject: Option<String>,
+        /// Your Firebase project id.
+        #[arg(long = "project-id", required_unless_present = "web_push")]
+        project_id: Option<String>,
+        /// Your service account JSON key, which is copied into app-private
+        /// state rather than read from wherever it was downloaded.
+        #[arg(long = "service-account", required_unless_present = "web_push")]
+        service_account: Option<PathBuf>,
+        /// Allow notifications to carry specifics. Off by default: the visible
+        /// text of a push is the least private thing this system produces.
+        #[arg(long = "include-detail")]
+        include_detail: bool,
+    },
+    /// Show whether push is configured, and which devices are reachable.
+    PushStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop sending push without forgetting the configuration.
+    PushDisable,
+    /// Send one harmless test notification to a registered device.
+    PushTest { device_id: String },
     /// Accept a one-time invitation on a control PC/phone client profile.
     Accept {
         invitation: PathBuf,
@@ -237,6 +368,61 @@ pub struct RemotePairCreateArgs {
     /// device even if it runs a newer client build.
     #[arg(long = "mobile", value_enum)]
     mobile_capabilities: Vec<PairMobileCapability>,
+    /// Physical capabilities to grant this device over its own hardware
+    /// (camera-capture, location-read, …). Omit for a device that is only a
+    /// controller: the runner then has no way to ask its hardware for anything,
+    /// whatever the device advertises.
+    #[arg(long = "device")]
+    device_capabilities: Vec<String>,
+    /// Also print a compact pairing code the phone can scan, instead of only
+    /// writing the invitation file.
+    #[arg(long)]
+    qr: bool,
+    /// Print the result as JSON — the invitation path, the compact bootstrap
+    /// URI, and (with `--qr`) the code as an SVG. This is what the desktop's
+    /// pairing panel reads; a terminal wants the human form above it.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteDeviceActionArgs {
+    /// device_info, camera_capture, microphone_capture, location_read,
+    /// notification_post, screen_capture or audio_playback.
+    pub action: String,
+    /// Which paired device. Omit when exactly one device can do this.
+    #[arg(long = "device-id")]
+    pub device_id: Option<String>,
+    #[arg(long)]
+    pub position: Option<String>,
+    #[arg(long = "duration-ms")]
+    pub duration_ms: Option<u64>,
+    #[arg(long)]
+    pub accuracy: Option<String>,
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Text for audio_playback to speak. Use this or --run-id/--artifact-id.
+    #[arg(long)]
+    pub text: Option<String>,
+    /// The run an audio artifact belongs to, for audio_playback.
+    #[arg(long = "run-id")]
+    pub run_id: Option<String>,
+    /// Which audio artifact of that run to play.
+    #[arg(long = "artifact-id")]
+    pub artifact_id: Option<String>,
+    #[arg(long = "wait-ms", default_value_t = 60_000)]
+    pub wait_ms: u64,
+    /// The durable invocation asking for this, when a caller has one.
+    ///
+    /// Two deliveries of the same invocation produce one command and therefore
+    /// one physical effect. Omitted — an operator running this by hand — every
+    /// invocation is its own command, because two deliberate asks are two asks.
+    #[arg(long = "invocation-id")]
+    pub invocation_id: Option<String>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -380,11 +566,211 @@ pub async fn run(command: &RemoteCmd) -> Result<(), String> {
                 std::sync::Arc::new(crate::daemon::DaemonMobileChatQueue::new(paths.clone()));
             let placement =
                 std::sync::Arc::new(crate::daemon::DaemonPlacementQueue::new(paths.clone()));
-            server::serve(paths, desktop, mobile_chat, placement).await?
+            let peer_runs =
+                std::sync::Arc::new(crate::daemon::DaemonChannelQueue::new(paths.clone()));
+            server::serve(paths, desktop, mobile_chat, placement, peer_runs).await?
         }
         RemoteCmd::PairCreate(args) => pair_create(&paths, args)?,
         RemoteCmd::PairList => pair_list(&paths)?,
+        RemoteCmd::DeviceList { json } => device_list(&paths, *json)?,
+        RemoteCmd::DeviceGrant {
+            device_id,
+            capabilities,
+        } => device_grant(&paths, device_id, capabilities)?,
+        RemoteCmd::DeviceAction(args) => device_action(&paths, args).await?,
+        RemoteCmd::DeviceCheck {
+            device_id,
+            dangerous,
+            wait_ms,
+            json,
+        } => device_check(&paths, device_id.as_deref(), *dangerous, *wait_ms, *json).await?,
+        RemoteCmd::DeviceCommands {
+            device_id,
+            limit,
+            json,
+        } => device_commands(&paths, device_id, *limit, *json)?,
+        RemoteCmd::PushConfigure {
+            web_push,
+            vapid_subject,
+            project_id,
+            service_account,
+            include_detail,
+        } => {
+            let config = if *web_push {
+                // Defaults to this runner's own advertised URL: a self-hosted
+                // runner has no support address, and a push service only needs
+                // somewhere to point if it has to complain about the sender.
+                let subject = match vapid_subject {
+                    Some(subject) => subject.clone(),
+                    None => enabled_host(&paths)
+                        .map(|config| config.advertise_url)
+                        .unwrap_or_else(|_| "https://localhost".to_string()),
+                };
+                push::configure_web_push(&paths, &subject, *include_detail, &KeyringRemoteSecrets)?
+            } else {
+                push::configure(
+                    &paths,
+                    project_id.as_deref().unwrap_or_default(),
+                    service_account.as_deref().unwrap_or(Path::new("")),
+                    *include_detail,
+                )?
+            };
+            match config.backend.as_str() {
+                "web_push" => println!(
+                    "Web Push is on. This runner minted its own VAPID key (kept in the system keychain) — no account anywhere, and each notification is encrypted to the device before your browser's push service carries it."
+                ),
+                _ => println!(
+                    "Push will use your Firebase project '{}' with the key copied into app-private state.",
+                    config.project_id
+                ),
+            }
+            println!(
+                "Notification detail is {}.",
+                if config.include_detail {
+                    "included"
+                } else {
+                    "withheld — a push says what kind of thing happened, not what it said"
+                }
+            );
+        }
+        RemoteCmd::PushStatus { json } => push_status(&paths, *json)?,
+        RemoteCmd::PushDisable => {
+            let mut config = push::load_config(&paths)?
+                .ok_or_else(|| "Push is not configured on this machine".to_string())?;
+            config.enabled = false;
+            push::save_config(&paths, &config)?;
+            println!("Push is disabled. Registrations and configuration are kept.");
+        }
+        RemoteCmd::PushTest { device_id } => {
+            let delivered = push::notify_device(
+                &paths,
+                device_id,
+                &push::PushNotification {
+                    kind: push::PushKind::SecurityAlert,
+                    target_id: Some(device_id.clone()),
+                    detail: Some("Test notification from your own runner".to_string()),
+                },
+                &KeyringRemoteSecrets,
+            )
+            .await?;
+            println!(
+                "{}",
+                if delivered {
+                    "Delivered to your provider. If nothing arrives, the device has not granted notifications."
+                } else {
+                    "Nothing was sent: push is not configured here, or that device has not registered."
+                }
+            );
+        }
+        RemoteCmd::VoiceStart {
+            device_id,
+            duration_ms,
+        } => {
+            let record = voice::start(
+                &paths,
+                device_id.as_deref(),
+                *duration_ms,
+                None,
+                None,
+                now_ms()?,
+            )
+            .await?;
+            println!(
+                "Listening on {} as {} (command {}). The microphone opens when the device takes \
+                 the command; stop it early with `monkey-cli daemon remote voice-stop {}`.",
+                record.device_id, record.session_id, record.command_id, record.session_id
+            );
+        }
+        RemoteCmd::VoiceStop { session_id } => {
+            let record = voice::stop(&paths, session_id, now_ms()?)?;
+            println!(
+                "{} is {} with {} chunks ({} bytes).{}",
+                record.session_id,
+                record.state.as_str(),
+                record.next_sequence,
+                record.bytes,
+                if record.state == protocol::VoiceSessionState::Open {
+                    " The device is still holding the microphone; it closes on its next chunk."
+                } else {
+                    ""
+                }
+            );
+        }
+        RemoteCmd::VoiceList {
+            device_id,
+            limit,
+            json,
+        } => {
+            let sessions = voice::sessions(&paths, device_id.as_deref(), *limit)?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &sessions.iter().map(voice::session_json).collect::<Vec<_>>()
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else if sessions.is_empty() {
+                println!("No voice streams have been opened on this machine.");
+            } else {
+                for record in &sessions {
+                    println!(
+                        "{}  {:<7}  {} chunks  {} bytes  {}",
+                        record.session_id,
+                        record.state.as_str(),
+                        record.next_sequence,
+                        record.bytes,
+                        record.device_id
+                    );
+                }
+            }
+        }
+        RemoteCmd::VoiceSave { session_id, output } => {
+            let record = voice::session(&paths, session_id)?
+                .ok_or_else(|| format!("Unknown voice session '{session_id}'"))?;
+            let source = voice::audio_path(&paths.root, &record.session_id);
+            if !source.exists() {
+                return Err(format!("{session_id} has no audio yet"));
+            }
+            std::fs::copy(&source, output)
+                .map_err(|error| format!("Could not write {}: {error}", output.display()))?;
+            println!(
+                "Wrote {} bytes of {} to {}.",
+                record.bytes,
+                record.media_type.as_deref().unwrap_or("audio"),
+                output.display()
+            );
+        }
+        RemoteCmd::DeviceCancel { command_id } => {
+            let record =
+                RemoteStore::open(&paths.root)?.request_device_cancel(command_id, now_ms()?)?;
+            println!(
+                "{} is now {}{}",
+                record.command_id,
+                record.state.as_str(),
+                if record.cancel_requested && !record.state.terminal() {
+                    " (cancellation requested; the device had already started, so any effect it \
+                      already had stands)"
+                } else {
+                    ""
+                }
+            );
+        }
         RemoteCmd::PairRevoke { device_id, reason } => {
+            // Told to the *other* devices, before the revocation lands: a
+            // revoked device is excluded from the push join by design, and the
+            // people who need to know a device was cut off are the ones still
+            // holding the others.
+            let _ = push::notify_all(
+                &paths,
+                &push::PushNotification {
+                    kind: push::PushKind::SecurityAlert,
+                    target_id: Some(device_id.clone()),
+                    detail: Some(format!("{device_id} was revoked on this runner")),
+                },
+                &KeyringRemoteSecrets,
+            )
+            .await;
             let mut store = RemoteStore::open(&paths.root)?;
             // The one-shot CLI process holds no live sessions; the resident
             // daemon force-stops any live session for this device on its next
@@ -862,6 +1248,23 @@ fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
 /// external side effects before the network went, and this machine cannot know —
 /// so re-placing without a human is exactly the "confirmed mutations are not
 /// replayed" rule the daemon's own `reconcile_interrupted` already holds to.
+/// Terminates device work whose deadline has passed, including the capture rows
+/// an open Talk socket registers.
+///
+/// **Why this needs its own tick.** Both expiry sweeps used to run in exactly
+/// one place — the device long-poll — so nothing swept until some device asked
+/// for work. A runner that died mid-conversation therefore left a `running`
+/// `voice_stream` row behind, and the security audit went on reporting a
+/// microphone in flight for a socket that no longer existed. A stale "something
+/// is listening" is worse than useless: it is the alarm nobody believes.
+pub(crate) fn expire_device_work(paths: &DaemonPaths) -> Result<u64, String> {
+    let now = now_ms()?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    let expired = store.expire_device_commands(now)?;
+    voice::expire(&mut store, now)?;
+    Ok(expired)
+}
+
 pub(crate) async fn placement_sync(paths: &DaemonPaths) -> Result<(), String> {
     let now = now_ms()?;
     for alias in aliases(paths, None)? {
@@ -976,8 +1379,9 @@ pub async fn spawn_if_configured(
     desktop: std::sync::Arc<DesktopControlRuntime>,
     mobile_chat: std::sync::Arc<dyn api::MobileChatQueue>,
     placement: std::sync::Arc<dyn api::PlacementQueue>,
+    peer_runs: std::sync::Arc<dyn crate::daemon::channel_worker::RunQueue>,
 ) -> Result<bool, String> {
-    server::spawn_if_configured(paths, desktop, mobile_chat, placement).await
+    server::spawn_if_configured(paths, desktop, mobile_chat, placement, peer_runs).await
 }
 
 fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), String> {
@@ -1007,6 +1411,7 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
             .copied()
             .map(protocol::DeviceCapability::from),
     );
+    capabilities.extend(device::parse_capabilities(&args.device_capabilities)?);
     protocol::validate_capabilities(&capabilities, &scopes)?;
     let invitation = RemoteStore::open(&paths.root)?.create_invitation_with_capabilities(
         &scopes,
@@ -1029,12 +1434,548 @@ fn pair_create(paths: &DaemonPaths, args: &RemotePairCreateArgs) -> Result<(), S
         capabilities: invitation.capabilities,
     };
     protected_json(&args.output, &value)?;
+    // The same one-time token, in the form a camera can read. It pins the
+    // certificate by fingerprint rather than carrying the PEM — see
+    // `PairingBootstrap`. Always computed, because the desktop's JSON reader
+    // shows the code beside the file and a terminal only prints it on `--qr`.
+    let bootstrap = PairingBootstrap {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        runner_id: value.runner_id.clone(),
+        runner_url: value.runner_url.clone(),
+        pairing_id: value.pairing_id.clone(),
+        pairing_token: value.pairing_token.clone(),
+        certificate_sha256: value.server_certificate_sha256.clone(),
+        expires_at_ms: value.expires_at_ms,
+    };
+    let uri = bootstrap.to_uri()?;
+    if args.json {
+        // The SVG rather than the matrix: the caller is a webview, and handing
+        // it a grid of booleans would put the rendering rules — quiet zone,
+        // crisp edges, contrast — in a second place.
+        let code = qr::encode(&uri)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "invitation_path": args.output.display().to_string(),
+                "controller_url": controller_url(&value.runner_url),
+                "expires_at_ms": value.expires_at_ms,
+                "bootstrap_uri": uri,
+                "bootstrap_bytes": uri.len(),
+                "qr_svg": code.to_svg(4),
+                "qr_modules": code.size,
+            })
+        );
+        return Ok(());
+    }
     println!(
         "One-time pairing invitation written to {} (expires at {}). Transfer it securely, open {}, and choose the file.",
         args.output.display(),
         value.expires_at_ms,
         controller_url(&value.runner_url)
     );
+    if args.qr {
+        println!("\nScan this with the device's camera (it expires with the invitation):\n");
+        println!("{}", qr::encode(&uri)?.to_terminal());
+        println!("Or paste this code into the controller's pairing field:\n{uri}");
+    }
+    Ok(())
+}
+
+// --- Physical devices ------------------------------------------------------
+
+/// One device as the operator reads it: the four sets kept visibly apart,
+/// because "why can it not take a photo" has four different answers.
+fn device_rows(paths: &DaemonPaths) -> Result<Vec<serde_json::Value>, String> {
+    let store = RemoteStore::open(&paths.root)?;
+    let now = now_ms()?;
+    store
+        .devices()?
+        .into_iter()
+        .map(|device| {
+            let surface = store.device_surface(&device.device_id)?;
+            let effective =
+                protocol::effective_capabilities(&device.capabilities, surface.as_ref());
+            let commands = store.device_commands(&device.device_id, 5)?;
+            Ok(serde_json::json!({
+                "device_id": device.device_id,
+                "device_name": device.device_name,
+                "revoked": !device.active(),
+                "secret_generation": device.secret_generation,
+                "granted": device.capabilities,
+                "advertised": surface.as_ref().map(|surface| surface.capabilities.clone()),
+                "os_permissions": surface.as_ref().map(|surface| surface.permissions.clone()),
+                "readiness": surface.as_ref().map(|surface| surface.readiness.clone()),
+                "effective": effective,
+                // One row per physical capability with the four axes kept
+                // apart and the single reason it is not effective named. The
+                // intersection alone tells an operator nothing they can act on.
+                "physical": protocol::PHYSICAL_DEVICE_CAPABILITIES
+                    .iter()
+                    .map(|capability| {
+                        let block = protocol::capability_block(
+                            &device.capabilities,
+                            surface.as_ref(),
+                            *capability,
+                        );
+                        serde_json::json!({
+                            "capability": capability,
+                            "granted": device.capabilities.contains(capability),
+                            "supported": surface
+                                .as_ref()
+                                .is_some_and(|surface| surface.capabilities.contains(capability)),
+                            "permission": surface
+                                .as_ref()
+                                .map(|surface| surface.permission(*capability)),
+                            "readiness": surface
+                                .as_ref()
+                                .map(|surface| surface.readiness(*capability)),
+                            "effective": block.is_none(),
+                            "blocked_by": block.map(|block| block.as_str()),
+                            "reason": block.map(|block| block.explain(*capability)),
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                "platform": surface.as_ref().map(|surface| surface.platform.clone()),
+                "platform_version": surface.as_ref().map(|surface| surface.platform_version.clone()),
+                "app_version": surface.as_ref().map(|surface| surface.app_version.clone()),
+                "device_model": surface.as_ref().map(|surface| surface.device_model.clone()),
+                "constraints": surface.as_ref().map(|surface| surface.constraints.clone()),
+                "last_seen_at_ms": surface.as_ref().map(|surface| surface.reported_at_ms),
+                "now_ms": now,
+                "recent_commands": commands.iter().map(command_json).collect::<Vec<_>>(),
+            }))
+        })
+        .collect()
+}
+
+fn command_json(record: &self::store::DeviceCommandRecord) -> serde_json::Value {
+    serde_json::json!({
+        "command_id": record.command_id,
+        "device_id": record.device_id,
+        "capability": record.capability,
+        "state": record.state.as_str(),
+        "attempt": record.attempt,
+        "cancel_requested": record.cancel_requested,
+        "created_at_ms": record.created_at_ms,
+        "updated_at_ms": record.updated_at_ms,
+        "expires_at_ms": record.expires_at_ms,
+        "source_run_id": record.source_run_id,
+        // Which attempt owns a running command, so an operator can see that a
+        // reconnect resumed the same one rather than starting a second.
+        "execution_id": record.execution_id,
+        "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
+            "sha256": artifact.sha256,
+            "bytes": artifact.bytes,
+            "media_type": artifact.media_type,
+        })),
+        "error": record.error,
+    })
+}
+
+fn device_list(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let rows = device_rows(paths)?;
+    if json {
+        return print_json(serde_json::json!({ "devices": rows }));
+    }
+    if rows.is_empty() {
+        println!("No paired devices.");
+        return Ok(());
+    }
+    for row in rows {
+        let names = |key: &str| match row.get(key) {
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(serde_json::Value::Null) | None => "(not reported)".to_string(),
+            Some(other) => other.to_string(),
+        };
+        println!(
+            "{} \"{}\"{}\n  device: {} {} (app {})\n  granted:   {}\n  supported: {}\n  OS:        {}\n  effective: {}",
+            row["device_id"].as_str().unwrap_or_default(),
+            row["device_name"].as_str().unwrap_or_default(),
+            if row["revoked"] == serde_json::json!(true) {
+                "  [revoked]"
+            } else {
+                ""
+            },
+            row["platform"].as_str().unwrap_or("(not reported)"),
+            row["platform_version"].as_str().unwrap_or(""),
+            row["app_version"].as_str().unwrap_or("?"),
+            names("granted"),
+            names("advertised"),
+            match row["os_permissions"].as_object() {
+                Some(map) => map
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("?")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => "(not reported)".to_string(),
+            },
+            names("effective"),
+        );
+    }
+    Ok(())
+}
+
+fn device_grant(
+    paths: &DaemonPaths,
+    device_id: &str,
+    capabilities: &[String],
+) -> Result<(), String> {
+    let requested = device::parse_capabilities(capabilities)?;
+    if let Some(unsupported) = requested
+        .iter()
+        .find(|capability| !capability.is_physical())
+    {
+        return Err(format!(
+            "'{unsupported:?}' is not a physical device capability; grant it at pairing time \
+             instead"
+        ));
+    }
+    let mut store = RemoteStore::open(&paths.root)?;
+    let device = store
+        .device(device_id)?
+        .ok_or_else(|| format!("Unknown remote device '{device_id}'"))?;
+    // Only the physical half is replaced. The run-facing grants were frozen at
+    // pairing and this command must not be a way to widen them.
+    let mut next = device
+        .capabilities
+        .iter()
+        .copied()
+        .filter(|capability| !capability.is_physical())
+        .collect::<BTreeSet<_>>();
+    next.extend(requested);
+    let stored = store.set_device_capabilities(device_id, &next, now_ms()?)?;
+    println!(
+        "{device_id} now grants: {}",
+        stored
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "A grant is only half the answer — the device must also advertise the capability and hold \
+         the matching operating-system permission before it becomes effective."
+    );
+    Ok(())
+}
+
+async fn device_action(paths: &DaemonPaths, args: &RemoteDeviceActionArgs) -> Result<(), String> {
+    let capability = device::capability_for_action(&args.action)?;
+    let mut arguments = serde_json::Map::new();
+    for (key, value) in [
+        ("position", args.position.clone()),
+        ("accuracy", args.accuracy.clone()),
+        ("title", args.title.clone()),
+        ("body", args.body.clone()),
+        ("text", args.text.clone()),
+        ("run_id", args.run_id.clone()),
+        ("artifact_id", args.artifact_id.clone()),
+    ] {
+        if let Some(value) = value {
+            arguments.insert(key.to_string(), serde_json::Value::String(value));
+        }
+    }
+    if let Some(duration_ms) = args.duration_ms {
+        arguments.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
+    }
+    let record = device::dispatch(
+        paths,
+        &device::DeviceActionRequest {
+            device_id: args.device_id.clone(),
+            capability,
+            arguments: serde_json::Value::Object(arguments),
+            wait_ms: args.wait_ms,
+            source_run_id: None,
+            source_session_id: None,
+            source_tool_call_id: args.invocation_id.clone(),
+            // Supplied only by a caller that has a durable invocation to name —
+            // the desktop passes its turn and tool-call ids. An operator typing
+            // this command twice means it twice.
+            invocation_id: args.invocation_id.clone(),
+        },
+        now_ms()?,
+    )
+    .await?;
+    if args.json {
+        return print_json(device::result_json(&record));
+    }
+    println!("{} {}", record.command_id, record.state.as_str());
+    if let Some(error) = &record.error {
+        println!("  {error}");
+    }
+    if let Some(result) = &record.result {
+        println!("  {result}");
+    }
+    if let Some(artifact) = &record.artifact {
+        println!(
+            "  artifact: {} bytes of {} (sha256 {})",
+            artifact.bytes, artifact.media_type, artifact.sha256
+        );
+    }
+    Ok(())
+}
+
+/// Exercises a genuinely paired device and says whether it works.
+///
+/// The one thing the automated suite cannot cover: real hardware, over the real
+/// signed transport, on somebody's actual phone. It needs no credentials, no
+/// account and no project — the pairing the operator already made is the whole
+/// setup — and it is never part of a normal test run, because a photograph is
+/// not something CI should take.
+///
+/// Safe checks run by default and touch no sensor. `--dangerous` adds the
+/// physical ones, each of which is skipped unless the device says it is
+/// effective, so the check reports "not ready" rather than hanging on a
+/// capability the phone cannot serve.
+async fn device_check(
+    paths: &DaemonPaths,
+    device_id: Option<&str>,
+    dangerous: bool,
+    wait_ms: u64,
+    json: bool,
+) -> Result<(), String> {
+    let rows = device_rows(paths)?;
+    let row = match device_id {
+        Some(device_id) => rows
+            .iter()
+            .find(|row| row["device_id"].as_str() == Some(device_id))
+            .ok_or_else(|| format!("No paired device '{device_id}'"))?,
+        None => match rows.len() {
+            0 => return Err("No device is paired with this runner.".to_string()),
+            1 => &rows[0],
+            _ => {
+                return Err(format!(
+                    "{} devices are paired — name one with --device-id",
+                    rows.len()
+                ))
+            }
+        },
+    };
+    let device_id = row["device_id"].as_str().unwrap_or_default().to_string();
+    let physical = row["physical"].as_array().cloned().unwrap_or_default();
+    let effective = |capability: &str| {
+        physical.iter().any(|entry| {
+            entry["capability"].as_str() == Some(capability)
+                && entry["effective"] == serde_json::json!(true)
+        })
+    };
+
+    if !json {
+        println!(
+            "Checking {} ({})",
+            row["device_name"].as_str().unwrap_or_default(),
+            device_id
+        );
+        for entry in &physical {
+            println!(
+                "  {:<20} granted={} supported={} permission={} readiness={} effective={}{}",
+                entry["capability"].as_str().unwrap_or_default(),
+                entry["granted"],
+                entry["supported"],
+                entry["permission"].as_str().unwrap_or("not reported"),
+                entry["readiness"].as_str().unwrap_or("not reported"),
+                entry["effective"],
+                match entry["reason"].as_str() {
+                    Some(reason) => format!("\n      {reason}"),
+                    None => String::new(),
+                },
+            );
+        }
+    }
+
+    // Safe first, then the physical ones only when asked for. `device_info`
+    // reads the device's own name and nothing else, which is why it is the
+    // default check: it proves the whole path — queue, wake, lease, start,
+    // result — without touching a sensor.
+    let mut plan: Vec<(&str, serde_json::Value)> = vec![("device_info", serde_json::json!({}))];
+    if dangerous {
+        plan.extend([
+            ("camera_capture", serde_json::json!({ "position": "back" })),
+            (
+                "microphone_capture",
+                serde_json::json!({ "duration_ms": 2_000 }),
+            ),
+            ("screen_capture", serde_json::json!({})),
+            ("location_read", serde_json::json!({ "accuracy": "coarse" })),
+            (
+                "notification_post",
+                serde_json::json!({ "title": "Little Monkey", "body": "Device check" }),
+            ),
+            (
+                "audio_playback",
+                serde_json::json!({ "text": "Device check" }),
+            ),
+        ]);
+    }
+
+    let mut results = Vec::new();
+    let mut failures = 0usize;
+    for (action, arguments) in plan {
+        if !effective(action) {
+            results.push(serde_json::json!({
+                "action": action,
+                "status": "skipped",
+                "detail": "not effective on this device",
+            }));
+            if !json {
+                println!("  {action}: skipped (not effective)");
+            }
+            continue;
+        }
+        let capability = device::capability_for_action(action)?;
+        let record = device::dispatch(
+            paths,
+            &device::DeviceActionRequest {
+                device_id: Some(device_id.clone()),
+                capability,
+                arguments,
+                wait_ms,
+                source_run_id: None,
+                source_session_id: None,
+                source_tool_call_id: None,
+                // Each check is its own ask, so none of them dedupes against
+                // another.
+                invocation_id: None,
+            },
+            now_ms()?,
+        )
+        .await?;
+        // The shape, not merely the state: a success carrying neither a result
+        // nor an artifact has not proven anything.
+        let succeeded = record.state == protocol::DeviceCommandState::Succeeded;
+        let has_payload = record.result.is_some() || record.artifact.is_some();
+        let artifact_ok = record.artifact.as_ref().is_none_or(|artifact| {
+            artifact.bytes > 0
+                && artifact.sha256.len() == 64
+                && !artifact.media_type.trim().is_empty()
+        });
+        if !(succeeded && has_payload && artifact_ok) {
+            failures += 1;
+        }
+        results.push(serde_json::json!({
+            "action": action,
+            "status": if succeeded && has_payload && artifact_ok { "ok" } else { "failed" },
+            "state": record.state.as_str(),
+            "command_id": record.command_id,
+            "artifact": record.artifact.as_ref().map(|artifact| serde_json::json!({
+                "sha256": artifact.sha256,
+                "bytes": artifact.bytes,
+                "media_type": artifact.media_type,
+            })),
+            "error": record.error,
+        }));
+        if !json {
+            println!(
+                "  {action}: {} ({}){}",
+                if succeeded && has_payload && artifact_ok {
+                    "ok"
+                } else {
+                    "FAILED"
+                },
+                record.state.as_str(),
+                match &record.error {
+                    Some(error) => format!(" — {error}"),
+                    None => String::new(),
+                }
+            );
+        }
+    }
+
+    if json {
+        print_json(serde_json::json!({
+            "device_id": device_id,
+            "physical": physical,
+            "checks": results,
+            "failures": failures,
+        }))?;
+    }
+    if failures > 0 {
+        return Err(format!("{failures} device check(s) failed"));
+    }
+    Ok(())
+}
+
+fn push_status(paths: &DaemonPaths, json: bool) -> Result<(), String> {
+    let config = push::load_config(paths)?;
+    let registrations = RemoteStore::open(&paths.root)?.push_registrations()?;
+    let value = serde_json::json!({
+        "configured": config.is_some(),
+        "enabled": config.as_ref().is_some_and(|config| config.enabled),
+        "backend": config.as_ref().map(|config| config.backend.clone()),
+        "project_id": config.as_ref().map(|config| config.project_id.clone()),
+        // The public half only. The VAPID private key never leaves the keychain
+        // and the device tokens are addresses, not diagnostics.
+        "application_server_key": push::application_server_key(paths, &KeyringRemoteSecrets)
+            .ok()
+            .flatten(),
+        "include_detail": config.as_ref().is_some_and(|config| config.include_detail),
+        // Never the token itself: it is the device's address, and printing it
+        // into a terminal or a support log helps nobody.
+        "registered_devices": registrations
+            .iter()
+            .map(|(device_id, backend, _)| serde_json::json!({
+                "device_id": device_id,
+                "backend": backend,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    if json {
+        return print_json(value);
+    }
+    match config {
+        None => println!(
+            "Push is not configured. It needs your own Firebase project — Little Monkey ships none."
+        ),
+        Some(config) => println!(
+            "Push backend {} for project {} ({}){}.\n{} device(s) registered.",
+            config.backend,
+            config.project_id,
+            if config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if config.include_detail {
+                ", detail included"
+            } else {
+                ", detail withheld"
+            },
+            registrations.len()
+        ),
+    }
+    Ok(())
+}
+
+fn device_commands(
+    paths: &DaemonPaths,
+    device_id: &str,
+    limit: u32,
+    json: bool,
+) -> Result<(), String> {
+    let store = RemoteStore::open(&paths.root)?;
+    let commands = store.device_commands(device_id, limit)?;
+    if json {
+        return print_json(serde_json::json!({
+            "commands": commands.iter().map(command_json).collect::<Vec<_>>(),
+        }));
+    }
+    for record in &commands {
+        println!(
+            "{}  {:<10} {:?}{}",
+            record.command_id,
+            record.state.as_str(),
+            record.capability,
+            record
+                .error
+                .as_ref()
+                .map(|error| format!("  — {error}"))
+                .unwrap_or_default()
+        );
+    }
     Ok(())
 }
 
@@ -1229,7 +2170,17 @@ async fn migrate_run(
     Ok(())
 }
 
-fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {
+/// The advertised transport, for callers outside this module that need to
+/// describe it — the security audit asks whether a phone holding a camera grant
+/// is talking over a pinned connection, and there must be one answer to that
+/// rather than a second reader of the same file.
+pub(crate) fn host_config(
+    paths: &DaemonPaths,
+) -> Result<Option<protocol::RemoteHostConfig>, String> {
+    server::load_host_config(paths)
+}
+
+pub(crate) fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, String> {
     let config = server::load_host_config(paths)?
         .ok_or_else(|| "Remote host is not configured".to_string())?;
     if !config.enabled {
@@ -1238,7 +2189,7 @@ fn enabled_host(paths: &DaemonPaths) -> Result<protocol::RemoteHostConfig, Strin
     Ok(config)
 }
 
-fn protected_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
+pub(crate) fn protected_json(path: &Path, value: &impl serde::Serialize) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Could not create output directory: {error}"))?;
@@ -1278,6 +2229,218 @@ fn print_json(value: serde_json::Value) -> Result<(), String> {
         serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
     );
     Ok(())
+}
+
+/// Milliseconds since the epoch, for the peer surface and everything else here.
+pub(crate) fn now_ms_public() -> Result<u64, String> {
+    now_ms()
+}
+
+/// Offer another installation peer standing on this one, and nothing else.
+///
+/// The scope is deliberately empty: no action, no run id, no workspace. A peer
+/// invitation carries the three peer grants the operator chose and nothing that
+/// would let the far side read a run or approve anything here.
+pub(crate) fn create_peer_invitation(
+    paths: &DaemonPaths,
+    label: &str,
+    grants: &BTreeSet<protocol::DeviceCapability>,
+    expires_minutes: u64,
+) -> Result<PairingInvitation, String> {
+    let config = enabled_host(paths)?;
+    let scopes = RemoteScopes {
+        actions: BTreeSet::new(),
+        run_ids: BTreeSet::new(),
+        workspace_ids: BTreeSet::new(),
+        max_artifact_bytes: protocol::MAX_REMOTE_ARTIFACT_BYTES,
+    };
+    let now = now_ms()?;
+    let expires_at_ms = now
+        .checked_add(expires_minutes.saturating_mul(60_000))
+        .ok_or_else(|| "Pairing expiry overflow".to_string())?;
+    let invitation = RemoteStore::open(&paths.root)?.create_invitation_with_capabilities(
+        &scopes,
+        grants,
+        now,
+        expires_at_ms,
+    )?;
+    let certificate = std::fs::read_to_string(&config.certificate_path)
+        .map_err(|error| format!("Could not read remote certificate: {error}"))?;
+    // The label travels as the device name the far side proposes back, so it is
+    // not part of the invitation itself; it is what this side will call the
+    // peer once it accepts.
+    let _ = label;
+    Ok(PairingInvitation {
+        protocol_version: REMOTE_PROTOCOL_VERSION,
+        runner_id: config.runner_id,
+        runner_url: config.advertise_url,
+        server_certificate_pem: certificate,
+        server_certificate_sha256: config.certificate_sha256,
+        pairing_id: invitation.pairing_id,
+        pairing_token: invitation.token,
+        expires_at_ms: invitation.expires_at_ms,
+        scopes: invitation.scopes,
+        capabilities: invitation.capabilities,
+    })
+}
+
+/// Write an invitation where only this user can read it.
+pub(crate) fn write_invitation_file(
+    path: &Path,
+    invitation: &PairingInvitation,
+) -> Result<(), String> {
+    protected_json(path, invitation)
+}
+
+/// Take up a peer's invitation, so this installation can talk to it.
+pub(crate) async fn accept_peer_invitation(
+    paths: &DaemonPaths,
+    invitation: &Path,
+    alias: &str,
+) -> Result<protocol::ControllerProfile, String> {
+    client::accept_invitation(paths, invitation, alias, &peer_device_name(), now_ms()?).await
+}
+
+/// How this installation introduces itself when accepting a peer invitation.
+fn peer_device_name() -> String {
+    format!(
+        "little-monkey-peer-{}",
+        hostname_label().unwrap_or_else(|| "unnamed".to_string())
+    )
+}
+
+fn hostname_label() -> Option<String> {
+    let raw = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())?;
+    let label: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(32)
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+/// One signed call to a peer, by the alias it was accepted under.
+pub(crate) async fn peer_call(
+    paths: &DaemonPaths,
+    alias: &str,
+    method: Method,
+    path_and_query: &str,
+    body: Vec<u8>,
+) -> Result<serde_json::Value, String> {
+    client::call(paths, alias, method, path_and_query, body, now_ms()?).await
+}
+
+/// Take up the replacement key a peer produced when it rotated this pairing.
+///
+/// The same bundle format and the same verification a controller rotation
+/// uses — a peer credential is a device credential, and giving it a second
+/// path would mean a second place for the scope checks to be forgotten.
+pub(crate) fn accept_peer_rotation(
+    paths: &DaemonPaths,
+    alias: &str,
+    bundle: &Path,
+) -> Result<protocol::ControllerProfile, String> {
+    client::accept_rotation(paths, alias, bundle, now_ms()?)
+}
+
+/// Introduce this installation to a peer and record what came back.
+///
+/// The one call that both proves a peer is reachable and refreshes what each
+/// side knows about the other. `last_seen_at_ms` is written only on success —
+/// a failed probe must never read as contact.
+pub(crate) async fn peer_hello(
+    paths: &DaemonPaths,
+    alias: &str,
+    requested: &BTreeSet<DeviceCapability>,
+) -> Result<protocol::PeerHelloResponse, String> {
+    let request = protocol::PeerHelloRequest {
+        protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+        instance_id: local_instance_id(paths, alias)?,
+        advertised: protocol::all_peer_capabilities(),
+        requested: requested.clone(),
+    };
+    request.validate()?;
+    let value = peer_call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/peer/hello",
+        serde_json::to_vec(&request).map_err(|error| error.to_string())?,
+    )
+    .await?;
+    let response: protocol::PeerHelloResponse = serde_json::from_value(value)
+        .map_err(|error| format!("Peer hello response is invalid: {error}"))?;
+    response.validate()?;
+
+    let now = now_ms()?;
+    let mut store = RemoteStore::open(&paths.root)?;
+    if let Some(mut profile) = store.controller(alias)? {
+        profile.last_seen_at_ms = Some(now);
+        profile.peer_advertised = response.advertised.clone();
+        profile.peer_requested = request.requested.clone();
+        // The far side is authoritative about what it grants; recording its
+        // answer is how a revocation over there shows up over here without
+        // this installation guessing.
+        profile.capabilities = protocol::peer_capabilities_of(&response.granted);
+        let secret = RemoteStore::controller_secret(&profile, &KeyringRemoteSecrets)?;
+        store.save_controller(&profile, &secret, now, &KeyringRemoteSecrets)?;
+    }
+    Ok(response)
+}
+
+/// Hand one artifact's bytes to a peer before referencing it in an envelope.
+///
+/// Push, not pull: the receiver holds no outbound pairing back here, so it
+/// could not fetch even if it wanted to. Returns what the receiver stored,
+/// which is what the envelope must then name.
+pub(crate) async fn peer_put_artifact(
+    paths: &DaemonPaths,
+    alias: &str,
+    bytes: &[u8],
+    filename: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<protocol::PeerArtifactStored, String> {
+    use base64::Engine as _;
+    let upload = protocol::PeerArtifactUpload {
+        protocol_version: protocol::REMOTE_PROTOCOL_VERSION,
+        sha256: protocol::sha256_hex(bytes),
+        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        filename: filename.map(str::to_string),
+        media_type: media_type.map(str::to_string),
+    };
+    upload.validate()?;
+    let value = peer_call(
+        paths,
+        alias,
+        Method::POST,
+        "/v1/remote/peer/artifacts",
+        serde_json::to_vec(&upload).map_err(|error| error.to_string())?,
+    )
+    .await?;
+    let stored: protocol::PeerArtifactStored = serde_json::from_value(value)
+        .map_err(|error| format!("Peer artifact response is invalid: {error}"))?;
+    if stored.sha256 != upload.sha256 || stored.artifact_id != upload.sha256 {
+        return Err("The peer stored different content than was sent".to_string());
+    }
+    Ok(stored)
+}
+
+/// What this installation calls itself in an envelope's origin chain.
+///
+/// The runner id when this machine also hosts, because that is the identity
+/// every peer already knows it by. Otherwise the device id the peer issued at
+/// pairing time: unique, stable, and already meaningful to the receiver — which
+/// is all the loop check and the dedupe key need.
+pub(crate) fn local_instance_id(paths: &DaemonPaths, alias: &str) -> Result<String, String> {
+    if let Some(config) = server::load_host_config(paths)? {
+        return Ok(config.runner_id);
+    }
+    let profile = RemoteStore::open(&paths.root)?
+        .controller(alias)?
+        .ok_or_else(|| format!("Unknown peer '{alias}'"))?;
+    Ok(profile.device_id)
 }
 
 fn now_ms() -> Result<u64, String> {

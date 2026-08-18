@@ -7,8 +7,15 @@ import {
   formatSpeakerTranscript,
   type CaptureGrant,
   type CompanionConfig,
+  type SpeechBackendKind,
+  type TranscriptionBackendKind,
 } from "../../lib/companionClient";
+import {
+  executableExtensionsClient,
+  type ActiveCapability,
+} from "../../lib/executableExtensionsClient";
 import { Button } from "../ui";
+import { VoiceSettingsSection } from "./VoiceSettingsSection";
 import { errorMessage } from "../../lib/errors";
 
 const INPUT = "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
@@ -17,8 +24,74 @@ function errorText(error: unknown): string {
   return errorMessage(error);
 }
 
+function capabilityValue(extensionId: string | null, capabilityId: string): string {
+  return JSON.stringify([extensionId, capabilityId]);
+}
+
+/**
+ * One provider picker over whatever capabilities the backend says are active.
+ *
+ * The list is backend truth: `activeCapabilities` only returns extensions that
+ * are installed, validated, enabled, running and healthy, so nothing here can
+ * offer a provider that would then fail. A selection whose owner has since
+ * gone is shown as an explicitly unavailable option rather than silently
+ * dropped, because a picker that quietly reverts to blank hides the fact that
+ * a working feature stopped working.
+ */
+function CapabilityPicker({
+  label,
+  hint,
+  capabilities,
+  extensionId,
+  capabilityId,
+  onSelect,
+}: {
+  label: string;
+  hint: string;
+  capabilities: ActiveCapability[];
+  extensionId: string | null;
+  capabilityId: string | null;
+  onSelect: (selected: ActiveCapability | null) => void;
+}) {
+  const value = capabilityId ? capabilityValue(extensionId, capabilityId) : "";
+  const available = capabilities.some(
+    (capability) => capability.extension_id === extensionId
+      && capability.capability_id === capabilityId,
+  );
+  return (
+    <label className="text-xs text-muted md:col-span-2">{label}
+      <select
+        className={`${INPUT} mt-1`}
+        value={value}
+        onChange={(event) => onSelect(
+          capabilities.find(
+            (capability) => capabilityValue(capability.extension_id, capability.capability_id)
+              === event.target.value,
+          ) ?? null,
+        )}
+      >
+        <option value="">Select a healthy, running capability</option>
+        {capabilityId && !available
+          && <option value={value} disabled>Configured owner/capability is unavailable — reselect it</option>}
+        {capabilities.map((capability) => (
+          <option
+            key={`${capability.extension_id}:${capability.capability_id}`}
+            value={capabilityValue(capability.extension_id, capability.capability_id)}
+          >
+            {capability.display_name} · {capability.extension_id} · {capability.version}
+          </option>
+        ))}
+      </select>
+      <span className="mt-1 block text-faint">{hint}</span>
+    </label>
+  );
+}
+
 export function CompanionPanel() {
   const [config, setConfig] = useState<CompanionConfig | null>(null);
+  const [sttCapabilities, setSttCapabilities] = useState<ActiveCapability[]>([]);
+  const [ttsCapabilities, setTtsCapabilities] = useState<ActiveCapability[]>([]);
+  const [realtimeCapabilities, setRealtimeCapabilities] = useState<ActiveCapability[]>([]);
   const [grants, setGrants] = useState<CaptureGrant[]>([]);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -27,12 +100,23 @@ export function CompanionPanel() {
   const [meetingMode, setMeetingMode] = useState(false);
 
   const load = useCallback(async () => {
-    const [nextConfig, nextGrants] = await Promise.all([
+    const discover = (kind: "stt" | "tts" | "realtime_voice", label: string) =>
+      executableExtensionsClient.activeCapabilities(kind).catch((reason) => {
+        setError(`Could not discover executable ${label} capabilities: ${errorText(reason)}`);
+        return [];
+      });
+    const [nextConfig, nextGrants, nextStt, nextTts, nextRealtime] = await Promise.all([
       companionClient.config(),
       companionClient.grants(),
+      discover("stt", "STT"),
+      discover("tts", "speech"),
+      discover("realtime_voice", "realtime voice"),
     ]);
     setConfig(nextConfig);
     setGrants(nextGrants);
+    setSttCapabilities(nextStt);
+    setTtsCapabilities(nextTts);
+    setRealtimeCapabilities(nextRealtime);
   }, []);
 
   useEffect(() => {
@@ -149,9 +233,10 @@ export function CompanionPanel() {
         <div className="flex items-center gap-2"><Mic size={16} /><h3 className="text-sm font-semibold">Voice and transcription</h3></div>
         <div className="mt-3 grid gap-3 md:grid-cols-2">
           <label className="text-xs text-muted">Backend
-            <select className={`${INPUT} mt-1`} value={config.voice.backend} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, backend: event.target.value as "local_whisper" | "provider" } })}>
+            <select className={`${INPUT} mt-1`} value={config.voice.backend} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, backend: event.target.value as TranscriptionBackendKind } })}>
               <option value="local_whisper">Local whisper.cpp</option>
               <option value="provider">BYOK provider</option>
+              <option value="executable_extension">Executable extension</option>
             </select>
           </label>
           <label className="text-xs text-muted">Language
@@ -164,23 +249,104 @@ export function CompanionPanel() {
             <label className="text-xs text-muted">Whisper model
               <div className="mt-1 flex gap-2"><input className={INPUT} readOnly value={config.voice.whisperModel ?? ""} /><Button size="sm" onClick={() => void chooseWhisperPath("model")}>Choose</Button></div>
             </label>
-          </> : <>
+          </> : config.voice.backend === "provider" ? <>
             <label className="text-xs text-muted">Provider id
               <input className={`${INPUT} mt-1`} value={config.voice.providerId ?? ""} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, providerId: event.target.value || null } })} placeholder="openai" />
             </label>
             <label className="text-xs text-muted">Transcription model
               <input className={`${INPUT} mt-1`} value={config.voice.providerModel} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, providerModel: event.target.value } })} />
             </label>
+          </> : <>
+            <CapabilityPicker
+              label="Executable STT capability"
+              hint="Only validated, enabled, running, healthy STT extensions are listed. Unless raw-audio persistence is enabled, delegated audio uses a private per-job artifact store that is removed after the invocation."
+              capabilities={sttCapabilities}
+              extensionId={config.voice.extensionId}
+              capabilityId={config.voice.extensionCapabilityId}
+              onSelect={(selected) => setConfig({
+                ...config,
+                voice: {
+                  ...config.voice,
+                  extensionId: selected?.extension_id ?? null,
+                  extensionCapabilityId: selected?.capability_id ?? null,
+                },
+              })}
+            />
           </>}
-          <label className="text-xs text-muted">System TTS voice (optional)
+          <label className="text-xs text-muted">Speech synthesis
+            <select
+              className={`${INPUT} mt-1`}
+              value={config.voice.ttsBackend}
+              onChange={(event) => setConfig({ ...config, voice: { ...config.voice, ttsBackend: event.target.value as SpeechBackendKind } })}
+            >
+              <option value="system">This machine&apos;s voice</option>
+              <option value="executable_extension">Executable extension</option>
+            </select>
+          </label>
+          <label className="text-xs text-muted">Voice name (optional)
             <input className={`${INPUT} mt-1`} value={config.voice.ttsVoice ?? ""} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, ttsVoice: event.target.value || null } })} />
           </label>
+          {config.voice.ttsBackend === "executable_extension" && (
+            <CapabilityPicker
+              label="Executable speech capability"
+              hint="The extension returns audio as an artifact it wrote during the same invocation; audio it did not write is refused before anything plays it."
+              capabilities={ttsCapabilities}
+              extensionId={config.voice.ttsExtensionId}
+              capabilityId={config.voice.ttsExtensionCapabilityId}
+              onSelect={(selected) => setConfig({
+                ...config,
+                voice: {
+                  ...config.voice,
+                  ttsExtensionId: selected?.extension_id ?? null,
+                  ttsExtensionCapabilityId: selected?.capability_id ?? null,
+                },
+              })}
+            />
+          )}
+          <label className="text-xs text-muted">Live call voice
+            <select
+              className={`${INPUT} mt-1`}
+              value={config.voice.realtimeBackend}
+              onChange={(event) => setConfig({ ...config, voice: { ...config.voice, realtimeBackend: event.target.value as SpeechBackendKind } })}
+            >
+              <option value="system">Transcribe and synthesize per turn</option>
+              <option value="executable_extension">Executable realtime extension</option>
+            </select>
+            <span className="mt-1 block text-faint">
+              A live phone call is a session, not a clip, so it is chosen separately from speech synthesis.
+            </span>
+          </label>
+          {config.voice.realtimeBackend === "executable_extension" && (
+            <CapabilityPicker
+              label="Executable realtime voice capability"
+              hint="One sandboxed session is held open for the whole call and closed when it ends. Updating or disabling the extension mid-call fails the call rather than handing the rest of it to different code."
+              capabilities={realtimeCapabilities}
+              extensionId={config.voice.realtimeExtensionId}
+              capabilityId={config.voice.realtimeExtensionCapabilityId}
+              onSelect={(selected) => setConfig({
+                ...config,
+                voice: {
+                  ...config.voice,
+                  realtimeExtensionId: selected?.extension_id ?? null,
+                  realtimeExtensionCapabilityId: selected?.capability_id ?? null,
+                },
+              })}
+            />
+          )}
           <label className="flex items-end gap-2 pb-2 text-xs text-muted">
             <input type="checkbox" checked={config.voice.saveRawAudio} onChange={(event) => setConfig({ ...config, voice: { ...config.voice, saveRawAudio: event.target.checked } })} />Persist raw audio artifacts
           </label>
         </div>
         <div className="mt-3 flex gap-2">
-          <Button size="sm" variant="primary" disabled={busy !== null} onClick={() => void saveConfig(config)}><Save size={14} />Save voice settings</Button>
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={busy !== null
+              || (config.voice.backend === "executable_extension" && (!config.voice.extensionId || !config.voice.extensionCapabilityId))
+              || (config.voice.ttsBackend === "executable_extension" && (!config.voice.ttsExtensionId || !config.voice.ttsExtensionCapabilityId))
+              || (config.voice.realtimeBackend === "executable_extension" && (!config.voice.realtimeExtensionId || !config.voice.realtimeExtensionCapabilityId))}
+            onClick={() => void saveConfig(config)}
+          ><Save size={14} />Save voice settings</Button>
           <Button size="sm" disabled={busy !== null} onClick={() => void transcribeFile()}><Play size={14} />Transcribe a file</Button>
           {busy?.startsWith("transcribe-") && <Button size="sm" variant="danger" onClick={() => void companionClient.cancelJob(busy)}>Cancel</Button>}
         </div>
@@ -190,6 +356,12 @@ export function CompanionPanel() {
         </label>
         {transcript && <textarea className={`${INPUT} mt-3 min-h-24`} value={transcript} onChange={(event) => setTranscript(event.target.value)} aria-label="Transcript result" />}
       </section>
+
+      <VoiceSettingsSection
+        config={config}
+        onChange={(voice) => setConfig({ ...config, voice })}
+        onSave={saveConfig}
+      />
 
       {status && <p role="status" className="text-xs text-success">{status}</p>}
       {error && <p role="alert" className="rounded-md border border-danger/40 bg-danger/10 p-3 text-xs text-danger">{error}</p>}

@@ -9,20 +9,18 @@
 //!
 //! # Isolation is structural, not a filter
 //!
-//! Every store this app has — the run ledger, the artifact store, sessions,
-//! prompts, stacks, the daemon's queue, the package set — is a file under the
-//! app data directory. So the isolation boundary is that directory: a profile
-//! *is* its data root, and one profile cannot read another's run history for
-//! the same reason it cannot read another SQLite file on the disk, rather than
-//! because a `WHERE profile_id = ?` was remembered on every query. There is no
-//! shared table to forget a predicate on.
+//! Every managed store this app has — the run ledger, artifact store, sessions,
+//! prompts, stacks, daemon queue, and package set — is under the app-data
+//! directory. Portable authored configuration uses the same profile id under
+//! the agent home. A profile therefore owns both roots, and isolation remains
+//! structural rather than depending on a forgotten `WHERE profile_id = ?`.
 //!
 //! Two consequences worth stating:
 //!
 //! - **The default profile keeps the legacy layout.** `default` resolves to the
 //!   app data directory itself, so an existing installation is the default
 //!   profile already and no data is moved on upgrade. Additional profiles live
-//!   under `<app data>/profiles/<id>`.
+//!   under both `<app data>/profiles/<id>` and `<agent home>/profiles/<id>`.
 //! - **Credentials are namespaced by keychain *service*.** The OS keychain is
 //!   not a directory, so path scoping cannot reach it. [`keychain_service`]
 //!   suffixes the service name with the profile id, which makes a second
@@ -50,6 +48,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -80,6 +79,7 @@ pub const MAX_PROFILES: usize = 32;
 const MAX_ID_BYTES: usize = 32;
 const MAX_NAME_BYTES: usize = 64;
 const MAX_REGISTRY_BYTES: u64 = 256 * 1024;
+static DELETE_STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Weight bounds. Zero would mean "never gets any of the machine", which is a
 /// disabled profile rather than a share, and an unbounded weight makes every
@@ -545,6 +545,10 @@ fn restrict_file(_path: &Path) -> ProfileResult<()> {
 /// typo that looks like data loss.
 pub fn active_id(base: &Path) -> ProfileResult<String> {
     let registry = load_registry(base)?;
+    selected_id(&registry)
+}
+
+pub(crate) fn selected_id(registry: &ProfileRegistry) -> ProfileResult<String> {
     match std::env::var(PROFILE_ENV_VAR) {
         Ok(requested) if !requested.trim().is_empty() => {
             let requested = requested.trim().to_string();
@@ -716,13 +720,14 @@ pub fn switch_profile(base: &Path, id: &str) -> ProfileResult<Profile> {
     Ok(profile)
 }
 
-/// Deletes a profile and everything under its data root.
+/// Deletes a profile and everything under its managed and authored roots.
 ///
 /// Refused for the default profile (it is the installation itself) and for the
-/// active one (the running process holds its files open). *Another* process
-/// running this profile through [`PROFILE_ENV_VAR`] is not detectable from
-/// here and is not protected against — the registry records which profile is
-/// active, not which ones are open.
+/// active one (the running process holds its files open). A profile selected by
+/// this process through [`PROFILE_ENV_VAR`] is active too. *Another* process
+/// running a profile override is not detectable from here and is not protected
+/// against — the registry records which profile is active, not which ones are
+/// open.
 ///
 /// ponytail: the profile's keychain entries are *orphaned*, not deleted — the
 /// `keyring` crate cannot enumerate a service's items, so there is no list to
@@ -730,35 +735,343 @@ pub fn switch_profile(base: &Path, id: &str) -> ProfileResult<Profile> {
 /// again, and a reused profile id would need the same name to reach them; the
 /// upgrade path is a per-profile index of stored credential references, which
 /// no caller keeps today.
-pub fn delete_profile(base: &Path, id: &str) -> ProfileResult<()> {
+pub fn delete_profile(base: &Path, agent_home: &Path, id: &str) -> ProfileResult<()> {
     if id == DEFAULT_PROFILE_ID {
         return Err(ProfileError::Invalid(
             "the default profile cannot be deleted".to_string(),
         ));
     }
+    validate_id(id)?;
     let mut registry = load_registry(base)?;
-    if registry.active_id == id {
+    let profile_exists = registry.get(id).is_some();
+    let recovered_staging = reconcile_staged_profile_deletion(
+        &[agent_home.to_path_buf(), base.to_path_buf()],
+        id,
+        profile_exists,
+    )?;
+    if !profile_exists {
+        if recovered_staging {
+            return Ok(());
+        }
+        return Err(ProfileError::UnknownProfile(id.to_string()));
+    }
+    let process_active_id = active_id(base)?;
+    if deletion_targets_active_profile(&registry, &process_active_id, id) {
         return Err(ProfileError::Invalid(
             "switch to another profile before deleting this one".to_string(),
         ));
     }
-    if registry.get(id).is_none() {
-        return Err(ProfileError::UnknownProfile(id.to_string()));
+    refuse_installed_profile_daemon(base, id)?;
+
+    // Validate both roots before moving either one. In particular, inspecting
+    // `<root>/profiles` alone would follow a symlinked `<root>` first.
+    let roots = [
+        profile_child_for_deletion(agent_home, id)?,
+        profile_child_for_deletion(base, id)?,
+    ]
+    .into_iter()
+    .flatten()
+    .fold(Vec::new(), |mut unique, root| {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+        unique
+    });
+    let mut staged = Vec::new();
+    for root in roots {
+        match stage_profile_root(&root, id) {
+            Ok(staged_root) => staged.push(staged_root),
+            Err(error) => return Err(error_with_rollback(error, &staged)),
+        }
     }
-    let root = profile_root(base, id);
-    match fs::remove_dir_all(&root) {
-        Ok(()) => {}
+
+    registry.profiles.retain(|profile| profile.id != id);
+    if let Err(error) = save_registry(base, &registry) {
+        return Err(error_with_rollback(error, &staged));
+    }
+
+    cleanup_staged_profile_roots(&staged)
+}
+
+fn refuse_installed_profile_daemon(base: &Path, id: &str) -> ProfileResult<()> {
+    let config = profile_root(base, id).join("daemon").join("config.json");
+    match fs::symlink_metadata(&config) {
+        Ok(_) => Err(ProfileError::Invalid(format!(
+            "profile '{id}' has an installed daemon; run `monkey --profile {id} daemon uninstall` before deleting it"
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ProfileError::Io {
+            operation: "inspect",
+            path: config,
+            source,
+        }),
+    }
+}
+
+fn deletion_targets_active_profile(
+    registry: &ProfileRegistry,
+    process_active_id: &str,
+    id: &str,
+) -> bool {
+    registry.active_id == id || process_active_id == id
+}
+
+fn real_directory_exists(path: &Path) -> ProfileResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ProfileError::Invalid(format!(
+                "profile parent '{}' must be a real directory",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(ProfileError::Io {
+            operation: "inspect",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn reconcile_staged_profile_deletion(
+    roots: &[PathBuf],
+    id: &str,
+    profile_exists: bool,
+) -> ProfileResult<bool> {
+    let prefix = format!(".{id}.delete-");
+    let mut parents = Vec::new();
+    for root in roots {
+        if !real_directory_exists(root)? {
+            continue;
+        }
+        let parent = root.join(PROFILES_DIR);
+        if !real_directory_exists(&parent)? || parents.contains(&parent) {
+            continue;
+        }
+        parents.push(parent);
+    }
+
+    let mut found_any = false;
+    for parent in parents {
+        let mut staged = Vec::new();
+        let entries = fs::read_dir(&parent).map_err(|source| ProfileError::Io {
+            operation: "read",
+            path: parent.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ProfileError::Io {
+                operation: "read",
+                path: parent.clone(),
+                source,
+            })?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                staged.push(entry.path());
+            }
+        }
+        if staged.is_empty() {
+            continue;
+        }
+        found_any = true;
+        if profile_exists {
+            if staged.len() != 1 {
+                return Err(ProfileError::Invalid(format!(
+                    "profile '{id}' has multiple interrupted deletion stages under '{}'",
+                    parent.display()
+                )));
+            }
+            let original = parent.join(id);
+            match fs::symlink_metadata(&original) {
+                Ok(_) => {
+                    return Err(ProfileError::Invalid(format!(
+                        "cannot restore interrupted deletion for '{id}': '{}' already exists",
+                        original.display()
+                    )))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ProfileError::Io {
+                        operation: "inspect",
+                        path: original,
+                        source,
+                    })
+                }
+            }
+            fs::rename(&staged[0], &original).map_err(|source| ProfileError::Io {
+                operation: "restore",
+                path: original,
+                source,
+            })?;
+        } else {
+            for path in staged {
+                remove_staged_profile_root(&path)?;
+            }
+        }
+    }
+    Ok(found_any)
+}
+
+fn profile_child_for_deletion(root: &Path, id: &str) -> ProfileResult<Option<PathBuf>> {
+    if !real_directory_exists(root)? {
+        return Ok(None);
+    }
+    let parent = root.join(PROFILES_DIR);
+    if !real_directory_exists(&parent)? {
+        return Ok(None);
+    }
+    let parent = fs::canonicalize(&parent).map_err(|source| ProfileError::Io {
+        operation: "canonicalize",
+        path: parent,
+        source,
+    })?;
+    let child = parent.join(id);
+    match fs::symlink_metadata(&child) {
+        Ok(_) => Ok(Some(child)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ProfileError::Io {
+            operation: "inspect",
+            path: child,
+            source,
+        }),
+    }
+}
+
+#[derive(Debug)]
+struct StagedProfileRoot {
+    original: PathBuf,
+    staged: PathBuf,
+}
+
+fn stage_profile_root(root: &Path, id: &str) -> ProfileResult<StagedProfileRoot> {
+    let parent = root.parent().ok_or_else(|| {
+        ProfileError::Invalid(format!("profile root '{}' has no parent", root.display()))
+    })?;
+    let sequence = DELETE_STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staged = parent.join(format!(
+        ".{id}.delete-{}-{}-{sequence}",
+        std::process::id(),
+        now_ms()
+    ));
+    match fs::symlink_metadata(&staged) {
+        Ok(_) => {
+            return Err(ProfileError::Invalid(format!(
+                "profile deletion staging path '{}' already exists",
+                staged.display()
+            )))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(ProfileError::Io {
-                operation: "remove",
-                path: root,
+                operation: "inspect",
+                path: staged,
                 source,
             })
         }
     }
-    registry.profiles.retain(|profile| profile.id != id);
-    save_registry(base, &registry)
+    fs::rename(root, &staged).map_err(|source| ProfileError::Io {
+        operation: "stage delete",
+        path: root.to_path_buf(),
+        source,
+    })?;
+    Ok(StagedProfileRoot {
+        original: root.to_path_buf(),
+        staged,
+    })
+}
+
+fn restore_staged_profile_roots(staged: &[StagedProfileRoot]) -> ProfileResult<()> {
+    let mut first_error = None;
+    for root in staged.iter().rev() {
+        let result = match fs::symlink_metadata(&root.original) {
+            Ok(_) => Err(ProfileError::Invalid(format!(
+                "cannot restore '{}': a new path already exists",
+                root.original.display()
+            ))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                fs::rename(&root.staged, &root.original).map_err(|source| ProfileError::Io {
+                    operation: "restore",
+                    path: root.original.clone(),
+                    source,
+                })
+            }
+            Err(source) => Err(ProfileError::Io {
+                operation: "inspect",
+                path: root.original.clone(),
+                source,
+            }),
+        };
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn error_with_rollback(error: ProfileError, staged: &[StagedProfileRoot]) -> ProfileError {
+    match restore_staged_profile_roots(staged) {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            ProfileError::Invalid(format!("{error}; rollback failed: {rollback_error}"))
+        }
+    }
+}
+
+fn remove_staged_profile_root(path: &Path) -> ProfileResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileTypeExt;
+                if metadata.file_type().is_symlink_dir() {
+                    fs::remove_dir(path)
+                } else {
+                    fs::remove_file(path)
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                fs::remove_file(path)
+            }
+        }
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ProfileError::Io {
+                operation: "inspect",
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    }
+    .map_err(|source| ProfileError::Io {
+        operation: "remove",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn cleanup_staged_profile_roots(staged: &[StagedProfileRoot]) -> ProfileResult<()> {
+    let mut first_error = None;
+    for root in staged {
+        if let Err(error) = remove_staged_profile_root(&root.staged) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// What one profile's daemon must hold itself to on a machine it shares with
@@ -930,7 +1243,8 @@ pub fn profiles_set_limits(
 #[tauri::command]
 pub fn profiles_delete(app: tauri::AppHandle, id: String) -> Result<Vec<ProfileSummary>, String> {
     let base = registry_base(&app)?;
-    delete_profile(&base, &id).map_err(|error| error.to_string())?;
+    let agent_home = crate::app_paths::agent_home_dir()?;
+    delete_profile(&base, &agent_home, &id).map_err(|error| error.to_string())?;
     summaries(&base)
 }
 
@@ -1041,16 +1355,242 @@ mod tests {
     #[test]
     fn the_default_profile_cannot_be_deleted_and_neither_can_the_active_one() {
         let base = temp_base("delete");
+        let agent_home = temp_base("delete-agent-home");
         let work = create_profile(&base, "Work").unwrap();
         fs::write(profile_root(&base, &work.id).join("secret.txt"), b"x").unwrap();
-        assert!(delete_profile(&base, DEFAULT_PROFILE_ID).is_err());
+        let authored_root = agent_home.join(PROFILES_DIR).join(&work.id);
+        fs::create_dir_all(&authored_root).unwrap();
+        fs::write(authored_root.join("hooks.json"), b"{}").unwrap();
+        assert!(delete_profile(&base, &agent_home, DEFAULT_PROFILE_ID).is_err());
         switch_profile(&base, &work.id).unwrap();
-        assert!(delete_profile(&base, &work.id).is_err());
+        assert!(delete_profile(&base, &agent_home, &work.id).is_err());
         switch_profile(&base, DEFAULT_PROFILE_ID).unwrap();
-        delete_profile(&base, &work.id).unwrap();
+        delete_profile(&base, &agent_home, &work.id).unwrap();
         assert!(!profile_root(&base, "work").exists());
+        assert!(!authored_root.exists());
         assert!(load_registry(&base).unwrap().get("work").is_none());
         fs::remove_dir_all(&base).unwrap();
+        fs::remove_dir_all(&agent_home).unwrap();
+    }
+
+    #[test]
+    fn a_process_profile_override_counts_as_active_for_deletion() {
+        let base = temp_base("delete-process-active");
+        let work = create_profile(&base, "Work").unwrap();
+        let registry = load_registry(&base).unwrap();
+
+        assert!(deletion_targets_active_profile(
+            &registry, &work.id, &work.id
+        ));
+        assert!(!deletion_targets_active_profile(
+            &registry,
+            DEFAULT_PROFILE_ID,
+            &work.id
+        ));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_restores_both_roots_when_registry_persistence_fails() {
+        let base = temp_base("delete-rollback-base");
+        let agent_home = temp_base("delete-rollback-home");
+        let work = create_profile(&base, "Work").unwrap();
+        let managed_file = profile_root(&base, &work.id).join("secret.txt");
+        fs::write(&managed_file, b"managed").unwrap();
+        let authored_file = agent_home
+            .join(PROFILES_DIR)
+            .join(&work.id)
+            .join("hooks.json");
+        fs::create_dir_all(authored_file.parent().unwrap()).unwrap();
+        fs::write(&authored_file, b"{}").unwrap();
+
+        // `save_registry` writes this path before publishing it. A directory at
+        // that path forces the persistence step to fail after both roots stage.
+        let registry_temp = registry_path(&base).with_extension("json.tmp");
+        fs::create_dir(&registry_temp).unwrap();
+
+        assert!(delete_profile(&base, &agent_home, &work.id).is_err());
+        assert_eq!(fs::read(&managed_file).unwrap(), b"managed");
+        assert_eq!(fs::read(&authored_file).unwrap(), b"{}");
+        assert!(load_registry(&base).unwrap().get(&work.id).is_some());
+
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_recovers_a_pre_commit_interrupted_stage() {
+        let base = temp_base("delete-recover-pre-commit");
+        let agent_home = temp_base("delete-recover-pre-commit-home");
+        let work = create_profile(&base, "Work").unwrap();
+        let managed_root = profile_root(&base, &work.id);
+        let authored_root = agent_home.join(PROFILES_DIR).join(&work.id);
+        fs::create_dir_all(&authored_root).unwrap();
+        fs::write(authored_root.join("MONKEY.md"), b"rules").unwrap();
+        let staged_managed = stage_profile_root(&managed_root, &work.id).unwrap();
+        let staged_authored = stage_profile_root(&authored_root, &work.id).unwrap();
+
+        delete_profile(&base, &agent_home, &work.id).unwrap();
+
+        assert!(!managed_root.exists());
+        assert!(!authored_root.exists());
+        assert!(!staged_managed.staged.exists());
+        assert!(!staged_authored.staged.exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_none());
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_retry_cleans_a_post_commit_tombstone() {
+        let base = temp_base("delete-recover-post-commit");
+        let agent_home = temp_base("delete-recover-post-commit-home");
+        let work = create_profile(&base, "Work").unwrap();
+        let staged = stage_profile_root(&profile_root(&base, &work.id), &work.id).unwrap();
+        let mut registry = load_registry(&base).unwrap();
+        registry.profiles.retain(|profile| profile.id != work.id);
+        save_registry(&base, &registry).unwrap();
+
+        delete_profile(&base, &agent_home, &work.id).unwrap();
+
+        assert!(!staged.staged.exists());
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_deduplicates_identical_authored_and_managed_roots() {
+        let base = temp_base("delete-shared-root");
+        let work = create_profile(&base, "Work").unwrap();
+        let file = profile_root(&base, &work.id).join("MONKEY.md");
+        fs::write(&file, b"rules").unwrap();
+
+        delete_profile(&base, &base, &work.id).unwrap();
+
+        assert!(!file.exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_none());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_deduplicates_aliased_authored_and_managed_roots() {
+        let base = temp_base("delete-aliased-root");
+        let work = create_profile(&base, "Work").unwrap();
+        let file = profile_root(&base, &work.id).join("MONKEY.md");
+        fs::write(&file, b"rules").unwrap();
+        fs::create_dir(base.join("alias")).unwrap();
+        let aliased_home = base.join("alias").join("..");
+
+        delete_profile(&base, &aliased_home, &work.id).unwrap();
+
+        assert!(!file.exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_none());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn profile_delete_refuses_an_installed_profile_daemon() {
+        let base = temp_base("delete-installed-daemon");
+        let agent_home = temp_base("delete-installed-daemon-home");
+        let work = create_profile(&base, "Work").unwrap();
+        let managed_root = profile_root(&base, &work.id);
+        let daemon_config = managed_root.join("daemon/config.json");
+        fs::create_dir_all(daemon_config.parent().unwrap()).unwrap();
+        fs::write(&daemon_config, b"{}").unwrap();
+
+        let error = delete_profile(&base, &agent_home, &work.id).unwrap_err();
+
+        assert!(error.to_string().contains("daemon uninstall"));
+        assert!(daemon_config.exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_some());
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_delete_refuses_a_symlinked_authored_parent() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_base("delete-symlink-base");
+        let agent_home = temp_base("delete-symlink-home");
+        let external = temp_base("delete-symlink-external");
+        let work = create_profile(&base, "Work").unwrap();
+        let external_profile = external.join(&work.id);
+        fs::create_dir_all(&external_profile).unwrap();
+        fs::write(external_profile.join("keep.txt"), b"keep").unwrap();
+        symlink(&external, agent_home.join(PROFILES_DIR)).unwrap();
+
+        assert!(delete_profile(&base, &agent_home, &work.id).is_err());
+        assert!(external_profile.join("keep.txt").exists());
+        assert!(profile_root(&base, &work.id).exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_some());
+
+        fs::remove_file(agent_home.join(PROFILES_DIR)).unwrap();
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_delete_preflights_a_symlinked_managed_parent_before_staging_authored_data() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_base("delete-managed-symlink-base");
+        let agent_home = temp_base("delete-managed-symlink-home");
+        let external = temp_base("delete-managed-symlink-external");
+        let work = create_profile(&base, "Work").unwrap();
+        let authored_file = agent_home
+            .join(PROFILES_DIR)
+            .join(&work.id)
+            .join("hooks.json");
+        fs::create_dir_all(authored_file.parent().unwrap()).unwrap();
+        fs::write(&authored_file, b"{}").unwrap();
+
+        fs::remove_dir_all(base.join(PROFILES_DIR)).unwrap();
+        let external_profile = external.join(&work.id);
+        fs::create_dir_all(&external_profile).unwrap();
+        fs::write(external_profile.join("keep.txt"), b"keep").unwrap();
+        symlink(&external, base.join(PROFILES_DIR)).unwrap();
+
+        assert!(delete_profile(&base, &agent_home, &work.id).is_err());
+        assert!(authored_file.exists());
+        assert!(external_profile.join("keep.txt").exists());
+        assert!(load_registry(&base).unwrap().get(&work.id).is_some());
+
+        fs::remove_file(base.join(PROFILES_DIR)).unwrap();
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(agent_home).unwrap();
+        fs::remove_dir_all(external).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_windows_directory_symlink_cleanup_removes_only_the_link() {
+        use std::os::windows::fs::symlink_dir;
+
+        let parent = temp_base("delete-windows-link-parent");
+        let target = temp_base("delete-windows-link-target");
+        fs::write(target.join("keep.txt"), b"keep").unwrap();
+        let link = parent.join("staged-link");
+        match symlink_dir(&target, &link) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                fs::remove_dir_all(parent).unwrap();
+                fs::remove_dir_all(target).unwrap();
+                return;
+            }
+            Err(error) => panic!("failed to create directory symlink: {error}"),
+        }
+
+        remove_staged_profile_root(&link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"keep");
+
+        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(target).unwrap();
     }
 
     #[test]
@@ -1309,6 +1849,7 @@ mod tests {
                 allow_network: false,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

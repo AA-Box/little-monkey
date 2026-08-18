@@ -741,7 +741,7 @@ async fn start_prompt(
     // lets a restarted ACP process recover the corresponding durable run even
     // if the stdio process exits immediately after submission.
     persist_turn_intent(&session_id, &digest, &prompt)?;
-    let queued = crate::daemon::queue_client_recipe(cli, &recipe_path, &digest)?;
+    let queued = crate::daemon::queue_client_recipe(cli, &recipe_path, &session_id, &digest)?;
 
     {
         let mut guard = sessions
@@ -864,6 +864,7 @@ fn persist_recipe(
         max_iterations: Some(25),
         timeout_seconds: Some(24 * 60 * 60),
         output: RecipeOutput { json: true },
+        channel_send: None,
         desktop_turn: None,
         placed_run: None,
     };

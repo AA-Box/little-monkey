@@ -942,6 +942,7 @@ fn run_spec(session: &ControlSession) -> RunSpec {
             allow_network: false,
             allow_external_mutations: false,
             egress_allowlist: None,
+            channel_send: None,
         },
         budgets: RunBudgets {
             wall_time_ms: MAX_SESSION_LIFETIME_MS,

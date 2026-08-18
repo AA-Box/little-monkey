@@ -27,7 +27,17 @@ export type ProcessKind =
   | "workflow_node"
   | "remote_run"
   | "background_shell"
-  | "side_task";
+  // The agent shell a turn blocks on. Every native process a tool call
+  // creates is one of these, which is why its limits are the ones K4's
+  // memory and process-count bounds are installed on.
+  | "foreground_shell"
+  | "side_task"
+  | "browser_session"
+  // The three bounded executions a turn blocks on. Each ran under the same
+  // resource controller as a foreground shell long before it had a row.
+  | "verify_command"
+  | "hook_command"
+  | "sandbox_run";
 
 export type ProcessState = "admitted" | "running" | "suspended" | "exited";
 
@@ -37,7 +47,10 @@ export type ProcessExitStatus =
   | "cancelled"
   | "limit_exceeded"
   | "lost"
-  | "needs_reconciliation";
+  | "needs_reconciliation"
+  // The row had to be closed and nothing proved the work was gone. Deliberately
+  // not `lost`, which asserts a fact: this one asserts the absence of one.
+  | "containment_lost";
 
 export interface ProcessLimits {
   maxWallMs?: number | null;
@@ -46,11 +59,120 @@ export interface ProcessLimits {
   maxChildProcesses?: number | null;
 }
 
+/**
+ * A limit that fired, as the mechanism itself reported it.
+ *
+ * Beside `ProcessExit.reason` rather than instead of it: the prose is what a
+ * person reads, and this is what a UI formats and a query filters on. Before
+ * migration V21 only the prose existed, so "how much memory did it actually
+ * hold" could be answered only by parsing a sentence — which the daemon
+ * genuinely did, with a marker string.
+ *
+ * `observed` is frequently *equal* to `configured` rather than above it, and that
+ * is not a bug to paper over in the display: a kernel-held bound exists so the
+ * workload never passes the number, so it refuses the thirteenth fork and leaves
+ * the count at twelve. Where that is what happened, `evidence` names the kernel
+ * counter that proved it, and a supervised bound — found by comparison — carries
+ * no evidence rather than an invented one.
+ */
+export interface LimitBreach {
+  /** The `ProcessLimits` field name, e.g. `max_memory_bytes`. */
+  limit: string;
+  configured: number;
+  observed: number;
+  /** `"cgroup v2"`, `"windows job object"`, `"supervisor"`. */
+  backend: string;
+  /** `"kernel"`, `"supervised"`, or `"owner-sourced"`. */
+  level: string;
+  observedAtMs: number;
+  evidence?: string | null;
+}
+
 export interface ProcessExit {
   status: ProcessExitStatus;
   code?: number | null;
   signal?: string | null;
   reason?: string | null;
+  /** Present exactly when a resource controller made the kill. */
+  breach?: LimitBreach | null;
+}
+
+/** Which layer supplied the number on a row, as `process_commands.rs` derives it. */
+export type LimitOrigin =
+  | "class_default"
+  | "caller_override"
+  | "caller_supplied"
+  | "unrecorded"
+  | "unbounded";
+
+/**
+ * What this host can do about one resource — the backend's own answer, not a
+ * table maintained here.
+ *
+ * The tag names match `resource_control.rs`'s `LimitCapability`, which is the
+ * point: a mechanism string invented in TypeScript is a second source of truth
+ * that drifts from the one doing the enforcing.
+ */
+export type LimitCapability =
+  | { status: "enforced"; level: "kernel" | "supervised" | "owner-sourced"; mechanism: string }
+  | { status: "not_applicable"; reason: string }
+  | { status: "unavailable"; reason: string };
+
+export interface ProcessLimitReport {
+  /** `max_wall_ms`, `max_memory_bytes`, … — the same name the breach uses. */
+  limit: string;
+  classDefault: number | null;
+  effective: number | null;
+  origin: LimitOrigin;
+  /** `"enforced"`, `"owner-sourced"`, `"unavailable"` — the static per-kind matrix. */
+  supportStatus: string;
+  supportDetail: string;
+  /**
+   * What actually held this limit, **for this process**, as its own controller
+   * recorded at attach time.
+   *
+   * Not what the machine reading the row would use for a new process — that was
+   * the old source and it made a workload the Linux kernel had held read back as
+   * `supervisor` on a Mac. Absent on a row that recorded no mechanism, which is
+   * a gap to show rather than one to fill in.
+   */
+  host?: LimitCapability;
+  /** What it is holding now, or held last. Never 0 for "not measured". */
+  observed?: number;
+  /** The highest anything ever measured — the number that says whether a limit was nearly hit. */
+  observedPeak?: number;
+  observedUnavailable?: string;
+}
+
+export interface ProcessResourceReport {
+  processId: string;
+  kind: ProcessKind;
+  backend?: string;
+  treePrimitive?: string;
+  /** Whether `backend` came off the row rather than from nowhere. */
+  backendIsRecorded: boolean;
+  /** The durable containment handle: a cgroup path, a process group, a job. */
+  scope?: string;
+  limits: ProcessLimitReport[];
+  breach?: LimitBreach;
+}
+
+/**
+ * What is bounding one process, and who says so.
+ *
+ * Fail-soft like everything else here: a panel that cannot read the report shows
+ * the row without it rather than showing an error where a process should be.
+ */
+export async function fetchProcessResourceReport(
+  processId: string,
+): Promise<ProcessResourceReport | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<ProcessResourceReport>("process_resource_report", { processId });
+  } catch (error) {
+    warn(`resource report for ${processId}`, error);
+    return null;
+  }
 }
 
 /**
@@ -82,7 +204,37 @@ export interface ProcessRecord {
   workspace: string | null;
   profile: string | null;
   nativePid: number | null;
+  /**
+   * The platform's own start-time stamp for that pid.
+   *
+   * Opaque and host-local: it exists so a reconciler can prove a pid still names
+   * the process this row is about rather than one the kernel handed the number
+   * to later. Nothing in the UI should render it. `null` on a row written before
+   * migration V22, and on a host that will not report one.
+   */
+  nativeStartTime?: number | null;
   limits: ProcessLimits;
+  /**
+   * What actually enforced this process, recorded when it was attached.
+   *
+   * Absent for a kind that owns no OS process tree, and on a row written before
+   * migration V23.
+   */
+  containment?: {
+    backend: string;
+    treePrimitive: string;
+    scope?: string | null;
+    enforcement: Record<string, LimitCapability>;
+  } | null;
+  /** The controller's last measurement of the owned tree. */
+  usage?: {
+    rssBytes?: number | null;
+    peakRssBytes?: number | null;
+    processCount?: number | null;
+    peakProcessCount?: number | null;
+    outputBytes?: number | null;
+  } | null;
+  usageSampledAtMs?: number | null;
   /** What has been asked of this process. Delivery is `processSignalDelivery.ts`. */
   signalIntent: SignalIntent;
   signalReason: string | null;

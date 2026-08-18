@@ -1,11 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { M3ComponentCatalogEntry, M3InstalledComponent } from "../../../lib/runtimeHubClient";
-import {
-  describeRegistryAction,
-  mergeRegistryEntries,
-  parseCatalogText,
-} from "./RuntimeHubComponents";
+import { describeRegistryAction, entryKey, parseCatalogText } from "./RuntimeHubComponents";
 
 function registryEntry(overrides: Partial<M3ComponentCatalogEntry> = {}): M3ComponentCatalogEntry {
   return {
@@ -79,38 +75,35 @@ describe("Runtime Hub component registry actions", () => {
 });
 
 /**
- * Importing a published component catalog into the local registry.
+ * The registry's identity, as this file spells it.
  *
- * The backend swaps the whole registry file atomically, so the merge here is
- * what stops importing one publisher's catalog from deleting every other
- * component the operator had registered.
+ * Merging a catalog into the registry is the backend's job — it reads, merges and
+ * writes under one lock, which a read-modify-write across the IPC boundary could
+ * not do without losing a concurrent import. What is left here is the React key,
+ * and the claim under test is only that it is keyed on the same four fields the
+ * backend's `M3ComponentCatalogEntry::registry_key` is. `a_registry_key_is_the_one_
+ * identity_the_registry_merges_on` in `m3_runtime_hub.rs` is the other half; the
+ * two together are what keeps the definitions from drifting.
  */
-describe("mergeRegistryEntries", () => {
-  it("keeps components the imported catalog says nothing about", () => {
-    const llama = registryEntry();
-    const mlx = registryEntry({
-      componentId: "mlx-runtime-apple-silicon",
-      kind: "mlx_runtime",
-      sourceId: "little-monkey-mlx",
-      version: "0.28.4",
-    });
-    const merged = mergeRegistryEntries([llama], [mlx]);
-    expect(merged).toHaveLength(2);
-    expect(merged.map((item) => item.componentId)).toContain("llama-cpp-server-metal");
-  });
-
-  it("lets an import correct an entry it already registered", () => {
-    const stale = registryEntry({ downloadUrl: "https://components.example.test/wrong" });
-    const fixed = registryEntry({ downloadUrl: "https://components.example.test/right" });
-    const merged = mergeRegistryEntries([stale], [fixed]);
-    expect(merged).toHaveLength(1);
-    expect(merged[0].downloadUrl).toBe("https://components.example.test/right");
-  });
-
-  it("treats a new version of the same component as an addition, not a replacement", () => {
-    const older = registryEntry({ version: "b4000", sha256: "d".repeat(64) });
-    const merged = mergeRegistryEntries([older], [registryEntry()]);
-    expect(merged.map((item) => item.version).sort()).toEqual(["b4000", "b4100"]);
+describe("entryKey", () => {
+  it("is keyed on exactly the four fields the backend keys a registry row on", () => {
+    const base = registryEntry();
+    for (const changed of [
+      { componentId: "tokenizer-bpe" },
+      { version: "b4200" },
+      { sha256: "c".repeat(64) },
+      // The field the old key was missing. Two entries differing only in where
+      // their bytes come from are two rows, not one silently overwriting the
+      // other.
+      { downloadUrl: "https://components.example.test/elsewhere" },
+    ]) {
+      expect(entryKey(registryEntry(changed))).not.toBe(entryKey(base));
+    }
+    // And nothing else: a corrected note or display name is the same row, which
+    // is how a publisher fixes one without the app listing it twice.
+    expect(entryKey(registryEntry({ compatibilityNote: "needs macOS 15" }))).toBe(entryKey(base));
+    expect(entryKey(registryEntry({ displayName: "llama.cpp (Metal)" }))).toBe(entryKey(base));
+    expect(entryKey(registryEntry({ sourceId: "little-monkey-mlx" }))).toBe(entryKey(base));
   });
 });
 

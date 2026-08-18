@@ -484,7 +484,7 @@ impl CheckpointInfo {
     }
 }
 
-fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub fn checkpoints_base_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data dir: {}", e))?
@@ -965,8 +965,18 @@ pub enum Restorability {
 /// none of it is knowable from the manifest alone.
 #[derive(Debug, Clone, Default)]
 pub struct RestoreEnvironment<'a> {
-    /// Models resident right now.
-    pub resident_models: &'a [String],
+    /// Models resident right now, when this host is the one that decides what
+    /// the restored process runs against.
+    ///
+    /// `None` says it is not — the image belongs to a turn a durable backend
+    /// accepted, and the model that turn executes under is the one frozen into
+    /// its execution context, not one this process could resolve. Comparing the
+    /// frozen model against what is loaded *here, now* would make the currently
+    /// selected model the authority over a turn accepted long before it, which
+    /// is the coupling freezing exists to remove. Whether the frozen model and
+    /// its credential are still usable is then the accepting backend's question
+    /// to answer, and it refuses the resume outright when they are not.
+    pub resident_models: Option<&'a [String]>,
     /// `request_id`s whose approval is still valid — an outstanding approval
     /// absent from this list has expired.
     pub live_approvals: &'a [String],
@@ -994,12 +1004,8 @@ pub fn restorability(
     if resume.workspace.is_some() && !environment.workspace_exists {
         blockers.push(RestoreBlocker::WorkspaceGone);
     }
-    if let Some(model) = resume.model.as_ref() {
-        if !environment
-            .resident_models
-            .iter()
-            .any(|entry| entry == model)
-        {
+    if let (Some(model), Some(resident)) = (resume.model.as_ref(), environment.resident_models) {
+        if !resident.iter().any(|entry| entry == model) {
             blockers.push(RestoreBlocker::ModelNotResident);
         }
     }
@@ -1157,6 +1163,71 @@ fn external_effects_of(manifest: &CheckpointManifest) -> Vec<ExternalEffectKind>
     effects.sort();
     effects.dedup();
     effects
+}
+
+/// Checkpoint `id`'s turn as it stood before it ran — see [`pre_turn_state`].
+pub struct PreTurnState {
+    pub files: Vec<PreTurnFile>,
+    /// The turn ran a shell command. No checkpoint snapshots what a shell did,
+    /// so rewinding to `files` is a partial rewind: anything the shell created
+    /// or changed outside this app's own write/edit tools stays.
+    pub shell_ran: bool,
+}
+
+/// One file as it stood *before* checkpoint `id`'s turn ran.
+pub struct PreTurnFile {
+    /// Absolute path of the workspace file the turn mutated.
+    pub path: PathBuf,
+    /// Its content before the turn, or `None` when the turn created it — so
+    /// rewinding to this state means deleting the file, not writing it.
+    pub contents: Option<Vec<u8>>,
+}
+
+/// Reads checkpoint `id`'s pre-turn state: every file its turn mutated, with
+/// the content each had beforehand.
+///
+/// Read-only, unlike [`revert_impl`], which rewinds the live workspace. The
+/// caller here rewinds a disposable *copy*: the learning loop's evaluation
+/// runs in a copy of the workspace the procedure was learned in, and that
+/// workspace already contains the procedure's result — reproducing the
+/// original task against it would be reproducing a solved one. Applying this
+/// state to the copy puts the task back.
+///
+/// Fails when the checkpoint is gone (pruned, or its turn never recorded one)
+/// or a backup is unreadable. That is a refusal to build the environment, and
+/// the caller records the evaluation as unevaluated: a pre-task state that
+/// cannot be reproduced is not one to guess at.
+///
+/// Covers the files this app's own write/edit tools mutated. Side effects a
+/// shell command had are not snapshotted by any checkpoint (see
+/// `CheckpointManifest::shell_ran`) and so are not rewound here either.
+pub fn pre_turn_state(base_dir: &Path, id: &str) -> Result<PreTurnState, String> {
+    validate_id(id)?;
+    let dir = base_dir.join(id);
+    let manifest = read_manifest(base_dir, id)?;
+    let files = manifest
+        .entries
+        .iter()
+        .map(|entry| {
+            let contents = match &entry.backup {
+                None => None,
+                Some(name) => Some(std::fs::read(dir.join(name)).map_err(|e| {
+                    format!(
+                        "Checkpoint '{}' cannot reproduce '{}': {}",
+                        id, entry.path, e
+                    )
+                })?),
+            };
+            Ok(PreTurnFile {
+                path: PathBuf::from(&entry.path),
+                contents,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PreTurnState {
+        files,
+        shell_ran: manifest.shell_ran,
+    })
 }
 
 /// Parses a raw `manifest.json`, falling back from the versioned v2 struct
@@ -2450,11 +2521,14 @@ pub struct RestoreReport {
     pub blocker_explanations: Vec<String>,
 }
 
+/// `resident_models` is omitted by the durable Resume path and supplied by the
+/// migration one — see [`RestoreEnvironment::resident_models`] for which
+/// question each is asking.
 #[tauri::command]
 pub fn checkpoint_restorability(
     app: tauri::AppHandle,
     id: String,
-    resident_models: Vec<String>,
+    resident_models: Option<Vec<String>>,
     live_approvals: Vec<String>,
 ) -> Result<RestoreReport, String> {
     let manifest = read_manifest(&checkpoints_base_dir(&app)?, &id)?;
@@ -2468,7 +2542,7 @@ pub fn checkpoint_restorability(
     let restorability = restorability(
         &manifest,
         &RestoreEnvironment {
-            resident_models: &resident_models,
+            resident_models: resident_models.as_deref(),
             live_approvals: &live_approvals,
             workspace_exists,
         },
@@ -2532,9 +2606,19 @@ mod tests {
         workspace_exists: bool,
     ) -> RestoreEnvironment<'a> {
         RestoreEnvironment {
-            resident_models: resident,
+            resident_models: Some(resident),
             live_approvals: approvals,
             workspace_exists,
+        }
+    }
+
+    /// What the durable Resume path asks: the same image, with no claim about
+    /// which models this host has loaded.
+    fn durable_environment<'a>(approvals: &'a [String]) -> RestoreEnvironment<'a> {
+        RestoreEnvironment {
+            resident_models: None,
+            live_approvals: approvals,
+            workspace_exists: true,
         }
     }
 
@@ -2581,6 +2665,39 @@ mod tests {
                 RestoreBlocker::ModelNotResident,
                 RestoreBlocker::ApprovalExpired,
             ]
+        );
+    }
+
+    /// The image-level verdict says nothing about the model when the model is
+    /// not this host's to decide.
+    ///
+    /// A durable Resume continues a turn under the context frozen when that turn
+    /// was *accepted*. What is loaded here now is a different question, and
+    /// letting it block the restore is exactly how the operator's current model
+    /// selection would come to govern a turn accepted before they changed it.
+    #[test]
+    fn a_durable_resume_is_not_blocked_by_what_this_host_has_loaded() {
+        let approvals = vec!["req-1".to_string()];
+        assert_eq!(
+            restorability(
+                &frozen(Some(resume_state())),
+                &durable_environment(&approvals)
+            ),
+            Restorability::Resumable {
+                process_id: "p-frozen".to_string()
+            }
+        );
+    }
+
+    /// …and the rest of the image's own verdict is unchanged by that: a freeze
+    /// with an expired approval is still refused when nobody supplies residency.
+    #[test]
+    fn a_durable_resume_still_answers_to_the_image_itself() {
+        assert_eq!(
+            restorability(&frozen(Some(resume_state())), &durable_environment(&[])),
+            Restorability::Blocked {
+                blockers: vec![RestoreBlocker::ApprovalExpired]
+            }
         );
     }
 
@@ -3069,6 +3186,54 @@ mod tests {
             !created.exists(),
             "file created during the turn must be deleted on revert"
         );
+    }
+
+    /// The learning loop reads this to rewind a *copy* of the workspace back
+    /// to the task a procedure was learned on, so it must report the pre-turn
+    /// state without touching the live workspace at all.
+    #[test]
+    fn pre_turn_state_reports_the_before_content_without_restoring_anything() {
+        let state = AppState::default();
+        let base = TempDir::new("base");
+        let ws = TempDir::new("ws");
+
+        let existing = ws.path.join("existing.txt");
+        std::fs::write(&existing, "original").unwrap();
+        let created = ws.path.join("created.txt");
+
+        let id = begin(&state, &base.path);
+        record_original(&state, Some(&id), &existing).unwrap();
+        std::fs::write(&existing, "mutated").unwrap();
+        record_original(&state, Some(&id), &created).unwrap();
+        std::fs::write(&created, "brand new").unwrap();
+        end_impl(&state, &id).unwrap();
+
+        let state_before = pre_turn_state(&base.path, &id).unwrap();
+        assert!(
+            !state_before.shell_ran,
+            "no shell ran, so this rewind is complete"
+        );
+        let before = |path: &Path| {
+            state_before
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.contents.clone())
+                .expect("every mutated file is reported")
+        };
+        assert_eq!(before(&existing), Some(b"original".to_vec()));
+        // Created by the turn, so rewinding to before it means no file.
+        assert_eq!(before(&created), None);
+        // Read-only: the workspace still holds the turn's own result.
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "mutated");
+        assert_eq!(std::fs::read_to_string(&created).unwrap(), "brand new");
+
+        // A checkpoint that has been pruned cannot be reproduced, and says so
+        // rather than reporting an empty state that would read as "nothing
+        // changed".
+        std::fs::remove_dir_all(base.path.join(&id)).unwrap();
+        assert!(pre_turn_state(&base.path, &id).is_err());
+        assert!(pre_turn_state(&base.path, "../escape").is_err());
     }
 
     #[test]

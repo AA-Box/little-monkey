@@ -33,6 +33,7 @@ pub mod browser_worker;
 // Typed, fixed-argument desktop bridge to the bundled authoritative daemon
 // and optional user-owned remote controller. No arbitrary CLI execution.
 mod daemon_commands;
+mod extension_commands;
 mod m6a_desktop_bridge;
 // Digest-confirmed owned-worktree/GitHub delivery and local PR review. The
 // core is kept Tauri-light so repository identity and safety policy remain in
@@ -87,10 +88,14 @@ pub mod native_skills;
 // Studio" (Phase 8): real Ollama Modelfile grammar, short-name hardening,
 // and GGUF/safetensors header sanity checks, independent of `ollama.rs`'s
 // own `ollama create -f` invocation (which stays in `ollama.rs`, unchanged).
+/// Sandboxed third-party WebAssembly components. This is deliberately
+/// separate from `package_ecosystem`, whose bundles remain data-only.
+pub mod executable_extensions;
 pub mod modelfile;
 pub mod package_ecosystem;
 mod security_commands;
 pub mod security_doctor;
+pub mod support_bundle;
 // Operational-health diagnostics (reachability/liveness of app-owned
 // services), sibling to `security_doctor` (which audits posture, not
 // health). Self-contained: engine + thin command layer live in one file,
@@ -152,6 +157,7 @@ pub mod mlx_runtime;
 // Inbound OpenAI/Anthropic compatibility translations and the scoped,
 // authenticated LAN policy shared by the API server and user-owned runners.
 mod artifact_commands;
+pub mod channels;
 pub mod chat_template_lab;
 pub mod checkpoints;
 pub mod compatibility_hub;
@@ -234,14 +240,30 @@ pub mod prompts;
 // ROADMAP #3). `pub` for the same reason as `prompts`: `WorkflowService` and
 // `monkey-cli` record into it without an `AppHandle`.
 pub mod config_revisions;
+// The evidence-backed learning loop over the native `SKILL.md` runtime. `pub`
+// for the same reason as `native_skills` itself: `monkey-cli`'s
+// `skills learned` subcommands drive the identical store, so the desktop and
+// the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+pub mod skill_learning;
+mod skill_learning_commands;
 mod system;
 mod terminal;
 mod tools;
 // Long-running agent shell commands that outlive the turn that started them
 // (`run_shell` with `run_in_background: true`) — see `background_shell.rs`.
 pub mod background_shell;
+// The process-table lifecycle every bounded agent-controlled execution shares:
+// the verify runner, the hook runner and the sandbox run, which were bounded by
+// a resource controller long before any of them had a row.
+pub mod bounded_execution;
+// What a new app session may conclude about native work an old one left behind —
+// and, crucially, what it may not.
+pub mod orphan_reclaim;
+// The one Windows spawn ordering: suspended, assigned, verified, resumed — so no
+// agent-controlled workload runs an instruction before its job holds it.
+pub mod managed_spawn_windows;
 // Real OS suspend/resume of a process group this app owns, shared by the
 // daemon's job runner and by `background_shell.rs`.
 pub mod os_signal;
@@ -274,6 +296,10 @@ pub mod run_scope;
 // but is only ever actually called from `main.rs`'s own Tauri app wiring,
 // not from `monkey-cli`.
 pub mod permissions;
+// Peer-to-peer envelopes between two paired installations: pure types and the
+// loop/bound/expiry rules, shared so the desktop can describe a peer exchange
+// without the daemon's protocol module.
+pub mod peers;
 // `pub` (not `mod`, like `sessions`/`tools`/`system` above) so `monkey-cli`
 // (slice 5) can call `read_rules_impl`/`load_impl`/`add_fact_impl` directly
 // from `little_monkey_lib`, the same way it already reuses `checkpoints`.
@@ -329,6 +355,20 @@ pub mod process_table;
 // report. Separate from `process_table` because it is all platform syscalls and
 // no storage.
 pub mod process_usage;
+// The tree half of the same question: what does the workload rooted at this pid
+// hold, and how many processes are in it. Reads the kernel's own process table
+// rather than forking `ps`, so it can follow parent links a process group loses.
+pub mod process_tree;
+// The one contract every native child-process owner installs its limits
+// through: capability, preparation, attachment, sampling and tree termination.
+pub mod resource_control;
+// The two kernel-held backends behind that contract. Gated per OS rather than
+// stubbed: a host that cannot hold a bound must not compile a module that
+// claims to.
+#[cfg(target_os = "linux")]
+pub mod resource_control_cgroup;
+#[cfg(windows)]
+pub mod resource_control_job;
 // Policy shared by the two HTTP listeners, which default to the same port and
 // today report a bare "address already in use" naming neither the winner nor
 // the reason. Where the shared pieces accumulate as D1 collapses them into one.
@@ -384,16 +424,19 @@ pub mod privacy_firewall;
 // action. Reuses `run_protocol`/`run_ledger` for run modeling exactly like
 // every other execution surface above.
 pub mod sandbox;
+// The agent shell's live-workspace policy, layered on the same Seatbelt,
+// Landlock/seccomp and AppContainer/job primitives as disposable sandboxes.
+// Public only for monkey-cli's AppHandle-free run_shell path.
+pub mod workspace_shell;
 // The Linux half of `sandbox`'s OS boundary (ROADMAP.md item K3): a Landlock
 // filesystem ruleset plus a seccomp-BPF network filter, installed in `pre_exec`
 // alongside `os_limits`. Linux-only because the crates behind it are, and
 // because a stub would just be a second place to claim confinement from.
 #[cfg(target_os = "linux")]
 pub mod sandbox_linux;
-// The Windows half, and a narrower promise than the other two: a job object
-// bounds the run's process tree, committed memory and window-station reach, but
-// no filesystem boundary exists here that does not require this crate owning its
-// own `CreateProcess`. Reported as `ProcessContained`, never `OsSandboxed`.
+// The Windows half: AppContainer filesystem/network confinement plus a job
+// object for the process tree, memory and window-station reach. It owns the raw
+// CreateProcess path needed to apply both at spawn.
 #[cfg(target_os = "windows")]
 pub mod sandbox_windows;
 // Local, single-machine "Team, Family, and Organization Mode" (ROADMAP.md
@@ -425,6 +468,9 @@ pub mod local_apps;
 // through, so no two of them share an app-data directory (or a run ledger).
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod extension_capability_tests;
 
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
@@ -768,6 +814,10 @@ pub fn run() {
     // launchd's `PATH`, so every shell tool would miss the user's own binaries
     // (`~/.local/bin`, Homebrew, version-manager shims) until this runs.
     login_path::hydrate();
+    // User-authored agent/CLI configuration has a stable, portable home of
+    // its own. Managed state below remains in the OS app-data directory.
+    app_paths::ensure_agent_config_dir()
+        .expect("failed to initialize the Little Monkey agent home");
     let app_data_dir = app_paths::data_dir()
         .expect("the operating system must provide an application data directory");
     // Installed before anything that can refuse an outbound request, and the only
@@ -791,6 +841,16 @@ pub fn run() {
     let native_skills_state =
         native_skill_commands::NativeSkillsCommandState::production(&app_data_dir)
             .expect("failed to initialize the native SKILL.md runtime");
+    let skill_learning_state =
+        skill_learning_commands::SkillLearningCommandState::production(&app_data_dir)
+            .expect("failed to initialize the skill learning store");
+    // Resolves an interrupted promotion against what is actually installed
+    // before anything can discover or invoke a half-published skill.
+    skill_learning_commands::reconcile_at_startup(
+        &skill_learning_state.store,
+        &native_skills_state.manager,
+        None,
+    );
     let browser_state = browser_worker::BrowserCommandState::production(&app_data_dir)
         .expect("failed to initialize the isolated browser worker");
     let m7_state = m7_companion::M7CompanionState::production(&app_data_dir)
@@ -887,6 +947,7 @@ pub fn run() {
         .manage(unified_http_server::UnifiedHttpServerState::default())
         .manage(m4_state)
         .manage(native_skills_state)
+        .manage(skill_learning_state)
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
@@ -976,6 +1037,23 @@ pub fn run() {
             tauri::async_runtime::spawn_blocking(|| {
                 let _ = cli_install::install_if_needed();
             });
+
+            // Install, upgrade and start the resident execution service. Chat
+            // cannot run a single turn without it, so it is brought up as part
+            // of launching rather than left for the user to discover under
+            // Background Agents — that panel manages it, it does not gate it.
+            // Idempotent and best-effort: an already-healthy service is left
+            // alone, and a failure surfaces where it matters, as a Repair
+            // action on the chat surface that could not send.
+            //
+            // Release builds only. The published service definition names the
+            // executable that installed it, so a machine that runs both a
+            // packaged app and a dev build would have each launch decide the
+            // other's definition is stale and restart the daemon to claim it.
+            // A developer's own service is theirs to manage: the Repair action
+            // and Background Agents both still work from a dev build.
+            #[cfg(not(debug_assertions))]
+            daemon_commands::ensure_resident_service_at_startup(app.handle().clone());
 
             // Idempotently migrate the exact legacy JSON snapshot into the
             // transactional profile/index while preserving that file and its
@@ -1135,6 +1213,8 @@ pub fn run() {
             connectors::connectors_add_github,
             connectors::connectors_add_token,
             connectors::connectors_add_s3,
+            connectors::connectors_add_extension,
+            connectors::connectors_list_extension_options,
             connectors::connectors_remove,
             connectors::connectors_reverify,
             connectors::connectors_export_audit,
@@ -1174,6 +1254,7 @@ pub fn run() {
             process_commands::process_link_run,
             process_commands::process_reap_missing,
             process_commands::process_usage_ledger,
+            process_commands::process_resource_report,
             permissions::permission_respond,
             permissions::permission_dry_run,
             permissions::set_permission_mode,
@@ -1208,6 +1289,7 @@ pub fn run() {
             tools::list_workspace_paths,
             tools::tool_remember,
             tools::tool_read_skill_resource,
+            tools::tool_manage_skill_learning,
             web::tool_web_fetch,
             web::tool_web_search,
             web::web_get_settings,
@@ -1270,6 +1352,7 @@ pub fn run() {
             config_revisions::config_revisions_branch,
             config_revisions::config_revisions_branches,
             config_revisions::config_revisions_entities,
+            config_revisions::config_revisions_changes,
             checkpoints::checkpoint_begin,
             checkpoints::checkpoint_end,
             checkpoints::checkpoint_revert,
@@ -1449,6 +1532,9 @@ pub fn run() {
             m3_commands::m3_component_installed,
             m3_commands::m3_component_registry_entries,
             m3_commands::m3_component_replace_registry_entries,
+            m3_commands::m3_component_merge_registry_entries,
+            m3_commands::m3_component_fetch_catalog,
+            m3_commands::m3_component_sync_catalog,
             m3_commands::m3_component_list_registry,
             m3_commands::m3_component_check_updates,
             m3_commands::m3_component_install,
@@ -1488,6 +1574,30 @@ pub fn run() {
             native_skill_commands::native_skills_uninstall_many,
             native_skill_commands::native_skills_rollback,
             native_skill_commands::native_skills_rollback_many,
+            skill_learning_commands::skill_learning_mode,
+            skill_learning_commands::skill_learning_set_mode,
+            skill_learning_commands::skill_learning_detect,
+            skill_learning_commands::skill_learning_list_candidates,
+            skill_learning_commands::skill_learning_candidate,
+            skill_learning_commands::skill_learning_begin_reflection,
+            skill_learning_commands::skill_learning_stage,
+            skill_learning_commands::skill_learning_plan_evaluation,
+            skill_learning_commands::skill_learning_report_evaluation,
+            skill_learning_commands::skill_learning_mark_unevaluated,
+            skill_learning_commands::skill_learning_evaluations,
+            skill_learning_commands::skill_learning_promote,
+            skill_learning_commands::skill_learning_reject,
+            skill_learning_commands::skill_learning_finalize_run,
+            skill_learning_commands::skill_learning_record_correction,
+            skill_learning_commands::skill_learning_create_sandboxes,
+            skill_learning_commands::skill_learning_destroy_sandboxes,
+            skill_learning_commands::skill_learning_settings,
+            skill_learning_commands::skill_learning_set_settings,
+            skill_learning_commands::skill_learning_reflection_brief,
+            skill_learning_commands::skill_learning_learned_skills,
+            skill_learning_commands::skill_learning_effectiveness,
+            skill_learning_commands::skill_learning_deprecate,
+            skill_learning_commands::skill_learning_discover,
             security_commands::security_audit,
             self_integrity::self_integrity_report,
             update_rollback::update_install_info,
@@ -1554,9 +1664,86 @@ pub fn run() {
             browser_worker::browser_scroll,
             browser_worker::browser_capture_evidence,
             browser_worker::browser_stop,
+            extension_commands::extensions_discover,
+            extension_commands::extensions_list,
+            extension_commands::extensions_active_capabilities,
+            extension_commands::extensions_inspect,
+            extension_commands::extensions_install,
+            extension_commands::extensions_validate,
+            extension_commands::extensions_set_enabled,
+            extension_commands::extensions_set_running,
+            extension_commands::extensions_preview_update,
+            extension_commands::extensions_update,
+            extension_commands::extensions_rollback,
+            extension_commands::extensions_uninstall,
+            extension_commands::extensions_status,
+            extension_commands::extensions_logs,
+            extension_commands::extensions_set_config,
+            extension_commands::extensions_set_secret,
+            extension_commands::extensions_remove_secret,
+            extension_commands::extensions_invoke,
+            extension_commands::extensions_cancel,
+            extension_commands::extensions_webhooks,
+            extension_commands::extensions_register_webhook,
+            extension_commands::extensions_remove_webhook,
+            daemon_commands::conversations_list,
+            daemon_commands::conversations_show,
+            daemon_commands::channels_list,
+            daemon_commands::channels_add,
+            daemon_commands::channels_probe,
+            daemon_commands::channels_enable,
+            daemon_commands::channels_set_policy,
+            daemon_commands::channels_set_credential,
+            daemon_commands::channels_senders,
+            daemon_commands::channels_decide_sender,
+            daemon_commands::channels_routes,
+            daemon_commands::channels_add_route,
+            daemon_commands::channels_update_route,
+            daemon_commands::channels_enable_route,
+            daemon_commands::channels_remove_route,
+            daemon_commands::channels_set_config,
+            daemon_commands::channels_callback_url,
+            daemon_commands::channels_set_public_url,
+            daemon_commands::channels_exposure_status,
+            daemon_commands::channels_exposure_manual,
+            daemon_commands::channels_exposure_set_tunnel,
+            daemon_commands::channels_exposure_set_token,
+            daemon_commands::channels_exposure_clear_token,
+            daemon_commands::channels_events,
+            daemon_commands::channels_remove,
+            daemon_commands::ingress_turns,
+            daemon_commands::ingress_turn_show,
+            daemon_commands::ingress_turn_resume,
+            daemon_commands::peers_list,
+            daemon_commands::peers_invite,
+            daemon_commands::peers_accept,
+            daemon_commands::peers_grant,
+            daemon_commands::peers_revoke,
+            daemon_commands::peers_rotate,
+            daemon_commands::peers_accept_rotation,
+            daemon_commands::peers_clear,
+            daemon_commands::peers_forget,
+            daemon_commands::peers_status,
+            daemon_commands::peers_threads,
+            daemon_commands::peers_outbound,
+            daemon_commands::peers_remote_thread,
+            daemon_commands::telecom_list,
+            daemon_commands::telecom_add,
+            daemon_commands::telecom_probe,
+            daemon_commands::telecom_enable,
+            daemon_commands::telecom_set_policy,
+            daemon_commands::telecom_set_limits,
+            daemon_commands::telecom_set_credential,
+            daemon_commands::telecom_set_greeting,
+            daemon_commands::telecom_calls,
+            daemon_commands::telecom_messages,
+            daemon_commands::telecom_callback_url,
+            daemon_commands::telecom_set_public_url,
+            daemon_commands::telecom_remove,
             daemon_commands::daemon_desktop_status,
             daemon_commands::daemon_desktop_decisions,
             daemon_commands::daemon_desktop_install,
+            daemon_commands::daemon_desktop_ensure,
             daemon_commands::daemon_desktop_start,
             daemon_commands::daemon_desktop_stop,
             daemon_commands::daemon_desktop_uninstall,
@@ -1577,6 +1764,15 @@ pub fn run() {
             daemon_commands::remote_pair_revoke,
             daemon_commands::remote_pair_rotate,
             daemon_commands::remote_audit,
+            daemon_commands::remote_device_list,
+            daemon_commands::remote_device_grant,
+            daemon_commands::remote_device_commands,
+            daemon_commands::remote_device_cancel,
+            daemon_commands::remote_push_status,
+            daemon_commands::remote_push_configure,
+            daemon_commands::remote_push_disable,
+            daemon_commands::remote_push_test,
+            daemon_commands::tool_device_action,
             daemon_commands::remote_node_list,
             daemon_commands::remote_placements,
             daemon_commands::remote_node_refresh,
@@ -1614,6 +1810,11 @@ pub fn run() {
             m7_companion::m7_overlay_submit,
             m7_companion::m7_config_get,
             m7_companion::m7_config_save,
+            m7_companion::m7_talk_status,
+            m7_companion::m7_talk_metrics,
+            m7_companion::m7_talk_metric_record,
+            m7_companion::m7_talk_metrics_clear,
+            m7_companion::m7_talk_transcribe,
             m7_companion::m7_capture_grant,
             m7_companion::m7_capture_revoke,
             m7_companion::m7_capture_grants,
@@ -1623,6 +1824,7 @@ pub fn run() {
             m7_companion::m7_transcribe_file,
             m7_companion::m7_transcribe_audio,
             m7_companion::m7_tts_speak,
+            m7_companion::m7_tts_synthesize,
             m7_companion::m7_job_cancel,
             generation_commands::generation_engine_status,
             generation_commands::generation_models,
@@ -1699,6 +1901,8 @@ pub fn run() {
         // get to actually be killed before the process itself exits.
         if let tauri::RunEvent::Exit = event {
             let _ = tauri::async_runtime::block_on(server::shutdown_unified_server(app_handle));
+            let _ = executable_extensions::close_all_sessions();
+            let _ = executable_extensions::cancel_all();
 
             let m3 = app_handle.state::<m3_commands::M3CommandState>();
             let _ = m3.cancel_all_and_shutdown_owned(std::time::Duration::from_secs(5));

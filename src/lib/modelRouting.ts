@@ -1,5 +1,5 @@
 /**
- * K9 (docs/agent-os-roadmap.md) — the dispatch-policy engine: given the
+ * The dispatch-policy engine: given the
  * targets this profile actually has, which one executes this turn, and why.
  *
  * Deliberately pure and store-free. Every input is passed in — candidates,

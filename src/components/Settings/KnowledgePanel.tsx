@@ -15,6 +15,10 @@ import {
   type StackQueryResult,
 } from "../../store/stackStore";
 import { errorMessage } from "../../lib/errors";
+import {
+  executableExtensionsClient,
+  type ActiveCapability,
+} from "../../lib/executableExtensionsClient";
 
 const EMBED_STATUS_TONE: Record<string, PillTone> = {
   ready: "success",
@@ -92,8 +96,21 @@ export function KnowledgePanel() {
   const [newBackend, setNewBackend] = useState<EmbeddingBackend>("llama");
   const [newModelId, setNewModelId] = useState<string>("");
   const [newOllamaTag, setNewOllamaTag] = useState("");
+  const [embeddingCapabilities, setEmbeddingCapabilities] = useState<ActiveCapability[]>([]);
+  const [newEmbeddingCapability, setNewEmbeddingCapability] = useState<ActiveCapability | null>(null);
+  const [newEmbeddingDim, setNewEmbeddingDim] = useState("1024");
   const [createError, setCreateError] = useState<string | null>(null);
   const [selectedEmbedModelPath, setSelectedEmbedModelPath] = useState<string>("");
+
+  // Discovery is backend truth: only installed, validated, enabled, running
+  // and healthy extensions are returned, so nothing offered here can resolve
+  // to a provider that would then refuse the first batch.
+  useEffect(() => {
+    void executableExtensionsClient
+      .activeCapabilities("embedding_provider")
+      .then(setEmbeddingCapabilities)
+      .catch(() => setEmbeddingCapabilities([]));
+  }, []);
 
   const handleCreate = useCallback(async () => {
     const name = newName.trim();
@@ -112,6 +129,29 @@ export function KnowledgePanel() {
           dim: spec.dim,
           query_prefix: spec.queryPrefix,
           doc_prefix: spec.docPrefix,
+        });
+        setExpandedId(stack.id);
+      } else if (newBackend === "extension") {
+        const capability = newEmbeddingCapability;
+        const dim = Number.parseInt(newEmbeddingDim, 10);
+        if (!capability) {
+          setCreateError(t("KnowledgePanel.selectEmbeddingExtensionError"));
+          return;
+        }
+        if (!Number.isInteger(dim) || dim < 1 || dim > 65536) {
+          setCreateError(t("KnowledgePanel.embeddingDimensionError"));
+          return;
+        }
+        // The dimension is pinned at creation and checked on every batch: a
+        // provider that later answers with a different width hard-fails to
+        // "reindex required" rather than mixing two embedding spaces.
+        const stack = await createStack(name, {
+          backend: "extension",
+          extension_id: capability.extension_id,
+          model_id_or_tag: capability.capability_id,
+          dim,
+          query_prefix: "",
+          doc_prefix: "",
         });
         setExpandedId(stack.id);
       } else {
@@ -136,7 +176,16 @@ export function KnowledgePanel() {
     } catch (err) {
       setCreateError(errorMessage(err));
     }
-  }, [newName, newBackend, newModelId, newOllamaTag, createStack, t]);
+  }, [
+    newName,
+    newBackend,
+    newModelId,
+    newOllamaTag,
+    newEmbeddingCapability,
+    newEmbeddingDim,
+    createStack,
+    t,
+  ]);
 
   const handleDelete = useCallback(
     async (stack: KnowledgeStack) => {
@@ -289,6 +338,7 @@ export function KnowledgePanel() {
               >
                 <option value="llama">{t("KnowledgePanel.backendLlama")}</option>
                 <option value="ollama">{t("KnowledgePanel.backendOllama")}</option>
+                <option value="extension">{t("KnowledgePanel.backendExtension")}</option>
               </select>
               {newBackend === "llama" ? (
                 <select
@@ -303,6 +353,40 @@ export function KnowledgePanel() {
                     </option>
                   ))}
                 </select>
+              ) : newBackend === "extension" ? (
+                <>
+                  <select
+                    value={newEmbeddingCapability
+                      ? `${newEmbeddingCapability.extension_id}:${newEmbeddingCapability.capability_id}`
+                      : ""}
+                    onChange={(event) => setNewEmbeddingCapability(
+                      embeddingCapabilities.find(
+                        (capability) => `${capability.extension_id}:${capability.capability_id}`
+                          === event.target.value,
+                      ) ?? null,
+                    )}
+                    className="h-8 min-w-0 flex-1 rounded-md border border-border bg-surface px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+                  >
+                    <option value="">{t("KnowledgePanel.selectEmbeddingExtension")}</option>
+                    {embeddingCapabilities.map((capability) => (
+                      <option
+                        key={`${capability.extension_id}:${capability.capability_id}`}
+                        value={`${capability.extension_id}:${capability.capability_id}`}
+                      >
+                        {capability.display_name} · {capability.extension_id} · {capability.version}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    min={1}
+                    max={65536}
+                    value={newEmbeddingDim}
+                    onChange={(event) => setNewEmbeddingDim(event.target.value)}
+                    aria-label={t("KnowledgePanel.embeddingDimension")}
+                    className="h-8 w-24 rounded-md border border-border bg-surface px-2.5 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-accent"
+                  />
+                </>
               ) : (
                 <input
                   type="text"

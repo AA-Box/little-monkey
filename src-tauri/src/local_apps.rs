@@ -142,6 +142,10 @@ pub fn config_file_path(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .profile_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    config_file_path_for_data_dir(&base)
+}
+
+pub(crate) fn config_file_path_for_data_dir(base: &Path) -> Result<PathBuf, String> {
     if !base.exists() {
         std::fs::create_dir_all(&base).map_err(|e| {
             format!(
@@ -343,20 +347,20 @@ pub fn read_static_file(
 /// either read-only or writes into a location keyed by a freshly generated
 /// id nothing else could already reference.
 pub fn publish_impl(
-    app: &AppHandle,
+    _app: &AppHandle,
     state: &AppState,
     recipe_name: &str,
     template: LocalAppTemplate,
     param_bindings: std::collections::HashMap<String, String>,
 ) -> Result<LocalAppDefinition, String> {
-    let app_data_dir = app
-        .profile_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    let config_roots = crate::app_paths::agent_config_roots()?;
+    let app_data_dir = config_roots.legacy.clone();
+    let global_config_roots = config_roots.ordered();
     let workspace_root = crate::workspace::primary_root_canon(state).ok();
     let (recipe, _path) = crate::recipes::resolve_recipe_with_path(
         recipe_name,
         workspace_root.as_deref(),
-        &app_data_dir,
+        &global_config_roots,
     )?;
 
     let mut unknown: Vec<&String> = param_bindings
@@ -377,10 +381,11 @@ pub fn publish_impl(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
-    let server_config = crate::server::load_config_impl(&crate::server::config_file_path(app)?)?;
+    let server_config_path = crate::server::config_file_path_for_data_dir(&app_data_dir)?;
+    let server_config = crate::server::load_config_impl(&server_config_path)?;
     let (token, token_entry) = crate::server::create_local_app_token_with_state(
         state,
-        &crate::server::config_file_path(app)?,
+        &server_config_path,
         &format!("Local App: {}", recipe.name),
         &id,
     )?;
@@ -422,7 +427,7 @@ pub fn publish_impl(
     std::fs::rename(&tmp, &index_path)
         .map_err(|e| format!("Failed to finalize Local App page: {e}"))?;
 
-    let config_path = config_file_path(app)?;
+    let config_path = config_file_path_for_data_dir(&app_data_dir)?;
     {
         let _guard = state
             .local_apps_config_lock

@@ -109,8 +109,11 @@ export function ProviderCard({ provider }: ProviderCardProps) {
             <h3 className="truncate text-sm font-semibold text-foreground">{provider.label}</h3>
             {provider.has_key && <StatusPill tone="success">{t("ProviderCard.connected")}</StatusPill>}
             {provider.is_custom && <StatusPill tone="neutral">{t("ProviderCard.custom")}</StatusPill>}
+            {provider.is_extension && <StatusPill tone="neutral">{t("ProviderCard.extension")}</StatusPill>}
           </div>
-          <p className="mt-0.5 truncate font-mono text-xs text-muted">{provider.base_url}</p>
+          <p className="mt-0.5 truncate font-mono text-xs text-muted">
+            {provider.is_extension ? t("ProviderCard.extensionEndpoint") : provider.base_url}
+          </p>
         </div>
         {provider.is_custom && (
           <Button
@@ -124,7 +127,21 @@ export function ProviderCard({ provider }: ProviderCardProps) {
         )}
       </div>
 
-      {!provider.has_key ? (
+      {provider.is_extension ? (
+        // No key field: an extension provider authenticates inside its own
+        // sandbox from the secret slots the operator filled in, so there is
+        // nothing to paste here and a box that accepted one would be a lie.
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-muted">{t("ProviderCard.extensionCredentials")}</span>
+          <Button variant="secondary" size="sm" onClick={() => void handleRefresh()} disabled={refreshing}>
+            {refreshing
+              ? t("ProviderCard.refreshing")
+              : providerModels.length
+                ? t("ProviderCard.refreshModelsWithCount", { count: providerModels.length })
+                : t("ProviderCard.refreshModels")}
+          </Button>
+        </div>
+      ) : !provider.has_key ? (
         <div className="flex items-center gap-2">
           <input
             type="password"

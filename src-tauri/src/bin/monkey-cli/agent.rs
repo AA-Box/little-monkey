@@ -10,6 +10,7 @@
 use std::io::Write;
 use std::sync::LazyLock;
 
+use little_monkey_lib::channels::mutation::{MutationOutcome, MUTATION_VERIFICATION_NAME};
 use little_monkey_lib::checkpoints;
 use little_monkey_lib::mcp::McpServerEntry;
 use little_monkey_lib::run_protocol::{
@@ -72,7 +73,10 @@ fn neutralize_model_control_tokens(value: &str) -> String {
         .into_owned()
 }
 
-fn wrap_untrusted_content(source: &str, content: &str) -> String {
+/// Visible to the rest of the binary because every path that turns externally
+/// supplied text into model input has to use this one — the channel ingress path
+/// wraps a stranger's message with it before it can become a run parameter.
+pub(crate) fn wrap_untrusted_content(source: &str, content: &str) -> String {
     let safe_source: String = neutralize_model_control_tokens(source)
         .replace('\r', " ")
         .replace('\n', " ")
@@ -678,10 +682,14 @@ async fn run_verification_phase(
         return Ok(None);
     }
 
+    // Resolved once, before the phase runs, and fatal when it cannot be: a verify
+    // command is a bounded native execution, and one with no process-table row is
+    // a limit-enforced tree outside the ledger that claims to hold all of them.
+    let projector = little_monkey_lib::bounded_execution::cli_projector()?;
     let mut first_failure: Option<VerifyFailure> = None;
     for cmd in &commands {
         statusln!(options, "\n[verify] running \"{}\"…", cmd.label);
-        let result = verify::run_command_impl(state, &root, cmd, None).await;
+        let result = verify::run_command_impl(state, &root, cmd, None, projector.clone()).await;
         let ok = !result.timed_out && result.code == Some(0);
         let output = build_verify_output(&result);
         statusln!(
@@ -826,6 +834,10 @@ async fn execute_tool_call(
     options: &chat::ChatOptions,
     state: &AppState,
     perms: &mut TerminalPermissions,
+    // The loop's own id for this invocation — the same one the run events
+    // carry. Trusted because the runtime assigns it; the model never sees or
+    // supplies it. `send_message` keys durable deliveries on it.
+    tool_call_id: &str,
     name: &str,
     raw_arguments: &str,
     checkpoint_id: Option<&str>,
@@ -859,6 +871,192 @@ async fn execute_tool_call(
     // "only offered while mode==='plan'" boundary the GUI enforces via
     // `isToolCallAllowed`, just checked here at dispatch time instead of a
     // separate offered-tools allowlist.
+    // `send_message` answers the conversation this run came from. Checked here,
+    // before the `tool_<name>` dispatch, for the same reason `present_plan` is:
+    // it is not a Tauri command, and the guard belongs at dispatch time rather
+    // than in an offered-tools list a hallucinated name could slip past.
+    //
+    // Two gates, both refusing rather than asking:
+    // - the run's own permission snapshot must allow external mutation. A reply
+    //   leaves the machine and is not undoable, so a run that was not granted
+    //   that authority cannot acquire it by being asked nicely;
+    // - the destination comes from the durable event that produced this job, so
+    //   there is no argument for the model to redirect.
+    if name == "send_message" {
+        let authority = crate::daemon::channel_tool::send_authority(
+            perms.allow_external_mutations(),
+            perms.channel_send(),
+        );
+        if !authority.allows_anything() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow sending messages outside this machine."
+            })
+            .to_string();
+        }
+        let string_arg = |key: &str| {
+            args[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let string_list = |key: &str| -> Vec<String> {
+            args[key]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: string_arg("account"),
+            conversation_id: string_arg("to"),
+            thread_id: string_arg("thread"),
+            reply_to_provider_id: string_arg("reply_to"),
+            text: args["text"].as_str().unwrap_or_default().to_string(),
+            artifact_ids: string_list("artifacts"),
+        };
+        // The approval prompt names everything that makes this send what it
+        // is: an explicit destination (a reply to the origin conversation
+        // stays implicit, as before), every file, and the first line of text.
+        // A preview of the text alone would ask the operator to approve the
+        // one part that is not the risk.
+        let mut preview = String::new();
+        if let Some(account) = &request.account_id {
+            preview.push_str(&format!("[account: {account}] "));
+        }
+        if let Some(to) = &request.conversation_id {
+            preview.push_str(&format!("[to: {to}] "));
+        }
+        preview.extend(request.text.chars().take(120));
+        if !request.artifact_ids.is_empty() {
+            preview.push_str(&format!(
+                " [artifacts: {}]",
+                request.artifact_ids.join(", ")
+            ));
+        }
+        return match perms.request("send_message", &preview).await {
+            Ok(()) => match crate::daemon::channel_tool::send_message(
+                &request,
+                &authority,
+                Some(tool_call_id),
+            ) {
+                Ok(value) => value.to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            },
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
+    // `peer_message` reaches another installation the operator paired with.
+    // Same external-mutation gate as `send_message` — it leaves this machine
+    // and cannot be taken back — plus the destination being an alias that must
+    // already exist, so there is nothing here for a model to redirect.
+    if name == "peer_message" {
+        if !perms.allow_external_mutations() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow contacting other installations."
+            })
+            .to_string();
+        }
+        let peer = args["peer"].as_str().unwrap_or_default().to_string();
+        let text = args["text"].as_str().unwrap_or_default().to_string();
+        let thread = args["thread"].as_str().map(str::to_string);
+        let correlation = args["correlation"].as_str().map(str::to_string);
+        let task = args["task"].as_bool().unwrap_or(false);
+        let artifacts: Vec<String> = args["artifacts"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let preview: String = text.chars().take(120).collect();
+        // The count is in the prompt because handing files over is the part an
+        // operator would want to see before approving, not after.
+        let summary = format!(
+            "{} {peer}: {preview}{}",
+            if task { "ask" } else { "message" },
+            match artifacts.len() {
+                0 => String::new(),
+                1 => " (with 1 artifact)".to_string(),
+                many => format!(" (with {many} artifacts)"),
+            }
+        );
+        return match perms.request("peer_message", &summary).await {
+            Ok(()) => match crate::daemon::peer_tool::send_peer_message(
+                &peer,
+                &text,
+                thread.as_deref(),
+                task,
+                correlation.as_deref(),
+                &artifacts,
+            )
+            .await
+            {
+                Ok(value) => value.to_string(),
+                Err(error) => serde_json::json!({ "error": error }).to_string(),
+            },
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
+    // `place_call` is the most consequential tool in the set: it reaches a
+    // person and it bills the operator. Same external-mutation gate as
+    // `send_message`, plus the account's own outbound policy, which can refuse
+    // in a way the approval prompt cannot override.
+    if name == "place_call" {
+        if !perms.allow_external_mutations() {
+            return serde_json::json!({
+                "error": "This run's permission snapshot does not allow placing calls."
+            })
+            .to_string();
+        }
+        let account_id = args["account_id"].as_str().unwrap_or_default().to_string();
+        let to_number = args["to_number"].as_str().unwrap_or_default().to_string();
+        let opening_line = args["opening_line"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // The approval prompt shows the words that will be said, because the
+        // words are most of what the operator is approving. An account set to
+        // dial without asking skips the prompt — that setting is the standing
+        // approval, and prompting anyway would make it mean nothing.
+        let detail = format!("call {to_number} from {account_id} and say: {opening_line}");
+        let gate = if crate::daemon::telecom_tool::outbound_needs_prompt(&account_id) {
+            perms.request("place_call", &detail).await
+        } else {
+            Ok(())
+        };
+        return match gate {
+            Ok(()) => {
+                match crate::daemon::telecom_tool::place_call(
+                    &account_id,
+                    &to_number,
+                    &opening_line,
+                    // The loop's own id for this invocation, which is what a
+                    // replayed run resolves to the same call by. Never
+                    // anything the model supplied.
+                    &crate::daemon::telecom_tool::CallInvocation {
+                        job_id: None,
+                        tool_call_id: Some(tool_call_id.to_string()),
+                    },
+                )
+                .await
+                {
+                    Ok(value) => value.to_string(),
+                    Err(error) => serde_json::json!({ "error": error }).to_string(),
+                }
+            }
+            Err(error) => serde_json::json!({ "error": error }).to_string(),
+        };
+    }
+
     if name == "present_plan" {
         return if perms.mode() != PermissionMode::Plan {
             serde_json::json!({ "error": "present_plan is only available in Plan Mode." })
@@ -1024,7 +1222,7 @@ async fn execute_tool_call(
                     let settings = web_cli::load_settings();
                     let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
                     let start_index = args["start_index"].as_u64().map(|v| v as usize);
-                    web::fetch_impl(&settings, url, max_chars, start_index)
+                    web::fetch_for_call(&settings, tool_call_id, url, max_chars, start_index)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|e| e.to_string()))
                 }
@@ -1049,13 +1247,69 @@ async fn execute_tool_call(
                         None
                     };
                     let count = args["count"].as_u64().map(|v| v as usize);
-                    web::search_impl(&settings, brave_key, query, count)
+                    web::search_for_call(&settings, tool_call_id, brave_key, query, count)
                         .await
                         .and_then(|results| {
                             serde_json::to_value(results).map_err(|e| e.to_string())
                         })
                 }
                 Err(e) => Err(e),
+            }
+        }
+        // A physical action on someone's phone always prompts — it is the one
+        // tool whose effect happens on a different machine, in a room the
+        // operator may not be in. Same `perms.request` choke point as every
+        // other gated tool, with the device and the action in the prompt so the
+        // person approving sees which phone is about to do what.
+        "device_action" => {
+            let action = args["action"].as_str().unwrap_or_default().to_string();
+            let capability = match crate::daemon::remote::device::capability_for_action(&action) {
+                Ok(capability) => capability,
+                Err(error) => return serde_json::json!({ "error": error }).to_string(),
+            };
+            let paths = match crate::daemon::store::DaemonPaths::resolve() {
+                Ok(paths) => paths,
+                Err(error) => return serde_json::json!({ "error": error }).to_string(),
+            };
+            let detail = match args["device_id"].as_str() {
+                Some(device_id) => format!("{action} on {device_id}"),
+                None => action.clone(),
+            };
+            match perms.request("device_action", &detail).await {
+                Ok(()) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|value| value.as_millis() as u64)
+                        .unwrap_or_default();
+                    crate::daemon::remote::device::dispatch(
+                        &paths,
+                        &crate::daemon::remote::device::DeviceActionRequest {
+                            device_id: args["device_id"].as_str().map(str::to_string),
+                            capability,
+                            arguments: args.clone(),
+                            wait_ms: args["wait_ms"].as_u64().unwrap_or(60_000),
+                            // The interactive CLI turn has no durable run or
+                            // session id in scope — the queue records the
+                            // provenance it is actually given rather than
+                            // inventing one. Callers that do run inside a
+                            // durable run (the daemon's own dispatch) pass it.
+                            source_run_id: None,
+                            source_session_id: None,
+                            source_tool_call_id: Some(tool_call_id.to_string()),
+                            // The same durable identity `send_message` keys its
+                            // deliveries on. A replayed turn reaches the same
+                            // pair and therefore the same command, so one tool
+                            // invocation can only ever take one photograph.
+                            invocation_id: crate::daemon::remote::device::invocation_identity(
+                                Some(tool_call_id),
+                            ),
+                        },
+                        now,
+                    )
+                    .await
+                    .map(|record| crate::daemon::remote::device::result_json(&record))
+                }
+                Err(error) => Err(error),
             }
         }
         // Read-only, so — like `read_file`/`grep`/`list_dir` above — never
@@ -1132,14 +1386,27 @@ async fn build_user_message(
     user_text: &str,
 ) -> Result<serde_json::Value, String> {
     let plain = serde_json::json!({ "role": "user", "content": user_text });
-    if !target.is_native() && !options.attach_images {
-        return Ok(plain);
-    }
-    let (clean, images) = chat::extract_image_paths(user_text);
+
+    // Files this turn's own inbound message carried, resolved from the durable
+    // event rather than from the text. A stranger writes the text; letting it
+    // name a path would let them have the model read any image on this machine
+    // back to them.
+    let carried = crate::daemon::channel_tool::current_turn_images();
+    // Paths the operator typed. Only looked for where they were already looked
+    // for — a native vision model, or `--attach-images` on an OpenAI-compat
+    // target — because this scan trusts the text.
+    let (clean, mut images) = if target.is_native() || options.attach_images {
+        chat::extract_image_paths(user_text)
+    } else {
+        (user_text.to_string(), Vec::new())
+    };
+    images.extend(carried);
     if images.is_empty() {
         return Ok(plain);
     }
     if target.is_native() && !supports_vision(client, target).await {
+        // Nothing is stripped: the text still names what arrived, so the model
+        // can say it cannot see the photo rather than ignore it.
         return Ok(plain);
     }
     for path in &images {
@@ -1203,6 +1470,60 @@ pub async fn run_turn(
     .await
 }
 
+/// Everything one turn's own tool calls proved about the workspace.
+///
+/// Separate from `mutated_files` (which a verification round deliberately
+/// clears, so that only edits made in response to *that* failure are verified
+/// again) because the workspace-mutation contract is a statement about the whole
+/// turn: a file changed in round two is still a file changed.
+#[derive(Debug, Default)]
+struct ObservedMutations {
+    /// Paths a `write_file`/`edit_file` call — this turn's own, or a subagent's
+    /// on its behalf — reported as written.
+    mutated_paths: std::collections::BTreeSet<String>,
+    /// Mutation targets whose last outcome was a failure or a denial, keyed by
+    /// path so a later success on the same file resolves it. A failure on one
+    /// file is not resolved by a success on another.
+    unresolved: std::collections::BTreeMap<String, String>,
+}
+
+impl ObservedMutations {
+    fn succeeded(&mut self, path: &str) {
+        self.mutated_paths.insert(path.to_string());
+        self.unresolved.remove(path);
+    }
+
+    fn failed(&mut self, key: String, reason: String) {
+        self.unresolved.insert(key, reason);
+    }
+
+    /// The contract-facing outcome, preferring the checkpoint's own measurement
+    /// of what changed on disk over the tools' claim that they wrote something.
+    fn outcome(&self, files_changed: &[String]) -> MutationOutcome {
+        MutationOutcome {
+            mutated: !files_changed.is_empty() || !self.mutated_paths.is_empty(),
+            changed_paths: if files_changed.is_empty() {
+                self.mutated_paths.iter().cloned().collect()
+            } else {
+                files_changed.to_vec()
+            },
+            unresolved_failure: self.unresolved.values().next().cloned(),
+        }
+    }
+}
+
+/// The error a failed mutation tool reported, if it named one. Rust port of
+/// `workspaceMutation.ts`'s `mutationToolFailureReason`.
+fn mutation_tool_failure_reason(result_content: &str) -> Option<String> {
+    let error = serde_json::from_str::<serde_json::Value>(result_content)
+        .ok()?
+        .get("error")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!error.is_empty()).then(|| error.chars().take(500).collect())
+}
+
 /// Same as [`run_turn`], but lets a caller cap the tool-calling loop below
 /// (or, in principle, above) the default [`MAX_ITERATIONS`] — `monkey-cli
 /// task run` uses this to honor a recipe's own `max_iterations` field
@@ -1240,6 +1561,7 @@ pub async fn run_turn_with_max_iterations(
         mcp_entries,
         attached_stacks,
         max_iterations_override,
+        false,
     )
     .await
 }
@@ -1250,6 +1572,12 @@ pub async fn run_turn_with_max_iterations(
 /// shapes are consumed exactly as captured instead of being flattened into a
 /// second prompt. The ordinary CLI path above remains the sole builder for
 /// interactive text/image prompts.
+///
+/// `mutation_required` is the turn's frozen workspace-mutation contract. When
+/// it is set, the outcome — what changed, and whether a requested edit was left
+/// failing — is reported as a durable run event before this returns, because the
+/// process that decides what to do about an unmet contract is not this one. See
+/// [`little_monkey_lib::channels::mutation`].
 #[allow(clippy::too_many_arguments)]
 pub async fn run_prepared_turn_with_max_iterations(
     client: &reqwest::Client,
@@ -1262,6 +1590,7 @@ pub async fn run_prepared_turn_with_max_iterations(
     mcp_entries: &[McpServerEntry],
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
+    mutation_required: bool,
 ) -> Result<Vec<String>, String> {
     if history
         .last()
@@ -1322,6 +1651,8 @@ pub async fn run_prepared_turn_with_max_iterations(
     }
 
     let mut usage = zero_usage();
+    let mut observed = ObservedMutations::default();
+    let started = std::time::Instant::now();
 
     let result = run_tool_loop(
         client,
@@ -1335,6 +1666,7 @@ pub async fn run_prepared_turn_with_max_iterations(
         attached_stacks,
         max_iterations_override,
         &mut usage,
+        &mut observed,
     )
     .await;
 
@@ -1344,7 +1676,37 @@ pub async fn run_prepared_turn_with_max_iterations(
         .map(|summary| summary.files)
         .unwrap_or_default();
 
+    // Reported before the error is returned, and on every exit path, because an
+    // unmet contract is exactly what a failed turn produces: the policy that
+    // decides whether to correct it reads durable events, not this return value.
+    if mutation_required {
+        let outcome = observed.outcome(&files_changed);
+        let _ = emit_run_event(
+            perms,
+            RunEvent::VerificationFinished {
+                verification_id: safe_protocol_id("verification", MUTATION_VERIFICATION_NAME),
+                name: MUTATION_VERIFICATION_NAME.to_string(),
+                passed: outcome.satisfied(),
+                summary: outcome.summary(),
+                artifact_ids: Vec::new(),
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
+            },
+        );
+    }
+
     result.map(|()| files_changed)
+}
+
+/// The loop's own id for one tool invocation: where the call sits in the run,
+/// never a value drawn fresh per attempt.
+///
+/// `send_message` keys durable deliveries on this id, so a run that replays a
+/// tool call has to arrive at the id its earlier attempt used — otherwise the
+/// outbox sees a new invocation and the message goes out a second time. The
+/// call's position is the one thing a replay reproduces exactly and two
+/// distinct calls never share.
+fn tool_call_id_for(round_index: usize, call_index: usize) -> String {
+    format!("tool-{}-{}", round_index + 1, call_index + 1)
 }
 
 /// The tool-calling loop itself, factored out of `run_turn` so the
@@ -1363,6 +1725,7 @@ async fn run_tool_loop(
     attached_stacks: &[String],
     max_iterations_override: Option<usize>,
     usage: &mut UsageSnapshot,
+    observed: &mut ObservedMutations,
 ) -> Result<(), String> {
     // Built once per turn (mirroring `agentLoop.ts`'s two `attemptStream`
     // call sites recomputing `mcpToolDefs()` per turn, not per streaming
@@ -1398,6 +1761,40 @@ async fn run_tool_loop(
     if perms.mode() == PermissionMode::Plan {
         tools_vec.push(tools_def::present_plan_tool_def());
     }
+    // `send_message` is offered only on a run that can actually reach
+    // somewhere: one that arrived from a messaging conversation and may answer
+    // it, or one whose snapshot grants another destination outright. A run
+    // with neither would only be offered a tool that refuses.
+    {
+        let authority = crate::daemon::channel_tool::send_authority(
+            perms.allow_external_mutations(),
+            perms.channel_send(),
+        );
+        let has_origin = crate::daemon::channel_tool::current_channel_origin().is_some();
+        let reachable = ((authority.reply || authority.cross_conversation) && has_origin)
+            || !authority.accounts.is_empty();
+        if reachable {
+            tools_vec.push(tools_def::send_message_tool_def());
+        }
+    }
+    // `peer_message` is offered only when this installation is paired with
+    // another as a peer. Nothing to reach, nothing to offer.
+    if perms.allow_external_mutations() {
+        let peers: Vec<String> = crate::daemon::peer_tool::reachable_peers()
+            .into_iter()
+            .map(|(alias, _)| alias)
+            .collect();
+        if !peers.is_empty() {
+            tools_vec.push(tools_def::peer_message_tool_def(&peers));
+        }
+    }
+    // `place_call` is offered only when the operator actually configured a
+    // number that may dial out. An operator whose numbers are all receive-only
+    // never sees the tool, rather than being offered one whose only possible
+    // answer is a refusal.
+    if perms.allow_external_mutations() && crate::daemon::telecom_tool::any_account_may_dial() {
+        tools_vec.push(tools_def::place_call_tool_def());
+    }
     // `search_docs` is offered only when at least one `--stack` was given —
     // mirrors the desktop app's `buildTools(attachedStackNames)`, which only
     // offers the tool when a stack is actually attached to the session (see
@@ -1411,6 +1808,14 @@ async fn run_tool_loop(
     // See `execute_tool_call`'s `"task"` arm for the dispatch and depth cap.
     if options.subagents {
         tools_vec.push(tools_def::task_tool_def());
+    }
+    // `device_action` is offered only when this machine actually has a paired
+    // device with at least one effective physical capability — the same
+    // offer-only-when-usable rule as `search_docs` above, and for a sharper
+    // reason: a model told it has a camera will try to use one, and "no paired
+    // device can do this" is a worse answer than never having been offered it.
+    if crate::daemon::remote::device::any_device_is_capable() {
+        tools_vec.push(tools_def::device_action_tool_def());
     }
     let native = target.is_native();
 
@@ -1563,7 +1968,7 @@ async fn run_tool_loop(
         history.push(assistant_message);
 
         for (call_index, call) in result.tool_calls.iter().enumerate() {
-            let observed_tool_call_id = format!("tool-{}-{}", round_index + 1, call_index + 1);
+            let observed_tool_call_id = tool_call_id_for(round_index, call_index);
             let tool_name = safe_protocol_id("tool", &call.name);
             let (arguments, arguments_sha256) =
                 redacted_tool_arguments(&call.name, &call.arguments);
@@ -1601,6 +2006,7 @@ async fn run_tool_loop(
                 options,
                 state,
                 perms,
+                &observed_tool_call_id,
                 &call.name,
                 &call.arguments,
                 checkpoint_id,
@@ -1633,12 +2039,34 @@ async fn run_tool_loop(
             // succeeded (the "Wrote…"/"Edited…" string shape, not
             // `{"error": ...}`). Mirrors `agentLoop.ts`'s equivalent check
             // right after `executeToolCall`.
-            if (call.name == "write_file" || call.name == "edit_file")
-                && is_successful_mutation_result(&content)
-            {
-                if let Some(path) = tool_call_path_arg(&call.arguments) {
-                    mutated_files.insert(path);
+            //
+            // `observed` gets the same facts and one more: a mutation that
+            // *failed*. The verification set is cleared between rounds and only
+            // holds successes, but the workspace-mutation contract has to be
+            // able to say "a requested edit was not applied", which is a
+            // different answer from "nothing was asked".
+            if call.name == "write_file" || call.name == "edit_file" {
+                let path = tool_call_path_arg(&call.arguments);
+                if is_successful_mutation_result(&content) {
+                    if let Some(path) = path {
+                        mutated_files.insert(path.clone());
+                        observed.succeeded(&path);
+                    }
+                } else {
+                    observed.failed(
+                        path.unwrap_or_else(|| format!("tool-call:{}", call.id)),
+                        mutation_tool_failure_reason(&content)
+                            .unwrap_or_else(|| "The file-mutation tool returned an error.".into()),
+                    );
                 }
+            }
+            // A `task` subagent's own writes are recorded into `mutated_files`
+            // from inside `execute_tool_call`, where this loop cannot see the
+            // individual paths. Folding the set in here is what keeps a child's
+            // edit counted as this turn's mutation — the same reason
+            // `agentLoop.ts` threads `onMutatedPath` into its subagents.
+            for path in &mutated_files {
+                observed.mutated_paths.insert(path.clone());
             }
 
             let model_content = protect_tool_result(&call.name, &content);
@@ -1673,6 +2101,19 @@ mod tests {
             ToolOutcome::Failed
         );
         assert_eq!(tool_outcome("read 12 bytes"), ToolOutcome::Succeeded);
+    }
+
+    /// The id a replayed run recomputes. `send_message` keys durable
+    /// deliveries on the job plus this id, so drawing it fresh per attempt —
+    /// a uuid, a clock, a counter over surviving rows — would make every
+    /// replayed tool call a second message to a person, while two distinct
+    /// calls in one run must never collide onto one delivery.
+    #[test]
+    fn a_tool_call_id_is_the_call_position_a_replay_reproduces() {
+        assert_eq!(tool_call_id_for(0, 0), "tool-1-1");
+        assert_eq!(tool_call_id_for(0, 0), tool_call_id_for(0, 0));
+        assert_ne!(tool_call_id_for(0, 0), tool_call_id_for(0, 1));
+        assert_ne!(tool_call_id_for(0, 1), tool_call_id_for(1, 0));
     }
 
     #[test]
@@ -1737,6 +2178,7 @@ mod tests {
                 &options,
                 &state,
                 &mut perms,
+                "tool-1-1",
                 "present_plan",
                 args,
                 None,
@@ -1786,6 +2228,7 @@ mod tests {
                 &options,
                 &state,
                 &mut perms,
+                "tool-1-1",
                 "task",
                 args,
                 None,
@@ -1837,6 +2280,7 @@ mod tests {
             &options,
             &state,
             &mut perms,
+            "tool-1-1",
             "task",
             args,
             None,
@@ -1870,6 +2314,7 @@ mod tests {
             &options,
             &state,
             &mut perms,
+            "tool-1-1",
             "remember",
             r#"{"text":"must not persist"}"#,
             None,

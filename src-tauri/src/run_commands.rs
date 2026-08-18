@@ -24,7 +24,7 @@ pub const RUN_CANCELLATION_REQUESTED_EVENT: &str = "runs://cancellation-requeste
 ///
 /// `pub(crate)` so `subsystem_audit` can open the same file from a process that
 /// has only a path — one spelling, rather than a second literal that could drift.
-pub(crate) const DATABASE_FILE: &str = "profile-v1.sqlite3";
+pub const DATABASE_FILE: &str = "profile-v1.sqlite3";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1155,6 +1155,7 @@ mod tests {
                     allow_network: true,
                     allow_external_mutations: false,
                     egress_allowlist: allowlist,
+                    channel_send: None,
                 },
                 budgets: RunBudgets {
                     wall_time_ms: 60_000,

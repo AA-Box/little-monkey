@@ -16,6 +16,7 @@ import {
   setLaunchArg,
   setLaunchFlag,
   studioClient,
+  type GenerationEngineKind,
   type GenerationModelSpec,
   type GenerationTask,
   type ModelComponent,
@@ -289,6 +290,25 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
           </label>
         );
       })}
+
+      {/* Which program renders this model. Above the launch switches because it
+          decides which of them mean anything: the toggles below are
+          stable-diffusion.cpp flags, and the MLX service ignores what it does
+          not recognize rather than failing to start. */}
+      <label className="grid gap-1 text-[11px] text-muted">
+        {t("Studio.add.engine")}
+        <select
+          className="rounded border border-border bg-background px-2 py-1 text-[11px] text-foreground"
+          value={spec.engine}
+          onChange={(event) => patch({ engine: event.target.value as GenerationEngineKind })}
+        >
+          <option value="stable_diffusion_cpp">{t("Studio.add.engineBundled")}</option>
+          <option value="mlx_video">{t("Studio.add.engineMlxVideo")}</option>
+        </select>
+        <span className="text-faint">
+          {t(spec.engine === "mlx_video" ? "Studio.add.engineMlxVideoHint" : "Studio.add.engineHint")}
+        </span>
+      </label>
 
       {/* Launch-time switches. Reachable by typing them into the field below
           since the quote-aware parser landed, so this is discoverability rather

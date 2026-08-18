@@ -7,32 +7,47 @@
 //! Ollama-compatible management commands retain their daemon behavior. A bare
 //! `monkey` prints the subcommand overview (see [`is_bare_invocation`]).
 
+// `matrix-sdk`'s sync path is a deep chain of nested `async fn`s, and proving
+// the spawned future is `Send` walks all of it. The default limit of 128 runs
+// out partway down `matrix-sdk-crypto`'s Olm session handling and reports an
+// overflow rather than a real error — this is the increase rustc itself names.
+#![recursion_limit = "256"]
+
 mod acp;
 mod agent;
+mod channels_cli;
 mod chat;
 mod checkpoints_cli;
 mod cmds;
 mod conformance_cli;
 mod contract_cli;
+mod conversations_cli;
 mod daemon;
 mod durable_run;
 mod embed_cli;
+mod extensions_cli;
+mod ingress_cli;
 mod launcher;
 mod managed_model_cli;
 mod mcp_cli;
 mod modelfile;
 mod ollama_api;
+mod peers_cli;
 mod permission;
 mod plugins_cli;
 mod processes_cli;
 mod profiles_cli;
 mod providers_cli;
 mod repl;
+mod revisions_cli;
 mod security_cli;
 mod skills_cli;
 mod sse;
 mod stacks_cli;
+mod support_bundle_cli;
 mod task;
+mod telecom_audit;
+mod telecom_cli;
 mod tools_cli;
 mod tools_def;
 mod verify_cli;
@@ -40,6 +55,7 @@ mod web_cli;
 mod workflow_cli;
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -53,7 +69,9 @@ use permission::{PermissionMode, TerminalPermissions};
 
 #[derive(Parser, Debug)]
 #[command(name = "monkey", bin_name = "monkey", version, about)]
-#[command(after_help = "Prompts need no quoting — `monkey MODEL summarize this repo` works as-is on sh, PowerShell and cmd. Use double quotes (the one form all three share) when exact spacing or shell metacharacters matter.\n\nRun `monkey` with no arguments for the interactive launcher.")]
+#[command(
+    after_help = "Prompts need no quoting — `monkey MODEL summarize this repo` works as-is on sh, PowerShell and cmd. Use double quotes (the one form all three share) when exact spacing or shell metacharacters matter.\n\nRun `monkey` with no arguments for the interactive launcher."
+)]
 struct Cli {
     /// Ollama-style model management subcommand. Note: a bare first argument
     /// matching a subcommand name (e.g. `monkey list`) parses as that
@@ -83,6 +101,11 @@ struct Cli {
     /// `LITTLE_MONKEY_PROFILE`; see `monkey profiles list` for the ids.
     #[arg(long, value_name = "ID", global = true)]
     profile: Option<String>,
+
+    /// Override the portable Little Monkey configuration home. Equivalent to
+    /// `LITTLE_MONKEY_HOME`; absolute paths only.
+    #[arg(long, value_name = "PATH", global = true)]
+    agent_home: Option<PathBuf>,
 
     /// Provider id (for example ollama, managed-llama, openai, anthropic,
     /// gemini, openrouter, or a custom provider id). Use only to override or
@@ -367,6 +390,48 @@ enum Cmd {
         #[arg(long)]
         system: Option<String>,
     },
+    /// Configure and inspect messaging channels — the accounts Little Monkey
+    /// receives external messages on, who may talk to it, and where those
+    /// messages run.
+    Channels {
+        #[command(subcommand)]
+        action: channels_cli::ChannelsCmd,
+    },
+    /// Read conversations that live outside this desktop — a paired phone's
+    /// chat, a messaging conversation the agent is answering.
+    Conversations {
+        #[command(subcommand)]
+        action: conversations_cli::ConversationsCmd,
+    },
+    /// Inspect turns that arrived from outside — a message, a call, a paired
+    /// device, a peer, a voice turn — and the runs they became.
+    Ingress {
+        #[command(subcommand)]
+        action: ingress_cli::IngressCmd,
+    },
+    /// Pair with another Little Monkey installation and exchange bounded
+    /// messages and task requests with it.
+    Peers {
+        #[command(subcommand)]
+        action: peers_cli::PeersCmd,
+    },
+    /// Configure the operator's own carrier accounts — the numbers Little
+    /// Monkey texts and calls from, what each may do, and what a call may cost.
+    Telecom {
+        #[command(subcommand)]
+        action: telecom_cli::TelecomCmd,
+    },
+    /// Show what recent configuration changes touched, across personas,
+    /// rules/memory files, MCP servers and workflow definitions — the
+    /// cross-entity view of the per-entity revision history.
+    Revisions {
+        /// Show only this change id (from an earlier listing).
+        #[arg(long)]
+        change: Option<String>,
+        /// How many recent changes to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Revert a checkpoint's file changes (defaults to the most recent one
     /// from this CLI). Prints the restored-file count.
     Revert {
@@ -410,6 +475,9 @@ enum Cmd {
     /// Inspect the same declarative plugin runtime and health aggregate as the desktop app.
     #[command(subcommand)]
     Plugins(plugins_cli::PluginsCmd),
+    /// Manage sandboxed WebAssembly Component Model extensions.
+    #[command(subcommand)]
+    Extensions(extensions_cli::ExtensionsCmd),
     /// Inspect local security posture and apply narrowly-scoped safe fixes.
     #[command(subcommand)]
     Security(security_cli::SecurityCmd),
@@ -884,10 +952,10 @@ fn compose_persona_and_system(
     }
 }
 
-/// Core logic behind [`compose_system_prompt`], parameterized by a plain
-/// `data_dir` (rather than resolved via [`app_data_dir`]) so it's directly
-/// unit-testable against a temp dir. Composes MONKEY.md rule files and
-/// remembered facts, mirroring the "## Project instructions (MONKEY.md)" /
+/// Core logic behind [`compose_system_prompt`], parameterized by the managed
+/// profile `data_dir` and the independently resolved global rules path so it
+/// is directly unit-testable against temp dirs. Composes MONKEY.md rule files
+/// and remembered facts, mirroring the "## Project instructions (MONKEY.md)" /
 /// "## Remembered facts" sections `src/lib/systemPrompt.ts::buildSystemPrompt`
 /// injects for the desktop app (kept in sync by hand — see the design doc's
 /// "three-way duplication tax" risk).
@@ -899,12 +967,12 @@ fn compose_persona_and_system(
 /// this existed.
 fn compose_system_prompt_impl(
     data_dir: &Path,
+    global_rules_path: &Path,
     state: &AppState,
     user_system: Option<&str>,
 ) -> Option<String> {
-    let global_path = data_dir.join("MONKEY.md");
     let roots = workspace::all_roots(state).unwrap_or_default();
-    let rule_files = rules::read_rules_impl(&global_path, &roots);
+    let rule_files = rules::read_rules_impl(global_rules_path, &roots);
 
     // Shares `memory.rs`'s `list_impl` with the desktop app's `memory_list`
     // command (see `systemPrompt.ts`'s `factsLines`) instead of hand-rolling
@@ -915,7 +983,8 @@ fn compose_system_prompt_impl(
     let root = workspace::primary_root_canon(state)
         .ok()
         .map(|root| root.to_string_lossy().to_string());
-    let facts = memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
+    let facts =
+        memory::list_impl(&data_dir.join("memories.json"), root.as_deref()).unwrap_or_default();
 
     let mut sections: Vec<String> = Vec::new();
     if !rule_files.is_empty() {
@@ -957,15 +1026,18 @@ fn compose_system_prompt_impl(
     }
 }
 
-/// Resolves the real app-data dir (the same hardcoded-identifier way
-/// `providers_cli.rs` does) and defers to [`compose_system_prompt_impl`];
-/// `None` app-data dir falls back to `user_system` unchanged, same tolerance
-/// `checkpoints_cli::base_dir` callers already have for an unresolvable OS
-/// data dir.
+/// Resolves one profile snapshot spanning managed memories and authored rules,
+/// then defers to [`compose_system_prompt_impl`]. An unresolvable snapshot
+/// falls back to `user_system` unchanged.
 fn compose_system_prompt(state: &AppState, user_system: Option<&str>) -> Option<String> {
-    match app_data_dir() {
-        Some(data_dir) => compose_system_prompt_impl(&data_dir, state, user_system),
-        None => user_system.map(str::to_string),
+    match little_monkey_lib::app_paths::agent_config_roots() {
+        Ok(roots) => {
+            let global_rules_path = roots
+                .effective_path_with_sibling("MONKEY.md", "AGENTS.md")
+                .unwrap_or_else(|_| roots.legacy.join("MONKEY.md"));
+            compose_system_prompt_impl(&roots.legacy, &global_rules_path, state, user_system)
+        }
+        Err(_) => user_system.map(str::to_string),
     }
 }
 
@@ -1112,17 +1184,45 @@ async fn resolve_mcp_entries(cli: &Cli, state: &AppState) -> Vec<McpServerEntry>
     mcp_cli::connect_all(state, &entries).await
 }
 
-#[tokio::main]
-async fn main() {
-    let mut cli = Cli::parse();
-
-    // Applied before anything resolves a path, and as the environment variable
-    // the library already reads, so the flag and `LITTLE_MONKEY_PROFILE` cannot
-    // disagree — a second resolution rule is a second answer to "whose data is
-    // this". Single-threaded here: `Cli::parse()` is the only thing that has
-    // run.
+fn cli_environment_overrides(cli: &Cli) -> Vec<(&'static str, &OsStr)> {
+    let mut overrides = Vec::with_capacity(2);
+    if let Some(agent_home) = cli.agent_home.as_deref() {
+        overrides.push((
+            little_monkey_lib::app_paths::AGENT_HOME_ENV,
+            agent_home.as_os_str(),
+        ));
+    }
     if let Some(profile) = cli.profile.as_deref() {
-        std::env::set_var(little_monkey_lib::profiles::PROFILE_ENV_VAR, profile);
+        overrides.push((
+            little_monkey_lib::profiles::PROFILE_ENV_VAR,
+            OsStr::new(profile),
+        ));
+    }
+    overrides
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    // `set_var` must run before Tokio creates worker threads. The library reads
+    // these same variables, so the flags and environment cannot disagree about
+    // which authored or managed profile roots this process owns.
+    for (key, value) in cli_environment_overrides(&cli) {
+        std::env::set_var(key, value);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed building the Runtime")
+        .block_on(run_cli(cli));
+}
+
+async fn run_cli(mut cli: Cli) {
+    if let Err(error) = little_monkey_lib::app_paths::ensure_agent_config_dir() {
+        fail(&format!(
+            "could not initialize the Little Monkey agent home: {error}"
+        ));
     }
 
     // The one client the whole CLI shares — threaded through as
@@ -1267,8 +1367,12 @@ async fn run_model(
                 Ok(installed) => installed,
                 Err(error) => fail(&error),
             };
-            let session = match managed_model_cli::start_server(client, &installed.local_path, context_tokens)
-                .await
+            let session = match managed_model_cli::start_server(
+                client,
+                &installed.local_path,
+                context_tokens,
+            )
+            .await
             {
                 Ok(session) => session,
                 Err(error) => fail(&error),
@@ -1383,6 +1487,12 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             .await;
             return;
         }
+        Cmd::Channels { action } => channels_cli::dispatch(action).await,
+        Cmd::Conversations { action } => conversations_cli::dispatch(action),
+        Cmd::Ingress { action } => ingress_cli::dispatch(action),
+        Cmd::Peers { action } => peers_cli::dispatch(action).await,
+        Cmd::Telecom { action } => telecom_cli::dispatch(action).await,
+        Cmd::Revisions { change, limit } => revisions_cli::list(change.as_deref(), *limit),
         Cmd::Revert { id } => match checkpoints_cli::revert(id.as_deref()) {
             Ok(count) => {
                 println!("Restored {count} file(s).");
@@ -1456,6 +1566,14 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
                 .ok_or_else(|| "Could not resolve the app data directory".to_string());
             match data_dir {
                 Ok(data_dir) => plugins_cli::run(action, &data_dir),
+                Err(error) => Err(error),
+            }
+        }
+        Cmd::Extensions(action) => {
+            let data_dir = app_data_dir()
+                .ok_or_else(|| "Could not resolve the app data directory".to_string());
+            match data_dir {
+                Ok(data_dir) => extensions_cli::run(action, &data_dir).await,
                 Err(error) => Err(error),
             }
         }
@@ -1668,6 +1786,50 @@ mod tests {
     }
 
     #[test]
+    fn agent_home_and_profile_flags_parse_after_a_subcommand() {
+        let cli = Cli::try_parse_from([
+            "monkey",
+            "list",
+            "--agent-home",
+            "/tmp/little-monkey-home",
+            "--profile",
+            "work",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.agent_home,
+            Some(PathBuf::from("/tmp/little-monkey-home"))
+        );
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn cli_environment_overrides_preserve_agent_home_then_profile() {
+        let cli = Cli::try_parse_from([
+            "monkey",
+            "list",
+            "--agent-home",
+            "/tmp/little-monkey-home",
+            "--profile",
+            "work",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli_environment_overrides(&cli),
+            vec![
+                (
+                    little_monkey_lib::app_paths::AGENT_HOME_ENV,
+                    OsStr::new("/tmp/little-monkey-home"),
+                ),
+                (
+                    little_monkey_lib::profiles::PROFILE_ENV_VAR,
+                    OsStr::new("work"),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn an_unquoted_multi_word_prompt_joins_instead_of_erroring() {
         let cli = Cli::try_parse_from(["monkey", "llama3.2", "graphify", "update", "."])
             .expect("unquoted multi-word prompt");
@@ -1856,7 +2018,12 @@ mod tests {
         let state = state_with_primary_root(&ws.path);
 
         assert_eq!(
-            compose_system_prompt_impl(&data_dir.path, &state, None),
+            compose_system_prompt_impl(
+                &data_dir.path,
+                &data_dir.path.join("MONKEY.md"),
+                &state,
+                None,
+            ),
             None
         );
     }
@@ -1868,7 +2035,12 @@ mod tests {
         let state = state_with_primary_root(&ws.path);
 
         assert_eq!(
-            compose_system_prompt_impl(&data_dir.path, &state, Some("You are terse.")),
+            compose_system_prompt_impl(
+                &data_dir.path,
+                &data_dir.path.join("MONKEY.md"),
+                &state,
+                Some("You are terse."),
+            ),
             Some("You are terse.".to_string())
         );
     }
@@ -1880,7 +2052,13 @@ mod tests {
         std::fs::write(ws.path.join("MONKEY.md"), "Always write tests.").unwrap();
         let state = state_with_primary_root(&ws.path);
 
-        let prompt = compose_system_prompt_impl(&data_dir.path, &state, Some("Be terse.")).unwrap();
+        let prompt = compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            Some("Be terse."),
+        )
+        .unwrap();
 
         assert!(prompt.contains("## Project instructions (MONKEY.md)"));
         assert!(prompt.contains("Always write tests."));
@@ -1907,7 +2085,13 @@ mod tests {
         .unwrap();
         assert_eq!(fact.source, "agent");
 
-        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        let prompt = compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            None,
+        )
+        .unwrap();
         assert!(prompt.contains("## Remembered facts"));
         assert!(prompt.contains("- Uses pnpm, not npm."));
     }
@@ -1925,8 +2109,14 @@ mod tests {
         let state = state_with_primary_root(&ws.path);
         let memories_path = data_dir.path.join("memories.json");
 
-        memory::add_fact_impl(&memories_path, &ws_canon.to_string_lossy(), "keep me", "agent", None)
-            .unwrap();
+        memory::add_fact_impl(
+            &memories_path,
+            &ws_canon.to_string_lossy(),
+            "keep me",
+            "agent",
+            None,
+        )
+        .unwrap();
         let disabled = memory::add_fact_impl(
             &memories_path,
             &ws_canon.to_string_lossy(),
@@ -1935,10 +2125,21 @@ mod tests {
             None,
         )
         .unwrap();
-        memory::set_enabled_impl(&memories_path, &ws_canon.to_string_lossy(), &disabled.id, false)
-            .unwrap();
+        memory::set_enabled_impl(
+            &memories_path,
+            &ws_canon.to_string_lossy(),
+            &disabled.id,
+            false,
+        )
+        .unwrap();
 
-        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        let prompt = compose_system_prompt_impl(
+            &data_dir.path,
+            &data_dir.path.join("MONKEY.md"),
+            &state,
+            None,
+        )
+        .unwrap();
         assert!(prompt.contains("- keep me"));
         assert!(!prompt.contains("disable me"));
     }
@@ -1946,10 +2147,13 @@ mod tests {
     #[test]
     fn global_rules_apply_without_any_workspace_open() {
         let data_dir = TempDir::new();
-        std::fs::write(data_dir.path.join("MONKEY.md"), "Global preference.").unwrap();
+        let agent_home = TempDir::new();
+        let global_rules = agent_home.path.join("MONKEY.md");
+        std::fs::write(&global_rules, "Global preference.").unwrap();
         let state = AppState::default(); // no workspace root attached
 
-        let prompt = compose_system_prompt_impl(&data_dir.path, &state, None).unwrap();
+        let prompt =
+            compose_system_prompt_impl(&data_dir.path, &global_rules, &state, None).unwrap();
         assert!(prompt.contains("From global:"));
         assert!(prompt.contains("Global preference."));
     }
@@ -1970,6 +2174,7 @@ mod tests {
             model_or_prompt: None,
             prompt: Vec::new(),
             profile: None,
+            agent_home: None,
             workspace: None,
             provider: None,
             model: None,
@@ -2199,6 +2404,7 @@ mod tests {
             model_or_prompt: None,
             prompt: Vec::new(),
             profile: None,
+            agent_home: None,
             workspace: None,
             provider: None,
             model: None,

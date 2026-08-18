@@ -28,6 +28,20 @@ pub struct DaemonPaths {
 }
 
 impl DaemonPaths {
+    /// The profile data directory these paths sit under — `root`'s parent.
+    ///
+    /// Several subsystems the daemon reaches into (the companion's voice
+    /// configuration, the shared artifact store, the extension registry) live
+    /// beside `daemon/`, not inside it. Handing them `root` produces a second,
+    /// empty copy of that state under `daemon/` that nothing else ever reads,
+    /// which is a silent wrong answer rather than an error, so the resolution
+    /// lives here once instead of at each call site.
+    pub fn app_data(&self) -> Result<&Path, String> {
+        self.root
+            .parent()
+            .ok_or_else(|| "Daemon root has no app-data parent".to_string())
+    }
+
     pub fn resolve() -> Result<Self, String> {
         let app_data = crate::app_data_dir()
             .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
@@ -279,7 +293,10 @@ pub struct NewDaemonJob {
 }
 
 pub struct DaemonStore {
-    connection: Connection,
+    /// Visible to the rest of `daemon` so subsystem-specific storage (see
+    /// `daemon::channel_store`) can add `impl DaemonStore` blocks in their own
+    /// file instead of growing this one without bound.
+    pub(super) connection: Connection,
 }
 
 impl DaemonStore {
@@ -484,6 +501,31 @@ impl DaemonStore {
             .map_err(|error| error.to_string())?;
         let rows = statement
             .query_map([], read_job)
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Jobs whose state was touched at or after `since_ms`, oldest first.
+    ///
+    /// The notification watcher's read: it needs the *terminal* transitions,
+    /// which `active_jobs` by definition cannot show it, and it needs them
+    /// without scanning the whole table on every tick.
+    pub fn jobs_updated_since(&self, since_ms: u64, limit: u32) -> Result<Vec<DaemonJob>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT job_id, run_id, recipe_snapshot, state, priority, attempt,
+                        max_attempts, created_at_ms, updated_at_ms, started_at_ms,
+                        finished_at_ms, process_id, max_runtime_ms, max_memory_bytes,
+                        max_log_bytes, pause_requested, cancel_requested,
+                        repository_policy_json, worktree_json, parent_run_id, last_error, hold_reason
+                 FROM daemon_jobs WHERE updated_at_ms >= ?1
+                 ORDER BY updated_at_ms ASC, job_id ASC LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![to_i64(since_ms)?, i64::from(limit)], read_job)
             .map_err(|error| error.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
@@ -1592,6 +1634,868 @@ CREATE TABLE IF NOT EXISTS daemon_job_device_reservations (
 ) STRICT;
 "#;
 
+const DAEMON_V5: i64 = 5;
+const DAEMON_V5_CHECKSUM: &str = "daemon-jobs-v5-channels";
+
+/// The messaging channel subsystem's durable state.
+///
+/// It lives in the daemon store rather than the run ledger because every writer
+/// is the daemon: an account is polled by a daemon worker, an inbound event is
+/// deduplicated before it becomes a job, and an outbox row is retried by the
+/// same loop that retries jobs. The run ledger records what a *run* did; these
+/// tables record what the outside world said and what we said back.
+///
+/// # Secrets
+///
+/// No table here has a column for a token, and none may grow one.
+/// `credential_ref` is a keychain account name — the same shape `connectors`
+/// uses — so the database is safe to copy into a support bundle and a leaked
+/// file grants nothing.
+///
+/// # Deduplication
+///
+/// `channel_events` is the durable dedupe authority for everything inbound:
+/// `UNIQUE(source, account_id, direction, provider_event_id)` means a
+/// redelivered webhook, a replayed polling window, and a provider echo of our
+/// own message all collapse onto the row that is already there. The daemon
+/// queue's `deterministic_job_id` is the second line of defense, not the first.
+///
+/// # Outbox
+///
+/// `needs_reconciliation` is a state rather than a flavor of `failed` because
+/// its meaning is the opposite: the send may have *succeeded*, so retrying
+/// risks duplicating an external effect. Nothing retries that state
+/// automatically. `UNIQUE(account_id, idempotency_key)` is what makes a
+/// crash between "row queued" and "row sent" recoverable at all.
+///
+/// # Cursors
+///
+/// Transport resume state (a Telegram update offset, a Slack cursor, a Matrix
+/// sync token) is bounded and per-account. `CHECK (length(cursor_value) <=
+/// 4096)` keeps a provider from turning a resume token into unbounded storage.
+const DAEMON_V5_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (length(kind) > 0),
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    non_secret_config_json TEXT NOT NULL,
+    credential_ref TEXT,
+    access_policy_json TEXT NOT NULL,
+    health TEXT NOT NULL CHECK (health IN (
+        'unconfigured','disconnected','connecting','connected','degraded','unsupported','error'
+    )),
+    health_detail TEXT,
+    last_error TEXT,
+    last_probe_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_accounts_kind_idx ON channel_accounts(kind, enabled);
+
+CREATE TABLE IF NOT EXISTS channel_sender_authorizations (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    sender_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending','approved','blocked')),
+    pairing_code_digest TEXT,
+    requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms > 0),
+    expires_at_ms INTEGER,
+    approved_at_ms INTEGER,
+    blocked_at_ms INTEGER,
+    display_label TEXT,
+    metadata_json TEXT NOT NULL,
+    PRIMARY KEY(account_id, sender_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_sender_pending_idx
+    ON channel_sender_authorizations(account_id, state, requested_at_ms);
+
+CREATE TABLE IF NOT EXISTS channel_routes (
+    route_id TEXT PRIMARY KEY,
+    scope_json TEXT NOT NULL UNIQUE,
+    target_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS channel_session_map (
+    session_key TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    session_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_used_at_ms INTEGER NOT NULL CHECK (last_used_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_session_account_idx
+    ON channel_session_map(account_id, conversation_id);
+
+CREATE TABLE IF NOT EXISTS channel_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK (source IN (
+        'desktop','mobile','messaging_channel','peer','voice','telephone'
+    )),
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    provider_event_id TEXT NOT NULL CHECK (length(provider_event_id) > 0),
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    sender_id TEXT,
+    envelope_json TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN (
+        'accepted','challenged','ignored','duplicate','failed'
+    )),
+    ignore_reason TEXT,
+    job_id TEXT,
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms > 0),
+    UNIQUE(source, account_id, direction, provider_event_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_events_recent_idx
+    ON channel_events(account_id, received_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS channel_outbox (
+    outbox_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_id TEXT,
+    reply_to_provider_id TEXT,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','sending','sent','failed','needs_reconciliation','cancelled'
+    )),
+    payload_json TEXT NOT NULL,
+    payload_digest TEXT NOT NULL CHECK (length(payload_digest) > 0),
+    idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) > 0),
+    provider_message_id TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 100),
+    next_attempt_at_ms INTEGER,
+    last_error TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    sent_at_ms INTEGER,
+    UNIQUE(account_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_outbox_ready_idx
+    ON channel_outbox(state, next_attempt_at_ms, created_at_ms);
+
+CREATE TABLE IF NOT EXISTS channel_cursors (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    cursor_key TEXT NOT NULL CHECK (length(cursor_key) > 0),
+    cursor_value TEXT NOT NULL CHECK (length(cursor_value) <= 4096),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    PRIMARY KEY(account_id, cursor_key)
+) STRICT;
+"#;
+
+const DAEMON_V6: i64 = 6;
+const DAEMON_V6_CHECKSUM: &str = "daemon-jobs-v6-telephony";
+
+/// Telephony state: the carrier accounts an operator owns and the calls that
+/// went through them.
+///
+/// SMS deliberately has no tables here. An inbound text is a `ChannelEnvelope`
+/// and lives in `channel_events` like every other message, which is the whole
+/// point of routing SMS through the messaging subsystem rather than beside it.
+/// What telephony adds that messaging has no concept of is a *call*.
+///
+/// # Two separate powers
+///
+/// `inbound_policy` and `outbound_approval` are separate columns because they
+/// are separate decisions. An operator who lets Little Monkey answer the phone
+/// has not agreed to let it dial out, and a schema that stored one flag would
+/// make that distinction impossible to express.
+///
+/// # Money
+///
+/// Every row here can cost the operator money at their carrier, which is why
+/// `telecom_calls` keeps `needs_reconciliation` as a state of its own: a call
+/// that may already have been placed is never retried automatically, and the
+/// row stays for a human to settle.
+const DAEMON_V6_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS telecom_accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('twilio','telnyx','plivo','mock')),
+    label TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0,1)),
+    carrier_account_id TEXT NOT NULL,
+    from_number TEXT NOT NULL CHECK (length(from_number) > 0),
+    credential_ref TEXT,
+    public_base_url TEXT,
+    non_secret_config_json TEXT NOT NULL,
+    inbound_policy TEXT NOT NULL CHECK (inbound_policy IN ('reject','voicemail','answer')),
+    outbound_approval TEXT NOT NULL CHECK (outbound_approval IN ('never','approval','allow')),
+    health TEXT NOT NULL CHECK (health IN (
+        'unconfigured','disconnected','connecting','connected','degraded','unsupported','error'
+    )),
+    health_detail TEXT,
+    last_error TEXT,
+    last_probe_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS telecom_calls (
+    call_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_call_id TEXT,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    peer_number TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN (
+        'queued','ringing','in_progress','completed','failed','needs_reconciliation'
+    )),
+    session_key TEXT,
+    job_id TEXT,
+    idempotency_key TEXT NOT NULL,
+    last_error TEXT,
+    started_at_ms INTEGER,
+    ended_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    UNIQUE(account_id, idempotency_key)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS telecom_calls_live_idx
+    ON telecom_calls(account_id, state, created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS telecom_calls_provider_idx
+    ON telecom_calls(account_id, provider_call_id);
+
+CREATE TABLE IF NOT EXISTS telecom_events (
+    event_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES telecom_accounts(account_id) ON DELETE CASCADE,
+    provider_event_id TEXT NOT NULL CHECK (length(provider_event_id) > 0),
+    kind TEXT NOT NULL,
+    call_id TEXT,
+    payload_digest TEXT NOT NULL,
+    received_at_ms INTEGER NOT NULL CHECK (received_at_ms > 0),
+    UNIQUE(account_id, provider_event_id)
+) STRICT;
+"#;
+
+const DAEMON_V7: i64 = 7;
+const DAEMON_V7_CHECKSUM: &str = "daemon-jobs-v7-call-limits";
+
+/// Per-account call limits, and the deadlines a live call is held to.
+///
+/// The defaults are the cautious ones: one call at a time, a ring given up on
+/// after a minute, a call cut at half an hour, and no recording. Every one of
+/// them bounds something that costs the operator money or records a person who
+/// did not ask to be recorded, so the safe value is the one an operator gets
+/// without choosing anything.
+///
+/// `ALTER TABLE ... ADD COLUMN` rather than a rebuild: the defaults are
+/// constants, so an existing row gets the safe limit without a data migration.
+const DAEMON_V7_SQL: &str = r#"
+ALTER TABLE telecom_accounts ADD COLUMN max_concurrent_calls INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE telecom_accounts ADD COLUMN ring_timeout_s INTEGER NOT NULL DEFAULT 60;
+ALTER TABLE telecom_accounts ADD COLUMN max_duration_s INTEGER NOT NULL DEFAULT 1800;
+ALTER TABLE telecom_accounts ADD COLUMN recording_enabled INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const DAEMON_V8: i64 = 8;
+const DAEMON_V8_CHECKSUM: &str = "daemon-jobs-v8-ingress-turns";
+
+/// Accepted conversation turns, whatever origin they arrived on.
+///
+/// This is the one table that spans the messaging channels, the phone, a paired
+/// device, a peer node and the voice stack, because "a turn was accepted and
+/// must run exactly once" is the same fact for all of them. Each origin keeps
+/// its own event log — `channel_events`, `telecom_events` — for what the
+/// provider said; this records what Little Monkey decided to do about it.
+///
+/// # The window this closes
+///
+/// Recording an inbound event makes it deduplicated, not durable: a process
+/// that dies between recording the event and enqueuing the run leaves a message
+/// that the provider will never redeliver (it was acknowledged) and that the
+/// event log will refuse as a duplicate if it does. A row here is written in
+/// the same breath as the accept decision and cleared only once the queue has
+/// the job, so recovery has both the fact and the payload it needs to finish.
+///
+/// # Exactly once
+///
+/// `dedupe_key` is UNIQUE and carries the origin identity
+/// (`source:account:event_id`), so redelivery collapses. `job_id` is the
+/// queue's deterministic id, so a recovery pass that races the original
+/// submission produces one job rather than two.
+const DAEMON_V8_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS ingress_turns (
+    ingress_id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    source TEXT NOT NULL CHECK (source IN (
+        'desktop','mobile','messaging_channel','peer','voice','telephone'
+    )),
+    source_account_id TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('accepted','queued','failed')),
+    ingress_json TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    job_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    last_error TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS ingress_turns_pending_idx
+    ON ingress_turns(state, created_at_ms);
+CREATE INDEX IF NOT EXISTS ingress_turns_recent_idx
+    ON ingress_turns(created_at_ms DESC);
+CREATE INDEX IF NOT EXISTS ingress_turns_job_idx ON ingress_turns(job_id);
+"#;
+
+const DAEMON_V9: i64 = 9;
+const DAEMON_V9_CHECKSUM: &str = "daemon-jobs-v9-call-opening-line";
+
+/// What is said when a call connects.
+///
+/// A call that opens with silence sounds broken to whoever picked up, so both
+/// directions have an opening line: the number's greeting on an inbound call,
+/// and on an outbound one the sentence the agent was approved to say. It lives
+/// on the call rather than on the account because the outbound line is
+/// per-call, and the approval the operator gave was for those words.
+const DAEMON_V9_SQL: &str = r#"
+ALTER TABLE telecom_calls ADD COLUMN opening_line TEXT;
+"#;
+
+const DAEMON_V10: i64 = 10;
+const DAEMON_V10_CHECKSUM: &str = "daemon-jobs-v10-peer-threads";
+
+/// What two paired installations have said to each other.
+///
+/// The pairing itself lives where every pairing lives — `remote-v1.sqlite3`,
+/// with the device identity, the secret generation and the capability grant.
+/// These tables hold only the traffic, because traffic is daemon state: it is
+/// deduplicated by the daemon, it becomes daemon jobs, and it has to survive a
+/// restart in step with the queue those jobs are in.
+///
+/// # Deduplication
+///
+/// `UNIQUE(sender_instance_id, message_id, direction)` is the durable half of
+/// at-most-once. A peer that retries a delivery — the client retries three
+/// times on a lost connection by design — lands on the row already here, and a
+/// rejected message keeps its row too, so a redelivery cannot re-run a
+/// decision that already went against it.
+///
+/// # Results
+///
+/// A result is a row like any other, with `direction='outbound'` and a message
+/// id derived from the job it reports on, so materializing the same finished
+/// run twice writes one row. Nothing is pushed to the peer: the sender polls
+/// its own thread, which is what keeps this side free of an outbound
+/// connection it would otherwise have to keep alive.
+const DAEMON_V10_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS peer_threads (
+    thread_id TEXT PRIMARY KEY,
+    peer_device_id TEXT NOT NULL,
+    peer_instance_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms > 0)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS peer_threads_recent_idx
+    ON peer_threads(peer_device_id, last_activity_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS peer_messages (
+    row_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES peer_threads(thread_id) ON DELETE CASCADE,
+    peer_device_id TEXT NOT NULL,
+    sender_instance_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact','result')),
+    correlation_id TEXT,
+    disposition TEXT NOT NULL CHECK (disposition IN ('accepted','rejected','delivered')),
+    rejection TEXT,
+    envelope_json TEXT NOT NULL,
+    ingress_id TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    UNIQUE(sender_instance_id, message_id, direction)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS peer_messages_thread_idx
+    ON peer_messages(thread_id, created_at_ms);
+CREATE INDEX IF NOT EXISTS peer_messages_job_idx ON peer_messages(job_id);
+"#;
+
+const DAEMON_V11: i64 = 11;
+const DAEMON_V11_CHECKSUM: &str = "daemon-jobs-v11-ingress-execution-snapshot";
+
+/// The frozen execution context's identity, alongside the turn it belongs to.
+///
+/// The context itself lives inside `ingress_json`, where it is what the turn
+/// executes. These two columns are the *observability* half: an operator asking
+/// "which configuration was this accepted under?" gets an answer without the
+/// listing having to parse a recipe out of a JSON blob, and two turns that
+/// disagree about their digest are visible side by side.
+///
+/// Nullable because turns accepted by an earlier build have no frozen context.
+/// Those rows keep working — they resolve their recipe at execution time, the
+/// behavior they were accepted with — and nothing backfills a digest for a
+/// configuration nobody recorded.
+const DAEMON_V11_SQL: &str = r#"
+ALTER TABLE ingress_turns ADD COLUMN execution_version INTEGER;
+ALTER TABLE ingress_turns ADD COLUMN execution_digest TEXT;
+"#;
+
+const DAEMON_V12: i64 = 12;
+const DAEMON_V12_CHECKSUM: &str = "daemon-jobs-v12-ingress-mutation-contract";
+
+/// The workspace-mutation contract and the continuation lineage.
+///
+/// Both are already inside `ingress_json` — the contract is a field on the
+/// accepted turn, and a continuation carries its parent's id — so these columns
+/// exist because the *policy* has to find rows by them. "Which accepted turns
+/// promised a file would change and have not been settled yet" is the query that
+/// runs on every daemon tick, and it cannot be a scan of every stored turn's
+/// JSON.
+///
+/// `mutation_state` is NULL until the run is terminal and its outcome has been
+/// read; from then on it is one of `satisfied`, `corrected` (a continuation was
+/// submitted), `unmet` (reported), or `interrupted` (the run stopped before it
+/// could say, so nothing is replayed).
+///
+/// Every column is nullable or defaulted, so turns accepted by an earlier build
+/// keep working: no contract, no lineage, nothing to settle.
+const DAEMON_V12_SQL: &str = r#"
+ALTER TABLE ingress_turns ADD COLUMN mutation_required INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE ingress_turns ADD COLUMN mutation_state TEXT;
+ALTER TABLE ingress_turns ADD COLUMN mutation_detail TEXT;
+ALTER TABLE ingress_turns ADD COLUMN parent_ingress_id TEXT;
+ALTER TABLE ingress_turns ADD COLUMN continuation_kind TEXT;
+ALTER TABLE ingress_turns ADD COLUMN continuation_attempt INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS ingress_turns_contract_idx
+    ON ingress_turns(mutation_required, mutation_state, created_at_ms);
+CREATE INDEX IF NOT EXISTS ingress_turns_parent_idx
+    ON ingress_turns(parent_ingress_id);
+"#;
+
+const DAEMON_V13: i64 = 13;
+const DAEMON_V13_CHECKSUM: &str = "daemon-jobs-v13-outbox-invocation-identity";
+
+/// One durable tool invocation, at most one outbound intent.
+///
+/// `channel_outbox` has always been unique on `(account_id, idempotency_key)`,
+/// which asks "has this account already been told this?" — the right question
+/// for a reply keyed to a provider event, and the wrong one for an agent's
+/// `send_message`. There the identity is the tool invocation itself, so the
+/// same job and tool-call id replayed against a *different* account cleared
+/// the account-scoped constraint and queued a second message to a second
+/// person. The account is part of what the invocation asked to send, not part
+/// of which invocation asked.
+///
+/// `invocation_id` is that identity — job plus tool-call id — and the index
+/// makes it unique across every account. Partial on NOT NULL because only
+/// agent sends have an invocation behind them: an inbound auto-reply is keyed
+/// to the event it answers and keeps the account-scoped constraint it has
+/// always had, so no historical row is reinterpreted and no existing key can
+/// collide into the new index.
+const DAEMON_V13_SQL: &str = r#"
+ALTER TABLE channel_outbox ADD COLUMN invocation_id TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS channel_outbox_invocation_idx
+    ON channel_outbox(invocation_id)
+    WHERE invocation_id IS NOT NULL;
+"#;
+
+const DAEMON_V14: i64 = 14;
+const DAEMON_V14_CHECKSUM: &str = "daemon-jobs-v14-channel-event-ingress-link";
+
+/// The durable relation between a provider event and the turn it became.
+///
+/// Before this column the two facts were only *correlated* — an event and a
+/// turn that happened to share an account and an event id — and they were
+/// committed by two separate transactions, so a crash between them left an
+/// event row that permanently suppressed the provider's redelivery with no
+/// accepted turn behind it. The column is what lets the acceptance be one
+/// transaction and what lets an operator ask, from SQLite alone, which turn
+/// owns an event and whether one was ever created.
+///
+/// # Existing rows
+///
+/// The backfill links every inbound accepted event that already has a turn, by
+/// the dedupe key that turn was stored under — `source:account:event_id`, the
+/// same three columns the event carries. What it deliberately cannot do is
+/// invent a turn for an event that never got one: those rows stay NULL, which
+/// is the same shape a message a webhook provider has been acknowledged for
+/// rests in, and the channel worker decides them again from the envelope they
+/// still carry rather than pretending they completed.
+const DAEMON_V14_SQL: &str = r#"
+ALTER TABLE channel_events ADD COLUMN ingress_id TEXT;
+
+UPDATE channel_events
+   SET ingress_id = (
+       SELECT ingress_turns.ingress_id FROM ingress_turns
+        WHERE ingress_turns.dedupe_key =
+              channel_events.source || ':' || channel_events.account_id || ':' ||
+              channel_events.provider_event_id
+   )
+ WHERE direction = 'inbound' AND disposition = 'accepted' AND ingress_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS channel_events_ingress_idx
+    ON channel_events(ingress_id);
+CREATE INDEX IF NOT EXISTS channel_events_orphan_idx
+    ON channel_events(direction, disposition, ingress_id, received_at_ms);
+"#;
+
+const DAEMON_V15: i64 = 15;
+const DAEMON_V15_CHECKSUM: &str = "daemon-jobs-v15-channel-conversation-refs";
+
+/// Where a provider wants a reply sent, kept durably per conversation.
+///
+/// Some providers do not accept a conversation id alone. The Bot Framework
+/// addresses a Teams reply by the `serviceUrl` its inbound activity carried,
+/// and that value is per conversation and per region — without it there is no
+/// endpoint to POST to at all. Holding it in memory made a reply survive only
+/// as long as the process that received the activity, so a durable turn that
+/// outlived a restart had a queued answer and nowhere to send it.
+///
+/// # What may live here
+///
+/// Addressing, never authorization. `reference_json` is written only from an
+/// input the provider's own adapter has already authenticated and validated —
+/// for Teams that means an activity whose Bot Framework JWT verified and a
+/// `serviceUrl` on a Microsoft-owned host — so an unauthenticated request can
+/// never plant an outbound destination.
+///
+/// A **credential** may never live here, and nothing that expires does either.
+/// The bot access tokens both Teams and Google Chat acquire stay in memory with
+/// their expiry, and the operator's own long-lived tokens stay in the keychain.
+/// LINE's `replyToken` is deliberately not here: it authorizes answering as the
+/// bot, is valid for seconds, and belongs to one event rather than to the
+/// conversation this table is keyed by — so that adapter pushes instead, and
+/// stores nothing. Teams is currently the only writer. Nothing reads this table
+/// but the adapters; no status API projects it.
+///
+/// The size check keeps a provider from turning a reply address into unbounded
+/// storage.
+///
+/// A row is per `(account_id, conversation_id)` and is overwritten as newer
+/// activities arrive, because the newest authenticated address is the one a
+/// provider wants used.
+const DAEMON_V15_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_conversation_refs (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL CHECK (length(conversation_id) > 0),
+    reference_json TEXT NOT NULL CHECK (length(reference_json) <= 8192),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms > 0),
+    PRIMARY KEY(account_id, conversation_id)
+) STRICT;
+"#;
+
+const DAEMON_V16: i64 = 16;
+const DAEMON_V16_CHECKSUM: &str = "daemon-jobs-v16-authenticated-peer-identity";
+
+/// Scope peer conversation identity to the authenticated pairing.
+///
+/// The v10 tables trusted two envelope fields too much: `thread_id` was global
+/// across every peer, and `sender_instance_id` participated in dedupe even
+/// though the signed device credential — not the envelope — is identity. The
+/// replacement keys make both guarantees depend on `peer_device_id`. Rows
+/// whose historical message owner disagrees with their thread owner are
+/// intentionally not copied; they were produced only by the old cross-peer
+/// collision and cannot be attributed safely.
+///
+/// Shape/expiry/loop refusals happen before a thread exists. Their separate,
+/// bounded table gives Security Doctor evidence without retaining peer text or
+/// an invalid unbounded identifier.
+const DAEMON_V16_SQL: &str = r#"
+DROP INDEX IF EXISTS peer_messages_job_idx;
+DROP INDEX IF EXISTS peer_messages_thread_idx;
+DROP INDEX IF EXISTS peer_threads_recent_idx;
+
+ALTER TABLE peer_messages RENAME TO peer_messages_v10;
+ALTER TABLE peer_threads RENAME TO peer_threads_v10;
+
+CREATE TABLE peer_threads (
+    peer_device_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    peer_instance_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms > 0),
+    PRIMARY KEY(peer_device_id, thread_id)
+) STRICT;
+
+INSERT INTO peer_threads (
+    peer_device_id, thread_id, peer_instance_id, session_key,
+    created_at_ms, last_activity_at_ms
+)
+SELECT peer_device_id, thread_id, peer_instance_id, session_key,
+       created_at_ms, last_activity_at_ms
+  FROM peer_threads_v10;
+
+CREATE TABLE peer_messages (
+    row_id TEXT PRIMARY KEY,
+    peer_device_id TEXT NOT NULL,
+    thread_id TEXT NOT NULL,
+    sender_instance_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact','result')),
+    correlation_id TEXT,
+    disposition TEXT NOT NULL CHECK (disposition IN ('accepted','rejected','delivered')),
+    rejection TEXT,
+    envelope_json TEXT NOT NULL,
+    ingress_id TEXT,
+    job_id TEXT,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms > 0),
+    FOREIGN KEY(peer_device_id, thread_id)
+        REFERENCES peer_threads(peer_device_id, thread_id) ON DELETE CASCADE,
+    UNIQUE(peer_device_id, message_id, direction)
+) STRICT;
+
+INSERT INTO peer_messages (
+    row_id, peer_device_id, thread_id, sender_instance_id, message_id,
+    direction, kind, correlation_id, disposition, rejection, envelope_json,
+    ingress_id, job_id, created_at_ms
+)
+SELECT message.row_id, message.peer_device_id, message.thread_id,
+       message.sender_instance_id, message.message_id, message.direction,
+       message.kind, message.correlation_id, message.disposition,
+       message.rejection, message.envelope_json, message.ingress_id,
+       message.job_id, message.created_at_ms
+  FROM peer_messages_v10 AS message
+  JOIN peer_threads_v10 AS thread
+    ON thread.thread_id = message.thread_id
+   AND thread.peer_device_id = message.peer_device_id;
+
+DROP TABLE peer_messages_v10;
+DROP TABLE peer_threads_v10;
+
+CREATE INDEX peer_threads_recent_idx
+    ON peer_threads(peer_device_id, last_activity_at_ms DESC);
+CREATE INDEX peer_messages_thread_idx
+    ON peer_messages(peer_device_id, thread_id, created_at_ms);
+CREATE INDEX peer_messages_job_idx ON peer_messages(job_id);
+
+CREATE TABLE peer_rejection_events (
+    event_id TEXT PRIMARY KEY CHECK (length(event_id) BETWEEN 1 AND 64),
+    peer_device_id TEXT NOT NULL CHECK (length(peer_device_id) BETWEEN 1 AND 128),
+    message_id TEXT CHECK (message_id IS NULL OR length(message_id) BETWEEN 1 AND 128),
+    thread_id TEXT CHECK (thread_id IS NULL OR length(thread_id) BETWEEN 1 AND 128),
+    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 64),
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms > 0)
+) STRICT;
+
+CREATE INDEX peer_rejection_events_recent_idx
+    ON peer_rejection_events(occurred_at_ms DESC, event_id DESC);
+"#;
+
+const DAEMON_V17: i64 = 17;
+const DAEMON_V17_CHECKSUM: &str = "daemon-jobs-v17-sms-delivery-and-callback-rejections";
+
+/// What became of a message after the carrier accepted it, and whether a
+/// carrier's callbacks are being refused at the door.
+///
+/// # Delivery is not sending
+///
+/// `channel_outbox.state` answers "did the provider take it?" — `sent` is the
+/// end of that story. A carrier answers a second question minutes later: did it
+/// reach the handset? On SMS that answer is routine and routinely negative
+/// (a wrong number, a landline, a carrier block), and until now it arrived,
+/// verified, and was dropped. These columns are where it lands, so an operator
+/// can see that the text they were told was sent was never delivered.
+///
+/// `delivery_state` is deliberately separate from `state` rather than a new
+/// value in it: a delivery receipt must never move a row back into the retry
+/// machinery, and a schema where "delivered" and "sent" are the same column
+/// invites exactly that.
+///
+/// # Rejected callbacks
+///
+/// A signature that does not verify earns no durable row — the body is
+/// attacker-supplied and recording it would be storage anyone can write. But
+/// the *fact* that this account's callbacks are being rejected is the single
+/// most useful thing Security Doctor can tell an operator whose public URL no
+/// longer matches what they configured, so a bounded counter and the reason
+/// code (never the body, never a header) live on the account itself.
+const DAEMON_V17_SQL: &str = r#"
+ALTER TABLE channel_outbox ADD COLUMN delivery_state TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivery_error TEXT;
+ALTER TABLE channel_outbox ADD COLUMN delivered_at_ms INTEGER;
+
+CREATE INDEX IF NOT EXISTS channel_outbox_provider_message_idx
+    ON channel_outbox(account_id, provider_message_id);
+
+ALTER TABLE telecom_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE telecom_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
+const DAEMON_V18: i64 = 18;
+const DAEMON_V18_CHECKSUM: &str = "daemon-jobs-v18-peer-artifact-provenance";
+
+/// Who handed this installation which bytes, and what this installation sent.
+///
+/// # Why a digest is not an authorization
+///
+/// The content store is content-addressed and shared with every other artifact
+/// this installation holds — a run's output, a channel attachment, a file the
+/// operator imported. "The digest resolves in `content-v1`" therefore says only
+/// that *somebody* put those bytes there, which is not a question a peer's
+/// envelope is asking. Without this table a peer that learned or guessed the
+/// SHA-256 of a local blob could reference it and have it attached to the turn
+/// its own words created, and a peer could reference content another peer
+/// uploaded. A digest is an integrity value; it is public by nature and it is
+/// not a capability.
+///
+/// `peer_artifact_receipts` is the authorization record: a row exists only
+/// because *this authenticated pairing* uploaded that content here and the
+/// bytes verified against their declared digest. It is keyed on
+/// `(peer_device_id, artifact_id)` — the pairing the signature resolved to, not
+/// anything the envelope claims — so one peer's admission is invisible to
+/// another, exactly as a thread is.
+///
+/// The row also holds the metadata the *receiver* validated at upload time.
+/// The envelope that later references the artifact does not get to restate it:
+/// an attachment is built from this row, so a peer cannot upload `build.log`
+/// and then present the same bytes as `secrets.env`.
+///
+/// # Bounded
+///
+/// An admission expires. Handing over content once must not buy permanent
+/// standing to reference it, and the bound is the envelope's own maximum life
+/// (`little_monkey_lib::peers::MAX_TTL_MS`, twenty-four hours): past that, no
+/// envelope authored while the upload was fresh could still be valid anyway.
+/// The blob itself is left to the artifact store's own retention — it may
+/// belong to a run or to local content, and this table's business is authority,
+/// not bytes.
+///
+/// # Outgoing
+///
+/// `peer_outbound_messages` is the other half the Peers screen was missing: what
+/// *this* installation sent, so an operator can follow a task they asked another
+/// installation to do without dropping to a terminal. It holds the ids this side
+/// minted plus the last state a poll observed; there is no remote enumeration
+/// route and none is wanted, so knowing which threads to ask about is exactly
+/// what this table is for.
+const DAEMON_V18_SQL: &str = r#"
+CREATE TABLE peer_artifact_receipts (
+    peer_device_id TEXT NOT NULL CHECK (length(peer_device_id) BETWEEN 1 AND 128),
+    artifact_id TEXT NOT NULL CHECK (length(artifact_id) BETWEEN 1 AND 128),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    filename TEXT CHECK (filename IS NULL OR length(filename) BETWEEN 1 AND 255),
+    media_type TEXT CHECK (media_type IS NULL OR length(media_type) BETWEEN 1 AND 255),
+    uploaded_at_ms INTEGER NOT NULL CHECK (uploaded_at_ms > 0),
+    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > uploaded_at_ms),
+    PRIMARY KEY(peer_device_id, artifact_id)
+) STRICT;
+
+CREATE INDEX peer_artifact_receipts_expiry_idx
+    ON peer_artifact_receipts(expires_at_ms);
+
+CREATE INDEX peer_rejection_events_peer_idx
+    ON peer_rejection_events(peer_device_id, occurred_at_ms DESC, event_id DESC);
+
+CREATE TABLE peer_outbound_messages (
+    alias TEXT NOT NULL CHECK (length(alias) BETWEEN 1 AND 128),
+    message_id TEXT NOT NULL CHECK (length(message_id) BETWEEN 1 AND 128),
+    thread_id TEXT NOT NULL CHECK (length(thread_id) BETWEEN 1 AND 128),
+    correlation_id TEXT CHECK (correlation_id IS NULL OR length(correlation_id) BETWEEN 1 AND 128),
+    kind TEXT NOT NULL CHECK (kind IN ('message','task_request','artifact')),
+    state TEXT NOT NULL CHECK (length(state) BETWEEN 1 AND 32),
+    result_text TEXT CHECK (result_text IS NULL OR length(result_text) <= 4096),
+    sent_at_ms INTEGER NOT NULL CHECK (sent_at_ms > 0),
+    checked_at_ms INTEGER,
+    PRIMARY KEY(alias, message_id)
+) STRICT;
+
+CREATE INDEX peer_outbound_messages_recent_idx
+    ON peer_outbound_messages(sent_at_ms DESC);
+"#;
+
+const DAEMON_V19: i64 = 19;
+const DAEMON_V19_CHECKSUM: &str = "daemon-jobs-v19-channel-callback-rejections";
+
+/// A messaging provider whose deliveries never authenticate.
+///
+/// V17 gave telephony accounts this and left the messaging side without it, and
+/// the asymmetry is not defensible: a webhook provider — WhatsApp, Teams, Google
+/// Chat, LINE — whose signing secret was rotated on one side, or whose console
+/// points at a URL that no longer resolves here, produces *exactly nothing*. No
+/// event row, no health transition, no error anywhere an operator can look. The
+/// delivery is refused before anything durable is written, which is the correct
+/// thing to do with an unauthenticated request and the worst possible thing to
+/// do to somebody trying to work out why their messages stopped arriving.
+///
+/// So the refusal itself becomes the bounded, non-secret record: how many in a
+/// row, the last reason code, and when. Never the body, never a header, never
+/// the signature that failed — a rejected delivery is an attacker-controlled
+/// payload, and this is a column an operator reads, not an evidence locker.
+///
+/// Cleared the moment one verifies, so the count reads "since it last worked"
+/// rather than "ever" — the same rule the telephony columns follow.
+const DAEMON_V19_SQL: &str = r#"
+ALTER TABLE channel_accounts ADD COLUMN rejected_callbacks INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection TEXT;
+ALTER TABLE channel_accounts ADD COLUMN last_rejection_at_ms INTEGER;
+"#;
+
+const DAEMON_V20: i64 = 20;
+const DAEMON_V20_CHECKSUM: &str = "daemon-jobs-v20-outbound-echo-ledger";
+
+/// Which of our own messages have come back to us.
+///
+/// # Why a table and not `sender.is_self`
+///
+/// Every adapter in this build except one is host code holding the account's
+/// own credential, so when it says a message is ours, that is the host's own
+/// conclusion. An extension-backed account is different: the thing that says
+/// "this is from you" is sandboxed guest code, and a boolean it set is guest
+/// data. The host cannot verify an arbitrary provider's sender identity from
+/// it, so an account whose loop protection rested on that boolean had no loop
+/// protection the host could stand behind.
+///
+/// The answer is causal rather than assertive. The question stops being *does
+/// the extension claim this is us* and becomes *is this the provider's own id
+/// for a message we already committed to sending*. Only the host knows that,
+/// because only the host queued the outbound row and recorded what the provider
+/// called it.
+///
+/// # Scope
+///
+/// Keyed by account and conversation as well as by the provider's id, because
+/// a provider is only obliged to make a message id unique within a
+/// conversation. `thread_id` is folded into the key as `''` when absent — SQL
+/// `NULL` is distinct from itself, so a nullable column in a UNIQUE would let
+/// the same threadless message be recorded twice and match neither time.
+///
+/// # Bounds
+///
+/// A busy account would otherwise grow this forever. Pruning is by age and by
+/// rows-per-account, both deterministic, and the retention only has to outlast
+/// the window in which a provider might echo something back — minutes, in
+/// practice, against a day of headroom.
+///
+/// No message text. The ledger answers "did we send this", not "what did we
+/// say"; the outbound event log already holds the latter and is what an
+/// operator reads.
+const DAEMON_V20_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS channel_outbound_echo (
+    account_id TEXT NOT NULL REFERENCES channel_accounts(account_id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL,
+    thread_key TEXT NOT NULL,
+    provider_message_id TEXT NOT NULL CHECK (length(provider_message_id) > 0),
+    outbox_id TEXT NOT NULL,
+    sent_at_ms INTEGER NOT NULL CHECK (sent_at_ms > 0),
+    PRIMARY KEY(account_id, conversation_id, thread_key, provider_message_id)
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS channel_outbound_echo_age_idx
+    ON channel_outbound_echo(account_id, sent_at_ms DESC);
+"#;
+
 /// Every migration in order, so applying them is a loop rather than a stanza per
 /// version. Mirrors the shape `denial_sink` and the run ledger already use, and
 /// pays off the debt `DaemonEngine::recover`'s comment flagged: before this,
@@ -1607,12 +2511,28 @@ const DAEMON_MIGRATIONS: &[(i64, &str, &str)] = &[
     (DAEMON_V2, DAEMON_V2_CHECKSUM, DAEMON_V2_SQL),
     (DAEMON_V3, DAEMON_V3_CHECKSUM, DAEMON_V3_SQL),
     (DAEMON_V4, DAEMON_V4_CHECKSUM, DAEMON_V4_SQL),
+    (DAEMON_V5, DAEMON_V5_CHECKSUM, DAEMON_V5_SQL),
+    (DAEMON_V6, DAEMON_V6_CHECKSUM, DAEMON_V6_SQL),
+    (DAEMON_V7, DAEMON_V7_CHECKSUM, DAEMON_V7_SQL),
+    (DAEMON_V8, DAEMON_V8_CHECKSUM, DAEMON_V8_SQL),
+    (DAEMON_V9, DAEMON_V9_CHECKSUM, DAEMON_V9_SQL),
+    (DAEMON_V10, DAEMON_V10_CHECKSUM, DAEMON_V10_SQL),
+    (DAEMON_V11, DAEMON_V11_CHECKSUM, DAEMON_V11_SQL),
+    (DAEMON_V12, DAEMON_V12_CHECKSUM, DAEMON_V12_SQL),
+    (DAEMON_V13, DAEMON_V13_CHECKSUM, DAEMON_V13_SQL),
+    (DAEMON_V14, DAEMON_V14_CHECKSUM, DAEMON_V14_SQL),
+    (DAEMON_V15, DAEMON_V15_CHECKSUM, DAEMON_V15_SQL),
+    (DAEMON_V16, DAEMON_V16_CHECKSUM, DAEMON_V16_SQL),
+    (DAEMON_V17, DAEMON_V17_CHECKSUM, DAEMON_V17_SQL),
+    (DAEMON_V18, DAEMON_V18_CHECKSUM, DAEMON_V18_SQL),
+    (DAEMON_V19, DAEMON_V19_CHECKSUM, DAEMON_V19_SQL),
+    (DAEMON_V20, DAEMON_V20_CHECKSUM, DAEMON_V20_SQL),
 ];
 
 /// Latest version this build understands. The forward-only guard compares
 /// against this rather than a specific version, so adding V4 needs no edit
 /// there.
-const DAEMON_LATEST: i64 = DAEMON_V4;
+const DAEMON_LATEST: i64 = DAEMON_V20;
 
 /// Active states, spelled once. A reservation is held for exactly as long as the
 /// job is in one of them, which is what releases it on any exit path — clean,
@@ -1707,6 +2627,408 @@ mod tests {
         assert_eq!(job.state, JobState::Running, "the row survives the upgrade");
         assert_eq!(job.hold_reason, None, "the new column reads as unset");
         assert!(store.committed_reservations().unwrap().is_empty());
+    }
+
+    /// Peer provenance arrives on a database that is already at V17 — the
+    /// telephony shape, which is what a live installation is sitting on.
+    ///
+    /// Two branches both reached for v17 at once: the telephony delivery
+    /// columns landed on `develop` while the peer tables were in review. Only
+    /// one of them can *be* v17, because the version is the identity a
+    /// migration is recorded under and the checksum guard exists to catch
+    /// exactly this — a schema edited in place under a number already applied.
+    /// Telephony landed first and keeps v17; peer provenance became v18.
+    ///
+    /// So the upgrade worth proving is not "from a fresh file" and not "from
+    /// v16": it is that a database carrying v17's telephony columns *and rows*
+    /// takes v18 and keeps both.
+    #[test]
+    fn peer_provenance_upgrades_a_database_that_is_already_at_v17() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V17 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        // Rows in both subsystems this upgrade passes over: a peer thread from
+        // v16, and traffic using the columns v17 itself added.
+        connection
+            .execute_batch(
+                "INSERT INTO peer_threads (
+                    peer_device_id, thread_id, peer_instance_id, session_key,
+                    created_at_ms, last_activity_at_ms
+                 ) VALUES ('device-1','thread-1','instance-remote','peer:device-1:thread-1',1,1);
+
+                 INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json, credential_ref,
+                    access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES ('acct-1','telegram','One',1,'{}',NULL,'{}','connected',1,1);
+
+                 INSERT INTO channel_outbox (
+                    outbox_id, account_id, conversation_id, state, payload_json,
+                    payload_digest, idempotency_key, attempt, max_attempts, created_at_ms,
+                    updated_at_ms, delivery_state, delivery_error, delivered_at_ms
+                 ) VALUES ('out-1','acct-1','c1','sent','{}','d1','key-1',0,3,1,1,
+                           'undelivered','carrier rejected the handset',9);
+
+                 INSERT INTO telecom_accounts (
+                    account_id, kind, label, enabled, carrier_account_id, from_number,
+                    credential_ref, public_base_url, non_secret_config_json, inbound_policy,
+                    outbound_approval, health, created_at_ms, updated_at_ms,
+                    rejected_callbacks, last_rejection, last_rejection_at_ms
+                 ) VALUES ('tel-1','mock','Mock',1,'carrier-1','+15550000000',NULL,NULL,'{}',
+                           'reject','never','connected',1,1,3,'signature_mismatch',7);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM daemon_migrations", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            DAEMON_V20
+        );
+        // V20's ledger exists and is empty. Empty is the correct starting
+        // state and not a vacuous assertion: the alternative a migration could
+        // have taken — back-filling it from the outbound event log — would
+        // claim the host had recorded ids it never recorded, and every one of
+        // those would suppress a real inbound message once.
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM channel_outbound_echo", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        // V19's columns exist and defaulted, on the account row that was
+        // written before they did. An `ALTER TABLE ... NOT NULL DEFAULT` that
+        // was mis-declared would fail the migration outright; what this proves
+        // is the historical row reads as "nothing has been refused" rather than
+        // as NULL, which is what the audit's threshold compares against.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rejected_callbacks FROM channel_accounts WHERE account_id='acct-1'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        // v17's own columns still hold what they held. An upgrade that quietly
+        // recreated a table would pass a "the table exists" check and fail this.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT delivery_state FROM channel_outbox WHERE outbox_id='out-1'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "undelivered"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT rejected_callbacks FROM telecom_accounts WHERE account_id='tel-1'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        // The pre-existing peer traffic is untouched, and the new tables are there.
+        let store = DaemonStore { connection };
+        assert!(store.peer_thread("device-1", "thread-1").unwrap().is_some());
+        assert!(store
+            .peer_artifact_receipt("device-1", "whatever", 1)
+            .unwrap()
+            .is_none());
+        assert!(store.outbound_peer_messages(None, 10).unwrap().is_empty());
+    }
+
+    /// The invocation index arrives on a database that already has outbox
+    /// rows, and those rows were keyed per account.
+    ///
+    /// Two accounts holding the same idempotency key was legal before V13 and
+    /// stays legal: a unique index over the key itself would have refused to
+    /// build here and left the installation unable to open its own state. The
+    /// index is over `invocation_id`, which no historical row has, so there is
+    /// nothing for it to collide with and nothing to backfill — an old row
+    /// keeps the account-scoped identity it was written with.
+    #[test]
+    fn outbox_rows_written_before_the_invocation_index_upgrade_in_place() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V12 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json, credential_ref,
+                    access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES
+                    ('acct-1','telegram','One',1,'{}',NULL,'{}','connected',1,1),
+                    ('acct-2','telegram','Two',1,'{}',NULL,'{}','connected',1,1);
+                 INSERT INTO channel_outbox (
+                    outbox_id, account_id, conversation_id, state, payload_json,
+                    payload_digest, idempotency_key, attempt, max_attempts, created_at_ms,
+                    updated_at_ms
+                 ) VALUES
+                    ('out-1','acct-1','c1','queued','{}','d1','reply-job-1-1',0,3,1,1),
+                    ('out-2','acct-2','c1','queued','{}','d2','reply-job-1-1',0,3,1,1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM channel_outbox", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "both historical rows survive");
+        let unset: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM channel_outbox WHERE invocation_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 2, "nothing is backfilled into the new identity");
+    }
+
+    /// A turn accepted before execution contexts were frozen has to survive the
+    /// upgrade, and read back as a turn with no frozen context — not as one
+    /// with today's configuration stamped onto it.
+    #[test]
+    fn an_ingress_row_written_before_the_execution_columns_upgrades_in_place() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V10 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, attempts,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-old', 'peer:node-1:handover-1', 'peer', 'node-1',
+                           'handover-1', 'peer:node-1', 'accepted', '{}', '[]', 0, 1, 1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let turn = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(turn.ingress_id, "ingr-old");
+        assert_eq!(
+            turn.state,
+            crate::daemon::ingress_store::IngressState::Accepted
+        );
+        assert_eq!(turn.execution_version, None);
+        assert_eq!(turn.execution_digest, None);
+        // V12's columns default rather than backfill: a turn accepted before the
+        // workspace-mutation contract existed promised nothing and continues
+        // nothing, which is exactly what it meant when it was written.
+        assert!(!turn.mutation_required);
+        assert!(turn.mutation_state.is_none());
+        assert!(turn.mutation_detail.is_none());
+        assert!(turn.parent_ingress_id.is_none());
+        assert!(turn.continuation_kind.is_none());
+        assert_eq!(turn.continuation_attempt, 0);
+        // And it is not work the contract policy will pick up, because there is
+        // no contract on it to settle.
+        assert!(store.unsettled_mutation_contracts(10).unwrap().is_empty());
+    }
+
+    /// The V11 file is the one most installations are upgrading from, so the
+    /// contract columns have to land on a database that already has the
+    /// execution snapshot without disturbing it.
+    #[test]
+    fn an_ingress_row_written_before_the_contract_columns_keeps_its_frozen_snapshot() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V11 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, job_id, attempts,
+                    execution_version, execution_digest, created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-v11', 'desktop:session-1:turn-1', 'desktop', 'session-1',
+                           'turn-1', 'desktop:session-1', 'queued', '{}', '[]',
+                           'ingress-abc', 1, 1, 'deadbeef', 1, 1);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let turn = &store.recent_ingress_turns(10).unwrap()[0];
+        assert_eq!(turn.execution_version, Some(1));
+        assert_eq!(turn.execution_digest.as_deref(), Some("deadbeef"));
+        assert!(!turn.mutation_required);
+        assert!(turn.mutation_state.is_none());
+    }
+
+    /// V13 links a provider event to the turn it became. An installation
+    /// upgrading into it carries two kinds of accepted event: ones whose turn
+    /// was created (the pair is recoverable, and the link is derivable from the
+    /// dedupe key they already share) and ones whose turn never was — the crash
+    /// window this whole change exists to close. The first must be linked; the
+    /// second must stay visible as unfinished rather than be linked to
+    /// something, or quietly counted as complete.
+    #[test]
+    fn events_written_before_the_ingress_link_are_paired_or_left_visible() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE daemon_migrations (
+                    version INTEGER PRIMARY KEY,
+                    checksum TEXT NOT NULL,
+                    applied_at_ms INTEGER NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        for &(version, checksum, sql) in DAEMON_MIGRATIONS {
+            if version > DAEMON_V12 {
+                break;
+            }
+            connection.execute_batch(sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO daemon_migrations(version, checksum, applied_at_ms)
+                     VALUES (?1, ?2, 1)",
+                    rusqlite::params![version, checksum],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch(
+                "INSERT INTO channel_accounts (
+                    account_id, kind, label, enabled, non_secret_config_json,
+                    credential_ref, access_policy_json, health, created_at_ms, updated_at_ms
+                 ) VALUES ('acct-1', 'telegram', 'Ops bot', 1, '{}', NULL, '{}',
+                           'connected', 1, 1);
+
+                 INSERT INTO ingress_turns (
+                    ingress_id, dedupe_key, source, source_account_id, source_event_id,
+                    session_key, state, ingress_json, params_json, attempts,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('ingr-paired', 'messaging_channel:acct-1:evt-1',
+                           'messaging_channel', 'acct-1', 'evt-1', 'tg:chat-7',
+                           'queued', '{}', '[]', 0, 1, 1);
+
+                 INSERT INTO channel_events (
+                    event_id, account_id, source, direction, provider_event_id,
+                    conversation_id, thread_id, sender_id, envelope_json, disposition,
+                    ignore_reason, job_id, received_at_ms
+                 ) VALUES
+                    ('evt-paired', 'acct-1', 'messaging_channel', 'inbound', 'evt-1',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 1),
+                    ('evt-orphan', 'acct-1', 'messaging_channel', 'inbound', 'evt-2',
+                     'chat-7', NULL, 'user-3', '{}', 'accepted', NULL, NULL, 2);",
+            )
+            .unwrap();
+
+        apply_daemon_migrations(&connection).unwrap();
+
+        let store = DaemonStore { connection };
+        let events = store.recent_channel_events("acct-1", 10).unwrap();
+        let paired = events
+            .iter()
+            .find(|event| event.event_id == "evt-paired")
+            .expect("the paired event");
+        assert_eq!(paired.ingress_id.as_deref(), Some("ingr-paired"));
+        let orphan = events
+            .iter()
+            .find(|event| event.event_id == "evt-orphan")
+            .expect("the orphaned event");
+        assert_eq!(orphan.ingress_id, None);
+        let unfinished = store.accepted_events_awaiting_processing(10).unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].event_id, "evt-orphan");
     }
 
     /// Re-running the loop is a no-op, and a checksum that no longer matches its

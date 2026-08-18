@@ -1,0 +1,98 @@
+name: Executable extension SDK
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-guests:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: extensions-sdk
+          key: executable-extension-sdk
+
+      - name: Test SDK and compile canonical WIT bindings
+        run: |
+          cargo test --manifest-path extensions-sdk/Cargo.toml --workspace --locked
+          node --test extensions-sdk/scripts/*.test.mjs
+
+      - name: Build WASI Preview 2 components
+        run: >-
+          cargo build --manifest-path extensions-sdk/Cargo.toml --workspace
+          --target wasm32-wasip2 --release --locked
+
+      - name: Package automated examples
+        run: |
+          set -euo pipefail
+          for example in simple-tool mock-channel mock-stt-provider; do
+            node extensions-sdk/scripts/package-example.mjs "$example" "$GITHUB_SHA"
+            test -s "extensions-sdk/dist/$example/component.wasm"
+            test -s "extensions-sdk/dist/$example/extension.json"
+            if grep -q '__[A-Z_]*__' "extensions-sdk/dist/$example/extension.json"; then
+              echo "unresolved manifest placeholder in $example" >&2
+              exit 1
+            fi
+          done
+
+  arm-host-runtime:
+    name: ARM host runtime (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf build-essential
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: src-tauri
+          key: executable-extension-${{ matrix.os }}
+
+      # `build.rs` calls `tauri-build`, which refuses to run without the
+      # `monkey-cli` sidecar at the `externalBin` path — and that binary is
+      # gitignored, so a fresh checkout has none. The same bootstrap `ci.yml`
+      # does before its own Rust tests: an empty placeholder, not a real build,
+      # since nothing here executes the CLI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Stage the CLI sidecar placeholder
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
+      - name: Exercise the Component Model sandbox on the release architecture
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml --lib
+          executable_extensions::tests --locked

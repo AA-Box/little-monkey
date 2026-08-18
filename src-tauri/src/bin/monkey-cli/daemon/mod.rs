@@ -1,10 +1,51 @@
+pub(crate) mod adapters;
 mod admission;
+mod call_audio;
+pub(crate) mod call_media;
+pub(crate) mod call_socket;
+pub(crate) mod callback_exposure;
+pub(crate) mod channel_adapter;
+#[cfg(test)]
+mod channel_agent_e2e;
+pub(crate) mod channel_audit;
+pub(crate) mod channel_ingress;
+#[cfg(test)]
+mod channel_restart_tests;
+pub(crate) mod channel_store;
+pub(crate) mod channel_tool;
+/// Acknowledgement semantics for the four providers that are delivered to.
+#[cfg(test)]
+mod channel_webhook_tests;
+pub(crate) mod channel_worker;
 mod engine;
+#[cfg(test)]
+mod extension_provider_tests;
+pub(crate) mod fail_points;
+/// The cross-origin contract: every conversational turn, one durable path.
+#[cfg(test)]
+mod ingress_contract;
+pub(crate) mod ingress_store;
 mod ledger;
-mod remote;
+#[cfg(test)]
+mod live_smoke;
+pub(crate) mod peer_audit;
+#[cfg(test)]
+mod peer_e2e;
+pub(crate) mod peer_ingress;
+mod peer_live;
+pub(crate) mod peer_store;
+pub(crate) mod peer_tool;
+pub(crate) mod remote;
 mod scheduler;
 mod service;
-mod store;
+pub(crate) mod store;
+pub(crate) mod telecom_store;
+pub(crate) mod telecom_tool;
+/// The carrier callback path, end to end through the production route.
+#[cfg(test)]
+mod telecom_webhook_tests;
+pub(crate) mod telecom_worker;
+pub(crate) mod telephony;
 mod trigger;
 mod webhook;
 mod workflow_trigger;
@@ -46,6 +87,14 @@ use self::worktree::{OwnedWorktree, WorktreeRequest};
 pub enum DaemonCmd {
     /// Explicitly install and start the current-user OS service.
     Install(DaemonInstallArgs),
+    /// Bring the resident service to a usable state: install it if missing,
+    /// republish and restart it if it is stale, start it if it is stopped, and
+    /// do nothing if it is already healthy. Idempotent and safe to run at
+    /// every launch.
+    Ensure {
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the previously installed user service.
     Start,
     /// Show service, heartbeat, kill-switch, queue, backpressure, and
@@ -177,6 +226,26 @@ pub struct DaemonRunArgs {
     pub allow_review_comment: bool,
     #[arg(long)]
     pub json: bool,
+    /// Origin of a conversational turn: `desktop` or `voice`.
+    ///
+    /// When set, the recipe is submitted through the durable conversation
+    /// ingress service instead of straight onto the queue — the turn is
+    /// recorded, deduplicated on its origin identity and recoverable, exactly
+    /// as a channel message or an inbound call is. The other origins build
+    /// their ingress in-process and never reach this flag.
+    #[arg(long, requires_all = ["ingress_account", "ingress_event"])]
+    pub ingress_source: Option<String>,
+    /// Device, window or session the turn arrived on. Scopes `--ingress-event`.
+    #[arg(long)]
+    pub ingress_account: Option<String>,
+    /// The origin's own stable id for this turn — the desktop's client-side
+    /// turn id, or a voice utterance id. Never a value minted per attempt, or a
+    /// retry after a timed-out response becomes a second run.
+    #[arg(long)]
+    pub ingress_event: Option<String>,
+    /// Durable session the turn continues. Defaults to `<source>:<account>`.
+    #[arg(long)]
+    pub ingress_session: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -286,6 +355,9 @@ pub enum TriggerCmd {
     },
     Remove {
         id: String,
+        /// Fail closed unless the trigger belongs to this executable extension.
+        #[arg(long)]
+        extension_id: Option<String>,
     },
     /// Store a workflow webhook HMAC secret under an opaque OS-keychain
     /// reference. The secret value is read from the named environment variable
@@ -296,9 +368,7 @@ pub enum TriggerCmd {
         secret_env: String,
     },
     /// Remove an opaque workflow webhook HMAC secret from the OS keychain.
-    SecretRemove {
-        reference: String,
-    },
+    SecretRemove { reference: String },
     /// Offline/forwarder-friendly signed ingestion path. The resident HTTP
     /// endpoint uses the exact same verifier and dedupe transaction.
     Deliver {
@@ -336,6 +406,19 @@ pub struct TriggerTargetArgs {
     /// target and checked against the daemon trigger kind/configuration.
     #[arg(long)]
     workflow_trigger_json: Option<String>,
+    /// Installed executable extension target, mutually exclusive with recipe
+    /// and workflow targets.
+    #[arg(long)]
+    extension_id: Option<String>,
+    /// Exact declared extension capability that receives the event.
+    #[arg(long)]
+    extension_handler_id: Option<String>,
+    /// Immutable installed extension version pinned by the trigger.
+    #[arg(long)]
+    extension_version: Option<String>,
+    /// SHA-256 of the exact signed manifest pinned by the trigger.
+    #[arg(long)]
+    extension_manifest_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -394,8 +477,10 @@ pub(crate) fn backpressure_for(
 pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
     match action {
         DaemonCmd::Install(args) => install(args),
+        DaemonCmd::Ensure { json } => ensure(*json),
         DaemonCmd::Start => {
-            ServiceManager::<service::RealCommandRunner>::real()?.start(&DaemonPaths::resolve()?)
+            let (paths, manager) = service_context()?;
+            manager.start(&paths)
         }
         DaemonCmd::Status { json } => status(*json),
         DaemonCmd::Decisions { limit, json } => decisions(*limit, *json),
@@ -427,8 +512,15 @@ pub async fn run(cli: &crate::Cli, action: &DaemonCmd) -> Result<(), String> {
     }
 }
 
+fn service_context() -> Result<(DaemonPaths, ServiceManager<service::RealCommandRunner>), String> {
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&roots.legacy);
+    let manager = ServiceManager::<service::RealCommandRunner>::real(roots)?;
+    Ok((paths, manager))
+}
+
 fn install(args: &DaemonInstallArgs) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let (paths, manager) = service_context()?;
     let config = DaemonConfig {
         concurrency: args.concurrency,
         max_queue: args.max_queue,
@@ -439,7 +531,6 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     };
     let mut store = DaemonStore::open(&paths)?;
     store.set_meta("stop_requested", "0")?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
     let manifest = manager.install(&paths, &config)?;
     println!(
         "Installed {} user service at {}",
@@ -449,10 +540,127 @@ fn install(args: &DaemonInstallArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// What [`ensure`] has to do to make the resident service usable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceAction {
+    /// Nothing: installed, current, and running.
+    Healthy,
+    Installed,
+    /// Republished and reactivated — the definition or the running build was
+    /// left behind by a previous install of the app.
+    Reinstalled,
+    Started,
+}
+
+impl ServiceAction {
+    /// The lifecycle decision, isolated from the I/O that measures its inputs.
+    ///
+    /// `version_current` is only meaningful while the service runs — a stopped
+    /// service has no build to be wrong about, and starting it necessarily
+    /// launches whatever the (already checked) definition names.
+    fn decide(
+        installed: bool,
+        manifest_current: bool,
+        running: bool,
+        version_current: bool,
+    ) -> Self {
+        if !installed {
+            return Self::Installed;
+        }
+        if !manifest_current || (running && !version_current) {
+            return Self::Reinstalled;
+        }
+        if !running {
+            return Self::Started;
+        }
+        Self::Healthy
+    }
+}
+
+/// The build the resident process last reported, or `None` when it has never
+/// run or predates the `version` heartbeat field. Absent reads as *stale*: a
+/// service that cannot say what it is running is not one to hand a turn to.
+fn running_service_version(paths: &DaemonPaths) -> Result<Option<String>, String> {
+    if !paths.state_db.is_file() {
+        return Ok(None);
+    }
+    DaemonStore::open(paths)?.get_meta("version")
+}
+
+/// The whole resident-service lifecycle, as one idempotent call.
+///
+/// This exists because the service is not an optional background-agents
+/// feature: every desktop chat turn executes on it, so the app owns installing,
+/// upgrading and starting it, and a person who only wants to send a message is
+/// never asked to go install anything. The desktop runs this at launch and
+/// behind its Repair action, and both get the same ladder.
+///
+/// It lives here rather than in the desktop bridge because everything the
+/// decision needs — the installed config, the published manifest, the running
+/// build — is already here next to [`install`]; spelling it across the IPC
+/// boundary would be a second copy that drifts.
+///
+/// A stale *running* build is repaired by reinstalling, which stops the
+/// service. That is the same interruption `install` has always been: active
+/// jobs are reconciled on the next start (`reconcile_interrupted`), and a
+/// daemon speaking the previous release's contract to this desktop is the
+/// fault being fixed.
+fn ensure(json: bool) -> Result<(), String> {
+    let (paths, manager) = service_context()?;
+    let installed = paths.config.is_file() && manager.is_installed(&paths)?;
+    let running = installed && manager.status(&paths)?;
+    let action = ServiceAction::decide(
+        installed,
+        installed && manager.manifest_is_current(&paths)?,
+        running,
+        running_service_version(&paths)?.as_deref() == Some(env!("CARGO_PKG_VERSION")),
+    );
+    if action != ServiceAction::Healthy {
+        // `daemon stop` latches intent that outlives the process, so without
+        // this the service starts and immediately stops itself again.
+        //
+        // Clearing it means a stop lasts until the app is launched again,
+        // which is the deliberate consequence of chat needing the service: a
+        // launch that left it stopped would open a chat window that cannot
+        // send. The durable "refuse to run work" lever is the kill switch,
+        // which this never touches and which every producer still honours.
+        let mut store = DaemonStore::open(&paths)?;
+        store.set_meta("stop_requested", "0")?;
+    }
+    match action {
+        ServiceAction::Healthy => {}
+        ServiceAction::Installed | ServiceAction::Reinstalled => {
+            // Defaults only for a first install; a repair keeps whatever
+            // concurrency and retention the operator configured.
+            let config = if installed {
+                DaemonConfig::load(&paths).unwrap_or_default()
+            } else {
+                DaemonConfig::default()
+            };
+            manager.install(&paths, &config)?;
+        }
+        ServiceAction::Started => manager.start(&paths)?,
+    }
+    if json {
+        let payload = serde_json::json!({
+            "action": action,
+            "installed": true,
+            "service_running": manager.status(&paths)?,
+        });
+        println!("{payload}");
+    } else {
+        println!(
+            "Execution service: {}",
+            format!("{action:?}").to_lowercase()
+        );
+    }
+    Ok(())
+}
+
 fn status(json: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
-    let installed = paths.config.is_file() && manager.manifest_path(&paths).is_file();
+    let (paths, manager) = service_context()?;
+    let installed = paths.config.is_file() && manager.is_installed(&paths)?;
     let mut queued = 0;
     let mut active = 0;
     let mut waiting_approval = 0;
@@ -583,7 +791,7 @@ fn decisions(limit: u32, json: bool) -> Result<(), String> {
 }
 
 async fn stop() -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let (paths, manager) = service_context()?;
     if paths.state_db.is_file() {
         let mut store = DaemonStore::open(&paths)?;
         store.set_meta("stop_requested", "1")?;
@@ -595,8 +803,7 @@ async fn stop() -> Result<(), String> {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
-    if manager.manifest_path(&paths).is_file() {
+    if manager.is_installed(&paths)? {
         manager.stop(&paths)?;
     }
     println!("Daemon stopped.");
@@ -604,8 +811,7 @@ async fn stop() -> Result<(), String> {
 }
 
 fn uninstall(purge_state: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
-    let manager = ServiceManager::<service::RealCommandRunner>::real()?;
+    let (paths, manager) = service_context()?;
     manager.uninstall(&paths)?;
     if purge_state && paths.root.exists() {
         let store = DaemonStore::open(&paths)?;
@@ -625,15 +831,31 @@ fn uninstall(purge_state: bool) -> Result<(), String> {
 }
 
 fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let config = DaemonConfig::load(&paths)?;
     let mut store = DaemonStore::open(&paths)?;
     if store.kill_switch()? {
         return Err("Global kill switch is engaged; release it before queueing work".to_string());
     }
-    let mut shared = SharedLedger::open(&paths.ledger_db)?;
-    let options = QueueOptions::from_run_args(args);
-    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
+    let queued = match args.ingress_source.as_deref() {
+        Some(source) => {
+            queue_conversation_turn(&paths, &global_config_roots, &mut store, args, source)?
+        }
+        None => {
+            let mut shared = SharedLedger::open(&paths.ledger_db)?;
+            enqueue(
+                Some(cli),
+                &paths,
+                &global_config_roots,
+                &config,
+                &mut store,
+                &mut shared,
+                QueueOptions::from_run_args(args),
+            )?
+        }
+    };
     if args.json {
         println!("{}", serde_json::to_string(&queued).unwrap_or_default());
     } else {
@@ -642,55 +864,186 @@ fn queue_command(cli: &crate::Cli, args: &DaemonRunArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// Queue an immutable recipe on behalf of a protocol client without writing
-/// human-oriented text to stdout. ACP uses this bridge so the resident daemon
-/// remains the execution authority while the stdio connection only relays the
-/// shared run protocol.
+/// Queue a recipe as a conversational turn, through the durable ingress
+/// service.
+///
+/// The desktop's Send button and a finalized voice utterance reach the daemon
+/// as a process, not as an in-process call, so this is where their turn is
+/// built. Everything after it — the accepted row, the frozen context, the
+/// deterministic job id, recovery — is the same code every other origin runs.
+///
+/// The turn's text is read out of the frozen recipe rather than passed on the
+/// command line. A desktop turn's prompt can be very large and already lives in
+/// the snapshot; sending it twice would only create a way for the two to
+/// disagree.
+fn queue_conversation_turn(
+    paths: &DaemonPaths,
+    global_config_roots: &[PathBuf],
+    store: &mut DaemonStore,
+    args: &DaemonRunArgs,
+    source: &str,
+) -> Result<QueuedRun, String> {
+    use little_monkey_lib::channels::ingress::ConversationSource;
+    use little_monkey_lib::channels::routing::RouteTarget;
+
+    let source = ConversationSource::parse(source)
+        .ok_or_else(|| format!("Unknown conversation source '{source}'"))?;
+    let mut target = RouteTarget::new(&args.name_or_path);
+    target.priority = args.priority;
+    // Frozen here rather than inside the submission service because the turn's
+    // own text comes out of the resolved recipe: the context has to exist
+    // before the ingress record can be built.
+    let execution = freeze_execution_for(&target, None, global_config_roots, None)?;
+    let recipe: recipes::Recipe = serde_json::from_str(&execution.as_v1().recipe_json)
+        .map_err(|error| format!("The frozen recipe for this turn is unreadable: {error}"))?;
+
+    let ingress = bridge_turn_ingress(
+        source,
+        args,
+        target,
+        &recipe.prompt,
+        // Read from the frozen snapshot rather than taken as a flag on the
+        // command line: whether this turn promised a file would change is part
+        // of what was accepted, and a value that could disagree with the
+        // snapshot would be a second source of truth.
+        recipe
+            .desktop_turn
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.workspace_mutation_required),
+        execution,
+        i64::try_from(now_ms()?).unwrap_or(i64::MAX),
+    );
+
+    let queue = DaemonChannelQueue::new(paths.clone());
+    let now = i64::try_from(now_ms()?).unwrap_or(i64::MAX);
+    let job_id =
+        match channel_ingress::submit_conversation_turn(store, &queue, &ingress, &args.param, now)?
+        {
+            channel_ingress::SubmitOutcome::Queued { job_id, .. }
+            | channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => job_id,
+            channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+            channel_ingress::SubmitOutcome::Parked { .. } => {
+                return Err("This turn could not be queued and was parked".to_string())
+            }
+        };
+    let job = store
+        .get_job(&job_id)?
+        .ok_or_else(|| format!("Queued turn '{job_id}' is missing from the queue"))?;
+    Ok(QueuedRun {
+        run_id: job
+            .run_id
+            .ok_or_else(|| format!("Queued turn '{job_id}' is still preparing"))?,
+        job_id,
+        state: job.state,
+    })
+}
+
+/// The durable turn a desktop Send or a finalized voice utterance becomes.
+///
+/// The dedupe identity is entirely the client's: the account is the chat
+/// session or the voice session, and the event id is the turn or utterance id
+/// the surface generated *before* its first submission attempt. Nothing here
+/// mints an identity, because an identity minted per attempt would make a
+/// retried send a second run.
+fn bridge_turn_ingress(
+    source: little_monkey_lib::channels::ingress::ConversationSource,
+    args: &DaemonRunArgs,
+    target: little_monkey_lib::channels::routing::RouteTarget,
+    prompt: &str,
+    mutation_required: bool,
+    execution: little_monkey_lib::channels::ingress::FrozenExecutionContext,
+    now_ms: i64,
+) -> little_monkey_lib::channels::ingress::ConversationIngress {
+    let account = args.ingress_account.as_deref().unwrap_or_default();
+    little_monkey_lib::channels::ingress::ConversationIngress::direct(
+        source,
+        account,
+        args.ingress_event.as_deref().unwrap_or_default(),
+        args.ingress_session
+            .clone()
+            .unwrap_or_else(|| format!("{}:{account}", source.as_str())),
+        prompt,
+        target,
+        now_ms,
+    )
+    .with_mutation_contract(mutation_required)
+    .with_execution(execution)
+}
+
+/// Queue a prompt typed in an editor, on behalf of a protocol client, without
+/// writing human-oriented text to stdout.
+///
+/// The editor protocol relays the shared run protocol and nothing else, so the
+/// resident daemon stays the execution authority. What arrives here is a
+/// person's prompt in their own editor — the operator, on the same machine as
+/// the desktop app — so it takes the same durable path a Send does, recorded
+/// under [`ConversationSource::Desktop`] with the client's own request digest
+/// as its dedupe identity.
+///
+/// [`ConversationSource::Desktop`]: little_monkey_lib::channels::ingress::ConversationSource::Desktop
 pub(crate) fn queue_client_recipe(
     cli: &crate::Cli,
     recipe_path: &Path,
+    session_id: &str,
     client_key: &str,
 ) -> Result<QueuedRun, String> {
+    use little_monkey_lib::channels::ingress::{ConversationIngress, ConversationSource};
+    use little_monkey_lib::channels::routing::RouteTarget;
+
     if client_key.is_empty() || client_key.len() > 4_096 || client_key.contains('\0') {
         return Err("Protocol client run key is invalid".to_string());
     }
-    let paths = DaemonPaths::resolve()?;
-    let config = DaemonConfig::load(&paths).map_err(|error| {
-        format!(
-            "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
-        )
-    })?;
+    if session_id.is_empty() || session_id.len() > 256 || session_id.contains('\0') {
+        return Err("Protocol client session id is invalid".to_string());
+    }
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let mut store = DaemonStore::open(&paths)?;
     if store.kill_switch()? {
         return Err("Global kill switch is engaged; protocol runs cannot be queued".to_string());
     }
-    let mut shared = SharedLedger::open(&paths.ledger_db)?;
-    let options = QueueOptions {
-        recipe: recipe_path.to_string_lossy().into_owned(),
-        params: Vec::new(),
-        origin: QueueOrigin::Remote {
-            request_id: client_key.to_string(),
-        },
-        deterministic_job_id: Some(format!(
-            "job-{}",
-            &sha256_hex(format!("protocol-client:{client_key}").as_bytes())[..32]
-        )),
-        priority: 0,
-        max_attempts: 1,
-        max_runtime_ms: 24 * 60 * 60 * 1_000,
-        max_memory_bytes: None,
-        owned_worktree: false,
-        repository: None,
-        branch_prefix: "codex/".to_string(),
-        allowed_remotes: vec!["origin".to_string()],
-        allow_commit: false,
-        allow_push: false,
-        allow_create_pull_request: false,
-        allow_review_comment: false,
-        parent_run_id: None,
-        snapshot_is_frozen: false,
-    };
-    enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)
+
+    let target = RouteTarget::new(recipe_path.to_string_lossy().into_owned());
+    // The editor's recipe is not a rendered snapshot, so this is where the
+    // operator's rules and facts are merged in — once, and then frozen. A
+    // recovered turn runs the prompt the editor sent under the rules that were
+    // in force when it sent it.
+    let execution = freeze_execution_for(&target, None, &global_config_roots, Some(cli))?;
+    let recipe: recipes::Recipe = serde_json::from_str(&execution.as_v1().recipe_json)
+        .map_err(|error| format!("The frozen recipe for this turn is unreadable: {error}"))?;
+    let ingress = ConversationIngress::direct(
+        ConversationSource::Desktop,
+        format!("editor:{session_id}"),
+        client_key,
+        format!("desktop:editor:{session_id}"),
+        recipe.prompt.clone(),
+        target,
+        i64::try_from(now_ms()?).unwrap_or(i64::MAX),
+    )
+    .with_execution(execution);
+
+    let queue = DaemonChannelQueue::new(paths.clone());
+    let now = i64::try_from(now_ms()?).unwrap_or(i64::MAX);
+    let job_id =
+        match channel_ingress::submit_conversation_turn(&mut store, &queue, &ingress, &[], now)? {
+            channel_ingress::SubmitOutcome::Queued { job_id, .. }
+            | channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => job_id,
+            channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+            channel_ingress::SubmitOutcome::Parked { .. } => {
+                return Err("This turn could not be queued and was parked".to_string())
+            }
+        };
+    let job = store
+        .get_job(&job_id)?
+        .ok_or_else(|| format!("Queued turn '{job_id}' is missing from the queue"))?;
+    Ok(QueuedRun {
+        run_id: job
+            .run_id
+            .ok_or_else(|| format!("Queued turn '{job_id}' is still preparing"))?,
+        job_id,
+        state: job.state,
+    })
 }
 
 /// Recipe name the mobile chat route executes. The node operator authors it
@@ -700,60 +1053,255 @@ pub(crate) fn queue_client_recipe(
 /// keeps this path from inventing an implicit target resolution of its own.
 pub(crate) const MOBILE_CHAT_RECIPE: &str = "mobile-chat";
 
-fn mobile_chat_job_id(client_key: &str) -> String {
-    format!(
-        "job-{}",
-        &sha256_hex(format!("mobile-chat:{client_key}").as_bytes())[..32]
+/// The durable job id one mobile turn produces.
+///
+/// Derived forwards from the turn's own identity rather than parsed out of the
+/// job id, which is a digest. Used by the push watcher to tell a finished chat
+/// reply apart from a finished background run.
+pub(crate) fn mobile_chat_job_id(session_id: &str, client_key: &str) -> String {
+    mobile_chat_ingress(session_id, client_key, "", 1).deterministic_job_id()
+}
+
+/// The durable turn one mobile chat message becomes.
+///
+/// The phone's own authenticated message id is the dedupe identity — never a
+/// fresh one minted here, or a retried request after a timed-out response would
+/// become a second run. `ConversationSource::Mobile` is what decides that a
+/// paired phone's words are the operator's instructions rather than untrusted
+/// data; see `ConversationSource::author_is_operator`.
+pub(crate) fn mobile_chat_ingress(
+    session_id: &str,
+    client_key: &str,
+    prompt: &str,
+    now_ms: i64,
+) -> little_monkey_lib::channels::ingress::ConversationIngress {
+    little_monkey_lib::channels::ingress::ConversationIngress::direct(
+        little_monkey_lib::channels::ingress::ConversationSource::Mobile,
+        session_id,
+        client_key,
+        format!("mobile:{session_id}"),
+        prompt,
+        little_monkey_lib::channels::routing::RouteTarget::new(MOBILE_CHAT_RECIPE),
+        now_ms,
     )
 }
 
-/// Queues one mobile chat turn against the operator's `mobile-chat` recipe.
-/// Frozen snapshot (no CLI rules merging), one attempt, no worktree — the
-/// same conservative posture as `queue_client_recipe`.
+/// Queues one mobile chat turn against the operator's `mobile-chat` recipe,
+/// through the same durable ingress service every other origin uses.
 pub(crate) fn queue_mobile_chat_recipe(
     paths: &DaemonPaths,
+    session_id: &str,
     client_key: &str,
     prompt: &str,
 ) -> Result<QueuedRun, String> {
     if client_key.is_empty() || client_key.len() > 256 {
         return Err("Mobile chat queue key is invalid".to_string());
     }
-    let config = DaemonConfig::load(paths).map_err(|error| {
-        format!(
-            "The Little Monkey background runner is not configured. Install it from the app or run `monkey daemon install`: {error}"
+    let ingress = mobile_chat_ingress(
+        session_id,
+        client_key,
+        prompt,
+        i64::try_from(now_ms()?).unwrap_or(i64::MAX),
+    );
+    let params = vec![format!(
+        "prompt={}",
+        channel_ingress::message_param(
+            &ingress,
+            "a paired mobile device",
+            little_monkey_lib::channels::ingress::MAX_LISTED_ATTACHMENTS,
         )
-    })?;
+    )];
+    let queue = DaemonChannelQueue::new(paths.clone());
     let mut store = DaemonStore::open(paths)?;
     if store.kill_switch()? {
         return Err("Global kill switch is engaged; mobile chat cannot be queued".to_string());
     }
-    let mut shared = SharedLedger::open(&paths.ledger_db)?;
-    let options = QueueOptions {
-        recipe: MOBILE_CHAT_RECIPE.to_string(),
-        params: vec![format!("prompt={prompt}")],
-        origin: QueueOrigin::Remote {
-            request_id: client_key.to_string(),
-        },
-        deterministic_job_id: Some(mobile_chat_job_id(client_key)),
-        priority: 0,
-        max_attempts: 1,
-        max_runtime_ms: 30 * 60 * 1_000,
-        max_memory_bytes: None,
-        owned_worktree: false,
-        repository: None,
-        branch_prefix: "codex/".to_string(),
-        allowed_remotes: vec!["origin".to_string()],
-        allow_commit: false,
-        allow_push: false,
-        allow_create_pull_request: false,
-        allow_review_comment: false,
-        parent_run_id: None,
-        // The recipe is used verbatim: its own system prompt is the mobile
-        // contract, never merged with whatever rules exist in the daemon
-        // process's cwd.
-        snapshot_is_frozen: true,
+    let now = i64::try_from(now_ms()?).unwrap_or(i64::MAX);
+    let job_id = match channel_ingress::submit_conversation_turn(
+        &mut store, &queue, &ingress, &params, now,
+    )? {
+        channel_ingress::SubmitOutcome::Queued { job_id, .. }
+        | channel_ingress::SubmitOutcome::AlreadyQueued { job_id, .. } => job_id,
+        // Durably accepted but not queued. The phone is told this failed so it
+        // can show the person something; recovery still owns the turn, and its
+        // deterministic job id is what stops a retry becoming a second run.
+        channel_ingress::SubmitOutcome::Deferred { error, .. } => return Err(error),
+        channel_ingress::SubmitOutcome::Parked { .. } => {
+            return Err("This mobile turn could not be queued and was parked".to_string())
+        }
     };
-    enqueue(None, paths, &config, &mut store, &mut shared, options)
+    let job = store
+        .get_job(&job_id)?
+        .ok_or_else(|| format!("Queued mobile turn '{job_id}' is missing from the queue"))?;
+    Ok(QueuedRun {
+        run_id: job
+            .run_id
+            .ok_or_else(|| format!("Queued mobile turn '{job_id}' is still preparing"))?,
+        job_id,
+        state: job.state,
+    })
+}
+
+/// Resolve everything a conversational turn will execute with, once.
+///
+/// Called when a turn is *accepted*, never again. The resolved recipe travels
+/// with the durable row from here on, so an operator editing the recipe file,
+/// moving the workspace or deleting the route between acceptance and execution
+/// changes what the *next* message runs and nothing about this one.
+///
+/// The credential is deliberately not resolved: only its identifier is frozen.
+/// A key rotated between acceptance and execution is meant to be picked up, and
+/// a key deleted is meant to fail the run rather than quietly demote it to some
+/// other model.
+/// `merge_rules_from` is the CLI context of an origin whose recipe is *not*
+/// already a rendered snapshot — the editor protocol's, today. Its rules and
+/// facts are merged into the system prompt here, at accept time, so the merged
+/// prompt is part of what gets frozen instead of being recomputed later against
+/// a rules file that has since changed.
+pub(crate) fn freeze_execution_for(
+    target: &little_monkey_lib::channels::routing::RouteTarget,
+    route_id: Option<&str>,
+    global_config_roots: &[PathBuf],
+    merge_rules_from: Option<&crate::Cli>,
+) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+    use little_monkey_lib::channels::ingress::{FrozenExecutionContext, FrozenExecutionContextV1};
+
+    let workspace_root = std::env::current_dir().ok();
+    let (mut recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        &target.recipe,
+        workspace_root.as_deref(),
+        global_config_roots,
+    )?;
+    let workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
+    if let Some(cli) = merge_rules_from {
+        let state = crate::build_state(&Some(workspace.clone()))?;
+        recipe.system = crate::effective_system(cli, &state, recipe.system.as_deref());
+    }
+    Ok(FrozenExecutionContext::V1(
+        FrozenExecutionContextV1 {
+            recipe_ref: target.recipe.clone(),
+            recipe_json: serde_json::to_string(&recipe)
+                .map_err(|error| format!("Could not freeze the recipe for this turn: {error}"))?,
+            recipe_source_path: Some(recipe_path.to_string_lossy().into_owned()),
+            workspace_path: Some(workspace.to_string_lossy().into_owned()),
+            model_target: describe_recipe_target(&recipe.target),
+            permission_mode: recipe.permission_mode.clone(),
+            credential_ref: credential_ref_for(&recipe.target),
+            route_id: route_id.map(str::to_string),
+            route_digest: target.digest(),
+            ..Default::default()
+        }
+        .seal(),
+    ))
+}
+
+/// The model a recipe names, in one line an operator can read in a listing.
+fn describe_recipe_target(target: &recipes::RecipeTarget) -> String {
+    match (
+        &target.provider,
+        &target.model,
+        &target.ollama,
+        &target.local_url,
+        &target.managed_model,
+    ) {
+        (Some(provider), Some(model), ..) => format!("provider:{provider}/{model}"),
+        (Some(provider), None, ..) => format!("provider:{provider}"),
+        (_, _, Some(model), _, _) => format!("ollama:{model}"),
+        (_, _, _, Some(url), _) => format!("local:{url}"),
+        (_, _, _, _, Some(model)) => format!("managed:{model}"),
+        _ => "unresolved".to_string(),
+    }
+}
+
+/// Which credential the run will need, named rather than resolved.
+///
+/// Only a cloud provider has one. A local origin, an Ollama model and the
+/// managed runtime authenticate with nothing, so freezing a reference for them
+/// would be inventing a secret that does not exist.
+fn credential_ref_for(target: &recipes::RecipeTarget) -> Option<String> {
+    target
+        .provider
+        .as_ref()
+        .map(|provider| format!("provider:{provider}"))
+}
+
+/// Production implementation of the channel worker's run seam.
+///
+/// Opens its own handles per submission rather than holding them, because the
+/// inbound loop can sit idle for hours between messages and a long-lived
+/// connection to the ledger buys nothing over that interval.
+pub(crate) struct DaemonChannelQueue {
+    paths: DaemonPaths,
+}
+
+impl DaemonChannelQueue {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl channel_worker::RunQueue for DaemonChannelQueue {
+    fn freeze_execution(
+        &self,
+        ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+    ) -> Result<little_monkey_lib::channels::ingress::FrozenExecutionContext, String> {
+        freeze_execution_for(
+            &ingress.target,
+            ingress.route_id.as_deref(),
+            &global_config_roots_for_paths(&self.paths)?,
+            // Channel, peer, call, mobile and voice recipes are the operator's
+            // own contracts, used verbatim. Merging the daemon process's
+            // ambient rules into them would let whatever sits in its working
+            // directory rewrite what a stranger's message runs under.
+            None,
+        )
+    }
+
+    fn submit(
+        &self,
+        ingress: &little_monkey_lib::channels::ingress::ConversationIngress,
+        params: Vec<String>,
+    ) -> Result<String, String> {
+        let config = DaemonConfig::load(&self.paths).map_err(|error| {
+            format!("The Little Monkey background runner is not configured: {error}")
+        })?;
+        let mut store = DaemonStore::open(&self.paths)?;
+        if store.kill_switch()? {
+            return Err("Global kill switch is engaged; the message was not run".to_string());
+        }
+        let mut shared = SharedLedger::open(&self.paths.ledger_db)?;
+        let options = channel_ingress::queue_options_for(ingress, params);
+        let global_config_roots = global_config_roots_for_paths(&self.paths)?;
+        enqueue(
+            None,
+            &self.paths,
+            &global_config_roots,
+            &config,
+            &mut store,
+            &mut shared,
+            options,
+        )
+        .map(|queued| queued.job_id)
+    }
+
+    fn frozen_context_unusable(
+        &self,
+        context: &little_monkey_lib::channels::ingress::FrozenExecutionContextV1,
+    ) -> Option<String> {
+        // Only a cloud provider names a credential; an Ollama model, a local
+        // origin and the managed runtime authenticate with nothing, so there is
+        // nothing about them that can have been revoked. Mirrors
+        // `credential_ref_for`, which is what wrote this reference.
+        let reference = context.credential_ref.as_deref()?;
+        let provider = reference.strip_prefix("provider:")?;
+        if little_monkey_lib::providers::read_key_with_env(provider).is_ok() {
+            return None;
+        }
+        Some(format!(
+            "This turn was accepted to run on {}, and the credential it named ('{reference}') is no longer available. Restore it and resume again, or ask the question afresh in a new turn — continuing it on a different model would answer in a voice the conversation never had.",
+            context.model_target,
+        ))
+    }
 }
 
 /// Production implementation of the remote API's mobile chat seam.
@@ -768,14 +1316,20 @@ impl DaemonMobileChatQueue {
 }
 
 impl remote::api::MobileChatQueue for DaemonMobileChatQueue {
-    fn queue_chat(&self, client_key: &str, prompt: &str) -> Result<String, String> {
-        queue_mobile_chat_recipe(&self.paths, client_key, prompt).map(|queued| queued.run_id)
+    fn queue_chat(
+        &self,
+        session_id: &str,
+        client_key: &str,
+        prompt: &str,
+    ) -> Result<String, String> {
+        queue_mobile_chat_recipe(&self.paths, session_id, client_key, prompt)
+            .map(|queued| queued.run_id)
     }
 
-    fn chat_run_id(&self, client_key: &str) -> Result<Option<String>, String> {
+    fn chat_run_id(&self, session_id: &str, client_key: &str) -> Result<Option<String>, String> {
         let store = DaemonStore::open(&self.paths)?;
         Ok(store
-            .get_job(&mobile_chat_job_id(client_key))?
+            .get_job(&mobile_chat_job_id(session_id, client_key))?
             .and_then(|job| job.run_id))
     }
 }
@@ -847,15 +1401,13 @@ fn placed_recipe_target(
             local_url: None,
             managed_model: None,
         }),
-        ModelTargetSnapshot::Ollama { model, .. } => {
-            Ok(little_monkey_lib::recipes::RecipeTarget {
-                provider: None,
-                model: None,
-                ollama: Some(model.clone()),
-                local_url: None,
-                managed_model: None,
-            })
-        }
+        ModelTargetSnapshot::Ollama { model, .. } => Ok(little_monkey_lib::recipes::RecipeTarget {
+            provider: None,
+            model: None,
+            ollama: Some(model.clone()),
+            local_url: None,
+            managed_model: None,
+        }),
         ModelTargetSnapshot::ManagedLlama { model_id, .. } => {
             if little_monkey_lib::m3_runtime_hub::installed_model_artifact(app_data, model_id)
                 .is_none()
@@ -970,6 +1522,7 @@ fn placed_recipe(
         max_iterations: usize::try_from(spec.budgets.max_iterations).ok(),
         timeout_seconds: Some(spec.budgets.wall_time_ms.div_ceil(1_000).max(1)),
         output: little_monkey_lib::recipes::RecipeOutput { json: true },
+        channel_send: None,
         desktop_turn: None,
         placed_run: Some(snapshot),
     };
@@ -1032,8 +1585,19 @@ impl remote::api::PlacementQueue for DaemonPlacementQueue {
             allow_review_comment: false,
             parent_run_id: None,
             snapshot_is_frozen: true,
+            frozen_execution: None,
+            appended_system: None,
         };
-        let queued = enqueue(None, &self.paths, &config, &mut store, &mut shared, options)?;
+        let global_config_roots = global_config_roots_for_paths(&self.paths)?;
+        let queued = enqueue(
+            None,
+            &self.paths,
+            &global_config_roots,
+            &config,
+            &mut store,
+            &mut shared,
+            options,
+        )?;
         Ok(remote::api::PlacedJob {
             node_run_id: queued.run_id,
             job_id: queued.job_id,
@@ -1110,6 +1674,23 @@ struct QueueOptions {
     /// In particular, do not merge current rules into its captured system
     /// prompt again when an operator explicitly retries it.
     snapshot_is_frozen: bool,
+    /// The definition resolved when a conversational turn was *accepted*.
+    ///
+    /// Present for every turn that came through the ingress service. When it is
+    /// set, `enqueue` executes it verbatim rather than resolving `recipe` again:
+    /// a recipe file an operator edited between acceptance and execution must
+    /// not change what an already-accepted message runs.
+    frozen_execution: Option<little_monkey_lib::channels::ingress::FrozenExecutionContextV1>,
+    /// One instruction appended to this job's system prompt, and to nothing
+    /// else.
+    ///
+    /// Set only for a durable continuation of an already accepted turn — the
+    /// corrective nudge for an unmet workspace-mutation contract, or the note a
+    /// resumed turn is given. It is applied *after* the frozen recipe is read,
+    /// so the accepted turn's own frozen context and digest are untouched: the
+    /// continuation provably ran the parent's configuration, plus one sentence
+    /// that belongs to this attempt.
+    appended_system: Option<String>,
 }
 
 impl QueueOptions {
@@ -1141,6 +1722,8 @@ impl QueueOptions {
             parent_run_id: None,
             origin: QueueOrigin::Local,
             snapshot_is_frozen: false,
+            frozen_execution: None,
+            appended_system: None,
         }
     }
 }
@@ -1200,6 +1783,7 @@ fn project_queue_origin(
                 code: None,
                 signal: None,
                 reason: Some("request accepted; the work continues as its daemon job".to_string()),
+                breach: None,
             },
         ),
         now_ms,
@@ -1239,6 +1823,7 @@ fn enqueue(
     // rules/facts into a NON-frozen recipe's system prompt.
     cli: Option<&crate::Cli>,
     paths: &DaemonPaths,
+    global_config_roots: &[PathBuf],
     config: &DaemonConfig,
     store: &mut DaemonStore,
     shared: &mut SharedLedger,
@@ -1278,13 +1863,43 @@ fn enqueue(
             state: existing.state,
         });
     }
-    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
-    let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(&options.recipe, workspace_root.as_deref(), &app_data)?;
+    // A conversational turn executes what was resolved when it was accepted.
+    // Everything else resolves now, which is correct for it: a scheduled or
+    // hand-run recipe is *meant* to pick up the operator's current file.
+    let (recipe, recipe_path) = match &options.frozen_execution {
+        Some(frozen) => {
+            if !frozen.recipe_matches_digest() {
+                return Err(
+                    "The frozen recipe for this turn does not match its own digest; refusing to run it"
+                        .to_string(),
+                );
+            }
+            (
+                serde_json::from_str(&frozen.recipe_json).map_err(|error| {
+                    format!("The frozen recipe for this turn is unreadable: {error}")
+                })?,
+                PathBuf::from(frozen.recipe_source_path.clone().unwrap_or_default()),
+            )
+        }
+        None => {
+            let workspace_root = std::env::current_dir().ok();
+            recipes::resolve_recipe_with_path(
+                &options.recipe,
+                workspace_root.as_deref(),
+                global_config_roots,
+            )?
+        }
+    };
     let overrides = parse_params(&options.params)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
-    let original_workspace = resolve_recipe_workspace(&recipe, &recipe_path)?;
+    let original_workspace = match options
+        .frozen_execution
+        .as_ref()
+        .and_then(|frozen| frozen.workspace_path.clone())
+    {
+        Some(path) => PathBuf::from(path),
+        None => resolve_recipe_workspace(&recipe, &recipe_path)?,
+    };
     // M6A desktop submissions already contain the exact rules/persona/system
     // snapshot observed by the sending WebView. Re-merging whatever rules
     // happen to exist when the resident service dequeues it would violate
@@ -1333,7 +1948,15 @@ fn enqueue(
 
     let mut snapshot = recipe;
     snapshot.prompt = rendered.prompt;
-    snapshot.system = effective_system;
+    // A continuation's own instruction goes on last, after the frozen system
+    // prompt and after any rules merging, and only into this job's snapshot.
+    snapshot.system = match &options.appended_system {
+        Some(appended) => Some(match effective_system {
+            Some(system) if !system.trim().is_empty() => format!("{system}\n\n{appended}"),
+            _ => appended.clone(),
+        }),
+        None => effective_system,
+    };
     snapshot.params.clear();
     snapshot.workspace = Some(
         workspace
@@ -1409,13 +2032,47 @@ fn enqueue(
     })
 }
 
+fn global_config_roots_for_paths(paths: &DaemonPaths) -> Result<Vec<PathBuf>, String> {
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    if !daemon_paths_match_profile(paths, &roots.legacy) {
+        return Err(
+            "The active profile changed while resolving daemon paths; retry the command"
+                .to_string(),
+        );
+    }
+    Ok(roots.ordered())
+}
+
+fn daemon_paths_match_profile(paths: &DaemonPaths, profile_root: &Path) -> bool {
+    paths.root == profile_root.join("daemon")
+}
+
+/// The binary a daemon child is launched from: this one.
+///
+/// Every child the daemon starts is another `monkey-cli` invocation, so the
+/// running executable is the answer — there is nothing to look up and nothing
+/// an environment can redirect.
+///
+/// Under `cargo test` the running executable is a test harness rather than the
+/// CLI, so the end-to-end test that needs a real daemon child resolves the
+/// binary cargo built beside it. That branch does not exist in a release
+/// build; production always launches itself.
+pub(crate) fn monkey_executable() -> Result<PathBuf, String> {
+    let current = std::env::current_exe()
+        .map_err(|error| format!("Could not resolve monkey executable: {error}"))?;
+    #[cfg(test)]
+    if let Some(built) = channel_agent_e2e::cli_beside_test_binary(&current) {
+        return Ok(built);
+    }
+    Ok(current)
+}
+
 fn submit_queued_snapshot(
     snapshot: &Path,
     job_id: &str,
     repository_policy_json: Option<&str>,
 ) -> Result<String, String> {
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not resolve monkey executable: {error}"))?;
+    let executable = monkey_executable()?;
     let mut command = Command::new(executable);
     command
         .arg("--no-rules")
@@ -1536,6 +2193,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::PermissionDecided { .. } => "permission_decided",
         RunEvent::RoutingDecided { .. } => "routing_decided",
         RunEvent::ToolStarted { .. } => "tool_started",
+        RunEvent::SkillInvoked { .. } => "skill_invoked",
         RunEvent::ToolFinished { .. } => "tool_finished",
         RunEvent::ArtifactAdded { .. } => "artifact_added",
         RunEvent::CheckpointLinked { .. } => "checkpoint_linked",
@@ -1602,7 +2260,9 @@ fn append_cancellation(paths: &DaemonPaths, run_id: &str, reason: &str) -> Resul
 }
 
 fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&config_roots.legacy);
+    let global_config_roots = config_roots.ordered();
     let config = DaemonConfig::load(&paths)?;
     let mut store = DaemonStore::open(&paths)?;
     let mut shared = SharedLedger::open(&paths.ledger_db)?;
@@ -1648,8 +2308,18 @@ fn retry(cli: &crate::Cli, run_id: &str, acknowledge: bool) -> Result<(), String
         allow_review_comment: false,
         parent_run_id: prior.run_id,
         snapshot_is_frozen: true,
+        frozen_execution: None,
+        appended_system: None,
     };
-    let queued = enqueue(Some(cli), &paths, &config, &mut store, &mut shared, options)?;
+    let queued = enqueue(
+        Some(cli),
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        options,
+    )?;
     let _ = std::fs::remove_file(retry_source);
     println!("Queued retry {} as {}", queued.job_id, queued.run_id);
     Ok(())
@@ -1740,7 +2410,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 workflow,
                 schedule: cron.clone(),
             };
-            add_trigger(&mut shared, id, config, None)?;
+            add_trigger(&paths, &mut shared, id, config, None)?;
         }
         TriggerCmd::AddFilesystem {
             id,
@@ -1765,7 +2435,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 pattern,
                 last_fingerprint: None,
             };
-            add_trigger(&mut shared, id, config, None)?;
+            add_trigger(&paths, &mut shared, id, config, None)?;
         }
         TriggerCmd::AddWebhook {
             id,
@@ -1794,6 +2464,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
             };
             let secret_slot = config.secret_reference(id).to_string();
             add_trigger(
+                &paths,
                 &mut shared,
                 id,
                 config,
@@ -1835,7 +2506,13 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 allow_review_comment: *allow_review_comment,
                 max_skew_ms: *max_skew_ms,
             };
-            add_trigger(&mut shared, id, config, Some((&secrets, id, &secret)))?;
+            add_trigger(
+                &paths,
+                &mut shared,
+                id,
+                config,
+                Some((&secrets, id, &secret)),
+            )?;
         }
         TriggerCmd::List { json } => {
             let triggers = shared.list_triggers()?;
@@ -1869,12 +2546,19 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
                 }
             }
         }
-        TriggerCmd::Remove { id } => {
+        TriggerCmd::Remove { id, extension_id } => {
             let stored = shared
                 .trigger(id)?
                 .ok_or_else(|| format!("Unknown trigger '{id}'"))?;
             let config: TriggerConfig = serde_json::from_slice(&stored.config_json)
                 .map_err(|error| format!("Invalid trigger '{id}': {error}"))?;
+            if let Some(expected) = extension_id {
+                if config.extension_target().map(|target| target.0) != Some(expected.as_str()) {
+                    return Err(
+                        "Trigger does not belong to the expected executable extension".to_string(),
+                    );
+                }
+            }
             if config
                 .workflow_binding()
                 .is_some_and(|binding| binding.managed_by_batch)
@@ -1940,6 +2624,7 @@ fn trigger_command(action: &TriggerCmd) -> Result<(), String> {
 }
 
 fn add_trigger(
+    paths: &DaemonPaths,
     shared: &mut SharedLedger,
     id: &str,
     config: TriggerConfig,
@@ -1948,6 +2633,7 @@ fn add_trigger(
     validate_trigger_id(id)?;
     config.validate()?;
     validate_trigger_recipe(&config)?;
+    validate_extension_trigger(paths, &config)?;
     if let Some((store, slot, secret)) = secret {
         store.put(slot, secret)?;
     }
@@ -1966,13 +2652,46 @@ fn add_trigger(
     Ok(())
 }
 
+fn validate_extension_trigger(paths: &DaemonPaths, config: &TriggerConfig) -> Result<(), String> {
+    let Some((extension_id, handler_id, version, manifest_sha256)) = config.extension_target()
+    else {
+        return Ok(());
+    };
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let detail = little_monkey_lib::executable_extensions::ExtensionManager::new(app_data)?
+        .inspect(extension_id)?;
+    if detail.active_version != version || detail.trust.manifest_sha256 != manifest_sha256 {
+        return Err("Extension trigger must pin the active immutable manifest".to_string());
+    }
+    if !detail
+        .manifest
+        .capabilities
+        .iter()
+        .any(|capability| capability.capability_id == handler_id)
+    {
+        return Err("Extension trigger handler is not a declared capability".to_string());
+    }
+    if !detail.permissions.iter().any(|permission| {
+        permission.granted
+            && permission.kind
+                == little_monkey_lib::executable_extensions::PermissionKind::WebhookReceive
+            && permission.scope == handler_id
+    }) {
+        return Err("Extension trigger handler lacks its exact ingress grant".to_string());
+    }
+    Ok(())
+}
+
 fn validate_trigger_recipe(config: &TriggerConfig) -> Result<(), String> {
     let Some((recipe_name, params, payload_param)) = config.recipe_target() else {
         return Ok(());
     };
-    let app_data = crate::app_data_dir().ok_or("Could not resolve app data directory")?;
+    let global_config_roots = recipes::global_config_roots()?;
     let cwd = std::env::current_dir().ok();
-    let recipe = recipes::resolve_recipe(recipe_name, cwd.as_deref(), &app_data)?;
+    let recipe = recipes::resolve_recipe(recipe_name, cwd.as_deref(), &global_config_roots)?;
     for key in params.keys() {
         if !recipe.params.contains_key(key) {
             return Err(format!(
@@ -1999,9 +2718,15 @@ fn build_trigger_target(
         || args.definition_sha256.is_some()
         || args.workflow_version.is_some()
         || args.workflow_trigger_json.is_some();
+    let extension_fields_present = args.extension_id.is_some()
+        || args.extension_handler_id.is_some()
+        || args.extension_version.is_some()
+        || args.extension_manifest_sha256.is_some();
     if let Some(recipe) = &args.recipe {
-        if workflow_fields_present {
-            return Err("RECIPE and workflow target flags are mutually exclusive".to_string());
+        if workflow_fields_present || extension_fields_present {
+            return Err(
+                "Recipe, workflow, and extension targets are mutually exclusive".to_string(),
+            );
         }
         return Ok((
             TriggerTarget::Recipe {
@@ -2014,6 +2739,30 @@ fn build_trigger_target(
     }
     if !params.is_empty() || payload_param.is_some() {
         return Err("--param/--payload-param are supported only for recipe targets".to_string());
+    }
+    if extension_fields_present {
+        if workflow_fields_present {
+            return Err("Workflow and extension target flags are mutually exclusive".to_string());
+        }
+        return Ok((
+            TriggerTarget::Extension {
+                extension_id: args
+                    .extension_id
+                    .clone()
+                    .ok_or_else(|| "Extension target requires --extension-id".to_string())?,
+                handler_id: args.extension_handler_id.clone().ok_or_else(|| {
+                    "Extension target requires --extension-handler-id".to_string()
+                })?,
+                version: args
+                    .extension_version
+                    .clone()
+                    .ok_or_else(|| "Extension target requires --extension-version".to_string())?,
+                manifest_sha256: args.extension_manifest_sha256.clone().ok_or_else(|| {
+                    "Extension target requires --extension-manifest-sha256".to_string()
+                })?,
+            },
+            None,
+        ));
     }
     let workflow_id = args
         .workflow_id
@@ -2113,11 +2862,13 @@ fn reap_dead_workflow_hosts(shared: &SharedLedger) {
 }
 
 async fn serve(cli: &crate::Cli) -> Result<(), String> {
-    let paths = DaemonPaths::resolve()?;
+    let roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let paths = DaemonPaths::under(&roots.legacy);
     let config = DaemonConfig::load(&paths)?;
     paths.ensure()?;
     let _lock = DaemonLock::acquire(&paths.lock)?;
     let mut store = DaemonStore::open(&paths)?;
+    store.set_meta("profile_id", &roots.profile_id)?;
     store.set_meta("stop_requested", "0")?;
     // A stale escape-hatch flag from a prior run must not instantly kill the
     // first session of this run.
@@ -2165,12 +2916,34 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         desktop_control.clone(),
         std::sync::Arc::new(DaemonMobileChatQueue::new(paths.clone())),
         std::sync::Arc::new(DaemonPlacementQueue::new(paths.clone())),
+        // Peer traffic reaches the queue through the same seam channel
+        // messages do: one funnel, one set of durability rules.
+        std::sync::Arc::new(DaemonChannelQueue::new(paths.clone())),
     )
     .await?;
     spawn_knowledge_refresh_scheduler()?;
+    // What tells a paired phone that a run wants an approval, or has finished.
+    // Its own task, reading the job table the rest of this process writes, so a
+    // transition raises its notification whichever code path caused it — the
+    // scheduler, a reporting child, or the crash reconciler.
+    remote::watch::spawn(paths.clone());
+    // Messaging channels. Its own task rather than a step in the loop below: a
+    // long-polling provider blocks for half a minute at a time, and the queue
+    // must keep ticking while it does.
+    channel_worker::spawn_channel_runtime(paths.clone());
+    // Call limits. Separate from the channel runtime because it enforces
+    // deadlines rather than moving messages: a call nobody is watching keeps
+    // costing money whether or not any provider is polling.
+    telecom_worker::spawn_telecom_runtime(paths.clone());
     spawn_webdav_backup_scheduler()?;
     if let Some(port) = config.webhook_port {
         webhook::spawn_local_listener(paths.clone(), port).await?;
+        // And, if the operator asked for one, their own tunnel in front of it.
+        // After the listener rather than before: a tunnel that connected to a
+        // port nothing was serving would advertise a public URL that answers
+        // nothing, which is worse than not being up. Does nothing at all for
+        // the default manual mode.
+        callback_exposure::spawn_supervisor(paths.clone());
     }
     let mut workflow_trigger_sync = WorkflowBatchSynchronizer::default();
     // Roadmap K17 S4: the heartbeat. Every machine's daemon is both a node and a
@@ -2189,6 +2962,13 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
             if let Err(error) = remote::placement_sync(&paths).await {
                 eprintln!("monkey daemon: placement sync paused: {error}");
             }
+            // On the same tick, and for the same reason: a device deadline that
+            // only advances when some device happens to ask for work is not a
+            // deadline. An open Talk socket registers a live capture, and a
+            // runner that dies must not leave one claiming to be open.
+            if let Err(error) = remote::expire_device_work(&paths) {
+                eprintln!("monkey daemon: device expiry sweep paused: {error}");
+            }
         }
         if let Err(error) =
             workflow_trigger_sync.sync_if_changed(&paths.root, &mut engine.shared, now)
@@ -2201,6 +2981,7 @@ async fn serve(cli: &crate::Cli) -> Result<(), String> {
         poll_persistent_triggers(&mut engine.shared, &mut engine.store, now)?;
         if let Err(error) =
             process_pending_deliveries(cli, &paths, &config, &mut engine.store, &mut engine.shared)
+                .await
         {
             eprintln!("Persistent trigger delivery paused: {error}");
         }
@@ -2337,7 +3118,7 @@ fn reconcile_reserved_deliveries(
     Ok(())
 }
 
-fn process_pending_deliveries(
+async fn process_pending_deliveries(
     cli: &crate::Cli,
     paths: &DaemonPaths,
     config: &DaemonConfig,
@@ -2346,7 +3127,7 @@ fn process_pending_deliveries(
 ) -> Result<(), String> {
     for pending in store.pending_delivery_payloads(64)? {
         if let Err(error) =
-            process_one_pending_delivery(cli, paths, config, store, shared, &pending)
+            process_one_pending_delivery(cli, paths, config, store, shared, &pending).await
         {
             eprintln!(
                 "Persistent trigger delivery '{}/{}' paused: {error}",
@@ -2357,7 +3138,7 @@ fn process_pending_deliveries(
     Ok(())
 }
 
-fn process_one_pending_delivery(
+async fn process_one_pending_delivery(
     cli: &crate::Cli,
     paths: &DaemonPaths,
     config: &DaemonConfig,
@@ -2371,6 +3152,20 @@ fn process_one_pending_delivery(
     let trigger: TriggerConfig =
         serde_json::from_slice(&stored_trigger.config_json).map_err(|error| error.to_string())?;
     trigger.validate()?;
+    if let Some((extension_id, handler_id, version, manifest_sha256)) = trigger.extension_target() {
+        return dispatch_extension_delivery(
+            paths,
+            store,
+            shared,
+            &DaemonChannelQueue::new(paths.clone()),
+            pending,
+            extension_id,
+            handler_id,
+            version,
+            manifest_sha256,
+        )
+        .await;
+    }
     if let Some((workflow_id, definition_sha256, binding)) = trigger.workflow_target() {
         return dispatch_workflow_delivery(
             paths,
@@ -2415,6 +3210,8 @@ fn process_one_pending_delivery(
         allow_review_comment: false,
         parent_run_id: None,
         snapshot_is_frozen: false,
+        frozen_execution: None,
+        appended_system: None,
     };
     if let TriggerConfig::Github {
         local_repository,
@@ -2437,7 +3234,16 @@ fn process_one_pending_delivery(
         options.allow_create_pull_request = *allow_create_pull_request;
         options.allow_review_comment = *allow_review_comment;
     }
-    let queued = enqueue(Some(cli), paths, config, store, shared, options)?;
+    let global_config_roots = global_config_roots_for_paths(paths)?;
+    let queued = enqueue(
+        Some(cli),
+        paths,
+        &global_config_roots,
+        config,
+        store,
+        shared,
+        options,
+    )?;
     shared.mark_delivery_submitted(
         &pending.trigger_id,
         &pending.delivery_id,
@@ -2445,6 +3251,148 @@ fn process_one_pending_delivery(
         now_ms()?,
     )?;
     store.mark_delivery_submitted(&pending.trigger_id, &pending.delivery_id, &queued.job_id)
+}
+
+pub(crate) async fn dispatch_extension_delivery(
+    paths: &DaemonPaths,
+    store: &mut DaemonStore,
+    shared: &mut SharedLedger,
+    queue: &dyn channel_worker::RunQueue,
+    pending: &PendingDelivery,
+    extension_id: &str,
+    handler_id: &str,
+    version: &str,
+    manifest_sha256: &str,
+) -> Result<(), String> {
+    match shared.delivery(&pending.trigger_id, &pending.delivery_id)? {
+        Some((status, _, None)) if status == "submitted" => {
+            store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)?;
+            return Ok(());
+        }
+        Some((status, _, None)) if status == "accepted" => {}
+        Some((status, _, run_id)) => {
+            return Err(format!(
+                "Extension delivery has incompatible shared state status={status} run_id={run_id:?}"
+            ));
+        }
+        None => return Err("Extension delivery is missing from the replay ledger".to_string()),
+    }
+    let app_data = paths
+        .root
+        .parent()
+        .ok_or_else(|| "Daemon root has no app-data parent".to_string())?;
+    let manager = little_monkey_lib::executable_extensions::ExtensionManager::new(app_data)?;
+    let detail = manager.inspect(extension_id)?;
+    if detail.active_version != version || detail.trust.manifest_sha256 != manifest_sha256 {
+        return Err("Extension trigger is pinned to a different immutable version".to_string());
+    }
+    if !detail.permissions.iter().any(|permission| {
+        permission.granted
+            && permission.kind
+                == little_monkey_lib::executable_extensions::PermissionKind::WebhookReceive
+            && permission.scope == handler_id
+    }) {
+        return Err("Extension trigger handler no longer has its exact ingress grant".to_string());
+    }
+    let payload: serde_json::Value = serde_json::from_str(&pending.payload_json)
+        .map_err(|error| format!("Stored trigger payload is invalid JSON: {error}"))?;
+    let invocation_id = format!(
+        "extension-trigger-{}",
+        &sha256_hex(format!("{}:{}", pending.trigger_id, pending.delivery_id).as_bytes())[..32]
+    );
+    let input_json = serde_json::to_string(&serde_json::json!({
+        "trigger_id": pending.trigger_id,
+        "delivery_id": pending.delivery_id,
+        "received_at_ms": pending.received_at_ms,
+        "payload": payload,
+    }))
+    .map_err(|error| error.to_string())?;
+    let result = manager
+        .invoke(
+            little_monkey_lib::executable_extensions::InvocationRequest {
+                extension_id: extension_id.to_string(),
+                capability_id: handler_id.to_string(),
+                input_json,
+                invocation_id: Some(invocation_id.clone()),
+                input_artifact_ids: Vec::new(),
+                expected_kind: Some(
+                    little_monkey_lib::executable_extensions::CapabilityKind::Channel,
+                ),
+                expected_version: Some(version.to_string()),
+            },
+        )
+        .await?;
+    if result.invocation_id != invocation_id {
+        return Err("Extension delivery returned a mismatched invocation id".to_string());
+    }
+    // What the handler normalized, if anything, enters the ordinary channel
+    // path from here. This is the whole reason a channel capability is invoked
+    // on a delivery rather than a plain webhook handler: the extension's job
+    // ends at "these are the messages that arrived", and everything after it —
+    // access policy, pairing, dedupe, routing, the session a turn lands in — is
+    // the same code every other provider goes through.
+    ingest_extension_channel_envelopes(store, queue, &result.output_json)?;
+    // The extension invocation/result commits first. A crash before these
+    // markers re-enters with the same id and receives the cached result.
+    shared.mark_delivery_submitted_external(
+        &pending.trigger_id,
+        &pending.delivery_id,
+        now_ms()?,
+    )?;
+    store.mark_delivery_submitted_external(&pending.trigger_id, &pending.delivery_id)
+}
+
+/// Hand a channel handler's normalized output to `channel_ingress`.
+///
+/// A handler that produced no `account_id` produced no channel traffic — a
+/// webhook that was a receipt, a heartbeat or a status callback — and that is
+/// a successful delivery with nothing to route, not an error.
+///
+/// The account is looked up rather than trusted: the envelope's kind, and the
+/// binding it must match, come from the stored account row, so a handler
+/// cannot address an account belonging to another extension or forge a
+/// Telegram envelope. Acceptance itself is idempotent on
+/// `(account_id, provider_event_id)`, which is what makes a redelivered
+/// webhook collapse onto one turn.
+fn ingest_extension_channel_envelopes(
+    store: &mut DaemonStore,
+    queue: &dyn channel_worker::RunQueue,
+    output_json: &str,
+) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct HandlerOutput {
+        #[serde(default)]
+        account_id: Option<String>,
+        #[serde(flatten)]
+        inbound: crate::daemon::adapters::extension::ExtensionInbound,
+    }
+    let output: HandlerOutput = serde_json::from_str(output_json)
+        .map_err(|error| format!("Extension channel handler returned unusable output: {error}"))?;
+    let Some(account_id) = output.account_id else {
+        return Ok(());
+    };
+    if output.inbound.messages.is_empty() {
+        return Ok(());
+    }
+    let account = store
+        .channel_account(&account_id)?
+        .ok_or_else(|| format!("Extension channel handler named unknown account '{account_id}'"))?;
+    if account.kind != little_monkey_lib::channels::types::ChannelKind::Extension {
+        return Err(format!(
+            "Account '{account_id}' is not an extension channel account"
+        ));
+    }
+    if !account.enabled {
+        return Ok(());
+    }
+    let envelopes = crate::daemon::adapters::extension::normalize_envelopes(
+        &account_id,
+        output.inbound.messages,
+    )?;
+    for envelope in &envelopes {
+        channel_ingress::accept_channel_envelope(store, queue, envelope, now_ms()? as i64)?;
+    }
+    Ok(())
 }
 
 fn dispatch_workflow_delivery(
@@ -2543,6 +3491,43 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use little_monkey_lib::workflow_core::{workflow_core_fixtures, WorkflowRunStatus};
+
+    #[test]
+    fn ensure_repairs_a_service_left_behind_by_a_previous_app_install() {
+        use ServiceAction::*;
+
+        // Nothing there yet — the first desktop launch on a machine.
+        assert_eq!(decide_all(false, false, false, false), Installed);
+        // The app was replaced: the definition still names the old binary, or
+        // it names the right one but the old process is still resident.
+        assert_eq!(decide_all(true, false, true, true), Reinstalled);
+        assert_eq!(decide_all(true, true, true, false), Reinstalled);
+        // Installed, current, but stopped (a reboot, or an explicit stop).
+        assert_eq!(decide_all(true, true, false, false), Started);
+        // A stale version on a *stopped* service is not a reinstall: starting
+        // it launches what the current definition names.
+        assert_eq!(decide_all(true, true, false, true), Started);
+        assert_eq!(decide_all(true, true, true, true), Healthy);
+    }
+
+    fn decide_all(
+        installed: bool,
+        manifest_current: bool,
+        running: bool,
+        version_current: bool,
+    ) -> ServiceAction {
+        ServiceAction::decide(installed, manifest_current, running, version_current)
+    }
+
+    #[test]
+    fn daemon_and_authored_roots_must_come_from_the_same_profile_snapshot() {
+        let first = Path::new("/tmp/little-monkey/profiles/first");
+        let second = Path::new("/tmp/little-monkey/profiles/second");
+        let paths = DaemonPaths::under(first);
+
+        assert!(daemon_paths_match_profile(&paths, first));
+        assert!(!daemon_paths_match_profile(&paths, second));
+    }
 
     #[test]
     fn a_remote_request_is_lineage_and_is_never_left_claiming_to_run() {
@@ -2648,6 +3633,10 @@ mod tests {
             allow_create_pull_request: false,
             allow_review_comment: false,
             json: false,
+            ingress_source: None,
+            ingress_account: None,
+            ingress_event: None,
+            ingress_session: None,
         };
         let options = QueueOptions::from_run_args(&args);
         let id = options.deterministic_job_id.unwrap();
@@ -2674,6 +3663,10 @@ mod tests {
             allow_create_pull_request: false,
             allow_review_comment: false,
             json: false,
+            ingress_source: None,
+            ingress_account: None,
+            ingress_event: None,
+            ingress_session: None,
         };
         let options = QueueOptions::from_run_args(&args);
         assert!(!options.owned_worktree && options.allow_push);
@@ -2689,6 +3682,10 @@ mod tests {
             definition_sha256: None,
             workflow_version: None,
             workflow_trigger_json: None,
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         let (target, binding) = build_trigger_target(
             &recipe_args,
@@ -2712,6 +3709,10 @@ mod tests {
                 })
                 .to_string(),
             ),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         let (target, binding) = build_trigger_target(&workflow_args, &[], &None).unwrap();
         assert!(matches!(target, TriggerTarget::Workflow { .. }));
@@ -2729,6 +3730,10 @@ mod tests {
             definition_sha256: Some("a".repeat(64)),
             workflow_version: Some(1),
             workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         assert!(build_trigger_target(&ambiguous, &[], &None).is_err());
 
@@ -2738,8 +3743,47 @@ mod tests {
             definition_sha256: Some("a".repeat(64)),
             workflow_version: Some(1),
             workflow_trigger_json: Some(r#"{"kind":"manual"}"#.into()),
+            extension_id: None,
+            extension_handler_id: None,
+            extension_version: None,
+            extension_manifest_sha256: None,
         };
         assert!(build_trigger_target(&workflow, &["x=y".into()], &None).is_err());
+    }
+
+    #[test]
+    fn trigger_target_args_pin_an_extension_handler_to_immutable_identity() {
+        let args = TriggerTargetArgs {
+            recipe: None,
+            workflow_id: None,
+            definition_sha256: None,
+            workflow_version: None,
+            workflow_trigger_json: None,
+            extension_id: Some("dev.example.webhook".into()),
+            extension_handler_id: Some("incoming".into()),
+            extension_version: Some("1.2.3".into()),
+            extension_manifest_sha256: Some("a".repeat(64)),
+        };
+        let (target, binding) = build_trigger_target(&args, &[], &None).unwrap();
+        assert!(matches!(
+            target,
+            TriggerTarget::Extension {
+                extension_id,
+                handler_id,
+                version,
+                manifest_sha256,
+            } if extension_id == "dev.example.webhook"
+                && handler_id == "incoming"
+                && version == "1.2.3"
+                && manifest_sha256 == "a".repeat(64)
+        ));
+        assert!(binding.is_none());
+
+        let incomplete = TriggerTargetArgs {
+            extension_manifest_sha256: None,
+            ..args
+        };
+        assert!(build_trigger_target(&incomplete, &[], &None).is_err());
     }
 
     #[test]

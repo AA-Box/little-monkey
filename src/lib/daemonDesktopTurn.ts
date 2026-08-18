@@ -25,12 +25,13 @@ import {
   permissionPolicyForRun,
   workspaceToRunWire,
 } from "./durableRun";
+import { ingressTurnResume, ingressTurnShow, isRefusedResume } from "./ingressClient";
 import type { ModelTargetSnapshot } from "./modelTargets";
 import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
 import type { McpServerInfo } from "../store/mcpStore";
 
-export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 2 as const;
+export const DAEMON_DESKTOP_TURN_SCHEMA_VERSION = 3 as const;
 const ACTIVE_TURNS_KEY = "little-monkey-daemon-desktop-turns-v1";
 const POLL_INTERVAL_MS = 150;
 
@@ -118,6 +119,11 @@ interface DesktopTurnRecipe {
     attached_stack_ids: string[];
     attached_stack_names: string[];
     attachments: FrozenAttachmentWire[];
+    /** Whether this turn promised the workspace would be different afterwards.
+     * Frozen here so the runtime checks the promise the turn was accepted with
+     * — not one re-derived from the prompt at execution time — and so the
+     * durable policy, not this process, owns what happens when it is unmet. */
+    workspace_mutation_required: boolean;
   };
 }
 
@@ -143,6 +149,7 @@ export interface BuildDaemonDesktopRecipeOptions {
   attachedStackIds: readonly string[];
   attachedStackNames: readonly string[];
   attachments: FrozenAttachmentInput[];
+  workspaceMutationRequired: boolean;
 }
 
 export interface ActiveDaemonDesktopTurn {
@@ -152,6 +159,10 @@ export interface ActiveDaemonDesktopTurn {
   assistantIndex: number;
   lastSequence: number;
   output: string;
+  /** Which of the operator's own surfaces submitted the turn — the origin half
+   * of its durable identity, needed to ask the backend about it. Absent on a
+   * link stored by an older build, which was always the composer. */
+  source?: DesktopTurnSource;
 }
 
 export interface DaemonTurnProjection {
@@ -354,14 +365,63 @@ export async function buildDaemonDesktopRecipe(
       attached_stack_ids: [...options.attachedStackIds],
       attached_stack_names: [...options.attachedStackNames],
       attachments,
+      workspace_mutation_required: options.workspaceMutationRequired,
     },
   };
 }
 
-export function daemonRouteFromStatus(status: DaemonStatus): "fallback" | "daemon" {
-  if (!status.installed) return "fallback";
+/**
+ * Where a conversational turn is allowed to execute.
+ *
+ * `browser` is a profile with no Tauri bridge at all — a dev server in a plain
+ * browser tab, where no durable execution authority exists on the machine and
+ * the in-process loop is the only thing there is. `daemon` is the resident
+ * runner. The packaged desktop app is always the second one: there is no third
+ * value for "desktop without a runner", because that state is a refusal rather
+ * than a different place to run.
+ */
+export type ConversationRoute = "browser" | "daemon";
+
+/**
+ * The execution service is missing or unhealthy — a repairable fault in the
+ * app's own runtime, not something the operator chose.
+ *
+ * Typed rather than a plain `Error` so a surface can offer to fix it in place.
+ * That distinction is the whole point: the service is infrastructure every chat
+ * turn runs on, installed and started by the app itself, so the answer to "it
+ * isn't there" is a Repair button — never a sentence sending someone who wanted
+ * to send a message off to install a background-agents feature.
+ *
+ * Deliberately NOT used for the kill switch or backpressure below: those are
+ * states an operator or the scheduler chose, and repairing the service would be
+ * the wrong response to both.
+ */
+export class ExecutionServiceUnavailable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecutionServiceUnavailable";
+  }
+}
+
+/** Whether a caught value is a repairable execution-service fault. */
+export function isExecutionServiceUnavailable(error: unknown): error is ExecutionServiceUnavailable {
+  return error instanceof ExecutionServiceUnavailable;
+}
+
+/**
+ * The route for a machine that HAS the bridge — so, only ever `daemon`.
+ *
+ * Every unhealthy state throws instead of returning, and the return type says so:
+ * a caller cannot accidentally treat a stopped, stale, kill-switched or missing
+ * runner as permission to execute somewhere else. Execution authority is not a
+ * thing this app silently changes.
+ */
+export function daemonRouteFromStatus(status: DaemonStatus): "daemon" {
+  if (!status.installed) {
+    throw new ExecutionServiceUnavailable("Little Monkey's execution service isn't installed yet, so this turn has nowhere to run.");
+  }
   if (!status.serviceRunning || !status.heartbeatFresh) {
-    throw new Error("The installed M6A resident runner is not healthy. Start it in Background Agents before sending this turn.");
+    throw new ExecutionServiceUnavailable("Little Monkey's execution service is not healthy, so this turn has nowhere to run.");
   }
   if (status.killSwitch) throw new Error("The M6A global kill switch is engaged.");
   // K8 backpressure, as an INTERACTIVE producer: a user is waiting on this turn.
@@ -386,16 +446,113 @@ export function daemonRouteFromStatus(status: DaemonStatus): "fallback" | "daemo
   return "daemon";
 }
 
-/** Local browser/dev profiles that cannot expose the typed command are the
- * only error case treated as legacy fallback. An installed-but-broken daemon
- * never silently changes execution authority. */
-export async function daemonDesktopRoute(): Promise<"fallback" | "daemon"> {
-  if (!isTauri()) return "fallback";
+/** The only place `browser` can come from: no Tauri bridge, so no resident
+ * runner can exist. Once the bridge is there, the turn belongs to the durable
+ * backend or it does not run at all. */
+export async function daemonDesktopRoute(): Promise<ConversationRoute> {
+  if (!isTauri()) return "browser";
   return daemonRouteFromStatus(await daemonStatus());
 }
 
-export function submitDaemonDesktopTurn(turnId: string, recipe: DesktopTurnRecipe): Promise<DaemonTurnSubmitResponse> {
-  return daemonDesktopTurnSubmit({ turnId, recipe });
+/** Which of the operator's own surfaces a turn was spoken or typed on. */
+export type DesktopTurnSource = "desktop" | "voice";
+
+/** How many times one send may reach the bridge. */
+const SUBMIT_ATTEMPTS = 3;
+
+/**
+ * Hands one turn to the resident runner, retrying a transport failure under
+ * the SAME turn id.
+ *
+ * The id is what makes the retry safe. A bridge call can time out after the
+ * daemon has already accepted the turn, so a second attempt has to be able to
+ * land on the run the first one created — which it does, because the turn id
+ * is the ingress dedupe identity and the daemon answers a repeat with the job
+ * it already has. Minting a fresh id per attempt is the bug this exists to
+ * prevent: it would turn one send into two runs.
+ */
+export async function submitDaemonDesktopTurn(
+  turnId: string,
+  recipe: DesktopTurnRecipe,
+  source: DesktopTurnSource = "desktop",
+): Promise<DaemonTurnSubmitResponse> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < SUBMIT_ATTEMPTS; attempt += 1) {
+    try {
+      return await daemonDesktopTurnSubmit({ turnId, recipe, source });
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < SUBMIT_ATTEMPTS) await wait(POLL_INTERVAL_MS * (attempt + 1));
+    }
+  }
+  throw lastError;
+}
+
+/** The durable continuation one Resume produced, once the backend has it. */
+export interface AcceptedResume {
+  /** The continuation's own accepted-turn id. */
+  ingressId: string;
+  /** The accepted turn it continues. */
+  parentIngressId: string;
+  jobId: string;
+  runId: string;
+}
+
+/** What a Resume submission settled on, from the caller's point of view.
+ *
+ * `pending` is the answer that matters: nothing here can say whether the backend
+ * took the request, so nothing downstream may act as though it did — the frozen
+ * image stays, the suspended process stays, and the same request id is sent
+ * again later. */
+export type ResumeSubmissionOutcome =
+  | { state: "accepted"; accepted: AcceptedResume }
+  | { state: "refused"; reason: string }
+  | { state: "pending"; error: unknown };
+
+/**
+ * Asks the durable backend to continue a frozen turn, retrying the transport
+ * under the SAME request id.
+ *
+ * The retry is safe for the reason {@link submitDaemonDesktopTurn}'s is: the id
+ * is the continuation's identity, so a bridge call that timed out *after* the
+ * backend accepted is answered on the next attempt with the continuation that
+ * already exists rather than a second one. Minting an id per attempt would turn
+ * one Resume into several runs of the same work, which is the one outcome
+ * nothing downstream can undo.
+ *
+ * Every failure that survives the retries is reported as `pending`, never as a
+ * failure: this side cannot distinguish "never arrived" from "arrived, answer
+ * lost", and only the backend's own refusal — which comes back as a value —
+ * settles anything. A caller therefore keeps everything it would need to ask
+ * again.
+ */
+export async function submitDurableResume(
+  source: DesktopTurnSource,
+  sessionKey: string,
+  parentTurnId: string,
+  requestId: string,
+): Promise<ResumeSubmissionOutcome> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < SUBMIT_ATTEMPTS; attempt += 1) {
+    try {
+      const submission = await ingressTurnResume(source, sessionKey, parentTurnId, requestId);
+      return isRefusedResume(submission)
+        ? { state: "refused", reason: submission.refused }
+        : {
+          state: "accepted",
+          accepted: {
+            ingressId: submission.ingress_id,
+            parentIngressId: submission.parent_ingress_id,
+            jobId: submission.job_id,
+            runId: submission.run_id,
+          },
+        };
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < SUBMIT_ATTEMPTS) await wait(POLL_INTERVAL_MS * (attempt + 1));
+    }
+  }
+  return { state: "pending", error: lastError };
 }
 
 function emptyProjection(link: ActiveDaemonDesktopTurn): DaemonTurnProjection {
@@ -489,6 +646,60 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * How long the UI waits for the durable policy to settle a turn's
+ * workspace-mutation contract before showing what it already has.
+ *
+ * The daemon settles a contract on its own tick, so the decision arrives shortly
+ * after the run ends rather than with it. Bounded because this is a wait for a
+ * *display* — the contract is settled and any correction is submitted whether or
+ * not anything is watching, so timing out here loses nothing but the live view.
+ */
+const CONTRACT_SETTLE_TIMEOUT_MS = 60_000;
+
+/** What the durable backend says should happen after one attempt ends. */
+interface DurableFollowUp {
+  /** A continuation the backend submitted. The UI watches it; it never starts
+   * it — see the ownership boundary in `agentLoop.ts`. */
+  runId?: string;
+  /** The contract's own verdict, to be shown in place of an answer that claimed
+   * a change it did not make. */
+  failure?: string;
+}
+
+/**
+ * Ask the durable backend what became of this turn once an attempt ended.
+ *
+ * This is the whole of the UI's part in the workspace-mutation contract: it
+ * reads. Whether a correction was needed, whether one was submitted, and what it
+ * runs under were all decided by the policy against durable state.
+ */
+async function durableFollowUp(
+  link: ActiveDaemonDesktopTurn,
+  watched: ReadonlySet<string>,
+): Promise<DurableFollowUp | null> {
+  const deadline = Date.now() + CONTRACT_SETTLE_TIMEOUT_MS;
+  for (;;) {
+    const detail = await ingressTurnShow(link.source ?? "desktop", link.sessionId, link.turnId)
+      .catch(() => null);
+    const turn = detail?.turn ?? null;
+    // No durable row (an older daemon, or a turn that never reached ingress)
+    // and nothing that promised a change: there is nothing to follow.
+    if (!turn || !turn.mutation_required) return null;
+    const unwatched = (detail?.continuations ?? []).filter(
+      (child) => child.run_id !== null && !watched.has(child.run_id),
+    );
+    const continuation = unwatched[unwatched.length - 1];
+    if (continuation?.run_id) return { runId: continuation.run_id };
+    if (turn.mutation_state === "unmet" || turn.mutation_state === "interrupted") {
+      return { failure: turn.mutation_detail ?? undefined };
+    }
+    if (turn.mutation_state !== null) return null;
+    if (Date.now() >= deadline) return null;
+    await wait(POLL_INTERVAL_MS);
+  }
+}
+
 export async function watchDaemonDesktopTurn(
   initialLink: ActiveDaemonDesktopTurn,
   signal: AbortSignal,
@@ -496,6 +707,7 @@ export async function watchDaemonDesktopTurn(
 ): Promise<DaemonTurnProjection> {
   let link = { ...initialLink };
   let projection = emptyProjection(link);
+  const watched = new Set<string>([link.runId]);
   let cancelSent = false;
   const requestCancel = () => {
     if (cancelSent) return;
@@ -515,7 +727,39 @@ export async function watchDaemonDesktopTurn(
       saveActiveDaemonTurn(link);
       callbacks.onLinkChanged?.(link);
       callbacks.onProjection(projection);
-      if (projection.terminal) return projection;
+      if (projection.terminal) {
+        // The operator asked to stop; a stopped turn is not corrected.
+        if (signal.aborted) return projection;
+        const followUp = await durableFollowUp(link, watched);
+        if (followUp?.runId) {
+          // The durable backend is running a continuation of this same accepted
+          // turn. Its answer replaces the one that claimed a change it did not
+          // make, exactly as the in-process loop used to discard that answer —
+          // except that the attempt is a durable run this only watches.
+          const finished = link.runId;
+          watched.add(followUp.runId);
+          link = { ...link, runId: followUp.runId, lastSequence: 0, output: "" };
+          removeActiveDaemonTurn(finished);
+          projection = {
+            ...emptyProjection(link),
+            status: "Making the requested workspace change…",
+          };
+          saveActiveDaemonTurn(link);
+          callbacks.onLinkChanged?.(link);
+          callbacks.onProjection(projection);
+          continue;
+        }
+        if (followUp?.failure) {
+          projection = {
+            ...projection,
+            output: "",
+            error: followUp.failure,
+            terminalStatus: "failed",
+          };
+          callbacks.onProjection(projection);
+        }
+        return projection;
+      }
       await wait(POLL_INTERVAL_MS);
     }
   } finally {

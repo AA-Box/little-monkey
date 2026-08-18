@@ -318,6 +318,76 @@ export const TOOLS: ToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'device_action',
+      description:
+        'Ask a paired phone or tablet to do one bounded thing with its own hardware and return the result. Every action needs the operator\'s grant, the device\'s support, and the device\'s OS permission; anything else is refused with a reason. The device shows what it is doing. Requires user permission.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: [
+              'device_info',
+              'camera_capture',
+              'microphone_capture',
+              'location_read',
+              'notification_post',
+              'screen_capture',
+              'audio_playback',
+            ],
+            description:
+              'device_info reads the device\'s own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud.',
+          },
+          device_id: {
+            type: 'string',
+            description:
+              'Which paired device. Omit when exactly one device can perform this action; if several can, the call fails and lists them.',
+          },
+          position: {
+            type: 'string',
+            enum: ['front', 'back'],
+            description: 'camera_capture only. Defaults to back.',
+          },
+          duration_ms: {
+            type: 'integer',
+            description:
+              'microphone_capture only: how long to record, 1-300000 ms. Defaults to 10000.',
+          },
+          accuracy: {
+            type: 'string',
+            enum: ['coarse', 'precise'],
+            description: 'location_read only. Defaults to coarse.',
+          },
+          title: { type: 'string', description: 'notification_post only: up to 128 characters.' },
+          body: { type: 'string', description: 'notification_post only: up to 512 characters.' },
+          text: {
+            type: 'string',
+            description:
+              'audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both.',
+          },
+          run_id: {
+            type: 'string',
+            description:
+              'audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant.',
+          },
+          artifact_id: {
+            type: 'string',
+            description: 'audio_playback only: which audio artifact of that run to play.',
+          },
+          wait_ms: {
+            type: 'integer',
+            description:
+              'How long to wait for the device before returning, 1000-120000 ms (default 60000). A device that is asleep may answer later; the result then says the command is still queued or running rather than that it failed.',
+          },
+        },
+        required: ['action'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 /**
@@ -619,6 +689,102 @@ export const SKILL_INVOKE_TOOL: ToolDef = {
         },
       },
       required: ['command'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/**
+ * The `manage_skill_learning` tool: the model's only route into the learning
+ * loop (`src-tauri/src/skill_learning.rs`).
+ *
+ * Deliberately NOT a filesystem primitive. There is no action here that
+ * writes into a skills directory, approves anything, or widens a permission:
+ * `propose` hands the backend structured fields, which it validates and turns
+ * into `SKILL.md` bytes itself under an app-owned staging directory, and the
+ * two `request_*` actions are requests whose outcome the durable policy (and,
+ * unless the user turned on unattended promotion for safe changes, the user)
+ * decides.
+ *
+ * `candidate_id` is not optional in practice: a candidate only exists once
+ * the backend detected a signal from a real run's durable events, so a model
+ * with nothing to cite cannot invent one. `run_id` is injected by
+ * `turnEngine.ts`'s reserved-args registry and is scrubbed if the model
+ * supplies it.
+ *
+ * Offered only when `settingsStore.skillLearningEnabled` is on and the
+ * backend's learning mode is not `off` — see `agentLoop.ts`'s
+ * `toolsForSettings` call site.
+ */
+export const MANAGE_SKILL_LEARNING_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'manage_skill_learning',
+    description:
+      "Draft, inspect, or request review of a reusable skill derived from THIS session's real, verified work. Only ever propose against a candidate id the app opened from run evidence. Proposing does not install anything, and requesting evaluation or promotion does not approve anything — the user and the app's policy decide that.",
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['propose', 'inspect_candidate', 'request_evaluation', 'request_promotion', 'deprecate_learned_skill'],
+          description: 'What to do with the learning backend.',
+        },
+        candidate_id: {
+          type: 'string',
+          description: 'The candidate this action applies to, as given to you by the app. Required for every action except deprecate_learned_skill.',
+        },
+        command: {
+          type: 'string',
+          description: 'For deprecate_learned_skill: the installed learned skill\'s command name, without the leading slash.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Short, evidence-backed reason for this action.',
+        },
+        reflection: {
+          type: 'object',
+          description: 'For propose: the structured skill. The app builds and validates the actual SKILL.md from these fields — do not write frontmatter or file paths outside proposed_resource_files.',
+          properties: {
+            scope: { type: 'string', enum: ['workspace', 'global'], description: 'Must match the scope the signal was detected in.' },
+            title: { type: 'string', description: 'Short name for the skill.' },
+            description: { type: 'string', description: 'One sentence describing when this procedure applies.' },
+            proposed_command: { type: 'string', description: 'Slash command name: lowercase letters, digits and single dashes.' },
+            proposed_skill_content: { type: 'string', description: 'The reusable procedure itself, in Markdown. Generalize it — do not embed one-off values from the observed run.' },
+            proposed_resource_files: {
+              type: 'array',
+              description: 'Optional bundled reference files, read on demand via read_skill_resource. Paths are relative and stay inside the skill folder.',
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  content: { type: 'string' },
+                },
+                required: ['path', 'content'],
+                additionalProperties: false,
+              },
+            },
+            allowed_tools: {
+              type: 'array',
+              description: 'Tools this skill needs while active. Narrower is better; an empty list means unrestricted and will require approval when it widens an existing version.',
+              items: { type: 'string' },
+            },
+            requirements: {
+              type: 'object',
+              description: 'External executables and environment variables the procedure genuinely needs. Declaring any of these requires the user\'s approval before installation.',
+              properties: {
+                bins: { type: 'array', items: { type: 'string' } },
+                env: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['bins', 'env'],
+              additionalProperties: false,
+            },
+          },
+          required: ['scope', 'title', 'description', 'proposed_command', 'proposed_skill_content', 'allowed_tools', 'requirements'],
+          additionalProperties: false,
+        },
+      },
+      required: ['action'],
       additionalProperties: false,
     },
   },

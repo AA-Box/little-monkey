@@ -11,10 +11,18 @@
 //! # The filesystem boundary, and why it is a deny-list of nothing
 //!
 //! An AppContainer process can reach an object only if its DACL grants that
-//! container's SID, or grants `ALL APPLICATION PACKAGES`. So the grant is a
-//! single ACE on the sandbox root ([`AppContainer::grant_tree_access`]) and
-//! nothing else: the workspace copy, `SANDBOX_HOME_DIR` and `SANDBOX_TMP_DIR`
-//! all live inside it. Everything the child needs in order to *run* —
+//! container's SID, or grants `ALL APPLICATION PACKAGES`. A disposable staged
+//! run therefore adds one ACE on its sandbox root
+//! ([`AppContainer::grant_tree_access`]): the workspace copy,
+//! `SANDBOX_HOME_DIR` and `SANDBOX_TMP_DIR` all live inside it. A live-workspace
+//! shell instead has an identity derived from its complete persistent authority:
+//! the canonical workspace, ordered canonical PATH/toolchain roots, and policy
+//! version. Its workspace content ACE and tool-root read/execute ACEs persist,
+//! while the private HOME/TMP root is granted only for that command's lifetime.
+//! Persistence matters because Windows propagates an inherited ACL edit through
+//! existing descendants; doing and undoing that walk around every command is not
+//! usable on a real repository.
+//! Everything else the child needs in order to *run* —
 //! `System32`, its DLLs, `cmd.exe` — is already granted to
 //! `ALL APPLICATION PACKAGES` by Windows itself, which is how any packaged app
 //! loads anything.
@@ -98,50 +106,55 @@
 //!   the child holds its own. Skip that and the read end never reaches EOF, so
 //!   every run would block until its timeout instead of until the command
 //!   finished.
+//! * Handle inheritance is restricted with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`
+//!   to stdin, stdout and stderr. `bInheritHandles` is process-wide otherwise,
+//!   so another thread opening an inheritable file during this call could leak
+//!   that handle into the tool even though its path is outside the sandbox.
 //! * The timeout kills through the job (`TerminateJobObject`), not the process.
 //!   It takes the whole tree, and closing the child's pipe ends is exactly what
 //!   releases the reader.
 //!
-//! # The assignment race
+//! # No assignment race
 //!
-//! A job can be attached atomically at creation with
-//! `PROC_THREAD_ATTRIBUTE_JOB_LIST`. This module already builds an attribute
-//! list, so adding it is now cheap — but the AppContainer is what confines the
-//! filesystem, and it *is* applied atomically at creation, so the window below
-//! no longer has a filesystem escape in it. The child is spawned and then
-//! assigned to the job, leaving a two-syscall window in which it is inside the
-//! container but not yet inside the job: it cannot touch the real workspace, only
-//! outlive a `TerminateJobObject` that has not happened yet. `cmd.exe /C` cannot
-//! spawn a grandchild before parsing its command line, so nothing reaches it in
-//! practice.
+//! `CreateProcessW` uses `CREATE_SUSPENDED`. The AppContainer and handle list
+//! are attached by process creation, then the inert child is assigned to the
+//! job, and only then is its primary thread resumed. No child instruction can
+//! run between creation and job assignment. Assignment failure terminates the
+//! suspended process directly; resume failure terminates its assigned job.
 
 use std::ffi::{c_void, OsStr};
 use std::io::{self, Read};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle};
-use std::path::Path;
-use std::time::Duration;
+use std::os::windows::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, LocalFree, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION,
+    ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    GetExplicitEntriesFromAclW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
+    ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeleteAppContainerProfile,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid,
-    WinCapabilityPrivateNetworkClientServerSid, ACL, DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE,
-    SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT, WELL_KNOWN_SID_TYPE,
+    CopySid, CreateWellKnownSid, EqualSid, FreeSid, GetLengthSid, WinCapabilityInternetClientSid,
+    WinCapabilityPrivateNetworkClientServerSid, ACL, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
+    NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    WELL_KNOWN_SID_TYPE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicUIRestrictions,
@@ -156,10 +169,11 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, STARTUPINFOW,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 /// Live processes allowed in one sandboxed tree.
@@ -183,12 +197,25 @@ const MAX_ACTIVE_PROCESSES: u32 = 512;
 /// right outcome if that ever changes.
 const MAX_JOB_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
+/// Workspace content rights without permission to rewrite its DACL or owner.
+const WORKSPACE_TREE_ACCESS: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
+
+const DACL_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
+
+// HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS). Kept local because windows-sys
+// exposes the Win32 error but not the conversion macro.
+const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00b7_u32 as i32;
+
+const WORKSPACE_PROFILE_POLICY_VERSION: &[u8] = b"workspace-shell-authority-v2";
+
 /// An owned job object. Dropping it kills every process still inside.
 ///
 /// The kill-on-close flag makes the handle's lifetime the containment's
-/// lifetime, so this must be held for as long as the child may run — see
-/// `execute_in_sandbox`, which binds it beside the child and lets both fall at
-/// the end of the same scope.
+/// lifetime, so this must be held for as long as the child may run. Disposable
+/// sandbox execution holds it beside the awaited child; live foreground,
+/// background, and CLI shells transfer it into [`ConfinedChild`], which owns it
+/// until that child's actual lifecycle ends.
 #[derive(Debug)]
 pub struct JobConfinement {
     handle: HANDLE,
@@ -196,7 +223,7 @@ pub struct JobConfinement {
 
 // The handle is owned outright and only ever passed to job-object syscalls,
 // which take it by value and are themselves thread-safe. Needed because the
-// value is held across an `await` in `execute_in_sandbox`.
+// value is held across awaits and by long-lived background shell owners.
 unsafe impl Send for JobConfinement {}
 unsafe impl Sync for JobConfinement {}
 
@@ -219,7 +246,74 @@ impl Drop for JobConfinement {
 /// is the same choice `os_limits::install` and `sandbox_linux::confine` make: a
 /// tool that will not start is visible, and a tool that quietly lost its
 /// boundary is not.
+/// The numbers a job will actually be configured with.
+///
+/// The point of this type is that the two ceilings stop being constants. A job
+/// used to bound every tree at 4 GiB and 512 processes whatever the process's
+/// `ProcessLimits` said, so a caller that asked for 512 MiB got 4 GiB and a row
+/// that claimed 512 MiB — the exact shape of "a caller believes a safety bound is
+/// active when it is not" that K4 exists to close.
+///
+/// The fixed values survive as a **ceiling**, never as the policy. A caller may
+/// tighten below them and can never widen past them, which is what makes them
+/// defence in depth rather than something masquerading as the user's limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobLimits {
+    pub memory_bytes: usize,
+    pub active_processes: u32,
+}
+
+impl JobLimits {
+    /// The fixed containment ceiling, with no caller policy applied.
+    #[must_use]
+    pub const fn guardrail() -> Self {
+        JobLimits {
+            memory_bytes: MAX_JOB_MEMORY_BYTES,
+            active_processes: MAX_ACTIVE_PROCESSES,
+        }
+    }
+
+    /// Intersect the guardrail with what this process is actually allowed.
+    ///
+    /// `min` in both directions, so an absent effective limit leaves the
+    /// guardrail in place and a present one can only lower it.
+    #[must_use]
+    pub fn from_effective(limits: &crate::resource_control::EffectiveLimits) -> Self {
+        let guardrail = JobLimits::guardrail();
+        JobLimits {
+            memory_bytes: limits
+                .memory_bytes
+                .and_then(|resolved| usize::try_from(resolved.value).ok())
+                .map_or(guardrail.memory_bytes, |bytes| {
+                    bytes.min(guardrail.memory_bytes)
+                }),
+            active_processes: limits
+                .child_processes
+                .and_then(|resolved| u32::try_from(resolved.value).ok())
+                .map_or(guardrail.active_processes, |count| {
+                    count.min(guardrail.active_processes)
+                }),
+        }
+    }
+}
+
+/// What a job is currently holding, as the kernel accounts for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobAccounting {
+    pub active_processes: u32,
+    /// Peak committed memory across the tree. The peak rather than the current
+    /// total because `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` reports no current
+    /// figure — and for a limit the peak is the honest number anyway: a tree that
+    /// touched the ceiling and freed is a tree that exceeded it.
+    pub job_memory_bytes: u64,
+}
+
 pub fn create_job() -> io::Result<JobConfinement> {
+    create_job_with(JobLimits::guardrail())
+}
+
+/// [`create_job`] with the numbers this process is entitled to.
+pub fn create_job_with(limits: JobLimits) -> io::Result<JobConfinement> {
     // An anonymous job (null name): nothing else needs to find it, and a named
     // one could be opened by any process in the session.
     let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -229,12 +323,12 @@ pub fn create_job() -> io::Result<JobConfinement> {
     // Owned from here on, so every early return below closes it.
     let job = JobConfinement { handle };
 
-    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        JobMemoryLimit: MAX_JOB_MEMORY_BYTES,
+    let mut configured = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        JobMemoryLimit: limits.memory_bytes,
         ..unsafe { std::mem::zeroed() }
     };
-    limits.BasicLimitInformation.ActiveProcessLimit = MAX_ACTIVE_PROCESSES;
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configured.BasicLimitInformation.ActiveProcessLimit = limits.active_processes;
+    configured.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         | JOB_OBJECT_LIMIT_JOB_MEMORY
         | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
@@ -244,7 +338,7 @@ pub fn create_job() -> io::Result<JobConfinement> {
         SetInformationJobObject(
             job.handle,
             JobObjectExtendedLimitInformation,
-            (&raw const limits).cast(),
+            (&raw const configured).cast(),
             u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
                 .expect("a Win32 struct size fits in u32"),
         )
@@ -280,9 +374,138 @@ pub fn create_job() -> io::Result<JobConfinement> {
 }
 
 impl JobConfinement {
+    /// The raw job handle, for a caller that must configure the job itself.
+    ///
+    /// Borrowed, never transferred: this type still owns the handle and its
+    /// `Drop` still closes it exactly once. The one caller is
+    /// [`crate::resource_control_job`], which associates a completion port so the
+    /// kernel can say *which* limit it refused — a job may hold exactly one such
+    /// port for its lifetime, so it has to be attached to this handle rather than
+    /// to a duplicate that will be closed.
+    #[must_use]
+    pub fn raw_handle(&self) -> HANDLE {
+        self.handle
+    }
+
+    /// A second handle to the same job.
+    ///
+    /// A job lives while *any* handle is open and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` fires when the last one closes, so
+    /// duplicating extends the containment's lifetime rather than weakening it.
+    /// The resource controller keeps one so it can still sample and terminate
+    /// after handing the other to the spawn site, which consumes it into the
+    /// child.
+    pub fn duplicate(&self) -> io::Result<JobConfinement> {
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let mut duplicated: HANDLE = std::ptr::null_mut();
+        // Safe: duplicates a handle this value owns into this same process. The
+        // result is owned by the returned `JobConfinement`, whose `Drop` closes
+        // it exactly once.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle,
+                GetCurrentProcess(),
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("DuplicateHandle"));
+        }
+        Ok(JobConfinement { handle: duplicated })
+    }
+
+    /// Whether `pid` is actually inside this job.
+    ///
+    /// The check that turns "we created a job and spawned a process" into "the
+    /// process is bounded": a spawn path that skipped the assignment would
+    /// otherwise leave a record claiming a kernel-held limit over a process no
+    /// job contains.
+    pub fn contains(&self, pid: u32) -> io::Result<bool> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        // Safe: opens a query-only handle to one pid, or null on refusal.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(os_error("OpenProcess"));
+        }
+        let mut inside = 0;
+        // Safe: both handles are valid for the call, and `inside` is a BOOL this
+        // stack owns.
+        let ok = unsafe { IsProcessInJob(process, self.handle, &mut inside) };
+        // Safe: closes the handle this function opened, exactly once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        if ok == 0 {
+            return Err(os_error("IsProcessInJob"));
+        }
+        Ok(inside != 0)
+    }
+
+    /// What the kernel says this job is holding.
+    ///
+    /// Two queries because the two figures live in different information
+    /// classes, and both are the kernel's own accounting over the whole tree —
+    /// strictly better than the parent-link walk the supervisor has to do
+    /// elsewhere, because a job has no membership question to get wrong.
+    pub fn accounting(&self) -> io::Result<JobAccounting> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut basic: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // Safe: writes the named information class's struct into a buffer of
+        // exactly that type and size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectBasicAccountingInformation,
+                (&raw mut basic).cast(),
+                u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .expect("a Win32 struct size fits in u32"),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("QueryInformationJobObject(basic accounting)"));
+        }
+
+        let mut extended: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        // Safe: as above, for the extended class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                (&raw mut extended).cast(),
+                u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("a Win32 struct size fits in u32"),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(os_error("QueryInformationJobObject(extended limits)"));
+        }
+
+        Ok(JobAccounting {
+            active_processes: basic.ActiveProcesses,
+            job_memory_bytes: extended.PeakJobMemoryUsed as u64,
+        })
+    }
+
     /// Put an already-spawned child, and everything it goes on to spawn, in the
-    /// job. See "the assignment race" above for why this cannot happen at
-    /// creation.
+    /// job. [`spawn_confined`] uses the raw form while its child is suspended;
+    /// this `tokio` form remains for callers and tests that own their spawn.
     ///
     /// Works when the app itself is already inside someone else's job, which is
     /// the normal case under a CI runner or a job-wrapping terminal: since
@@ -317,6 +540,34 @@ impl JobConfinement {
         }
     }
 
+    /// [`JobConfinement::assign`] for a process this crate did not spawn itself.
+    ///
+    /// Opens the pid with exactly the two rights the assignment needs —
+    /// `PROCESS_SET_QUOTA` to place it under the job's limits and
+    /// `PROCESS_TERMINATE` because the job's `KILL_ON_JOB_CLOSE` will eventually
+    /// use it — and nothing else. Used by an owner whose spawn site cannot be
+    /// given the job before creation; see
+    /// [`crate::resource_control::ResourceController::adopt`] for the window that
+    /// leaves and why it is stated rather than glossed.
+    pub fn assign_pid(&self, pid: u32) -> io::Result<()> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // Safe: opens a handle to one pid with two rights, or null on refusal.
+        let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+        if process.is_null() {
+            return Err(os_error("OpenProcess"));
+        }
+        let assigned = self.assign_raw(process);
+        // Safe: closes the handle this function opened, exactly once.
+        unsafe {
+            let _ = CloseHandle(process);
+        }
+        assigned
+    }
+
     /// Kill everything in the job now, without giving up the handle.
     ///
     /// The timeout path needs this rather than a `drop`: the job has to stay
@@ -324,10 +575,22 @@ impl JobConfinement {
     /// closes the child's ends so those reads reach EOF instead of blocking.
     /// Best effort — a kill that fails leaves the `Drop` to try again.
     pub fn terminate(&self) {
+        let _ = self.terminate_result();
+    }
+
+    /// Kill every process in the job, now, reporting whether it worked.
+    ///
+    /// Atomic in the way a walk-and-signal loop cannot be: a process created
+    /// while the terminate is in flight is created *into* the job and dies with
+    /// it, so there is no window for a fork to outrun the kill. Public because
+    /// the resource controller needs the failure — a limit kill that silently
+    /// did nothing is the worst outcome available.
+    pub fn terminate_result(&self) -> io::Result<()> {
         // 1 rather than 0: the exit code is what a killed tree reports, and a
         // zero there would read as a clean exit.
-        unsafe {
-            let _ = TerminateJobObject(self.handle, 1);
+        match unsafe { TerminateJobObject(self.handle, 1) } {
+            0 => Err(os_error("TerminateJobObject")),
+            _ => Ok(()),
         }
     }
 }
@@ -350,6 +613,23 @@ fn os_error(call: &str) -> io::Error {
     )
 }
 
+fn terminate_process_result(process: HANDLE) -> io::Result<()> {
+    match unsafe { TerminateProcess(process, 1) } {
+        0 => Err(os_error("TerminateProcess")),
+        _ => Ok(()),
+    }
+}
+
+fn with_cleanup_error(primary: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => io::Error::new(
+            primary.kind(),
+            format!("{primary}; terminating the failed spawn also failed: {cleanup}"),
+        ),
+    }
+}
+
 /// A NUL-terminated UTF-16 buffer, which is what every `PCWSTR` here wants.
 fn wide(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain([0]).collect()
@@ -361,14 +641,266 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
-/// An owned AppContainer profile and its SID.
+/// Acquire the process-external lock for AppContainer DACL transactions.
 ///
-/// The profile is per-run and deleted on drop: it is registry and directory
-/// state under the user's profile, so leaking one per sandboxed run would be a
-/// slow leak of exactly the kind nobody notices until there are thousands.
+/// The desktop app and CLI can mutate the same workspace concurrently, so a
+/// process-local mutex is insufficient. Opening one file with sharing disabled
+/// makes the kernel release the lock on close or process death; no stale lock
+/// record needs recovery. A wedged peer can delay confinement for at most
+/// [`DACL_LOCK_TIMEOUT`], after which the call fails closed.
+fn acquire_dacl_mutation_lock() -> io::Result<OwnedHandle> {
+    acquire_dacl_mutation_lock_with_timeout(DACL_LOCK_TIMEOUT)
+}
+
+fn acquire_dacl_mutation_lock_with_timeout(timeout: Duration) -> io::Result<OwnedHandle> {
+    let path = std::env::temp_dir().join("little-monkey-appcontainer-dacl-v1.lock");
+    let path = wide_path(&path);
+    let started = Instant::now();
+    loop {
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                // Attribute-only access (`0`) does not participate in the
+                // read/write/delete share checks, so two nominally exclusive
+                // opens can coexist. Request one real file right to make a
+                // zero-share handle a kernel lock.
+                FILE_GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+            return Ok(unsafe { OwnedHandle::from_raw_handle(handle) });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out after {timeout:?} waiting for the AppContainer DACL lock"),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10).min(timeout - elapsed));
+            continue;
+        }
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "CreateFileW(DACL lock) failed: {error} (os error {:?})",
+                error.raw_os_error()
+            ),
+        ));
+    }
+}
+
+fn copy_sid(sid: PSID) -> io::Result<Vec<u32>> {
+    let byte_len = unsafe { GetLengthSid(sid) };
+    if byte_len == 0 {
+        return Err(os_error("GetLengthSid"));
+    }
+    let mut copy = vec![0u32; (byte_len as usize).div_ceil(size_of::<u32>())];
+    if unsafe { CopySid(byte_len, copy.as_mut_ptr().cast(), sid) } == 0 {
+        return Err(os_error("CopySid"));
+    }
+    Ok(copy)
+}
+
+fn inheritance_for(path: &Path) -> io::Result<u32> {
+    Ok(if std::fs::metadata(path)?.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    })
+}
+
+/// Apply or remove the AppContainer ACE on one tree.
+///
+/// `GetNamedSecurityInfoW` plus `SetNamedSecurityInfoW` is a read-modify-write
+/// transaction with no kernel-side compare-and-swap. Serializing it keeps two
+/// concurrent sandbox starts or cleanups, including calls from another Little
+/// Monkey process, from each writing a DACL derived from stale state and losing
+/// the other's ACE. A NULL DACL grants everyone full access; replacing it with
+/// an ordinary ACL would silently change unrelated access, so that shape is
+/// refused rather than normalized here.
+fn update_tree_access(
+    path: &Path,
+    sid: PSID,
+    mode: ACCESS_MODE,
+    permissions: u32,
+) -> io::Result<()> {
+    let inheritance = inheritance_for(path)?;
+    let _mutation = acquire_dacl_mutation_lock()?;
+    update_tree_access_locked(path, sid, mode, permissions, inheritance)
+}
+
+/// [`update_tree_access`] after the process-external lock is held.
+fn update_tree_access_locked(
+    path: &Path,
+    sid: PSID,
+    mode: ACCESS_MODE,
+    permissions: u32,
+    inheritance: u32,
+) -> io::Result<()> {
+    let object = wide_path(path);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // Safe: `object` is NUL-terminated; every out-parameter is a valid slot,
+    // and the two we do not want are passed as null as the API allows.
+    let read = unsafe {
+        GetNamedSecurityInfoW(
+            object.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(read as i32));
+    }
+    if dacl.is_null() {
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to replace the NULL DACL on {}", path.display()),
+        ));
+    }
+    // `descriptor` owns the buffer `dacl` points into, so it is freed only
+    // after `SetEntriesInAclW` has copied what it needs.
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: permissions,
+        grfAccessMode: mode,
+        grfInheritance: inheritance,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            // `TRUSTEE_IS_SID` means this field is a SID, not a string.
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut merged: *mut ACL = std::ptr::null_mut();
+    let combined = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut merged) };
+    if combined != ERROR_SUCCESS {
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        return Err(io::Error::from_raw_os_error(combined as i32));
+    }
+    let applied = unsafe {
+        SetNamedSecurityInfoW(
+            object.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            merged,
+            std::ptr::null(),
+        )
+    };
+    unsafe {
+        LocalFree(merged.cast());
+        LocalFree(descriptor.cast());
+    }
+    match applied {
+        ERROR_SUCCESS => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+}
+
+/// Whether the root already has the exact direct inheritance shape and enough
+/// rights for this SID. Called under [`acquire_dacl_mutation_lock`] so the
+/// answer and a following write are one transaction across app processes.
+fn tree_access_is_present_locked(
+    path: &Path,
+    sid: PSID,
+    permissions: u32,
+    inheritance: u32,
+) -> io::Result<bool> {
+    let object = wide_path(path);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let read = unsafe {
+        GetNamedSecurityInfoW(
+            object.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if read != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(read as i32));
+    }
+    if dacl.is_null() {
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing to inspect the NULL DACL on {}", path.display()),
+        ));
+    }
+
+    let mut count = 0;
+    let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+    let listed = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
+    if listed != ERROR_SUCCESS {
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        return Err(io::Error::from_raw_os_error(listed as i32));
+    }
+    let present = if count == 0 {
+        false
+    } else {
+        unsafe { std::slice::from_raw_parts(entries, count as usize) }
+            .iter()
+            .any(|entry| {
+                entry.grfAccessMode == GRANT_ACCESS
+                    && entry.grfInheritance == inheritance
+                    && entry.grfInheritance & INHERIT_ONLY_ACE == 0
+                    && entry.grfAccessPermissions & permissions == permissions
+                    && entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
+                    && unsafe { EqualSid(entry.Trustee.ptstrName.cast(), sid) } != 0
+            })
+    };
+    unsafe {
+        LocalFree(entries.cast());
+        LocalFree(descriptor.cast());
+    }
+    Ok(present)
+}
+
+/// Install a persistent ACE once. Subsequent calls only inspect the root and
+/// do not re-propagate through a large workspace or toolchain tree.
+fn ensure_tree_access(path: &Path, sid: PSID, permissions: u32) -> io::Result<()> {
+    let inheritance = inheritance_for(path)?;
+    let _mutation = acquire_dacl_mutation_lock()?;
+    if tree_access_is_present_locked(path, sid, permissions, inheritance)? {
+        return Ok(());
+    }
+    update_tree_access_locked(path, sid, GRANT_ACCESS, permissions, inheritance)
+}
+
+/// An owned AppContainer SID and the profile that defines it.
 pub struct AppContainer {
     name: Vec<u16>,
     sid: PSID,
+    delete_profile_on_drop: bool,
 }
 
 // The SID is an owned allocation only ever passed to syscalls that read it.
@@ -380,9 +912,50 @@ impl Drop for AppContainer {
     fn drop(&mut self) {
         unsafe {
             FreeSid(self.sid);
-            // Best effort: a profile that will not delete is a leak to report,
-            // not a reason to fail a run that has already finished.
-            let _ = DeleteAppContainerProfile(self.name.as_ptr());
+            if self.delete_profile_on_drop {
+                // Best effort: a profile that will not delete is a leak to
+                // report, not a reason to fail a run that already finished.
+                let _ = DeleteAppContainerProfile(self.name.as_ptr());
+            }
+        }
+    }
+}
+
+/// A temporary AppContainer ACE on one directory tree.
+///
+/// The SID is copied into the guard so cleanup does not borrow the container.
+/// Dropping the guard revokes the ACE and Windows propagates that removal to
+/// existing descendants which inherited it.
+pub struct AppContainerTreeGrant {
+    path: PathBuf,
+    // Words rather than bytes preserve the alignment required by `PSID`.
+    sid: Vec<u32>,
+    active: bool,
+}
+
+impl AppContainerTreeGrant {
+    /// Revoke now and report an error. Drop retries if this call fails.
+    pub fn revoke(mut self) -> io::Result<()> {
+        let result = update_tree_access(&self.path, self.sid.as_mut_ptr().cast(), REVOKE_ACCESS, 0);
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+}
+
+impl Drop for AppContainerTreeGrant {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Err(error) =
+            update_tree_access(&self.path, self.sid.as_mut_ptr().cast(), REVOKE_ACCESS, 0)
+        {
+            eprintln!(
+                "sandbox: failed to revoke AppContainer access from {}: {error}",
+                self.path.display()
+            );
         }
     }
 }
@@ -442,19 +1015,105 @@ pub fn create_app_container(tag: &str) -> io::Result<AppContainer> {
             )));
         }
     }
-    Ok(AppContainer { name, sid })
+    Ok(AppContainer {
+        name,
+        sid,
+        delete_profile_on_drop: true,
+    })
+}
+
+fn hash_canonical_path(digest: &mut Sha256, path: &Path) -> io::Result<()> {
+    let path = path.canonicalize()?;
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    digest.update((units.len() as u64).to_le_bytes());
+    for unit in units {
+        digest.update(unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn workspace_profile_name(workspace: &Path, readable_roots: &[PathBuf]) -> io::Result<Vec<u16>> {
+    let mut digest = Sha256::new();
+    digest.update(WORKSPACE_PROFILE_POLICY_VERSION);
+    hash_canonical_path(&mut digest, workspace)?;
+    digest.update((readable_roots.len() as u64).to_le_bytes());
+    for root in readable_roots {
+        hash_canonical_path(&mut digest, root)?;
+    }
+    let digest = digest.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut tag = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        tag.push(HEX[(byte >> 4) as usize] as char);
+        tag.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(wide(&format!("LittleMonkey.Workspace.{tag}")))
+}
+
+/// Open the stable AppContainer identity for one complete filesystem policy.
+///
+/// Unlike [`create_app_container`], this profile deliberately survives drop.
+/// Its SID therefore keeps one persistent writable ACE on this workspace and
+/// persistent read/execute ACEs on exactly `readable_roots`. Removing or
+/// reordering a root, or bumping [`WORKSPACE_PROFILE_POLICY_VERSION`], selects a
+/// new SID; old ACEs remain cleanup debt but confer no authority on the current
+/// shell. This turns DACL propagation from twice per command into once per
+/// authority shape; new descendants inherit the root ACE without another walk.
+///
+/// This leaves one profile/package state and its ACEs per authority shape used
+/// on this machine. They are bounded by workspaces and policy changes rather
+/// than calls but still require a future ledger-backed removal path. A
+/// descendant with a protected DACL may reject inheritance and remains
+/// inaccessible; that is a narrower result, never a reason to weaken or
+/// repeatedly rewrite the tree.
+pub fn open_workspace_app_container(
+    workspace: &Path,
+    readable_roots: &[PathBuf],
+) -> io::Result<AppContainer> {
+    let name = workspace_profile_name(workspace, readable_roots)?;
+    let display = wide("Little Monkey workspace shell");
+    let mut sid: PSID = std::ptr::null_mut();
+    let created = unsafe {
+        CreateAppContainerProfile(
+            name.as_ptr(),
+            display.as_ptr(),
+            display.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut sid,
+        )
+    };
+    if created == HRESULT_ALREADY_EXISTS {
+        sid = std::ptr::null_mut();
+        let derived = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+        if derived < 0 {
+            return Err(io::Error::other(format!(
+                "could not open the existing workspace AppContainer profile (derive HRESULT {derived:#x})"
+            )));
+        }
+    } else if created < 0 {
+        return Err(io::Error::other(format!(
+            "could not create the workspace AppContainer profile (HRESULT {created:#x})"
+        )));
+    }
+    Ok(AppContainer {
+        name,
+        sid,
+        delete_profile_on_drop: false,
+    })
 }
 
 impl AppContainer {
     /// Grant this container full access to one directory tree, inheritably.
     ///
-    /// This is the entire filesystem grant. Everything else the child can reach
-    /// is what Windows already grants `ALL APPLICATION PACKAGES` — System32 and
-    /// friends, read and execute, which is how any packaged app loads its DLLs —
-    /// so the user's home, the real workspace and every other user file are
-    /// denied by construction rather than by a list this code has to keep
-    /// correct. That is a stronger default than the Seatbelt and Landlock roots,
-    /// which have to enumerate what is readable.
+    /// This is the disposable staged run's entire filesystem grant. Everything
+    /// else that run can reach is what Windows already grants
+    /// `ALL APPLICATION PACKAGES` — System32 and friends, read and execute,
+    /// which is how any packaged app loads its DLLs — so the user's home, the
+    /// real workspace and every other user file are denied by construction
+    /// rather than by a list this code has to keep correct. That is a stronger
+    /// default than the Seatbelt and Landlock roots, which have to enumerate
+    /// what is readable.
     ///
     /// # What this grant does *not* reach: `cmd`'s `dir`
     ///
@@ -486,67 +1145,94 @@ impl AppContainer {
     /// retains; granting an ACE on each parent would mean writing ACEs onto the
     /// user's `AppData` for every run.
     pub fn grant_tree_access(&self, path: &Path) -> io::Result<()> {
-        let object = wide_path(path);
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // Safe: `object` is NUL-terminated; every out-parameter is a valid slot,
-        // and the two we do not want are passed as null as the API allows.
-        let read = unsafe {
-            GetNamedSecurityInfoW(
-                object.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        if read != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(read as i32));
+        update_tree_access(path, self.sid, GRANT_ACCESS, FILE_ALL_ACCESS)
+    }
+
+    /// Grant writable content access to one tree for the guard's lifetime.
+    ///
+    /// Unlike [`AppContainer::grant_tree_access`], this form removes its ACE on
+    /// drop. It is for a live workspace, whose DACL must not accumulate an
+    /// orphaned AppContainer SID after every shell tool call.
+    pub fn grant_tree_access_scoped(&self, path: &Path) -> io::Result<AppContainerTreeGrant> {
+        let path = path.canonicalize()?;
+        let mut sid = copy_sid(self.sid)?;
+        update_tree_access(
+            &path,
+            sid.as_mut_ptr().cast(),
+            GRANT_ACCESS,
+            WORKSPACE_TREE_ACCESS,
+        )?;
+        Ok(AppContainerTreeGrant {
+            path,
+            sid,
+            active: true,
+        })
+    }
+
+    /// Ensure this workspace identity has writable content access to one tree.
+    ///
+    /// The direct root ACE is inspected under the cross-process DACL lock. If
+    /// it already has these rights and inheritance flags, this returns without
+    /// asking Windows to propagate the same ACE through the tree again.
+    pub fn ensure_tree_access_persistent(&self, path: &Path) -> io::Result<()> {
+        let path = path.canonicalize()?;
+        ensure_tree_access(&path, self.sid, WORKSPACE_TREE_ACCESS)
+    }
+
+    /// Grant read, traversal and execution for the lifetime of the guard.
+    ///
+    /// `PATH` and rustup roots use this narrower form so a confined shell can
+    /// launch installed tools without being able to modify their binaries.
+    pub fn grant_tree_read_access_scoped(&self, path: &Path) -> io::Result<AppContainerTreeGrant> {
+        let path = path.canonicalize()?;
+        let mut sid = copy_sid(self.sid)?;
+        update_tree_access(
+            &path,
+            sid.as_mut_ptr().cast(),
+            GRANT_ACCESS,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        )?;
+        Ok(AppContainerTreeGrant {
+            path,
+            sid,
+            active: true,
+        })
+    }
+
+    /// Scoped read grant that treats only `ERROR_ACCESS_DENIED` as an optional
+    /// root the host cannot annotate.
+    ///
+    /// `None` means no ACE was added. The child gets only whatever access the
+    /// existing DACL already allowed; skipping the root cannot widen it.
+    pub fn grant_tree_read_access_if_permitted_scoped(
+        &self,
+        path: &Path,
+    ) -> io::Result<Option<AppContainerTreeGrant>> {
+        match self.grant_tree_read_access_scoped(path) {
+            Ok(grant) => Ok(Some(grant)),
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(None),
+            Err(error) => Err(error),
         }
-        // `descriptor` owns the buffer `dacl` points into, so it is freed only
-        // after `SetEntriesInAclW` has copied what it needs.
-        let entry = EXPLICIT_ACCESS_W {
-            grfAccessPermissions: FILE_ALL_ACCESS,
-            grfAccessMode: GRANT_ACCESS,
-            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: 0,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_UNKNOWN,
-                // `TRUSTEE_IS_SID` means this field is a SID, not a string.
-                ptstrName: self.sid.cast(),
-            },
-        };
-        let mut merged: *mut ACL = std::ptr::null_mut();
-        let combined = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut merged) };
-        if combined != ERROR_SUCCESS {
-            unsafe {
-                LocalFree(descriptor.cast());
-            }
-            return Err(io::Error::from_raw_os_error(combined as i32));
-        }
-        let applied = unsafe {
-            SetNamedSecurityInfoW(
-                object.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                merged,
-                std::ptr::null(),
-            )
-        };
-        unsafe {
-            LocalFree(merged.cast());
-            LocalFree(descriptor.cast());
-        }
-        match applied {
-            ERROR_SUCCESS => Ok(()),
-            error => Err(io::Error::from_raw_os_error(error as i32)),
+    }
+
+    /// Ensure a persistent read/execute root without re-propagating an existing
+    /// matching ACE.
+    pub fn ensure_tree_read_access_persistent(&self, path: &Path) -> io::Result<()> {
+        let path = path.canonicalize()?;
+        ensure_tree_access(&path, self.sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)
+    }
+
+    /// Optional form of [`AppContainer::ensure_tree_read_access_persistent`].
+    ///
+    /// Returns `false` only for `ERROR_ACCESS_DENIED`, which is common for a
+    /// system-owned PATH root. No ACE was added in that case, so the result is
+    /// fail-closed: the AppContainer either had ambient read access or that tool
+    /// remains unavailable.
+    pub fn ensure_tree_read_access_if_permitted_persistent(&self, path: &Path) -> io::Result<bool> {
+        match self.ensure_tree_read_access_persistent(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 }
@@ -578,10 +1264,90 @@ fn capability_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
 
 /// What a confined run produced.
 pub struct ConfinedOutput {
+    /// The limit that ended this run, when a mechanism made the kill.
+    ///
+    /// `None` from [`run_confined`], which has no controller to ask — the two
+    /// entry points differ in what they can *know*, not in what they enforce.
+    pub breach: Option<crate::resource_control::LimitBreach>,
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+}
+
+struct SpawnedConfined {
+    process: OwnedHandle,
+    pid: u32,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+}
+
+/// A confined process which may outlive the call that spawned it.
+///
+/// Dropping this value kills the process tree before the scoped ACL grants and
+/// AppContainer profile are removed. Output handles are public to mirror
+/// `std::process::Child`'s `take()` pattern.
+pub struct ConfinedChild {
+    job: Option<JobConfinement>,
+    process: OwnedHandle,
+    pub stdout: Option<std::fs::File>,
+    pub stderr: Option<std::fs::File>,
+    _grants: Vec<AppContainerTreeGrant>,
+    _container: Option<AppContainer>,
+    pid: u32,
+}
+
+impl ConfinedChild {
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let waited = unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) };
+        match waited {
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_OBJECT_0 => {
+                let mut code = 0;
+                let status = if unsafe {
+                    GetExitCodeProcess(self.process.as_raw_handle(), &mut code)
+                } == 0
+                {
+                    Err(os_error("GetExitCodeProcess"))
+                } else {
+                    Ok(Some(std::process::ExitStatus::from_raw(code)))
+                };
+                self.release_confinement();
+                status
+            }
+            WAIT_FAILED => Err(os_error("WaitForSingleObject")),
+            value => Err(io::Error::other(format!(
+                "WaitForSingleObject returned unexpected status {value:#x}"
+            ))),
+        }
+    }
+
+    /// Kill the entire confined process tree while keeping handles available
+    /// for output draining and exit observation.
+    pub fn kill(&mut self) -> io::Result<()> {
+        match self.job.as_ref() {
+            Some(job) => job.terminate_result(),
+            None => Ok(()),
+        }
+    }
+
+    fn release_confinement(&mut self) {
+        // Closing the job first kills descendants which outlived the shell.
+        // Only then is it safe to remove their filesystem grant and profile.
+        drop(self.job.take());
+        self._grants.clear();
+        drop(self._container.take());
+    }
+}
+
+impl Drop for ConfinedChild {
+    fn drop(&mut self) {
+        self.release_confinement();
+    }
 }
 
 /// One end of an anonymous pipe pair, with the child's end inheritable and the
@@ -737,27 +1503,42 @@ fn temp_reassignment(env: &[(String, String)]) -> String {
 /// expects. An empty block would give the child *this* process's environment,
 /// so the caller's allowlist is passed even when it is short.
 ///
-/// `extra` is appended only for keys the caller did not already set, so a
-/// sandbox-owned `USERPROFILE` always wins over the real one.
+/// Windows treats names case-insensitively and requires this block sorted the
+/// same way. Caller duplicates collapse with the last value winning; `extra`
+/// fills only names the caller did not set, so a sandbox-owned `USERPROFILE`
+/// always wins over the real one.
 fn environment_block(env: &[(String, String)], extra: &[&str]) -> Vec<u16> {
-    let mut block = Vec::new();
+    let same_key = |left: &str, right: &str| left.to_lowercase() == right.to_lowercase();
+    let mut merged: Vec<(String, std::ffi::OsString)> = Vec::new();
     for (key, value) in env {
-        block.extend(OsStr::new(&format!("{key}={value}")).encode_wide());
-        block.push(0);
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|(existing, _)| same_key(existing, key))
+        {
+            *existing = (key.clone(), value.into());
+        } else {
+            merged.push((key.clone(), value.into()));
+        }
     }
     for key in extra {
-        if env
-            .iter()
-            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
-        {
+        if merged.iter().any(|(existing, _)| same_key(existing, key)) {
             continue;
         }
         if let Some(value) = std::env::var_os(key) {
-            block.extend(OsStr::new(key).encode_wide());
-            block.push(u16::from(b'='));
-            block.extend(value.encode_wide());
-            block.push(0);
+            merged.push(((*key).to_string(), value));
         }
+    }
+    merged.sort_by_cached_key(|(key, _)| key.to_lowercase());
+
+    let mut block = Vec::new();
+    for (key, value) in merged {
+        block.extend(OsStr::new(&key).encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
     }
     block.push(0);
     block
@@ -798,7 +1579,7 @@ fn spawn_confined(
     workspace_dir: &Path,
     env: &[(String, String)],
     allow_network: bool,
-) -> io::Result<(OwnedHandle, std::fs::File, std::fs::File)> {
+) -> io::Result<SpawnedConfined> {
     let (stdout_read, stdout_write) = piped()?;
     let (stderr_read, stderr_write) = piped()?;
     let stdin = null_device()?;
@@ -832,56 +1613,73 @@ fn spawn_confined(
         Reserved: 0,
     });
 
-    // The attribute list exists only to carry the security capabilities, so
-    // without a container there is nothing to build and the plain `STARTUPINFOW`
-    // form is used instead.
-    let mut attribute_buffer = Vec::new();
-    let attribute_list = match security.as_ref() {
-        None => std::ptr::null_mut(),
-        Some(security) => {
-            let mut size: usize = 0;
-            // Expected to fail with ERROR_INSUFFICIENT_BUFFER; that is how the
-            // size is obtained, so the return value is deliberately ignored.
-            unsafe {
-                let _ = InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
-            }
-            attribute_buffer = vec![0u8; size];
-            let list = attribute_buffer.as_mut_ptr().cast::<c_void>();
-            // Safe: the buffer is exactly the size the call above asked for.
-            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
-                return Err(os_error("InitializeProcThreadAttributeList"));
-            }
-            // Safe: `security` outlives the spawn below, and the size matches its
-            // type.
-            let updated = unsafe {
-                UpdateProcThreadAttribute(
-                    list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                    (security as *const SECURITY_CAPABILITIES).cast(),
-                    size_of::<SECURITY_CAPABILITIES>(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            };
-            if updated == 0 {
-                let error = os_error("UpdateProcThreadAttribute");
-                unsafe { DeleteProcThreadAttributeList(list) };
-                return Err(error);
-            }
-            list
-        }
+    // `bInheritHandles` alone inherits every inheritable handle opened by any
+    // thread during this spawn. The explicit list reduces that process-wide
+    // race to the three standard handles, for both AppContainer and legacy
+    // job-only runs.
+    let inherited_handles = [
+        stdin.as_raw_handle(),
+        stdout_write.as_raw_handle(),
+        stderr_write.as_raw_handle(),
+    ];
+    let attribute_count = if security.is_some() { 2 } else { 1 };
+    let mut attribute_size: usize = 0;
+    // Expected to fail with ERROR_INSUFFICIENT_BUFFER; that is how the size is
+    // obtained, so the return value is deliberately ignored.
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(
+            std::ptr::null_mut(),
+            attribute_count,
+            0,
+            &mut attribute_size,
+        );
+    }
+    let mut attribute_buffer = vec![0u8; attribute_size];
+    let attribute_list = attribute_buffer.as_mut_ptr().cast::<c_void>();
+    if unsafe {
+        InitializeProcThreadAttributeList(attribute_list, attribute_count, 0, &mut attribute_size)
+    } == 0
+    {
+        return Err(os_error("InitializeProcThreadAttributeList"));
+    }
+    let handles_updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            inherited_handles.as_ptr().cast(),
+            size_of::<HANDLE>() * inherited_handles.len(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
     };
+    if handles_updated == 0 {
+        let error = os_error("UpdateProcThreadAttribute(HANDLE_LIST)");
+        unsafe { DeleteProcThreadAttributeList(attribute_list) };
+        return Err(error);
+    }
+    if let Some(security) = security.as_ref() {
+        let security_updated = unsafe {
+            UpdateProcThreadAttribute(
+                attribute_list,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                (security as *const SECURITY_CAPABILITIES).cast(),
+                size_of::<SECURITY_CAPABILITIES>(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if security_updated == 0 {
+            let error = os_error("UpdateProcThreadAttribute(SECURITY_CAPABILITIES)");
+            unsafe { DeleteProcThreadAttributeList(attribute_list) };
+            return Err(error);
+        }
+    }
 
     let startup = STARTUPINFOEXW {
         StartupInfo: STARTUPINFOW {
-            // The EX size only when there is an attribute list to describe;
-            // claiming it otherwise makes `CreateProcessW` read past a plain
-            // `STARTUPINFOW`.
-            cb: match attribute_list.is_null() {
-                true => size_of::<STARTUPINFOW>() as u32,
-                false => size_of::<STARTUPINFOEXW>() as u32,
-            },
+            cb: size_of::<STARTUPINFOEXW>() as u32,
             dwFlags: STARTF_USESTDHANDLES,
             hStdInput: stdin.as_raw_handle(),
             hStdOutput: stdout_write.as_raw_handle(),
@@ -922,13 +1720,10 @@ fn spawn_confined(
         ..unsafe { std::mem::zeroed() }
     };
 
-    // The EX flag only when there is a list for it to point at: setting it with a
-    // null `lpAttributeList` is how you get a confusing ERROR_INVALID_PARAMETER
-    // out of an otherwise correct call.
-    let mut flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
-    if !attribute_list.is_null() {
-        flags |= EXTENDED_STARTUPINFO_PRESENT;
-    }
+    let flags = CREATE_UNICODE_ENVIRONMENT
+        | CREATE_NO_WINDOW
+        | CREATE_SUSPENDED
+        | EXTENDED_STARTUPINFO_PRESENT;
     // Safe: every pointer is to a live, correctly shaped, NUL-terminated buffer
     // owned by this scope, and `cb`/`flags` agree on which startup-info form this
     // is.
@@ -946,9 +1741,7 @@ fn spawn_confined(
             &mut process,
         )
     };
-    if !attribute_list.is_null() {
-        unsafe { DeleteProcThreadAttributeList(attribute_list) };
-    }
+    unsafe { DeleteProcThreadAttributeList(attribute_list) };
     if spawned == 0 {
         return Err(os_error("CreateProcessW"));
     }
@@ -960,6 +1753,20 @@ fn spawn_confined(
             OwnedHandle::from_raw_handle(process.hThread),
         )
     };
+
+    // The primary thread has not run a single instruction. Assignment therefore
+    // closes the process-tree gap before the command can spawn a descendant.
+    if let Err(error) = job.assign_raw(child.as_raw_handle()) {
+        let cleanup = terminate_process_result(child.as_raw_handle());
+        return Err(with_cleanup_error(error, cleanup));
+    }
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+        let error = os_error("ResumeThread");
+        let cleanup = job
+            .terminate_result()
+            .or_else(|_| terminate_process_result(child.as_raw_handle()));
+        return Err(with_cleanup_error(error, cleanup));
+    }
     drop(thread);
 
     // The child now holds its own copies, and the parent's must go or the reads
@@ -968,13 +1775,192 @@ fn spawn_confined(
     drop(stderr_write);
     drop(stdin);
 
-    job.assign_raw(process.hProcess)?;
-
     // `File` rather than `OwnedHandle` so the reads below are plain `io::Read`,
     // and because both are `Send` and can therefore cross an `await`.
     let stdout_file = unsafe { std::fs::File::from_raw_handle(stdout_read.into_raw_handle()) };
     let stderr_file = unsafe { std::fs::File::from_raw_handle(stderr_read.into_raw_handle()) };
-    Ok((child, stdout_file, stderr_file))
+    Ok(SpawnedConfined {
+        process: child,
+        pid: process.dwProcessId,
+        stdout: stdout_file,
+        stderr: stderr_file,
+    })
+}
+
+/// Spawn a long-lived AppContainer process and bind every confinement resource
+/// to the returned handle.
+///
+/// Taking the container, job and scoped grants by value makes early failure and
+/// eventual child drop clean up the complete boundary together. Unlike
+/// [`run_confined`], this API deliberately has no job-only degraded mode.
+pub fn spawn_confined_child(
+    container: AppContainer,
+    job: JobConfinement,
+    grants: Vec<AppContainerTreeGrant>,
+    shell_command: &str,
+    workspace_dir: &Path,
+    env: &[(String, String)],
+    allow_network: bool,
+) -> io::Result<ConfinedChild> {
+    let spawned = spawn_confined(
+        Some(&container),
+        &job,
+        shell_command,
+        workspace_dir,
+        env,
+        allow_network,
+    )?;
+    Ok(ConfinedChild {
+        job: Some(job),
+        process: spawned.process,
+        stdout: Some(spawned.stdout),
+        stderr: Some(spawned.stderr),
+        _grants: grants,
+        _container: Some(container),
+        pid: spawned.pid,
+    })
+}
+
+/// [`run_confined`] under a resource controller that watches the run.
+///
+/// # What the extra parameter buys
+///
+/// `run_confined` spawns, waits and returns, so a caller holding a controller
+/// had nowhere to put it: the run's identity was never recorded and nothing
+/// sampled the job while it was executing, which for the sandbox run meant a row
+/// that could state a memory ceiling and never what was held against it.
+///
+/// The containment itself is unchanged and is established by [`spawn_confined`]
+/// before the child's first instruction. What this adds is the attach — which
+/// reads the job membership back and refuses a run that is not inside it — and a
+/// sampling tick that hands the controller to `observe` so a caller can project
+/// what the job is holding.
+///
+/// ponytail: the wait-and-read block below is a near-copy of `run_confined`'s
+/// rather than a shared helper, because sharing it means threading three
+/// `Option`s through the one function whose ordering must stay readable. If a
+/// third variant appears, extract then.
+pub async fn run_confined_supervised(
+    container: Option<&AppContainer>,
+    job: &JobConfinement,
+    shell_command: &str,
+    workspace_dir: &Path,
+    env: &[(String, String)],
+    allow_network: bool,
+    timeout: Duration,
+    controller: &mut crate::resource_control::ResourceController,
+    mut observe: impl FnMut(
+        &crate::resource_control::ResourceController,
+        Option<crate::resource_control::ResourceSample>,
+    ),
+) -> io::Result<ConfinedOutput> {
+    let spawned = spawn_confined(
+        container,
+        job,
+        shell_command,
+        workspace_dir,
+        env,
+        allow_network,
+    )?;
+    // Fail closed, on the same terms as every other controlled spawn: a run that
+    // is executing and cannot be shown to be inside its containment is reclaimed
+    // rather than reported as bounded. One that finished first is not a
+    // containment failure.
+    match controller.attach(spawned.pid) {
+        Ok(()) | Err(crate::resource_control::AttachFailure::AlreadyExited) => {}
+        Err(crate::resource_control::AttachFailure::Containment(error)) => {
+            job.terminate();
+            return Err(error);
+        }
+    }
+    observe(controller, None);
+
+    let child = spawned.process;
+    let mut stdout_file = spawned.stdout;
+    let mut stderr_file = spawned.stderr;
+
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        if let Err(error) = stdout_file.read_to_end(&mut out) {
+            eprintln!("sandbox: reading the confined child's stdout failed: {error}");
+        }
+        if let Err(error) = stderr_file.read_to_end(&mut err) {
+            eprintln!("sandbox: reading the confined child's stderr failed: {error}");
+        }
+        (out, err)
+    });
+
+    let waiter_handle = child.as_raw_handle() as usize;
+    let waited = tokio::task::spawn_blocking(move || {
+        let handle = waiter_handle as HANDLE;
+        unsafe { WaitForSingleObject(handle, INFINITE) };
+        let mut code: u32 = 0;
+        let read = unsafe { GetExitCodeProcess(handle, &mut code) };
+        (read, code)
+    });
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    tokio::pin!(waited);
+    let mut ticker = tokio::time::interval(crate::resource_control::SAMPLE_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // Biased so a run that finishes on its tick is reported as finished
+            // rather than as timed out.
+            biased;
+            joined = &mut waited => {
+                let (read, code) = joined.map_err(io::Error::other)?;
+                let (stdout, stderr) = reader.await.map_err(io::Error::other)?;
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: (read != 0).then_some(code as i32),
+                    stdout,
+                    stderr,
+                    timed_out: false,
+                    breach: None,
+                });
+            }
+            _ = &mut deadline => {
+                job.terminate();
+                let (stdout, stderr) = reader.await.unwrap_or_default();
+                drop(child);
+                return Ok(ConfinedOutput {
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                    timed_out: true,
+                    breach: None,
+                });
+            }
+            _ = ticker.tick() => {
+                // The job's own accounting *and* its refusals, in the order every
+                // other owner asks: a kernel that refused a fork announces itself
+                // through the mechanism, never through a measurement passing a cap.
+                match controller.check(crate::resource_control::now_ms_for_breach()) {
+                    Ok(crate::resource_control::ResourceCheck::Breached { breach, sample }) => {
+                        observe(controller, sample);
+                        let (stdout, stderr) = reader.await.unwrap_or_default();
+                        drop(child);
+                        return Ok(ConfinedOutput {
+                            exit_code: None,
+                            stdout,
+                            stderr,
+                            timed_out: breach.limit
+                                == crate::process_table::ProcessLimitKind::Wall.as_str(),
+                            breach: Some(breach),
+                        });
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Running(sample)) => {
+                        observe(controller, Some(sample));
+                    }
+                    Ok(crate::resource_control::ResourceCheck::Gone) | Err(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// See [`spawn_confined`] for why the raw work is not inlined here.
@@ -987,7 +1973,7 @@ pub async fn run_confined(
     allow_network: bool,
     timeout: Duration,
 ) -> io::Result<ConfinedOutput> {
-    let (child, mut stdout_file, mut stderr_file) = spawn_confined(
+    let spawned = spawn_confined(
         container,
         job,
         shell_command,
@@ -995,6 +1981,9 @@ pub async fn run_confined(
         env,
         allow_network,
     )?;
+    let child = spawned.process;
+    let mut stdout_file = spawned.stdout;
+    let mut stderr_file = spawned.stderr;
 
     let reader = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
@@ -1040,6 +2029,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: false,
+                breach: None,
             })
         }
         Err(_) => {
@@ -1053,6 +2043,7 @@ pub async fn run_confined(
                 stdout,
                 stderr,
                 timed_out: true,
+                breach: None,
             })
         }
     }
@@ -1111,6 +2102,312 @@ pub fn app_containers_are_enforceable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::Authorization::GetEffectiveRightsFromAclW;
+
+    fn sid_access_entries(path: &Path, sid: PSID) -> io::Result<Vec<(u32, u32)>> {
+        let _mutation = acquire_dacl_mutation_lock()?;
+        let object = wide_path(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let read = unsafe {
+            GetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if read != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(read as i32));
+        }
+        if dacl.is_null() {
+            unsafe {
+                LocalFree(descriptor.cast());
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "NULL DACL"));
+        }
+
+        let mut count = 0;
+        let mut entries: *mut EXPLICIT_ACCESS_W = std::ptr::null_mut();
+        let listed = unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) };
+        if listed != ERROR_SUCCESS {
+            unsafe {
+                LocalFree(descriptor.cast());
+            }
+            return Err(io::Error::from_raw_os_error(listed as i32));
+        }
+        let access = if count == 0 {
+            Vec::new()
+        } else {
+            let entries = unsafe { std::slice::from_raw_parts(entries, count as usize) };
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    (entry.Trustee.TrusteeForm == TRUSTEE_IS_SID
+                        && unsafe { EqualSid(entry.Trustee.ptstrName.cast(), sid) } != 0)
+                        .then_some((entry.grfAccessPermissions, entry.grfInheritance))
+                })
+                .collect()
+        };
+        unsafe {
+            LocalFree(entries.cast());
+            LocalFree(descriptor.cast());
+        }
+        Ok(access)
+    }
+
+    fn sid_permissions(path: &Path, sid: PSID) -> io::Result<Vec<u32>> {
+        Ok(sid_access_entries(path, sid)?
+            .into_iter()
+            .map(|(permissions, _)| permissions)
+            .collect())
+    }
+
+    fn sid_effective_permissions(path: &Path, sid: PSID) -> io::Result<u32> {
+        let _mutation = acquire_dacl_mutation_lock()?;
+        let object = wide_path(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let read = unsafe {
+            GetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if read != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(read as i32));
+        }
+        if dacl.is_null() {
+            unsafe { LocalFree(descriptor.cast()) };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "NULL DACL"));
+        }
+
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.cast(),
+        };
+        let mut access = 0;
+        let resolved = unsafe { GetEffectiveRightsFromAclW(dacl, &trustee, &mut access) };
+        unsafe { LocalFree(descriptor.cast()) };
+        match resolved {
+            ERROR_SUCCESS => Ok(access),
+            error => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    #[test]
+    fn scoped_tree_grant_removes_its_ace_from_the_existing_tree() {
+        let root = std::env::temp_dir().join(format!("lm-ac-scoped-{}", uuid::Uuid::new_v4()));
+        let child = root.join("existing-child");
+        let file = root.join("tool.exe");
+        std::fs::create_dir_all(&child).expect("test tree");
+        std::fs::write(&file, b"tool").expect("test file");
+        let Ok(container) = create_app_container(&format!("scoped{}", uuid::Uuid::new_v4())) else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no AppContainer on this CI runner, so scoped ACL cleanup was not tested"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+
+        assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
+        assert!(sid_permissions(&child, container.sid).unwrap().is_empty());
+        let child_baseline = sid_effective_permissions(&child, container.sid).unwrap();
+        assert_ne!(
+            child_baseline & WORKSPACE_TREE_ACCESS,
+            WORKSPACE_TREE_ACCESS,
+            "the baseline already grants every right this test must observe arriving"
+        );
+        {
+            let _grant = container
+                .grant_tree_access_scoped(&root)
+                .expect("scoped grant");
+            assert_eq!(
+                sid_permissions(&root, container.sid).unwrap(),
+                [WORKSPACE_TREE_ACCESS]
+            );
+            let child_permissions = sid_effective_permissions(&child, container.sid).unwrap();
+            assert_eq!(
+                child_permissions & WORKSPACE_TREE_ACCESS,
+                WORKSPACE_TREE_ACCESS,
+                "the existing child did not inherit the scoped grant"
+            );
+        }
+        assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
+        assert_eq!(
+            sid_effective_permissions(&child, container.sid).unwrap(),
+            child_baseline,
+            "revoking the root grant did not restore the child's effective rights"
+        );
+
+        {
+            let _grant = container
+                .grant_tree_read_access_scoped(&root)
+                .expect("scoped read grant");
+            assert_eq!(
+                sid_permissions(&root, container.sid).unwrap(),
+                [FILE_GENERIC_READ | FILE_GENERIC_EXECUTE]
+            );
+        }
+        assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
+
+        {
+            let _grant = container
+                .grant_tree_read_access_scoped(&file)
+                .expect("scoped file read grant");
+            assert_eq!(
+                sid_access_entries(&file, container.sid).unwrap(),
+                [(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, NO_INHERITANCE)]
+            );
+        }
+        assert!(sid_permissions(&file, container.sid).unwrap().is_empty());
+
+        container
+            .ensure_tree_access_persistent(&root)
+            .expect("persistent grant");
+        container
+            .ensure_tree_access_persistent(&root)
+            .expect("idempotent persistent grant");
+        assert_eq!(
+            sid_access_entries(&root, container.sid).unwrap(),
+            [(WORKSPACE_TREE_ACCESS, SUB_CONTAINERS_AND_OBJECTS_INHERIT)]
+        );
+        update_tree_access(&root, container.sid, REVOKE_ACCESS, 0).expect("persistent cleanup");
+        assert!(sid_permissions(&root, container.sid).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn environment_is_case_insensitively_deduplicated_and_sorted() {
+        let block = environment_block(
+            &[
+                ("zeta".into(), "1".into()),
+                ("Beta".into(), "2".into()),
+                ("ALPHA".into(), "first".into()),
+                ("alpha".into(), "last".into()),
+            ],
+            &[],
+        );
+        assert!(block.ends_with(&[0, 0]));
+        let entries: Vec<String> = block
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf16(entry).expect("UTF-16 environment entry"))
+            .collect();
+        assert_eq!(entries, ["alpha=last", "Beta=2", "zeta=1"]);
+        assert_eq!(environment_block(&[], &[]), [0, 0]);
+    }
+
+    #[test]
+    fn workspace_profile_identity_includes_ordered_readable_roots() {
+        let root = std::env::temp_dir().join(format!("lm-profile-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let tool_a = root.join("tool-a");
+        let tool_b = root.join("tool-b");
+        for path in [&workspace, &tool_a, &tool_b] {
+            std::fs::create_dir_all(path).expect("authority root");
+        }
+
+        let a_b = workspace_profile_name(&workspace, &[tool_a.clone(), tool_b.clone()]).unwrap();
+        assert_eq!(
+            a_b,
+            workspace_profile_name(&workspace, &[tool_a.clone(), tool_b.clone()]).unwrap()
+        );
+        assert_ne!(
+            a_b,
+            workspace_profile_name(&workspace, std::slice::from_ref(&tool_a)).unwrap(),
+            "removing a readable root must retire the old SID"
+        );
+        assert_ne!(
+            a_b,
+            workspace_profile_name(&workspace, &[tool_b, tool_a]).unwrap(),
+            "the ordered authority list is part of the identity"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dacl_lock_is_kernel_exclusive_and_bounded() {
+        let first = acquire_dacl_mutation_lock().expect("first lock");
+        let refused = acquire_dacl_mutation_lock_with_timeout(Duration::from_millis(30));
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        drop(first);
+        drop(acquire_dacl_mutation_lock().expect("lock after close"));
+    }
+
+    #[test]
+    fn null_dacl_is_refused_without_replacing_it() {
+        let root = std::env::temp_dir().join(format!("lm-null-dacl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("test directory");
+        let object = wide_path(&root);
+        let mut original_dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let read = unsafe {
+            GetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut original_dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(read, ERROR_SUCCESS);
+        let nulled = unsafe {
+            SetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(nulled, ERROR_SUCCESS);
+
+        let mut sid = capability_sid(WinCapabilityInternetClientSid).expect("test SID");
+        let refused = update_tree_access(
+            &root,
+            sid.as_mut_ptr().cast(),
+            GRANT_ACCESS,
+            FILE_GENERIC_READ,
+        );
+        let restored = unsafe {
+            SetNamedSecurityInfoW(
+                object.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                original_dacl,
+                std::ptr::null(),
+            )
+        };
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        assert_eq!(restored, ERROR_SUCCESS);
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_dir(&root);
+    }
 
     /// Concurrent callers must get the same answer.
     ///
@@ -1176,6 +2473,48 @@ mod tests {
             exited.is_ok(),
             "the child outlived the job that was supposed to kill it"
         );
+    }
+
+    /// The suspended spawn is assigned before its first instruction, so every
+    /// descendant it creates is born into the job and dies on timeout with it.
+    #[tokio::test]
+    async fn a_confined_timeout_kills_a_spawned_descendant() {
+        let root = std::env::temp_dir().join(format!("lm-job-tree-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("test directory");
+        let started = root.join("descendant-started.txt");
+        let escaped = root.join("descendant-escaped.txt");
+        let job = create_job().expect("job");
+        let env = vec![(
+            "SystemRoot".to_string(),
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
+        )];
+        let command = concat!(
+            "start \"\" /B %SystemRoot%\\System32\\cmd.exe /C \"",
+            "echo started>descendant-started.txt & ",
+            "%SystemRoot%\\System32\\ping.exe -n 4 127.0.0.1 >NUL & ",
+            "echo escaped>descendant-escaped.txt\" & ",
+            "%SystemRoot%\\System32\\ping.exe -n 30 127.0.0.1 >NUL"
+        );
+        let output = run_confined(
+            None,
+            &job,
+            command,
+            &root,
+            &env,
+            false,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("confined timeout");
+        assert!(output.timed_out, "the foreground command exited early");
+        assert!(started.exists(), "the descendant never started");
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !escaped.exists(),
+            "a descendant outlived the job and wrote after its timeout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The point of the whole module: a confined command can write inside the
