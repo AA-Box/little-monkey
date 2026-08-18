@@ -63,6 +63,10 @@ const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 /// window is wide because the decode phase is genuinely quiet on some
 /// architectures.
 const JOB_STALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// Matches Runtime Hub's default timed keep-alive. Studio runs do not need a
+/// second manual unload step, but reloading a video model after every prompt
+/// would make the UI needlessly slow.
+const STUDIO_ENGINE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// One tool run, end to end. Unlike a generation this is a single synchronous
 /// request — there is no job to poll — so the deadline covers the operation
 /// itself and not just a round trip.
@@ -794,6 +798,7 @@ async fn run_speech_with(
 pub async fn generation_run(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
+    m3: tauri::State<'_, crate::m3_commands::M3CommandState>,
     request: GenerationRequest,
 ) -> Result<Vec<GenerationEntry>, String> {
     // A remote backend has no library entry to look up, no components to
@@ -826,6 +831,9 @@ pub async fn generation_run(
                 );
                 vec![run_speech(&app, &spec, &validated).await?]
             } else {
+                if spec.engine == GenerationEngineKind::MlxVideo {
+                    crate::m3_commands::unload_mlx_for_studio(&m3).await?;
+                }
                 run_diffusion(&app, &state, &spec, &validated).await?
             };
             (spec.id.clone(), validated, media)
@@ -1001,7 +1009,10 @@ async fn run_diffusion(
                     ));
                 }
             }
-            JobProgress::Completed(media) => return Ok(media),
+            JobProgress::Completed(media) => {
+                engine.schedule_idle_stop(STUDIO_ENGINE_IDLE_TIMEOUT);
+                return Ok(media);
+            }
             JobProgress::Failed(error) => return Err(error),
             JobProgress::Cancelled => return Err("Generation cancelled".to_string()),
         }

@@ -667,6 +667,12 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     ensureMlxRuntime: async () => {
       const key = "mlx-auto-install";
       if (get().busy[key]) return;
+      // Studio can request MLX without the user ever opening Runtime Hub.
+      // Hydrate the same hardware/runtime/component snapshot lazily so the
+      // install path is shared instead of making Studio point at Settings.
+      if (!get().hardware || get().runtimes.length === 0 || get().componentRegistry.length === 0) {
+        await Promise.all([get().refreshOverview(), get().refreshComponents()]);
+      }
       const platform = get().hardware?.platform;
       const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
       if (
