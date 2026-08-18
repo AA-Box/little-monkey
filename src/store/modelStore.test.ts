@@ -115,6 +115,24 @@ describe("modelStore.start", () => {
     );
   });
 
+  it("refuses to start when the associated projector is missing", async () => {
+    await expect(useModelStore.getState().start(
+      makeModel({
+        components: {
+          projector: {
+            path: "/models/components/mmproj.gguf",
+            file: "mmproj.gguf",
+            size_bytes: 1_024,
+            ownership: "external",
+            sha256: null,
+            missing: true,
+          },
+        },
+      }),
+    )).rejects.toThrow(/projector.*no longer exists/i);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("sets the usage-store context limit to whatever llama_start actually resolved, not a fixed guess", async () => {
     invokeMock.mockResolvedValueOnce(16_384);
 

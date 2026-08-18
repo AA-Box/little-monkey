@@ -29,6 +29,7 @@ export function AddCustomModelForm() {
   const [localModelPath, setLocalModelPath] = useState<string | null>(null);
   const [projectorCandidates, setProjectorCandidates] = useState<ProjectorCandidate[]>([]);
   const [localProjector, setLocalProjector] = useState<string | null>(null);
+  const [selectedLocalProjectorPath, setSelectedLocalProjectorPath] = useState<string | null>(null);
 
   const [reference, setReference] = useState("");
   const [resolved, setResolved] = useState<ResolvedModelReference | null>(null);
@@ -52,16 +53,14 @@ export function AddCustomModelForm() {
       setLocalModelPath(model.path);
       const candidates = await detectProjectors(selected);
       setProjectorCandidates(candidates);
-      if (candidates.length === 1 && model.path) {
-        await setProjector(model.path, candidates[0].path);
-        setLocalProjector(candidates[0].file);
-      }
+      setLocalProjector(model.components?.projector?.file ?? null);
+      setSelectedLocalProjectorPath(candidates.length === 1 ? candidates[0].path : null);
     } catch (err) {
       setPickError(errorMessage(err));
     } finally {
       setPicking(false);
     }
-  }, [addExternalModel, detectProjectors, setProjector]);
+  }, [addExternalModel, detectProjectors]);
 
   const handleChooseProjector = useCallback(async () => {
     if (!localModelPath) return;
@@ -70,13 +69,19 @@ export function AddCustomModelForm() {
       filters: [{ name: t("AddCustomModelForm.projectorFileFilter"), extensions: ["gguf"] }],
     });
     if (!selected || Array.isArray(selected)) return;
+    setSelectedLocalProjectorPath(selected);
+    setLocalProjector(null);
+  }, [localModelPath, t]);
+
+  const handleSaveLocalProjector = useCallback(async () => {
+    if (!localModelPath || !selectedLocalProjectorPath) return;
     try {
-      const model = await setProjector(localModelPath, selected);
-      setLocalProjector(model.components?.projector?.file ?? selected.split(/[\\/]/).pop() ?? selected);
+      const model = await setProjector(localModelPath, selectedLocalProjectorPath);
+      setLocalProjector(model.components?.projector?.file ?? selectedLocalProjectorPath.split(/[\\/]/).pop() ?? selectedLocalProjectorPath);
     } catch (err) {
       setPickError(errorMessage(err));
     }
-  }, [localModelPath, setProjector, t]);
+  }, [localModelPath, selectedLocalProjectorPath, setProjector]);
 
   const trimmedReference = reference.trim();
 
@@ -141,12 +146,24 @@ export function AddCustomModelForm() {
       <div className="flex items-center justify-between gap-2 text-xs text-muted">
         <span>
           {t("AddCustomModelForm.projectorLabel")}:{" "}
-          {localProjector ?? (projectorCandidates.length > 0 ? `${t("AddCustomModelForm.detectedProjector")}: ${projectorCandidates.map((candidate) => candidate.file).join(", ")}` : t("AddCustomModelForm.noProjector"))}
+          {localProjector ?? (selectedLocalProjectorPath
+            ? <>{t("AddCustomModelForm.detectedProjector")}: {projectorCandidates.find((candidate) => candidate.path === selectedLocalProjectorPath)?.file ?? selectedLocalProjectorPath.split(/[\\/]/).pop()} <span className="text-foreground">[{t("AddCustomModelForm.selectedProjector")}]</span></>
+            : projectorCandidates.length > 0
+              ? `${t("AddCustomModelForm.detectedProjector")}: ${projectorCandidates.map((candidate) => candidate.file).join(", ")}`
+              : t("AddCustomModelForm.noProjector"))}
         </span>
         <Button variant="ghost" size="sm" onClick={() => void handleChooseProjector()} disabled={!localModelPath || picking}>
           {t("AddCustomModelForm.chooseProjectorButton")}
         </Button>
       </div>
+      {selectedLocalProjectorPath && !localProjector && (
+        <div className="flex items-center justify-between gap-2 text-[11px] text-faint">
+          <span>{t("AddCustomModelForm.projectorCompatibilityNote")}</span>
+          <Button variant="secondary" size="sm" onClick={() => void handleSaveLocalProjector()}>
+            {t("AddCustomModelForm.saveProjectorButton")}
+          </Button>
+        </div>
+      )}
       {pickError && <p className="text-xs text-danger">{pickError}</p>}
 
       <div className="border-t border-border pt-3">

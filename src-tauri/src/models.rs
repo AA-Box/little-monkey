@@ -7,16 +7,53 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
+use crate::process_lock::try_acquire_cross_process_lock;
 use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
 const BUNDLE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+
+static ACTIVE_BUNDLE_INSTALLS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+struct BundleInstallCleanup {
+    reference: String,
+}
+
+impl Drop for BundleInstallCleanup {
+    fn drop(&mut self) {
+        if let Some(active) = ACTIVE_BUNDLE_INSTALLS.get() {
+            if let Ok(mut active) = active.lock() {
+                active.remove(&self.reference);
+            }
+        }
+    }
+}
+
+fn begin_bundle_install(reference: &str) -> Result<BundleInstallCleanup, String> {
+    let active = ACTIVE_BUNDLE_INSTALLS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut active = active
+        .lock()
+        .map_err(|_| "Active bundle-install lock poisoned".to_string())?;
+    active.insert(reference.to_string());
+    Ok(BundleInstallCleanup {
+        reference: reference.to_string(),
+    })
+}
+
+fn bundle_installation_active() -> bool {
+    ACTIVE_BUNDLE_INSTALLS
+        .get()
+        .and_then(|active| active.lock().ok())
+        .is_some_and(|active| !active.is_empty())
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -524,6 +561,18 @@ fn managed_component_path(models_dir: &Path, path: &Path) -> bool {
     path.parent() == Some(managed_components_dir(models_dir).as_path())
 }
 
+fn managed_projector_referenced(
+    registry: &LocalModelBundleRegistry,
+    projector_path: &Path,
+) -> bool {
+    let projector_path = projector_path.to_string_lossy();
+    registry.bundles.iter().any(|bundle| {
+        bundle.projector.as_ref().is_some_and(|projector| {
+            projector.ownership == ComponentOwnership::Managed && projector.path == projector_path
+        })
+    })
+}
+
 fn reconcile_managed_components(
     models_dir: &Path,
     registry: &LocalModelBundleRegistry,
@@ -559,6 +608,9 @@ fn reconcile_managed_components(
             continue;
         }
         let canonical = path.canonicalize().unwrap_or(path.clone());
+        if component_install_lock_held(&path)? {
+            continue;
+        }
         if !referenced.contains(canonical.to_string_lossy().as_ref()) {
             std::fs::remove_file(&path).map_err(|error| {
                 format!(
@@ -569,6 +621,19 @@ fn reconcile_managed_components(
         }
     }
     Ok(())
+}
+
+fn component_install_lock_held(path: &Path) -> Result<bool, String> {
+    let file = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let destination_name = file.strip_suffix(".part").unwrap_or(file);
+    let lock_path = path.with_file_name(format!("{destination_name}.install.lock"));
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    Ok(try_acquire_cross_process_lock(&lock_path)?.is_none())
 }
 
 pub fn verify_projector_for_model(
@@ -736,7 +801,7 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
     }
 
     apply_bundle_registry(&mut installed, &bundle_registry);
-    if bundle_registry_valid {
+    if bundle_registry_valid && !bundle_installation_active() {
         if let Err(error) = reconcile_managed_components(&dir, &bundle_registry) {
             eprintln!("little-monkey: could not reconcile managed components: {error}");
         }
@@ -1012,7 +1077,10 @@ pub fn models_remove_projector(app: AppHandle, model_path: String) -> Result<Mod
                 .canonicalize()
                 .map_err(|e| e.to_string())?;
             let path = PathBuf::from(&projector.path);
-            if path.parent() == Some(managed_components_dir(&root).as_path()) && path.is_file() {
+            if managed_component_path(&root, &path)
+                && !managed_projector_referenced(&registry, &path)
+                && path.is_file()
+            {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -1198,6 +1266,7 @@ pub async fn models_install_reference(
     expected_projector_sha256: Option<String>,
 ) -> Result<ModelInfo, String> {
     let dir = models_dir(&app)?;
+    let _bundle_cleanup = begin_bundle_install(&reference)?;
     let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
     {
         let mut installs = state
@@ -1244,11 +1313,27 @@ pub async fn models_install_reference(
     .await?;
     let model = managed_model_info(&installed.local_path, &installed.provenance);
     if let Some(projector_path) = installed.projector_path {
-        return models_set_projector(
-            app,
+        let result = models_set_projector(
+            app.clone(),
             installed.local_path.to_string_lossy().into_owned(),
             projector_path.to_string_lossy().into_owned(),
         );
+        return match result {
+            Ok(model) => Ok(model),
+            Err(error) => {
+                if installed.model_was_new {
+                    let _ =
+                        model_sources::delete_installed_model(&dir, &installed.local_path).await;
+                }
+                if installed.projector_was_new {
+                    let registry = load_bundle_registry(&app).unwrap_or_default();
+                    if !managed_projector_referenced(&registry, &projector_path) {
+                        let _ = std::fs::remove_file(projector_path);
+                    }
+                }
+                Err(error)
+            }
+        };
     }
     Ok(model)
 }
@@ -1406,7 +1491,9 @@ pub async fn models_delete(
             if projector.ownership == ComponentOwnership::Managed {
                 let component_root = managed_components_dir(&dir_canon);
                 let component_path = PathBuf::from(projector.path);
-                if component_path.parent() == Some(component_root.as_path()) {
+                if component_path.parent() == Some(component_root.as_path())
+                    && !managed_projector_referenced(&registry, &component_path)
+                {
                     let _ = std::fs::remove_file(component_path);
                 }
             }
@@ -1503,6 +1590,55 @@ mod tests {
             projector.canonicalize().unwrap().to_string_lossy()
         );
         assert_eq!(found.ownership, ComponentOwnership::Managed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_managed_projector_survives_detach_until_last_reference() {
+        let projector = PathBuf::from("/models/components/mmproj-shared.gguf");
+        let component = || ProjectorComponent {
+            path: projector.to_string_lossy().into_owned(),
+            file: "mmproj-shared.gguf".to_string(),
+            size_bytes: 10,
+            ownership: ComponentOwnership::Managed,
+            sha256: Some("a".repeat(64)),
+            missing: false,
+        };
+        let mut registry = LocalModelBundleRegistry {
+            schema_version: BUNDLE_REGISTRY_SCHEMA_VERSION,
+            bundles: vec![
+                LocalModelBundleRecord {
+                    model_path: "/models/model-a.gguf".to_string(),
+                    projector: Some(component()),
+                },
+                LocalModelBundleRecord {
+                    model_path: "/models/model-b.gguf".to_string(),
+                    projector: Some(component()),
+                },
+            ],
+        };
+
+        registry.bundles.remove(0);
+        assert!(managed_projector_referenced(&registry, &projector));
+        registry.bundles.clear();
+        assert!(!managed_projector_referenced(&registry, &projector));
+    }
+
+    #[test]
+    fn component_gc_detects_an_active_install_lock() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-component-lock-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let components = root.join("components");
+        std::fs::create_dir_all(&components).unwrap();
+        let component = components.join("mmproj-shared.gguf");
+        std::fs::write(&component, b"component").unwrap();
+        let lock_path = components.join("mmproj-shared.gguf.install.lock");
+        let lock = crate::process_lock::acquire_cross_process_lock(&lock_path).unwrap();
+        assert!(component_install_lock_held(&component).unwrap());
+        drop(lock);
+        assert!(!component_install_lock_held(&component).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

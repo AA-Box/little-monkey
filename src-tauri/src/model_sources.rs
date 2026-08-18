@@ -145,6 +145,64 @@ pub struct InstalledModelReference {
     pub provenance: ManagedModelProvenance,
     pub local_path: PathBuf,
     pub projector_path: Option<PathBuf>,
+    pub model_was_new: bool,
+    pub projector_was_new: bool,
+}
+
+struct StagedProjector {
+    destination: PathBuf,
+    partial: Option<PathBuf>,
+    _lock: CrossProcessFileLock,
+}
+
+impl StagedProjector {
+    fn publish(&mut self) -> Result<bool, String> {
+        let Some(partial) = self.partial.take() else {
+            return Ok(false);
+        };
+        if let Err(error) = fs::rename(&partial, &self.destination) {
+            self.partial = Some(partial);
+            return Err(format!(
+                "Verified projector could not be published at {}: {error}",
+                self.destination.display()
+            ));
+        }
+        Ok(true)
+    }
+
+    fn cleanup_partial(&self) {
+        if let Some(partial) = &self.partial {
+            let _ = fs::remove_file(partial);
+        }
+    }
+}
+
+impl Drop for StagedProjector {
+    fn drop(&mut self) {
+        self.cleanup_partial();
+    }
+}
+
+struct StagedProvenance {
+    destination: PathBuf,
+    temporary: PathBuf,
+}
+
+impl StagedProvenance {
+    fn publish(self) -> Result<(), String> {
+        fs::rename(&self.temporary, &self.destination).map_err(|error| {
+            format!(
+                "Failed to publish model provenance {}: {error}",
+                self.destination.display()
+            )
+        })
+    }
+}
+
+impl Drop for StagedProvenance {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,28 +517,31 @@ where
             });
             let mut installed_resolution = resolution.public.clone();
             installed_resolution.tool_calling = provenance.tool_calling;
-            let projector_path = if let Some(projector) = selected_projector {
-                Some(
-                    install_projector_artifact(
-                        &client,
-                        &resolution,
-                        projector,
-                        &models_dir,
-                        resolution.public.size_bytes,
-                        overall_total,
-                        cancel,
-                        &mut on_progress,
-                    )
-                    .await?,
+            let (projector_path, projector_was_new) = if let Some(projector) = selected_projector {
+                let mut staged = install_projector_artifact(
+                    &client,
+                    &resolution,
+                    projector,
+                    &models_dir,
+                    resolution.public.size_bytes,
+                    overall_total,
+                    cancel,
+                    &mut on_progress,
                 )
+                .await?;
+                let destination = staged.destination.clone();
+                let was_new = staged.publish()?;
+                (Some(destination), was_new)
             } else {
-                None
+                (None, false)
             };
             return Ok(InstalledModelReference {
                 resolved: installed_resolution,
                 provenance,
                 local_path: destination,
                 projector_path,
+                model_was_new: false,
+                projector_was_new,
             });
         }
         if !disambiguated {
@@ -548,12 +609,28 @@ where
         let _ = fs::remove_file(&partial);
         return Err("Model bundle installation cancelled".to_string());
     }
-    fs::rename(&partial, &destination).map_err(|error| {
-        format!(
-            "Verified model could not be published at {}: {error}",
-            destination.display()
+    let mut staged_projector = if let Some(projector) = selected_projector {
+        match install_projector_artifact(
+            &client,
+            &resolution,
+            projector,
+            &models_dir,
+            resolution.public.size_bytes,
+            overall_total,
+            cancel,
+            &mut on_progress,
         )
-    })?;
+        .await
+        {
+            Ok(staged) => Some(staged),
+            Err(error) => {
+                let _ = fs::remove_file(&partial);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
 
     let provenance = provenance_for(
         &resolution.public,
@@ -562,10 +639,24 @@ where
         now_ms()?,
         tool_calling,
     );
-    if let Err(error) = save_provenance(&destination, &provenance) {
-        let _ = fs::remove_file(&destination);
-        return Err(error);
+    let staged_provenance = match stage_provenance_for_new_model(&destination, &provenance) {
+        Ok(staged) => staged,
+        Err(error) => {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
+
+    if cancel.is_some_and(|token| token.is_cancelled()) {
+        let _ = fs::remove_file(&partial);
+        return Err("Model bundle installation cancelled".to_string());
     }
+    let projector_was_new = publish_new_bundle(
+        &partial,
+        &destination,
+        &mut staged_projector,
+        staged_provenance,
+    )?;
 
     let mut installed_resolution = resolution.public.clone();
     installed_resolution.tool_calling = tool_calling;
@@ -573,23 +664,9 @@ where
         resolved: installed_resolution,
         provenance,
         local_path: destination,
-        projector_path: if let Some(projector) = selected_projector {
-            Some(
-                install_projector_artifact(
-                    &client,
-                    &resolution,
-                    projector,
-                    &models_dir,
-                    resolution.public.size_bytes,
-                    overall_total,
-                    cancel,
-                    &mut on_progress,
-                )
-                .await?,
-            )
-        } else {
-            None
-        },
+        projector_path: staged_projector.map(|projector| projector.destination.clone()),
+        model_was_new: true,
+        projector_was_new,
     })
 }
 
@@ -762,6 +839,8 @@ pub fn find_installed_reference(
             provenance,
             local_path: path,
             projector_path: None,
+            model_was_new: false,
+            projector_was_new: false,
         }));
     }
     Ok(None)
@@ -1146,16 +1225,13 @@ async fn resolve_hugging_face(
     let selector = format!("#{}", sibling.rfilename);
 
     let mut projector_candidates = Vec::new();
-    for candidate in metadata
-        .siblings
-        .iter()
-        .filter(|candidate| is_projector_candidate(&candidate.rfilename))
-    {
-        let artifact = hf_artifact(candidate, &reference.repo, revision)?;
-        let download_url = Url::parse(&artifact.download_url)
-            .map_err(|error| format!("Hugging Face projector URL is invalid: {error}"))?;
-        probe_remote_gguf(client, download_url, None).await?;
-        projector_candidates.push(artifact);
+    for artifact in hf_projector_artifacts(&metadata, &reference.repo, revision) {
+        let Ok(download_url) = Url::parse(&artifact.download_url) else {
+            continue;
+        };
+        if probe_remote_gguf(client, download_url, None).await.is_ok() {
+            projector_candidates.push(artifact);
+        }
     }
     let selected_projector =
         (projector_candidates.len() == 1).then(|| projector_candidates[0].clone());
@@ -1192,6 +1268,19 @@ async fn resolve_hugging_face(
         },
         bearer_token: None,
     })
+}
+
+fn hf_projector_artifacts(
+    metadata: &HfModelMetadata,
+    repo: &str,
+    revision: &str,
+) -> Vec<ResolvedModelArtifact> {
+    metadata
+        .siblings
+        .iter()
+        .filter(|candidate| is_projector_candidate(&candidate.rfilename))
+        .filter_map(|candidate| hf_artifact(candidate, repo, revision).ok())
+        .collect()
 }
 
 fn select_ollama_layers(manifest: &OciManifest) -> Result<(&OciLayer, Option<&OciLayer>), String> {
@@ -1328,7 +1417,7 @@ async fn install_projector_artifact<F>(
     overall_total: u64,
     cancel: Option<&CancellationToken>,
     on_progress: &mut F,
-) -> Result<PathBuf, String>
+) -> Result<StagedProjector, String>
 where
     F: FnMut(ModelDownloadProgress),
 {
@@ -1367,7 +1456,7 @@ where
         sanitize_file_name(&format!("mmproj-{}-{stem}.gguf", &artifact.sha256[..12]));
     validate_direct_child(&components_dir, &components_dir.join(&destination_name))?;
     let destination = components_dir.join(&destination_name);
-    let _lock = acquire_destination_lock(&components_dir, &destination).await?;
+    let lock = acquire_destination_lock(&components_dir, &destination).await?;
     if !path_entry_is_missing(&destination)? {
         if destination.is_file()
             && fs::metadata(&destination)
@@ -1385,7 +1474,11 @@ where
                 overall_downloaded: overall_base.saturating_add(artifact.size_bytes),
                 overall_total,
             });
-            return Ok(destination);
+            return Ok(StagedProjector {
+                destination,
+                partial: None,
+                _lock: lock,
+            });
         }
         return Err(format!(
             "Managed projector destination is occupied by an unverified file: {}",
@@ -1418,16 +1511,20 @@ where
     )
     .await
     {
-        if cancel.is_some_and(|token| token.is_cancelled()) {
-            let _ = fs::remove_file(&partial);
-        }
+        let _ = fs::remove_file(&partial);
         return Err(error);
     }
     if cancel.is_some_and(|token| token.is_cancelled()) {
         let _ = fs::remove_file(&partial);
         return Err("Model bundle installation cancelled".to_string());
     }
-    let actual = sha256_file(&partial)?;
+    let actual = match sha256_file(&partial) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
     if actual != artifact.sha256 {
         let _ = fs::remove_file(&partial);
         return Err(format!(
@@ -1450,13 +1547,52 @@ where
             destination.display()
         ));
     }
-    fs::rename(&partial, &destination).map_err(|e| {
-        format!(
-            "Verified projector could not be published at {}: {e}",
-            destination.display()
-        )
-    })?;
-    Ok(destination)
+    Ok(StagedProjector {
+        destination,
+        partial: Some(partial),
+        _lock: lock,
+    })
+}
+
+fn publish_new_bundle(
+    model_partial: &Path,
+    model_destination: &Path,
+    staged_projector: &mut Option<StagedProjector>,
+    staged_provenance: StagedProvenance,
+) -> Result<bool, String> {
+    let mut projector_published = false;
+    if let Some(projector) = staged_projector.as_mut() {
+        projector_published = match projector.publish() {
+            Ok(published) => published,
+            Err(error) => {
+                let _ = fs::remove_file(model_partial);
+                return Err(error);
+            }
+        };
+    }
+
+    if let Err(error) = fs::rename(model_partial, model_destination) {
+        if projector_published {
+            if let Some(projector) = staged_projector.as_ref() {
+                let _ = fs::remove_file(&projector.destination);
+            }
+        }
+        return Err(format!(
+            "Verified model could not be published at {}: {error}",
+            model_destination.display()
+        ));
+    }
+
+    if let Err(error) = staged_provenance.publish() {
+        let _ = fs::remove_file(model_destination);
+        if projector_published {
+            if let Some(projector) = staged_projector.as_ref() {
+                let _ = fs::remove_file(&projector.destination);
+            }
+        }
+        return Err(error);
+    }
+    Ok(projector_published)
 }
 
 fn select_hf_sibling<'a>(
@@ -2364,8 +2500,30 @@ fn provenance_for(
     }
 }
 
-fn save_provenance(model_path: &Path, provenance: &ManagedModelProvenance) -> Result<(), String> {
+fn stage_provenance(
+    model_path: &Path,
+    provenance: &ManagedModelProvenance,
+) -> Result<StagedProvenance, String> {
     validate_provenance(model_path, provenance)?;
+    stage_provenance_bytes(model_path, provenance)
+}
+
+fn stage_provenance_for_new_model(
+    model_destination: &Path,
+    provenance: &ManagedModelProvenance,
+) -> Result<StagedProvenance, String> {
+    let local_file_name = model_destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("Model path has no UTF-8 filename")?;
+    validate_provenance_metadata(local_file_name, provenance)?;
+    stage_provenance_bytes(model_destination, provenance)
+}
+
+fn stage_provenance_bytes(
+    model_path: &Path,
+    provenance: &ManagedModelProvenance,
+) -> Result<StagedProvenance, String> {
     let path = provenance_path(model_path)?;
     if path.exists() {
         return Err(format!(
@@ -2404,30 +2562,53 @@ fn save_provenance(model_path: &Path, provenance: &ManagedModelProvenance) -> Re
                     temporary.display()
                 )
             })?;
-        fs::rename(&temporary, &path).map_err(|error| {
-            format!(
-                "Failed to publish model provenance {}: {error}",
-                path.display()
-            )
-        })
+        Ok(())
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    write_result
+    write_result.map(|()| StagedProvenance {
+        destination: path,
+        temporary,
+    })
+}
+
+fn save_provenance(model_path: &Path, provenance: &ManagedModelProvenance) -> Result<(), String> {
+    stage_provenance(model_path, provenance)?.publish()
 }
 
 fn validate_provenance(
     model_path: &Path,
     provenance: &ManagedModelProvenance,
 ) -> Result<(), String> {
-    if provenance.schema_version != PROVENANCE_SCHEMA_VERSION {
-        return Err("Unsupported model provenance schema version".to_string());
-    }
     let local_file_name = model_path
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or("Model path has no UTF-8 filename")?;
+    validate_provenance_metadata(local_file_name, provenance)?;
+    let metadata = fs::symlink_metadata(model_path)
+        .map_err(|error| format!("Failed to inspect model {}: {error}", model_path.display()))?;
+    if !metadata.file_type().is_file() || metadata.len() != provenance.size_bytes {
+        return Err("Model file does not match provenance size".to_string());
+    }
+    validate_local_gguf(model_path, provenance.size_bytes)?;
+    let embedded_tool_calling = embedded_tool_calling(model_path)?;
+    if provenance.tool_calling != embedded_tool_calling {
+        return Err(
+            "Model provenance tool-calling capability does not match its embedded GGUF template"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_provenance_metadata(
+    local_file_name: &str,
+    provenance: &ManagedModelProvenance,
+) -> Result<(), String> {
+    if provenance.schema_version != PROVENANCE_SCHEMA_VERSION {
+        return Err("Unsupported model provenance schema version".to_string());
+    }
     if provenance.local_file_name != local_file_name {
         return Err("Model provenance local filename does not match its GGUF".to_string());
     }
@@ -2468,19 +2649,6 @@ fn validate_provenance(
     }
     if let Some(name) = &provenance.license_name {
         validate_human_text(name, "licenseName", 4096)?;
-    }
-    let metadata = fs::symlink_metadata(model_path)
-        .map_err(|error| format!("Failed to inspect model {}: {error}", model_path.display()))?;
-    if !metadata.file_type().is_file() || metadata.len() != provenance.size_bytes {
-        return Err("Model file does not match provenance size".to_string());
-    }
-    validate_local_gguf(model_path, provenance.size_bytes)?;
-    let embedded_tool_calling = embedded_tool_calling(model_path)?;
-    if provenance.tool_calling != embedded_tool_calling {
-        return Err(
-            "Model provenance tool-calling capability does not match its embedded GGUF template"
-                .to_string(),
-        );
     }
     Ok(())
 }
@@ -4277,6 +4445,79 @@ mod tests {
                 "{signature} must name the reason it has no run, not pick any arm"
             );
         }
+    }
+
+    #[test]
+    fn malformed_hf_projector_siblings_are_ignored_without_hiding_the_valid_candidate() {
+        let metadata = hf_metadata(vec![
+            lfs_sibling("mmproj-good.gguf", &digest('a'), 12),
+            HfSibling {
+                rfilename: "mmproj-old.gguf".to_string(),
+                size: Some(12),
+                lfs: None,
+            },
+        ]);
+
+        let candidates = hf_projector_artifacts(&metadata, "owner/repo", &"a".repeat(40));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].file_name, "mmproj-good.gguf");
+    }
+
+    #[test]
+    fn bundle_publish_rolls_back_the_new_model_when_projector_publish_fails() {
+        let directory = test_dir("bundle-rollback");
+        let components = directory.join("components");
+        fs::create_dir_all(&components).unwrap();
+        let model_partial = directory.join("model.gguf.part");
+        let model_destination = directory.join("model.gguf");
+        fs::write(&model_partial, b"verified model").unwrap();
+        let projector_destination = components.join("mmproj-aaaaaaaaaaaa-good.gguf");
+        let lock_path =
+            projector_destination.with_file_name("mmproj-aaaaaaaaaaaa-good.gguf.install.lock");
+        let lock = acquire_cross_process_lock(&lock_path).unwrap();
+        let mut staged_projector = Some(StagedProjector {
+            destination: projector_destination,
+            partial: Some(components.join("missing-projector.gguf.part")),
+            _lock: lock,
+        });
+        let resolved = ResolvedModelReference {
+            source: ModelReferenceSource::HuggingFace,
+            canonical_reference: "hf:owner/repo@main#model.gguf".to_string(),
+            display_name: "owner/repo".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "main".to_string(),
+            file_name: "model.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/resolve/main/model.gguf".to_string(),
+            sha256: digest('b'),
+            size_bytes: 12,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: Vec::new(),
+        };
+        let provenance = provenance_for(
+            &resolved,
+            "hf:owner/repo#model.gguf".to_string(),
+            "model.gguf".to_string(),
+            1,
+            false,
+        );
+        let staged_provenance =
+            stage_provenance_for_new_model(&model_destination, &provenance).unwrap();
+
+        assert!(publish_new_bundle(
+            &model_partial,
+            &model_destination,
+            &mut staged_projector,
+            staged_provenance,
+        )
+        .is_err());
+        assert!(!model_destination.exists());
+        assert!(!model_partial.exists());
+        assert!(!provenance_path(&model_destination).unwrap().exists());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
