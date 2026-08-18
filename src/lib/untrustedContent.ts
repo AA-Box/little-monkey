@@ -64,6 +64,7 @@ const UNTRUSTED_TOOL_NAMES = new Set([
   "web_search",
   "search_docs",
   "task",
+  "run_program",
 ]);
 
 export function protectToolResult(toolName: string, content: string, isMcp = false): string {

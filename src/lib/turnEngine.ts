@@ -51,6 +51,101 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
+import {
+  formatProgrammaticExecutionResult,
+  PROGRAMMATIC_TOOL_NAME,
+  programmaticExecutionService,
+  type ProgrammaticToolContext,
+} from "./programmaticExecution";
+
+export interface ToolExecutionContext {
+  /** The exact definitions offered for this invocation's authorization/schema path. */
+  toolDefinitions?: readonly ToolDef[];
+  /** Re-checks mutable capability state at invocation time. */
+  isToolAvailable?: (toolName: string) => boolean;
+  /** Shared completion lifecycle for direct and nested calls. */
+  onCompleted?: (toolCall: ToolCall, result: string) => void | Promise<void>;
+}
+
+/** The canonical execution identity shared by run_program and its recorder. */
+export function programmaticToolExecutionId(turnId: string, toolCallId: string): string {
+  return protocolToolCallId(`${turnId}:${toolCallId}`);
+}
+
+interface JsonSchemaLike {
+  type?: string | string[];
+  enum?: unknown[];
+  properties?: Record<string, JsonSchemaLike>;
+  required?: string[];
+  additionalProperties?: boolean;
+  items?: JsonSchemaLike;
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+}
+
+function jsonEqual(left: unknown, right: unknown): boolean {
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
+/** The one dispatcher-owned schema check shared by ordinary and nested calls. */
+function validateToolArguments(value: unknown, schema: object): string | null {
+  const visit = (entry: unknown, current: JsonSchemaLike, path: string): string | null => {
+    if (current.enum && !current.enum.some((candidate) => jsonEqual(candidate, entry))) {
+      return `${path} must match one of the offered values.`;
+    }
+    const types = current.type ? (Array.isArray(current.type) ? current.type : [current.type]) : [];
+    if (types.length > 0) {
+      const matches = types.some((type) => {
+        switch (type) {
+          case "object": return entry !== null && typeof entry === "object" && !Array.isArray(entry);
+          case "array": return Array.isArray(entry);
+          case "string": return typeof entry === "string";
+          case "boolean": return typeof entry === "boolean";
+          case "number": return typeof entry === "number" && Number.isFinite(entry);
+          case "integer": return typeof entry === "number" && Number.isSafeInteger(entry);
+          case "null": return entry === null;
+          default: return true;
+        }
+      });
+      if (!matches) return `${path} has the wrong type.`;
+    }
+    if (typeof entry === "string") {
+      if (current.minLength !== undefined && entry.length < current.minLength) return `${path} is too short.`;
+      if (current.maxLength !== undefined && entry.length > current.maxLength) return `${path} is too long.`;
+    }
+    if (typeof entry === "number") {
+      if (current.minimum !== undefined && entry < current.minimum) return `${path} is below the minimum.`;
+      if (current.maximum !== undefined && entry > current.maximum) return `${path} is above the maximum.`;
+    }
+    if (Array.isArray(entry) && current.items) {
+      for (let index = 0; index < entry.length; index += 1) {
+        const error = visit(entry[index], current.items, `${path}[${index}]`);
+        if (error) return error;
+      }
+    }
+    if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+      const object = entry as Record<string, unknown>;
+      for (const required of current.required ?? []) {
+        if (!(required in object)) return `${path}.${required} is required.`;
+      }
+      const properties = current.properties ?? {};
+      for (const [key, child] of Object.entries(object)) {
+        if (current.additionalProperties === false && !(key in properties)) return `${path}.${key} is not allowed.`;
+        const error = properties[key] ? visit(child, properties[key], `${path}.${key}`) : null;
+        if (error) return error;
+      }
+    }
+    return null;
+  };
+
+  return visit(value, schema as JsonSchemaLike, "arguments");
+}
 
 /** Where a turn's requests should go. Local llama.cpp and Ollama are kept
  * distinct (rather than a single generic "direct fetch" kind) so
@@ -577,6 +672,8 @@ export async function executeToolCall(
   // `executeToolCallInner`'s param of the same name.
   workspaceRootOverride?: string,
   extensionRegistry?: ExtensionToolRegistry,
+  programmatic?: ProgrammaticToolContext,
+  executionContext?: ToolExecutionContext,
 ): Promise<string> {
   const name = toolCall.function.name;
   const sessionId = chatSessionId ?? subagent?.sessionId;
@@ -619,10 +716,17 @@ export async function executeToolCall(
     chatSessionId,
     workspaceRootOverride,
     extensionRegistry,
+    programmatic,
+    executionContext,
   );
 
   if (hooksForEvent('PostToolUse', name).length > 0) {
     fireObservedHooks('PostToolUse', { tool_name: name, args: argsForHooks(), session_id: sessionId, result });
+  }
+  try {
+    await executionContext?.onCompleted?.(toolCall, result);
+  } catch (error) {
+    console.error(`Tool completion lifecycle failed for ${name}:`, error);
   }
   return result;
 }
@@ -668,6 +772,8 @@ async function executeToolCallInner(
   // RESERVED_ARGS entry for the trust story.
   workspaceRootOverride?: string,
   extensionRegistry?: ExtensionToolRegistry,
+  programmatic?: ProgrammaticToolContext,
+  executionContext?: ToolExecutionContext,
 ): Promise<string> {
   useUsageHistoryStore.getState().recordToolCall();
   const { name, arguments: rawArguments } = toolCall.function;
@@ -708,6 +814,18 @@ async function executeToolCallInner(
   // a model-supplied value for any of them survives.
   scrubReservedArgs(args);
 
+  const offeredDefinition = executionContext?.toolDefinitions?.find((tool) => tool.function.name === name);
+  if (executionContext?.toolDefinitions && !offeredDefinition) {
+    return stringifyToolError(new Error(`Tool "${name}" was not offered for this turn and was not executed.`));
+  }
+  if (executionContext?.isToolAvailable && !executionContext.isToolAvailable(name)) {
+    return stringifyToolError(new Error(`Tool "${name}" is no longer available and was not executed.`));
+  }
+  if (offeredDefinition) {
+    const schemaError = validateToolArguments(args, offeredDefinition.function.parameters);
+    if (schemaError) return stringifyToolError(new Error(`Invalid arguments for "${name}": ${schemaError}`));
+  }
+
   // Classify (cached per turn) on the now-scrubbed args, BEFORE
   // `injectReservedArgs` below, so both the cache key and the judge prompt
   // reflect only the model's actual call — not internal bookkeeping fields
@@ -736,6 +854,26 @@ async function executeToolCallInner(
     workspaceRootOverride,
     learningRunId: skill?.runId,
   });
+
+  if (name === PROGRAMMATIC_TOOL_NAME) {
+    if (!programmatic) {
+      return stringifyToolError(new Error('The programmatic execution capability is not available in this context.'));
+    }
+    const source = typeof args.source === 'string' ? args.source : '';
+    if (!source) {
+      return stringifyToolError(new Error('run_program requires a non-empty "source" string.'));
+    }
+    const result = await programmaticExecutionService.execute({
+      executionId: programmaticToolExecutionId(turnId, toolCall.id),
+      source,
+      toolDefinitions: programmatic.toolDefinitions,
+      signal,
+      workspaceRoots: programmatic.workspaceRoots,
+      isToolAvailable: programmatic.isToolAvailable,
+      invokeTool: programmatic.invokeTool,
+    });
+    return formatProgrammaticExecutionResult(result);
+  }
 
   // `present_plan` is a frontend-only tool (see `tools.ts`'s `PRESENT_PLAN_TOOL`
   // doc comment): it never reaches Rust at all, checked BEFORE the

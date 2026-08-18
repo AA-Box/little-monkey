@@ -143,6 +143,36 @@ describe("daemon desktop turn snapshot", () => {
     expect(recipe.desktop_turn.attachments[0].content_sha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  it("builds a durable chat-only snapshot without workspace roots", async () => {
+    const recipe = await buildDaemonDesktopRecipe({
+      sessionId: "chat-only",
+      turnId: "turn-chat-only",
+      submittedAtMs: 123,
+      userText: "hello",
+      systemPrompt: "frozen system",
+      history: [{ role: "user", content: "hello" }],
+      resolvedTarget: { kind: "provider", providerId: "openai", model: "gpt-test" },
+      targetSnapshot: providerTarget,
+      roots: [],
+      permissionMode: "smart",
+      allowNetwork: false,
+      memoryEnabled: false,
+      verifyEnabled: false,
+      verifyMaxRounds: 0,
+      subagentsEnabled: false,
+      effort: null,
+      mcpServers: [],
+      attachedStackIds: [],
+      attachedStackNames: [],
+      attachments: [],
+      workspaceMutationRequired: false,
+    });
+
+    expect(recipe.workspace).toBeNull();
+    expect(recipe.desktop_turn.workspace).toBeNull();
+    expect(recipe.desktop_turn.execution_roots).toEqual([]);
+  });
+
   it("normalizes image and tool history for native Ollama without losing bytes", () => {
     const history: ChatMessage[] = [
       {

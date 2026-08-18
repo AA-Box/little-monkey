@@ -789,9 +789,9 @@ pub fn run_append_event(
 }
 
 #[tauri::command]
-pub fn run_decide_permission(
-    app: tauri::AppHandle,
-    window: tauri::Window,
+pub fn run_decide_permission<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    window: tauri::Window<R>,
     state: tauri::State<'_, AppState>,
     run_id: String,
     request_id: String,
