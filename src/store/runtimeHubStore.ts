@@ -181,6 +181,13 @@ interface RuntimeHubStoreState {
   installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
   replaceComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
+  /** Folds a catalog's entries into the registry through the backend's merge, so
+   *  an import adds to what this machine knows instead of replacing it. */
+  mergeComponentRegistry: (entries: M3ComponentCatalogEntry[]) => Promise<void>;
+  /** Fetches the catalog this project publishes and adopts it, atomically in the
+   *  backend. Rejects when the catalog cannot be reached or is invalid, and in
+   *  neither case has the registry been touched. */
+  syncComponentCatalog: (url?: string) => Promise<void>;
   planSchedule: (input: M3SchedulingInput) => Promise<void>;
   fetchChatTemplateLabReport: (template: string | null) => Promise<void>;
   previewOffloadPlan: (runtimeId: string, input: OffloadPlanInput) => Promise<void>;
@@ -625,13 +632,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           timeoutMs: null,
           request: { entry },
         });
-        // An MLX component arrives as an archive rather than the single blob
-        // every other kind is: downloading it leaves nothing runnable until
-        // it is unpacked through the signature-verifying installer. Chained
-        // here so one click installs, rather than leaving the user with a
-        // downloaded component and a runtime still reporting Not Installed.
         if (entry.kind === "mlx_runtime") {
-          await runtimeHubClient.mlxInstallComponent(entry.componentId);
           await get().refreshRuntime("mlx");
         }
         await get().refreshComponents();
@@ -684,6 +685,41 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
       begin(key);
       try {
         const componentRegistry = await runtimeHubClient.componentReplaceRegistryEntries(entries);
+        set({ componentRegistry });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    mergeComponentRegistry: async (entries) => {
+      const key = "component-registry";
+      begin(key);
+      try {
+        const componentRegistry = await runtimeHubClient.componentMergeRegistryEntries(entries);
+        set({ componentRegistry });
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    syncComponentCatalog: async (url) => {
+      const key = "component-catalog";
+      const operationId = createM3OperationId("component-catalog");
+      begin(key, operationId);
+      try {
+        // The registry the backend returns is the merged one, so the panel does
+        // not re-read and cannot render a state the file never had.
+        const componentRegistry = await runtimeHubClient.componentSyncCatalog({
+          operationId,
+          timeoutMs: 30_000,
+          ...(url ? { url } : {}),
+        });
         set({ componentRegistry });
       } catch (error) {
         fail(key, error);

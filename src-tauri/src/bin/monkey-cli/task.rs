@@ -99,66 +99,64 @@ fn desktop_execution_target(
     snapshot: &DesktopTurnSnapshot,
 ) -> Result<Target, String> {
     match (&snapshot.target, &snapshot.execution_base_url) {
-            (
-                ModelTargetSnapshot::Provider {
-                    provider_id,
-                    endpoint,
-                    model,
-                    ..
-                },
-                None,
-            ) => {
-                let recipe_provider = target
-                    .provider
-                    .as_deref()
-                    .ok_or("desktop provider snapshot requires a provider recipe target")?;
-                let recipe_model = target
-                    .model
-                    .as_deref()
-                    .ok_or("desktop provider snapshot requires a model")?;
-                if recipe_provider != provider_id || recipe_model != model {
-                    return Err(
-                        "desktop provider execution target differs from its frozen target"
-                            .to_string(),
-                    );
-                }
-                let custom = crate::providers_cli::load_custom_providers();
-                let current =
-                    little_monkey_lib::providers::resolve_base_url(recipe_provider, &custom)?
-                        .trim_end_matches('/')
-                        .to_string();
-                if current != endpoint.trim_end_matches('/') {
-                    return Err("desktop provider endpoint changed after the turn was queued; refusing target drift".to_string());
-                }
-                Ok(Target::Provider {
-                    provider_id: recipe_provider.to_string(),
-                    model: recipe_model.to_string(),
-                })
+        (
+            ModelTargetSnapshot::Provider {
+                provider_id,
+                endpoint,
+                model,
+                ..
+            },
+            None,
+        ) => {
+            let recipe_provider = target
+                .provider
+                .as_deref()
+                .ok_or("desktop provider snapshot requires a provider recipe target")?;
+            let recipe_model = target
+                .model
+                .as_deref()
+                .ok_or("desktop provider snapshot requires a model")?;
+            if recipe_provider != provider_id || recipe_model != model {
+                return Err(
+                    "desktop provider execution target differs from its frozen target".to_string(),
+                );
             }
-            (ModelTargetSnapshot::Ollama { model, .. }, Some(base_url)) => {
-                if target.ollama.as_deref() != Some(model.as_str()) {
-                    return Err(
-                        "desktop Ollama execution model differs from its frozen target".to_string(),
-                    );
-                }
-                Ok(Target::Local {
-                    base_url: base_url.trim_end_matches('/').to_string(),
-                    model: Some(model.clone()),
-                    native_ollama: true,
-                })
+            let custom = crate::providers_cli::load_custom_providers();
+            let current = little_monkey_lib::providers::resolve_base_url(recipe_provider, &custom)?
+                .trim_end_matches('/')
+                .to_string();
+            if current != endpoint.trim_end_matches('/') {
+                return Err("desktop provider endpoint changed after the turn was queued; refusing target drift".to_string());
             }
-            (ModelTargetSnapshot::ManagedLlama { model_id, .. }, Some(base_url)) => {
-                if target.local_url.as_deref() != Some(base_url.as_str()) {
-                    return Err(
-                        "desktop managed runtime origin differs from its frozen recipe".to_string(),
-                    );
-                }
-                Ok(Target::Local {
-                    base_url: base_url.trim_end_matches('/').to_string(),
-                    model: target.model.clone().or_else(|| Some(model_id.clone())),
-                    native_ollama: false,
-                })
+            Ok(Target::Provider {
+                provider_id: recipe_provider.to_string(),
+                model: recipe_model.to_string(),
+            })
+        }
+        (ModelTargetSnapshot::Ollama { model, .. }, Some(base_url)) => {
+            if target.ollama.as_deref() != Some(model.as_str()) {
+                return Err(
+                    "desktop Ollama execution model differs from its frozen target".to_string(),
+                );
             }
+            Ok(Target::Local {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                model: Some(model.clone()),
+                native_ollama: true,
+            })
+        }
+        (ModelTargetSnapshot::ManagedLlama { model_id, .. }, Some(base_url)) => {
+            if target.local_url.as_deref() != Some(base_url.as_str()) {
+                return Err(
+                    "desktop managed runtime origin differs from its frozen recipe".to_string(),
+                );
+            }
+            Ok(Target::Local {
+                base_url: base_url.trim_end_matches('/').to_string(),
+                model: target.model.clone().or_else(|| Some(model_id.clone())),
+                native_ollama: false,
+            })
+        }
         _ => Err("desktop execution target is incomplete".to_string()),
     }
 }
@@ -397,9 +395,9 @@ fn resolve_workspace_dir(recipe: &Recipe, recipe_path: &Path) -> PathBuf {
 /// line, with a `Warning:` for any file that failed to parse instead of
 /// silently omitting it.
 pub fn list() -> Result<(), String> {
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let global_config_roots = recipes::global_config_roots()?;
     let workspace_root = std::env::current_dir().ok();
-    let found = recipes::discover_recipes(workspace_root.as_deref(), &app_data_dir);
+    let found = recipes::discover_recipes(workspace_root.as_deref(), &global_config_roots);
     if found.is_empty() {
         println!(
             "No recipes found (checked ./.littlemonkey/recipes/ and the global recipes directory)."
@@ -489,6 +487,36 @@ pub fn conformance(path: &str) -> Result<(), String> {
     }
 }
 
+fn schedule_command_args(
+    agent_home: &Path,
+    binary_path: &Path,
+    profile_id: &str,
+    recipe_path: &Path,
+) -> Result<Vec<String>, String> {
+    let agent_home = agent_home
+        .to_str()
+        .ok_or_else(|| "The Little Monkey agent home is not valid UTF-8".to_string())?;
+    let binary_path = binary_path
+        .to_str()
+        .ok_or_else(|| "The monkey executable path is not valid UTF-8".to_string())?;
+    let recipe_path = recipe_path
+        .to_str()
+        .ok_or_else(|| "The recipe path is not valid UTF-8".to_string())?;
+    Ok(vec![
+        format!(
+            "{}={agent_home}",
+            little_monkey_lib::app_paths::AGENT_HOME_ENV
+        ),
+        binary_path.to_string(),
+        "--profile".to_string(),
+        profile_id.to_string(),
+        "task".to_string(),
+        "run".to_string(),
+        recipe_path.to_string(),
+        "--json".to_string(),
+    ])
+}
+
 /// `task schedule <name_or_path> --cron '...'` — emits a ready-to-install
 /// launchd plist (macOS) or crontab line for running this recipe on a
 /// schedule via the OS's own scheduler, rather than the app daemonizing
@@ -499,10 +527,14 @@ pub fn conformance(path: &str) -> Result<(), String> {
 pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
     little_monkey_lib::automations::validate_cron_impl(cron)?;
 
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let global_config_roots = config_roots.ordered();
     let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(name_or_path, workspace_root.as_deref(), &app_data_dir)?;
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        name_or_path,
+        workspace_root.as_deref(),
+        &global_config_roots,
+    )?;
     let recipe_abs_path = recipe_path.canonicalize().map_err(|e| {
         format!(
             "Failed to resolve absolute path to '{}': {e}",
@@ -511,25 +543,22 @@ pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
     })?;
 
     let binary_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to resolve monkey's own binary path: {e}"))?
-        .to_string_lossy()
-        .to_string();
-    let recipe_path_str = recipe_abs_path.to_string_lossy().to_string();
-    let args = vec![
-        "task".to_string(),
-        "run".to_string(),
-        recipe_path_str,
-        "--json".to_string(),
-    ];
+        .map_err(|e| format!("Failed to resolve monkey's own binary path: {e}"))?;
+    let args = schedule_command_args(
+        &config_roots.agent_home,
+        &binary_path,
+        &config_roots.profile_id,
+        &recipe_abs_path,
+    )?;
     let label = format!("com.littlemonkey.task.{}", recipe.name);
 
     if cfg!(target_os = "macos") {
         match little_monkey_lib::automations::format_launchd_plist(
             &label,
-            &binary_path,
+            "/usr/bin/env",
             &args,
             cron,
-        ) {
+        )? {
             Some(plist) => {
                 println!("{plist}");
                 eprintln!(
@@ -542,14 +571,18 @@ pub fn schedule(name_or_path: &str, cron: &str) -> Result<(), String> {
                 );
                 println!(
                     "{}",
-                    little_monkey_lib::automations::format_crontab_line(cron, &binary_path, &args)
+                    little_monkey_lib::automations::format_crontab_line(
+                        cron,
+                        "/usr/bin/env",
+                        &args,
+                    )?
                 );
             }
         }
     } else {
         println!(
             "{}",
-            little_monkey_lib::automations::format_crontab_line(cron, &binary_path, &args)
+            little_monkey_lib::automations::format_crontab_line(cron, "/usr/bin/env", &args)?
         );
         eprintln!("\n# Add the above line via `crontab -e`.");
     }
@@ -728,12 +761,15 @@ fn snapshot_target(target: &recipes::RecipeTarget) -> Result<ModelTargetSnapshot
             model_id: model_id.clone(),
             model_path: artifact.to_string_lossy().to_string(),
             capabilities,
-            estimated_memory_bytes: match little_monkey_lib::m3_runtime_hub::installed_model_footprint(&app_data, model_id) {
-                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Known { memory, .. } => {
-                    Some(memory.ram_bytes)
-                }
-                little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Unknown => None,
-            },
+            estimated_memory_bytes:
+                match little_monkey_lib::m3_runtime_hub::installed_model_footprint(
+                    &app_data, model_id,
+                ) {
+                    little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Known {
+                        memory, ..
+                    } => Some(memory.ram_bytes),
+                    little_monkey_lib::m3_runtime_hub::M3ModelFootprint::Unknown => None,
+                },
         });
     }
     Err(
@@ -780,6 +816,33 @@ fn permission_policy(mode: PermissionMode, approval_timeout_ms: u64) -> Permissi
             .as_deref()
             == Some(std::ffi::OsStr::new("1")),
         egress_allowlist: None,
+        channel_send: None,
+    }
+}
+
+/// The one permission policy a run both records and executes under.
+///
+/// Precedence: a placed run's immutable policy, then a desktop turn's
+/// snapshot, then the recipe's own declaration on top of the mode's defaults.
+/// `run_inner` freezes exactly this into the RunSpec and hands exactly this
+/// to `TerminalPermissions`, so what the ledger says the run could do and
+/// what its tools consult at call time cannot be two different things.
+fn frozen_permission_policy(
+    recipe: &Recipe,
+    mode: PermissionMode,
+    approval_timeout_ms: u64,
+) -> PermissionPolicySnapshot {
+    match (&recipe.placed_run, &recipe.desktop_turn) {
+        (Some(placed), _) => placed.permission_policy.clone(),
+        (_, Some(snapshot)) => snapshot.permission_policy.clone(),
+        _ => {
+            let mut policy = permission_policy(mode, approval_timeout_ms);
+            // A hand-authored/scheduled recipe is the only carrier of a
+            // cross-conversation messaging grant on this path; the snapshot
+            // records it so the run's authority is auditable after the fact.
+            policy.channel_send = recipe.channel_send.clone();
+            policy
+        }
     }
 }
 
@@ -936,10 +999,15 @@ async fn run_inner(
     run_key: Option<&str>,
     json_output: bool,
 ) -> Result<(i32, RunResult), String> {
-    let app_data_dir = crate::app_data_dir().ok_or("Could not resolve the app data directory")?;
+    let config_roots = little_monkey_lib::app_paths::agent_config_roots()?;
+    let app_data_dir = config_roots.legacy.clone();
+    let global_config_roots = config_roots.ordered();
     let workspace_root = std::env::current_dir().ok();
-    let (recipe, recipe_path) =
-        recipes::resolve_recipe_with_path(name_or_path, workspace_root.as_deref(), &app_data_dir)?;
+    let (recipe, recipe_path) = recipes::resolve_recipe_with_path(
+        name_or_path,
+        workspace_root.as_deref(),
+        &global_config_roots,
+    )?;
 
     let overrides = parse_param_flags(param_flags)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
@@ -1048,11 +1116,7 @@ async fn run_inner(
         (_, Some(snapshot)) => Some(snapshot.workspace.clone()),
         _ => Some(workspace_snapshot(&state)?),
     };
-    let frozen_policy = match (&recipe.placed_run, &recipe.desktop_turn) {
-        (Some(placed), _) => placed.permission_policy.clone(),
-        (_, Some(snapshot)) => snapshot.permission_policy.clone(),
-        _ => permission_policy(mode, approval_timeout_ms),
-    };
+    let frozen_policy = frozen_permission_policy(&recipe, mode, approval_timeout_ms);
     let input_artifact_ids = recipe
         .desktop_turn
         .as_ref()
@@ -1220,9 +1284,15 @@ async fn run_inner(
     let event_sink: Arc<dyn CliRunEventSink> = recorder.clone();
     let mut perms =
         TerminalPermissions::with_event_sink(mode, event_sink, approval_timeout_ms, json_output);
-    if let Some(snapshot) = &recipe.desktop_turn {
-        perms.set_allow_network(snapshot.permission_policy.allow_network);
-    }
+    // The run executes under exactly the policy its immutable RunSpec
+    // recorded — the same `frozen_policy` precedence (placed run, then
+    // desktop turn, then the recipe's own declaration) — rather than a second
+    // derivation that could drift from it. This is what makes a placed run's
+    // cross-account messaging grant, and its external-mutations flag, real at
+    // tool time instead of only auditable after the fact.
+    perms.set_allow_network(run_spec.permission_policy.allow_network);
+    perms.set_allow_external_mutations(run_spec.permission_policy.allow_external_mutations);
+    perms.set_channel_send(run_spec.permission_policy.channel_send.clone());
     let mut history: Vec<serde_json::Value> = recipe
         .desktop_turn
         .as_ref()
@@ -1285,6 +1355,13 @@ async fn run_inner(
         }
     };
 
+    // The turn's frozen workspace-mutation contract, read from the immutable
+    // snapshot rather than re-derived from the prompt: whether this turn
+    // promised a file would change was decided when it was accepted.
+    let mutation_required = recipe
+        .desktop_turn
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.workspace_mutation_required);
     let turn_future = async {
         if recipe.desktop_turn.is_some() {
             crate::agent::run_prepared_turn_with_max_iterations(
@@ -1298,6 +1375,7 @@ async fn run_inner(
                 &mcp_entries,
                 &attached_stacks,
                 Some(max_iterations),
+                mutation_required,
             )
             .await
         } else {
@@ -1540,6 +1618,7 @@ mod tests {
                 dim: 768,
                 query_prefix: String::new(),
                 doc_prefix: String::new(),
+                extension_id: None,
             },
             chunk_chars: 1_600,
             chunk_overlap: 200,
@@ -1612,6 +1691,41 @@ mod tests {
     fn parse_param_flags_allows_a_value_containing_an_equals_sign() {
         let map = parse_param_flags(&["url=http://x?a=b".to_string()]).unwrap();
         assert_eq!(map.get("url"), Some(&"http://x?a=b".to_string()));
+    }
+
+    #[test]
+    fn schedule_command_pins_agent_home_as_environment_and_profile_as_an_argument() {
+        let agent_home = Path::new("/home/test/Agent Home");
+        let binary_path = Path::new("/opt/little monkey/bin/monkey");
+        let recipe_path = Path::new("/repo/recipes/nightly audit.yml");
+        assert_eq!(
+            schedule_command_args(agent_home, binary_path, "work", recipe_path),
+            Ok(vec![
+                "LITTLE_MONKEY_HOME=/home/test/Agent Home".to_string(),
+                "/opt/little monkey/bin/monkey".to_string(),
+                "--profile".to_string(),
+                "work".to_string(),
+                "task".to_string(),
+                "run".to_string(),
+                recipe_path.to_string_lossy().into_owned(),
+                "--json".to_string(),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schedule_rejects_non_utf8_paths_instead_of_changing_them() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', 0xff,
+        ]));
+        let binary = Path::new("/tmp/monkey");
+        let recipe = Path::new("/tmp/recipe.yml");
+        assert!(schedule_command_args(&invalid, binary, "work", recipe).is_err());
+        assert!(schedule_command_args(Path::new("/tmp/home"), &invalid, "work", recipe).is_err());
+        assert!(schedule_command_args(Path::new("/tmp/home"), binary, "work", &invalid).is_err());
     }
 
     #[test]
@@ -1782,9 +1896,115 @@ mod tests {
             max_iterations: None,
             timeout_seconds: None,
             output: recipes::RecipeOutput::default(),
+            channel_send: None,
             desktop_turn: None,
             placed_run: None,
         }
+    }
+
+    /// The immutable snapshot a submitter placed this run with, carrying one
+    /// explicit cross-account messaging grant.
+    fn placed_with_grant(
+        channel_send: Option<little_monkey_lib::run_protocol::ChannelSendPolicy>,
+    ) -> little_monkey_lib::node_placement::PlacedRunSnapshot {
+        let mut policy = permission_policy(PermissionMode::Manual, 1_000);
+        policy.allow_external_mutations = true;
+        policy.channel_send = channel_send;
+        little_monkey_lib::node_placement::PlacedRunSnapshot {
+            schema_version: 1,
+            submitted_run_id: "run:placed".to_string(),
+            kind: little_monkey_lib::run_protocol::RunKind::Workflow,
+            target: snapshot_target(&ollama_target()).expect("target"),
+            workspace: None,
+            permission_policy: policy,
+            budgets: little_monkey_lib::run_protocol::RunBudgets {
+                wall_time_ms: 60_000,
+                max_iterations: 5,
+                max_model_calls: 100,
+                max_tool_calls: 100,
+                max_input_tokens: 1_000_000,
+                max_output_tokens: 1_000_000,
+                max_cost_micros: None,
+                max_artifact_bytes: 1 << 20,
+                max_event_count: 10_000,
+            },
+        }
+    }
+
+    #[test]
+    fn a_placed_run_executes_under_the_grant_it_was_placed_with() {
+        use little_monkey_lib::run_protocol::ChannelSendPolicy;
+        // The recipe wrapping a placed run declares nothing of its own; the
+        // grant must come from the placement snapshot and nowhere else.
+        let mut recipe = recipe_with_workspace(None);
+        recipe.placed_run = Some(placed_with_grant(Some(ChannelSendPolicy {
+            cross_conversation: false,
+            accounts: vec!["chan-ops".to_string()],
+        })));
+
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        let grant = policy.channel_send.expect("the placed grant survives");
+        assert_eq!(grant.accounts, vec!["chan-ops".to_string()]);
+        assert!(policy.allow_external_mutations);
+
+        // And the grant is exactly what the tool's authorization ladder then
+        // consults: that account is reachable, any other is refused.
+        let authority = crate::daemon::channel_tool::SendAuthority {
+            reply: false,
+            cross_conversation: grant.cross_conversation,
+            accounts: grant.accounts,
+        };
+        let mut request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: Some("chan-ops".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            text: "placed".to_string(),
+            ..Default::default()
+        };
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect("the placed grant reaches exactly that account");
+        request.account_id = Some("chan-other".to_string());
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect_err("an account the placement never granted stays refused");
+    }
+
+    #[test]
+    fn a_placed_run_without_the_grant_cannot_send_cross_account() {
+        let mut recipe = recipe_with_workspace(None);
+        // The wrapping recipe tries to smuggle a grant of its own in; the
+        // placed snapshot, which carries none, must win.
+        recipe.channel_send = Some(little_monkey_lib::run_protocol::ChannelSendPolicy {
+            cross_conversation: true,
+            accounts: vec!["chan-ops".to_string()],
+        });
+        recipe.placed_run = Some(placed_with_grant(None));
+
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        assert!(policy.channel_send.is_none());
+
+        let authority = crate::daemon::channel_tool::SendAuthority {
+            reply: false,
+            cross_conversation: false,
+            accounts: Vec::new(),
+        };
+        let request = crate::daemon::channel_tool::ChannelSendRequest {
+            account_id: Some("chan-ops".to_string()),
+            conversation_id: Some("conv-1".to_string()),
+            text: "placed".to_string(),
+            ..Default::default()
+        };
+        crate::daemon::channel_tool::plan_send(&request, &authority, None)
+            .expect_err("no grant on the placement, no cross-account send");
+    }
+
+    #[test]
+    fn a_plain_recipes_own_declaration_still_reaches_execution() {
+        let mut recipe = recipe_with_workspace(None);
+        recipe.channel_send = Some(little_monkey_lib::run_protocol::ChannelSendPolicy {
+            cross_conversation: true,
+            accounts: Vec::new(),
+        });
+        let policy = frozen_permission_policy(&recipe, PermissionMode::Manual, 1_000);
+        assert!(policy.channel_send.expect("declared").cross_conversation);
     }
 
     #[test]

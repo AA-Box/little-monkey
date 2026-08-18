@@ -140,7 +140,7 @@ describe("trustScorecardsStore.recompute", () => {
   it("produces one scorecard per configured cloud-provider model", async () => {
     invokeMock.mockResolvedValueOnce([]);
     useModelStore.setState({
-      providers: [{ id: "openai", label: "OpenAI", base_url: "https://api.openai.com", is_custom: false, has_key: true }],
+      providers: [{ id: "openai", label: "OpenAI", base_url: "https://api.openai.com", is_custom: false, has_key: true, is_extension: false }],
       providerModels: { openai: [{ id: "gpt-4o" }, { id: "gpt-4o-mini" }] },
     } as Partial<ReturnType<typeof useModelStore.getState>>);
 

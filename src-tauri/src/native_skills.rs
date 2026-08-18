@@ -261,6 +261,33 @@ pub struct SkillDescriptor {
     /// command's doc comment). Always empty for signed packages, which carry
     /// no bundle beyond their inline `instructions`.
     pub resource_files: Vec<String>,
+    /// Set when this exact content hash was installed by the learning loop
+    /// (`skill_learning.rs`). Populated after discovery by
+    /// `SkillLearningStore::decorate`, never by the scan itself — this core
+    /// stays unaware of where a folder came from, and the provenance is keyed
+    /// by content hash so a rollback surfaces the rolled-back version's own
+    /// provenance rather than the newest one's.
+    #[serde(default)]
+    pub learned: Option<LearnedProvenance>,
+}
+
+/// Immutable record of one promotion. Keyed by `installed_sha256` in the
+/// learning store, so nothing that happens later — an update, a rollback, a
+/// deprecation — can rewrite what a historical run actually used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearnedProvenance {
+    /// Always `"learned"`. Present so a consumer can branch on origin without
+    /// having to know that presence of this struct implies it.
+    pub origin: String,
+    pub candidate_id: String,
+    pub source_run_ids: Vec<String>,
+    pub source_kind: String,
+    pub parent_skill_sha256: Option<String>,
+    pub installed_sha256: String,
+    pub evaluation_ids: Vec<String>,
+    pub promotion_policy: String,
+    pub approval_id: Option<String>,
+    pub promoted_at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -617,6 +644,7 @@ impl NativeSkillManager {
                 git_repository: None,
                 allowed_tools: Vec::new(),
                 resource_files: Vec::new(),
+                learned: None,
             });
         }
         skills.sort_by(|left, right| {
@@ -1300,6 +1328,7 @@ impl NativeSkillManager {
                 git_repository: managed.and_then(|record| record.origin_repository.clone()),
                 allowed_tools: scanned.parsed.manifest.allowed_tools.clone(),
                 resource_files,
+                learned: None,
             };
             if descriptor.enabled {
                 let current_source = source_label(&descriptor.source);

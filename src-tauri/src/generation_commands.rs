@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::artifact_store::ArtifactStore;
-use crate::generation::{self, GenerationModelSpec, GenerationRequest, JobProgress};
+use crate::generation::{
+    self, EngineCommand, GenerationEngineKind, GenerationModelSpec, GenerationRequest, JobProgress,
+};
 use crate::managed_runtime::{self, STABLE_DIFFUSION};
 use crate::profiles::ProfileScopedPaths;
 use crate::studio_tools;
@@ -49,9 +51,18 @@ const BACKENDS_FILE: &str = "studio-backends.json";
 const MAX_BACKENDS: usize = 32;
 /// Keeps a corrupt or hand-edited gallery from being read without bound.
 const MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
-/// A long clip on a constrained machine can legitimately sample for a long
-/// time; this exists so a wedged engine cannot poll forever.
-const JOB_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a running job may show *no sign of movement at all* before it is
+/// called wedged and cancelled.
+///
+/// Not a budget for the whole run. A clip's cost is the user's own choice —
+/// frames times resolution times steps, and then a VAE decode that dominates
+/// everything else — so any wall-clock ceiling is really a hidden cap on the
+/// settings the picker offers. This measures stillness instead: sampling step,
+/// queue position, and the engine's own output are all watched, and a job that
+/// changes none of them for this long has stopped rather than slowed. The
+/// window is wide because the decode phase is genuinely quiet on some
+/// architectures.
+const JOB_STALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// One tool run, end to end. Unlike a generation this is a single synchronous
 /// request — there is no job to poll — so the deadline covers the operation
 /// itself and not just a round trip.
@@ -216,28 +227,84 @@ fn total_ram_bytes() -> u64 {
     std::panic::catch_unwind(system_memory::total).unwrap_or(0)
 }
 
-/// The verified app-owned `sd-server`, materializing it from bundled resources
-/// on first use exactly as the llama runtime does.
-fn engine_binary(app: &AppHandle) -> Result<PathBuf, String> {
+/// What to spawn for `spec`: the verified app-owned `sd-server`, or the video
+/// service inside the user's installed MLX package.
+///
+/// Resolved per model rather than once per app because the two engines read
+/// disjoint file formats — an MLX conversion is unreadable to
+/// stable-diffusion.cpp and a GGUF is unreadable to MLX — so which program to
+/// start is a property of the weights, not of the host.
+fn engine_command(app: &AppHandle, spec: &GenerationModelSpec) -> Result<EngineCommand, String> {
     // K22: refuse to hand out an executable path at all while the startup
     // integrity check reports a tampered component.
     crate::self_integrity::ensure_loadable()?;
     let app_data = app
         .profile_data_dir()
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
-    let resource_dir = app.path().resource_dir().ok();
-    if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(
-        &STABLE_DIFFUSION,
-        resource_dir.as_deref(),
-        &app_data,
-    ) {
-        return Ok(path);
+    match spec.engine {
+        GenerationEngineKind::MlxVideo => mlx_video_command(&app_data),
+        GenerationEngineKind::StableDiffusionCpp => {
+            let resource_dir = app.path().resource_dir().ok();
+            if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(
+                &STABLE_DIFFUSION,
+                resource_dir.as_deref(),
+                &app_data,
+            ) {
+                return Ok(EngineCommand::binary(path));
+            }
+            managed_runtime::find_managed_sd_server(Some(&app_data))
+                .map(EngineCommand::binary)
+                .ok_or_else(|| {
+                    "The generation engine is not installed in this build; run `pnpm stage:runtime:sd` and rebuild"
+                        .to_string()
+                })
+        }
     }
-    managed_runtime::find_managed_sd_server(Some(&app_data)).ok_or_else(|| {
-        "The generation engine is not installed in this build; run `pnpm stage:runtime:sd` and rebuild"
-            .to_string()
+}
+
+/// The MLX package's own interpreter running the video service inside it.
+///
+/// Every launch re-verifies the whole installed tree — `verify_active` re-hashes
+/// each file the signed manifest declares and refuses any file it does not — so
+/// the script this returns is as verified as the interpreter that runs it. It is
+/// resolved from the manifest's install root rather than named directly, because
+/// a path assembled here that the installer never published would run unverified
+/// code.
+#[cfg(target_os = "macos")]
+fn mlx_video_command(app_data: &Path) -> Result<EngineCommand, String> {
+    let installer = crate::m3_production::production_mlx_installer(&app_data.join("m3"))
+        .map_err(|error| error.to_string())?;
+    let install = installer.verify_active().map_err(|error| {
+        format!(
+            "The MLX video engine is not ready: {error}. Install the MLX package from Settings \
+             → Runtime Hub → Components."
+        )
+    })?;
+    let service = install.version_directory.join(MLX_VIDEO_SERVICE_ENTRY);
+    if !service.is_file() {
+        return Err(format!(
+            "The installed MLX package has no video service ({}). Install a package built after \
+             this feature shipped.",
+            MLX_VIDEO_SERVICE_ENTRY
+        ));
+    }
+    Ok(EngineCommand {
+        program: install.python_executable,
+        prefix_args: vec![service.to_string_lossy().to_string()],
     })
 }
+
+/// The same, everywhere the MLX package cannot be installed at all.
+#[cfg(not(target_os = "macos"))]
+fn mlx_video_command(_app_data: &Path) -> Result<EngineCommand, String> {
+    Err("The MLX video engine runs on Apple silicon only.".to_string())
+}
+
+/// The video service's path inside an installed MLX package, mirroring
+/// `serviceEntry` for the text one. Kept in step with
+/// `scripts/build-mlx-package.mjs`, which copies it there.
+#[cfg(target_os = "macos")]
+const MLX_VIDEO_SERVICE_ENTRY: &str = "service/mlx_video_server.py";
 
 /// Whether the engine binary can actually start on this host.
 ///
@@ -880,14 +947,27 @@ async fn run_diffusion(
     request: &GenerationRequest,
 ) -> Result<Vec<generation::GeneratedMedia>, String> {
     let root = model_root(app)?;
-    let binary = engine_binary(app)?;
+    let command = engine_command(app, spec)?;
     let engine = &state.generation_engine;
+
+    // The engine only resolves a LoRA by its name inside `--lora-model-dir`,
+    // so the absolute paths the request carries are linked in and replaced
+    // with those names. Only a run that selected one pays for the clone.
+    let staged;
+    let request = if request.loras.is_empty() {
+        request
+    } else {
+        let mut owned = request.clone();
+        generation::stage_loras(&root, &mut owned)?;
+        staged = owned;
+        &staged
+    };
 
     let _ = app.emit(
         "studio://progress",
         GenerationProgressEvent::new("", "loading"),
     );
-    let base_url = engine.ensure_ready(&binary, spec, &root).await?;
+    let base_url = engine.ensure_ready(&command, spec, &root).await?;
     engine.clear_progress();
 
     let client = reqwest::Client::builder()
@@ -900,18 +980,26 @@ async fn run_diffusion(
         GenerationProgressEvent::new(&job_id, "submitted"),
     );
 
-    let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let mut moving = (engine.output_mark(), u32::MAX);
+    let mut moved_at = tokio::time::Instant::now();
     loop {
-        if tokio::time::Instant::now() >= deadline {
-            generation::cancel_job(&client, &base_url, &job_id).await;
-            return Err("Generation exceeded its time limit".to_string());
-        }
         match generation::poll_job(&client, &base_url, &job_id).await? {
             JobProgress::Running { queue_position } => {
                 let mut event = GenerationProgressEvent::new(&job_id, "running")
                     .with_progress(engine.progress());
                 event.queue_position = queue_position;
                 let _ = app.emit("studio://progress", event);
+                let now = (engine.output_mark(), queue_position);
+                if now != moving {
+                    moving = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= JOB_STALL_TIMEOUT {
+                    generation::cancel_job(&client, &base_url, &job_id).await;
+                    return Err(format!(
+                        "Generation stopped making progress for {} minutes and was cancelled",
+                        JOB_STALL_TIMEOUT.as_secs() / 60
+                    ));
+                }
             }
             JobProgress::Completed(media) => return Ok(media),
             JobProgress::Failed(error) => return Err(error),
@@ -1316,7 +1404,9 @@ pub fn studio_tool_stop(
 
 #[cfg(test)]
 mod tests {
-    use super::{binary_starts, merge_tool_catalog, Duration, SystemTime, Uuid};
+    #[cfg(target_os = "macos")]
+    use super::MLX_VIDEO_SERVICE_ENTRY;
+    use super::{binary_starts, merge_tool_catalog, Duration, Path, SystemTime, Uuid};
     use crate::m3_runtime_hub::{M3ComponentCatalogEntry, M3ComponentChannel, M3ComponentKind};
 
     fn entry(id: &str, version: &str, kind: M3ComponentKind) -> M3ComponentCatalogEntry {
@@ -1451,5 +1541,26 @@ mod tests {
             "the replaced binary is probed again rather than answered from the old verdict"
         );
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The path Studio launches and the path the packaging script writes are
+    /// two hand-maintained strings that must be the same one.
+    ///
+    /// Nothing else catches a drift between them: a package built with the
+    /// service under another name still installs and still verifies — its
+    /// manifest is over whatever files it contains — and the failure surfaces
+    /// only as a video model that cannot start, on a machine that has already
+    /// downloaded 300 MB.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_video_service_is_where_the_packaging_script_puts_it() {
+        let script = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/build-mlx-package.mjs"),
+        )
+        .unwrap();
+        assert!(
+            script.contains(&format!("\"{MLX_VIDEO_SERVICE_ENTRY}\"")),
+            "build-mlx-package.mjs does not copy the service to {MLX_VIDEO_SERVICE_ENTRY}"
+        );
     }
 }

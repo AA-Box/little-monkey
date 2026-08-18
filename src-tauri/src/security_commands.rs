@@ -8,10 +8,19 @@ use crate::m7_companion::{CaptureKind, M7CompanionState};
 use crate::native_skill_commands::NativeSkillsCommandState;
 use crate::native_skills::{ExternalSignedSkill, SkillSource};
 use crate::security_doctor::{
-    run_security_audit, BrowserGrantSnapshot, CompanionGrantSnapshot, NativeSkillSnapshot,
-    SecurityAuditReport, SecurityAuditRequest, SecurityRuntimeSnapshot,
+    append_findings, run_security_audit, BrowserGrantSnapshot, CompanionGrantSnapshot,
+    DaemonSecurityState, NativeSkillSnapshot, SecurityAuditReport, SecurityAuditRequest,
+    SecurityRuntimeSnapshot, VoicePrivacySnapshot,
 };
 use crate::AppState;
+
+/// The `DaemonSecurityState` shape this build knows how to read.
+///
+/// Checked rather than assumed: a desktop app talking to a newer bundled CLI
+/// would otherwise deserialize the fields it recognizes and silently drop a
+/// whole category of check, which is exactly the failure this whole path exists
+/// to remove. A mismatch becomes one visible finding instead.
+const DAEMON_STATE_SCHEMA_VERSION: u32 = 1;
 
 #[tauri::command]
 pub async fn security_audit(
@@ -65,6 +74,17 @@ pub async fn security_audit(
         }
         Err(error) => runtime.companion_error = Some(error),
     }
+    // Voice settings are this machine's own, not a device grant, so they reach
+    // the audit through the companion state rather than the device store. A
+    // read that fails leaves `None`, which the audit reads as "not observed"
+    // rather than as "nothing is listening".
+    if let Ok(voice) = companion.security_voice_privacy() {
+        runtime.voice = Some(VoicePrivacySnapshot {
+            wake_phrase_enabled: voice.wake_phrase_enabled,
+            always_listening: voice.always_listening,
+            local_only: voice.local_only,
+        });
+    }
 
     let package_skills = match m4.packages.active_skills() {
         Ok(skills) => skills
@@ -89,6 +109,33 @@ pub async fn security_audit(
             Vec::new()
         }
     };
+    // Devices, messaging accounts, phone numbers and peers live in databases
+    // the daemon owns, which this process cannot open. Before this the desktop
+    // panel simply ran none of those checks and reported a clean page, which is
+    // worse than reporting nothing: an operator cannot tell a check that passed
+    // from one that never ran. Read over the same typed bridge every other
+    // daemon-backed panel uses — a fixed argument list this file builds, never
+    // anything the frontend supplies.
+    let daemon_findings = match daemon_security_state().await {
+        Ok(state) => state.apply(&mut runtime),
+        Err(error) => vec![crate::security_doctor::SecurityFinding {
+            id: "daemon.state_unavailable".to_string(),
+            category: "storage".to_string(),
+            title: "Part of this audit could not run".to_string(),
+            detail: format!(
+                "Paired devices, messaging accounts, phone numbers and peers could not be \
+                 inspected, so nothing on this page reflects them: {error}"
+            ),
+            status: crate::security_doctor::FindingStatus::Warning,
+            fixable: false,
+            path: None,
+            remediation: Some(
+                "Start or repair the background service from Settings, then run the audit again."
+                    .to_string(),
+            ),
+        }],
+    };
+
     let native_manager = native.manager.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if runtime.native_skills_error.is_none() {
@@ -124,7 +171,35 @@ pub async fn security_audit(
         })
     })
     .await
-    .map_err(|error| format!("Security Doctor worker failed: {error}"))?
+    .map_err(|error| format!("Security Doctor worker failed: {error}"))
+    .and_then(|report| {
+        let mut report = report?;
+        // After the audit, so the summary the panel shows counts them.
+        append_findings(&mut report, daemon_findings);
+        Ok(report)
+    })
+}
+
+/// Ask the bundled CLI for the half of the audit only it can see.
+///
+/// A fixed argument list built here. The frontend passes no arguments to this
+/// path and never could — the whole point of the typed bridge is that React
+/// asks for a *capability*, not for a command line.
+async fn daemon_security_state() -> Result<DaemonSecurityState, String> {
+    let output =
+        crate::daemon_commands::command(vec!["security".into(), "daemon-state".into()]).await?;
+    let state: DaemonSecurityState = serde_json::from_str(output.trim())
+        .map_err(|error| format!("Could not read the background service's report: {error}"))?;
+    // Newer than this build understands. Refused rather than partially read:
+    // a category silently missing from a security page is the failure mode this
+    // whole path was added to close.
+    if state.schema_version > DAEMON_STATE_SCHEMA_VERSION {
+        return Err(format!(
+            "the background service reports a newer format (v{}) than this app understands (v{DAEMON_STATE_SCHEMA_VERSION})",
+            state.schema_version
+        ));
+    }
+    Ok(state)
 }
 
 fn primary_workspace(state: &AppState) -> Result<Option<PathBuf>, String> {

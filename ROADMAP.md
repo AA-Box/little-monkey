@@ -13,11 +13,10 @@ README. "Partially built" entries name the shipped part honestly, because a
 half-built feature that the README already describes is still roadmap work
 for the remainder — not a done item.
 
-For the same work viewed as OS subsystems — process model, enforced isolation,
-scheduling, and a versioned platform contract — see
-[docs/agent-os-roadmap.md](docs/agent-os-roadmap.md). It cross-references the
-items below rather than duplicating them, and adds the kernel-level gaps that
-have no entry here.
+The kernel-level plan that used to sit beside this file — process model,
+enforced isolation, scheduling, and a versioned platform contract — is built.
+What shipped is described in [README.md](README.md), and where a claim stops is
+[docs/limitations.md](docs/limitations.md).
 
 ---
 
@@ -35,8 +34,7 @@ already configured, and routing runs before the Privacy Firewall, which still
 overrides it.
 
 **Remaining:** subagent task classes (blocked on lifting target resolution out
-of `agentLoop.ts` — see K9 in [docs/agent-os-roadmap.md](docs/agent-os-roadmap.md)
-for why the import direction forbids it today), routing to managed llama.cpp
+of `agentLoop.ts`, which the import direction forbids today), routing to managed llama.cpp
 rather than only Ollama for local-only policies, and recording the decision in
 the durable run ledger so "why this target" survives a restart.
 
@@ -63,8 +61,7 @@ chart — a zero-height bar cannot say "unknown" rather than "zero".
 **One honest gap:** no runtime here reports a quantization *scheme* for a loaded
 model (a GGUF's `general.quantization_version` is a format version, not `Q4_K_M`),
 so a run identifies its model and runtime and says plainly that it cannot identify
-the quantization. See `docs/agent-os-roadmap.md` K6 for the full account, including
-why the abandoned TypeScript prototype was audited and not salvaged.
+the quantization.
 
 **Remaining:** `runtimeEdgeProfiles.ts` still returns hardcoded prose profiles
 whose own text defers to this benchmark; replacing that prose with measurements is

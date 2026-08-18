@@ -713,6 +713,12 @@ pub fn normalize_semantic_stream(events: &[RunEventEnvelope]) -> Vec<NormalizedS
                         serde_json::json!({ "decision": decision }),
                     )),
                     RunEvent::ToolStarted { .. } => normalized.push(semantic("tool_started", serde_json::json!({}))),
+                    // The exact version a replay reads back, so a run stays
+                    // able to say which skill content it actually ran.
+                    RunEvent::SkillInvoked { command, scope, sha256 } => normalized.push(semantic(
+                        "skill_invoked",
+                        serde_json::json!({ "command": command, "scope": scope, "sha256": sha256 }),
+                    )),
                     RunEvent::ToolFinished { outcome, .. } => normalized.push(semantic(
                         "tool_finished",
                         serde_json::json!({ "outcome": outcome }),
@@ -886,6 +892,7 @@ mod tests {
                 allow_network: true,
                 allow_external_mutations: false,
                 egress_allowlist: None,
+                channel_send: None,
             },
             budgets: RunBudgets {
                 wall_time_ms: 60_000,

@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { errorMessage } from "../lib/errors";
 
 /** Mirrors the Rust `EmbeddingBackend` enum (src-tauri/src/stacks.rs) exactly. */
-export type EmbeddingBackend = "llama" | "ollama";
+export type EmbeddingBackend = "llama" | "ollama" | "extension";
 
 /** Mirrors the Rust `SourceKind` enum exactly. */
 export type SourceKind = "folder" | "file";
@@ -15,6 +15,10 @@ export type SourceKind = "folder" | "file";
  * mixing vectors from two different embedding spaces. */
 export interface EmbeddingSpec {
   backend: EmbeddingBackend;
+  /** Which installation owns an `extension` backend's capability. Required for
+   * that backend and refused for the others, so a stack can never carry an
+   * owner a later install would inherit. */
+  extension_id?: string | null;
   model_id_or_tag: string;
   dim: number;
   query_prefix: string;

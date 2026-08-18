@@ -23,21 +23,18 @@ use crate::context_cache::{
     EffectiveContextInput, EffectiveContextResolution,
 };
 use crate::m3_production::M3CatalogSourceConfig;
+use crate::m3_runtime_hub::M3ComponentKind;
 use crate::m3_runtime_hub::{
     M3ActivateComponentVersionRequest, M3ActivateModelVersionRequest, M3ApiCaller,
     M3ApiDispatchRequest, M3ApiDispatchResponse, M3CancelInferenceRequest, M3CatalogMatch,
     M3CleanupReport, M3CompatibilityMatrixReport, M3ComponentCatalogEntry, M3ComponentHub,
     M3ComponentUpdateCheck, M3DeleteModelRequest, M3DownloadRequest, M3HardwareCompatibilityReport,
-    M3HubError, M3InstallComponentRequest, M3InstalledComponentView, M3InstalledModelView,
-    M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest, M3RuntimeCapabilityView,
-    M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView, M3RuntimeStatusView,
-    M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus, M3UnloadModelRequest,
-    M3VerifyProjectorRequest,
+    M3HubError, M3HubResult, M3InstallComponentRequest, M3InstalledComponentView,
+    M3InstalledModelView, M3LoadModelRequest, M3OperationContext, M3PruneModelVersionsRequest,
+    M3RuntimeCapabilityView, M3RuntimeHub, M3RuntimeKind, M3RuntimeMetricsView,
+    M3RuntimeStatusView, M3SetRuntimeConfigRequest, M3SettingCapabilitiesView, M3StorageStatus,
+    M3UnloadModelRequest, M3VerifyProjectorRequest,
 };
-// Only `m3_mlx_install_component` inspects a component kind, and that
-// command exists only in the macOS build.
-#[cfg(target_os = "macos")]
-use crate::m3_runtime_hub::M3ComponentKind;
 use crate::profiles::ProfileScopedPaths;
 use crate::quantization::{
     BackendDescriptor, ConversionReport, ConversionRequest, DeclaredLicense, GgufQuantType,
@@ -1490,6 +1487,75 @@ pub fn m3_component_replace_registry_entries(
         .map_err(command_error)
 }
 
+/// Folds a caller-supplied catalog into the registry, atomically.
+///
+/// This is what **Import catalog** calls. It is the same adoption path
+/// [`m3_component_sync_catalog`] uses — one merge rule, one identity, one write —
+/// so a file the user picked and a catalog the app fetched cannot end up adopted
+/// by two subtly different sets of rules.
+#[tauri::command]
+pub fn m3_component_merge_registry_entries(
+    state: tauri::State<'_, M3CommandState>,
+    entries: Vec<M3ComponentCatalogEntry>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::merge_component_registry_entries(&state.component_hub, entries)
+        .map_err(command_error)
+}
+
+/// Fetches a component catalog and returns what it lists, without persisting
+/// any of it.
+///
+/// Kept as its own command because fetching and adopting are separate acts and
+/// only the second one writes: this is what a diagnostic or a test asks for when
+/// the question is "what does the published catalog say?". The panel calls
+/// [`m3_component_sync_catalog`], which is this plus the merge, under the lock.
+#[tauri::command]
+pub async fn m3_component_fetch_catalog(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    url: Option<String>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let url =
+        url.unwrap_or_else(|| crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL.to_string());
+    let result = crate::m3_runtime_hub::fetch_component_catalog(&url, &context).await;
+    finish(&state, &operation_id, result).await
+}
+
+/// Fetches the published catalog and adopts it, returning the registry that
+/// resulted.
+///
+/// One command rather than a fetch the frontend then merges and writes back, for
+/// the reason `m3_production::merge_component_registry_entries` gives: a
+/// read-modify-write split across the IPC boundary can lose a concurrent import or
+/// a hand edit, and the backend is the authority on registry integrity. The whole
+/// catalog is validated before the lock is taken, so an invalid catalog cannot
+/// even reach the file — it is adopted whole or not at all.
+///
+/// Defaults to the catalog this project publishes, and takes a URL so a
+/// self-hosted or air-gapped mirror is a setting rather than a rebuild.
+#[tauri::command]
+pub async fn m3_component_sync_catalog(
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    url: Option<String>,
+) -> Result<Vec<M3ComponentCatalogEntry>, String> {
+    let context = state.begin_operation(&operation_id, timeout_ms)?;
+    let endpoint =
+        url.unwrap_or_else(|| crate::m3_production::DEFAULT_COMPONENT_CATALOG_URL.to_string());
+    let fetched = crate::m3_runtime_hub::fetch_component_catalog(&endpoint, &context).await;
+    // The operation is finished before the lock is taken: a fetch that failed must
+    // release its operation slot, and the merge below is disk work that the
+    // network deadline has nothing to say about.
+    let fetched = finish(&state, &operation_id, fetched).await?;
+    let _guard = command_lock(&state.catalog_mutation)?;
+    crate::m3_production::merge_component_registry_entries(&state.component_hub, fetched)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub async fn m3_component_list_registry(
     state: tauri::State<'_, M3CommandState>,
@@ -1512,6 +1578,25 @@ pub async fn m3_component_check_updates(
     finish(&state, &operation_id, result).await
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub async fn m3_component_install(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+) -> Result<M3InstalledComponentView, String> {
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| command_error(M3HubError::Runtime(error.to_string())))?;
+    component_install_impl(&state, operation_id, timeout_ms, request, |artifact| {
+        crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
+    })
+    .await
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tauri::command]
 pub async fn m3_component_install(
     state: tauri::State<'_, M3CommandState>,
@@ -1519,11 +1604,41 @@ pub async fn m3_component_install(
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
+    component_install_impl(&state, operation_id, timeout_ms, request, |_| Ok(())).await
+}
+
+async fn component_install_impl<F>(
+    state: &M3CommandState,
+    operation_id: String,
+    timeout_ms: Option<u64>,
+    request: M3InstallComponentRequest,
+    mlx_precommit: F,
+) -> Result<M3InstalledComponentView, String>
+where
+    F: Fn(&Path) -> M3HubResult<()>,
+{
     let context = state.begin_operation(&operation_id, timeout_ms)?;
-    let result = state
-        .component_hub
-        .install_component(&request, &context)
-        .await;
+    let result: M3HubResult<M3InstalledComponentView> = async {
+        if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
+            return Err(M3HubError::Unsupported(
+                "MLX runtime components require macOS".to_string(),
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        if request.entry.kind == M3ComponentKind::MlxRuntime {
+            return state
+                .component_hub
+                .install_component_with_precommit(&request, &context, |artifact| {
+                    mlx_precommit(artifact)
+                })
+                .await;
+        }
+        state
+            .component_hub
+            .install_component(&request, &context)
+            .await
+    }
+    .await;
     finish(&state, &operation_id, result).await
 }
 
@@ -1937,5 +2052,341 @@ mod tests {
         assert!(error.contains("Corrupt"), "got {error}");
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod mlx_full_ladder {
+        use super::*;
+        use crate::m3_runtime_hub::{
+            fetch_component_catalog, M3Clock, M3ComponentCatalogEntry, M3ComponentChannel,
+            M3ComponentHub, M3ComponentHubDependencies, M3DownloadTransport, M3HardwareProbe,
+            M3HubConfig, M3RuntimeHub, M3RuntimeHubDependencies, ReqwestM3DownloadTransport,
+            M3_COMPONENT_CATALOG_SCHEMA_VERSION, M3_HUB_SCHEMA_VERSION,
+        };
+        use crate::mlx_runtime::tests::{write_test_signed_archive, TestSignatureVerifier};
+        use crate::mlx_runtime::{MlxInstallLimits, MlxPackageInstaller};
+        use crate::runtime_adapter::{HardwareSnapshot, PlatformCapabilities};
+        use sha2::{Digest, Sha256};
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Directory(PathBuf);
+        impl Directory {
+            fn new() -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                let path = std::env::temp_dir().join(format!(
+                    "m3-mlx-ladder-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir_all(&path).expect("test root");
+                Self(path)
+            }
+        }
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        struct Clock(AtomicU64);
+        impl M3Clock for Clock {
+            fn now_ms(&self) -> M3HubResult<u64> {
+                Ok(self.0.fetch_add(1, Ordering::Relaxed))
+            }
+        }
+        struct Hardware;
+        impl M3HardwareProbe for Hardware {
+            fn snapshot(&self) -> M3HubResult<HardwareSnapshot> {
+                Ok(HardwareSnapshot {
+                    captured_at_ms: 1,
+                    total_ram_bytes: 32 << 30,
+                    available_ram_bytes: 24 << 30,
+                    logical_cpu_count: 8,
+                    platform: PlatformCapabilities::from_host("macos", "aarch64", Vec::new()),
+                })
+            }
+        }
+        fn config() -> M3HubConfig {
+            M3HubConfig {
+                schema_version: M3_HUB_SCHEMA_VERSION,
+                storage_quota_bytes: 32 << 20,
+                storage_reserve_bytes: 1 << 20,
+                download_chunk_bytes: 64 << 10,
+                operation_timeout_ms: 10_000,
+                max_catalog_results: 16,
+            }
+        }
+        fn state(root: &Path, download: Arc<dyn M3DownloadTransport>) -> M3CommandState {
+            let runtime = Arc::new(
+                M3RuntimeHub::new(
+                    root.join("runtime"),
+                    config(),
+                    M3RuntimeHubDependencies {
+                        clock: Arc::new(Clock(AtomicU64::new(1))),
+                        hardware: Arc::new(Hardware),
+                        download: download.clone(),
+                        catalogs: Vec::new(),
+                        runtimes: Vec::new(),
+                        runtime_reconciler: None,
+                        lan_factory: None,
+                    },
+                )
+                .expect("runtime hub"),
+            );
+            let components = Arc::new(
+                M3ComponentHub::new(
+                    root.join("components"),
+                    config(),
+                    M3ComponentHubDependencies {
+                        clock: Arc::new(Clock(AtomicU64::new(2))),
+                        download,
+                        sources: Vec::new(),
+                    },
+                )
+                .expect("component hub"),
+            );
+            M3CommandState::new(runtime, components)
+        }
+        fn sha(bytes: &[u8]) -> String {
+            format!("{:x}", Sha256::digest(bytes))
+        }
+        fn entry(url: String, bytes: &[u8], version: &str) -> M3ComponentCatalogEntry {
+            M3ComponentCatalogEntry {
+                schema_version: M3_COMPONENT_CATALOG_SCHEMA_VERSION,
+                source_id: "fixture-mlx".into(),
+                component_id: "mlx-runtime-apple-silicon".into(),
+                kind: M3ComponentKind::MlxRuntime,
+                display_name: "Fixture MLX".into(),
+                accelerator: None,
+                version: version.into(),
+                channel: M3ComponentChannel::Stable,
+                download_url: url,
+                sha256: sha(bytes),
+                size_bytes: bytes.len() as u64,
+                published_at_ms: 1,
+                compatibility_note: None,
+                metadata: BTreeMap::new(),
+            }
+        }
+        fn active_mlx_version(app: &Path) -> String {
+            MlxPackageInstaller::new(
+                app.join("m3").join("runtimes").join("mlx"),
+                Arc::new(TestSignatureVerifier),
+                MlxInstallLimits::default(),
+            )
+            .expect("test MLX installer")
+            .verify_active()
+            .expect("verified active MLX package")
+            .package_version
+        }
+
+        struct Fixture {
+            origin: String,
+            heads: Arc<AtomicUsize>,
+            ranges: Arc<AtomicUsize>,
+            if_ranges: Arc<AtomicUsize>,
+        }
+        impl Fixture {
+            async fn spawn(catalog: Vec<M3ComponentCatalogEntry>, artifact: Vec<u8>) -> Self {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let heads = Arc::new(AtomicUsize::new(0));
+                let ranges = Arc::new(AtomicUsize::new(0));
+                let if_ranges = Arc::new(AtomicUsize::new(0));
+                let asset = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let asset_addr = asset.local_addr().unwrap();
+                let catalog = serde_json::to_vec(&catalog).unwrap();
+                let h = heads.clone();
+                let r = ranges.clone();
+                let i = if_ranges.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut s, _)) = asset.accept().await {
+                        let catalog = catalog.clone();
+                        let artifact = artifact.clone();
+                        let h = h.clone();
+                        let r = r.clone();
+                        let i = i.clone();
+                        tokio::spawn(async move {
+                            let mut b = vec![0; 8192];
+                            let n = s.read(&mut b).await.unwrap_or(0);
+                            let req = String::from_utf8_lossy(&b[..n]);
+                            let first = req.lines().next().unwrap_or("");
+                            let range = req
+                                .lines()
+                                .find(|x| x.to_ascii_lowercase().starts_with("range:"))
+                                .map(|x| x[6..].trim());
+                            let if_range = req
+                                .lines()
+                                .any(|x| x.to_ascii_lowercase().starts_with("if-range:"));
+                            let (status, body, extra) = if first.contains("/catalog.json") {
+                                (
+                                    "200 OK",
+                                    catalog,
+                                    "content-type: application/json\r\n".to_string(),
+                                )
+                            } else if first.starts_with("HEAD") {
+                                h.fetch_add(1, Ordering::Relaxed);
+                                (
+                                    "200 OK",
+                                    artifact.clone(),
+                                    "accept-ranges: bytes\r\netag: \"mlx-fixture\"\r\n".to_string(),
+                                )
+                            } else {
+                                let value = range.unwrap();
+                                r.fetch_add(1, Ordering::Relaxed);
+                                if if_range {
+                                    i.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let start = value
+                                    .trim_start_matches("bytes=")
+                                    .split('-')
+                                    .next()
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap();
+                                let end = (start + 65536).min(artifact.len()) - 1;
+                                ("206 Partial Content", artifact[start..=end].to_vec(), format!("content-range: bytes {start}-{end}/{}\r\netag: \"mlx-fixture\"\r\n", artifact.len()))
+                            };
+                            let response=format!("HTTP/1.1 {status}\r\nconnection: close\r\n{extra}content-length: {}\r\n\r\n", body.len());
+                            let _ = s.write_all(response.as_bytes()).await;
+                            let _ = s.write_all(&body).await;
+                        });
+                    }
+                });
+                let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = origin.local_addr().unwrap();
+                tokio::spawn(async move {
+                    while let Ok((mut s, _)) = origin.accept().await {
+                        tokio::spawn(async move {
+                            let mut b = vec![0; 1024];
+                            let n = s.read(&mut b).await.unwrap_or(0);
+                            let path = String::from_utf8_lossy(&b[..n])
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("/")
+                                .to_string();
+                            let location = format!("http://{asset_addr}{path}");
+                            let response=format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\nconnection: close\r\ncontent-length: 0\r\n\r\n");
+                            let _ = s.write_all(response.as_bytes()).await;
+                        });
+                    }
+                });
+                Self {
+                    origin: format!("http://{addr}"),
+                    heads,
+                    ranges,
+                    if_ranges,
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_to_signed_mlx_runtime_install_is_transactional() {
+            let root = Directory::new();
+            let valid = root.0.join("valid.tar.gz");
+            let bad = root.0.join("bad.tar.gz");
+            write_test_signed_archive(&valid, "mlx-test-v1", true);
+            write_test_signed_archive(&bad, "mlx-test-v2", false);
+            let valid_bytes = fs::read(&valid).unwrap();
+            let bad_bytes = fs::read(&bad).unwrap();
+            let valid_fixture = Fixture::spawn(Vec::new(), valid_bytes.clone()).await;
+            let valid_entry = entry(
+                format!("{}/artifact.tar.gz", valid_fixture.origin),
+                &valid_bytes,
+                "mlx-test-v1",
+            );
+            let catalog_fixture = Fixture::spawn(vec![valid_entry], valid_bytes.clone()).await;
+            let transport = Arc::new(ReqwestM3DownloadTransport::for_loopback_fixture().unwrap());
+            let state = state(&root.0, transport);
+            let context = M3OperationContext::new(10_000);
+            let fetched = fetch_component_catalog(
+                &format!("{}/catalog.json", catalog_fixture.origin),
+                &context,
+            )
+            .await
+            .unwrap();
+            crate::m3_production::merge_component_registry_entries(&state.component_hub, fetched)
+                .unwrap();
+            let adopted =
+                crate::m3_production::component_registry_entries(state.component_hub.root())
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            let app = root.0.join("app");
+            let installed = component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest {
+                    entry: adopted.clone(),
+                },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(installed.active_version_key, adopted.version_key());
+            assert_eq!(active_mlx_version(&app), "mlx-test-v1");
+            assert!(valid_fixture.heads.load(Ordering::Relaxed) >= 1);
+            assert!(valid_fixture.ranges.load(Ordering::Relaxed) >= 3);
+            assert!(valid_fixture.if_ranges.load(Ordering::Relaxed) >= 1);
+            let bad_fixture = Fixture::spawn(Vec::new(), bad_bytes.clone()).await;
+            let bad_entry = entry(
+                format!("{}/artifact.tar.gz", bad_fixture.origin),
+                &bad_bytes,
+                "mlx-test-v2",
+            );
+            let error = component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest {
+                    entry: bad_entry.clone(),
+                },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("signature"));
+            let after = state.component_hub.list_installed().unwrap();
+            assert_eq!(after[0].active_version_key, adopted.version_key());
+            assert!(!after[0]
+                .versions
+                .iter()
+                .any(|v| v.version_key == bad_entry.version_key()));
+            assert_eq!(active_mlx_version(&app), "mlx-test-v1");
+            component_install_impl(
+                &state,
+                "mlx-op".into(),
+                None,
+                M3InstallComponentRequest { entry: adopted },
+                |p| {
+                    crate::m3_production::install_mlx_from_artifact_for_test(
+                        &app,
+                        p,
+                        Arc::new(TestSignatureVerifier),
+                    )
+                    .map(|_| ())
+                },
+            )
+            .await
+            .expect("failed operation releases its id for immediate reuse");
+        }
     }
 }

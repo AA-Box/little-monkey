@@ -34,6 +34,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
+import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
 import { useT } from "../../lib/i18n";
 import { detectShortcutPlatform, shortcutIdForEvent } from "../../lib/shortcuts";
@@ -86,6 +87,8 @@ import { useCustomAgentStore } from "../../store/customAgentStore";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
 import { errorMessage } from "../../lib/errors";
+import { daemonEnsure } from "../../lib/daemonClient";
+import { isExecutionServiceUnavailable } from "../../lib/daemonDesktopTurn";
 
 const MAX_TEXTAREA_HEIGHT_PX = 160;
 
@@ -258,6 +261,12 @@ function activeModelDescription(): string {
   return state.active ? `local:${state.active.name} (${state.llamaStatus})` : `local runtime (${state.llamaStatus}; no model selected)`;
 }
 
+/** How much of a session's transcript exists right now — the evidence for
+ * whether a failed send ever became a turn. */
+function messageCount(sessionId: string): number {
+  return useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.messages.length ?? 0;
+}
+
 export async function switchModelFromSlash(selector: string): Promise<string> {
   const state = useModelStore.getState();
   const providerModelFilters = useSettingsStore.getState().providerModelFilters;
@@ -332,9 +341,12 @@ interface ChatWindowProps {
    * the feature-panel region still runs the command, it just can't reveal the
    * panel. */
   onOpenPmCopilot?: () => void;
+  /** Switches the app to the Studio section — where a running generation the
+   * chip is counting actually lives. Optional like the two above. */
+  onOpenStudio?: () => void;
 }
 
-export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot }: ChatWindowProps) {
+export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsTab, headerActionsSlot, onOpenBackgroundTasks, onOpenPmCopilot, onOpenStudio }: ChatWindowProps) {
   const messages = useSessionStore(selectSessionMessages(sessionId));
   const persistError = useSessionStore((state) => state.persistError);
   const roots = useWorkspaceStore((state) => state.roots);
@@ -353,7 +365,11 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [startingCrew, setStartingCrew] = useState(false);
   const [crewId, setCrewId] = useState<string | null>(null);
   const [ultracodeMode, setUltracodeMode] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // The caught value, not its text: what the banner offers depends on what
+  // failed. A refused turn whose only fault is that the execution service is
+  // down gets a Repair action instead of a Retry that would refuse again.
+  const [error, setError] = useState<unknown>(null);
+  const [repairingService, setRepairingService] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentRef[]>([]);
   const pendingBrowserEvidence = useBrowserWorkbenchStore((state) => state.pendingBySession[sessionId] ?? null);
   const consumeBrowserEvidence = useBrowserWorkbenchStore((state) => state.consumeForChat);
@@ -637,6 +653,21 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     });
   }, [consumeTerminalEvidence, pendingTerminalEvidence, resizeTextarea, sessionId, t]);
 
+  // One finalized spoken utterance, sent as its own turn.
+  //
+  // `utteranceId` is the recognition job's id, minted before the audio was
+  // transcribed, and it travels all the way to the durable ingress row as the
+  // turn's dedupe identity: a submission retried after a timeout lands on the
+  // run the first attempt made instead of starting a second one. Only the
+  // final transcript gets here — partial recognition never becomes a turn.
+  const sendVoiceTurn = useCallback((text: string, utteranceId: string) => {
+    setError(null);
+    void runAgentTurn(sessionId, text, [], undefined, utteranceId, [], [], false, null, "voice")
+      .catch((err: unknown) => {
+        setError(err);
+      });
+  }, [sessionId]);
+
   // The separately-capability-scoped companion overlay never writes session
   // state directly. Rust emits its explicit context only to the main window;
   // the currently active primary composer accepts it here for user review
@@ -646,6 +677,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     let unlisten: (() => void) | null = null;
     void companionClient.onCompose((payload) => {
       if (useSessionStore.getState().activeSessionId !== sessionId) return;
+      // A finalized hands-free utterance is a turn the operator already made,
+      // out loud. It becomes a durable `voice` ingress turn under the
+      // recognition job's own id, rather than text waiting in the box — see
+      // `sendVoiceTurn`. Everything else still waits for Send.
+      if (payload.utteranceId) {
+        sendVoiceTurn(payload.text, payload.utteranceId);
+        return;
+      }
       setInput(payload.text);
       if (payload.imageDataUrl) {
         setAttachments((current) => [
@@ -670,7 +709,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       disposed = true;
       unlisten?.();
     };
-  }, [resizeTextarea, sessionId]);
+  }, [resizeTextarea, sendVoiceTurn, sessionId]);
 
   const loadWorkspacePaths = useCallback((): Promise<MentionEntry[]> => {
     if (workspacePathsRef.current) return Promise.resolve(workspacePathsRef.current);
@@ -765,7 +804,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         textareaRef.current?.focus();
       });
     } catch (caught) {
-      setError(errorMessage(caught));
+      setError(caught);
     }
   }, [resizeTextarea, t]);
 
@@ -787,9 +826,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // draws `skillInvocations` from) lets the turn's `skill` tool auto-invoke
     // any skill not already explicitly invoked above — see
     // `settingsStore.skillAutoInvokeEnabled`.
+    const messagesBefore = messageCount(sessionId);
     void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
       .catch((err: unknown) => {
-        setError(errorMessage(err));
+        setError(err);
+        // A send refused before it was accepted — an unavailable resident
+        // runner is the usual reason — leaves nothing behind: no transcript
+        // entry, no durable turn, no run. The typed message is the only thing
+        // that would be lost, so it goes back in the box, and pressing Send
+        // again once the runner is up is the same send rather than a retyped
+        // one. A turn that got far enough to write to the transcript owns its
+        // own failure and the composer stays as the user left it.
+        if (messageCount(sessionId) !== messagesBefore) return;
+        setInput((current) => current || text);
+        setAttachments((current) => (current.length > 0 ? current : pendingAttachments));
       })
       .finally(() => {
         textareaRef.current?.focus();
@@ -1012,7 +1062,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(errorMessage(err));
+        setError(err);
       } finally {
         setStartingCrew(false);
         textareaRef.current?.focus();
@@ -1028,7 +1078,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         setAttachments([]);
         requestAnimationFrame(resizeTextarea);
       } catch (err) {
-        setError(errorMessage(err));
+        setError(err);
       } finally {
         setStartingComparison(false);
         textareaRef.current?.focus();
@@ -1048,6 +1098,22 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     stopTurn(sessionId);
   }, [sessionId]);
 
+  // A turn refused for want of the execution service leaves nothing behind
+  // (see `sendTurn`): the typed message went back in the composer, so the
+  // repair only has to clear the banner — the send is the user's again, with
+  // exactly the text they wrote.
+  const serviceRepairNeeded = isExecutionServiceUnavailable(error);
+  const handleRepairService = useCallback(() => {
+    setRepairingService(true);
+    daemonEnsure()
+      .then(() => { setError(null); })
+      .catch((repairError: unknown) => { setError(repairError); })
+      .finally(() => {
+        setRepairingService(false);
+        textareaRef.current?.focus();
+      });
+  }, []);
+
   const handleEditMessage = useCallback(
     (index: number, newText: string) => {
       if (sending || preparingTurnRef.current) return;
@@ -1062,7 +1128,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           sendTurn(newText, [], skillInvocations);
         })
         .catch((turnError: unknown) => {
-          setError(errorMessage(turnError));
+          setError(turnError);
         })
         .finally(() => {
           preparingTurnRef.current = false;
@@ -1138,7 +1204,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         sendTurn(text, imageAttachments, skillInvocations, ultracodeMode);
       })
       .catch((turnError: unknown) => {
-        setError(errorMessage(turnError));
+        setError(turnError);
       })
       .finally(() => {
         preparingTurnRef.current = false;
@@ -1427,19 +1493,28 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
         onStartSideTask={handleStartSideTask}
         onEditGeneratedImage={handleEditGeneratedImage}
         onOpenBackgroundTasks={onOpenBackgroundTasks}
+        onOpenSettingsTab={onOpenSettingsTab}
       />
 
-      {error && (
+      {error !== null && (
         <div className="mx-4 mb-2">
           <div className="mx-auto flex max-w-3xl items-center justify-between gap-3 rounded-lg border border-danger bg-danger-soft px-3 py-2 text-sm text-danger">
-            <span className="min-w-0 break-words">{error}</span>
+            <span className="min-w-0 break-words">
+              {serviceRepairNeeded ? t("ChatWindow.executionServiceDown") : errorMessage(error)}
+            </span>
+            {/* Retrying a turn the execution service refused just refuses
+                again, so the same slot repairs the service instead. */}
             <button
               type="button"
-              onClick={compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
-              disabled={sending || preparingTurn || startingComparison || startingCrew}
+              onClick={serviceRepairNeeded
+                ? handleRepairService
+                : compareTargets.length >= 2 || crewId ? handleSend : handleRetry}
+              disabled={sending || preparingTurn || startingComparison || startingCrew || repairingService}
               className="shrink-0 cursor-pointer rounded-md border border-danger px-2 py-0.5 text-xs transition-colors hover:bg-danger hover:text-danger-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {t("ChatWindow.retryButton")}
+              {serviceRepairNeeded
+                ? repairingService ? t("ChatWindow.repairingService") : t("ChatWindow.repairServiceButton")
+                : t("ChatWindow.retryButton")}
             </button>
           </div>
         </div>
@@ -1455,7 +1530,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
 
       <TaskSuggestionChips sessionId={sessionId} />
 
-      <RunningTasksChip onClick={onOpenBackgroundTasks} />
+      <RunningTasksChip onClick={onOpenBackgroundTasks} onOpenStudio={onOpenStudio} />
 
       <div className="relative shrink-0 bg-background px-4 py-3">
         <SideChatPanel sessionId={sessionId} />
@@ -1512,6 +1587,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                       name={name}
                       isDir={attachment.isDir}
                       previewUrl={attachment.kind === "image" ? attachment.dataUrl : undefined}
+                      // Inline-content attachments (terminal evidence) carry a
+                      // synthetic path — nothing to reveal on disk.
+                      revealPath={attachment.content === undefined ? attachment.path : undefined}
                       onRemove={() => handleRemoveAttachment(attachment.path)}
                     />
                   );
@@ -1552,15 +1630,26 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </div>
                 )}
               </div>
-              <button
-                type="button"
-                onClick={sending ? handleStop : handleSend}
-                disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
-                aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
-                className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-              >
-                {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
-              </button>
+              <span className="group/action relative shrink-0">
+                <button
+                  type="button"
+                  onClick={sending ? handleStop : handleSend}
+                  disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
+                  aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
+                  className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                >
+                  {sending ? <Square size={13} className="fill-current" /> : <CornerDownLeft size={16} />}
+                </button>
+                {/* The one control in the composer whose effect is worth
+                    spelling out: stopping mid-turn keeps what already
+                    streamed rather than discarding the exchange. */}
+                {sending && (
+                  <Tooltip
+                    text={t("ChatWindow.stopResponseAriaLabel")}
+                    hint={t("ChatWindow.stopResponseHint")}
+                  />
+                )}
+              </span>
             </div>
           </div>
         </div>

@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Activity, Columns2, FileDiff, FolderTree, GitPullRequest, Globe2, ListTodo, Maximize2, Minimize2, PanelRight, Plus, SquareTerminal, X } from "lucide-react";
 
 import ChatSessionList from "./components/Chat/ChatSessionList";
+import ExternalConversationView from "./components/Chat/ExternalConversationView";
+import { useExternalConversationStore } from "./store/externalConversationStore";
 import { StudioNav, type StudioMode } from "./components/Studio/StudioNav";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
@@ -110,6 +112,7 @@ import {
   SpreadsheetCopilotPanel,
   StudioPanel,
   SyntheticMonitoringPanel,
+  TalkPanel,
   TerminalPanel,
   TrustScorecardsPanel,
   VisualEditModePanel,
@@ -254,6 +257,10 @@ function App() {
   const activeCrewSessionId = useSessionStore((s) =>
     s.sessions.find((session) => session.id === s.activeSessionId)?.crewRun ? s.activeSessionId : null
   );
+  // A conversation from another environment (a paired phone, a messaging
+  // thread) takes the main pane in place of the chat, exactly like a
+  // comparison or a crew run does.
+  const externalConversation = useExternalConversationStore((s) => s.selected);
   const newSession = useSessionStore((s) => s.newSession);
   const switchSession = useSessionStore((s) => s.switchSession);
   const splitSessionId = useSessionStore((s) => s.splitSessionId);
@@ -342,6 +349,7 @@ function App() {
   const dbAdminGuardrailsOpen = activeFeaturePanel === "db-admin-guardrails";
   const apiContractDiffLabOpen = activeFeaturePanel === "api-contract-diff-lab";
   const workflowTestHarnessOpen = activeFeaturePanel === "workflow-test-harness";
+  const talkOpen = activeFeaturePanel === "talk";
   useEffect(() => {
     if (settingsOpen) setSettingsMounted(true);
   }, [settingsOpen]);
@@ -1084,6 +1092,7 @@ function App() {
             setTerminalOpen(false);
             restartOnboarding();
           }}
+          onOpenTalk={() => openFeaturePanel("talk")}
           onOpenDailyBrief={() => openFeaturePanel("daily-brief")}
           onOpenApiContractDiffLab={() => openFeaturePanel("api-contract-diff-lab")}
           onOpenGoldenDatasetBuilder={() => openFeaturePanel("golden-dataset-builder")}
@@ -1128,9 +1137,19 @@ function App() {
           }
         >
           <Suspense fallback={<LazyPanelFallback />}>
-            {section === "studio" ? (
+            {/* Studio stays mounted while Chat is shown. The RUN survives a
+                switch on its own now (`studioRunStore.ts` owns it), but the
+                composer around it does not: prompt, init image, painted mask
+                and outpaint history are this panel's state, and unmounting
+                would throw all of it away mid-edit. */}
+            <div
+              className={
+                section === "studio" ? "flex min-h-0 flex-1 flex-col" : "hidden"
+              }
+            >
               <StudioPanel mode={studioMode} railSlot={studioRail} />
-            ) : globalSearchOpen ? (
+            </div>
+            {section === "studio" ? null : globalSearchOpen ? (
               <GlobalSearch
                 onClose={() => closeFeaturePanel("global-search")}
                 onOpenRun={(runId) => {
@@ -1165,6 +1184,13 @@ function App() {
                 }}
                 onOpenAgentInbox={() => openFeaturePanel("agent-inbox")}
                 onOpenSettingsTab={openSettingsTab}
+              />
+            ) : talkOpen ? (
+              <TalkPanel
+                sessionId={activeSessionId}
+                onClose={() => closeFeaturePanel("talk")}
+                onReturnToChat={() => closeFeaturePanel("talk")}
+                onOpenVoiceSettings={() => openSettingsTab("companion")}
               />
             ) : dataNotebookOpen ? (
               <DataNotebookPanel onClose={() => closeFeaturePanel("data-notebook")} />
@@ -1269,6 +1295,10 @@ function App() {
               <CompareView groupId={activeComparisonId} />
             ) : activeCrewSessionId ? (
               <CrewView sessionId={activeCrewSessionId} />
+            ) : externalConversation ? (
+              // A session from another environment — a paired phone, a
+              // messaging thread. Read-only; see `ExternalConversationView`.
+              <ExternalConversationView selection={externalConversation} />
             ) : (
               <ChatWindow
                 sessionId={activeSessionId}
@@ -1277,6 +1307,7 @@ function App() {
                 headerActionsSlot={chatHeaderActionsEl}
                 onOpenBackgroundTasks={openBackgroundTasksPanel}
                 onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
+                onOpenStudio={() => setSection("studio")}
               />
             )}
           </Suspense>
@@ -1314,6 +1345,7 @@ function App() {
                   onOpenSettingsTab={openSettingsTab}
                   onOpenBackgroundTasks={openBackgroundTasksPanel}
                   onOpenPmCopilot={() => openFeaturePanel("pm-copilot")}
+                  onOpenStudio={() => setSection("studio")}
                 />
               )}
             </Suspense>

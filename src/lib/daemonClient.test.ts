@@ -88,6 +88,26 @@ describe("remote pairing policy", () => {
     expect(warnings).toHaveLength(7);
     expect(warnings.some((warning) => warning.includes("view-runs"))).toBe(true);
   });
+
+  it("checks device hardware grants against the node's own rules", () => {
+    expect(
+      validateRemotePairRequest({
+        ...pair,
+        deviceCapabilities: ["camera_capture", "location_read"],
+      }),
+    ).toEqual([]);
+    expect(
+      validateRemotePairRequest({ ...pair, deviceCapabilities: ["root_access"] }),
+    ).toContain("Unknown device hardware capability.");
+    // A stream that is the only microphone grant would survive withdrawing
+    // microphone capture, which is exactly what the node refuses.
+    expect(
+      validateRemotePairRequest({ ...pair, deviceCapabilities: ["voice_stream"] }),
+    ).toContain("Streaming voice also requires microphone_capture.");
+    // Hardware grants are opt-in: an invitation that names none is still valid
+    // and simply cannot reach any hardware.
+    expect(validateRemotePairRequest({ ...pair, deviceCapabilities: [] })).toEqual([]);
+  });
 });
 
 describe("K8 backpressure signal", () => {

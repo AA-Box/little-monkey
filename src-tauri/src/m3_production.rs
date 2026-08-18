@@ -95,6 +95,16 @@ const MAX_INFERENCE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 static KEYCHAIN_SERVICE: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| crate::profiles::keychain_service("com.littlemonkey.m3-lan"));
 const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
+/// The component catalog this project publishes for its own artifacts.
+///
+/// A rolling release tag whose single asset is re-uploaded in place by the MLX
+/// packaging workflow, so this URL is stable across component versions while
+/// its contents move. Shipping it is what makes a published component reachable
+/// without the user first downloading a JSON file by hand and importing it;
+/// what it lists is still only installable after the digest and, for a signed
+/// component, the pinned publisher key both check out.
+pub const DEFAULT_COMPONENT_CATALOG_URL: &str =
+    "https://github.com/AA-Box/little-monkey/releases/download/mlx-catalog/mlx-catalog.json";
 #[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
 #[cfg(target_os = "macos")]
@@ -1283,6 +1293,52 @@ fn load_component_sources(root: &Path) -> M3HubResult<Vec<Arc<dyn M3ComponentSou
     component_sources_from_entries(&component_registry_entries(root)?)
 }
 
+/// Folds `incoming` into whatever the registry holds **right now** and persists
+/// the result.
+///
+/// # Why the merge is here and not in the panel
+///
+/// [`replace_component_registry_entries`] swaps the whole file, so adopting a
+/// catalog has to be a read-modify-write. Done in the frontend that is a lost
+/// update waiting to happen, and the window is not theoretical: opening the
+/// Components panel starts a registry load and a catalog fetch at the same time,
+/// so the fetch's merge could read a registry state older than the one already on
+/// disk and write it back — deleting a locally registered component to add a
+/// published one. Reading the file inside the same critical section that writes it
+/// closes that: the only state a merge can be based on is the state it is about to
+/// replace.
+///
+/// The caller holds the command-level mutation lock (see
+/// `m3_commands::m3_component_sync_catalog`), which is what makes "read, merge,
+/// write" one step against every other registry mutation in the app.
+///
+/// Incoming entries win a key collision, which is how a publisher corrects a note
+/// or a URL for a version already registered. Identity is
+/// [`M3ComponentCatalogEntry::registry_key`] — the backend's one definition, so a
+/// fetched catalog and an imported file cannot be adopted by two subtly different
+/// rules.
+pub fn merge_component_registry_entries(
+    hub: &M3ComponentHub,
+    incoming: Vec<M3ComponentCatalogEntry>,
+) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
+    let held = component_registry_entries(hub.root())?;
+    // A `BTreeMap` rather than insertion order: the file is rewritten on every
+    // adoption, and a stable order is what keeps two idempotent syncs from
+    // producing two different files. `list_registry` sorts for display anyway.
+    let mut merged: BTreeMap<String, M3ComponentCatalogEntry> = held
+        .into_iter()
+        .map(|entry| (entry.registry_key(), entry))
+        .collect();
+    // Restamped first, so a key is computed from the entry as it will be stored.
+    // `registry_key` does not read `source_id`, but computing it before and after
+    // the same rewrite is the kind of difference that stops being harmless the
+    // moment someone adds a field to it.
+    for entry in adopt_into_registry(incoming) {
+        merged.insert(entry.registry_key(), entry);
+    }
+    replace_component_registry_entries(hub, merged.into_values().collect())
+}
+
 /// Replaces the local component registry file and the hub's in-memory
 /// sources together, mirroring `replace_catalog_source_configs`'s
 /// validate-then-atomically-publish shape.
@@ -1791,10 +1847,7 @@ impl CapabilityCheckedInferenceEngine {
         request: &CanonicalInferenceRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
         let inventory = self
             .adapter
@@ -1845,10 +1898,7 @@ impl CapabilityCheckedInferenceEngine {
         request: &CanonicalEmbeddingRequest,
         context: &M3OperationContext,
     ) -> M3HubResult<()> {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         let runtime_context = RuntimeOperationContext::new(limits, context.cancellation.clone());
         let inventory = self
             .adapter
@@ -3248,10 +3298,7 @@ impl ProductionMlxServiceController {
     }
 
     fn runtime_context(context: &MlxOperationContext) -> RuntimeOperationContext {
-        let limits = RuntimeOperationLimits {
-            timeout_ms: context.timeout_ms,
-            ..RuntimeOperationLimits::default()
-        };
+        let limits = RuntimeOperationLimits::with_timeout_ms(context.timeout_ms);
         RuntimeOperationContext::new(limits, context.cancellation.clone())
     }
 
@@ -3951,6 +3998,19 @@ pub fn install_mlx_from_artifact(
     app_data_dir: &Path,
     artifact_path: &Path,
 ) -> M3HubResult<MlxInstalledPackageView> {
+    install_mlx_from_artifact_with_verifier(
+        app_data_dir,
+        artifact_path,
+        Arc::new(ProductionMlxSignatureVerifier),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_mlx_from_artifact_with_verifier(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+    verifier: Arc<dyn MlxSignatureVerifier>,
+) -> M3HubResult<MlxInstalledPackageView> {
     let limits = MlxInstallLimits::default();
     let staging = std::env::temp_dir().join(format!("mlx-unpack-{}", uuid::Uuid::new_v4()));
     let unpacked = (|| {
@@ -3964,7 +4024,13 @@ pub fn install_mlx_from_artifact(
             return Err(M3HubError::Runtime(error.to_string()));
         }
     };
-    let installed = production_mlx_installer(&app_data_dir.join(M3_DIRECTORY))?
+    let installer = MlxPackageInstaller::new(
+        app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx"),
+        verifier,
+        limits,
+    )
+    .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installed = installer
         .install_and_activate(&bundle, &MlxHostCapabilities::current())
         .map_err(|error| M3HubError::Runtime(error.to_string()));
     let _ = fs::remove_dir_all(&staging);
@@ -3973,6 +4039,15 @@ pub fn install_mlx_from_artifact(
         package_version: installed.package_version,
         manifest_sha256: installed.manifest_sha256,
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn install_mlx_from_artifact_for_test(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+    verifier: Arc<dyn MlxSignatureVerifier>,
+) -> M3HubResult<MlxInstalledPackageView> {
+    install_mlx_from_artifact_with_verifier(app_data_dir, artifact_path, verifier)
 }
 
 #[cfg(target_os = "macos")]

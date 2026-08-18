@@ -285,6 +285,19 @@ describe("who delivers what", () => {
     remote_run: false,
     // Cancelling a node means cancelling its run, which is a different request.
     workflow_node: false,
+    // Both own a real OS process, and the Rust side that spawned it is what
+    // signals it: a foreground shell through its resource controller, a browser
+    // session through its worker. Claiming delivery here would latch an intent
+    // this window has no primitive to act on.
+    foreground_shell: false,
+    browser_session: false,
+    // Each is one blocking step of the turn that started it: the turn's own
+    // cancellation ends the command and reclaims its tree, and nothing reads a
+    // latch between the spawn and the wait. `ProcessKind::signal_support` refuses
+    // them for exactly that reason.
+    verify_command: false,
+    hook_command: false,
+    sandbox_run: false,
   } satisfies Record<ProcessKind, boolean>;
 
   it("scopes the sweep to exactly the kinds it can deliver to", () => {
@@ -498,6 +511,37 @@ describe("cooperative pause delivery", () => {
     );
 
     expect(outcome).toBe("no-live-target");
+  });
+
+  /**
+   * The resume could not be handed to the durable backend at all, so it has not
+   * been delivered — reporting it as delivered would be this module's own
+   * version of the lie above. The frozen image, the suspended row and the
+   * Resume's request id are all intact, so the next sweep sends the identical
+   * request rather than a second one.
+   */
+  it("reports a resume the durable backend never took as still pending", async () => {
+    resumeFrozenTurnMock.mockResolvedValue("deferred");
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-frozen", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("deferred");
+  });
+
+  /** A resume that threw on the way to the backend is the same case: nothing is
+   * known, so nothing is claimed. */
+  it("reports a resume that failed on the way out as still pending", async () => {
+    resumeFrozenTurnMock.mockRejectedValue(new Error("the bridge is gone"));
+
+    const outcome = await deliverProcessSignal(
+      record({ kind: "chat_turn", externalId: "ext-frozen", state: "suspended" }),
+      MAIN,
+    );
+
+    expect(outcome).toBe("deferred");
   });
 
   /** Only a chat turn writes an image: the freeze is the agent loop's own safe

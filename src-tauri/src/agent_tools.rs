@@ -214,6 +214,122 @@ pub fn present_plan_tool_def() -> serde_json::Value {
     })
 }
 
+/// The agent's provider-independent messaging tool.
+///
+/// By default it answers the conversation the run came from: with every
+/// optional field omitted, the destination is the origin the daemon durably
+/// recorded for this run, so the message being answered cannot redirect the
+/// reply. `account`/`to`/`thread`/`reply_to` may name another destination,
+/// but each is honored only when the run's immutable permission snapshot
+/// granted it — naming an account id is not authority to use it, and the
+/// tool refuses rather than prompts when the grant is absent.
+///
+/// Like [`present_plan_tool_def`], excluded from [`tool_definitions`]'s base
+/// array: a run with no channel origin and no cross-send grant has nowhere to
+/// send anything, and offering the tool there would only invite a failed call.
+pub fn send_message_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message over a configured messaging channel. With no destination fields it replies to the conversation this run came from. Destinations other than that conversation work only if this run was explicitly granted them. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The message to send. May be omitted when 'artifacts' names at least one file to send on its own." },
+                    "account": { "type": "string", "description": "Optional configured account id to send through. Defaults to the account this run's conversation arrived on." },
+                    "to": { "type": "string", "description": "Optional destination conversation id. Defaults to the conversation this run came from." },
+                    "thread": { "type": "string", "description": "Optional provider thread id inside the destination conversation." },
+                    "reply_to": { "type": "string", "description": "Optional provider message id to reply to. Defaults to the message that produced this run when replying to it." },
+                    "artifacts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional durable artifact ids of stored files to send, such as an image this conversation received earlier. Files travel only by artifact id — there is no path parameter."
+                    }
+                },
+                // Nothing is unconditionally required: a message may be text,
+                // files, or both, and the daemon refuses the empty case. A
+                // schema demanding `text` would make an image reply
+                // impossible to express, which is a contract the send path
+                // has always accepted.
+                "required": [],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// The agent's peer tool, offered only when the operator has paired this
+/// installation with at least one other as a peer.
+///
+/// Excluded from [`tool_definitions`] for the same reason
+/// [`send_message_tool_def`] is: an installation with no peers has nowhere to
+/// send anything. The destination is an alias the operator chose — there is no
+/// parameter for an address, so the set of places this tool can reach is
+/// exactly the set the operator already paired with.
+pub fn peer_message_tool_def(aliases: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "peer_message",
+            "description": format!(
+                "Send a message or a task request to another Little Monkey installation the operator paired with. Available peers: {}. The peer decides what to do with it under its own permissions. Requires user permission.",
+                aliases.join(", ")
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "peer": { "type": "string", "description": "The peer's alias.", "enum": aliases },
+                    "text": { "type": "string", "description": "What to say or ask for." },
+                    "thread": { "type": "string", "description": "An existing thread id to continue. Omit to start a new one." },
+                    "task": { "type": "boolean", "description": "True to ask the peer to do work rather than just saying something." },
+                    "correlation": { "type": "string", "description": "Your own handle for this request, returned with the peer's result so a later turn can match them up." },
+                    // Ids from this installation's own content store, never
+                    // paths: the tool hands the bytes over and the peer stores
+                    // them itself, so nothing here can name a file on disk.
+                    "artifacts": {
+                        "type": "array",
+                        "description": "Artifact ids from this run's own outputs to hand over. Requires the peer to have granted artifact exchange.",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["peer", "text"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// The agent's outbound call tool, offered only on a run whose telephony
+/// account permits dialing out.
+///
+/// A phone call reaches a person who did not ask to be reached and bills the
+/// operator, so this is the most tightly held tool in the set: the account is
+/// named explicitly, the number must be in international format, and the
+/// account's own outbound policy can refuse in a way no approval prompt
+/// overrides. Excluded from [`tool_definitions`] for the same reason
+/// [`send_message_tool_def`] is — a run with no telephony account has nothing
+/// to dial with.
+pub fn place_call_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "place_call",
+            "description": "Place a phone call from one of the operator's configured numbers. Calls cost money and reach a real person; only call this when the user has asked for it. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account_id": { "type": "string", "description": "The telephony account to call from." },
+                    "to_number": { "type": "string", "description": "The number to call, in international format, e.g. +15551234567." },
+                    "opening_line": { "type": "string", "description": "What to say as soon as the call connects — who is calling and why. A call cannot open with silence." }
+                },
+                "required": ["account_id", "to_number", "opening_line"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
 /// The agent's read-only knowledge-stack retrieval tool (RAG design doc
 /// slice 4, `monkey-cli` parity) — a Rust port of `src/lib/tools.ts`'s
 /// `search_docs` `ToolDef`. Like [`present_plan_tool_def`] above,
@@ -241,6 +357,59 @@ pub fn search_docs_tool_def(stack_names: &[String]) -> serde_json::Value {
                     "max_results": { "type": "integer", "description": "Maximum number of results to return (default 6)." }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }
+        }
+    })
+}
+
+/// The `device_action` tool — asks a paired physical device for one bounded
+/// thing.
+///
+/// Like [`present_plan_tool_def`] and [`search_docs_tool_def`], deliberately
+/// excluded from [`tool_definitions`]'s base array: it is appended only when
+/// this machine actually has a paired device with an effective physical
+/// capability. A model that is offered a camera it cannot reach will try to use
+/// one, and the honest failure ("no paired device can do this") is a worse
+/// answer than never having offered it.
+///
+/// `voice_stream` is absent on purpose. A continuous stream is not a discrete
+/// command, and routing it through this tool would spend a grant meant for the
+/// Talk surface.
+pub fn device_action_tool_def() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "device_action",
+            "description": "Ask a paired phone or tablet to do one bounded thing with its own hardware and return the result. Every action needs the operator's grant, the device's support, and the device's OS permission; anything else is refused with a reason. The device shows what it is doing. Requires user permission.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "device_info",
+                            "camera_capture",
+                            "microphone_capture",
+                            "location_read",
+                            "notification_post",
+                            "screen_capture",
+                            "audio_playback"
+                        ],
+                        "description": "device_info reads the device's own platform and capabilities. camera_capture takes one still. microphone_capture records for a bounded time. location_read takes one fix (never continuous tracking). notification_post shows a notification. screen_capture captures the screen, and needs the device to have armed screen sharing first. audio_playback either plays a stored run artifact on the device or speaks text aloud."
+                    },
+                    "device_id": { "type": "string", "description": "Which paired device. Omit when exactly one device can perform this action; if several can, the call fails and lists them." },
+                    "position": { "type": "string", "enum": ["front", "back"], "description": "camera_capture only. Defaults to back." },
+                    "duration_ms": { "type": "integer", "description": "microphone_capture only: how long to record, 1-300000 ms. Defaults to 10000." },
+                    "accuracy": { "type": "string", "enum": ["coarse", "precise"], "description": "location_read only. Defaults to coarse." },
+                    "title": { "type": "string", "description": "notification_post only: up to 128 characters." },
+                    "body": { "type": "string", "description": "notification_post only: up to 512 characters." },
+                    "text": { "type": "string", "description": "audio_playback only: what to speak, up to 1024 characters. Use this or run_id + artifact_id, never both." },
+                    "run_id": { "type": "string", "description": "audio_playback only: the run an audio artifact belongs to. The device fetches it over its own paired connection, so it also needs the read_artifacts grant." },
+                    "artifact_id": { "type": "string", "description": "audio_playback only: which audio artifact of that run to play." },
+                    "wait_ms": { "type": "integer", "description": "How long to wait for the device before returning, 1000-120000 ms (default 60000). A device that is asleep may answer later; the result then says the command is still queued or running rather than that it failed." }
+                },
+                "required": ["action"],
                 "additionalProperties": false
             }
         }
@@ -286,4 +455,87 @@ pub fn task_tool_def() -> serde_json::Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The peer tool's whole safety story is what it *cannot* be asked to do.
+    ///
+    /// A model reading a peer's own words is being read instructions by a
+    /// stranger. It must not be possible to talk it into contacting somewhere
+    /// new, authenticating as something else, or reaching a file — so there is
+    /// no parameter for any of it, the alias is an enumeration of pairings the
+    /// operator made, and nothing else may be passed at all.
+    #[test]
+    fn the_peer_tool_can_only_name_a_pairing_the_operator_already_made() {
+        let definition = peer_message_tool_def(&["studio".to_string(), "server".to_string()]);
+        let parameters = &definition["function"]["parameters"];
+        let properties = parameters["properties"]
+            .as_object()
+            .expect("parameters are an object");
+
+        let mut names: Vec<&str> = properties.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["artifacts", "correlation", "peer", "task", "text", "thread"],
+            "the peer tool grew a parameter"
+        );
+        for forbidden in [
+            "host",
+            "url",
+            "endpoint",
+            "token",
+            "secret",
+            "certificate",
+            "fingerprint",
+            "path",
+            "file",
+            "workspace",
+            "model",
+            "tool",
+            "permission",
+            "permission_mode",
+            "device",
+            "phone",
+            "number",
+            "route",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "'{forbidden}' must not be a peer_message parameter"
+            );
+        }
+        // Nothing may be smuggled past the schema either.
+        assert_eq!(parameters["additionalProperties"], false);
+        // And the destination is a pairing, not a string a model composes.
+        assert_eq!(
+            definition["function"]["parameters"]["properties"]["peer"]["enum"],
+            serde_json::json!(["studio", "server"])
+        );
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["peer", "text"]),
+            "a peer message needs a destination and something to say, and nothing else"
+        );
+    }
+
+    /// An installation with no peers is not offered the tool at all, so the
+    /// alias enumeration can never be empty on a live definition.
+    #[test]
+    fn the_peer_tool_is_not_part_of_the_default_set() {
+        let definitions = tool_definitions();
+        let names: Vec<String> = definitions
+            .as_array()
+            .expect("the tool set is an array")
+            .iter()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !names.contains(&"peer_message".to_string()),
+            "peer_message is offered only when a peer exists"
+        );
+    }
 }

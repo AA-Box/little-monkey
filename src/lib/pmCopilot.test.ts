@@ -34,7 +34,7 @@ const PROVIDER: ProviderConfig = {
   label: "Test Provider",
   base_url: "https://provider.test/v1",
   is_custom: false,
-  has_key: true,
+  has_key: true, is_extension: false
 };
 const PROVIDER_MODEL: ProviderModelInfo = { id: "test-model" };
 

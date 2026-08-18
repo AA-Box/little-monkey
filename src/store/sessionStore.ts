@@ -405,6 +405,20 @@ export interface SessionStore {
   /** Session ids currently executing a verification command, mapped to that
    * command's label — see `setRunningVerifyLabel`. Never persisted. */
   runningVerifyLabel: Record<string, string>;
+  /** How the last turn of an OFF-SCREEN session ended, keyed by session —
+   * what the sidebar's status dot reads to say "finished" vs "failed" for a
+   * conversation the user has since navigated away from. Only recorded for
+   * sessions in neither pane (a turn you watched finish needs no badge) and
+   * cleared the moment one is opened. Never persisted: a badge that outlives
+   * the app would point at an outcome the user can no longer act on. */
+  turnOutcomes: Record<string, "done" | "error">;
+  /** `turnId -> sessionId` for every turn in flight in this window, so a
+   * permission prompt (which arrives from Rust carrying only its `turn_id`)
+   * can be attributed to the conversation it blocks. Registered by
+   * `runAgentTurn` alongside `runningTurns` and dropped in the same finally;
+   * a subagent's prompts resolve through it too, since they borrow the
+   * parent turn's id. Never persisted. */
+  turnSessions: Record<string, string>;
   /** Last file-persistence failure, surfaced in the UI (ChatWindow banner)
    * instead of silently dropping history; cleared by the next successful
    * save. */
@@ -541,6 +555,15 @@ export interface SessionStore {
   /** Record whether an agent turn is in flight for `sessionId` — called
    * only by `runAgentTurn` (start/finally). */
   markTurnRunning: (sessionId: string, running: boolean) => void;
+  /** Record how a turn ended for the sidebar's status dot — called by
+   * `runAgentTurn`'s finally. A no-op when the session is on screen in
+   * either pane, and when the turn was cancelled by the user (they already
+   * know how that one ended). */
+  noteTurnOutcome: (sessionId: string, outcome: "done" | "error") => void;
+  /** Record (or, with a null `sessionId`, drop) which session `turnId` is
+   * running in — called by `runAgentTurn` around the same boundaries as
+   * `markTurnRunning`. */
+  markTurnSession: (turnId: string, sessionId: string | null) => void;
   /** Sets (or clears with `null`) the label of the verification command
    * currently executing for `sessionId` — called only by
    * `runVerificationPhase` (agentLoop.ts), around each `verify_run` invoke,
@@ -628,6 +651,18 @@ export function sessionDisplayTitle(session: ChatSession): string {
     entry.locale.toLowerCase() === locale && entry.originalTitle === session.title,
   );
   return translation?.translatedTitle ?? session.title;
+}
+
+/** Drops `id`'s status-dot outcome (opening a session is seeing it), or
+ * returns the same map when there was nothing to drop. */
+function seenTurnOutcome(
+  outcomes: Record<string, "done" | "error">,
+  id: string,
+): Record<string, "done" | "error"> {
+  if (!(id in outcomes)) return outcomes;
+  const next = { ...outcomes };
+  delete next[id];
+  return next;
 }
 
 /** Zustand selector: whether an agent turn is in flight for `sessionId`. */
@@ -1748,7 +1783,26 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
   runningSyntheses: {},
   runningCrews: {},
   runningVerifyLabel: {},
+  turnOutcomes: {},
+  turnSessions: {},
   persistError: null,
+
+  markTurnSession: (turnId, sessionId) => {
+    set((state) => {
+      if (sessionId) return { turnSessions: { ...state.turnSessions, [turnId]: sessionId } };
+      if (!(turnId in state.turnSessions)) return state;
+      const turnSessions = { ...state.turnSessions };
+      delete turnSessions[turnId];
+      return { turnSessions };
+    });
+  },
+
+  noteTurnOutcome: (sessionId, outcome) => {
+    set((state) => {
+      if (sessionId === state.activeSessionId || sessionId === state.splitSessionId) return state;
+      return { turnOutcomes: { ...state.turnOutcomes, [sessionId]: outcome } };
+    });
+  },
 
   markTurnRunning: (sessionId, running) => {
     set((state) => {
@@ -1824,7 +1878,13 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
     // would put one transcript in both panes (see `openSplit`) — the split
     // pane closes instead, as if its content moved to the primary pane.
     const splitSessionId = state.splitSessionId === id ? null : state.splitSessionId;
-    set({ sessions, activeSessionId: id, splitSessionId, messages: sessions.find((s) => s.id === id)!.messages });
+    set({
+      sessions,
+      activeSessionId: id,
+      splitSessionId,
+      turnOutcomes: seenTurnOutcome(state.turnOutcomes, id),
+      messages: sessions.find((s) => s.id === id)!.messages,
+    });
   },
 
   deleteSession: (id) => {
@@ -2476,10 +2536,11 @@ export const useSessionStore = create<SessionStore>((set, get) => ({
       // each run turns into one transcript concurrently, interleaving their
       // streamed updates. Opening the active session is a silent no-op.
       if (id === state.activeSessionId) return state;
-      if (!target.unread) return { splitSessionId: id };
+      const turnOutcomes = seenTurnOutcome(state.turnOutcomes, id);
+      if (!target.unread) return { splitSessionId: id, turnOutcomes };
       const sessions = state.sessions.map((s) => (s.id === id ? { ...s, unread: false } : s));
       persist(sessions, state.activeSessionId, state.groups);
-      return { sessions, splitSessionId: id };
+      return { sessions, splitSessionId: id, turnOutcomes };
     });
   },
 

@@ -1,5 +1,5 @@
 import type { ChatContentPart, ChatMessage } from "./llamaClient";
-import type { PrivacyGateOutcome } from "../store/privacyFirewallStore";
+import type { PrivacyFinding, PrivacyGateOutcome } from "../store/privacyFirewallStore";
 
 export interface CachedPrivacyText {
   content: string;
@@ -11,10 +11,22 @@ export type PrivacyWireOutcome =
   | {
       action: "send";
       messages: ChatMessage[];
-      newlyRedactedFindings: number;
+      newlyRedacted: PrivacyFinding[];
     }
   | { action: "switch_local" }
   | { action: "cancelled" };
+
+/**
+ * Names what was redacted rather than only counting it. A bare count leaves
+ * the user unable to tell a genuine secret from a false positive without
+ * re-deriving the scan themselves, so every automatic-redaction notice
+ * carries each finding's kind, masked preview, and line.
+ */
+export function describeRedactions(findings: PrivacyFinding[]): string {
+  return findings
+    .map((finding) => `${finding.kind} ${finding.maskedPreview} (line ${finding.line})`)
+    .join(", ");
+}
 
 type GateText = (content: string) => Promise<PrivacyGateOutcome>;
 
@@ -23,19 +35,19 @@ async function gateText(
   gate: GateText,
   cache: PrivacyWireCache,
 ): Promise<
-  | { action: "send"; content: string; newlyRedactedFindings: number }
+  | { action: "send"; content: string; newlyRedacted: PrivacyFinding[] }
   | { action: "switch_local" }
   | { action: "cancelled" }
 > {
   if (content.length === 0) {
-    return { action: "send", content, newlyRedactedFindings: 0 };
+    return { action: "send", content, newlyRedacted: [] };
   }
   const cached = cache.get(content);
   if (cached) {
     return {
       action: "send",
       content: cached.content,
-      newlyRedactedFindings: 0,
+      newlyRedacted: [],
     };
   }
 
@@ -47,12 +59,12 @@ async function gateText(
   return {
     action: "send",
     content: outcome.content,
-    newlyRedactedFindings:
+    newlyRedacted:
       outcome.content === content
-        ? 0
+        ? []
         : outcome.report.findings.filter(
             (finding) => finding.action !== "allow" && !finding.exempted,
-          ).length,
+          ),
   };
 }
 
@@ -73,14 +85,14 @@ export async function gatePrivacyWireMessages(
   cache: PrivacyWireCache,
 ): Promise<PrivacyWireOutcome> {
   let changed = false;
-  let newlyRedactedFindings = 0;
+  const newlyRedacted: PrivacyFinding[] = [];
   const next: ChatMessage[] = [];
 
   for (const message of messages) {
     if (typeof message.content === "string") {
       const outcome = await gateText(message.content, gate, cache);
       if (outcome.action !== "send") return outcome;
-      newlyRedactedFindings += outcome.newlyRedactedFindings;
+      newlyRedacted.push(...outcome.newlyRedacted);
       if (outcome.content === message.content) {
         next.push(message);
       } else {
@@ -99,7 +111,7 @@ export async function gatePrivacyWireMessages(
       }
       const outcome = await gateText(part.text, gate, cache);
       if (outcome.action !== "send") return outcome;
-      newlyRedactedFindings += outcome.newlyRedactedFindings;
+      newlyRedacted.push(...outcome.newlyRedacted);
       if (outcome.content === part.text) {
         parts.push(part);
       } else {
@@ -118,6 +130,6 @@ export async function gatePrivacyWireMessages(
   return {
     action: "send",
     messages: changed ? next : messages,
-    newlyRedactedFindings,
+    newlyRedacted,
   };
 }

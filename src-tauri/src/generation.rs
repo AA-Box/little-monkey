@@ -61,9 +61,22 @@ const MAX_BATCH_COUNT: u32 = 8;
 /// anything, and llama.cpp clamps the number to the layers a model actually
 /// has rather than erroring on an overshoot.
 const SPEECH_GPU_LAYERS: u32 = 999;
-/// Weights are tens of gigabytes and are read lazily from disk on first use,
-/// so first-token latency after launch is dominated by IO, not compute.
-const READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the engine may say *nothing at all* before a launch is called
+/// dead.
+///
+/// Not a budget for the whole load. Weights are tens of gigabytes read lazily
+/// from disk, and how long that takes is a property of the model, not of this
+/// app: an image-to-video pair like Wan 2.2 A14B loads two 14B diffusion
+/// models plus a text encoder and a VAE, which routinely outruns any
+/// wall-clock ceiling small enough to catch a genuinely hung engine. Silence
+/// is what actually separates the two — `sd-server` narrates its load line by
+/// line, so an engine that is working says so, and one that has wedged says
+/// nothing.
+const READY_SILENCE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Ceiling on the single readiness probe, so a wedged socket cannot hold the
+/// request open forever. The silence watchdog is what normally ends the wait;
+/// this only bounds the case where the engine keeps talking but never answers.
+const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(6 * 3600);
 
 /// One `sd-server` command-line weight slot. The mapping to a flag is the
 /// entire model-specific surface: a new architecture picks different slots
@@ -123,6 +136,48 @@ pub enum ComponentSlot {
     /// entry written against another build still loads and still says what it
     /// meant, rather than failing the whole registry to parse.
     Vocoder,
+}
+
+/// Which engine renders a model.
+///
+/// Not an architecture and not a task: it names the program that has to be
+/// started, because two of them cannot read the same file. An MLX conversion
+/// stores its weights as packed `U32` groups with separate scales and biases,
+/// which stable-diffusion.cpp's safetensors reader has no case for, and a GGUF
+/// quantization is equally unreadable to MLX. Whichever engine is wrong for a
+/// file fails deep inside a loader with a message about tensors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationEngineKind {
+    /// The bundled `sd-server`. Every model added before this field existed.
+    #[default]
+    StableDiffusionCpp,
+    /// The video service in the installed MLX package. Apple silicon only,
+    /// and only present once the user installs that package.
+    MlxVideo,
+}
+
+/// What to spawn for a model: a program, and the arguments that must precede
+/// the ones [`launch_args`] builds.
+///
+/// `sd-server` is its own executable, so the prefix is empty. The MLX service
+/// is a Python file inside a verified package, so the program is that package's
+/// own interpreter and the prefix is the script — neither of which the engine
+/// state should be resolving for itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineCommand {
+    pub program: PathBuf,
+    pub prefix_args: Vec<String>,
+}
+
+impl EngineCommand {
+    /// A plain executable, which is what the bundled engines are.
+    pub fn binary(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            prefix_args: Vec::new(),
+        }
+    }
 }
 
 impl ComponentSlot {
@@ -400,6 +455,13 @@ pub struct GenerationModelSpec {
     pub license: LicenseGate,
     /// Model-specific `sd-server` launch flags beyond the component slots.
     pub extra_launch_args: Vec<String>,
+    /// Which engine renders this model.
+    ///
+    /// Defaulted rather than required: `studio-models.json` already holds
+    /// entries written before this field existed, and the whole registry fails
+    /// to parse if one of them cannot deserialize.
+    #[serde(default)]
+    pub engine: GenerationEngineKind,
 }
 
 impl GenerationModelSpec {
@@ -557,6 +619,86 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the LoRAs a run selected are linked so the engine can resolve them.
+///
+/// `sd-server` resolves `lora[].path` against `--lora-model-dir` and nothing
+/// else: it scans that directory, keys each entry on its path *relative* to
+/// it, and rejects the whole request — `400 invalid generation parameters` —
+/// when a path is not one of them. An absolute path to a file the user picked
+/// anywhere on disk never matches, so every run carrying a LoRA failed. The
+/// user's files stay where they are; [`stage_loras`] links them in here. A
+/// model id may not start with a dot, so this cannot collide with one.
+pub fn lora_dir(model_root: &Path) -> PathBuf {
+    model_root.join(".loras")
+}
+
+/// Extensions `sd-server` will even look at when it scans the LoRA directory.
+const LORA_EXTENSIONS: [&str; 4] = ["gguf", "pt", "pth", "safetensors"];
+
+/// Links every selected LoRA into [`lora_dir`] and rewrites its path to the
+/// name it has there, which is the only form the engine resolves.
+///
+/// The staged name carries a hash of the source path because sharing a
+/// filename across directories is the normal case, not the exotic one — half
+/// the LoRAs on Hugging Face are `pytorch_lora_weights.safetensors`.
+pub fn stage_loras(model_root: &Path, request: &mut GenerationRequest) -> Result<(), String> {
+    if request.loras.is_empty() {
+        return Ok(());
+    }
+    let dir = lora_dir(model_root);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create {}: {error}", dir.display()))?;
+    for lora in &mut request.loras {
+        let source = PathBuf::from(&lora.path);
+        if !source.is_file() {
+            return Err(format!("LoRA file is missing: {}", lora.path));
+        }
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .filter(|value| LORA_EXTENSIONS.contains(&value.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "A LoRA must be a {} file: {}",
+                    LORA_EXTENSIONS.join(", "),
+                    lora.path
+                )
+            })?;
+        // Names a directory entry, not a security boundary, so the standard
+        // hasher is enough: the worst a rehash across builds can do is leave
+        // one extra link behind.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&lora.path, &mut hasher);
+        let name = format!("{:016x}.{extension}", std::hash::Hasher::finish(&hasher));
+        let staged = dir.join(&name);
+        // The link's target is the path just checked, so an existing entry —
+        // link or hard link — is never a stale one.
+        if staged.symlink_metadata().is_err() {
+            link_lora(&source, &staged)?;
+        }
+        lora.path = name;
+    }
+    Ok(())
+}
+
+/// Symlinks first because it crosses volumes; hard links are the fallback for
+/// a Windows without the privilege a symlink needs there.
+fn link_lora(source: &Path, staged: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(source, staged);
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(source, staged);
+    linked
+        .or_else(|_| std::fs::hard_link(source, staged))
+        .map_err(|error| {
+            format!(
+                "Failed to link {} into the LoRA directory: {error}",
+                source.display()
+            )
+        })
+}
+
 /// Builds the `sd-server` command line for a model. Every weight path is
 /// absolute and app-owned; nothing is read from a user shell or PATH.
 pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> Vec<String> {
@@ -565,6 +707,11 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
         "127.0.0.1".to_string(),
         "--listen-port".to_string(),
         port.to_string(),
+        // The engine reads this directory per request, so it does not have to
+        // exist yet — but without the flag it defaults to empty and no LoRA
+        // can ever resolve.
+        "--lora-model-dir".to_string(),
+        lora_dir(model_root).to_string_lossy().to_string(),
     ];
     for component in &spec.components {
         // Speech slots belong to `llama-tts`; handing one of their flags to
@@ -591,8 +738,19 @@ pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> 
 /// leaves the id alone, so an id-keyed reuse would keep serving the old file
 /// set until the app restarted, and the fix the user just made would appear to
 /// do nothing.
-fn launch_signature(spec: &GenerationModelSpec, model_root: &Path) -> Vec<String> {
-    launch_args(spec, model_root, 0)
+fn launch_signature(
+    engine: &EngineCommand,
+    spec: &GenerationModelSpec,
+    model_root: &Path,
+) -> Vec<String> {
+    // The program is part of the signature, not just its arguments: switching a
+    // model between engines leaves every slot flag identical, so an args-only
+    // signature would keep serving the warm process from the engine the user
+    // just switched away from.
+    let mut signature = vec![engine.program.to_string_lossy().to_string()];
+    signature.extend(engine.prefix_args.iter().cloned());
+    signature.extend(launch_args(spec, model_root, 0));
+    signature
 }
 
 /// The weight file that identifies a loaded model to `sd-server`, which
@@ -1442,13 +1600,17 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
 const MAX_STDERR_TAIL: usize = 4_000;
 
 /// Engine failures whose own wording does not say what to change, paired with
-/// the sentence that does. Both entries below were hit for real: the first by
-/// putting an all-in-one checkpoint on the wrong slot, the second by a
-/// quantization built for a different loader.
+/// the sentence that does. Every entry below was hit for real: a checkpoint on
+/// the wrong slot, a quantization built for a different loader, and a weight
+/// file stored in a data type the engine's safetensors reader has no case for.
 const ENGINE_FAILURE_HINTS: &[(&str, &str)] = &[
     (
+        "unsupported dtype",
+        "That file stores its weights in a data type this engine cannot read. It accepts F32, F16, BF16, F8_E4M3, F8_E5M2, I32 and I64; a `U32` tensor means the weights are packed integers — MLX `-q4`/`-q8` repositories store them that way, as do GPTQ, AWQ, bitsandbytes NF4 and torchao. An MLX quantization is for Apple's MLX runtime and no flag makes it load here. Use the F16/BF16 or FP8 release of the same model, or a GGUF quantization built for stable-diffusion.cpp.",
+    ),
+    (
         "get sd version from file failed",
-        "The engine could not read that file as a bare diffusion model. An all-in-one checkpoint belongs on --model; --diffusion-model is for a UNet on its own.",
+        "The engine could not detect a model version in that file. A standalone UNet or DiT belongs on --diffusion-model; only an all-in-one checkpoint belongs on --model. Check which slot the file is on — either direction produces this error.",
     ),
     (
         "wrong shape in model metadata",
@@ -1476,9 +1638,13 @@ fn engine_failure_detail(tail: &str) -> String {
     } else {
         errors.join("\n")
     };
+    // The earliest signature wins, not the first one listed: a loader gives up
+    // in cascade — an unreadable tensor is reported as a missing model version
+    // two lines later — and only the first line is the cause.
     match ENGINE_FAILURE_HINTS
         .iter()
-        .find(|(signature, _)| tail.contains(signature))
+        .filter_map(|(signature, hint)| tail.find(signature).map(|at| (at, hint)))
+        .min_by_key(|(at, _)| *at)
     {
         Some((_, hint)) => format!("{body}\n\n{hint}"),
         None => body,
@@ -1685,6 +1851,50 @@ impl GenerationEngineState {
         Ok(())
     }
 
+    /// A fingerprint of everything the engine has said so far, used as a
+    /// heartbeat while it loads.
+    ///
+    /// The tail is length-capped, so a long load reaches the cap and then keeps
+    /// the same length while its *content* rolls forward — hence a hash rather
+    /// than a byte count. Sampling lines never reach the tail at all, so they
+    /// are folded in separately.
+    pub fn output_mark(&self) -> (u64, Option<(u32, u32)>) {
+        let Ok(state) = self.inner.lock() else {
+            return (0, None);
+        };
+        let said = state
+            .stderr_tail
+            .as_ref()
+            .and_then(|tail| {
+                tail.lock().ok().map(|value| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&*value, &mut hasher);
+                    std::hash::Hasher::finish(&hasher)
+                })
+            })
+            .unwrap_or(0);
+        let sampling = state
+            .sampling
+            .as_ref()
+            .and_then(|cell| cell.lock().ok().and_then(|value| *value));
+        (said, sampling)
+    }
+
+    /// The engine's own last words, ready to append to a failure message.
+    fn stderr_detail(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .ok()?
+            .stderr_tail
+            .as_ref()
+            .and_then(|tail| {
+                tail.lock()
+                    .ok()
+                    .map(|value| engine_failure_detail(value.trim()))
+            })
+            .filter(|value| !value.is_empty())
+    }
+
     /// True when the child has already exited; used to fail a readiness wait
     /// fast instead of polling a dead process for five minutes.
     ///
@@ -1721,11 +1931,11 @@ impl GenerationEngineState {
     /// different model is loaded. Returns the base URL to submit jobs to.
     pub async fn ensure_ready(
         &self,
-        binary: &Path,
+        engine: &EngineCommand,
         spec: &GenerationModelSpec,
         model_root: &Path,
     ) -> Result<String, String> {
-        let signature = launch_signature(spec, model_root);
+        let signature = launch_signature(engine, spec, model_root);
         let warm = self
             .inner
             .lock()
@@ -1752,7 +1962,8 @@ impl GenerationEngineState {
             }
         }
 
-        let mut child = Command::new(binary)
+        let mut child = Command::new(&engine.program)
+            .args(&engine.prefix_args)
             .args(launch_args(spec, model_root, port))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1791,59 +2002,95 @@ impl GenerationEngineState {
                     .to_string()
             })
             .unwrap_or_default();
-        let deadline = Instant::now() + READY_TIMEOUT;
-        while Instant::now() < deadline {
+        let mut spoken = self.output_mark();
+        let mut spoke_at = Instant::now();
+        loop {
             if let Some(failure) = self.child_exited()? {
                 self.stop()?;
                 return Err(failure);
             }
-            // Wait out the whole deadline on one probe rather than abandoning a
-            // short one every half second. `sd-server` answers `/capabilities`
-            // from its worker pool, and a big model warms up for a minute or
-            // more before the first answer comes back — every probe we give up
-            // on leaves its handler thread blocked, so a 2s timeout drains the
-            // pool in seconds and the engine can never answer at all. A dead
-            // child drops the connection, so this still fails fast.
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1));
-            if let Ok(response) =
-                crate::egress::send(client.get(&capabilities).timeout(remaining)).await
-            {
-                // A foreign service could answer on this port while our child
-                // is losing the bind. Prove the child is still alive after the
-                // response, exactly as `llama.rs` does — and prove the answer
-                // came from the model we asked for, because an engine holding
-                // different weights accepts the connection and then rejects
-                // every job with a bare 400.
-                if response.status().is_success()
-                    && response
-                        .json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|body| {
-                            body.pointer("/model/path")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .is_some_and(|loaded| loaded == expected_model_path)
-                {
-                    if let Some(failure) = self.child_exited()? {
-                        self.stop()?;
-                        return Err(failure);
+            // Hold one probe open rather than abandoning a short one every half
+            // second. `sd-server` answers `/capabilities` from its worker pool,
+            // and a big model warms up for a minute or more before the first
+            // answer comes back — every probe we give up on leaves its handler
+            // thread blocked, so a short timeout drains the pool in seconds and
+            // the engine can never answer at all. The watchdog below is what
+            // ends the wait, and it does so without touching the request.
+            let probe = crate::egress::send(client.get(&capabilities).timeout(READY_PROBE_TIMEOUT));
+            tokio::pin!(probe);
+            let answered = loop {
+                tokio::select! {
+                    result = &mut probe => break Some(result),
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        if let Some(failure) = self.child_exited()? {
+                            self.stop()?;
+                            return Err(failure);
+                        }
+                        let heard = self.output_mark();
+                        if heard != spoken {
+                            spoken = heard;
+                            spoke_at = Instant::now();
+                        } else if spoke_at.elapsed() >= READY_SILENCE_TIMEOUT {
+                            break None;
+                        }
                     }
-                    // It has answered once, so everything else may now ask it
-                    // things without waiting out a load it cannot see.
-                    if let Ok(mut state) = self.inner.lock() {
-                        state.ready = true;
-                    }
-                    return Ok(base_url);
                 }
+            };
+            let response = match answered {
+                Some(Ok(response)) => response,
+                // A transport error against a child that is still alive is a
+                // connection refused while the listener comes up. Try again.
+                Some(Err(_)) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                None => {
+                    // The engine's own last words, for the same reason
+                    // `child_exited` carries them: "did not become ready" alone
+                    // names the symptom and hides every cause.
+                    let detail = self.stderr_detail();
+                    self.stop()?;
+                    let headline = format!(
+                        "Generation engine went silent for {}s while loading and never became ready",
+                        READY_SILENCE_TIMEOUT.as_secs()
+                    );
+                    return Err(match detail {
+                        Some(detail) => format!("{headline}:\n{detail}"),
+                        None => headline,
+                    });
+                }
+            };
+            // A foreign service could answer on this port while our child
+            // is losing the bind. Prove the child is still alive after the
+            // response, exactly as `llama.rs` does — and prove the answer
+            // came from the model we asked for, because an engine holding
+            // different weights accepts the connection and then rejects
+            // every job with a bare 400.
+            if response.status().is_success()
+                && response
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|body| {
+                        body.pointer("/model/path")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|loaded| loaded == expected_model_path)
+            {
+                if let Some(failure) = self.child_exited()? {
+                    self.stop()?;
+                    return Err(failure);
+                }
+                // It has answered once, so everything else may now ask it
+                // things without waiting out a load it cannot see.
+                if let Ok(mut state) = self.inner.lock() {
+                    state.ready = true;
+                }
+                return Ok(base_url);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        self.stop()?;
-        Err("Generation engine did not become ready in time".to_string())
     }
 }
 
@@ -2346,6 +2593,7 @@ mod tests {
             min_ram_bytes: 16 * 1024 * 1024 * 1024,
             license: LicenseGate::default(),
             extra_launch_args: vec!["--diffusion-fa".to_string()],
+            engine: GenerationEngineKind::default(),
         }
     }
 
@@ -2551,17 +2799,82 @@ mod tests {
             "unet.gguf",
             1,
         )];
-        let before = launch_signature(&spec, root);
+        let engine = EngineCommand::binary("/engines/sd-server");
+        let before = launch_signature(&engine, &spec, root);
         spec.components.push(ModelComponent::huggingface(
             ComponentSlot::Vae,
             "r",
             "vae.safetensors",
             1,
         ));
-        assert_ne!(before, launch_signature(&spec, root));
+        assert_ne!(before, launch_signature(&engine, &spec, root));
         // The port is the one thing that legitimately differs between two
-        // launches of the same file set, so it must not be in the key.
-        assert_eq!(launch_signature(&spec, root), launch_args(&spec, root, 0),);
+        // launches of the same file set, so it must not be in the key:
+        // everything after the engine's own argv is exactly a port-zero launch.
+        assert_eq!(
+            launch_signature(&engine, &spec, root)[1..],
+            launch_args(&spec, root, 0)[..]
+        );
+    }
+
+    /// Two engines take the same slot flags, so the flags alone cannot say
+    /// which process is warm.
+    #[test]
+    fn switching_engines_invalidates_a_warm_process() {
+        let root = Path::new("/models");
+        let spec = model(
+            "m",
+            vec![GenerationTask::TextToVideo],
+            FrameGrid::DownTo4nPlus1,
+        );
+        let bundled = launch_signature(&EngineCommand::binary("/engines/sd-server"), &spec, root);
+        let mlx = launch_signature(
+            &EngineCommand {
+                program: PathBuf::from("/packages/mlx/runtime/bin/python3"),
+                prefix_args: vec!["/packages/mlx/service/mlx_video_server.py".to_string()],
+            },
+            &spec,
+            root,
+        );
+        assert_ne!(bundled, mlx);
+        // Same model, same files: only the program differs, which is exactly
+        // the case an args-only signature would miss.
+        assert_eq!(bundled[1..], mlx[2..]);
+    }
+
+    /// Every model in a library written before the engine field existed is a
+    /// stable-diffusion.cpp model, and a registry that fails to parse takes
+    /// every other model down with it.
+    #[test]
+    fn a_spec_saved_without_an_engine_still_loads() {
+        let stored = serde_json::json!({
+            "id": "wan",
+            "name": "Wan",
+            "family": "Wan",
+            "tasks": ["text_to_video"],
+            "components": [],
+            "defaults": {
+                "width": 832,
+                "height": 480,
+                "steps": 20,
+                "cfgScale": 6.0,
+                "sampleMethod": "euler",
+                "flowShift": 3.0,
+                "fps": 24,
+                "videoFrames": 33,
+                "frameGrid": "down_to4n_plus1"
+            },
+            "minRamBytes": 0,
+            "license": {"id": "", "name": "", "url": "", "excludedTerritories": [], "acceptanceRequired": false},
+            "extraLaunchArgs": []
+        });
+        let spec: GenerationModelSpec = serde_json::from_value(stored).unwrap();
+        assert_eq!(spec.engine, GenerationEngineKind::StableDiffusionCpp);
+        // And the name it round-trips under is the one the frontend sends.
+        assert_eq!(
+            serde_json::to_value(GenerationEngineKind::MlxVideo).unwrap(),
+            serde_json::json!("mlx_video")
+        );
     }
 
     /// A checkpoint that needs a separate VAE does not name one, so the common
@@ -3074,6 +3387,111 @@ mod tests {
         assert!(validate_request(&wan, &too_many).is_err());
     }
 
+    /// The engine matches `lora[].path` against the names it finds under
+    /// `--lora-model-dir` and rejects the whole request when one is unknown, so
+    /// an absolute path — the only kind the library holds — has to be linked in
+    /// and replaced with its name there before the body is built.
+    #[test]
+    fn selected_loras_are_linked_into_the_directory_the_engine_scans() {
+        let root = std::env::temp_dir().join(format!("lm-lora-{}", uuid::Uuid::new_v4()));
+        let library = root.join("library");
+        std::fs::create_dir_all(library.join("a")).unwrap();
+        std::fs::create_dir_all(library.join("b")).unwrap();
+        // The collision that makes a plain filename unusable as the staged
+        // name: one filename, two directories, two different LoRAs.
+        for parent in ["a", "b"] {
+            std::fs::write(
+                library
+                    .join(parent)
+                    .join("pytorch_lora_weights.safetensors"),
+                vec![7u8; 8],
+            )
+            .unwrap();
+        }
+
+        // Built once and reused: the staged name is keyed on the path as the
+        // request spells it, and `a/file` and `a\file` are two spellings of one
+        // file on Windows.
+        let sources: Vec<String> = ["a", "b"]
+            .iter()
+            .map(|parent| {
+                library
+                    .join(parent)
+                    .join("pytorch_lora_weights.safetensors")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        let selections: Vec<LoraSelection> = sources
+            .iter()
+            .map(|path| LoraSelection {
+                path: path.clone(),
+                multiplier: 1.0,
+                is_high_noise: false,
+            })
+            .collect();
+
+        let mut request = video_request(GenerationTask::TextToVideo);
+        request.loras = selections.clone();
+        stage_loras(&root, &mut request).unwrap();
+
+        let dir = lora_dir(&root);
+        assert!(launch_args(&video_model(), &root, 1)
+            .windows(2)
+            .any(|pair| pair
+                == [
+                    "--lora-model-dir".to_string(),
+                    dir.to_string_lossy().to_string()
+                ]));
+        assert_ne!(request.loras[0].path, request.loras[1].path);
+        for lora in &request.loras {
+            assert!(!Path::new(&lora.path).is_absolute(), "{}", lora.path);
+            assert!(lora.path.ends_with(".safetensors"), "{}", lora.path);
+            // What the engine resolves: the name, joined onto the scanned
+            // directory, reaching the user's bytes.
+            assert_eq!(std::fs::read(dir.join(&lora.path)).unwrap(), vec![7u8; 8]);
+        }
+
+        // Staging the same request again is a no-op, not a second link.
+        let names: Vec<String> = request.loras.iter().map(|lora| lora.path.clone()).collect();
+        let mut again = video_request(GenerationTask::TextToVideo);
+        again.loras = selections;
+        stage_loras(&root, &mut again).unwrap();
+        assert_eq!(
+            again
+                .loras
+                .iter()
+                .map(|lora| lora.path.clone())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        // A file that is gone, and one the engine would not even look at, fail
+        // here with their own reason rather than as "invalid parameters".
+        let mut missing = video_request(GenerationTask::TextToVideo);
+        missing.loras = vec![LoraSelection {
+            path: library
+                .join("a/gone.safetensors")
+                .to_string_lossy()
+                .to_string(),
+            multiplier: 1.0,
+            is_high_noise: false,
+        }];
+        assert!(stage_loras(&root, &mut missing).is_err());
+
+        std::fs::write(library.join("a/notes.txt"), b"x").unwrap();
+        let mut wrong_kind = video_request(GenerationTask::TextToVideo);
+        wrong_kind.loras = vec![LoraSelection {
+            path: library.join("a/notes.txt").to_string_lossy().to_string(),
+            multiplier: 1.0,
+            is_high_noise: false,
+        }];
+        assert!(stage_loras(&root, &mut wrong_kind).is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A user-added model is stored as JSON and read back on the next launch,
     /// so the whole spec has to survive a round trip.
     #[test]
@@ -3371,6 +3789,20 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         assert!(detail.contains("get sd version from file failed"));
         assert!(detail.contains("belongs on --model"), "{detail}");
 
+        // A packed-integer quantization fails on the first tensor it cannot
+        // read and then reports a missing model version, which is how a
+        // U32 Wan checkpoint came back as advice about slots.
+        let dtype_tail = "\
+[ERROR] model_loader.cpp:321 - unsupported dtype 'U32' (tensor 'blocks.0.cross_attn.k.weight')
+[ERROR] stable-diffusion.cpp:902 - get sd version from file failed: ''
+[ERROR] main.cpp:92 - new_sd_ctx_t failed";
+        let dtype_detail = engine_failure_detail(dtype_tail);
+        assert!(dtype_detail.contains("cannot read"), "{dtype_detail}");
+        assert!(
+            !dtype_detail.contains("belongs on --model"),
+            "{dtype_detail}"
+        );
+
         // A quantization for another loader is the other failure that reads as
         // a broken download rather than a wrong file.
         assert!(engine_failure_detail(
@@ -3597,7 +4029,7 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         runtime.block_on(async {
             let engine = GenerationEngineState::default();
             let base_url = engine
-                .ensure_ready(Path::new(&binary), &spec, Path::new("/unused"))
+                .ensure_ready(&EngineCommand::binary(&binary), &spec, Path::new("/unused"))
                 .await
                 .expect("engine ready");
             let client = reqwest::Client::new();
@@ -3673,6 +4105,50 @@ ggml_metal_device_init: recommendedMaxWorkingSetSize = 40200.90 MB
         assert_eq!(capabilities.features.get("mask_image"), Some(&true));
         assert_eq!(capabilities.features.get("control_image"), Some(&false));
         assert_eq!(capabilities.features.get("ip_adapter_image"), None);
+    }
+
+    /// The readiness wait is ended by silence, not by elapsed time, so a load
+    /// that is still narrating itself must never look silent. The tail is
+    /// capped, so once a verbose load fills it the length stops changing while
+    /// the content keeps rolling — a byte count would call that silence and
+    /// kill a model that was loading normally.
+    #[test]
+    fn a_rolling_capped_tail_still_reads_as_the_engine_talking() {
+        let tail = Arc::new(Mutex::new(String::new()));
+        let engine = GenerationEngineState {
+            inner: Mutex::new(EngineProcess {
+                stderr_tail: Some(Arc::clone(&tail)),
+                ..EngineProcess::default()
+            }),
+        };
+        let say = |line: &str| {
+            let mut buffer = tail.lock().unwrap();
+            buffer.push_str(line);
+            buffer.push('\n');
+            if buffer.len() > MAX_STDERR_TAIL {
+                let (capped, _) =
+                    crate::output_cap::cap_tail(std::mem::take(&mut buffer), MAX_STDERR_TAIL);
+                *buffer = capped;
+            }
+        };
+
+        let quiet = engine.output_mark();
+        say("loading tensors 1/400");
+        let talking = engine.output_mark();
+        assert_ne!(quiet, talking);
+
+        // Past the cap: same length every time, different words.
+        for step in 0..600 {
+            say(&format!("loading tensors {step}/400 of a very large model"));
+        }
+        let capped_len = tail.lock().unwrap().len();
+        let at_cap = engine.output_mark();
+        say("loading tensors 601/400 of a very large model");
+        assert_eq!(tail.lock().unwrap().len(), capped_len);
+        assert_ne!(at_cap, engine.output_mark());
+
+        // Nothing said, nothing changed — that is what ends the wait.
+        assert_eq!(engine.output_mark(), engine.output_mark());
     }
 
     /// An engine that is up but still loading has an address and must not be

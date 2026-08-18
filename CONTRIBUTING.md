@@ -17,7 +17,7 @@ requests.
 
 1. Fork the repo and create your branch from `develop` — not `main`. `main` is
    the release branch; pushing to it triggers the signed release build.
-2. Add tests if you changed behaviour (see [Testing](#testing) below).
+2. Add tests if you changed behaviour (see [Test your code modification](#test-your-code-modification) below).
 3. Update the docs if you changed something a user or operator would notice —
    `README.md` for shipped behaviour, [ROADMAP.md](ROADMAP.md) for work that
    isn't built yet, `docs/` for design notes.
@@ -87,8 +87,8 @@ choosing, routing, or rendering it badly.
 ## Set up a development environment
 
 You need Node.js, `pnpm`, Rust, Cargo, and the Tauri 2 prerequisites for your
-platform. Full list in the README's
-[Prerequisites](README.md#prerequisites).
+platform. Full list in
+[Setup and development](docs/setup.md#prerequisites).
 
 ```sh
 pnpm install
@@ -158,6 +158,23 @@ pnpm test:compare:live           # live Compare smoke; uses installed Ollama mod
 cd extensions/little-monkey-vscode
 LITTLE_MONKEY_COMPLETION_MODEL='your-exact-fim-tag' npm run benchmark:completions
 ```
+
+The messaging adapters have a third opt-in suite that talks to real provider
+accounts. Nothing is bundled and nothing is defaulted: you supply your own test
+bot and your own destination, and every test passes silently when its variables
+are absent, so CI never needs them. Without a destination variable a test
+probes and sends nothing.
+
+```sh
+cd src-tauri
+LM_TEST_TELEGRAM_BOT_TOKEN=… LM_TEST_TELEGRAM_CHAT_ID=… \
+LM_TEST_DISCORD_BOT_TOKEN=…  LM_TEST_DISCORD_CHANNEL_ID=… \
+LM_TEST_SLACK_BOT_TOKEN=xoxb-… LM_TEST_SLACK_APP_TOKEN=xapp-… LM_TEST_SLACK_CHANNEL_ID=… \
+cargo test --bin monkey-cli -- daemon::live_smoke --nocapture
+```
+
+The message it posts is visible in whatever chat you name, so point it at a
+channel of your own rather than one other people read.
 
 ### What CI runs
 

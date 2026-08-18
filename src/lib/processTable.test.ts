@@ -16,6 +16,16 @@ vi.mock("@tauri-apps/api/core", () => ({
   isTauri: () => true,
 }));
 
+/** The bridge to the resident runner. A desktop turn is always a durable turn —
+ * the projection asserted here is the one `runAgentTurn` writes before routing,
+ * so it is the same row whichever way the turn is executed. */
+const daemon = vi.hoisted(() => ({ submit: vi.fn(), watch: vi.fn() }));
+vi.mock("./daemonDesktopTurn", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./daemonDesktopTurn")>()),
+  submitDaemonDesktopTurn: daemon.submit,
+  watchDaemonDesktopTurn: daemon.watch,
+}));
+
 let scriptedRounds: Array<{ content?: string; toolCalls?: unknown[] }> = [];
 
 vi.mock("./llamaClient", async (importOriginal) => {
@@ -42,16 +52,21 @@ import { useWorkspaceStore } from "../store/workspaceStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { useModelStore } from "../store/modelStore";
 
-const NO_DAEMON = {
-  installed: false,
-  serviceRunning: false,
-  heartbeatFresh: false,
+const HEALTHY_DAEMON = {
+  installed: true,
+  serviceRunning: true,
+  heartbeatFresh: true,
   killSwitch: false,
+  queued: 0,
+  active: 0,
 };
 
 interface AdmitCall {
   kind: string;
   externalId: string;
+  /** Never sent at admission: the run row does not exist yet and the column is
+   * a foreign key into `runs`. */
+  runId?: string | null;
   parentExternalId?: string | null;
   workspace?: string | null;
   profile?: string | null;
@@ -69,7 +84,11 @@ let transitions: TransitionCall[] = [];
 
 function installBackend(options: { failProjection?: boolean } = {}): void {
   invokeMock.mockImplementation(async (command: string, payload?: Record<string, unknown>) => {
-    if (command === "daemon_desktop_status") return NO_DAEMON;
+    if (command === "daemon_desktop_status") return HEALTHY_DAEMON;
+    if (command === "rules_list") return [];
+    if (command === "workspace_list_roots") {
+      return [{ id: "r0", path: "/tmp/projection-workspace", label: "ws", is_primary: true }];
+    }
     if (command === "process_admit") {
       if (options.failProjection) throw new Error("ledger is locked");
       const args = payload?.args as AdmitCall;
@@ -123,11 +142,37 @@ describe("a chat turn projects itself onto the process table", () => {
     transitions = [];
     scriptedRounds = [];
     installBackend();
+    daemon.submit.mockReset();
+    daemon.watch.mockReset();
+    daemon.submit.mockResolvedValue({ job_id: "job-1", run_id: "run-1", state: "queued" });
+    daemon.watch.mockResolvedValue({
+      output: "all done",
+      status: "done",
+      terminal: true,
+      terminalStatus: "succeeded",
+      error: null,
+      summary: null,
+      lastSequence: 1,
+    });
     useWorkspaceStore.setState({
       roots: [{ id: "r0", path: "/tmp/projection-workspace", label: "ws", is_primary: true }],
     });
     usePermissionStore.setState({ mode: "manual" });
-    useModelStore.setState({ activeProvider: "ollama", activeOllamaModel: "test-model" });
+    useModelStore.setState({
+      activeProvider: "ollama",
+      activeOllamaModel: "test-model",
+      ollamaReachable: true,
+      ollamaModels: [
+        {
+          name: "test-model",
+          size_bytes: 1,
+          is_cloud: false,
+          tool_calling: true,
+          vision: false,
+          modified_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    });
   });
 
   it("admits a chat_turn, marks it running, and exits it succeeded", async () => {
@@ -200,6 +245,18 @@ describe("the fail-soft client contract", () => {
   it("returns an empty list rather than throwing", async () => {
     invokeMock.mockRejectedValue(new Error("no backend"));
     await expect(listProcesses({ liveOnly: true })).resolves.toEqual([]);
+  });
+
+  it("admits a kind whose model has no run without one", async () => {
+    // `agent_processes.run_id` is NULL by design for `subagent` and the m4
+    // workflow kinds — the ledger reports their token counts as structurally
+    // unavailable, which is the honest answer, not a gap to paper over with a
+    // borrowed run id.
+    installBackend();
+    await expect(admitProcess({ kind: "subagent", externalId: "task-1" })).resolves.toBe(
+      "p-subagent-1",
+    );
+    expect(admits[0].runId).toBeUndefined();
   });
 });
 

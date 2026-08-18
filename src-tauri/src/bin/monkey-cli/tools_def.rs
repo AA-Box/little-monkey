@@ -13,7 +13,8 @@ use little_monkey_lib::AppState;
 /// section is generated from, and that generator runs inside the library.
 /// Re-exported here so every call site in this binary is unchanged.
 pub use little_monkey_lib::agent_tools::{
-    present_plan_tool_def, search_docs_tool_def, task_tool_def, tool_definitions,
+    device_action_tool_def, peer_message_tool_def, place_call_tool_def, present_plan_tool_def,
+    search_docs_tool_def, send_message_tool_def, task_tool_def, tool_definitions,
 };
 
 /// Composite `mcp__<serverId>__<toolName>` tool name mapped to the exact

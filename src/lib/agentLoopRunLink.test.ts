@@ -9,13 +9,26 @@
  * Separate from `processTable.test.ts` because this suite has to hand
  * `agentLoop.ts` a real durable run, which means replacing `beginDurableRun` —
  * and that file asserts the projection of a turn that has no recorder at all.
+ *
+ * The turn runs in a browser/dev profile, because that is now the only place a
+ * turn runs in this process at all. The process table is a desktop surface, so
+ * its two calls are spies here rather than the real IPC-backed client.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
-  isTauri: () => true,
+  isTauri: () => false,
+}));
+
+const projection = vi.hoisted(() => ({ admit: vi.fn(), link: vi.fn() }));
+vi.mock("./processTable", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./processTable")>()),
+  admitProcess: (...args: unknown[]) => projection.admit(...args),
+  linkProcessRun: (...args: unknown[]) => projection.link(...args),
+  markProcessRunning: async () => {},
+  exitProcess: async () => {},
 }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 
@@ -50,18 +63,10 @@ vi.mock("./durableRun", async (importOriginal) => {
 });
 
 import { runAgentTurn } from "./agentLoop";
-import { admitProcess } from "./processTable";
 import { useModelStore } from "../store/modelStore";
 import { usePermissionStore } from "../store/permissionStore";
 import { useSessionStore, type ChatSession } from "../store/sessionStore";
 import { useWorkspaceStore } from "../store/workspaceStore";
-
-const NO_DAEMON = {
-  installed: false,
-  serviceRunning: false,
-  heartbeatFresh: false,
-  killSwitch: false,
-};
 
 interface AdmitCall {
   kind: string;
@@ -78,19 +83,15 @@ let admits: AdmitCall[] = [];
 let links: LinkCall[] = [];
 
 function installBackend(options: { failLink?: boolean } = {}): void {
-  invokeMock.mockImplementation(async (command: string, payload?: Record<string, unknown>) => {
-    if (command === "daemon_desktop_status") return NO_DAEMON;
-    if (command === "process_admit") {
-      const args = payload?.args as AdmitCall;
-      admits.push(args);
-      return { processId: `p-${args.kind}-${admits.length}`, ...args };
-    }
-    if (command === "process_link_run") {
-      if (options.failLink) throw new Error("foreign key mismatch");
-      links.push(payload as unknown as LinkCall);
-      return undefined;
-    }
-    return undefined;
+  invokeMock.mockImplementation(async () => undefined);
+  projection.admit.mockImplementation(async (args: AdmitCall) => {
+    admits.push(args);
+    return `p-${args.kind}-${admits.length}`;
+  });
+  projection.link.mockImplementation(async (processId: string, runId: string) => {
+    // The real client swallows this; the loop must not care either way.
+    if (options.failLink) return;
+    links.push({ processId, runId });
   });
 }
 
@@ -128,6 +129,8 @@ async function drainPersistence(): Promise<void> {
 describe("a chat turn's process row carries its run id", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    projection.admit.mockReset();
+    projection.link.mockReset();
     admits = [];
     links = [];
     begunRunIds = [];
@@ -206,17 +209,5 @@ describe("a chat turn's process row carries its run id", () => {
     expect(links).toEqual([]);
 
     await drainPersistence();
-  });
-
-  it("admits a kind whose model has no run without one", async () => {
-    // `agent_processes.run_id` is NULL by design for `subagent` and the m4
-    // workflow kinds — the ledger reports their token counts as structurally
-    // unavailable, which is the honest answer, not a gap to paper over with a
-    // borrowed run id.
-    await expect(admitProcess({ kind: "subagent", externalId: "task-1" })).resolves.toBe(
-      "p-subagent-1",
-    );
-    expect(admits[0].runId).toBeUndefined();
-    expect(links).toEqual([]);
   });
 });

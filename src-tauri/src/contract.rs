@@ -45,7 +45,7 @@ use crate::http_route_registry::{
 /// * **minor**: anything additive — a new route, method, tool, or optional
 ///   parameter.
 /// * **patch**: descriptions and other non-structural wording.
-pub const CONTRACT_VERSION: &str = "1.2.0";
+pub const CONTRACT_VERSION: &str = "1.7.0";
 
 /// How long a surface stays after it is announced deprecated.
 ///
@@ -96,6 +96,13 @@ pub enum RemotePlane {
     /// Placement and live migration (K17/K18) — the only way a run authored
     /// elsewhere starts here.
     Node,
+    /// Bounded traffic between two paired installations. Carries words, never
+    /// a spec: what a peer says runs under this node's own recipe.
+    Peer,
+    /// A paired physical device's own hardware: what it advertises, and the
+    /// durable queue of commands the runner has for it. The only plane whose
+    /// effects happen somewhere other than this machine.
+    Device,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +113,10 @@ pub enum RemoteGate {
     Capability(&'static str),
     /// A device may always sever itself; no grant beyond a valid signature.
     SelfService,
+    /// Any one of the three peer grants. Which one a request actually needs
+    /// depends on what it carries, and is decided per envelope inside the
+    /// gate; reaching the plane at all needs peer standing of some kind.
+    PeerStanding,
 }
 
 /// Every route the signed remote plane dispatches.
@@ -242,6 +253,100 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         gate: RemoteGate::SelfService,
     },
     RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/surface",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/state",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/next",
+        gate: RemoteGate::SelfService,
+    },
+    // Reconciliation after a reconnect or a restart. Self-service like the
+    // lease, and deliberately not a lease: it returns only what this device
+    // already started and never finished, so the device can deliver a staged
+    // result or say the outcome is unknown — never perform the action again.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/recover",
+        gate: RemoteGate::SelfService,
+    },
+    // A running command's control signals, held open by the long poll. This is
+    // how a cancellation reaches a recording already in progress.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/commands/{command_id}/control",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/start",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/commands/{command_id}/result",
+        gate: RemoteGate::SelfService,
+    },
+    // A live stream's audio. Unlike the routes above these carry a capability
+    // gate, because they are not self-service: the device is acting on a grant
+    // an operator made, and withdrawing `voice_stream` closes the microphone on
+    // the next chunk.
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/chunk",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/voice/{session_id}/close",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/talk/ticket",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/talk/{session_id}/stream",
+        gate: RemoteGate::Capability("VoiceStream"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "GET",
+        path: "/v1/remote/device/push/key",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "POST",
+        path: "/v1/remote/device/push",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Device,
+        method: "DELETE",
+        path: "/v1/remote/device/push",
+        gate: RemoteGate::SelfService,
+    },
+    RemoteRouteSpec {
         plane: RemotePlane::Node,
         method: "GET",
         path: "/v1/remote/node",
@@ -276,6 +381,35 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
         method: "POST",
         path: "/v1/remote/node/migration/accept",
         gate: RemoteGate::Capability("Migrate"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/messages",
+        gate: RemoteGate::PeerStanding,
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "GET",
+        path: "/v1/remote/peer/threads/{thread_id}",
+        gate: RemoteGate::PeerStanding,
+    },
+    // Liveness and self-description in one call: a peer says who it is and
+    // what it supports, and learns the same plus what it is actually granted.
+    // Nothing it sends here changes what it may do.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/hello",
+        gate: RemoteGate::PeerStanding,
+    },
+    // Content a peer hands over before the envelope that references it. Its
+    // own grant, because handing over bytes is not the same act as speaking.
+    RemoteRouteSpec {
+        plane: RemotePlane::Peer,
+        method: "POST",
+        path: "/v1/remote/peer/artifacts",
+        gate: RemoteGate::Capability("PeerArtifact"),
     },
 ];
 
@@ -441,6 +575,7 @@ fn gate_name(gate: RemoteGate) -> String {
         RemoteGate::Action(action) => format!("action:{action}"),
         RemoteGate::Capability(capability) => format!("capability:{capability}"),
         RemoteGate::SelfService => "self_service".to_string(),
+        RemoteGate::PeerStanding => "peer_standing".to_string(),
     }
 }
 
@@ -485,6 +620,10 @@ fn tool_entries() -> Vec<ToolEntry> {
     entries.push(tool_entry(
         &crate::agent_tools::task_tool_def(),
         "subagents_enabled",
+    ));
+    entries.push(tool_entry(
+        &crate::agent_tools::device_action_tool_def(),
+        "paired_device_capable",
     ));
     entries
 }

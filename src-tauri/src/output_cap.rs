@@ -20,6 +20,20 @@
 //! Reusing the smaller number rather than minting a third one is deliberate: the
 //! consumer decides the ceiling, and `verify.rs` had already chosen this value
 //! for exactly this consumer.
+//!
+//! # Two shapes, and only one of them is a bound
+//!
+//! [`cap_tail`] trims a `String` that has already been collected. It is honest
+//! about what reaches a *reader* and says nothing at all about what reached the
+//! *heap*: a command that prints a gigabyte still allocated a gigabyte before
+//! anything was trimmed, so the cap held the model's context window and not this
+//! app's memory.
+//!
+//! [`CappedStream`] and [`drain_capped`] are the actual bound. Bytes are dropped
+//! from the front as they arrive, so the retained buffer never exceeds the cap
+//! however much the child produces. K4 asks for the second everywhere output is
+//! captured; the first survives only for callers that already hold a whole string
+//! from somewhere else.
 
 /// Bytes of each captured stream that may reach a model.
 ///
@@ -59,9 +73,173 @@ pub fn cap_tail(value: String, cap: usize) -> (String, bool) {
     (format!("{TRUNCATION_MARKER}{}", &value[start..]), true)
 }
 
+/// One captured stream, held to its ceiling **while it is being produced**.
+///
+/// Bytes rather than a `String` because the cap is enforced during the read, when
+/// a chunk boundary can land inside a multi-byte character and there is no whole
+/// string to decode yet. [`Self::into_string`] does the one decode, at the end,
+/// over a buffer that is bounded by construction.
+///
+/// Lifted out of `tools.rs`, which had the only implementation, because the two
+/// other capture paths in this app — `verify.rs` and
+/// `workspace_shell::run_to_output` — collected their streams whole and trimmed
+/// afterwards. That is the failure K4 names explicitly: a bound applied after the
+/// child exits bounds nothing about the app's memory while the child runs.
+#[derive(Debug, Default)]
+pub struct CappedStream {
+    /// The kept tail. At most `cap` bytes once a cap is in force.
+    bytes: Vec<u8>,
+    /// Whether anything was dropped from the front to stay inside the cap.
+    truncated: bool,
+    /// Every byte the child produced, including the dropped ones.
+    ///
+    /// The cap is what the reader gets; this is what the *process* did, and an
+    /// output limit has to be judged against the second. Without it a workload
+    /// that printed a terabyte and a workload that printed 20 KB would be
+    /// indistinguishable to the thing enforcing the output limit.
+    total_bytes: u64,
+}
+
+impl CappedStream {
+    /// Appends `chunk`, dropping whole bytes off the *front* once `cap` is
+    /// exceeded.
+    ///
+    /// Tail, not head, for the reason [`cap_tail`] gives: a failing command
+    /// prints its diagnostic last. Front-dropping is what makes this bounded in
+    /// the first place — a head-keeping cap could stop reading, but then the
+    /// child blocks forever on a full pipe instead of running to completion,
+    /// which turns a noisy command into a timeout.
+    pub fn push(&mut self, chunk: &[u8], cap: Option<usize>) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        self.bytes.extend_from_slice(chunk);
+        let Some(cap) = cap else { return };
+        if self.bytes.len() <= cap {
+            return;
+        }
+        let overflow = self.bytes.len() - cap;
+        self.bytes.drain(..overflow);
+        self.truncated = true;
+    }
+
+    /// How many bytes the child actually produced on this stream.
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// The retained bytes, for a caller that wants them undecoded.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Decodes the kept tail, prefixing the shared truncation marker if the front
+    /// was dropped.
+    ///
+    /// The leading continuation bytes are shed first, so a cut that landed inside
+    /// a character widens the kept region forward to the next boundary instead of
+    /// decoding to a replacement character. That is exactly what [`cap_tail`] does
+    /// when it works on a whole `String`, and keeping the behaviour identical is
+    /// why it is done here rather than left to `from_utf8_lossy`.
+    #[must_use]
+    pub fn into_string(mut self) -> (String, bool) {
+        if self.truncated {
+            let keep = self
+                .bytes
+                .iter()
+                .position(|byte| (byte & 0b1100_0000) != 0b1000_0000)
+                .unwrap_or(self.bytes.len());
+            self.bytes.drain(..keep);
+        }
+        let decoded = String::from_utf8_lossy(&self.bytes).to_string();
+        if self.truncated {
+            (format!("{TRUNCATION_MARKER}{decoded}"), true)
+        } else {
+            (decoded, false)
+        }
+    }
+}
+
+/// Reads one pipe to EOF, keeping at most `cap` bytes of its tail.
+///
+/// Reading to EOF rather than stopping at the cap is the whole point: an
+/// early-returning reader leaves the child blocked on a full pipe buffer, so a
+/// command that merely printed too much would report a timeout instead of its
+/// exit code. Callers must drain stdout and stderr *concurrently* for the same
+/// reason — a child that fills stderr while this awaits stdout deadlocks.
+pub async fn drain_capped<R>(mut reader: R, cap: Option<usize>) -> std::io::Result<CappedStream>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut stream = CappedStream::default();
+    // 8 KiB: larger than the 64 KiB pipe buffer would not help (the kernel hands
+    // over what it has), and smaller would just mean more syscalls.
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(stream);
+        }
+        stream.push(&chunk[..read], cap);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the whole type exists for: retained memory is bounded by the
+    /// cap, not by what the child chose to print.
+    #[test]
+    fn a_flood_far_past_the_cap_never_grows_the_retained_buffer() {
+        let mut stream = CappedStream::default();
+        for _ in 0..1_000 {
+            stream.push(&[b'x'; 8 * 1024], Some(1_024));
+            assert!(
+                stream.as_bytes().len() <= 1_024,
+                "the buffer grew past the cap mid-stream, which is the bound this type is"
+            );
+        }
+        assert!(stream.was_truncated());
+        assert_eq!(
+            stream.total_bytes(),
+            1_000 * 8 * 1024,
+            "the cap bounds what is kept; an output limit is judged against what was produced"
+        );
+    }
+
+    #[test]
+    fn a_stream_inside_the_cap_keeps_everything_and_reports_no_truncation() {
+        let mut stream = CappedStream::default();
+        stream.push(b"hello", Some(1_024));
+        assert_eq!(stream.total_bytes(), 5);
+        assert_eq!(stream.into_string(), ("hello".to_string(), false));
+    }
+
+    #[test]
+    fn a_cut_landing_inside_a_multibyte_character_widens_rather_than_corrupts() {
+        let mut stream = CappedStream::default();
+        // Four bytes each, so a cap of 5 cannot fall on a boundary.
+        stream.push("🙈🙉🙊".as_bytes(), Some(5));
+        let (text, truncated) = stream.into_string();
+        assert!(truncated);
+        assert_eq!(text, format!("{TRUNCATION_MARKER}🙊"));
+    }
+
+    #[test]
+    fn no_cap_means_no_truncation() {
+        let mut stream = CappedStream::default();
+        stream.push(&[b'x'; 100_000], None);
+        assert!(!stream.was_truncated());
+        assert_eq!(stream.as_bytes().len(), 100_000);
+    }
 
     #[test]
     fn output_within_the_cap_is_untouched_and_not_reported_as_truncated() {

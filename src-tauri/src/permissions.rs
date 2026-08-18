@@ -63,6 +63,19 @@ pub struct PermissionRequestPayload {
     /// decision.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// The turn this call belongs to — the same `turn_id` the frontend
+    /// passed to the tool invoke, echoed back so it can tell WHICH
+    /// conversation is blocked on this prompt (the sidebar marks that row as
+    /// waiting for the user). `None` for a call made outside any turn.
+    ///
+    /// Purely an attribution hint for the UI: every gate decision already
+    /// consulted `turn` before this payload was built (see `effective_mode`
+    /// and `evaluate_gate` above), and `respond_if_pending` matches the
+    /// answer by `request_id` against the entry in `pending` — never by
+    /// anything the frontend echoes back — so a window that lies about,
+    /// drops or rewrites this field can only mislabel its own sidebar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
 }
 
 /// A risk annotation attached to a permission prompt — either computed
@@ -941,6 +954,7 @@ pub async fn request_permission<R: tauri::Runtime>(
         risk_reason: risk.as_ref().map(|r| r.reason.clone()),
         risk_floored: risk.as_ref().map(|r| r.floored).unwrap_or(false),
         agent_label: agent_label.map(str::to_string),
+        turn_id: turn.map(str::to_string),
     };
 
     if app.emit("permission://request", payload).is_err() {
@@ -2210,10 +2224,13 @@ mod tests {
             risk_reason: None,
             risk_floored: false,
             agent_label: Some("fix user's login bug".to_string()),
+            turn_id: Some("turn-1".to_string()),
         };
 
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["agent_label"], "fix user's login bug");
+        // The turn attribution the sidebar reads to mark the waiting row.
+        assert_eq!(json["turn_id"], "turn-1");
         // The detail string is untouched by the label — no "Subagent '...'"
         // prefix baked into it, unlike the pre-fix `with_agent_label` design.
         assert_eq!(json["detail"], "Write 12 bytes to a.txt");
@@ -2229,12 +2246,17 @@ mod tests {
             risk_reason: None,
             risk_floored: false,
             agent_label: None,
+            turn_id: None,
         };
 
         let json = serde_json::to_value(&payload).unwrap();
         assert!(
             json.get("agent_label").is_none(),
             "agent_label should be omitted, not null, when absent"
+        );
+        assert!(
+            json.get("turn_id").is_none(),
+            "turn_id should be omitted, not null, for a call outside any turn"
         );
     }
 

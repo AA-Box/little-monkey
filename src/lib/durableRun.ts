@@ -15,13 +15,13 @@ import {
   type RunEventWire,
   type RunKind,
   type RunSpecWire,
-  type ToolOutcome,
   type UsageSnapshotWire,
   type WorkspaceContextWire,
 } from "./runProtocol";
 import type { PermissionMode } from "../store/permissionStore";
 import type { WorkspaceRootInfo } from "../store/workspaceStore";
 import { errorMessage } from "./errors";
+import { toolResultOutcome } from "./toolOutcome";
 
 const MUTATING_TOOLS = new Set([
   "write_file",
@@ -417,19 +417,6 @@ export function utf8Chunks(value: string, size = EVENT_TEXT_CHUNK_BYTES): string
   return result;
 }
 
-function resultOutcome(result: string, cancelled: boolean): ToolOutcome {
-  if (cancelled) return "cancelled";
-  try {
-    const parsed = JSON.parse(result) as { error?: unknown };
-    if (parsed && typeof parsed === "object" && parsed.error) {
-      return String(parsed.error).toLowerCase().includes("permission") ? "denied" : "failed";
-    }
-  } catch {
-    // Successful plain-text tool results are expected.
-  }
-  return "succeeded";
-}
-
 /** Serial event writer for one active desktop run. Calls are queued so
  * concurrent tool completions cannot race the ledger sequence. */
 export class DurableRunRecorder {
@@ -498,6 +485,21 @@ export class DurableRunRecorder {
     }, actorId);
   }
 
+  /**
+   * The exact native skill version this run froze into its prompt.
+   *
+   * Recorded at the moment of invocation, never inferred later: "which
+   * version of /review did this run use?" has to be answerable from the run
+   * itself, because by the time anyone asks, the installed version may be a
+   * newer one — or a rolled-back older one. A skill whose identity is not a
+   * content hash (a local prompt skill) is silently skipped: there is nothing
+   * an outcome could be attributed to.
+   */
+  recordSkillInvoked(command: string, scope: "global" | "workspace", sha256: string): void {
+    if (!/^[0-9a-f]{64}$/.test(sha256)) return;
+    void this.enqueue({ type: "skill_invoked", payload: { command, scope, sha256 } });
+  }
+
   recordToolStarted(toolCallId: string, actorId: string | null = this.actorId): void {
     void this.enqueue({ type: "tool_started", payload: { tool_call_id: protocolToolCallId(toolCallId) } }, actorId);
   }
@@ -509,7 +511,7 @@ export class DurableRunRecorder {
     cancelled = false,
     actorId: string | null = this.actorId,
   ): Promise<void> {
-    const outcome = resultOutcome(result, cancelled);
+    const outcome = toolResultOutcome(result, cancelled);
     const protocolId = protocolToolCallId(toolCallId);
     const toolName = this.toolNames.get(protocolId) ?? "tool";
     this.usage = { ...this.usage, tool_calls: this.usage.tool_calls + 1 };

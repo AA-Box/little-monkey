@@ -481,7 +481,10 @@ pub fn admit(header: &MigrationHeader, target: &TargetNode<'_>) -> MigrationVerd
     let verdict = restorability(
         &header.manifest,
         &RestoreEnvironment {
-            resident_models: target.resident_models,
+            // A migration really is the case residency was written for: this
+            // node is about to run the image itself, so what it has loaded is
+            // the authority over whether it can.
+            resident_models: Some(target.resident_models),
             live_approvals: target.live_approvals,
             workspace_exists: true,
         },

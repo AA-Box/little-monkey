@@ -16,6 +16,7 @@ import { useT } from "../../lib/i18n";
 import { BUILT_IN_SLASH_COMMANDS } from "../../lib/slashCommands";
 import { useSkillProposalStore } from "../../store/skillProposalStore";
 import { NativeSkillsManager } from "./NativeSkillsManager";
+import { SkillLearningPanel } from "./SkillLearningPanel";
 import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
 import { PROMPT_ENTRY_KIND } from "../../store/configRevisionStore";
 import { errorMessage } from "../../lib/errors";
@@ -244,6 +245,7 @@ export function PromptLibraryPanel() {
       )}
 
       <NativeSkillsManager />
+      <SkillLearningPanel />
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="secondary" size="sm" onClick={() => void handleExport()} disabled={exportBusy || entries.length === 0}>

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "extension_id": "dev.little-monkey.examples.simple-tool",
+  "version": "1.0.0",
+  "display_name": "Example: Simple Tool",
+  "description": "A minimal echo tool implemented as a WebAssembly Component.",
+  "host_api": {
+    "minimum": "1.0.0",
+    "maximum_exclusive": "2.0.0"
+  },
+  "component": {
+    "path": "component.wasm",
+    "sha256": "__COMPONENT_SHA256__"
+  },
+  "capabilities": [
+    {
+      "capability_id": "echo",
+      "kind": "tool",
+      "display_name": "Echo",
+      "description": "Returns the supplied text as structured JSON.",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": {
+          "text": { "type": "string", "maxLength": 65536 }
+        }
+      }
+    }
+  ],
+  "permissions": [],
+  "config_schema": [],
+  "secret_slots": [],
+  "dependencies": [],
+  "compatibility": {
+    "minimum_app_version": "1.3.0",
+    "maximum_app_version_exclusive": null,
+    "platforms": ["linux", "macos", "windows"],
+    "architectures": ["aarch64", "x86_64"]
+  },
+  "publisher": "Little Monkey Examples",
+  "provenance": {
+    "publisher": "Little Monkey Examples",
+    "source": {
+      "local_folder": { "canonical_path": "__SOURCE_PATH__" }
+    },
+    "source_revision": "__SOURCE_REVISION__",
+    "build_reproducible": false
+  },
+  "signature": null,
+  "checksums": {
+    "component.wasm": "__COMPONENT_SHA256__"
+  }
+}

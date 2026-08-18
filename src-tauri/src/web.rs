@@ -25,8 +25,8 @@
 //! takes a *synchronous* closure, so there's no way to `.await` inside it) is
 //! only ever a fast-reject pre-check, not the actual security boundary for
 //! the connection: `fetch_impl` installs [`SsrfGuardedResolver`] as the
-//! `reqwest::Client`'s DNS resolver, so hostname resolution for the real TCP
-//! connect happens exactly once, filtered through the same blocklist, with no
+//! `reqwest::Client`'s DNS resolver. It delegates to K5's per-run pinned
+//! resolver, then filters the pinned answers through the same blocklist, with no
 //! separate later lookup for a DNS-rebinding attacker (TTL=0 / a rebinding
 //! service answering the check-time and connect-time queries differently) to
 //! race against.
@@ -35,10 +35,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use url::Url;
 
 use crate::egress::{EgressDenial, EgressRule};
+use crate::executable_extensions::{CapabilityKind, ExtensionManager};
 use crate::profiles::ProfileScopedPaths;
 use crate::{checkpoints, permissions, AppState};
 
@@ -101,6 +103,15 @@ pub enum SearchProvider {
     Duckduckgo,
     Brave,
     Searxng,
+    ExecutableExtension,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchProvider {
+    #[default]
+    Builtin,
+    ExecutableExtension,
 }
 
 /// Serde default for [`WebSettings::fetch_max_chars`] — same fallback value
@@ -120,6 +131,10 @@ fn default_fetch_max_chars() -> usize {
 pub struct WebSettings {
     #[serde(default)]
     pub search_provider: SearchProvider,
+    #[serde(default)]
+    pub search_extension_id: Option<String>,
+    #[serde(default)]
+    pub search_extension_capability_id: Option<String>,
     /// Required when `search_provider == Searxng`; ignored otherwise. `None`
     /// (not an empty string) is the "unset" state — see
     /// `normalize_and_validate_settings`, which turns a blank input back into
@@ -136,15 +151,26 @@ pub struct WebSettings {
     /// own `max_chars`. Real (settings-driven) as of phase 3.
     #[serde(default = "default_fetch_max_chars")]
     pub fetch_max_chars: usize,
+    #[serde(default)]
+    pub fetch_provider: FetchProvider,
+    #[serde(default)]
+    pub fetch_extension_id: Option<String>,
+    #[serde(default)]
+    pub fetch_extension_capability_id: Option<String>,
 }
 
 impl Default for WebSettings {
     fn default() -> Self {
         Self {
             search_provider: SearchProvider::default(),
+            search_extension_id: None,
+            search_extension_capability_id: None,
             searxng_base_url: None,
             allow_local_network: false,
             fetch_max_chars: DEFAULT_MAX_CHARS,
+            fetch_provider: FetchProvider::default(),
+            fetch_extension_id: None,
+            fetch_extension_capability_id: None,
         }
     }
 }
@@ -184,6 +210,39 @@ pub fn load_settings_impl(path: &Path) -> Result<WebSettings, String> {
     }
 }
 
+/// The extension-backed web selections currently persisted, for the Security
+/// Doctor's orphaned-provider check. Total: unconfigured or unreadable
+/// settings mean no selections, which is not a finding.
+#[derive(Debug, Default, Clone)]
+pub struct PersistedWebSelections {
+    pub search: Option<(String, String)>,
+    pub fetch: Option<(String, String)>,
+}
+
+pub fn persisted_extension_selections(app_data: &Path) -> PersistedWebSelections {
+    let Ok(settings) = load_settings_impl(&app_data.join(SETTINGS_FILE)) else {
+        return PersistedWebSelections::default();
+    };
+    PersistedWebSelections {
+        search: (settings.search_provider == SearchProvider::ExecutableExtension)
+            .then(|| {
+                Some((
+                    settings.search_extension_id.clone()?,
+                    settings.search_extension_capability_id.clone()?,
+                ))
+            })
+            .flatten(),
+        fetch: (settings.fetch_provider == FetchProvider::ExecutableExtension)
+            .then(|| {
+                Some((
+                    settings.fetch_extension_id.clone()?,
+                    settings.fetch_extension_capability_id.clone()?,
+                ))
+            })
+            .flatten(),
+    }
+}
+
 /// Core save logic: atomic sibling temp file + rename, same idiom as
 /// `sessions.rs`'s `save_to` / `mcp.rs`'s `save_config_impl`.
 fn save_settings_impl(path: &Path, settings: &WebSettings) -> Result<(), String> {
@@ -215,6 +274,28 @@ fn normalize_base_url(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_extension_capability_id(
+    label: &str,
+    value: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 160
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(format!("{label} must be a bounded ASCII identifier"));
+    }
+    Ok(Some(value.to_string()))
+}
+
 /// Pure validation/normalization core behind [`web_set_settings`]: blanks out
 /// a blank/whitespace-only `searxng_base_url` back to `None` (rather than
 /// persisting an empty string), otherwise validates+normalizes it, and
@@ -232,6 +313,36 @@ fn normalize_and_validate_settings(mut settings: WebSettings) -> Result<WebSetti
         if !trimmed.is_empty() {
             settings.searxng_base_url = Some(normalize_base_url(trimmed)?);
         }
+    }
+    settings.search_extension_id =
+        normalize_extension_capability_id("search_extension_id", settings.search_extension_id)?;
+    settings.search_extension_capability_id = normalize_extension_capability_id(
+        "search_extension_capability_id",
+        settings.search_extension_capability_id,
+    )?;
+    settings.fetch_extension_id =
+        normalize_extension_capability_id("fetch_extension_id", settings.fetch_extension_id)?;
+    settings.fetch_extension_capability_id = normalize_extension_capability_id(
+        "fetch_extension_capability_id",
+        settings.fetch_extension_capability_id,
+    )?;
+    if settings.search_provider == SearchProvider::ExecutableExtension
+        && (settings.search_extension_id.is_none()
+            || settings.search_extension_capability_id.is_none())
+    {
+        return Err(
+            "search_extension_id and search_extension_capability_id are required for executable-extension search"
+                .to_string(),
+        );
+    }
+    if settings.fetch_provider == FetchProvider::ExecutableExtension
+        && (settings.fetch_extension_id.is_none()
+            || settings.fetch_extension_capability_id.is_none())
+    {
+        return Err(
+            "fetch_extension_id and fetch_extension_capability_id are required for executable-extension fetch"
+                .to_string(),
+        );
     }
     Ok(settings)
 }
@@ -588,13 +699,237 @@ fn fetch_refusal(url: &Url, denial: &EgressDenial) -> String {
     }
 }
 
+const MAX_EXTENSION_RESULT_URL_BYTES: usize = 8 * 1024;
+const MAX_EXTENSION_RESULT_TITLE_CHARS: usize = 1_024;
+const MAX_EXTENSION_SEARCH_SNIPPET_CHARS: usize = 8 * 1024;
+const MAX_EXTENSION_CONTENT_TYPE_BYTES: usize = 512;
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionFetchInput<'a> {
+    url: &'a str,
+    max_chars: usize,
+    start_index: usize,
+}
+
+#[derive(serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionSearchInput<'a> {
+    query: &'a str,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct WebExtensionCall {
+    extension_id: String,
+    capability_id: String,
+    input_json: String,
+    invocation_id: String,
+}
+
+struct ExtensionCancellationGuard {
+    invocation_id: String,
+    armed: bool,
+}
+
+/// The desktop Stop path cancels explicitly so it can await runtime cleanup;
+/// this guard covers callers such as monkey-cli whose whole tool future is
+/// dropped on Ctrl-C.
+impl ExtensionCancellationGuard {
+    fn new(invocation_id: String) -> Self {
+        Self {
+            invocation_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExtensionCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = crate::executable_extensions::cancel(&self.invocation_id);
+        }
+    }
+}
+
+fn deterministic_extension_invocation_id(
+    prefix: &str,
+    trusted_call_id: &str,
+    extension_id: &str,
+    capability_id: &str,
+    input_json: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for field in [
+        "little-monkey:web-extension:v1",
+        prefix,
+        trusted_call_id,
+        extension_id,
+        capability_id,
+        input_json,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("{prefix}-{:x}", digest.finalize())
+}
+
+fn extension_fetch_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    url: &str,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<Option<WebExtensionCall>, String> {
+    if settings.fetch_provider != FetchProvider::ExecutableExtension {
+        return Ok(None);
+    }
+    if trusted_call_id.trim().is_empty() {
+        return Err("Executable web-fetch requires a trusted runtime call id".to_string());
+    }
+    let extension_id = settings
+        .fetch_extension_id
+        .as_deref()
+        .ok_or("Choose a healthy executable web-fetch extension in Settings > Web")?;
+    let capability_id = settings
+        .fetch_extension_capability_id
+        .as_deref()
+        .ok_or("Choose a healthy executable web-fetch capability in Settings > Web")?;
+    let input_json = serde_json::to_string(&ExtensionFetchInput {
+        url,
+        max_chars: max_chars.unwrap_or(settings.fetch_max_chars),
+        start_index: start_index.unwrap_or(0),
+    })
+    .map_err(|error| format!("Could not encode executable web-fetch input: {error}"))?;
+    Ok(Some(WebExtensionCall {
+        extension_id: extension_id.to_string(),
+        capability_id: capability_id.to_string(),
+        invocation_id: deterministic_extension_invocation_id(
+            "web-fetch",
+            trusted_call_id,
+            extension_id,
+            capability_id,
+            &input_json,
+        ),
+        input_json,
+    }))
+}
+
+fn extension_search_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    query: &str,
+    count: Option<usize>,
+) -> Result<Option<WebExtensionCall>, String> {
+    if settings.search_provider != SearchProvider::ExecutableExtension {
+        return Ok(None);
+    }
+    if trusted_call_id.trim().is_empty() {
+        return Err("Executable web-search requires a trusted runtime call id".to_string());
+    }
+    let extension_id = settings
+        .search_extension_id
+        .as_deref()
+        .ok_or("Choose a healthy executable web-search extension in Settings > Web")?;
+    let capability_id = settings
+        .search_extension_capability_id
+        .as_deref()
+        .ok_or("Choose a healthy executable web-search capability in Settings > Web")?;
+    let input_json = serde_json::to_string(&ExtensionSearchInput {
+        query,
+        count: count
+            .unwrap_or(DEFAULT_SEARCH_COUNT)
+            .clamp(1, DEFAULT_SEARCH_COUNT),
+    })
+    .map_err(|error| format!("Could not encode executable web-search input: {error}"))?;
+    Ok(Some(WebExtensionCall {
+        extension_id: extension_id.to_string(),
+        capability_id: capability_id.to_string(),
+        invocation_id: deterministic_extension_invocation_id(
+            "web-search",
+            trusted_call_id,
+            extension_id,
+            capability_id,
+            &input_json,
+        ),
+        input_json,
+    }))
+}
+
+/// Where web's extension calls look for the installed extension store.
+///
+/// Production has exactly one answer, the active profile's data directory.
+/// Tests need another, because installing a real component into the developer's
+/// own profile to prove a search reaches it is not something a test may do.
+#[cfg(test)]
+static WEB_EXTENSION_APP_DATA: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_web_extension_app_data_for_test(app_data: Option<PathBuf>) {
+    *WEB_EXTENSION_APP_DATA.lock().unwrap() = app_data;
+}
+
+fn web_extension_app_data() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(app_data) = WEB_EXTENSION_APP_DATA.lock().unwrap().clone() {
+        return Ok(app_data);
+    }
+    crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey app-data directory".to_string())
+}
+
+async fn invoke_web_extension(
+    kind: CapabilityKind,
+    call: WebExtensionCall,
+) -> Result<String, String> {
+    let app_data = web_extension_app_data()?;
+    let mut cancellation = ExtensionCancellationGuard::new(call.invocation_id.clone());
+    let result = ExtensionManager::new(app_data)?
+        .invoke_owned_active_capability(
+            kind,
+            &call.extension_id,
+            &call.capability_id,
+            call.input_json,
+            Some(call.invocation_id),
+            Vec::new(),
+        )
+        .await;
+    cancellation.disarm();
+    result.map(|result| result.output_json)
+}
+
+fn parse_extension_result_url(label: &str, value: &str) -> Result<Url, String> {
+    if value.len() > MAX_EXTENSION_RESULT_URL_BYTES {
+        return Err(format!(
+            "Executable extension returned an oversized {label}"
+        ));
+    }
+    let parsed = Url::parse(value)
+        .map_err(|error| format!("Executable extension returned an invalid {label}: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(format!(
+            "Executable extension returned a non-http(s) or credential-bearing {label}"
+        ));
+    }
+    Ok(parsed)
+}
+
 /// Result of a successful `web_fetch`, echoed back to the model as JSON.
 /// Deliberately plain snake_case field names (no `serde(rename)`), matching
 /// `Fact`'s (`memory.rs`) convention for tool results the model itself reads
 /// — it's the same snake_case the model's own tool-call arguments use
 /// (`max_chars`, `start_index`), not the camelCase Tauri IPC otherwise uses
 /// for frontend-facing payloads like `CheckpointSummary`.
-#[derive(serde::Serialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct FetchResult {
     /// The URL that was requested.
     pub url: String,
@@ -610,6 +945,55 @@ pub struct FetchResult {
     /// model can tell whether/how far to page further with `start_index`.
     pub total_chars: usize,
     pub truncated: bool,
+}
+
+fn parse_extension_fetch_output(
+    output_json: &str,
+    requested_url: &str,
+    max_chars: usize,
+    start_index: usize,
+    allow_local_network: bool,
+) -> Result<FetchResult, String> {
+    if output_json.len() > MAX_BODY_BYTES {
+        return Err("Executable web-fetch output exceeds its byte limit".to_string());
+    }
+    let result: FetchResult = serde_json::from_str(output_json).map_err(|error| {
+        format!("Executable web-fetch returned invalid normalized JSON: {error}")
+    })?;
+    if result.url != requested_url {
+        return Err("Executable web-fetch changed the requested URL in its result".to_string());
+    }
+    parse_extension_result_url("requested URL", &result.url)?;
+    let final_url = parse_extension_result_url("final URL", &result.final_url)?;
+    crate::egress::check_run_allowlist(&final_url)
+        .map_err(|denial| fetch_refusal(&final_url, &denial))?;
+    validate_fetch_url(&final_url, allow_local_network)
+        .map_err(|denial| fetch_refusal(&final_url, &denial))?;
+    if result.title.as_ref().is_some_and(|title| {
+        title.trim().is_empty()
+            || title.contains('\0')
+            || title.chars().count() > MAX_EXTENSION_RESULT_TITLE_CHARS
+    }) {
+        return Err("Executable web-fetch returned an invalid title".to_string());
+    }
+    if result.content_type.len() > MAX_EXTENSION_CONTENT_TYPE_BYTES
+        || result.content_type.contains(['\r', '\n', '\0'])
+    {
+        return Err("Executable web-fetch returned an invalid content type".to_string());
+    }
+    let markdown_chars = result.markdown.chars().count();
+    if markdown_chars > max_chars || result.total_chars > MAX_BODY_BYTES {
+        return Err(
+            "Executable web-fetch returned content outside the requested bounds".to_string(),
+        );
+    }
+    let start = start_index.min(result.total_chars);
+    let expected_chars = max_chars.min(result.total_chars.saturating_sub(start));
+    let expected_truncated = start.saturating_add(expected_chars) < result.total_chars;
+    if markdown_chars != expected_chars || result.truncated != expected_truncated {
+        return Err("Executable web-fetch returned inconsistent window metadata".to_string());
+    }
+    Ok(result)
 }
 
 /// Extracts the content of a `<title>` tag via a simple, case-insensitive
@@ -771,8 +1155,18 @@ fn build_redirect_policy(allow_local_network: bool) -> reqwest::redirect::Policy
                 format!("refusing to follow more than {MAX_REDIRECT_HOPS} redirects"),
             )));
         }
+        // K5 must run before the SSRF pre-check below: hostname validation
+        // resolves DNS, so doing it first would leak a disallowed name to the
+        // resolver before the run's frozen policy had refused it. `send` checks
+        // the initial URL; automatic redirects never pass through `send` again.
+        if let Err(denial) = crate::egress::check_run_allowlist(attempt.url()) {
+            return attempt.error(refused(denial));
+        }
         match validate_fetch_url(attempt.url(), allow_local_network) {
-            Ok(()) => attempt.follow(),
+            Ok(()) => {
+                crate::egress::note_allowed_redirect_destination(attempt.url());
+                attempt.follow()
+            }
             // The hop's own rule, not a rule about redirects: a hop refused for
             // pointing at loopback should say `egress.loopback`, so the reason is
             // the same whether the address arrived in the request or in a `302`.
@@ -800,10 +1194,10 @@ fn refused(denial: EgressDenial) -> std::io::Error {
 /// a rebinding service) can answer those two lookups differently, passing the
 /// check with a public address while the real connection lands on a private
 /// one. Installed via `ClientBuilder::dns_resolver` in [`fetch_impl`], this
-/// resolver is the *only* resolution that ever happens for a hostname target:
-/// it resolves once (async, via `tokio::net::lookup_host`, so no blocking-DNS
-/// call lands on the async runtime thread the way `validate_fetch_url`'s
-/// pre-check does) and filters the result through the exact same
+/// resolver is the *only* connect-time resolution for a hostname target: it
+/// resolves through K5's per-run pin (async, so no blocking-DNS call lands on
+/// the async runtime thread the way `validate_fetch_url`'s pre-check does) and
+/// filters the pinned result through the exact same
 /// [`blocked_reason_ip`] classifier `validate_fetch_url` uses, handing `reqwest`
 /// only addresses that already passed the filter. Since the addresses handed
 /// back are exactly what `reqwest` connects to — not a hint checked against a
@@ -819,20 +1213,14 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let allow_local_network = self.allow_local_network;
         let host = name.as_str().to_string();
+        // Taken while this task's RunScope is active. K5 returns the run's
+        // existing pin or resolves and records the first answer set.
+        let pinned = crate::egress::resolve_pinned(name);
         Box::pin(async move {
-            // Port `0` here is intentional and harmless: `reqwest` overrides
-            // it with whatever port the request URL itself specifies (or the
-            // scheme's conventional port) — see `Resolve::resolve`'s own doc
-            // comment. Formatted as an owned `"{host}:0"` string (rather than
-            // a `(&str, u16)` tuple) purely so the future `lookup_host`
-            // returns doesn't borrow from `host` across the `.await` — it
-            // owns its own copy instead.
-            let resolved = tokio::net::lookup_host(format!("{host}:0"))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let resolved = pinned.await?;
 
             if allow_local_network {
-                return Ok(Box::new(resolved) as reqwest::dns::Addrs);
+                return Ok(resolved);
             }
 
             // Classified rather than merely filtered, so the refusal below can
@@ -900,38 +1288,55 @@ async fn read_body_capped(mut response: reqwest::Response, max: usize) -> reqwes
 /// settings-driven version `tool_web_fetch` (and monkey-cli, phase 4) call with
 /// whatever `web_settings.json` currently holds.
 ///
-/// # Why the run scope is entered here and not at the command
-///
-/// This tool has no run and will not acquire one. A `web_fetch` is a tool call
-/// inside a chat turn: the run id in this app is a `run_ledger` entity, the
-/// frontend agent loop only forwards one to `provider_chat`, and both of this
-/// function's callers — [`tool_web_fetch`] and `monkey-cli`'s agent — are a person
-/// asking for a turn. So the honest answer is a *reason*, and it is the same
-/// reason `providers.rs` gives an ordinary non-run chat stream:
-/// [`crate::run_scope::Unattributed::UserAction`], i.e. work the user asked for
-/// outside any run.
-///
-/// Entered here rather than in [`tool_web_fetch`] because this is the boundary both
-/// callers share — a scope at the command would leave `monkey-cli`'s fetches
-/// recording a blank — and because this is the one of the two that a test can drive,
-/// so the label is pinned rather than asserted in prose.
-///
-/// The consequence to know about: this is a `scoped` and therefore *shadows* an outer
-/// scope. If a durable run ever drives a fetch, this must become a
-/// [`crate::run_scope::RunScope`] parameter, exactly as `m4_runtime`'s
-/// `run_async_worker` did for the same reason — silently relabelling a run's egress
-/// as a user action would be worse than the blank this replaces.
+/// AppHandle-free callers preserve an ambient run scope when one exists (the
+/// durable monkey-cli task path supplies one); otherwise this public core labels
+/// their traffic as a user action. [`tool_web_fetch`] enters the injected turn's
+/// scope around [`fetch_within_scope`] directly.
 pub async fn fetch_impl(
     settings: &WebSettings,
     url: String,
     max_chars: Option<usize>,
     start_index: Option<usize>,
 ) -> Result<FetchResult, String> {
-    crate::run_scope::scoped(
-        crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
-        fetch_within_scope(settings, url, max_chars, start_index),
-    )
+    if settings.fetch_provider == FetchProvider::ExecutableExtension {
+        return Err(
+            "Executable web-fetch requires a trusted runtime call id; use fetch_for_call"
+                .to_string(),
+        );
+    }
+    user_action_when_unscoped(fetch_within_scope(settings, url, max_chars, start_index)).await
+}
+
+pub async fn fetch_for_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    url: String,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<FetchResult, String> {
+    user_action_when_unscoped(fetch_within_scope_for_call(
+        settings,
+        trusted_call_id,
+        url,
+        max_chars,
+        start_index,
+    ))
     .await
+}
+
+async fn user_action_when_unscoped<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if crate::run_scope::current().is_some() {
+        future.await
+    } else {
+        crate::run_scope::scoped(
+            crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
+            future,
+        )
+        .await
+    }
 }
 
 /// [`fetch_impl`]'s body, with the scope already established.
@@ -948,22 +1353,45 @@ async fn fetch_within_scope(
     max_chars: Option<usize>,
     start_index: Option<usize>,
 ) -> Result<FetchResult, String> {
+    fetch_within_scope_for_call(settings, "direct-web-fetch", url, max_chars, start_index).await
+}
+
+async fn fetch_within_scope_for_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    url: String,
+    max_chars: Option<usize>,
+    start_index: Option<usize>,
+) -> Result<FetchResult, String> {
     let max_chars = max_chars.unwrap_or(settings.fetch_max_chars);
     let start_index = start_index.unwrap_or(0);
 
     let parsed = Url::parse(&url).map_err(|e| format!("Invalid URL '{}': {}", url, e))?;
+    // `validate_fetch_url` resolves hostname targets. Enforce the run's frozen
+    // host/port/protocol policy first so a denied hostname is not leaked to DNS.
+    crate::egress::check_run_allowlist(&parsed)
+        .map_err(|denial| fetch_refusal(&parsed, &denial))?;
     validate_fetch_url(&parsed, settings.allow_local_network)
         .map_err(|denial| fetch_refusal(&parsed, &denial))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .redirect(build_redirect_policy(settings.allow_local_network))
-        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
-            allow_local_network: settings.allow_local_network,
-        }))
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    if let Some(call) = extension_fetch_call(
+        settings,
+        trusted_call_id,
+        &url,
+        Some(max_chars),
+        Some(start_index),
+    )? {
+        let output_json = invoke_web_extension(CapabilityKind::WebFetch, call).await?;
+        return parse_extension_fetch_output(
+            &output_json,
+            &url,
+            max_chars,
+            start_index,
+            settings.allow_local_network,
+        );
+    }
+
+    let client = fetch_client(settings)?;
 
     let response = crate::egress::send(client.get(parsed.clone()))
         .await
@@ -994,6 +1422,62 @@ async fn fetch_within_scope(
         total_chars,
         truncated,
     })
+}
+
+fn fetch_client(settings: &WebSettings) -> Result<reqwest::Client, String> {
+    crate::egress::hardened()
+        .timeout(FETCH_TIMEOUT)
+        .redirect(build_redirect_policy(settings.allow_local_network))
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
+            allow_local_network: settings.allow_local_network,
+        }))
+        .user_agent(USER_AGENT)
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+/// Builds the client used by the executable-extension HTTP broker.
+///
+/// The caller still validates the request URL with [`validate_fetch_url`] so
+/// literal private addresses are refused before any request is built. This
+/// client closes the hostname check/connect gap: its resolver filters the exact
+/// pinned addresses handed to the connector, while [`crate::egress::hardened`]
+/// keeps redirects on the original origin. Proxies are disabled because a
+/// proxy would resolve the target outside this guarded resolver.
+pub(crate) fn executable_extension_http_client(
+    read_budget: Duration,
+) -> reqwest::Result<reqwest::Client> {
+    crate::egress::hardened_with_read_budget(read_budget)
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(SsrfGuardedResolver {
+            allow_local_network: false,
+        }))
+        .build()
+}
+
+fn tool_egress_scope<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    turn_id: Option<&str>,
+) -> Result<crate::run_scope::RunScope, String> {
+    let (run_id, attribution) = permissions::permission_attribution(app, state, turn_id)?;
+    egress_scope_for_attribution(run_id, attribution)
+}
+
+fn egress_scope_for_attribution(
+    run_id: Option<String>,
+    attribution: crate::run_ledger::PermissionAttribution,
+) -> Result<crate::run_scope::RunScope, String> {
+    use crate::run_ledger::PermissionAttribution;
+    use crate::run_scope::{RunScope, Unattributed};
+
+    match attribution {
+        PermissionAttribution::LedgerRun | PermissionAttribution::UnregisteredRun => run_id
+            .map(RunScope::run)
+            .ok_or_else(|| "Network tool attribution named a run without its id".to_string()),
+        PermissionAttribution::Unattributed(reason) => Ok(RunScope::Unattributed(reason)),
+        PermissionAttribution::Unknown => Ok(RunScope::Unattributed(Unattributed::UserAction)),
+    }
 }
 
 /// Fetch a URL and return its content as Markdown (HTML) or as-is (plain
@@ -1045,6 +1529,19 @@ pub async fn tool_web_fetch(
     )?;
 
     let settings = load_settings_impl(&settings_file_path(&app)?)?;
+    let egress_scope = tool_egress_scope(&app, state.inner(), turn_id.as_deref())?;
+    let trusted_call_id = if settings.fetch_provider == FetchProvider::ExecutableExtension {
+        tool_call_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("Executable web-fetch requires its runtime-owned tool_call_id")?
+            .to_string()
+    } else {
+        "builtin-web-fetch".to_string()
+    };
+    let extension_invocation_id =
+        extension_fetch_call(&settings, &trusted_call_id, &url, max_chars, start_index)?
+            .map(|call| call.invocation_id);
 
     // Same per-turn cancellation channel `tool_run_shell` uses — see
     // `AppState::tool_cancel`'s doc comment. Callers that don't thread a turn
@@ -1058,9 +1555,23 @@ pub async fn tool_web_fetch(
         .or_insert_with(|| std::sync::Arc::new(Notify::new()))
         .clone();
 
+    let operation = crate::run_commands::scoped_with_egress(
+        &app,
+        state.inner(),
+        egress_scope,
+        fetch_within_scope_for_call(&settings, &trusted_call_id, url, max_chars, start_index),
+    );
+    tokio::pin!(operation);
     let outcome = tokio::select! {
-        result = fetch_impl(&settings, url, max_chars, start_index) => result,
-        _ = cancel.notified() => Err("Fetch cancelled by the user".to_string()),
+        biased;
+        result = &mut operation => result,
+        _ = cancel.notified() => {
+            if let Some(invocation_id) = extension_invocation_id.as_deref() {
+                let _ = crate::executable_extensions::cancel(invocation_id);
+                let _ = operation.await;
+            }
+            Err("Fetch cancelled by the user".to_string())
+        },
     };
 
     // Drop this turn's channel once no other in-flight tool of the same turn
@@ -1096,7 +1607,8 @@ pub async fn tool_web_fetch(
 
 /// One ranked result from [`search_impl`], echoed back to the model as JSON.
 /// Same "plain snake_case, no `serde(rename)`" convention as [`FetchResult`].
-#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
@@ -1118,6 +1630,33 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// document: DuckDuckGo's HTML runs a few hundred KB and both JSON payloads are
 /// far under it, so this only ever bites a body no honest backend sends.
 const MAX_SEARCH_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+fn parse_extension_search_output(
+    output_json: &str,
+    count: usize,
+) -> Result<Vec<SearchResult>, String> {
+    if output_json.len() > MAX_SEARCH_BODY_BYTES {
+        return Err("Executable web-search output exceeds its byte limit".to_string());
+    }
+    let results: Vec<SearchResult> = serde_json::from_str(output_json).map_err(|error| {
+        format!("Executable web-search returned invalid normalized JSON: {error}")
+    })?;
+    if results.len() > count {
+        return Err("Executable web-search returned more results than requested".to_string());
+    }
+    for result in &results {
+        if result.title.trim().is_empty()
+            || result.title.contains('\0')
+            || result.title.chars().count() > MAX_EXTENSION_RESULT_TITLE_CHARS
+            || result.snippet.contains('\0')
+            || result.snippet.chars().count() > MAX_EXTENSION_SEARCH_SNIPPET_CHARS
+        {
+            return Err("Executable web-search returned invalid bounded text".to_string());
+        }
+        parse_extension_result_url("search-result URL", &result.url)?;
+    }
+    Ok(results)
+}
 
 /// The client all three search backends share.
 ///
@@ -1502,6 +2041,48 @@ pub async fn search_impl(
     query: String,
     count: Option<usize>,
 ) -> Result<Vec<SearchResult>, String> {
+    if settings.search_provider == SearchProvider::ExecutableExtension {
+        return Err(
+            "Executable web-search requires a trusted runtime call id; use search_for_call"
+                .to_string(),
+        );
+    }
+    user_action_when_unscoped(search_within_scope(settings, brave_key, query, count)).await
+}
+
+pub async fn search_for_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    brave_key: Option<String>,
+    query: String,
+    count: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
+    user_action_when_unscoped(search_within_scope_for_call(
+        settings,
+        trusted_call_id,
+        brave_key,
+        query,
+        count,
+    ))
+    .await
+}
+
+async fn search_within_scope(
+    settings: &WebSettings,
+    brave_key: Option<String>,
+    query: String,
+    count: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
+    search_within_scope_for_call(settings, "direct-web-search", brave_key, query, count).await
+}
+
+async fn search_within_scope_for_call(
+    settings: &WebSettings,
+    trusted_call_id: &str,
+    brave_key: Option<String>,
+    query: String,
+    count: Option<usize>,
+) -> Result<Vec<SearchResult>, String> {
     let count = count
         .unwrap_or(DEFAULT_SEARCH_COUNT)
         .clamp(1, DEFAULT_SEARCH_COUNT);
@@ -1523,6 +2104,12 @@ pub async fn search_impl(
                     "SearXNG requires a base URL — set one in Settings > Web.".to_string()
                 })?;
             searxng_search(&base, &query, count).await
+        }
+        SearchProvider::ExecutableExtension => {
+            let call = extension_search_call(settings, trusted_call_id, &query, Some(count))?
+                .ok_or_else(|| "Executable web-search provider is not selected".to_string())?;
+            let output_json = invoke_web_extension(CapabilityKind::WebSearch, call).await?;
+            parse_extension_search_output(&output_json, count)
         }
     }
 }
@@ -1586,6 +2173,19 @@ pub async fn tool_web_search(
     } else {
         None
     };
+    let egress_scope = tool_egress_scope(&app, state.inner(), turn_id.as_deref())?;
+    let trusted_call_id = if settings.search_provider == SearchProvider::ExecutableExtension {
+        tool_call_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("Executable web-search requires its runtime-owned tool_call_id")?
+            .to_string()
+    } else {
+        "builtin-web-search".to_string()
+    };
+    let extension_invocation_id =
+        extension_search_call(&settings, &trusted_call_id, &query, count)?
+            .map(|call| call.invocation_id);
 
     // Same per-turn cancellation channel `tool_web_fetch`/`tool_run_shell`
     // use — see `AppState::tool_cancel`'s doc comment. Callers that don't
@@ -1599,9 +2199,23 @@ pub async fn tool_web_search(
         .or_insert_with(|| std::sync::Arc::new(Notify::new()))
         .clone();
 
+    let operation = crate::run_commands::scoped_with_egress(
+        &app,
+        state.inner(),
+        egress_scope,
+        search_within_scope_for_call(&settings, &trusted_call_id, brave_key, query, count),
+    );
+    tokio::pin!(operation);
     let outcome = tokio::select! {
-        result = search_impl(&settings, brave_key, query, count) => result,
-        _ = cancel.notified() => Err("Search cancelled by the user".to_string()),
+        biased;
+        result = &mut operation => result,
+        _ = cancel.notified() => {
+            if let Some(invocation_id) = extension_invocation_id.as_deref() {
+                let _ = crate::executable_extensions::cancel(invocation_id);
+                let _ = operation.await;
+            }
+            Err("Search cancelled by the user".to_string())
+        },
     };
 
     // Drop this turn's channel once no other in-flight tool of the same turn
@@ -1640,6 +2254,223 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn network_tools_keep_registered_and_unregistered_turn_ids_for_k5() {
+        use crate::run_ledger::PermissionAttribution;
+
+        for attribution in [
+            PermissionAttribution::LedgerRun,
+            PermissionAttribution::UnregisteredRun,
+        ] {
+            let scope = egress_scope_for_attribution(Some("turn:web".to_string()), attribution)
+                .expect("turn scope");
+            assert_eq!(scope.run_id(), Some("turn:web"));
+        }
+        let scope = egress_scope_for_attribution(None, PermissionAttribution::Unknown)
+            .expect("user action scope");
+        assert_eq!(
+            scope.unattributed(),
+            Some(crate::run_scope::Unattributed::UserAction)
+        );
+    }
+
+    struct RunPolicyReset;
+
+    impl Drop for RunPolicyReset {
+        fn drop(&mut self) {
+            crate::egress::clear_run_policy_source();
+        }
+    }
+
+    fn install_test_run_policy(
+        run_id: &str,
+        hosts: &[&str],
+        ports: &[u16],
+        protocols: &[&str],
+    ) -> RunPolicyReset {
+        let run_id = run_id.to_string();
+        let allowlist = crate::run_protocol::EgressAllowlist {
+            hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            ports: ports.to_vec(),
+            protocols: protocols
+                .iter()
+                .map(|protocol| (*protocol).to_string())
+                .collect(),
+        };
+        allowlist.validate().expect("valid test allowlist");
+        crate::egress::install_run_policy_source(move |asked| {
+            if asked == run_id {
+                crate::egress::RunEgressPolicy::Declared(std::sync::Arc::new(allowlist.clone()))
+            } else {
+                crate::egress::RunEgressPolicy::Unknown
+            }
+        });
+        RunPolicyReset
+    }
+
+    #[tokio::test]
+    async fn fetch_checks_the_run_allowlist_before_resolving_the_initial_host() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:web-initial", &["allowed.example"], &[443], &["https"]);
+
+        let error = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:web-initial"),
+            fetch_within_scope(
+                &WebSettings::default(),
+                "https://must-not-resolve.invalid/".to_string(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("the undeclared host must be refused");
+
+        assert!(
+            error.contains(EgressRule::RunHostNotAllowlisted.code()),
+            "unexpected refusal: {error}"
+        );
+        assert!(
+            !error.contains(EgressRule::DnsResolutionFailed.code()),
+            "the refused hostname must not reach DNS: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_handle_free_fetch_preserves_an_ambient_run_for_k5() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:cli-fetch", &["allowed.example"], &[443], &["https"]);
+
+        let error = crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:cli-fetch"),
+            fetch_impl(
+                &WebSettings::default(),
+                "https://must-not-resolve.invalid/".to_string(),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect_err("the CLI helper must retain the run allowlist");
+
+        assert!(
+            error.contains(EgressRule::RunHostNotAllowlisted.code()),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn app_handle_free_search_preserves_an_ambient_run_for_k5() {
+        let _serialized = crate::denial_sink::test_lock();
+        let directory =
+            std::env::temp_dir().join(format!("lm-web-cli-search-sink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("creates the sink directory");
+        let path = directory.join(crate::denial_sink::SINK_FILE);
+        crate::denial_sink::install(
+            crate::denial_sink::DenialSink::open(&path).expect("the sink opens"),
+        );
+        let _policy =
+            install_test_run_policy("run:cli-search", &["allowed.example"], &[443], &["https"]);
+        let mut settings = WebSettings::default();
+        settings.search_provider = SearchProvider::Searxng;
+        settings.searxng_base_url = Some("https://must-not-resolve.invalid".to_string());
+
+        crate::run_scope::scoped(
+            crate::run_scope::RunScope::run("run:cli-search"),
+            search_impl(&settings, None, "query".to_string(), Some(1)),
+        )
+        .await
+        .expect_err("the CLI helper must retain the run allowlist");
+
+        let reader = crate::denial_sink::DenialSink::open(&path).expect("reopens for reading");
+        let mine: Vec<_> = reader
+            .recent(64)
+            .expect("reads")
+            .into_iter()
+            .filter(|row| row.run_id.as_deref() == Some("run:cli-search"))
+            .collect();
+        assert_eq!(mine.len(), 1, "exactly one denial belongs to this run");
+        assert_eq!(mine[0].rule_code, EgressRule::RunHostNotAllowlisted.code());
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[tokio::test]
+    async fn fetch_rechecks_the_run_allowlist_before_resolving_a_redirect_host() {
+        let _serialized = crate::denial_sink::test_lock();
+        let _policy =
+            install_test_run_policy("run:web-redirect", &["allowed.example"], &[443], &["https"]);
+        let origin =
+            spawn_redirecting_server("https://must-not-resolve.invalid/steal".to_string(), "");
+        let mut settings = WebSettings::default();
+        settings.allow_local_network = true;
+
+        let error =
+            crate::run_scope::scoped(crate::run_scope::RunScope::run("run:web-redirect"), async {
+                let client = fetch_client(&settings).expect("build fetch client");
+                crate::egress::send(client.get(origin))
+                    .await
+                    .expect_err("the redirect to an undeclared host must be refused")
+            })
+            .await;
+
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::RunHostNotAllowlisted),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_accounts_each_allowed_redirect_destination() {
+        let _serialized = crate::denial_sink::test_lock();
+        crate::egress::clear_run_policy_source();
+        let (target, seen) = spawn_recording_server();
+        let origin = spawn_redirecting_server(format!("{target}/landed"), "");
+        let expected_ports: std::collections::BTreeSet<u16> = [&origin, &target]
+            .into_iter()
+            .map(|url| {
+                Url::parse(url)
+                    .expect("fixture url parses")
+                    .port_or_known_default()
+                    .expect("fixture url has a port")
+            })
+            .collect();
+        let mut settings = WebSettings::default();
+        settings.allow_local_network = true;
+        let process = crate::run_scope::ProcessScope::new("p-web-redirect-accounting");
+
+        let response = crate::run_scope::scoped_with_process(
+            crate::run_scope::RunScope::run("run:web-redirect-accounting"),
+            process.clone(),
+            async {
+                let client = fetch_client(&settings).expect("build fetch client");
+                crate::egress::send(client.get(origin))
+                    .await
+                    .expect("the allowed redirect must be followed")
+            },
+        )
+        .await;
+        assert!(response.status().is_success());
+        assert!(
+            seen.lock().unwrap().is_some(),
+            "the redirect target must be contacted"
+        );
+
+        let destinations = process.take_destinations();
+        let actual_ports: std::collections::BTreeSet<u16> = destinations
+            .seen
+            .iter()
+            .map(|(destination, requests)| {
+                assert_eq!(*requests, 1, "each hop is one request");
+                destination.port
+            })
+            .collect();
+        assert_eq!(actual_ports, expected_ports);
+        assert_eq!(destinations.overflowed, 0);
     }
 
     /// `::127.0.0.1` walked past this guard entirely: not `::1`, not unspecified,
@@ -2419,6 +3250,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn executable_extension_client_refuses_loopback_at_connect_time() {
+        let client = executable_extension_http_client(Duration::from_secs(1))
+            .expect("build executable-extension client");
+        let error = client
+            .get("http://localhost:1/")
+            .send()
+            .await
+            .expect_err("guarded resolver must refuse loopback before connecting");
+
+        assert_eq!(
+            denied_rule(&error),
+            Some(EgressRule::Loopback),
+            "unexpected error: {error}"
+        );
+    }
+
     /// A trimmed fixture of `html.duckduckgo.com/html/`'s actual result
     /// markup (captured live while implementing this), with one result's
     /// `href` left as the bare destination URL (the shape actually observed)
@@ -2577,6 +3425,10 @@ mod tests {
             serde_json::to_string(&SearchProvider::Searxng).unwrap(),
             "\"searxng\""
         );
+        assert_eq!(
+            serde_json::to_string(&SearchProvider::ExecutableExtension).unwrap(),
+            "\"executable_extension\""
+        );
 
         assert_eq!(
             serde_json::from_str::<SearchProvider>("\"duckduckgo\"").unwrap(),
@@ -2589,6 +3441,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SearchProvider>("\"searxng\"").unwrap(),
             SearchProvider::Searxng
+        );
+        assert_eq!(
+            serde_json::from_str::<SearchProvider>("\"executable_extension\"").unwrap(),
+            SearchProvider::ExecutableExtension
         );
     }
 
@@ -2613,9 +3469,14 @@ mod tests {
     fn web_settings_default_matches_the_design_docs_defaults() {
         let settings = WebSettings::default();
         assert_eq!(settings.search_provider, SearchProvider::Duckduckgo);
+        assert_eq!(settings.search_extension_id, None);
+        assert_eq!(settings.search_extension_capability_id, None);
         assert_eq!(settings.searxng_base_url, None);
         assert!(!settings.allow_local_network);
         assert_eq!(settings.fetch_max_chars, DEFAULT_MAX_CHARS);
+        assert_eq!(settings.fetch_provider, FetchProvider::Builtin);
+        assert_eq!(settings.fetch_extension_id, None);
+        assert_eq!(settings.fetch_extension_capability_id, None);
     }
 
     #[test]
@@ -2629,9 +3490,14 @@ mod tests {
         let path = temp_settings_path("roundtrip.json");
         let settings = WebSettings {
             search_provider: SearchProvider::Searxng,
+            search_extension_id: Some("dev.example.search".to_string()),
+            search_extension_capability_id: Some("private-search".to_string()),
             searxng_base_url: Some("https://searx.example.com".to_string()),
             allow_local_network: true,
             fetch_max_chars: 50_000,
+            fetch_provider: FetchProvider::ExecutableExtension,
+            fetch_extension_id: Some("dev.example.fetch".to_string()),
+            fetch_extension_capability_id: Some("private-fetch".to_string()),
         };
         save_settings_impl(&path, &settings).unwrap();
         assert_eq!(load_settings_impl(&path).unwrap(), settings);
@@ -2639,6 +3505,15 @@ mod tests {
         // temp+rename, same as `sessions.rs`/`mcp.rs`).
         assert!(!path.with_extension("json.tmp").exists());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_settings_default_the_executable_provider_fields() {
+        let settings: WebSettings = serde_json::from_str(
+            r#"{"search_provider":"duckduckgo","searxng_base_url":null,"allow_local_network":false,"fetch_max_chars":20000}"#,
+        )
+        .unwrap();
+        assert_eq!(settings, WebSettings::default());
     }
 
     #[test]
@@ -2752,6 +3627,217 @@ mod tests {
         };
         let err = normalize_and_validate_settings(settings).unwrap_err();
         assert!(err.contains("http"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn executable_provider_settings_require_bounded_capability_ids() {
+        let missing = normalize_and_validate_settings(WebSettings {
+            search_provider: SearchProvider::ExecutableExtension,
+            ..WebSettings::default()
+        })
+        .unwrap_err();
+        assert!(missing.contains("search_extension_capability_id"));
+
+        let owner_missing = normalize_and_validate_settings(WebSettings {
+            search_provider: SearchProvider::ExecutableExtension,
+            search_extension_capability_id: Some("private-search".to_string()),
+            ..WebSettings::default()
+        })
+        .unwrap_err();
+        assert!(owner_missing.contains("search_extension_id"));
+
+        let normalized = normalize_and_validate_settings(WebSettings {
+            search_provider: SearchProvider::ExecutableExtension,
+            search_extension_id: Some("  dev.example.search  ".to_string()),
+            search_extension_capability_id: Some("  private-search  ".to_string()),
+            fetch_provider: FetchProvider::ExecutableExtension,
+            fetch_extension_id: Some("dev.example.fetch".to_string()),
+            fetch_extension_capability_id: Some("private-fetch:v1".to_string()),
+            ..WebSettings::default()
+        })
+        .unwrap();
+        assert_eq!(
+            normalized.search_extension_id.as_deref(),
+            Some("dev.example.search")
+        );
+        assert_eq!(
+            normalized.search_extension_capability_id.as_deref(),
+            Some("private-search")
+        );
+        assert_eq!(
+            normalized.fetch_extension_id.as_deref(),
+            Some("dev.example.fetch")
+        );
+        assert_eq!(
+            normalized.fetch_extension_capability_id.as_deref(),
+            Some("private-fetch:v1")
+        );
+    }
+
+    #[test]
+    fn extension_calls_use_deterministic_bounded_ids_and_exact_typed_json() {
+        let settings = WebSettings {
+            fetch_provider: FetchProvider::ExecutableExtension,
+            fetch_extension_id: Some("dev.example.fetch".to_string()),
+            fetch_extension_capability_id: Some("private-fetch".to_string()),
+            search_provider: SearchProvider::ExecutableExtension,
+            search_extension_id: Some("dev.example.search".to_string()),
+            search_extension_capability_id: Some("private-search".to_string()),
+            ..WebSettings::default()
+        };
+        let first = extension_fetch_call(
+            &settings,
+            "runtime-call-17",
+            "https://example.com/page",
+            Some(120),
+            Some(40),
+        )
+        .unwrap()
+        .unwrap();
+        let repeated = extension_fetch_call(
+            &settings,
+            "runtime-call-17",
+            "https://example.com/page",
+            Some(120),
+            Some(40),
+        )
+        .unwrap()
+        .unwrap();
+        let next_call = extension_fetch_call(
+            &settings,
+            "runtime-call-18",
+            "https://example.com/page",
+            Some(120),
+            Some(40),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first.input_json,
+            r#"{"url":"https://example.com/page","max_chars":120,"start_index":40}"#
+        );
+        assert_eq!(first.invocation_id, repeated.invocation_id);
+        assert_ne!(first.invocation_id, next_call.invocation_id);
+        assert_eq!(first.extension_id, "dev.example.fetch");
+        assert!(first.invocation_id.starts_with("web-fetch-"));
+        assert!(first.invocation_id.len() <= 160);
+
+        let mut replacement_owner = settings.clone();
+        replacement_owner.fetch_extension_id = Some("dev.example.replacement".to_string());
+        let replaced = extension_fetch_call(
+            &replacement_owner,
+            "runtime-call-17",
+            "https://example.com/page",
+            Some(120),
+            Some(40),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(first.invocation_id, replaced.invocation_id);
+
+        let search = extension_search_call(&settings, "runtime-call-17", "rust", Some(99))
+            .unwrap()
+            .unwrap();
+        assert_eq!(search.input_json, r#"{"query":"rust","count":10}"#);
+        assert!(search.invocation_id.starts_with("web-search-"));
+        assert!(
+            extension_fetch_call(&settings, " ", "https://example.com/page", None, None,)
+                .unwrap_err()
+                .contains("trusted runtime call id")
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_providers_reject_legacy_calls_without_runtime_identity() {
+        let settings = WebSettings {
+            fetch_provider: FetchProvider::ExecutableExtension,
+            fetch_extension_id: Some("dev.example.fetch".to_string()),
+            fetch_extension_capability_id: Some("private-fetch".to_string()),
+            search_provider: SearchProvider::ExecutableExtension,
+            search_extension_id: Some("dev.example.search".to_string()),
+            search_extension_capability_id: Some("private-search".to_string()),
+            ..WebSettings::default()
+        };
+        assert!(
+            fetch_impl(&settings, "https://example.com".to_string(), None, None,)
+                .await
+                .unwrap_err()
+                .contains("trusted runtime call id")
+        );
+        assert!(search_impl(&settings, None, "rust".to_string(), None)
+            .await
+            .unwrap_err()
+            .contains("trusted runtime call id"));
+    }
+
+    #[test]
+    fn extension_search_output_is_strict_and_bounded() {
+        let valid =
+            r#"[{"title":"Rust","url":"https://www.rust-lang.org/","snippet":"A language."}]"#;
+        assert_eq!(parse_extension_search_output(valid, 1).unwrap().len(), 1);
+
+        let too_many = format!("[{0},{0}]", &valid[1..valid.len() - 1]);
+        assert!(parse_extension_search_output(&too_many, 1)
+            .unwrap_err()
+            .contains("more results"));
+        assert!(parse_extension_search_output(
+            r#"[{"title":"Bad","url":"file:///etc/passwd","snippet":"no"}]"#,
+            1,
+        )
+        .unwrap_err()
+        .contains("http"));
+        assert!(parse_extension_search_output(
+            r#"[{"title":"Bad","url":"https://example.com","snippet":"no","extra":true}]"#,
+            1,
+        )
+        .unwrap_err()
+        .contains("normalized JSON"));
+    }
+
+    #[test]
+    fn extension_fetch_output_matches_the_requested_window_exactly() {
+        let result = FetchResult {
+            url: "https://93.184.216.34/page".to_string(),
+            final_url: "https://93.184.216.34/final".to_string(),
+            title: Some("Example".to_string()),
+            content_type: "text/html".to_string(),
+            markdown: "hello".to_string(),
+            total_chars: 11,
+            truncated: true,
+        };
+        let output = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            parse_extension_fetch_output(&output, &result.url, 5, 0, false).unwrap(),
+            result
+        );
+
+        let mut local_final_url = result.clone();
+        local_final_url.final_url = "http://127.0.0.1/private".to_string();
+        assert!(parse_extension_fetch_output(
+            &serde_json::to_string(&local_final_url).unwrap(),
+            &local_final_url.url,
+            5,
+            0,
+            false,
+        )
+        .unwrap_err()
+        .contains(EgressRule::Loopback.code()));
+
+        let inconsistent = output.replace("\"truncated\":true", "\"truncated\":false");
+        assert!(parse_extension_fetch_output(
+            &inconsistent,
+            "https://93.184.216.34/page",
+            5,
+            0,
+            false,
+        )
+        .unwrap_err()
+        .contains("window metadata"));
+        assert!(
+            parse_extension_fetch_output(&output, "https://other.example/page", 5, 0, false,)
+                .unwrap_err()
+                .contains("requested URL")
+        );
     }
 
     /// Brave's actual response shape (`web.results[].{title,url,description}`)
