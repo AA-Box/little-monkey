@@ -667,25 +667,29 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     ensureMlxRuntime: async () => {
       const key = "mlx-auto-install";
       if (get().busy[key]) return;
+      // Claim the setup operation before any lazy hydration. Both Studio and
+      // Runtime Hub can request this concurrently, and hydration itself is
+      // asynchronous, so claiming after it would still allow duplicate
+      // repairs/downloads through.
+      begin(key);
       // Studio can request MLX without the user ever opening Runtime Hub.
       // Hydrate the same hardware/runtime/component snapshot lazily so the
       // install path is shared instead of making Studio point at Settings.
-      if (!get().hardware || get().runtimes.length === 0 || get().componentRegistry.length === 0) {
-        await Promise.all([get().refreshOverview(), get().refreshComponents()]);
-      }
-      const platform = get().hardware?.platform;
-      const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
-      if (
-        !platform ||
-        platform.os !== "macos" ||
-        !["aarch64", "arm64"].includes(platform.arch) ||
-        !mlxRuntime
-      ) {
-        return;
-      }
-
-      begin(key);
       try {
+        if (!get().hardware || get().runtimes.length === 0 || get().componentRegistry.length === 0) {
+          await Promise.all([get().refreshOverview(), get().refreshComponents()]);
+        }
+        const platform = get().hardware?.platform;
+        const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
+        if (
+          !platform ||
+          platform.os !== "macos" ||
+          !["aarch64", "arm64"].includes(platform.arch) ||
+          !mlxRuntime
+        ) {
+          return;
+        }
+
         const installed = get().installedComponents.find(
           (component) => component.componentId === MLX_COMPONENT_ID,
         );
@@ -698,6 +702,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           // active MLX tree. Rehydrate it from the already digest-verified
           // component artifact before downloading anything new.
           await runtimeHubClient.mlxInstallComponent(MLX_COMPONENT_ID);
+          // Repair can change the runtime capability from canInfer=false to
+          // true, so refresh the capability snapshot as well as diagnostics.
+          await get().refreshOverview();
           await get().refreshRuntime("mlx");
           return;
         }

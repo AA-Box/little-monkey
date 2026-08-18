@@ -3,6 +3,7 @@ import { Download, PackagePlus, RefreshCw, Trash2 } from "lucide-react";
 
 import { AddModelForm } from "../../Studio/AddModelForm";
 import { Button, StatusPill } from "../../ui";
+import { useT } from "../../../lib/i18n";
 import {
   formatBytes,
   SectionHeading,
@@ -12,9 +13,6 @@ import {
   type GenerationModel,
 } from "../../../lib/studioClient";
 
-function engineLabel(model: GenerationModel): string {
-  return model.engine === "mlx_video" ? "MLX video" : "Bundled generation engine";
-}
 function StudioModelCard({
   model,
   onChanged,
@@ -22,6 +20,7 @@ function StudioModelCard({
   model: GenerationModel;
   onChanged: () => void;
 }) {
+  const { t } = useT();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const blockedByLicense = model.license.acceptanceRequired && !model.licenseAccepted;
@@ -53,7 +52,7 @@ function StudioModelCard({
   }
 
   async function remove() {
-    if (!window.confirm(`Remove ${model.name} from the Studio library?`)) return;
+    if (!window.confirm(t("RuntimeHub.studioModels.removeConfirm", { name: model.name }))) return;
     setError(null);
     setBusy(true);
     try {
@@ -73,29 +72,37 @@ function StudioModelCard({
           <div className="flex flex-wrap items-center gap-2">
             <h4 className="break-words text-sm font-semibold text-foreground">{model.name}</h4>
             <StatusPill tone={model.engine === "mlx_video" ? "success" : "neutral"}>
-              {engineLabel(model)}
+              {model.engine === "mlx_video"
+                ? t("RuntimeHub.studioModels.engineMlxVideo")
+                : t("RuntimeHub.studioModels.engineBundled")}
             </StatusPill>
           </div>
           <p className="mt-1 break-all font-mono text-xs text-muted">
-            {model.family || "Unclassified"} · {model.tasks.join(", ")}
+            {model.family || t("RuntimeHub.studioModels.unclassified")} · {model.tasks.join(", ")}
           </p>
         </div>
         <StatusPill tone={model.installed ? "success" : "warning"}>
-          {model.installed ? "Installed" : `${formatBytes(model.missingBytes)} missing`}
+          {model.installed
+            ? t("RuntimeHub.studioModels.installed")
+            : t("RuntimeHub.studioModels.missing", { bytes: formatBytes(model.missingBytes) })}
         </StatusPill>
       </div>
 
       <div className="mt-3 grid gap-2 text-xs text-muted sm:grid-cols-2">
-        <span>{formatBytes(model.totalBytes)} on disk</span>
-        <span>{model.fitsInMemory ? "Fits available memory" : "Too large for available memory"}</span>
+        <span>{t("RuntimeHub.studioModels.onDisk", { bytes: formatBytes(model.totalBytes) })}</span>
+        <span>
+          {model.fitsInMemory
+            ? t("RuntimeHub.studioModels.fitsMemory")
+            : t("RuntimeHub.studioModels.tooLarge")}
+        </span>
       </div>
 
       {blockedByLicense && (
         <div className="mt-3 rounded-md border border-warning/30 bg-warning-soft p-3 text-xs text-warning">
-          <p>{model.license.name} requires acceptance before its files can be downloaded.</p>
+          <p>{t("RuntimeHub.studioModels.licenseRequired", { name: model.license.name })}</p>
           <div className="mt-2 flex justify-end">
             <Button type="button" size="sm" onClick={() => void acceptLicense()} disabled={busy}>
-              Accept license
+              {t("RuntimeHub.studioModels.acceptLicense")}
             </Button>
           </div>
         </div>
@@ -105,11 +112,17 @@ function StudioModelCard({
       <div className="mt-4 flex flex-wrap justify-end gap-2">
         {!model.installed && !blockedByLicense && (
           <Button type="button" size="sm" variant="primary" onClick={() => void download()} disabled={busy || !model.fitsInMemory}>
-            <Download size={14} aria-hidden="true" /> Download missing files
+            <Download size={14} aria-hidden="true" /> {t("RuntimeHub.studioModels.downloadMissing")}
           </Button>
         )}
-        <Button type="button" size="sm" variant="secondary" onClick={remove} disabled={busy}>
-          <Trash2 size={14} aria-hidden="true" /> Remove
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          onClick={() => void remove()}
+          disabled={busy}
+        >
+          <Trash2 size={14} aria-hidden="true" /> {t("RuntimeHub.studioModels.remove")}
         </Button>
       </div>
     </article>
@@ -123,6 +136,7 @@ function StudioModelCard({
  * either kind of MLX model.
  */
 export function RuntimeHubStudioModels() {
+  const { t } = useT();
   const [models, setModels] = useState<GenerationModel[]>([]);
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -147,15 +161,16 @@ export function RuntimeHubStudioModels() {
   return (
     <section className="flex flex-col gap-3" aria-labelledby="studio-models-heading">
       <SectionHeading
-        title="Studio models"
-        description="Manage image and video generation models alongside Runtime Hub chat models. MLX video models use the shared managed MLX package and activate only when Studio needs them."
+        title={t("RuntimeHub.studioModels.title")}
+        description={t("RuntimeHub.studioModels.description")}
         action={(
           <div className="flex flex-wrap gap-2">
             <Button type="button" size="sm" variant="secondary" onClick={() => void refresh()} disabled={refreshing}>
-              <RefreshCw size={14} aria-hidden="true" /> Refresh
+              <RefreshCw size={14} aria-hidden="true" /> {t("RuntimeHub.studioModels.refresh")}
             </Button>
             <Button type="button" size="sm" variant="secondary" onClick={() => setAdding((current) => !current)}>
-              <PackagePlus size={14} aria-hidden="true" /> {adding ? "Close add form" : "Add Studio model"}
+              <PackagePlus size={14} aria-hidden="true" />
+              {adding ? t("RuntimeHub.studioModels.closeAddForm") : t("RuntimeHub.studioModels.add")}
             </Button>
           </div>
         )}
@@ -181,7 +196,7 @@ export function RuntimeHubStudioModels() {
         </div>
       ) : (
         <div id="studio-models-heading" className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted">
-          No Studio models are registered yet. Add one here to use it from Studio.
+          {t("RuntimeHub.studioModels.empty")}
         </div>
       )}
     </section>

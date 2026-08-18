@@ -17,6 +17,7 @@ import type {
   SettingValue,
 } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
+import { useT } from "../../../lib/i18n";
 import {
   BusyButton,
   CompatibilityWarningBanner,
@@ -487,6 +488,7 @@ function SettingControl({
 }
 
 function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
+  const { t } = useT();
   const runtimeId = runtime.descriptor.runtimeId;
   const installedModels = useRuntimeHubStore((state) => state.installedModels);
   const detail = useRuntimeHubStore((state) => state.runtimeDetails[runtimeId]);
@@ -614,10 +616,9 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
           verifies the pinned Ed25519 signature before activation. */}
       {state === "not_installed" && (
         <div className="mt-4 rounded-md border border-border bg-surface-2 p-3">
-          <p className="text-sm text-foreground">Installing the MLX service package…</p>
+          <p className="text-sm text-foreground">{t("RuntimeHub.mlx.installing")}</p>
           <p className="mt-1 text-xs text-muted">
-            The signed Apple Silicon package is downloaded from the published catalog and
-            verified before it is activated.
+            {t("RuntimeHub.mlx.installDescription")}
           </p>
           <BusyButton
             type="button"
@@ -625,7 +626,7 @@ function RuntimeCard({ runtime }: { runtime: M3RuntimeCapability }) {
             busy={busy["mlx-auto-install"] || busy["component-catalog"] || busy["component-install:mlx-runtime-apple-silicon"]}
             onClick={() => void ensureMlxRuntime().catch(() => {})}
           >
-            Retry automatic install
+            {t("RuntimeHub.mlx.retryAutomaticInstall")}
           </BusyButton>
           <ErrorNotice message={errors["mlx-auto-install"]} />
         </div>

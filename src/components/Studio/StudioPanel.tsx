@@ -1150,12 +1150,12 @@ export function StudioPanel({ mode, railSlot }: Props) {
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
           <span>
             {mlxInstalling
-              ? "Preparing the MLX video service…"
-              : mlxInstallError ?? "The MLX video service is not ready yet."}
+              ? t("Studio.mlx.preparing")
+              : mlxInstallError ?? t("Studio.mlx.notReady")}
           </span>
           {!mlxInstalling && (
             <Button size="sm" variant="secondary" onClick={() => void ensureMlxRuntime().catch(() => {})}>
-              Retry MLX setup
+              {t("Studio.mlx.retry")}
             </Button>
           )}
         </div>

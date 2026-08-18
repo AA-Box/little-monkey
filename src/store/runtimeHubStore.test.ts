@@ -63,6 +63,7 @@ const mocks = vi.hoisted(() => ({
     componentCheckUpdates: vi.fn(),
     componentSyncCatalog: vi.fn(),
     componentInstall: vi.fn(),
+    mlxInstallComponent: vi.fn(),
   },
 }));
 
@@ -257,6 +258,139 @@ describe("runtimeHubStore", () => {
       request: { entry },
     }));
     expect(useRuntimeHubStore.getState().errors["mlx-auto-install"]).toBeUndefined();
+  });
+
+  it("refreshes MLX readiness after repairing an active component", async () => {
+    const damaged = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: false,
+      canUnload: false,
+      canLogs: false,
+      canMetrics: false,
+      canInfer: false,
+      canEmbed: false,
+      settings: [],
+    };
+    const repaired = { ...damaged, canLoad: true, canUnload: true, canInfer: true };
+    const entry = {
+      schemaVersion: 1,
+      sourceId: "local",
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: "MLX runtime (Apple silicon)",
+      accelerator: null,
+      version: "mlx-lm-0.28.4+video",
+      channel: "beta",
+      downloadUrl: "https://components.example.test/mlx-runtime.tar.gz",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      publishedAtMs: 2,
+      compatibilityNote: null,
+      metadata: {},
+    };
+    const installed = {
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: entry.displayName,
+      accelerator: null,
+      channel: "beta",
+      activeVersionKey: "b".repeat(64),
+      versions: [{
+        versionKey: "b".repeat(64),
+        version: entry.version,
+        channel: "beta",
+        sha256: entry.sha256,
+        sizeBytes: entry.sizeBytes,
+        sourceUrl: entry.downloadUrl,
+        artifactPath: "/managed/mlx",
+        installedAtMs: 1,
+        publishedAtMs: entry.publishedAtMs,
+        active: true,
+        compatibilityNote: null,
+      }],
+    };
+    useRuntimeHubStore.setState({
+      hardware: hardware as never,
+      runtimes: [damaged] as never,
+      componentRegistry: [entry] as never,
+      installedComponents: [installed] as never,
+    });
+    mocks.client.mlxInstallComponent.mockResolvedValue({});
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([repaired]);
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "mlx", status: { state: "stopped" } });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await useRuntimeHubStore.getState().ensureMlxRuntime();
+
+    expect(mocks.client.mlxInstallComponent).toHaveBeenCalledWith("mlx-runtime-apple-silicon");
+    expect(mocks.client.refreshRuntimes).toHaveBeenCalledOnce();
+    expect(useRuntimeHubStore.getState().runtimes[0].canInfer).toBe(true);
+    expect(useRuntimeHubStore.getState().errors["mlx-auto-install"]).toBeUndefined();
+  });
+
+  it("coalesces concurrent MLX setup requests into one installation", async () => {
+    const mlxCapability = {
+      descriptor: { runtimeId: "mlx", kind: "mlx", label: "MLX", managed: true, apiBackend: "mlx" },
+      canLoad: false,
+      canUnload: false,
+      canLogs: false,
+      canMetrics: false,
+      canInfer: false,
+      canEmbed: false,
+      settings: [],
+    };
+    const entry = {
+      schemaVersion: 1,
+      sourceId: "local",
+      componentId: "mlx-runtime-apple-silicon",
+      kind: "mlx_runtime",
+      displayName: "MLX runtime (Apple silicon)",
+      accelerator: null,
+      version: "mlx-lm-0.28.4+video",
+      channel: "beta",
+      downloadUrl: "https://components.example.test/mlx-runtime.tar.gz",
+      sha256: "a".repeat(64),
+      sizeBytes: 128,
+      publishedAtMs: 2,
+      compatibilityNote: null,
+      metadata: {},
+    };
+    useRuntimeHubStore.setState({
+      hardware: null,
+      runtimes: [],
+      componentRegistry: [],
+    });
+    mocks.client.componentSyncCatalog.mockResolvedValue([entry]);
+    mocks.client.componentInstall.mockResolvedValue({});
+    mocks.client.componentInstalled.mockResolvedValue([]);
+    mocks.client.componentListRegistry.mockResolvedValue([entry]);
+    mocks.client.componentCheckUpdates.mockResolvedValue([]);
+    mocks.client.hardwareSnapshot.mockResolvedValue(hardware);
+    mocks.client.hardwareProfile.mockResolvedValue(profile);
+    mocks.client.storageStatus.mockResolvedValue(storage);
+    mocks.client.installedModels.mockResolvedValue([]);
+    mocks.client.catalogSources.mockResolvedValue([]);
+    mocks.client.refreshRuntimes.mockResolvedValue([mlxCapability]);
+    mocks.client.runtimeStatus.mockResolvedValue({ runtimeType: "mlx", status: { state: "stopped" } });
+    mocks.client.runtimeInventory.mockResolvedValue({ schema_version: 1, runtime_id: "mlx", models: [], captured_at_ms: 1 });
+    mocks.client.runtimeConfig.mockResolvedValue(null);
+    mocks.client.contextCacheState.mockResolvedValue({ runtimeId: "mlx", configured: { tokens: null, source: "unavailable", settingKey: null } });
+
+    await Promise.all([
+      useRuntimeHubStore.getState().ensureMlxRuntime(),
+      useRuntimeHubStore.getState().ensureMlxRuntime(),
+    ]);
+
+    expect(mocks.client.componentInstall).toHaveBeenCalledOnce();
+    expect(mocks.client.refreshRuntimes).toHaveBeenCalledTimes(2);
+    expect(useRuntimeHubStore.getState().busy["mlx-auto-install"]).toBeUndefined();
   });
 
   it("does not block the rest of the overview refresh when the compatibility report fails", async () => {
