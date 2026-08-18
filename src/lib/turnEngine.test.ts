@@ -22,13 +22,16 @@ import {
   executeToolCall,
   isBlockedInPlanMode,
   isToolCallAllowed,
+  programmaticToolExecutionId,
   PRESENT_PLAN_RESULT,
   stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
   type SkillToolContext,
   type SubagentContext,
+  type ToolExecutionContext,
 } from "./turnEngine";
+import { QuickJsProgrammaticRuntime } from "./programmaticQuickJsRuntime";
 import type { RiskClassification } from "./riskJudge";
 import type { McpToolRegistry } from "./mcpTools";
 import type { ExtensionToolRegistry } from "./executableExtensionTools";
@@ -45,12 +48,210 @@ import { useSessionStore } from "../store/sessionStore";
 import { providerModelTargetKey } from "./modelTargets";
 import { useUserHooksStore } from "../store/userHooksStore";
 import { usePermissionStore } from "../store/permissionStore";
+import { DurableRunRecorder } from "./durableRun";
+import type { RunEventWire } from "./runProtocol";
 
 const emptyMcpRegistry: McpToolRegistry = new Map();
+
+const programmaticReadTool: ToolDef = {
+  type: "function",
+  function: {
+    name: "read_file",
+    description: "Read a file",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: false,
+    },
+  },
+};
+
+const programmaticWriteTool: ToolDef = {
+  type: "function",
+  function: {
+    name: "write_file",
+    description: "Write a file",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+      required: ["path", "content"],
+      additionalProperties: false,
+    },
+  },
+};
 
 function call(name: string, args: Record<string, unknown> = {}): ToolCall {
   return { id: `call-${name}`, type: "function", function: { name, arguments: JSON.stringify(args) } };
 }
+
+describe("executeToolCall / programmatic dispatcher integration", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("routes nested SDK calls through the canonical dispatcher and completion lifecycle", async () => {
+    invokeMock.mockResolvedValue("Wrote 1 byte to a.txt");
+    const completed = vi.fn();
+    const executionContext: ToolExecutionContext = {
+      toolDefinitions: [programmaticWriteTool],
+      isToolAvailable: () => true,
+      onCompleted: completed,
+    };
+    const runtime = new QuickJsProgrammaticRuntime();
+    const result = await runtime.execute({
+      executionId: "integration-program",
+      source: 'return await tools.write_file({path: "a.txt", content: "x"});',
+      toolDefinitions: [programmaticWriteTool],
+      isToolAvailable: () => true,
+      invokeTool: async (name, args, id, signal) => {
+        const nestedCall = call(name, args);
+        nestedCall.id = id;
+        return {
+          content: await executeToolCall(
+          nestedCall,
+          "checkpoint-1",
+          "turn-1",
+          emptyMcpRegistry,
+          signal,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          executionContext,
+          ),
+          cancelled: false,
+        };
+      },
+    });
+
+    expect(result.status).toBe("succeeded");
+    expect(result.value).toBe("Wrote 1 byte to a.txt");
+    expect(invokeMock).toHaveBeenCalledWith("tool_write_file", expect.objectContaining({
+      path: "a.txt",
+      content: "x",
+      checkpoint_id: "checkpoint-1",
+      turn_id: "turn-1",
+    }));
+    expect(completed).toHaveBeenCalledWith(
+      expect.objectContaining({ function: expect.objectContaining({ name: "write_file" }) }),
+      "Wrote 1 byte to a.txt",
+    );
+  });
+
+  it("records the production run_program and nested identities through the durable recorder", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "tool_write_file") return "Wrote 1 byte to nested.txt";
+      return { envelope: null, status: "running", terminal: false };
+    });
+    const recorder = new DurableRunRecorder("run-program");
+    const outerCall = call("run_program", {
+      source: 'return await tools.write_file({path: "nested.txt", content: "x"});',
+    });
+    const outerId = programmaticToolExecutionId("run-program", outerCall.id);
+
+    await recorder.recordToolProposed(outerId, "run_program", outerCall.function.arguments);
+    recorder.recordToolStarted(outerId);
+    const result = await executeToolCall(
+      outerCall,
+      "checkpoint-1",
+      "run-program",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        toolDefinitions: [programmaticWriteTool],
+        isToolAvailable: () => true,
+        invokeTool: async (name, args, nestedToolCallId, signal) => {
+          const nestedStartedAt = Date.now();
+          const nestedCall = call(name, args);
+          nestedCall.id = nestedToolCallId;
+          await recorder.recordToolProposed(nestedToolCallId, name, nestedCall.function.arguments);
+          recorder.recordToolStarted(nestedToolCallId);
+          const nestedResult = await executeToolCall(
+            nestedCall,
+            "checkpoint-1",
+            "run-program",
+            emptyMcpRegistry,
+            signal,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { toolDefinitions: [programmaticWriteTool], isToolAvailable: () => true },
+          );
+          await recorder.recordToolFinished(nestedToolCallId, nestedResult, Date.now() - nestedStartedAt);
+          return { content: nestedResult, cancelled: false };
+        },
+      },
+    );
+    await recorder.recordToolFinished(outerId, result, 1);
+    await recorder.flush();
+
+    const events = invokeMock.mock.calls
+      .filter(([command]) => command === "run_append_event")
+      .map(([, args]) => (args as { event: RunEventWire }).event)
+      .filter(
+        (event): event is Extract<RunEventWire, { type: "tool_proposed" | "tool_started" | "tool_finished" }> =>
+          event.type === "tool_proposed" || event.type === "tool_started" || event.type === "tool_finished",
+      );
+    expect(events.map((event) => event.payload.tool_call_id)).toEqual([
+      outerId,
+      outerId,
+      `${outerId}:nested:1`,
+      `${outerId}:nested:1`,
+      `${outerId}:nested:1`,
+      outerId,
+    ]);
+    const outerProposal = events.find(
+      (event): event is Extract<RunEventWire, { type: "tool_proposed" }> =>
+        event.type === "tool_proposed" && event.payload.tool_name === "run_program",
+    );
+    expect(outerProposal?.payload.tool_call_id).toBe(outerId);
+  });
+
+  it("rejects invalid arguments before the dispatcher invokes the host tool", async () => {
+    const completed = vi.fn();
+    const result = await executeToolCall(
+      call("read_file", { path: 42 }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { toolDefinitions: [programmaticReadTool], onCompleted: completed },
+    );
+
+    expect(JSON.parse(result).error).toContain("Invalid arguments for \"read_file\"");
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(completed).toHaveBeenCalledOnce();
+  });
+});
 
 describe("executeToolCall / present_plan", () => {
   beforeEach(() => {

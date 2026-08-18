@@ -67,7 +67,7 @@ import { runSideQuestion, stopSideQuestion } from "../../lib/sideQuestion";
 import { usePmCopilotStore } from "../../store/pmCopilotStore";
 import { useSideChatStore } from "../../store/sideChatStore";
 import SideChatPanel from "./SideChatPanel";
-import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools } from "../../lib/tools";
+import { TASK_TOOL, PRESENT_PLAN_TOOL, buildTools, toolsForWorkspace } from "../../lib/tools";
 import { mcpToolDefs } from "../../lib/mcpTools";
 import {
   DEFAULT_PROVIDER_MODEL_FILTER,
@@ -970,13 +970,14 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       const permissionMode = usePermissionStore.getState().mode;
       const attachedIds = useSessionStore.getState().sessions.find((entry) => entry.id === sessionId)?.attachedStackIds ?? [];
       const stackNames = useStackStore.getState().stacks.filter((stack) => attachedIds.includes(stack.id)).map((stack) => stack.name);
-      const builtIns = buildTools(stackNames).filter((tool) => {
+      const hasWorkspace = useWorkspaceStore.getState().roots.some((root) => root.is_primary);
+      const builtIns = toolsForWorkspace(buildTools(stackNames), hasWorkspace).filter((tool) => {
         const name = tool.function.name;
         if (!settings.memoryEnabled && name === "remember") return false;
         if (!settings.webToolsEnabled && (name === "web_fetch" || name === "web_search")) return false;
         return true;
       });
-      if (settings.subagentsEnabled) builtIns.push(TASK_TOOL);
+      if (settings.subagentsEnabled && hasWorkspace) builtIns.push(TASK_TOOL);
       if (permissionMode === "plan") builtIns.push(PRESENT_PLAN_TOOL);
       const mcp = mcpToolDefs().defs;
       const lines = [...builtIns, ...mcp]

@@ -204,12 +204,21 @@ fn apply_desktop_execution_roots(
     state: &little_monkey_lib::AppState,
     snapshot: &DesktopTurnSnapshot,
 ) -> Result<(), String> {
+    let Some(workspace) = &snapshot.workspace else {
+        if !snapshot.execution_roots.is_empty() {
+            return Err("desktop chat-only turns must not carry execution roots".to_string());
+        }
+        *state
+            .workspace_roots
+            .lock()
+            .map_err(|_| "desktop workspace roots lock was poisoned".to_string())? = Vec::new();
+        return Ok(());
+    };
     let mut roots = Vec::with_capacity(snapshot.execution_roots.len());
     let mut ordered = snapshot.execution_roots.clone();
     ordered.sort_by_key(|root| !root.is_primary);
     for root in ordered {
-        let grant = snapshot
-            .workspace
+        let grant = workspace
             .roots
             .iter()
             .find(|grant| grant.root_id == root.root_id)
@@ -1021,8 +1030,16 @@ async fn run_inner(
     // unattended run into an all-tools-approved session.
     validate_headless_permission_mode(mode)?;
 
-    let workspace_dir = resolve_workspace_dir(&recipe, &recipe_path);
-    let state = crate::build_state(&Some(workspace_dir))?;
+    let state = if recipe
+        .desktop_turn
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.workspace.is_none())
+    {
+        little_monkey_lib::AppState::default()
+    } else {
+        let workspace_dir = resolve_workspace_dir(&recipe, &recipe_path);
+        crate::build_state(&Some(workspace_dir))?
+    };
     if let Some(snapshot) = &recipe.desktop_turn {
         apply_desktop_execution_roots(&state, snapshot)?;
     }
@@ -1113,7 +1130,7 @@ async fn run_inner(
         // must not invent one for it: `None` here is the submitter's statement
         // that this run has no filesystem, not an absence to be filled in.
         (Some(placed), _) => placed.workspace.clone(),
-        (_, Some(snapshot)) => Some(snapshot.workspace.clone()),
+        (_, Some(snapshot)) => snapshot.workspace.clone(),
         _ => Some(workspace_snapshot(&state)?),
     };
     let frozen_policy = frozen_permission_policy(&recipe, mode, approval_timeout_ms);

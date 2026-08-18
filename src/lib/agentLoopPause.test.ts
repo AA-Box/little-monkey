@@ -329,6 +329,11 @@ describe("chat turn cooperative pause", () => {
   });
 
   it("holds at the end-of-round checkpoint instead of opening another model round", async () => {
+    // This scenario deliberately exercises a workspace tool while the turn
+    // is paused; chat-only turns correctly do not offer `read_file`.
+    useWorkspaceStore.setState({
+      roots: [{ id: "root-1", path: "/workspace", label: "workspace", is_primary: true }],
+    });
     const readCall: ToolCall = {
       id: "read-1",
       type: "function",

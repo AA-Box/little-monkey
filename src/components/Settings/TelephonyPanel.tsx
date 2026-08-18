@@ -43,7 +43,7 @@ import { errorMessage } from "../../lib/errors";
 import { useT } from "../../lib/i18n";
 
 const INPUT =
-  "w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
+  "h-9 w-full rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:ring-1 focus:ring-accent";
 
 /** Health comes from the daemon's last probe, never from having saved a
  * credential: a token nobody has tried reads "not checked yet". */

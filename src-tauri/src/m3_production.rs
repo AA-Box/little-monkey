@@ -1206,15 +1206,10 @@ struct ProductionComponentRegistry {
 /// component versions (llama.cpp/MLX/tokenizer/converter/projector/
 /// accelerator-support builds).
 ///
-/// There is no real upstream binary registry/CDN this app can verify and
-/// hit today for these artifacts, so — mirroring the pluggable
-/// `M3CatalogSource` pattern used for model catalogs — this reads a local
-/// JSON file an operator populates with entries they have independently
-/// vetted (a real source URL plus the sha256 they verified against it),
-/// rather than hardcoding a call to a registry this environment cannot
-/// confirm works. A missing file means an empty registry (no components
-/// advertised as installable yet), which is the honest default until an
-/// operator supplies real, verified entries.
+/// This reads the local JSON registry that the Runtime Hub populates from the
+/// published catalog or an explicit import. Keeping the adopted entries on disk
+/// makes offline listing deterministic; every install still verifies the
+/// declared digest and, for MLX, the pinned publisher signature.
 pub fn component_registry_entries(root: &Path) -> M3HubResult<Vec<M3ComponentCatalogEntry>> {
     let path = root.join(COMPONENT_REGISTRY_FILE);
     let metadata = match fs::symlink_metadata(&path) {
