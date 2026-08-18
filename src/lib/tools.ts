@@ -454,6 +454,27 @@ export function buildTools(attachedStackNames: string[]): ToolDef[] {
   return attachedStackNames.length > 0 ? [...TOOLS, searchDocsTool(attachedStackNames)] : TOOLS;
 }
 
+/** Tools that require an attached workspace. Chat-only turns must not offer
+ * them: without a root there is no safe filesystem or process boundary to
+ * resolve against. */
+const WORKSPACE_TOOL_NAMES = new Set([
+  'read_file',
+  'write_file',
+  'edit_file',
+  'list_dir',
+  'glob',
+  'grep',
+  'run_shell',
+  'shell_output',
+  'shell_kill',
+  'task',
+  'workflow',
+]);
+
+export function toolsForWorkspace(tools: ToolDef[], hasWorkspace: boolean): ToolDef[] {
+  return hasWorkspace ? tools : tools.filter((tool) => !WORKSPACE_TOOL_NAMES.has(tool.function.name));
+}
+
 /**
  * A frontend-only tool: presenting a structured plan for the user to
  * approve before switching out of Plan Mode (see `agentLoop.ts`'s

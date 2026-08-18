@@ -115,7 +115,7 @@ impl RecipeTarget {
     }
 }
 
-pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 2;
+pub const DESKTOP_TURN_SCHEMA_VERSION: u32 = 3;
 const MAX_DESKTOP_HISTORY_MESSAGES: usize = 2_000;
 const MAX_DESKTOP_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DESKTOP_MCP_SERVERS: usize = 64;
@@ -210,7 +210,8 @@ pub struct DesktopTurnSnapshot {
     pub execution_base_url: Option<String>,
     pub history: Vec<serde_json::Value>,
     pub target: ModelTargetSnapshot,
-    pub workspace: WorkspaceContext,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceContext>,
     pub execution_roots: Vec<DesktopWorkspaceRootSnapshot>,
     pub permission_policy: PermissionPolicySnapshot,
     pub generation: DesktopGenerationSettingsSnapshot,
@@ -433,9 +434,14 @@ impl DesktopTurnSnapshot {
                 )
             }
         }
-        self.workspace
-            .validate()
-            .map_err(|error| error.to_string())?;
+        if let Some(workspace) = &self.workspace {
+            workspace.validate().map_err(|error| error.to_string())?;
+        } else if recipe.workspace.is_some() || !self.execution_roots.is_empty() {
+            return Err("desktop chat-only turns must not carry a workspace or execution roots".to_string());
+        }
+        if self.workspace.is_none() && self.workspace_mutation_required {
+            return Err("desktop workspace mutation requires an open workspace".to_string());
+        }
         self.permission_policy
             .validate()
             .map_err(|error| error.to_string())?;
@@ -546,47 +552,48 @@ impl DesktopTurnSnapshot {
             return Err("desktop history exceeds the 32 MiB snapshot limit".to_string());
         }
 
-        if self.execution_roots.is_empty()
-            || self.execution_roots.len() != self.workspace.roots.len()
-            || self
-                .execution_roots
-                .iter()
-                .filter(|root| root.is_primary)
-                .count()
-                != 1
-        {
-            return Err(
-                "desktop execution roots must exactly cover the workspace grants".to_string(),
-            );
-        }
-        for root in &self.execution_roots {
-            if root.label.trim().is_empty() || root.label.len() > 512 {
-                return Err("desktop workspace root label is invalid".to_string());
-            }
-            let grant = self
-                .workspace
-                .roots
-                .iter()
-                .find(|grant| grant.root_id == root.root_id)
-                .ok_or_else(|| {
-                    "desktop execution root is absent from workspace grants".to_string()
-                })?;
-            if grant.canonical_path != root.canonical_path {
+        if let Some(workspace) = &self.workspace {
+            if self.execution_roots.is_empty()
+                || self.execution_roots.len() != workspace.roots.len()
+                || self
+                    .execution_roots
+                    .iter()
+                    .filter(|root| root.is_primary)
+                    .count()
+                    != 1
+            {
                 return Err(
-                    "desktop execution root path differs from its workspace grant".to_string(),
+                    "desktop execution roots must exactly cover the workspace grants".to_string(),
                 );
             }
-            if root.is_primary != (root.root_id == self.workspace.primary_root_id) {
-                return Err("desktop execution root primary marker is inconsistent".to_string());
+            for root in &self.execution_roots {
+                if root.label.trim().is_empty() || root.label.len() > 512 {
+                    return Err("desktop workspace root label is invalid".to_string());
+                }
+                let grant = workspace
+                    .roots
+                    .iter()
+                    .find(|grant| grant.root_id == root.root_id)
+                    .ok_or_else(|| {
+                        "desktop execution root is absent from workspace grants".to_string()
+                    })?;
+                if grant.canonical_path != root.canonical_path {
+                    return Err(
+                        "desktop execution root path differs from its workspace grant".to_string(),
+                    );
+                }
+                if root.is_primary != (root.root_id == workspace.primary_root_id) {
+                    return Err("desktop execution root primary marker is inconsistent".to_string());
+                }
             }
-        }
-        let primary = self
-            .execution_roots
-            .iter()
-            .find(|root| root.is_primary)
-            .ok_or_else(|| "desktop primary execution root is missing".to_string())?;
-        if recipe.workspace.as_deref() != Some(primary.canonical_path.as_str()) {
-            return Err("desktop primary workspace does not match recipe workspace".to_string());
+            let primary = self
+                .execution_roots
+                .iter()
+                .find(|root| root.is_primary)
+                .ok_or_else(|| "desktop primary execution root is missing".to_string())?;
+            if recipe.workspace.as_deref() != Some(primary.canonical_path.as_str()) {
+                return Err("desktop primary workspace does not match recipe workspace".to_string());
+            }
         }
 
         let mut attachment_bytes = 0usize;
@@ -1524,7 +1531,7 @@ mod tests {
                 credential_ref_id: "credential-openrouter".to_string(),
                 capabilities: test_capabilities(),
             },
-            workspace: crate::run_protocol::WorkspaceContext {
+            workspace: Some(crate::run_protocol::WorkspaceContext {
                 workspace_id: "workspace-test".to_string(),
                 primary_root_id: "root-primary".to_string(),
                 roots: vec![crate::run_protocol::RootGrant {
@@ -1534,7 +1541,7 @@ mod tests {
                     allow_symlinks_within_root: false,
                 }],
                 repository_policy: None,
-            },
+            }),
             execution_roots: vec![DesktopWorkspaceRootSnapshot {
                 root_id: "root-primary".to_string(),
                 canonical_path: "/workspace/project".to_string(),
@@ -1621,6 +1628,17 @@ mod tests {
         assert!(validate_recipe(&hostile_origin)
             .unwrap_err()
             .contains("execution origin"));
+    }
+
+    #[test]
+    fn desktop_snapshot_accepts_chat_only_without_workspace() {
+        let mut recipe = desktop_recipe();
+        recipe.workspace = None;
+        let snapshot = recipe.desktop_turn.as_mut().unwrap();
+        snapshot.workspace = None;
+        snapshot.execution_roots.clear();
+        snapshot.workspace_mutation_required = false;
+        validate_recipe(&recipe).expect("a chat-only desktop turn must validate");
     }
 
     #[test]

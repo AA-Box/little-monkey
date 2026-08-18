@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTools, GENERATE_IMAGE_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, toolsForProfile, TOOLS } from "./tools";
+import { buildTools, GENERATE_IMAGE_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, toolsForProfile, toolsForWorkspace, TOOLS } from "./tools";
 
 describe("buildTools", () => {
   it("returns the base TOOLS list unchanged when no stacks are attached", () => {
@@ -28,6 +28,21 @@ describe("buildTools", () => {
     buildTools(["Docs"]);
     expect(TOOLS).toHaveLength(before);
     expect(TOOLS.some((tool) => tool.function.name === "search_docs")).toBe(false);
+  });
+});
+
+describe("toolsForWorkspace", () => {
+  it("removes workspace and subagent tools when no workspace is attached", () => {
+    const tools = toolsForWorkspace([...TOOLS, TASK_TOOL], false);
+    const names = tools.map((tool) => tool.function.name);
+    expect(names).toContain("web_search");
+    expect(names).not.toContain("read_file");
+    expect(names).not.toContain("run_shell");
+    expect(names).not.toContain("task");
+  });
+
+  it("preserves the normal tool list when a workspace is attached", () => {
+    expect(toolsForWorkspace(TOOLS, true)).toBe(TOOLS);
   });
 });
 
