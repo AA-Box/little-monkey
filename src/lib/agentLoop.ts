@@ -50,12 +50,13 @@ import {
   executeToolCall,
   isBlockedInPlanMode,
   isToolCallAllowed,
+  programmaticToolExecutionId,
   PRESENT_PLAN_RESULT,
-  stringifyToolError,
   type ResolvedTarget,
   type RiskAnnotationContext,
   type SkillToolContext,
   type SubagentContext,
+  type ToolExecutionContext,
 } from './turnEngine';
 import { classifyToolCall, type RiskClassification } from './riskJudge';
 import {
@@ -154,6 +155,13 @@ import {
   WORKSPACE_MUTATION_FAILURE,
 } from './workspaceMutation';
 import { errorMessage } from "./errors";
+import {
+  PROGRAMMATIC_SYSTEM_GUIDANCE,
+  PROGRAMMATIC_TOOL,
+  programmaticExecutionService,
+  type ProgrammaticNestedToolResult,
+  type ProgrammaticToolContext,
+} from "./programmaticExecution";
 
 /** Hard cap on model/tool round trips for a single call to runAgentTurn. */
 const MAX_ITERATIONS = 25;
@@ -766,12 +774,8 @@ export const parseRecipeNotice = recipeNoticeCodec.parse;
 export const formatRecipeNotice = recipeNoticeCodec.format;
 
 /**
- * Re-exported for backward compatibility — `isToolCallAllowed` now lives in
- * `turnEngine.ts` (see that module's doc comment) so `subagent.ts`'s own
- * child tool-calling loop can reuse the exact same gate this loop's own
- * dispatch below applies, rather than a parallel/duplicated check. Re-export
- * of the binding already imported above (not a fresh `export ... from`) so
- * this file's own use of it below and the public export are the same value.
+ * Re-exported for backward compatibility — `isToolCallAllowed` lives in
+ * `turnEngine.ts` so child loops can reuse the same offered-tool gate.
  */
 export { isToolCallAllowed };
 
@@ -2858,10 +2862,20 @@ async function runAgentTurnBody(
   // in tools.ts for why (webview-rasterized wire shape; monkey-cli can't
   // offer it). The result lives in private app storage, not the workspace,
   // so it has no edit-permission or selected-folder dependency.
+  const programmaticCapabilities = await programmaticExecutionService.capabilities();
   const hasWorkspace = primaryRoot(useWorkspaceStore.getState().roots) !== null;
   const baseToolsForTurn: ToolDef[] = toolsForWorkspace(
     toolsForSettings(
-      toolsForMode([...buildTools(attachedStackNames), GENERATE_IMAGE_TOOL, ...mcpDefs, ...extensionDefs], mode),
+      toolsForMode(
+        [
+          ...buildTools(attachedStackNames),
+          GENERATE_IMAGE_TOOL,
+          ...mcpDefs,
+          ...extensionDefs,
+          ...(programmaticCapabilities.healthy ? [PROGRAMMATIC_TOOL] : []),
+        ],
+        mode,
+      ),
       settings.memoryEnabled,
       settings.webToolsEnabled,
       // Ultracode force-offers the `task` tool even when the subagents toggle
@@ -3099,6 +3113,71 @@ async function runAgentTurnBody(
       baseToolsForTurn,
       allowedToolsRestriction(invokedSkillCommands, availableSkills),
     );
+    const isToolAvailable = (toolName: string): boolean => {
+      if (!toolsForTurn.some((tool) => tool.function.name === toolName)) return false;
+      const currentSettings = useSettingsStore.getState();
+      if (toolName === 'remember' && !currentSettings.memoryEnabled) return false;
+      if (WEB_TOOL_NAMES.has(toolName) && !currentSettings.webToolsEnabled) return false;
+      if ((toolName === 'task' || toolName === 'workflow') && !currentSettings.subagentsEnabled && !ultracode) {
+        return false;
+      }
+      if (toolName.startsWith('mcp__')) return mcpToolDefs().registry.has(toolName);
+      if (toolName.startsWith('ext__')) return extensionRegistry.has(toolName);
+      return true;
+    };
+    const completeToolCall = async (completedToolCall: ToolCall, resultContent: string): Promise<void> => {
+      if (
+        !signal?.aborted
+        && (completedToolCall.function.name === 'write_file' || completedToolCall.function.name === 'edit_file')
+      ) {
+        if (isSuccessfulMutationResult(resultContent)) {
+          const path = toolCallPathArg(completedToolCall);
+          if (path) {
+            mutatedFiles.add(path);
+            mutationSucceeded = true;
+            unresolvedMutationFailures.delete(path);
+          }
+        } else {
+          const path = toolCallPathArg(completedToolCall);
+          unresolvedMutationFailures.set(
+            path ?? `tool-call:${completedToolCall.id}`,
+            mutationToolFailureReason(resultContent) ?? 'The file-mutation tool returned an error.',
+          );
+        }
+      }
+
+      if (completedToolCall.function.name === 'remember') {
+        const fact = parseRememberedFact(resultContent);
+        if (fact) {
+          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
+          await useRulesStore.getState().refresh();
+        }
+      }
+
+      if (completedToolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
+        const planArgs = toolCallPlanArgs(completedToolCall);
+        if (planArgs) {
+          addMessage({
+            role: 'system',
+            content: formatPlanNotice({
+              id: crypto.randomUUID(),
+              title: planArgs.title,
+              plan: planArgs.plan,
+              openQuestions: planArgs.openQuestions,
+              status: 'proposed',
+            }),
+          });
+        }
+      }
+    };
+    const toolExecutionContext: ToolExecutionContext = {
+      toolDefinitions: toolsForTurn,
+      isToolAvailable,
+      onCompleted: completeToolCall,
+    };
+    const programmaticToolOffered = toolsForTurn.some(
+      (tool) => tool.function.name === PROGRAMMATIC_TOOL.function.name,
+    );
     const systemMessage: ChatMessage = {
       role: 'system',
       content: [
@@ -3107,6 +3186,7 @@ async function runAgentTurnBody(
           skillInvocations,
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
+        ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
         ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
@@ -3402,15 +3482,18 @@ async function runAgentTurnBody(
     const results = await runToolCallsForRound(toolCalls, settings.maxConcurrentSubagents, async (toolCall) => {
       const toolStartedAt = Date.now();
       const recorder = durable.recorder;
+      const recorderToolCallId = toolCall.function.name === PROGRAMMATIC_TOOL.function.name
+        ? programmaticToolExecutionId(recorder?.runId ?? turnId, toolCall.id)
+        : toolCall.id;
       await recorder?.recordToolProposed(
-        toolCall.id,
+        recorderToolCallId,
         toolCall.function.name,
         toolCall.function.arguments ?? '{}',
       );
-      recorder?.recordToolStarted(toolCall.id);
+      recorder?.recordToolStarted(recorderToolCallId);
       const finishObservedTool = async (result: string): Promise<string> => {
         await recorder?.recordToolFinished(
-          toolCall.id,
+          recorderToolCallId,
           result,
           Date.now() - toolStartedAt,
           result === CANCELLED_TOOL_RESULT || signal?.aborted === true,
@@ -3421,9 +3504,19 @@ async function runAgentTurnBody(
         // pathological round cannot grow the record without limit.
         if (result !== CANCELLED_TOOL_RESULT && durable.toolFailures.length < MAX_RECORDED_TOOL_FAILURES) {
           try {
-            const parsed = JSON.parse(result) as { error?: unknown };
+            const parsed = JSON.parse(result) as { error?: unknown; status?: unknown; failure?: { category?: unknown; message?: unknown } };
+            const programFailure =
+              toolCall.function.name === 'run_program' &&
+              parsed &&
+              typeof parsed === 'object' &&
+              parsed.status !== 'succeeded' &&
+              parsed.failure;
             if (parsed && typeof parsed === 'object' && parsed.error) {
               durable.toolFailures.push(`${toolCall.function.name}: ${String(parsed.error).slice(0, 200)}`);
+            } else if (programFailure) {
+              durable.toolFailures.push(
+                `${toolCall.function.name}: ${String(programFailure.category ?? 'failed')} - ${String(programFailure.message ?? 'Program failed').slice(0, 180)}`,
+              );
             }
           } catch {
             // A plain-text tool result is a success — nothing to record.
@@ -3431,20 +3524,6 @@ async function runAgentTurnBody(
         }
         return result;
       };
-      // Reject (without executing) any call whose name wasn't actually
-      // offered to the model this turn — e.g. `remember` after
-      // `memoryEnabled` was turned off, or any other tool a local/quantized
-      // model hallucinates outside the schema it was given. `toolsForSettings`
-      // only shapes what's *offered*; this is the enforcement point that
-      // makes that toggle an actual authorization boundary rather than a
-      // polite suggestion the model can ignore. Still gets a result message,
-      // same invariant as the cancelled-call path below.
-      if (!isToolCallAllowed(toolCall, toolsForTurn)) {
-        return finishObservedTool(
-          stringifyToolError(new Error(`Tool "${toolCall.function.name}" was not offered this turn and was not executed.`)),
-        );
-      }
-
       // Once the Stop button has fired, remaining calls are not executed —
       // but every one still gets a (cancelled) result message, so the
       // transcript never carries a tool_calls entry without its results
@@ -3490,6 +3569,59 @@ async function runAgentTurnBody(
           );
         },
       };
+      const programmaticContext: ProgrammaticToolContext = {
+        toolDefinitions: toolsForTurn,
+        workspaceRoots: useWorkspaceStore.getState().roots.map((root) => root.path),
+        isToolAvailable,
+        invokeTool: async (nestedToolName, nestedArgs, nestedToolCallId, nestedSignal): Promise<ProgrammaticNestedToolResult> => {
+          const nestedToolCall: ToolCall = {
+            id: nestedToolCallId,
+            type: 'function',
+            function: { name: nestedToolName, arguments: JSON.stringify(nestedArgs) },
+          };
+          const nestedStartedAt = Date.now();
+          await recorder?.recordToolProposed(nestedToolCallId, nestedToolName, nestedToolCall.function.arguments);
+          recorder?.recordToolStarted(nestedToolCallId);
+          const nestedResult = await executeToolCall(
+            nestedToolCall,
+            checkpointId,
+            durable.recorder?.runId ?? turnId,
+            mcpRegistry,
+            nestedSignal,
+            riskAnnotation,
+            attachedStackNames,
+            subagentContext,
+            undefined,
+            skillToolContext,
+            sessionId,
+            undefined,
+            extensionRegistry,
+            undefined,
+            toolExecutionContext,
+          );
+          const cancelled = nestedResult === CANCELLED_TOOL_RESULT || nestedSignal.aborted;
+          await recorder?.recordToolFinished(nestedToolCallId, nestedResult, Date.now() - nestedStartedAt, cancelled);
+          let nestedFailure: ProgrammaticNestedToolResult["failure"];
+          if (cancelled) {
+            nestedFailure = { category: "cancelled", message: "Nested tool call was cancelled.", toolName: nestedToolName };
+          } else {
+            try {
+              const parsed = JSON.parse(nestedResult) as { error?: unknown };
+              if (parsed && typeof parsed === "object" && parsed.error) {
+                const message = String(parsed.error);
+                nestedFailure = {
+                  category: /permission denied|blocked/i.test(message) ? "permission_denied" : "nested_tool_failure",
+                  message,
+                  toolName: nestedToolName,
+                };
+              }
+            } catch {
+              // Plain tool output is a successful result.
+            }
+          }
+          return { content: nestedResult, cancelled, ...(nestedFailure ? { failure: nestedFailure } : {}) };
+        },
+      };
       const result = await executeToolCall(
         toolCall,
         checkpointId,
@@ -3504,6 +3636,8 @@ async function runAgentTurnBody(
         sessionId,
         undefined,
         extensionRegistry,
+        programmaticContext,
+        toolExecutionContext,
       );
       return finishObservedTool(result);
     });
@@ -3525,68 +3659,6 @@ async function runAgentTurnBody(
       };
       addMessage(toolMessage);
 
-      // Track this turn's file mutations for `runVerificationPhase` at the
-      // loop's eventual exit — only for calls that actually ran (not
-      // cancelled, not rejected above) and actually succeeded (the
-      // "Wrote…"/"Edited…" string shape, not `{"error": ...}"`).
-      if (
-        !signal?.aborted
-        && (toolCall.function.name === 'write_file' || toolCall.function.name === 'edit_file')
-      ) {
-        if (isSuccessfulMutationResult(resultContent)) {
-          const path = toolCallPathArg(toolCall);
-          if (path) {
-            mutatedFiles.add(path);
-            mutationSucceeded = true;
-            unresolvedMutationFailures.delete(path);
-          }
-        } else {
-          const path = toolCallPathArg(toolCall);
-          unresolvedMutationFailures.set(
-            path ?? `tool-call:${toolCall.id}`,
-            mutationToolFailureReason(resultContent)
-              ?? 'The file-mutation tool returned an error.',
-          );
-        }
-      }
-
-      // A successful `remember` gets its own transcript notice (with a
-      // Forget button — see MessageList.tsx's MemoryRow), cloned from how
-      // checkpoint_end's summary becomes a checkpoint notice. rulesStore is
-      // refreshed right after so later iterations of THIS turn already see
-      // the new fact in the system prompt, not just the next turn.
-      if (toolCall.function.name === 'remember') {
-        const fact = parseRememberedFact(resultContent);
-        if (fact) {
-          addMessage({ role: 'system', content: formatMemoryNotice({ id: fact.id, text: fact.text }) });
-          await useRulesStore.getState().refresh();
-        }
-      }
-
-      // A successful `present_plan` gets its own transcript notice (rendered
-      // as a `PlanCard` with Approve/Keep-planning buttons — see
-      // `MessageList.tsx`), cloned from the `remember` notice pattern just
-      // above. Gated on `resultContent === PRESENT_PLAN_RESULT` — the exact
-      // literal `executeToolCall`/`turnEngine.ts` returns for this tool and
-      // nothing else — rather than just the tool name, so a cancelled call
-      // (`CANCELLED_TOOL_RESULT`) or a call rejected by `isToolCallAllowed`
-      // above (which `continue`s before reaching here at all) never produces
-      // a plan card for a plan that was never actually presented.
-      if (toolCall.function.name === 'present_plan' && resultContent === PRESENT_PLAN_RESULT) {
-        const planArgs = toolCallPlanArgs(toolCall);
-        if (planArgs) {
-          addMessage({
-            role: 'system',
-            content: formatPlanNotice({
-              id: crypto.randomUUID(),
-              title: planArgs.title,
-              plan: planArgs.plan,
-              openQuestions: planArgs.openQuestions,
-              status: 'proposed',
-            }),
-          });
-        }
-      }
     }
 
     if (signal) await parkHere();

@@ -472,6 +472,9 @@ mod test_support;
 #[cfg(test)]
 mod extension_capability_tests;
 
+#[cfg(test)]
+mod programmatic_tool_e2e;
+
 // `Manager` brings `AppHandle::state`/`state::<T>()` into scope — used by
 // `run()`'s `RunEvent::Exit` handler below to reach `AppState::mcp` for
 // `mcp::disconnect_all`.

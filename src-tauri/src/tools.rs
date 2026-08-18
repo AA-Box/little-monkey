@@ -336,8 +336,8 @@ fn glob_impl(
 /// through verbatim, so the invoke payload must be matched by snake_case
 /// names rather than the macro's camelCase default.
 #[tauri::command(rename_all = "snake_case")]
-pub async fn tool_write_file(
-    app: tauri::AppHandle,
+pub async fn tool_write_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
     path: String,
     content: String,
