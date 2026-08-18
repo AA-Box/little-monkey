@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use little_monkey_lib::m3_runtime_hub::M3ModelFootprint;
 use little_monkey_lib::run_protocol::{
     ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RepositoryPolicy,
-    RunEvent, RunStatus,
+    RunEvent, RunKind, RunStatus,
 };
 use little_monkey_lib::runtime_adapter::MemoryRequirement;
 
@@ -2876,6 +2876,17 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         if !self.config.notifications {
             return;
         }
+        // Interactive desktop turns already surface their progress and answer
+        // in the app. OS banners are for unattended work only.
+        if self
+            .shared
+            .load_run(run_id)
+            .ok()
+            .and_then(|run| run.map(|stored| stored.spec.kind))
+            .is_some_and(|kind| kind == RunKind::Interactive)
+        {
+            return;
+        }
         let _ = self.notifier.notify(&DaemonNotification {
             run_id: run_id.to_string(),
             title: title.to_string(),
@@ -3199,6 +3210,36 @@ pub(super) mod tests {
             signals: Arc::new(Mutex::new(Vec::new())),
             memory: Arc::new(Mutex::new(Some(1024))),
         }
+    }
+
+    #[test]
+    fn interactive_runs_do_not_emit_os_notifications() {
+        let (paths, store, shared, _recorder, background_run_id) = fixture("notifications");
+        let interactive_run_id = "run-interactive";
+        let mut interactive_spec = spec(interactive_run_id, 1_000);
+        interactive_spec.kind = RunKind::Interactive;
+        let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+        DurableRunRecorder::submit(ledger, &interactive_spec, "daemon-fixture".into()).unwrap();
+
+        let notifier = FakeNotifier::default();
+        let notifications = notifier.0.clone();
+        let engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            fake_adapter(),
+            notifier,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+
+        engine.notify(&background_run_id, "Background run started", "background");
+        engine.notify(interactive_run_id, "Background run started", "interactive");
+
+        let notifications = notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].run_id, background_run_id);
     }
 
     /// A 16 GiB machine with 16 GiB free, so admission is decided by the
