@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowDown,
   ArrowLeft,
@@ -542,6 +543,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [savingEntryId, setSavingEntryId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
+  const lightboxOpenRef = useRef(false);
+  lightboxOpenRef.current = lightbox !== null;
 
   // `showModal` is the only way into the top layer, so open and close are
   // driven from state rather than the `open` attribute.
@@ -551,6 +554,30 @@ export function StudioPanel({ mode, railSlot }: Props) {
     if (lightbox) dialog.showModal();
     else dialog.close();
   }, [lightbox]);
+
+  // The macOS traffic-light close control belongs to the app window, not the
+  // HTML dialog. If it is clicked while the lightbox is open, consume that
+  // close request for the dialog so a near-miss cannot quit the whole app.
+  useEffect(() => {
+    if (!IN_DESKTOP_APP) return undefined;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onCloseRequested((event) => {
+        if (!lightboxOpenRef.current) return;
+        event.preventDefault();
+        setLightbox(null);
+      })
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
@@ -2456,10 +2483,21 @@ export function StudioPanel({ mode, railSlot }: Props) {
         onClick={(event) => {
           if (event.target === lightboxRef.current) setLightbox(null);
         }}
-        className="max-h-[92vh] max-w-[92vw] rounded-lg border border-border bg-surface p-3 text-foreground backdrop:bg-black/70"
+        className="fixed left-1/2 top-1/2 m-0 max-h-[calc(100vh-2rem)] w-[min(92vw,1100px)] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 overflow-auto rounded-lg border border-border bg-surface p-3 text-foreground outline-none backdrop:bg-black/70 focus:outline-none"
       >
         {lightbox && previews[lightbox.artifactId] && (
           <div className="grid gap-2">
+            <div className="flex justify-end">
+              <IconButton
+                size="sm"
+                variant="secondary"
+                aria-label={t("Studio.result.close")}
+                title={t("Studio.result.close")}
+                onClick={() => setLightbox(null)}
+              >
+                <X size={14} />
+              </IconButton>
+            </div>
             {lightbox.mediaType.startsWith("video/") ? (
               <video
                 controls
