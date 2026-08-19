@@ -622,9 +622,10 @@ pub async fn generation_download_model(
         }
     }
 
-    let root = model_root(&app)?.join(&spec.id);
-    std::fs::create_dir_all(&root)
-        .map_err(|error| format!("Failed to create {}: {error}", root.display()))?;
+    let models_root = model_root(&app)?;
+    let model_dir = models_root.join(&spec.id);
+    std::fs::create_dir_all(&model_dir)
+        .map_err(|error| format!("Failed to create {}: {error}", model_dir.display()))?;
 
     let cancel = Arc::new(CancellationToken::new());
     {
@@ -643,8 +644,21 @@ pub async fn generation_download_model(
             };
             let bearer_token = read_hugging_face_token(&spec.id)?;
             let destination = spec
-                .model_source_path(&root)
+                .model_source_path(&models_root)
                 .ok_or_else(|| "MFLUX model source is not configured".to_string())?;
+            // A model entry may keep its id while changing repository or
+            // revision, and a cancelled transfer has no trustworthy identity
+            // marker. Do not resume an unknown snapshot: remove only the
+            // app-owned source directory, then stage the new snapshot and
+            // write a matching marker at the end.
+            if destination.is_dir() && !spec.model_source_marker_matches(&models_root) {
+                std::fs::remove_dir_all(&destination).map_err(|error| {
+                    format!(
+                        "Failed to replace the old model source at {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            }
             std::fs::create_dir_all(&destination)
                 .map_err(|error| format!("Failed to create {}: {error}", destination.display()))?;
             crate::models::download_repo_snapshot(
@@ -657,7 +671,7 @@ pub async fn generation_download_model(
             )
             .await?;
             std::fs::write(
-                destination.join(".little-monkey-source.json"),
+                destination.join(crate::generation::MODEL_SOURCE_MARKER_FILE),
                 serde_json::to_vec(&json!({
                     "repo": repo,
                     "revision": revision.as_deref().unwrap_or("main"),
@@ -674,13 +688,13 @@ pub async fn generation_download_model(
             else {
                 continue;
             };
-            let destination = root.join(component.file_name());
+            let destination = model_dir.join(component.file_name());
             if destination.is_file() {
                 continue;
             }
             // Download beside the destination and rename, so an interrupted
             // transfer never leaves a half file that looks installed.
-            let temporary = root.join(format!(
+            let temporary = model_dir.join(format!(
                 ".{}.{}.part",
                 component.file_name(),
                 Uuid::new_v4()

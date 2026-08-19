@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import io
 import json
 import random
@@ -58,6 +59,29 @@ class ProgressCallback:
         print(f"mflux step {step}/{self.total}", file=sys.stderr, flush=True)
 
 
+class CancellableVae:
+    """Poll cancellation around each VAE operation and decode tile."""
+
+    def __init__(self, vae: Any, check_cancel: Callable[[], None]):
+        self._vae = vae
+        self._check_cancel = check_cancel
+
+    def encode(self, image: Any) -> Any:
+        self._check_cancel()
+        encoded = self._vae.encode(image)
+        self._check_cancel()
+        return encoded
+
+    def decode(self, latent: Any) -> Any:
+        self._check_cancel()
+        decoded = self._vae.decode(latent)
+        self._check_cancel()
+        return decoded
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._vae, name)
+
+
 class MfluxRunner:
     """Loads one model key and reuses it for subsequent requests."""
 
@@ -96,7 +120,44 @@ class MfluxRunner:
                 self.model_key = key
             return self.model
 
-    def generate(self, job: Job, offset: int, total: int) -> bytes:
+    def preload(self) -> None:
+        """Load before the HTTP service accepts jobs, so cancellation never
+        races an uncancellable model-construction phase.
+        """
+
+        self._load()
+
+    @contextmanager
+    def _cancellable_vae(self, model: Any, job: Job):
+        vae = getattr(model, "vae", None)
+        if vae is None:
+            yield
+            return
+
+        def check_cancel() -> None:
+            if job.cancel_event.is_set():
+                raise GenerationCancelled("Generation cancelled")
+
+        original_vae = vae
+        original_tiling = getattr(model, "tiling_config", None)
+        try:
+            # The pinned runtime's VAE helper decodes in 512px tiles when a
+            # tiling config is present. Wrapping the VAE makes each tile a
+            # cancellation boundary, including the post-sampling decode.
+            from mflux.models.common.vae.tiling_config import TilingConfig
+
+            model.vae = CancellableVae(vae, check_cancel)
+            model.tiling_config = TilingConfig(
+                vae_decode_tiles_per_dim=2,
+                vae_decode_overlap=8,
+                vae_encode_tiled=False,
+            )
+            yield
+        finally:
+            model.vae = original_vae
+            model.tiling_config = original_tiling
+
+    def generate(self, job: Job, offset: int, total: int, batch_index: int = 0) -> bytes:
         model = self._load()
         steps = int(job.request.get("sample_params", {}).get("sample_steps", 20))
         callback = ProgressCallback(job, offset, total, self.lock)
@@ -112,6 +173,8 @@ class MfluxRunner:
             seed = int(job.request.get("seed", -1))
             if seed < 0:
                 seed = random.randint(0, 2_147_483_647)
+            else:
+                seed += batch_index
             sample = job.request.get("sample_params", {})
             kwargs: dict[str, Any] = {
                 "seed": seed,
@@ -123,15 +186,18 @@ class MfluxRunner:
             }
             init_image = job.request.get("init_image")
             init_strength = job.request.get("strength")
-            if init_image:
-                with tempfile.NamedTemporaryFile(suffix=".png") as input_file:
-                    input_file.write(base64.b64decode(init_image))
-                    input_file.flush()
-                    kwargs["image_path"] = input_file.name
-                    kwargs["image_strength"] = float(init_strength if init_strength is not None else 0.5)
+            with self._cancellable_vae(model, job):
+                if init_image:
+                    with tempfile.NamedTemporaryFile(suffix=".png") as input_file:
+                        input_file.write(base64.b64decode(init_image))
+                        input_file.flush()
+                        kwargs["image_path"] = input_file.name
+                        kwargs["image_strength"] = float(init_strength if init_strength is not None else 0.5)
+                        image = model.generate_image(**kwargs)
+                else:
                     image = model.generate_image(**kwargs)
-            else:
-                image = model.generate_image(**kwargs)
+            if job.cancel_event.is_set():
+                raise GenerationCancelled("Generation cancelled")
             output = io.BytesIO()
             getattr(image, "image", image).save(output, format="PNG")
             return output.getvalue()
@@ -170,7 +236,7 @@ class ServiceState:
             count = max(1, min(8, int(job.request.get("batch_count", 1))))
             steps = int(job.request.get("sample_params", {}).get("sample_steps", 20))
             for index in range(count):
-                payload = self.runner.generate(job, index * steps, count * steps)
+                payload = self.runner.generate(job, index * steps, count * steps, batch_index=index)
                 encoded = base64.b64encode(payload).decode("ascii")
                 with self.lock:
                     job.images.append({"b64_json": encoded, "mime_type": "image/png"})
@@ -200,7 +266,7 @@ class ServiceState:
                 "id": job.job_id,
                 "status": job.status,
                 "queue_position": job.queue_position,
-                "progress": {"step": job.step, "total_steps": job.total_steps},
+                "progress": {"step": job.step, "total": job.total_steps},
             }
             if job.status == "completed":
                 result["result"] = {
@@ -310,11 +376,12 @@ def main() -> None:
     parser.add_argument("--base-model", default="dev")
     parser.add_argument("--quantize", type=int, default=None)
     args = parser.parse_args()
-    server = create_server(
-        args.listen_ip,
-        args.listen_port,
-        MfluxRunner(args.model_path, args.base_model, args.quantize),
-    )
+    runner = MfluxRunner(args.model_path, args.base_model, args.quantize)
+    # Model construction is not safely interruptible from the HTTP worker.
+    # Complete it before accepting jobs so cancellation always applies to an
+    # active generation rather than racing a one-time load.
+    runner.preload()
+    server = create_server(args.listen_ip, args.listen_port, runner)
     print(
         f"MFLUX image service listening on {args.listen_ip}:{args.listen_port}",
         file=sys.stderr,
