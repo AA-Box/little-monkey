@@ -7,6 +7,7 @@ export type DictationState = "idle" | "starting" | "listening" | "stopping" | "e
 export interface DictationLanguage {
   id: string;
   label: string;
+  supportsOnDevice: boolean;
 }
 
 export interface DictationCapabilities {

@@ -295,15 +295,23 @@ void little_monkey_dictation_macos_release(void *opaque_session) {
 char *little_monkey_dictation_macos_capabilities_json(void) {
     @autoreleasepool {
         NSMutableArray *languages = [NSMutableArray array];
+        SFSpeechRecognizer *defaultRecognizer = [[SFSpeechRecognizer alloc] initWithLocale:[NSLocale currentLocale]];
+        BOOL defaultSupportsOnDevice = defaultRecognizer != nil && defaultRecognizer.supportsOnDeviceRecognition;
         for (NSLocale *locale in [SFSpeechRecognizer supportedLocales]) {
             NSString *identifier = locale.localeIdentifier ?: @"";
             NSString *label = [locale displayNameForKey:NSLocaleIdentifier value:identifier] ?: identifier;
-            [languages addObject:@{ @"id": identifier, @"label": label }];
+            SFSpeechRecognizer *recognizer = [[SFSpeechRecognizer alloc] initWithLocale:locale];
+            BOOL supportsOnDevice = recognizer != nil && recognizer.supportsOnDeviceRecognition;
+            [languages addObject:@{
+                @"id": identifier,
+                @"label": label,
+                @"supportsOnDevice": @(supportsOnDevice),
+            }];
         }
         NSData *data = [NSJSONSerialization dataWithJSONObject:@{
             @"supported": @([SFSpeechRecognizer class] != Nil && languages.count > 0),
             @"supportsPartialResults": @YES,
-            @"supportsOnDevice": @YES,
+            @"supportsOnDevice": @(defaultSupportsOnDevice),
             @"languages": languages,
         } options:0 error:nil];
         char *result = malloc(data.length + 1);

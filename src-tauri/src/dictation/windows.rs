@@ -31,6 +31,12 @@ fn event_mask(event: SPEVENTENUM) -> u64 {
     1u64 << (event.0 as u32)
 }
 
+#[derive(Default)]
+struct RecognitionState {
+    phrase_in_progress: bool,
+    has_unfinalized_hypothesis: bool,
+}
+
 pub fn capabilities() -> DictationCapabilities {
     let (supported, languages) = thread::spawn(|| unsafe {
         let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
@@ -168,8 +174,11 @@ unsafe fn run_sapi(
     let context = recognizer
         .CreateRecoContext()
         .map_err(|error| format!("Windows speech recognition context failed: {error}"))?;
-    let interest =
-        event_mask(SPEI_HYPOTHESIS) | event_mask(SPEI_RECOGNITION) | event_mask(SPEI_END_SR_STREAM);
+    let interest = event_mask(SPEI_PHRASE_START)
+        | event_mask(SPEI_HYPOTHESIS)
+        | event_mask(SPEI_RECOGNITION)
+        | event_mask(SPEI_FALSE_RECOGNITION)
+        | event_mask(SPEI_END_SR_STREAM);
     context
         .SetInterest(interest, interest)
         .map_err(|error| format!("Windows speech event subscription failed: {error}"))?;
@@ -191,7 +200,7 @@ unsafe fn run_sapi(
     });
 
     let mut events = [SPEVENT::default(); 32];
-    let mut has_unfinalized_hypothesis = false;
+    let mut recognition = RecognitionState::default();
     loop {
         match receiver.try_recv() {
             Ok(Control::Stop) => {
@@ -200,14 +209,23 @@ unsafe fn run_sapi(
                     state: "stopping".to_string(),
                 });
                 let _ = grammar.SetDictationState(SPRS_INACTIVE);
-                let _ = drain_after_stop(
+                let _ = process_sapi_events(
                     session_id,
                     &context,
-                    receiver,
                     callback,
                     &mut events,
-                    &mut has_unfinalized_hypothesis,
+                    &mut recognition,
                 )?;
+                if recognition.phrase_in_progress {
+                    drain_after_stop(
+                        session_id,
+                        &context,
+                        receiver,
+                        callback,
+                        &mut events,
+                        &mut recognition,
+                    )?;
+                }
                 let _ = context.SetContextState(SPCS_DISABLED);
                 callback(NativeEvent::State {
                     session_id: session_id.to_string(),
@@ -234,12 +252,17 @@ unsafe fn run_sapi(
             &context,
             callback,
             &mut events,
-            &mut has_unfinalized_hypothesis,
+            &mut recognition,
         )?
         .reached_end
         {
-            if has_unfinalized_hypothesis {
-                return Err("Windows speech recognition ended without a final result".to_string());
+            if recognition.phrase_in_progress {
+                let detail = if recognition.has_unfinalized_hypothesis {
+                    "with an unfinalized hypothesis"
+                } else {
+                    "before a phrase result"
+                };
+                return Err(format!("Windows speech recognition ended {detail}"));
             }
             callback(NativeEvent::State {
                 session_id: session_id.to_string(),
@@ -251,9 +274,7 @@ unsafe fn run_sapi(
 }
 
 unsafe fn installed_languages() -> Vec<DictationLanguage> {
-    let Ok(category) =
-        CoCreateInstance::<_, ISpObjectTokenCategory>(&SpObjectTokenCategory, None, CLSCTX_ALL)
-    else {
+    let Ok(category) = recognizer_category() else {
         return Vec::new();
     };
     let Ok(tokens) = category.EnumTokens(None, None) else {
@@ -268,10 +289,9 @@ unsafe fn installed_languages() -> Vec<DictationLanguage> {
         let Ok(token) = tokens.Item(index) else {
             continue;
         };
-        let Ok(raw_language) = token.GetStringValue(windows::core::w!("Language")) else {
+        let Some(language_codes) = recognizer_language_attribute(&token) else {
             continue;
         };
-        let language_codes = pwstr_to_string(raw_language);
         for language_code in language_codes.split(';') {
             let Some(locale) = lcid_to_locale(language_code) else {
                 continue;
@@ -285,6 +305,7 @@ unsafe fn installed_languages() -> Vec<DictationLanguage> {
             languages.push(DictationLanguage {
                 label: locale.clone(),
                 id: locale,
+                supports_on_device: false,
             });
         }
     }
@@ -294,11 +315,7 @@ unsafe fn installed_languages() -> Vec<DictationLanguage> {
 unsafe fn find_recognizer_for_language(language: &str) -> Result<ISpObjectToken, String> {
     let wanted_lcid = locale_to_lcid(language)
         .ok_or_else(|| format!("Windows speech language is invalid: {language}"))?;
-    let category =
-        CoCreateInstance::<_, ISpObjectTokenCategory>(&SpObjectTokenCategory, None, CLSCTX_ALL)
-            .map_err(|error| {
-                format!("Windows speech recognizer category is unavailable: {error}")
-            })?;
+    let category = recognizer_category()?;
     let tokens = category
         .EnumTokens(None, None)
         .map_err(|error| format!("Windows speech recognizers could not be enumerated: {error}"))?;
@@ -310,10 +327,9 @@ unsafe fn find_recognizer_for_language(language: &str) -> Result<ISpObjectToken,
         let token = tokens
             .Item(index)
             .map_err(|error| format!("Windows speech recognizer token lookup failed: {error}"))?;
-        let Ok(raw_language) = token.GetStringValue(windows::core::w!("Language")) else {
+        let Some(language_codes) = recognizer_language_attribute(&token) else {
             continue;
         };
-        let language_codes = pwstr_to_string(raw_language);
         if language_codes
             .split(';')
             .filter_map(parse_lcid)
@@ -325,6 +341,26 @@ unsafe fn find_recognizer_for_language(language: &str) -> Result<ISpObjectToken,
     Err(format!(
         "Windows speech recognizer does not provide language {language}"
     ))
+}
+
+unsafe fn recognizer_category() -> Result<ISpObjectTokenCategory, String> {
+    let category =
+        CoCreateInstance::<_, ISpObjectTokenCategory>(&SpObjectTokenCategory, None, CLSCTX_ALL)
+            .map_err(|error| {
+                format!("Windows speech recognizer category is unavailable: {error}")
+            })?;
+    category.SetId(SPCAT_RECOGNIZERS, false).map_err(|error| {
+        format!("Windows speech recognizer category could not initialize: {error}")
+    })?;
+    Ok(category)
+}
+
+unsafe fn recognizer_language_attribute(token: &ISpObjectToken) -> Option<String> {
+    let attributes = token.OpenKey(windows::core::w!("Attributes")).ok()?;
+    let raw_language = attributes
+        .GetStringValue(windows::core::w!("Language"))
+        .ok()?;
+    Some(pwstr_to_string(raw_language))
 }
 
 unsafe fn pwstr_to_string(value: PWSTR) -> String {
@@ -364,45 +400,38 @@ fn locale_to_lcid(value: &str) -> Option<u32> {
     (lcid != 0).then_some(lcid)
 }
 
-/// Stop input, then drain SAPI's queued recognition results until the engine
-/// reports end-of-stream. A hypothesis is never promoted to final text: if
-/// SAPI cannot produce a real recognition before the bounded safety deadline,
-/// the caller receives an error instead of clipped text.
+/// Stop input, then drain SAPI's queued recognition results only while a
+/// phrase is in progress. A hypothesis is never promoted to final text: if
+/// SAPI cannot produce the phrase's recognition or false-recognition before
+/// the bounded safety deadline, the caller receives an error instead of
+/// clipped text. End-of-stream is not used as ordinary grammar completion.
 fn drain_after_stop(
     session_id: &str,
     context: &ISpRecoContext,
     receiver: &mpsc::Receiver<Control>,
     callback: &NativeCallback,
     events: &mut [SPEVENT],
-    has_unfinalized_hypothesis: &mut bool,
-) -> Result<bool, String> {
+    recognition: &mut RecognitionState,
+) -> Result<(), String> {
     let deadline = Instant::now() + STOP_DRAIN_TIMEOUT;
     loop {
         if matches!(receiver.try_recv(), Ok(Control::Cancel)) {
-            return Ok(false);
+            return Ok(());
         }
         let _ = context.WaitForNotifyEvent(100);
-        let batch = process_sapi_events(
-            session_id,
-            context,
-            callback,
-            events,
-            has_unfinalized_hypothesis,
-        )?;
-        if batch.saw_final {
-            return Ok(true);
-        }
-        if batch.reached_end {
-            if *has_unfinalized_hypothesis {
-                return Err("Windows speech recognition ended without a final result".to_string());
-            }
-            return Ok(false);
+        let batch = process_sapi_events(session_id, context, callback, events, recognition)?;
+        if batch.phrase_completed || !recognition.phrase_in_progress {
+            return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(
-                "Windows speech recognition did not deliver a final result while stopping"
-                    .to_string(),
-            );
+            let detail = if recognition.has_unfinalized_hypothesis {
+                "an unfinalized hypothesis"
+            } else {
+                "a phrase result"
+            };
+            return Err(format!(
+                "Windows speech recognition did not deliver {detail} while stopping"
+            ));
         }
     }
 }
@@ -410,7 +439,7 @@ fn drain_after_stop(
 #[derive(Default)]
 struct SapiEventBatch {
     reached_end: bool,
-    saw_final: bool,
+    phrase_completed: bool,
 }
 
 /// Process and release one batch of queued SAPI events. The `lParam` for
@@ -422,7 +451,7 @@ unsafe fn process_sapi_events(
     context: &ISpRecoContext,
     callback: &NativeCallback,
     events: &mut [SPEVENT],
-    has_unfinalized_hypothesis: &mut bool,
+    recognition: &mut RecognitionState,
 ) -> Result<SapiEventBatch, String> {
     let mut fetched = 0;
     context
@@ -431,35 +460,54 @@ unsafe fn process_sapi_events(
     let mut batch = SapiEventBatch::default();
     for event in events.iter().take(fetched as usize) {
         let event_id = event._bitfield & 0xffff;
+        if event_id == SPEI_PHRASE_START.0 {
+            recognition.phrase_in_progress = true;
+            recognition.has_unfinalized_hypothesis = false;
+            continue;
+        }
         if event_id == SPEI_END_SR_STREAM.0 {
             batch.reached_end = true;
             continue;
         }
-        if event_id != SPEI_HYPOTHESIS.0 && event_id != SPEI_RECOGNITION.0 {
+        if event_id != SPEI_HYPOTHESIS.0
+            && event_id != SPEI_RECOGNITION.0
+            && event_id != SPEI_FALSE_RECOGNITION.0
+        {
             continue;
         }
         let raw_result = event.lParam.0 as *mut std::ffi::c_void;
-        if raw_result.is_null() {
-            continue;
-        }
-        let result = ISpRecoResult::from_raw(raw_result);
-        let text = phrase_text(&result).unwrap_or_default();
-        if text.is_empty() {
-            continue;
-        }
-        if event_id == SPEI_RECOGNITION.0 {
-            batch.saw_final = true;
-            *has_unfinalized_hypothesis = false;
-            callback(NativeEvent::Final {
-                session_id: session_id.to_string(),
-                text,
-            });
-        } else {
-            *has_unfinalized_hypothesis = true;
-            callback(NativeEvent::Partial {
-                session_id: session_id.to_string(),
-                text,
-            });
+        let result = (!raw_result.is_null()).then(|| ISpRecoResult::from_raw(raw_result));
+        let text = result
+            .as_ref()
+            .and_then(|result| phrase_text(result).ok())
+            .unwrap_or_default();
+        match event_id {
+            event_id if event_id == SPEI_HYPOTHESIS.0 => {
+                recognition.has_unfinalized_hypothesis = true;
+                if !text.is_empty() {
+                    callback(NativeEvent::Partial {
+                        session_id: session_id.to_string(),
+                        text,
+                    });
+                }
+            }
+            event_id if event_id == SPEI_RECOGNITION.0 => {
+                recognition.phrase_in_progress = false;
+                recognition.has_unfinalized_hypothesis = false;
+                batch.phrase_completed = true;
+                if !text.is_empty() {
+                    callback(NativeEvent::Final {
+                        session_id: session_id.to_string(),
+                        text,
+                    });
+                }
+            }
+            event_id if event_id == SPEI_FALSE_RECOGNITION.0 => {
+                recognition.phrase_in_progress = false;
+                recognition.has_unfinalized_hypothesis = false;
+                batch.phrase_completed = true;
+            }
+            _ => {}
         }
     }
     Ok(batch)

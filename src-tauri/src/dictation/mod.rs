@@ -26,6 +26,8 @@ pub const ERROR_EVENT: &str = "dictation://error";
 pub struct DictationLanguage {
     pub id: String,
     pub label: String,
+    #[serde(default)]
+    pub supports_on_device: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

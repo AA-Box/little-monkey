@@ -72,6 +72,12 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const voice = config.voice;
   const { t } = useT();
   const player = useMemo(() => createTalkPlayer(), []);
+  const selectedDictationLanguage = dictationCapabilities?.languages.find(
+    (language) => language.id === voice.dictationLanguage,
+  );
+  const supportsSelectedOnDevice = voice.dictationLanguage
+    ? selectedDictationLanguage?.supportsOnDevice === true
+    : dictationCapabilities?.supportsOnDevice === true;
 
   const loadDevices = useCallback(async () => {
     // Labels only exist after permission has been given once — an unlabelled
@@ -246,12 +252,12 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
               className="mt-0.5"
               type="checkbox"
               checked={voice.dictationRequireOnDevice}
-              disabled={!dictationCapabilities.supportsOnDevice}
+              disabled={!supportsSelectedOnDevice}
               onChange={(event) => patch({ dictationRequireOnDevice: event.target.checked })}
             />
             <span>
               {t('VoiceSettings.requireOnDevice')}
-              {!dictationCapabilities.supportsOnDevice && (
+              {!supportsSelectedOnDevice && (
                 <span className="mt-1 block text-[11px] text-faint">{t('VoiceSettings.onDeviceUnavailable')}</span>
               )}
             </span>
