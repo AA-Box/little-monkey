@@ -2449,35 +2449,40 @@ pub async fn poll_job(
     job_id: &str,
 ) -> Result<JobProgress, String> {
     let mut retries = POLL_RETRY_DELAYS.iter();
-    let response = loop {
-        match crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))).await {
-            Ok(response) => break response,
-            // Polling is an idempotent GET. Reqwest classifies a malformed or
-            // prematurely closed response differently on different hosts, so
-            // retry every pre-response transport failure except errors that
-            // describe the request itself or an explicit redirect/status rule.
+    loop {
+        let response = match crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))).await {
+            Ok(response) => response,
+            // Polling is an idempotent GET. Reqwest classifies transport
+            // failures differently on different hosts, so retry every failure
+            // except errors that describe the request or an explicit redirect
+            // or status rule.
             Err(error) if !error.is_builder() && !error.is_redirect() && !error.is_status() => {
                 let Some(delay) = retries.next() else {
                     return Err(format!("Poll generation job: {error}"));
                 };
-                // The job remains in the engine, so retrying this read cannot
-                // submit duplicate work or lose a completed result.
                 tokio::time::sleep(*delay).await;
+                continue;
             }
             Err(error) => return Err(format!("Poll generation job: {error}")),
+        };
+        if !response.status().is_success() {
+            return Err(format!(
+                "Generation job {job_id} is no longer available ({})",
+                response.status()
+            ));
         }
-    };
-    if !response.status().is_success() {
-        return Err(format!(
-            "Generation job {job_id} is no longer available ({})",
-            response.status()
-        ));
+        let body: Value = match response.json().await {
+            Ok(body) => body,
+            Err(error) => {
+                let Some(delay) = retries.next() else {
+                    return Err(format!("Generation engine returned an unreadable job: {error}"));
+                };
+                tokio::time::sleep(*delay).await;
+                continue;
+            }
+        };
+        return decode_job_status(&body);
     }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("Generation engine returned an unreadable job: {error}"))?;
-    decode_job_status(&body)
 }
 
 pub async fn cancel_job(client: &reqwest::Client, base_url: &str, job_id: &str) -> bool {
@@ -4097,21 +4102,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_job_retries_transient_transport_error() {
-        use std::io::Write;
+    async fn poll_job_retries_transient_response_error() {
+        use std::io::{Read, Write};
         use std::net::{Shutdown, TcpListener};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            // A bare close is reported differently by reqwest on each host.
-            // Malformed response bytes deterministically fail the first
-            // request at the transport boundary, where poll_job retries it.
-            let _ = first.write_all(b"not an HTTP response\r\n");
+            let mut request = [0_u8; 4096];
+            let _ = first.read(&mut request);
+            // A valid response with malformed status JSON deterministically
+            // exercises the retry path without depending on TCP reset timing.
+            let body = b"not-json";
+            write!(
+                first,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            )
+            .unwrap();
             let _ = first.shutdown(Shutdown::Both);
 
             let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut request);
             let body = r#"{"status":"queued","queue_position":0}"#;
             write!(
                 second,
