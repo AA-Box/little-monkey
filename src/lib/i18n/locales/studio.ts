@@ -113,9 +113,11 @@ export const studioLocale: Record<string, string> = {
     "This page is open in a browser, where Studio cannot reach the generation engine. Open Little Monkey itself to add models and generate.",
   "Studio.emptyLibrary": "Your library is empty. Add a model to get started — nothing is preinstalled.",
   "Studio.forget": "Forget this model",
+  "Studio.editModel": "Edit model options",
   "Studio.add.open": "Add model",
   "Studio.add.cancel": "Cancel",
   "Studio.add.title": "Add a model",
+  "Studio.add.editTitle": "Edit model",
   "Studio.add.slotHint":
     "Each part is named from its own file name where that says enough — check them. A part named wrong fails inside the engine as a tensor-shape error, not here.",
   "Studio.add.slot": "What this part is",
@@ -205,6 +207,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.engineArgsHint":
     "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --vae-format, --model-args.",
   "Studio.add.save": "Add to library",
+  "Studio.add.saveChanges": "Save changes",
   "Studio.lora.title": "LoRAs",
   "Studio.lora.add": "Add LoRA",
   "Studio.lora.remove": "Remove this LoRA",

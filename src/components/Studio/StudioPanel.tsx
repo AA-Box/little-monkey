@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   Loader2,
   Plus,
+  Pencil,
   RectangleHorizontal,
   RectangleVertical,
   Redo2,
@@ -517,6 +518,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [partsDraft, setPartsDraft] = useState<Record<string, ModelComponent[]>>({});
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
+  const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   // The run itself lives in a store, not here: this panel unmounts whenever
   // the user switches to Chat, and a generation must survive that.
@@ -1244,6 +1246,44 @@ export function StudioPanel({ mode, railSlot }: Props) {
                     )}
                   </span>
                 </button>
+
+                {!isRemoteModelId(model.id) && (
+                  <div className="mt-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        setAdding(false);
+                        setEditingModelId((current) => (current === model.id ? null : model.id));
+                      }}
+                    >
+                      <Pencil size={12} />
+                      {t(editingModelId === model.id ? "Studio.add.cancel" : "Studio.editModel")}
+                    </Button>
+                  </div>
+                )}
+
+                {editingModelId === model.id && (
+                  <div className="mt-2">
+                    <AddModelForm
+                      initialSpec={toSpec(model)}
+                      editing
+                      onSaved={() => {
+                        setEditingModelId(null);
+                        void (async () => {
+                          try {
+                            if (status?.loadedModelId === model.id) {
+                              await studioClient.unloadEngine();
+                            }
+                            await refresh();
+                          } catch (reason) {
+                            setError(errorText(reason));
+                          }
+                        })();
+                      }}
+                    />
+                  </div>
+                )}
 
                 {/* Adding and swapping files happens here and only here. The
                     generation tabs pick from what this produces. A backend's
