@@ -139,7 +139,6 @@ pub struct ManagedModelProvenance {
     pub installed_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledModelReference {
     pub resolved: ResolvedModelReference,
     pub provenance: ManagedModelProvenance,
@@ -147,12 +146,15 @@ pub struct InstalledModelReference {
     pub projector_path: Option<PathBuf>,
     pub model_was_new: bool,
     pub projector_was_new: bool,
+    // Keep the component lock through the caller's registry association. The
+    // GC treats an unlocked, unregistered component as orphaned.
+    projector_install_lock: Option<CrossProcessFileLock>,
 }
 
 struct StagedProjector {
     destination: PathBuf,
     partial: Option<PathBuf>,
-    _lock: CrossProcessFileLock,
+    _lock: Option<CrossProcessFileLock>,
 }
 
 impl StagedProjector {
@@ -175,11 +177,30 @@ impl StagedProjector {
             let _ = fs::remove_file(partial);
         }
     }
+
+    fn take_lock(&mut self) -> CrossProcessFileLock {
+        self._lock
+            .take()
+            .expect("projector install lock must be transferred exactly once")
+    }
 }
 
 impl Drop for StagedProjector {
     fn drop(&mut self) {
         self.cleanup_partial();
+    }
+}
+
+impl InstalledModelReference {
+    pub(crate) fn projector_install_lock_is_held(&self) -> bool {
+        self.projector_install_lock.is_some()
+    }
+}
+
+impl Drop for InstalledModelReference {
+    fn drop(&mut self) {
+        // Keep the lock field alive until the owning caller finishes its
+        // model-to-projector registry association.
     }
 }
 
@@ -517,24 +538,26 @@ where
             });
             let mut installed_resolution = resolution.public.clone();
             installed_resolution.tool_calling = provenance.tool_calling;
-            let (projector_path, projector_was_new) = if let Some(projector) = selected_projector {
-                let mut staged = install_projector_artifact(
-                    &client,
-                    &resolution,
-                    projector,
-                    &models_dir,
-                    resolution.public.size_bytes,
-                    overall_total,
-                    cancel,
-                    &mut on_progress,
-                )
-                .await?;
-                let destination = staged.destination.clone();
-                let was_new = staged.publish()?;
-                (Some(destination), was_new)
-            } else {
-                (None, false)
-            };
+            let (projector_path, projector_was_new, projector_install_lock) =
+                if let Some(projector) = selected_projector {
+                    let mut staged = install_projector_artifact(
+                        &client,
+                        &resolution,
+                        projector,
+                        &models_dir,
+                        resolution.public.size_bytes,
+                        overall_total,
+                        cancel,
+                        &mut on_progress,
+                    )
+                    .await?;
+                    let destination = staged.destination.clone();
+                    let was_new = staged.publish()?;
+                    let projector_install_lock = staged.take_lock();
+                    (Some(destination), was_new, Some(projector_install_lock))
+                } else {
+                    (None, false, None)
+                };
             return Ok(InstalledModelReference {
                 resolved: installed_resolution,
                 provenance,
@@ -542,6 +565,7 @@ where
                 projector_path,
                 model_was_new: false,
                 projector_was_new,
+                projector_install_lock,
             });
         }
         if !disambiguated {
@@ -660,13 +684,18 @@ where
 
     let mut installed_resolution = resolution.public.clone();
     installed_resolution.tool_calling = tool_calling;
+    let projector_path = staged_projector
+        .as_ref()
+        .map(|projector| projector.destination.clone());
+    let projector_install_lock = staged_projector.as_mut().map(StagedProjector::take_lock);
     Ok(InstalledModelReference {
         resolved: installed_resolution,
         provenance,
         local_path: destination,
-        projector_path: staged_projector.map(|projector| projector.destination.clone()),
+        projector_path,
         model_was_new: true,
         projector_was_new,
+        projector_install_lock,
     })
 }
 
@@ -841,6 +870,7 @@ pub fn find_installed_reference(
             projector_path: None,
             model_was_new: false,
             projector_was_new: false,
+            projector_install_lock: None,
         }));
     }
     Ok(None)
@@ -1477,7 +1507,7 @@ where
             return Ok(StagedProjector {
                 destination,
                 partial: None,
-                _lock: lock,
+                _lock: Some(lock),
             });
         }
         return Err(format!(
@@ -1550,7 +1580,7 @@ where
     Ok(StagedProjector {
         destination,
         partial: Some(partial),
-        _lock: lock,
+        _lock: Some(lock),
     })
 }
 
@@ -4479,7 +4509,7 @@ mod tests {
         let mut staged_projector = Some(StagedProjector {
             destination: projector_destination,
             partial: Some(components.join("missing-projector.gguf.part")),
-            _lock: lock,
+            _lock: Some(lock),
         });
         let resolved = ResolvedModelReference {
             source: ModelReferenceSource::HuggingFace,

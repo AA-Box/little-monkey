@@ -44,7 +44,11 @@ fn begin_bundle_install(reference: &str) -> Result<BundleInstallCleanup, String>
     let mut active = active
         .lock()
         .map_err(|_| "Active bundle-install lock poisoned".to_string())?;
-    active.insert(reference.to_string());
+    if !active.insert(reference.to_string()) {
+        return Err(format!(
+            "A model bundle installation for reference '{reference}' is already running"
+        ));
+    }
     Ok(BundleInstallCleanup {
         reference: reference.to_string(),
     })
@@ -1315,8 +1319,11 @@ pub async fn models_install_reference(
         },
     )
     .await?;
+    if installed.projector_path.is_some() {
+        debug_assert!(installed.projector_install_lock_is_held());
+    }
     let model = managed_model_info(&installed.local_path, &installed.provenance);
-    if let Some(projector_path) = installed.projector_path {
+    if let Some(projector_path) = installed.projector_path.as_ref() {
         let result = models_set_projector(
             app.clone(),
             installed.local_path.to_string_lossy().into_owned(),
@@ -1333,7 +1340,7 @@ pub async fn models_install_reference(
                     if let Ok(registry_path) = bundle_registry_path(&app) {
                         if let Ok(_registry_lock) = lock_bundle_registry(&registry_path) {
                             if let Ok(registry) = load_bundle_registry_from_path(&registry_path) {
-                                if !managed_projector_referenced(&registry, &projector_path) {
+                                if !managed_projector_referenced(&registry, projector_path) {
                                     let _ = std::fs::remove_file(projector_path);
                                 }
                             }
@@ -1651,5 +1658,16 @@ mod tests {
         drop(lock);
         assert!(!component_install_lock_held(&component).unwrap());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duplicate_bundle_install_is_rejected_without_stealing_cleanup_ownership() {
+        let reference = format!("duplicate-{}", uuid::Uuid::new_v4().simple());
+        let first = begin_bundle_install(&reference).unwrap();
+        assert!(begin_bundle_install(&reference).is_err());
+        drop(first);
+        let second = begin_bundle_install(&reference).unwrap();
+        assert!(begin_bundle_install(&reference).is_err());
+        drop(second);
     }
 }
