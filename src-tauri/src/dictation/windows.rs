@@ -13,7 +13,7 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED,
 };
 
-use super::{DictationCapabilities, NativeCallback, NativeEvent};
+use super::{DictationCapabilities, DictationLanguage, NativeCallback, NativeEvent};
 
 const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -418,8 +418,9 @@ fn drain_after_stop(
         if matches!(receiver.try_recv(), Ok(Control::Cancel)) {
             return Ok(());
         }
-        let _ = context.WaitForNotifyEvent(100);
-        let batch = process_sapi_events(session_id, context, callback, events, recognition)?;
+        let _ = unsafe { context.WaitForNotifyEvent(100) };
+        let batch =
+            unsafe { process_sapi_events(session_id, context, callback, events, recognition) }?;
         if batch.phrase_completed || !recognition.phrase_in_progress {
             return Ok(());
         }
