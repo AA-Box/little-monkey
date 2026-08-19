@@ -41,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import uuid
@@ -264,20 +265,31 @@ class Runner:
                 errors="replace",
                 # A child of this service must not inherit a terminal's width or
                 # colours; tqdm's plain form is what the progress regex expects.
-                env={**os.environ, "TERM": "dumb", "COLUMNS": "80"},
+                # The runtime verifier intentionally excludes regenerable
+                # bytecode from the signed payload. Avoid creating it in the
+                # first place, especially in site-packages.
+                env={
+                    **os.environ,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "TERM": "dumb",
+                    "COLUMNS": "80",
+                },
             )
             job.process = process
             tail: list[str] = []
             assert process.stdout is not None
-            for line in process.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                if not report_progress(line):
-                    tail.append(line)
-                    del tail[:-40]
-            code = process.wait()
-            job.process = None
+            try:
+                for line in process.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    if not report_progress(line):
+                        tail.append(line)
+                        del tail[:-40]
+                code = process.wait()
+            finally:
+                job.process = None
+                clear_runtime_bytecode_cache()
             if job.cancelled.is_set():
                 raise GenerationError("cancelled")
             if code != 0:
@@ -336,6 +348,25 @@ class Runner:
             image.write_bytes(base64.b64decode(initial, validate=True))
             argv += ["--image", str(image)]
         return argv
+
+
+def remove_bytecode_caches(root: Path) -> None:
+    """Removes regenerable Python caches below one managed runtime directory."""
+    for cache in root.rglob("__pycache__"):
+        if cache.is_symlink() or not cache.is_dir():
+            continue
+        shutil.rmtree(cache, ignore_errors=True)
+
+
+def clear_runtime_bytecode_cache() -> None:
+    """Cleans site-package caches after a child generation process exits."""
+    # The service is shipped in a venv. Do not touch caches when this source
+    # file is run directly with the host interpreter (including its tests).
+    if sys.prefix == sys.base_prefix:
+        return
+    site_packages = Path(sysconfig.get_path("purelib"))
+    if site_packages.name == "site-packages" and site_packages.is_relative_to(Path(sys.prefix)):
+        remove_bytecode_caches(site_packages)
 
 
 def report_progress(line: str) -> bool:
