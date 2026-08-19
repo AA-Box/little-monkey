@@ -1559,6 +1559,8 @@ pub fn run() {
             m3_commands::m3_mlx_install,
             #[cfg(target_os = "macos")]
             m3_commands::m3_mlx_install_component,
+            #[cfg(target_os = "macos")]
+            m3_commands::m3_mflux_install_component,
             m3_commands::m3_telemetry_record_load,
             m3_commands::m3_telemetry_record_request,
             m3_commands::m3_telemetry_recent_traces,
@@ -1847,6 +1849,7 @@ pub fn run() {
             generation_commands::generation_add_model,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
+            generation_commands::generation_set_hugging_face_token,
             generation_commands::generation_download_model,
             generation_commands::generation_cancel_download,
             generation_commands::generation_parts,

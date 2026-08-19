@@ -290,6 +290,7 @@ export interface M3CleanupReport {
 export type M3ComponentKind =
   | "llama_cpp_server"
   | "mlx_runtime"
+  | "mflux_image_runtime"
   | "tokenizer"
   | "converter"
   | "projector_runtime"
@@ -1422,6 +1423,8 @@ export const runtimeHubClient = {
    *  The hub proved the digest; this proves the publisher signed it. */
   mlxInstallComponent: (componentId: string) =>
     invoke<MlxInstalledPackage>("m3_mlx_install_component", { componentId }),
+  mfluxInstallComponent: (componentId: string) =>
+    invoke<MlxInstalledPackage>("m3_mflux_install_component", { componentId }),
   runtimePrWatcherState: () => invoke<RuntimePrWatcherState>("runtime_pr_watcher_state"),
   runtimePrWatcherCheckNow: () =>
     invoke<RuntimePrWatcherCheckResult>("runtime_pr_watcher_check_now"),
