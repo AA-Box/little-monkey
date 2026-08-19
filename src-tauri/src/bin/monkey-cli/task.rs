@@ -1338,7 +1338,16 @@ async fn run_inner(
                 // Managed llama-server consumes the context size at process
                 // startup, so it is never forwarded as a request option.
                 let context = crate::managed_model_cli::context_tokens(None)?;
-                crate::managed_model_cli::start_server(client, &artifact, None, context).await
+                let projector =
+                    little_monkey_lib::models::projector_for_model(&app_data_dir, &artifact)?
+                        .map(|component| PathBuf::from(component.path));
+                crate::managed_model_cli::start_server(
+                    client,
+                    &artifact,
+                    projector.as_deref(),
+                    context,
+                )
+                .await
             }
             .await;
             match started {

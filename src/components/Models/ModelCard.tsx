@@ -19,6 +19,8 @@ export interface ModelCardProps {
   isActive: boolean;
   /** Status of the llama-server process. Only meaningful when `isActive` is true. */
   llamaStatus: LlamaStatus;
+  /** Live runtime confirmation that the active projector loaded successfully. */
+  llamaVisionEnabled?: boolean;
   /** Present while `model.file` is being downloaded. */
   downloadProgress?: DownloadProgress;
   /** Backend reason the last start failed. Shown verbatim in place of the
@@ -44,6 +46,7 @@ export function ModelCard({
   model,
   isActive,
   llamaStatus,
+  llamaVisionEnabled = false,
   downloadProgress,
   startError,
   onInstall,
@@ -67,6 +70,8 @@ export function ModelCard({
       : 0;
 
   const activePill = isActive ? ACTIVE_PILL[llamaStatus] : null;
+  const visionConfigured = model.capabilities?.image_input === true;
+  const visionReady = isActive && llamaStatus === "ready" && llamaVisionEnabled;
 
   return (
     <div
@@ -82,9 +87,9 @@ export function ModelCard({
               {t("ModelCard.toolCallingBadge")}
             </span>
           )}
-          {model.capabilities?.image_input && (
+          {visionConfigured && (
             <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
-              {t("ModelCard.visionBadge")}
+              {t(visionReady ? "ModelCard.visionReadyBadge" : "ModelCard.visionConfiguredBadge")}
             </span>
           )}
           {activePill && <StatusPill tone={activePill.tone}>{t(activePill.labelKey)}</StatusPill>}
@@ -96,6 +101,11 @@ export function ModelCard({
         {model.components?.projector && (
           <p className={`mt-1 truncate text-[11px] ${model.components.projector.missing ? "text-danger" : "text-muted"}`}>
             {t(model.components.projector.missing ? "ModelCard.projectorMissing" : "ModelCard.projectorLabel")}: {model.components.projector.file}
+          </p>
+        )}
+        {model.components?.projector && (
+          <p className="mt-1 text-[11px] text-faint">
+            {t("ModelCard.embeddingsUnavailableWithProjector")}
           </p>
         )}
         {isErrored && (

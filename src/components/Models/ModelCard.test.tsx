@@ -8,7 +8,9 @@ vi.mock("../../lib/i18n", () => ({
       ({
         "ModelCard.projectorLabel": "Multimodal projector",
         "ModelCard.projectorMissing": "Projector missing",
-        "ModelCard.visionBadge": "Vision",
+        "ModelCard.visionConfiguredBadge": "Vision configured",
+        "ModelCard.visionReadyBadge": "Vision ready",
+        "ModelCard.embeddingsUnavailableWithProjector": "Embeddings unavailable with projector",
         "ModelCard.statusSelected": "Selected",
         "ModelCard.startButton": "Start",
         "ModelCard.deleteWeightsTitle": "Delete weights",
@@ -54,8 +56,42 @@ describe("ModelCard multimodal state", () => {
       />,
     );
 
-    expect(markup).toContain("Vision");
+    expect(markup).toContain("Vision configured");
+    expect(markup).not.toContain("Vision ready");
     expect(markup).toContain("Multimodal projector: mmproj.gguf");
+    expect(markup).toContain("Embeddings unavailable with projector");
     expect(markup).not.toContain("Projector missing");
+  });
+
+  it("shows vision ready only after the active runtime confirms it", () => {
+    const markup = renderToStaticMarkup(
+      <ModelCard
+        model={{
+          id: "local:model",
+          name: "Local model",
+          repo: "",
+          file: "model.gguf",
+          size_gb: 1,
+          tool_calling: false,
+          installed: true,
+          path: "/models/model.gguf",
+          is_external: true,
+          kind: "chat",
+          components: { projector: null },
+          capabilities: { text: true, image_input: true },
+        }}
+        isActive
+        llamaStatus="ready"
+        llamaVisionEnabled
+        onInstall={() => {}}
+        onCancelDownload={() => {}}
+        onDelete={() => {}}
+        onStart={() => {}}
+        onStop={() => {}}
+      />,
+    );
+
+    expect(markup).toContain("Vision ready");
+    expect(markup).not.toContain("Vision configured");
   });
 });

@@ -94,6 +94,7 @@ describe("modelStore.start", () => {
   });
 
   it("passes an attached projector to the local launcher", async () => {
+    useModelStore.getState().setEmbeddingsEnabled(true);
     invokeMock.mockResolvedValueOnce(8_192);
     await useModelStore.getState().start(
       makeModel({
@@ -111,7 +112,10 @@ describe("modelStore.start", () => {
     );
     expect(invokeMock).toHaveBeenCalledWith(
       "llama_start",
-      expect.objectContaining({ projectorPath: "/models/components/mmproj.gguf" }),
+      expect.objectContaining({
+        projectorPath: "/models/components/mmproj.gguf",
+        embeddings: false,
+      }),
     );
   });
 

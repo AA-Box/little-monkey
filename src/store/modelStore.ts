@@ -608,13 +608,17 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       const startArgs: Record<string, unknown> = {
         modelPath: model.path,
         gpuLayers: DEFAULT_GPU_LAYERS,
-        embeddings: get().embeddingsEnabled,
       };
       const projector = model.components?.projector;
       if (projector?.missing) {
         throw new Error("The multimodal projector configured for this model no longer exists.");
       }
-      if (projector) startArgs.projectorPath = projector.path;
+      if (projector) {
+        startArgs.projectorPath = projector.path;
+        startArgs.embeddings = false;
+      } else {
+        startArgs.embeddings = get().embeddingsEnabled;
+      }
       resolvedCtxSize = await invoke<number>("llama_start", startArgs);
     } catch (err) {
       // `llama_start` can reject before ever spawning the process (e.g.

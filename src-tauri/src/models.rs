@@ -15,7 +15,9 @@ use tokio::io::AsyncWriteExt;
 
 use crate::model_sources::{self, ManagedModelProvenance};
 use crate::permissions;
-use crate::process_lock::try_acquire_cross_process_lock;
+use crate::process_lock::{
+    acquire_cross_process_lock, try_acquire_cross_process_lock, CrossProcessFileLock,
+};
 use crate::profiles::ProfileScopedPaths;
 use crate::AppState;
 
@@ -370,6 +372,14 @@ fn bundle_registry_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(base.join("local_model_bundles.json"))
 }
 
+fn bundle_registry_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("json.lock")
+}
+
+fn lock_bundle_registry(path: &Path) -> Result<CrossProcessFileLock, String> {
+    acquire_cross_process_lock(&bundle_registry_lock_path(path))
+}
+
 fn load_bundle_registry(app: &AppHandle) -> Result<LocalModelBundleRegistry, String> {
     let path = bundle_registry_path(app)?;
     load_bundle_registry_from_path(&path)
@@ -455,8 +465,9 @@ pub fn set_projector_for_model(
     } else {
         None
     };
-    let mut registry =
-        load_bundle_registry_from_path(&profile_data_dir.join("local_model_bundles.json"))?;
+    let registry_path = profile_data_dir.join("local_model_bundles.json");
+    let _registry_lock = lock_bundle_registry(&registry_path)?;
+    let mut registry = load_bundle_registry_from_path(&registry_path)?;
     let component = ProjectorComponent {
         path: projector.to_string_lossy().into_owned(),
         file,
@@ -478,18 +489,7 @@ pub fn set_projector_for_model(
         });
     }
     registry.schema_version = BUNDLE_REGISTRY_SCHEMA_VERSION;
-    save_bundle_registry_to_path(
-        &profile_data_dir.join("local_model_bundles.json"),
-        &registry,
-    )
-}
-
-fn save_bundle_registry(
-    app: &AppHandle,
-    registry: &LocalModelBundleRegistry,
-) -> Result<(), String> {
-    let path = bundle_registry_path(app)?;
-    save_bundle_registry_to_path(&path, registry)
+    save_bundle_registry_to_path(&registry_path, &registry)
 }
 
 fn save_bundle_registry_to_path(
@@ -947,6 +947,8 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
 /// touches the underlying file on disk — it isn't owned by the app.
 #[tauri::command]
 pub fn models_remove_external(app: AppHandle, id: String) -> Result<(), String> {
+    let bundle_registry_path = bundle_registry_path(&app)?;
+    let _bundle_registry_lock = lock_bundle_registry(&bundle_registry_path)?;
     let mut entries = load_external_registry(&app)?;
     let removed_path = entries
         .iter()
@@ -959,9 +961,9 @@ pub fn models_remove_external(app: AppHandle, id: String) -> Result<(), String> 
     }
     save_external_registry(&app, &entries)?;
     if let Some(path) = removed_path {
-        let mut registry = load_bundle_registry(&app)?;
+        let mut registry = load_bundle_registry_from_path(&bundle_registry_path)?;
         registry.bundles.retain(|bundle| bundle.model_path != path);
-        save_bundle_registry(&app, &registry)?;
+        save_bundle_registry_to_path(&bundle_registry_path, &registry)?;
     }
     Ok(())
 }
@@ -1061,7 +1063,9 @@ pub fn models_set_projector(
 pub fn models_remove_projector(app: AppHandle, model_path: String) -> Result<ModelInfo, String> {
     let model = regular_gguf(&model_path)?;
     known_main_model(&app, &model)?;
-    let mut registry = load_bundle_registry(&app)?;
+    let bundle_registry_path = bundle_registry_path(&app)?;
+    let _bundle_registry_lock = lock_bundle_registry(&bundle_registry_path)?;
+    let mut registry = load_bundle_registry_from_path(&bundle_registry_path)?;
     let old = registry
         .bundles
         .iter()
@@ -1070,7 +1074,7 @@ pub fn models_remove_projector(app: AppHandle, model_path: String) -> Result<Mod
     registry
         .bundles
         .retain(|record| record.model_path != model.to_string_lossy());
-    save_bundle_registry(&app, &registry)?;
+    save_bundle_registry_to_path(&bundle_registry_path, &registry)?;
     if let Some(projector) = old {
         if projector.ownership == ComponentOwnership::Managed {
             let root = models_dir(&app)?
@@ -1326,9 +1330,14 @@ pub async fn models_install_reference(
                         model_sources::delete_installed_model(&dir, &installed.local_path).await;
                 }
                 if installed.projector_was_new {
-                    let registry = load_bundle_registry(&app).unwrap_or_default();
-                    if !managed_projector_referenced(&registry, &projector_path) {
-                        let _ = std::fs::remove_file(projector_path);
+                    if let Ok(registry_path) = bundle_registry_path(&app) {
+                        if let Ok(_registry_lock) = lock_bundle_registry(&registry_path) {
+                            if let Ok(registry) = load_bundle_registry_from_path(&registry_path) {
+                                if !managed_projector_referenced(&registry, &projector_path) {
+                                    let _ = std::fs::remove_file(projector_path);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(error)
@@ -1475,7 +1484,9 @@ pub async fn models_delete(
         None,
     )
     .await?;
-    let mut registry = load_bundle_registry(&app)?;
+    let bundle_registry_path = bundle_registry_path(&app)?;
+    let _bundle_registry_lock = lock_bundle_registry(&bundle_registry_path)?;
+    let mut registry = load_bundle_registry_from_path(&bundle_registry_path)?;
     let projector = registry
         .bundles
         .iter()
@@ -1486,7 +1497,7 @@ pub async fn models_delete(
         .retain(|bundle| bundle.model_path != p.to_string_lossy());
     let result = model_sources::delete_installed_model(&dir_canon, &p).await;
     if result.is_ok() {
-        save_bundle_registry(&app, &registry)?;
+        save_bundle_registry_to_path(&bundle_registry_path, &registry)?;
         if let Some(projector) = projector {
             if projector.ownership == ComponentOwnership::Managed {
                 let component_root = managed_components_dir(&dir_canon);
