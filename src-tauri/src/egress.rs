@@ -4712,9 +4712,10 @@ mod tests {
             // anyway. It sets a connect timeout, `egress::READ_TIMEOUT`, a hop cap
             // and its own per-hop SSRF check.
             ("model_sources.rs", 0, 1),
-            // `download_to_file`, the same shape and the same reason, likewise on
+            // `download_to_file` and the Hugging Face repository-tree listing,
+            // the same shape and the same reason, likewise on
             // `egress::READ_TIMEOUT`.
-            ("models.rs", 0, 1),
+            ("models.rs", 0, 2),
             // The loopback Ollama daemon: `/api/version`, `/api/ps`, `/api/embed`;
             // deadlines audited below.
             ("ollama.rs", 0, 3),

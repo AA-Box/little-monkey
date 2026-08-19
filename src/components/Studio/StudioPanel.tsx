@@ -563,6 +563,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // rather than shown and then silently dropped on the way out.
   const remote = isRemoteModelId(selected?.id ?? null);
   const mlxModelSelected = !remote && selected?.engine === "mlx_video";
+  const mfluxModelSelected = !remote && selected?.engine === "mflux_image";
   const mlxRuntimeReady = useRuntimeHubStore((state) =>
     state.runtimes.some((runtime) => runtime.descriptor.kind === "mlx" && runtime.canInfer),
   );
@@ -625,13 +626,17 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // where the engine takes a `mask_image` at all, so an older build is never
   // sent a field it rejects.
   const canMask =
-    task === "image_to_image" && !remote && engineSupports(capabilities, "mask_image");
+    task === "image_to_image" && !remote && !mfluxModelSelected && engineSupports(capabilities, "mask_image");
 
   // The lists the pickers offer: the running engine's own, falling back to the
   // pinned build's while nothing is running. An engine answering with an empty
   // list is treated as not having answered — an empty sampler picker is never
   // the right thing to show.
-  const samplers = capabilities?.samplers.length ? capabilities.samplers : SAMPLERS;
+  const samplers = mfluxModelSelected
+    ? ["linear"]
+    : capabilities?.samplers.length
+      ? capabilities.samplers
+      : SAMPLERS;
   const schedulers = capabilities?.schedulers.length ? capabilities.schedulers : SCHEDULERS;
   const upscalers = capabilities?.upscalers.length ? capabilities.upscalers : UPSCALERS;
 
@@ -730,7 +735,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
       height: alignDimension(selected.defaults.height),
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
-      sampler: selected.defaults.sampleMethod,
+      sampler: selected.engine === "mflux_image" ? "linear" : selected.defaults.sampleMethod,
       scheduler: "",
       clipSkip: -1,
       eta: null,
@@ -1100,7 +1105,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
     );
   }
 
-  if (status && !status.supported) {
+  if (status && !status.supported && !status.mfluxSupported) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-center">
         <div className="max-w-md">
@@ -1123,6 +1128,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
     // it, up to the cap that keeps a leaned-on button from queueing forever.
     runQueue.length + (busy ? 1 : 0) < MAX_STUDIO_QUEUE &&
     (!mlxModelSelected || mlxRuntimeReady) &&
+    (!mfluxModelSelected || !!status?.mfluxInstalled) &&
     (!needsInitImage(task) || !!initImage);
 
   // Tools share nothing with generation — no model, no prompt, no sampler —
@@ -1160,6 +1166,12 @@ export function StudioPanel({ mode, railSlot }: Props) {
               {t("Studio.mlx.retry")}
             </Button>
           )}
+        </div>
+      )}
+
+      {mfluxModelSelected && !status?.mfluxInstalled && (
+        <div className="mb-3 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          {t("Studio.mflux.notReady")}
         </div>
       )}
 
@@ -1276,7 +1288,10 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 {/* Adding and swapping files happens here and only here. The
                     generation tabs pick from what this produces. A backend's
                     models have no files here to swap. */}
-                <details className="mt-2" hidden={isRemoteModelId(model.id)}>
+                <details
+                  className="mt-2"
+                  hidden={isRemoteModelId(model.id) || model.engine === "mflux_image"}
+                >
                   <summary className="cursor-pointer text-[11px] text-muted">
                     {t("Studio.parts")}
                     <span className="ml-1.5 text-faint">
@@ -1885,25 +1900,27 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 />
               </div>
 
-              <label className="grid gap-1 text-[11px] text-muted">
-                {t("Studio.sampler")}
-                <Select
-                  mono
-                  value={settings.sampler}
-                  onChange={(sampler) => setSettings({ ...settings, sampler })}
-                >
-                  {/* A model may name a sampler this build does not list; keep
-                      it selectable rather than silently switching it. */}
-                  {(samplers.includes(settings.sampler)
-                    ? samplers
-                    : [settings.sampler, ...samplers]
-                  ).map((entry) => (
-                    <option key={entry} value={entry}>
-                      {entry}
-                    </option>
-                  ))}
-                </Select>
-              </label>
+              {!mfluxModelSelected && (
+                <label className="grid gap-1 text-[11px] text-muted">
+                  {t("Studio.sampler")}
+                  <Select
+                    mono
+                    value={settings.sampler}
+                    onChange={(sampler) => setSettings({ ...settings, sampler })}
+                  >
+                    {/* A model may name a sampler this build does not list; keep
+                        it selectable rather than silently switching it. */}
+                    {(samplers.includes(settings.sampler)
+                      ? samplers
+                      : [settings.sampler, ...samplers]
+                    ).map((entry) => (
+                      <option key={entry} value={entry}>
+                        {entry}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+              )}
 
               <div className="grid gap-3">
                 <SliderField
@@ -1948,7 +1965,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 />
               )}
 
-              <details className="grid gap-2" hidden={remote}>
+              <details className="grid gap-2" hidden={remote || mfluxModelSelected}>
                 <summary className="cursor-pointer text-[11px] text-muted">
                   {t("Studio.advanced")}
                 </summary>
@@ -1980,7 +1997,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 </div>
               </details>
 
-              <div className="grid gap-2 rounded bg-background/60 p-2">
+              <div className="grid gap-2 rounded bg-background/60 p-2" hidden={mfluxModelSelected}>
                 <label className="flex items-center gap-2 text-[11px] font-medium">
                   <input
                     type="checkbox"
@@ -2099,7 +2116,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </>
           )}
 
-          {!isSpeechTask(task) && !remote && (
+          {!isSpeechTask(task) && !remote && !mfluxModelSelected && (
             <details className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.lora.title")}
@@ -2196,7 +2213,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </Button>
           </div>
 
-          {!isSpeechTask(task) && (
+          {!isSpeechTask(task) && !mfluxModelSelected && (
             <div className="flex shrink-0 items-stretch gap-2">
               <input
                 className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"

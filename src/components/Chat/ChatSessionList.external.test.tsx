@@ -114,6 +114,16 @@ describe("ChatSessionList across environments", () => {
     expect(screen.getByRole("img", { name: "Failed" }).querySelector("svg")).toBeTruthy();
   });
 
+  it("exposes pin and archive actions on a local chat row", () => {
+    render(<ChatSessionList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    expect(useSessionStore.getState().sessions[0]?.pinned).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    expect(useSessionStore.getState().sessions[0]?.archived).toBe(true);
+  });
+
   it("lists a conversation the daemon owns beside the local sessions", async () => {
     render(<ChatSessionList />);
 
