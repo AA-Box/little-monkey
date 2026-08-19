@@ -4095,13 +4095,17 @@ mod tests {
     #[tokio::test]
     async fn poll_job_retries_transient_transport_error() {
         use std::io::Write;
-        use std::net::TcpListener;
+        use std::net::{Shutdown, TcpListener};
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (first, _) = listener.accept().unwrap();
-            drop(first);
+            let (mut first, _) = listener.accept().unwrap();
+            // A bare close is reported differently by reqwest on each host.
+            // Malformed response bytes deterministically fail the first
+            // request at the transport boundary, where poll_job retries it.
+            let _ = first.write_all(b"not an HTTP response\r\n");
+            let _ = first.shutdown(Shutdown::Both);
 
             let (mut second, _) = listener.accept().unwrap();
             let body = r#"{"status":"queued","queue_position":0}"#;
