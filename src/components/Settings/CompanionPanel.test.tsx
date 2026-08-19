@@ -40,6 +40,8 @@ const CONFIG: CompanionConfig = {
     wakePhraseEnabled: false,
     wakePhrase: 'hey monkey',
     alwaysListening: false,
+    dictationLanguage: null,
+    dictationRequireOnDevice: false,
   },
   imageEndpoints: [],
 };
