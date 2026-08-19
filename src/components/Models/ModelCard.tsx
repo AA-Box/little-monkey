@@ -19,6 +19,8 @@ export interface ModelCardProps {
   isActive: boolean;
   /** Status of the llama-server process. Only meaningful when `isActive` is true. */
   llamaStatus: LlamaStatus;
+  /** Live runtime confirmation that the active projector loaded successfully. */
+  llamaVisionEnabled?: boolean;
   /** Present while `model.file` is being downloaded. */
   downloadProgress?: DownloadProgress;
   /** Backend reason the last start failed. Shown verbatim in place of the
@@ -29,6 +31,8 @@ export interface ModelCardProps {
   onDelete: () => void;
   onStart: () => void;
   onStop: () => void;
+  onAddProjector?: () => void;
+  onRemoveProjector?: () => void;
 }
 
 const ACTIVE_PILL: Record<LlamaStatus, { tone: PillTone; labelKey: string } | null> = {
@@ -42,6 +46,7 @@ export function ModelCard({
   model,
   isActive,
   llamaStatus,
+  llamaVisionEnabled = false,
   downloadProgress,
   startError,
   onInstall,
@@ -49,6 +54,8 @@ export function ModelCard({
   onDelete,
   onStart,
   onStop,
+  onAddProjector,
+  onRemoveProjector,
 }: ModelCardProps) {
   const { t } = useT();
   const isDownloading = !model.installed && downloadProgress !== undefined;
@@ -63,6 +70,8 @@ export function ModelCard({
       : 0;
 
   const activePill = isActive ? ACTIVE_PILL[llamaStatus] : null;
+  const visionConfigured = model.capabilities?.image_input === true;
+  const visionReady = isActive && llamaStatus === "ready" && llamaVisionEnabled;
 
   return (
     <div
@@ -78,12 +87,27 @@ export function ModelCard({
               {t("ModelCard.toolCallingBadge")}
             </span>
           )}
+          {visionConfigured && (
+            <span className="inline-flex items-center rounded-full bg-surface-2 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-faint">
+              {t(visionReady ? "ModelCard.visionReadyBadge" : "ModelCard.visionConfiguredBadge")}
+            </span>
+          )}
           {activePill && <StatusPill tone={activePill.tone}>{t(activePill.labelKey)}</StatusPill>}
         </div>
         <p className="mt-0.5 truncate font-mono text-xs text-muted">
           {model.repo ? `${model.repo} · ` : ""}
           {formatSizeGb(model.size_gb)}
         </p>
+        {model.components?.projector && (
+          <p className={`mt-1 truncate text-[11px] ${model.components.projector.missing ? "text-danger" : "text-muted"}`}>
+            {t(model.components.projector.missing ? "ModelCard.projectorMissing" : "ModelCard.projectorLabel")}: {model.components.projector.file}
+          </p>
+        )}
+        {model.components?.projector && (
+          <p className="mt-1 text-[11px] text-faint">
+            {t("ModelCard.embeddingsUnavailableWithProjector")}
+          </p>
+        )}
         {isErrored && (
           <p className="mt-1 flex items-start gap-1 text-xs text-danger">
             <AlertTriangle size={12} className="mt-0.5 shrink-0" />
@@ -147,6 +171,17 @@ export function ModelCard({
               <Button variant="primary" size="sm" onClick={onStart}>
                 <Play size={14} />
                 {t("ModelCard.startButton")}
+              </Button>
+            )}
+
+            {!busy && onAddProjector && (
+              <Button variant="secondary" size="sm" onClick={onAddProjector}>
+                {t(model.components?.projector ? "ModelCard.replaceProjectorButton" : "ModelCard.addProjectorButton")}
+              </Button>
+            )}
+            {!busy && model.components?.projector && onRemoveProjector && (
+              <Button variant="secondary" size="sm" onClick={onRemoveProjector}>
+                {t("ModelCard.removeProjectorButton")}
               </Button>
             )}
 

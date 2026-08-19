@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { CheckCircle2, Download, FolderOpen, Search } from "lucide-react";
 import { Button } from "../ui";
 import { useModelStore } from "../../store/modelStore";
-import type { ResolvedModelReference } from "../../store/modelStore";
+import type { ProjectorCandidate, ResolvedModelReference } from "../../store/modelStore";
 import { formatBytes } from "../../lib/modelRegistry";
 import { useT } from "../../lib/i18n";
 import { errorMessage } from "../../lib/errors";
@@ -11,21 +11,29 @@ import { errorMessage } from "../../lib/errors";
 /**
  * Two ways to add a model outside the curated catalog: pick an already-
  * downloaded `.gguf` file from anywhere on disk (registered as an external
- * reference, never copied), or resolve and install a public single-file GGUF
- * from an Ollama-style tag or explicit Hugging Face reference.
+ * reference, never copied), or resolve and install a public GGUF bundle from
+ * an Ollama-style tag or explicit Hugging Face reference.
  */
 export function AddCustomModelForm() {
   const addExternalModel = useModelStore((s) => s.addExternalModel);
+  const detectProjectors = useModelStore((s) => s.detectProjectors);
+  const setProjector = useModelStore((s) => s.setProjector);
   const resolveModelReference = useModelStore((s) => s.resolveModelReference);
   const installModelReference = useModelStore((s) => s.installModelReference);
+  const cancelDownload = useModelStore((s) => s.cancelDownload);
   const downloadProgress = useModelStore((s) => s.downloadProgress);
   const { t } = useT();
 
   const [pickError, setPickError] = useState<string | null>(null);
   const [picking, setPicking] = useState(false);
+  const [localModelPath, setLocalModelPath] = useState<string | null>(null);
+  const [projectorCandidates, setProjectorCandidates] = useState<ProjectorCandidate[]>([]);
+  const [localProjector, setLocalProjector] = useState<string | null>(null);
+  const [selectedLocalProjectorPath, setSelectedLocalProjectorPath] = useState<string | null>(null);
 
   const [reference, setReference] = useState("");
   const [resolved, setResolved] = useState<ResolvedModelReference | null>(null);
+  const [selectedProjectorSha, setSelectedProjectorSha] = useState<string | undefined>();
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installedName, setInstalledName] = useState<string | null>(null);
@@ -41,13 +49,39 @@ export function AddCustomModelForm() {
         filters: [{ name: "GGUF model", extensions: ["gguf"] }],
       });
       if (!selected || Array.isArray(selected)) return;
-      await addExternalModel(selected);
+      const model = await addExternalModel(selected);
+      setLocalModelPath(model.path);
+      const candidates = await detectProjectors(selected);
+      setProjectorCandidates(candidates);
+      setLocalProjector(model.components?.projector?.file ?? null);
+      setSelectedLocalProjectorPath(candidates.length === 1 ? candidates[0].path : null);
     } catch (err) {
       setPickError(errorMessage(err));
     } finally {
       setPicking(false);
     }
-  }, [addExternalModel]);
+  }, [addExternalModel, detectProjectors]);
+
+  const handleChooseProjector = useCallback(async () => {
+    if (!localModelPath) return;
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: t("AddCustomModelForm.projectorFileFilter"), extensions: ["gguf"] }],
+    });
+    if (!selected || Array.isArray(selected)) return;
+    setSelectedLocalProjectorPath(selected);
+    setLocalProjector(null);
+  }, [localModelPath, t]);
+
+  const handleSaveLocalProjector = useCallback(async () => {
+    if (!localModelPath || !selectedLocalProjectorPath) return;
+    try {
+      const model = await setProjector(localModelPath, selectedLocalProjectorPath);
+      setLocalProjector(model.components?.projector?.file ?? selectedLocalProjectorPath.split(/[\\/]/).pop() ?? selectedLocalProjectorPath);
+    } catch (err) {
+      setPickError(errorMessage(err));
+    }
+  }, [localModelPath, selectedLocalProjectorPath, setProjector]);
 
   const trimmedReference = reference.trim();
 
@@ -57,9 +91,12 @@ export function AddCustomModelForm() {
     setInstallError(null);
     setInstalledName(null);
     setResolved(null);
+    setSelectedProjectorSha(undefined);
     setResolving(true);
     try {
-      setResolved(await resolveModelReference(trimmedReference));
+      const next = await resolveModelReference(trimmedReference);
+      setResolved(next);
+      setSelectedProjectorSha(next.projectorCandidates?.length === 1 ? next.projectorCandidates[0].sha256 : undefined);
     } catch (err) {
       setResolveError(errorMessage(err));
     } finally {
@@ -76,6 +113,7 @@ export function AddCustomModelForm() {
       const installed = await installModelReference(
         trimmedReference,
         resolved.sha256,
+        selectedProjectorSha,
       );
       setInstalledName(installed.name);
     } catch (err) {
@@ -83,7 +121,7 @@ export function AddCustomModelForm() {
     } finally {
       setInstalling(false);
     }
-  }, [resolved, trimmedReference, installModelReference]);
+  }, [resolved, trimmedReference, installModelReference, selectedProjectorSha]);
 
   const progress = resolved
     ? downloadProgress[trimmedReference]
@@ -105,6 +143,27 @@ export function AddCustomModelForm() {
           {picking ? t("AddCustomModelForm.openingButton") : t("AddCustomModelForm.openModelFileButton")}
         </Button>
       </div>
+      <div className="flex items-center justify-between gap-2 text-xs text-muted">
+        <span>
+          {t("AddCustomModelForm.projectorLabel")}:{" "}
+          {localProjector ?? (selectedLocalProjectorPath
+            ? <>{t("AddCustomModelForm.detectedProjector")}: {projectorCandidates.find((candidate) => candidate.path === selectedLocalProjectorPath)?.file ?? selectedLocalProjectorPath.split(/[\\/]/).pop()} <span className="text-foreground">[{t("AddCustomModelForm.selectedProjector")}]</span></>
+            : projectorCandidates.length > 0
+              ? `${t("AddCustomModelForm.detectedProjector")}: ${projectorCandidates.map((candidate) => candidate.file).join(", ")}`
+              : t("AddCustomModelForm.noProjector"))}
+        </span>
+        <Button variant="ghost" size="sm" onClick={() => void handleChooseProjector()} disabled={!localModelPath || picking}>
+          {t("AddCustomModelForm.chooseProjectorButton")}
+        </Button>
+      </div>
+      {selectedLocalProjectorPath && !localProjector && (
+        <div className="flex items-center justify-between gap-2 text-[11px] text-faint">
+          <span>{t("AddCustomModelForm.projectorCompatibilityNote")}</span>
+          <Button variant="secondary" size="sm" onClick={() => void handleSaveLocalProjector()}>
+            {t("AddCustomModelForm.saveProjectorButton")}
+          </Button>
+        </div>
+      )}
       {pickError && <p className="text-xs text-danger">{pickError}</p>}
 
       <div className="border-t border-border pt-3">
@@ -154,7 +213,11 @@ export function AddCustomModelForm() {
 
         {resolved && (
           <div className="mt-3 rounded-md border border-border bg-surface p-3">
-            <ResolvedModelReferenceDetails resolved={resolved} />
+            <ResolvedModelReferenceDetails
+              resolved={resolved}
+              selectedProjectorSha={selectedProjectorSha}
+              onProjectorChange={setSelectedProjectorSha}
+            />
 
             {installing && (
               <div className="mt-3">
@@ -179,6 +242,15 @@ export function AddCustomModelForm() {
                       })
                     : t("AddCustomModelForm.preparingInstall")}
                 </p>
+                <div className="mt-2 flex justify-end">
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    onClick={() => void cancelDownload(trimmedReference)}
+                  >
+                    {t("AddCustomModelForm.cancelInstallButton")}
+                  </Button>
+                </div>
               </div>
             )}
 
@@ -196,7 +268,11 @@ export function AddCustomModelForm() {
                 variant="primary"
                 size="sm"
                 onClick={() => void handleInstall()}
-                disabled={installing || installedName !== null}
+                disabled={
+                  installing ||
+                  installedName !== null ||
+                  (resolved.projectorCandidates?.length ?? 0) > 1 && !selectedProjectorSha
+                }
               >
                 <Download size={14} />
                 {installing
@@ -224,8 +300,12 @@ export function resolvedModelSourceKey(source: string): string | null {
 
 export function ResolvedModelReferenceDetails({
   resolved,
+  selectedProjectorSha,
+  onProjectorChange,
 }: {
   resolved: ResolvedModelReference;
+  selectedProjectorSha?: string;
+  onProjectorChange?: (sha256: string | undefined) => void;
 }) {
   const { t } = useT();
   const sourceKey = resolvedModelSourceKey(resolved.source);
@@ -288,6 +368,26 @@ export function ResolvedModelReferenceDetails({
           </dd>
         </div>
       </dl>
+      {resolved.artifacts && resolved.artifacts.length > 1 && (
+        <div className="mt-3 border-t border-border pt-2 text-xs">
+          {resolved.artifacts.slice(1).map((artifact) => (
+            <p key={artifact.sha256} className="text-muted">
+              {t("AddCustomModelForm.projectorLabel")}: <span className="font-mono text-foreground">{artifact.fileName}</span> ({formatBytes(artifact.sizeBytes)})
+            </p>
+          ))}
+        </div>
+      )}
+      {resolved.projectorCandidates && resolved.projectorCandidates.length > 1 && (
+        <label className="mt-3 block text-xs text-muted">
+          {t("AddCustomModelForm.projectorLabel")}
+          <select className="mt-1 block w-full rounded-md border border-border bg-background p-1.5 text-foreground" value={selectedProjectorSha ?? ""} onChange={(event) => onProjectorChange?.(event.target.value || undefined)}>
+            <option value="" disabled>{t("AddCustomModelForm.chooseProjectorOption")}</option>
+            {resolved.projectorCandidates.map((candidate) => (
+              <option key={candidate.sha256} value={candidate.sha256}>{candidate.fileName}</option>
+            ))}
+          </select>
+        </label>
+      )}
     </>
   );
 }

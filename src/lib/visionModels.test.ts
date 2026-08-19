@@ -1,12 +1,21 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { isVisionCapableProviderModel } from "./visionModels";
+import { isVisionCapableLocalModel, isVisionCapableProviderModel } from "./visionModels";
 import { useModelStore } from "../store/modelStore";
 import { useSettingsStore } from "../store/settingsStore";
 
 afterEach(() => {
-  useModelStore.setState({ providerModels: {} });
+  useModelStore.setState({ providerModels: {}, activeProvider: "local", llamaStatus: "stopped", llamaVisionEnabled: false });
   useSettingsStore.setState({ visionOverrides: {} });
+});
+
+describe("isVisionCapableLocalModel", () => {
+  it("requires a ready runtime that reports a loaded projector", () => {
+    useModelStore.setState({ activeProvider: "local", llamaStatus: "ready", llamaVisionEnabled: true });
+    expect(isVisionCapableLocalModel()).toBe(true);
+    useModelStore.setState({ llamaStatus: "starting" });
+    expect(isVisionCapableLocalModel()).toBe(false);
+  });
 });
 
 /** A false "no" here is silent data loss: `stripImagesForTextOnlyTarget` in
