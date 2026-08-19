@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
@@ -24,7 +24,7 @@ import { useGitDeliveryStore } from "../../store/gitDeliveryStore";
 import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { REMOTE_CONTROL_ENVIRONMENT } from "../../lib/conversationsClient";
 import { detectShortcutPlatform } from "../../lib/shortcuts";
-import { SessionGitBadge, type SessionGitContext } from "./SessionGitBadge";
+import { SessionGitBadge, SessionPreviewCard, type SessionGitContext } from "./SessionGitBadge";
 import {
   buildSessionListView,
   environmentOptions,
@@ -109,6 +109,51 @@ function EnvironmentMarker({ environment, label }: { environment: string; label:
   );
 }
 
+function SessionTitle({
+  title,
+  status,
+  statusLabel,
+  unread,
+}: {
+  title: string;
+  status: SessionStatus | null;
+  statusLabel: string;
+  unread: boolean;
+}) {
+  const viewportRef = useRef<HTMLSpanElement>(null);
+  const contentRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(0);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const content = contentRef.current;
+    if (!viewport || !content) return;
+    const measure = () => setOverflow(Math.max(0, content.scrollWidth - viewport.clientWidth));
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(viewport);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [title]);
+
+  return (
+    <span ref={viewportRef} className="block min-w-0 overflow-hidden whitespace-nowrap">
+      <span
+        ref={contentRef}
+        className={`inline-block whitespace-nowrap ${overflow > 0 ? "session-title-marquee" : ""} ${unread ? "font-semibold" : ""}`}
+        style={{ "--session-title-overflow": `${overflow}px` } as CSSProperties}
+      >
+        <StatusMarker status={status} label={statusLabel} />
+        {title}
+      </span>
+    </span>
+  );
+}
+
 /** A list section's heading row, optionally carrying the view menu's trigger. */
 function SectionHeading({ title, action }: { title: string; action?: ReactNode }) {
   return (
@@ -156,6 +201,10 @@ export default function ChatSessionList() {
   const [renameValue, setRenameValue] = useState("");
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
+  const [shortcutModifierPressed, setShortcutModifierPressed] = useState(false);
+  const [hoveredRow, setHoveredRow] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const [preview, setPreview] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const previewCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prefs = useSessionListViewStore((state) => state.prefs);
 
   // The delivery store owns the durable list of application-created
@@ -308,10 +357,34 @@ export default function ChatSessionList() {
 
   useEffect(() => {
     const platform = detectShortcutPlatform();
+    const primaryKey = platform === "macos" ? "Meta" : "Control";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === primaryKey || (platform === "macos" ? event.metaKey : event.ctrlKey)) {
+        setShortcutModifierPressed(true);
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === primaryKey || !(platform === "macos" ? event.metaKey : event.ctrlKey)) {
+        setShortcutModifierPressed(false);
+      }
+    };
+    const onBlur = () => setShortcutModifierPressed(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    const platform = detectShortcutPlatform();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.repeat || event.isComposing || event.defaultPrevented) return;
       const target = event.target as HTMLElement | null;
-      if (target?.closest("input, textarea, select, [contenteditable=\"true\"]")) return;
+      if (target && typeof target.closest === "function" && target.closest("input, textarea, select, [contenteditable=\"true\"]")) return;
       const primaryPressed = platform === "macos" ? event.metaKey : event.ctrlKey;
       if (!primaryPressed || event.altKey || event.shiftKey) return;
       const key = Number(event.key);
@@ -358,6 +431,29 @@ export default function ChatSessionList() {
       highlighted ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"
     }`;
 
+  const clearPreviewCloseTimer = () => {
+    if (previewCloseTimer.current) clearTimeout(previewCloseTimer.current);
+    previewCloseTimer.current = null;
+  };
+
+  const schedulePreviewClose = () => {
+    clearPreviewCloseTimer();
+    previewCloseTimer.current = setTimeout(() => setPreview(null), 120);
+  };
+
+  const showPreview = (session: ChatSession, target: HTMLElement, gitContext: SessionGitContext | null) => {
+    const anchorRect = target.getBoundingClientRect();
+    setHoveredRow({ sessionId: session.id, anchorRect });
+    if (gitContext) {
+      setPreview(null);
+      return;
+    }
+    const workspacePath = session.workspacePath ?? primaryWorkspacePath;
+    if (!workspacePath) return;
+    clearPreviewCloseTimer();
+    setPreview({ sessionId: session.id, anchorRect });
+  };
+
   const renderRow = (row: SessionRow) => {
     if (row.kind === "external") {
       const label = environmentLabel(row.environment);
@@ -394,6 +490,7 @@ export default function ChatSessionList() {
     const isMenuOpen = menuOpenId === session.id;
     const gitContext = sessionGitContexts.get(session.id) ?? null;
     const shortcutLabel = shortcutBySessionId.get(session.id) ?? null;
+    const workspacePath = session.workspacePath ?? primaryWorkspacePath;
     const closeMenu = () => {
       setMenuOpenId(null);
       setMenuAnchor(null);
@@ -411,6 +508,18 @@ export default function ChatSessionList() {
         role="button"
         tabIndex={0}
         onClick={() => !isRenaming && open()}
+        onPointerEnter={(event) => showPreview(session, event.currentTarget, gitContext)}
+        onPointerLeave={() => {
+          setHoveredRow(null);
+          schedulePreviewClose();
+        }}
+        onFocus={(event) => showPreview(session, event.currentTarget, gitContext)}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            setHoveredRow(null);
+            schedulePreviewClose();
+          }
+        }}
         onKeyDown={(event) => {
           if (isRenaming) return;
           if (event.key === "Enter" || event.key === " ") {
@@ -436,11 +545,12 @@ export default function ChatSessionList() {
           />
         ) : (
           <span className={`min-w-0 flex-1 truncate ${gitContext ? "pr-28" : "pr-20"} ${session.unread ? "font-semibold" : ""}`}>
-            <StatusMarker
+            <SessionTitle
+              title={row.title}
               status={row.status}
-              label={row.status ? t(`ChatSessionList.status.${row.status}`) : t("ChatSessionList.view.stateIdle")}
+              statusLabel={row.status ? t(`ChatSessionList.status.${row.status}`) : t("ChatSessionList.view.stateIdle")}
+              unread={session.unread}
             />
-            {row.title}
           </span>
         )}
 
@@ -448,12 +558,19 @@ export default function ChatSessionList() {
           <div className={`absolute right-1 flex items-center gap-0.5 rounded-md pl-0.5 ${
             gitContext || session.pinned || isMenuOpen ? "bg-surface-2/95" : "group-hover:bg-surface-2/95 group-focus-within:bg-surface-2/95"
           }`}>
-            {shortcutLabel && !gitContext && (
-              <kbd className="mr-0.5 shrink-0 px-1 font-mono text-[11px] text-faint group-hover:hidden group-focus-within:hidden">
+            {shortcutLabel && !gitContext && shortcutModifierPressed && hoveredRow?.sessionId !== session.id && (
+              <kbd className="mr-0.5 shrink-0 rounded bg-surface px-1 font-mono text-[11px] text-faint">
                 {shortcutLabel}
               </kbd>
             )}
-            {gitContext && <SessionGitBadge session={session} context={gitContext} />}
+            {gitContext && (
+              <SessionGitBadge
+                session={session}
+                context={gitContext}
+                rowHovered={hoveredRow?.sessionId === session.id}
+                rowAnchorRect={hoveredRow?.sessionId === session.id ? hoveredRow.anchorRect : null}
+              />
+            )}
             <button
               type="button"
               onClick={(event) => {
@@ -513,6 +630,16 @@ export default function ChatSessionList() {
             anchorRect={menuAnchor}
             onClose={closeMenu}
             onRename={() => startRename(session)}
+          />
+        )}
+
+        {preview?.sessionId === session.id && workspacePath && (
+          <SessionPreviewCard
+            session={session}
+            workspacePath={workspacePath}
+            anchorRect={preview.anchorRect}
+            onPointerEnter={clearPreviewCloseTimer}
+            onPointerLeave={schedulePreviewClose}
           />
         )}
       </div>
