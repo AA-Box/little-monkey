@@ -835,6 +835,13 @@ pub fn models_list_installed(app: AppHandle) -> Result<Vec<ModelInfo>, String> {
         if !filename.to_lowercase().ends_with(".gguf") {
             continue;
         }
+        // Projectors belong in a bundle's components directory, never as a
+        // standalone chat model. Metadata wins over the filename; the helper
+        // only falls back to a filename hint when the GGUF metadata cannot be
+        // read.
+        if classify_gguf_artifact(&path, filename) == GgufArtifactKind::Projector {
+            continue;
+        }
 
         let size_gb = entry
             .metadata()
