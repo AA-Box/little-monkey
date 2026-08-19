@@ -1,6 +1,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { LoaderCircle, Mic } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { companionClient } from "../../lib/companionClient";
 import {
@@ -16,6 +17,7 @@ import {
   createDictationSessionId,
   dictationClient,
   type DictationCapabilities,
+  type DictationPlatform,
   type DictationState,
   type DictationUnlisten,
 } from "../../lib/dictationClient";
@@ -65,6 +67,22 @@ function focusTextarea(
   textarea.setSelectionRange(selectionStart, selectionEnd);
 }
 
+function dictationSettingsUrl(platform: DictationPlatform | undefined, code: string): string | null {
+  if (platform === "macos") {
+    if (code.startsWith("microphone_")) {
+      return "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+    }
+    if (code === "speech_permission_denied" || code === "speech_unavailable") {
+      return "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition";
+    }
+  }
+  if (platform === "windows") {
+    if (code.startsWith("microphone_")) return "ms-settings:privacy-microphone";
+    if (code === "sapi_unavailable" || code === "speech_unavailable") return "ms-settings:privacy-speech";
+  }
+  return null;
+}
+
 export const DictationButton = forwardRef<DictationButtonHandle, DictationButtonProps>(function DictationButton(
   { sessionId, value, onChange, textareaRef, resizeTextarea, disabled = false },
   ref,
@@ -102,6 +120,16 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
     const waiters = settleWaitersRef.current.splice(0);
     for (const waiter of waiters) waiter.reject(reason);
   }, []);
+
+  const openPermissionSettings = useCallback(async (code: string) => {
+    const url = dictationSettingsUrl(capabilities?.platform, code);
+    if (!url) return;
+    try {
+      await openUrl(url);
+    } catch (reason) {
+      if (mountedRef.current) setError(errorMessage(reason));
+    }
+  }, [capabilities?.platform]);
 
   const finishActive = useCallback((session: ActiveDictation) => {
     const hasInsertedText = Boolean(dictationInsertedText(session.insertion));
@@ -252,6 +280,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
         dictationClient.onError((event) => {
           const current = activeRef.current;
           if (!current || current.insertion.sessionId !== event.sessionId) return;
+          void openPermissionSettings(event.code);
           failActive(new Error(event.message));
         }),
       ]);
@@ -268,7 +297,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       disposed = true;
       for (const unlisten of unlistenRef.current.splice(0)) unlisten();
     };
-  }, [failActive, finishActive, setActiveSession, updateComposer]);
+  }, [failActive, finishActive, openPermissionSettings, setActiveSession, updateComposer]);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -383,13 +412,22 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   const unavailable = capabilityError ?? (!capabilities?.supported ? t("DictationButton.unavailable") : null);
   const tooltipText = error ?? unavailable ?? (isStarting ? t("DictationButton.starting") : isActive ? t("DictationButton.stop") : t("DictationButton.dictate"));
   const ariaLabel = isActive ? t("DictationButton.stop") : t("DictationButton.startAriaLabel");
+  const handleClick = () => {
+    if (isActive) {
+      void stopActive();
+    } else if (capabilities?.supported) {
+      start();
+    } else {
+      void openPermissionSettings("speech_unavailable");
+    }
+  };
 
   return (
     <span className="group/action relative shrink-0">
       <button
         type="button"
-        onClick={() => void (isActive ? stopActive() : start())}
-        disabled={disabled || isStarting || !capabilities?.supported}
+        onClick={handleClick}
+        disabled={disabled || isStarting || !capabilities}
         aria-label={isStarting ? t("DictationButton.starting") : ariaLabel}
         aria-pressed={isActive || undefined}
         className={`flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background ${isActive ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent" : ""}`}
