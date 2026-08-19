@@ -87,6 +87,13 @@ afterEach(() => {
 });
 
 describe("ChatSessionList across environments", () => {
+  it("shows the working state beside the animated marker", () => {
+    useSessionStore.setState({ runningTurns: { "local-1": true }, turnOutcomes: {} });
+    render(<ChatSessionList />);
+
+    expect(screen.getByText("Working")).toBeTruthy();
+  });
+
   it("lists a conversation the daemon owns beside the local sessions", async () => {
     render(<ChatSessionList />);
 

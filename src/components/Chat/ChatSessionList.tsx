@@ -39,22 +39,22 @@ const STATUS_DOT: Record<Exclude<SessionStatus, "attention">, string> = {
   error: "bg-danger",
 };
 
-/** The leading status marker on a session row. Never color alone: the
- * hover/screen-reader label names the state, and the two states worth
- * interrupting for carry a shape of their own (a pulse, a triangle). */
+/** The leading status marker on a session row. Keep the state visible as text
+ * as well as color/shape so an animated dot is not the only working signal. */
 function StatusMarker({ status, label }: { status: SessionStatus; label: string }) {
   return (
     <span
       role="img"
       aria-label={label}
       title={label}
-      className="mr-1.5 inline-flex shrink-0 items-center align-middle"
+      className="mr-1.5 inline-flex shrink-0 items-center gap-1 align-middle"
     >
       {status === "attention" ? (
         <AlertTriangle size={12} className="text-warning" aria-hidden />
       ) : (
         <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[status]}`} />
       )}
+      <span className="text-[10px] font-medium text-muted">{label}</span>
     </span>
   );
 }
