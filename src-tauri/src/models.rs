@@ -68,6 +68,54 @@ pub enum ComponentOwnership {
     External,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GgufArtifactKind {
+    LanguageModel,
+    Projector,
+    Unknown,
+}
+
+fn is_projector_filename(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.contains("mmproj") || lower.contains("projector")
+}
+
+fn classify_gguf_artifact_metadata(architecture: Option<&str>) -> GgufArtifactKind {
+    // llama.cpp uses the `clip` GGUF architecture for image encoders and
+    // multimodal projector files; any other declared architecture belongs to
+    // a standalone model family. Filename hints are considered only when the
+    // bounded metadata parser cannot establish an architecture.
+    match architecture
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(architecture) if architecture.eq_ignore_ascii_case("clip") => {
+            GgufArtifactKind::Projector
+        }
+        Some(_) => GgufArtifactKind::LanguageModel,
+        None => GgufArtifactKind::Unknown,
+    }
+}
+
+fn classify_gguf_artifact_with_source(path: &Path, file_name: &str) -> (GgufArtifactKind, bool) {
+    let metadata_kind = crate::quantization::sniff_gguf_file(path)
+        .ok()
+        .map(|header| classify_gguf_artifact_metadata(header.architecture.as_deref()))
+        .unwrap_or(GgufArtifactKind::Unknown);
+    if metadata_kind != GgufArtifactKind::Unknown {
+        return (metadata_kind, metadata_kind == GgufArtifactKind::Projector);
+    }
+    if is_projector_filename(file_name) {
+        (GgufArtifactKind::Projector, false)
+    } else {
+        (GgufArtifactKind::Unknown, false)
+    }
+}
+
+fn classify_gguf_artifact(path: &Path, file_name: &str) -> GgufArtifactKind {
+    classify_gguf_artifact_with_source(path, file_name).0
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProjectorComponent {
     pub path: String,
@@ -936,8 +984,7 @@ pub fn models_add_external(app: AppHandle, path: String) -> Result<ModelInfo, St
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("Invalid file name: {path}"))?
         .to_string();
-    let lower_filename = filename.to_ascii_lowercase();
-    if lower_filename.contains("mmproj") || lower_filename.contains("projector") {
+    if classify_gguf_artifact(&p, &filename) == GgufArtifactKind::Projector {
         return Err(
             "The selected file appears to be a multimodal projector, not a language model."
                 .to_string(),
@@ -1026,9 +1073,10 @@ pub struct ProjectorCandidate {
     pub size_bytes: u64,
 }
 
-/// Finds sibling GGUFs that look like multimodal projector files. This is a
-/// hint for the picker only; binding still requires an explicit user action
-/// and runtime startup remains the compatibility boundary.
+/// Finds sibling GGUFs that are metadata-confirmed or filename-hinted
+/// multimodal projector files. This is a hint for the picker only; binding
+/// still requires an explicit user action and runtime startup remains the
+/// compatibility boundary.
 #[tauri::command(rename_all = "camelCase")]
 pub fn models_detect_projectors(
     app: AppHandle,
@@ -1054,26 +1102,39 @@ pub fn models_detect_projectors(
         let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let lower = file.to_ascii_lowercase();
-        if !lower.ends_with(".gguf") || !(lower.contains("mmproj") || lower.contains("projector")) {
+        if !file.to_ascii_lowercase().ends_with(".gguf") {
             continue;
         }
         let canonical = match path.canonicalize() {
             Ok(path) => path,
             Err(_) => continue,
         };
+        let (kind, metadata_confirmed) = classify_gguf_artifact_with_source(&canonical, file);
+        if kind != GgufArtifactKind::Projector {
+            continue;
+        }
         let size_bytes = match std::fs::metadata(&canonical) {
             Ok(metadata) => metadata.len(),
             Err(_) => continue,
         };
-        candidates.push(ProjectorCandidate {
-            path: canonical.to_string_lossy().into_owned(),
-            file: file.to_string(),
-            size_bytes,
-        });
+        candidates.push((
+            !metadata_confirmed,
+            ProjectorCandidate {
+                path: canonical.to_string_lossy().into_owned(),
+                file: file.to_string(),
+                size_bytes,
+            },
+        ));
     }
-    candidates.sort_by(|left, right| left.file.cmp(&right.file));
-    Ok(candidates)
+    candidates.sort_by(|(left_hint, left), (right_hint, right)| {
+        left_hint
+            .cmp(right_hint)
+            .then_with(|| left.file.cmp(&right.file))
+    });
+    Ok(candidates
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect())
 }
 
 fn model_info_for_path(app: &AppHandle, path: &Path) -> Result<ModelInfo, String> {
@@ -1551,6 +1612,52 @@ pub async fn models_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_gguf(architecture: &str) -> Vec<u8> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        let key = b"general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key);
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        bytes.extend_from_slice(&(architecture.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(architecture.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn gguf_metadata_overrides_projector_filename_hints() {
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-gguf-classification-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let neutral_projector = root.join("vision.gguf");
+        std::fs::write(&neutral_projector, minimal_gguf("clip")).unwrap();
+        assert_eq!(
+            classify_gguf_artifact_with_source(&neutral_projector, "vision.gguf"),
+            (GgufArtifactKind::Projector, true)
+        );
+
+        let misleading_model = root.join("language-projector.gguf");
+        std::fs::write(&misleading_model, minimal_gguf("llama")).unwrap();
+        assert_eq!(
+            classify_gguf_artifact(&misleading_model, "language-projector.gguf"),
+            GgufArtifactKind::LanguageModel
+        );
+
+        let unknown_projector = root.join("mmproj-unknown.gguf");
+        std::fs::write(&unknown_projector, b"GGUF").unwrap();
+        assert_eq!(
+            classify_gguf_artifact(&unknown_projector, "mmproj-unknown.gguf"),
+            GgufArtifactKind::Projector
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn validate_repo_accepts_curated_repos() {
