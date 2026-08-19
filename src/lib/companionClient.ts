@@ -62,6 +62,10 @@ export interface VoiceConfig {
   wakePhrase: string;
   /** Continuous local listening for the wake phrase. Requires the phrase. */
   alwaysListening: boolean;
+  /** Native composer dictation locale; null means the operating-system default. */
+  dictationLanguage: string | null;
+  /** macOS only: refuse network-backed recognition when on-device is unavailable. */
+  dictationRequireOnDevice: boolean;
 }
 
 export interface ImageEndpointConfig {

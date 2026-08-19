@@ -3,7 +3,9 @@
 <plist version="1.0">
   <dict>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Little Monkey records audio only while you visibly hold the companion microphone control, to transcribe that explicit recording.</string>
+    <string>Little Monkey uses the microphone only while you dictate text into the composer or explicitly record companion audio.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Little Monkey uses speech recognition to turn your spoken words into editable composer text.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Little Monkey captures only the screen region you explicitly select for companion context.</string>
     <key>CFBundleIconName</key>
