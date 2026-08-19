@@ -2,7 +2,7 @@
   "name": "little-monkey",
   "displayName": "Little Monkey",
   "description": "ACP coding agent and explicit local FIM completions for Little Monkey.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "little-monkey",
   "license": "UNLICENSED",
   "engines": {

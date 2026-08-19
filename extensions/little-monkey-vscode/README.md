@@ -2,6 +2,8 @@
 
 This extension is a thin client for Little Monkey's ACP v1 server. Agent runs execute in the installed local daemon and use its durable ledger, checkpoints, verification, worktree, and permission system. VS Code can display an approval wait, but it cannot grant one.
 
+The current release is version 1.0.0. Install the `little-monkey-vscode-1.0.0.vsix` asset from a Little Monkey GitHub release; marketplace publishing is not automatic.
+
 ## Setup
 
 1. Install Little Monkey and enable its local daemon.
