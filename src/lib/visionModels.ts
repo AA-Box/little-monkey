@@ -81,7 +81,10 @@ export function isVisionCapableOllamaModel(model: OllamaModelInfo): boolean {
   return model.vision;
 }
 
-/** Local llama.cpp curated/installed models never support vision — `llama.rs` has no `--mmproj`/clip-projector support today. */
+/** Local vision is true only for the active bundle after llama-server reports
+ * ready with the projector actually loaded. A configured component that has
+ * not started successfully is not capability evidence. */
 export function isVisionCapableLocalModel(): boolean {
-  return false;
+  const state = useModelStore.getState();
+  return state.activeProvider === 'local' && state.llamaStatus === 'ready' && state.llamaVisionEnabled;
 }
