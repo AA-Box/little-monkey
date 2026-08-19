@@ -1782,7 +1782,7 @@ fn is_generated_bytecode_cache(relative: &str, expected_paths: &BTreeSet<String>
     let Some(stem) = filename.strip_suffix(".pyc") else {
         return false;
     };
-    let Some((source_stem, cache_tag)) = stem.split_once('.') else {
+    let Some((source_stem, cache_tag)) = stem.rsplit_once('.') else {
         return false;
     };
     if source_stem.is_empty() || cache_tag.is_empty() {

@@ -27,6 +27,12 @@ vi.mock("../../lib/outpaint", async (importOriginal) => ({
   runOutpaint,
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onCloseRequested: vi.fn(async () => vi.fn()),
+  }),
+}));
+
 vi.mock("../../lib/studioClient", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/studioClient")>();
   return {
