@@ -57,10 +57,12 @@ jobs:
       # canonicalizer has drifted from the Rust one, which would produce
       # signatures no client can verify.
       - run: pnpm test:mlx-package
+      - run: pnpm test:mflux-service
 
       - name: Build and sign
         env:
           MLX_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
+          MFLUX_SIGNING_KEY: ${{ secrets.MLX_SIGNING_PRIVATE_KEY }}
         run: |
           if [ -z "$MLX_SIGNING_KEY" ]; then
             echo "::error::MLX_SIGNING_PRIVATE_KEY is not set. See pnpm mlx:keygen."
@@ -68,6 +70,7 @@ jobs:
           fi
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           pnpm mlx:package
+          pnpm mflux:package
 
       - name: Publish the archive
         env:
@@ -84,21 +87,44 @@ jobs:
           echo "MLX_DOWNLOAD_URL=$(gh release view "$VERSION" --json assets \
             --jq '.assets[0].url')" >> "$GITHUB_ENV"
 
+      - name: Publish the image runtime archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARCHIVE=$(ls packaging/mflux/mflux-image-runtime-*.tar.gz)
+          VERSION=$(basename "$ARCHIVE" .tar.gz)
+          gh release create "$VERSION" "$ARCHIVE" \
+            --title "$VERSION" \
+            --latest=false \
+            --notes "MFLUX image runtime package for Apple silicon. Installed from the Runtime Hub." \
+            || gh release upload "$VERSION" "$ARCHIVE" --clobber
+          echo "MFLUX_DOWNLOAD_URL=$(gh release view "$VERSION" --json assets \
+            --jq '.assets[0].url')" >> "$GITHUB_ENV"
+
       # Re-emitted with the real asset URL now that one exists. The digest is
       # unchanged — it is over the archive, which was not rebuilt.
       - name: Write the catalog entry
         env:
           MLX_DOWNLOAD_URL: ${{ env.MLX_DOWNLOAD_URL }}
+          MFLUX_DOWNLOAD_URL: ${{ env.MFLUX_DOWNLOAD_URL }}
           CHANNEL: ${{ inputs.channel }}
         run: |
           set -euo pipefail
           node -e '
             const fs = require("node:fs");
             const path = "packaging/mlx/mlx-catalog.json";
-            const entries = JSON.parse(fs.readFileSync(path, "utf8"));
-            entries[0].downloadUrl = process.env.MLX_DOWNLOAD_URL;
-            entries[0].channel = process.env.CHANNEL;
-            entries[0].publishedAtMs = Date.now();
+            const entries = [
+              ...JSON.parse(fs.readFileSync(path, "utf8")),
+              ...JSON.parse(fs.readFileSync("packaging/mflux/mflux-catalog.json", "utf8")),
+            ];
+            for (const entry of entries) {
+              entry.downloadUrl = entry.kind === "mflux_image_runtime"
+                ? process.env.MFLUX_DOWNLOAD_URL
+                : process.env.MLX_DOWNLOAD_URL;
+              entry.channel = process.env.CHANNEL;
+              entry.publishedAtMs = Date.now();
+            }
             fs.writeFileSync(path, JSON.stringify(entries, null, 2) + "\n");
           '
           cat packaging/mlx/mlx-catalog.json

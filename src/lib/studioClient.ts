@@ -110,6 +110,11 @@ export interface ModelComponent {
   sizeBytes: number;
 }
 
+export type ModelSource =
+  | { kind: "components" }
+  | { kind: "hugging_face_repo"; repo: string; revision: string | null }
+  | { kind: "local_directory"; path: string };
+
 /** The flat file name a component takes on disk. */
 export function componentFileName(component: ModelComponent): string {
   const raw =
@@ -164,7 +169,10 @@ export interface LicenseGate {
  * video service inside the installed MLX package: Apple silicon only, and the
  * only engine that can read an MLX-quantized checkpoint.
  */
-export type GenerationEngineKind = "stable_diffusion_cpp" | "mlx_video";
+export type GenerationEngineKind =
+  | "stable_diffusion_cpp"
+  | "mlx_video"
+  | "mflux_image";
 
 /** A model exactly as stored in the user's library. */
 export interface GenerationModelSpec {
@@ -173,11 +181,13 @@ export interface GenerationModelSpec {
   family: string;
   tasks: GenerationTask[];
   components: ModelComponent[];
+  source: ModelSource;
   defaults: GenerationDefaults;
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
   engine: GenerationEngineKind;
+  quantizationBits: number | null;
 }
 
 export interface GenerationModel {
@@ -186,11 +196,13 @@ export interface GenerationModel {
   family: string;
   tasks: GenerationTask[];
   components: ModelComponent[];
+  source: ModelSource;
   defaults: GenerationDefaults;
   minRamBytes: number;
   license: LicenseGate;
   extraLaunchArgs: string[];
   engine: GenerationEngineKind;
+  quantizationBits: number | null;
   installed: boolean;
   /** Measured on this machine, not declared in the entry. */
   totalBytes: number;
@@ -237,6 +249,8 @@ export interface EngineCapabilities {
 export interface GenerationEngineStatus {
   supported: boolean;
   engineInstalled: boolean;
+  mfluxSupported: boolean;
+  mfluxInstalled: boolean;
   loadedModelId: string | null;
   totalRamBytes: number;
 }
@@ -490,6 +504,7 @@ export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
           ? (["text_to_image", "image_to_image"] as GenerationTask[])
           : (["text_to_image"] as GenerationTask[]),
       components: [],
+      source: { kind: "components" },
       defaults: {
         width: 1024,
         height: 1024,
@@ -513,6 +528,7 @@ export function backendModels(backends: RemoteBackend[]): GenerationModel[] {
       extraLaunchArgs: [],
       // Never launched locally, so the field only has to be a valid one.
       engine: "stable_diffusion_cpp" as GenerationEngineKind,
+      quantizationBits: null,
       installed: true,
       totalBytes: 0,
       missingBytes: 0,
@@ -545,6 +561,8 @@ export const studioClient = {
     invoke<void>("generation_remove_model", { modelId }),
   acceptLicense: (licenseId: string) =>
     invoke<void>("generation_accept_license", { licenseId }),
+  setHuggingFaceToken: (modelId: string, token: string) =>
+    invoke<void>("generation_set_hugging_face_token", { modelId, token }),
   downloadModel: (modelId: string) =>
     invoke<void>("generation_download_model", { modelId }),
   cancelDownload: (modelId: string) =>
@@ -782,6 +800,7 @@ export function emptyModelSpec(): GenerationModelSpec {
     family: "",
     tasks: [],
     components: [],
+    source: { kind: "components" },
     defaults: {
       width: 1024,
       height: 1024,
@@ -803,5 +822,6 @@ export function emptyModelSpec(): GenerationModelSpec {
     },
     extraLaunchArgs: [],
     engine: "stable_diffusion_cpp",
+    quantizationBits: null,
   };
 }

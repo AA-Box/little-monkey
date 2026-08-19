@@ -3937,6 +3937,18 @@ pub fn production_mlx_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstal
     ))
 }
 
+#[cfg(target_os = "macos")]
+pub fn production_mflux_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInstaller>> {
+    Ok(Arc::new(
+        MlxPackageInstaller::new(
+            root.join("runtimes").join("mflux"),
+            Arc::new(ProductionMlxSignatureVerifier),
+            MlxInstallLimits::default(),
+        )
+        .map_err(|error| M3HubError::Runtime(error.to_string()))?,
+    ))
+}
+
 /// What an install reports back. Paths stay inside the app's private tree, so
 /// only the identity of the package crosses to the UI.
 #[cfg(target_os = "macos")]
@@ -4021,6 +4033,57 @@ fn install_mlx_from_artifact_with_verifier(
     };
     let installer = MlxPackageInstaller::new(
         app_data_dir.join(M3_DIRECTORY).join("runtimes").join("mlx"),
+        verifier,
+        limits,
+    )
+    .map_err(|error| M3HubError::Runtime(error.to_string()))?;
+    let installed = installer
+        .install_and_activate(&bundle, &MlxHostCapabilities::current())
+        .map_err(|error| M3HubError::Runtime(error.to_string()));
+    let _ = fs::remove_dir_all(&staging);
+    let installed = installed?;
+    Ok(MlxInstalledPackageView {
+        package_version: installed.package_version,
+        manifest_sha256: installed.manifest_sha256,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn install_mflux_from_artifact(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+) -> M3HubResult<MlxInstalledPackageView> {
+    install_mflux_from_artifact_with_verifier(
+        app_data_dir,
+        artifact_path,
+        Arc::new(ProductionMlxSignatureVerifier),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_mflux_from_artifact_with_verifier(
+    app_data_dir: &Path,
+    artifact_path: &Path,
+    verifier: Arc<dyn MlxSignatureVerifier>,
+) -> M3HubResult<MlxInstalledPackageView> {
+    let limits = MlxInstallLimits::default();
+    let staging = std::env::temp_dir().join(format!("mflux-unpack-{}", uuid::Uuid::new_v4()));
+    let unpacked = (|| {
+        mlx_runtime::extract_package_archive(artifact_path, &staging, &limits)?;
+        mlx_runtime::read_package_directory(&staging, &limits)
+    })();
+    let bundle = match unpacked {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(M3HubError::Runtime(error.to_string()));
+        }
+    };
+    let installer = MlxPackageInstaller::new(
+        app_data_dir
+            .join(M3_DIRECTORY)
+            .join("runtimes")
+            .join("mflux"),
         verifier,
         limits,
     )

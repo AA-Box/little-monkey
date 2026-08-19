@@ -6650,7 +6650,9 @@ const MAX_COMPATIBILITY_NOTE_BYTES: usize = 4 * 1024;
 /// through, rather than in each caller.
 pub(crate) fn component_kind_runs_here(kind: M3ComponentKind) -> bool {
     match kind {
-        M3ComponentKind::MlxRuntime => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime => {
+            cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        }
         _ => true,
     }
 }
@@ -6660,6 +6662,7 @@ pub(crate) fn component_kind_runs_here(kind: M3ComponentKind) -> bool {
 pub enum M3ComponentKind {
     LlamaCppServer,
     MlxRuntime,
+    MfluxImageRuntime,
     Tokenizer,
     Converter,
     ProjectorRuntime,
@@ -6899,7 +6902,7 @@ enum M3ComponentCatalogDocument {
 /// acts a person performed rather than a document a server served.
 pub(crate) fn kind_verifies_publisher_signature(kind: M3ComponentKind) -> bool {
     match kind {
-        M3ComponentKind::MlxRuntime => true,
+        M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime => true,
         M3ComponentKind::LlamaCppServer
         | M3ComponentKind::Tokenizer
         | M3ComponentKind::Converter
@@ -9522,6 +9525,7 @@ mod tests {
         let verified: Vec<M3ComponentKind> = [
             M3ComponentKind::LlamaCppServer,
             M3ComponentKind::MlxRuntime,
+            M3ComponentKind::MfluxImageRuntime,
             M3ComponentKind::Tokenizer,
             M3ComponentKind::Converter,
             M3ComponentKind::ProjectorRuntime,
@@ -9534,7 +9538,13 @@ mod tests {
         .into_iter()
         .filter(|kind| kind_verifies_publisher_signature(*kind))
         .collect();
-        assert_eq!(verified, vec![M3ComponentKind::MlxRuntime]);
+        assert_eq!(
+            verified,
+            vec![
+                M3ComponentKind::MlxRuntime,
+                M3ComponentKind::MfluxImageRuntime
+            ]
+        );
     }
 
     /// The registry's identity, and the field it was missing.
