@@ -12,6 +12,7 @@ import {
   Download,
   Image as ImageIcon,
   Loader2,
+  Maximize2,
   Plus,
   Pencil,
   RectangleHorizontal,
@@ -2367,29 +2368,42 @@ export function StudioPanel({ mode, railSlot }: Props) {
               </div>
             ) : (
               <div className="absolute inset-0">
-                <button
-                  type="button"
-                  className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
-                  title={t("Studio.result.expand")}
-                  aria-label={t("Studio.result.expand")}
-                  onClick={() => setLightbox(shown)}
-                >
-                  {shown.mediaType.startsWith("video/") ? (
+                {shown.mediaType.startsWith("video/") ? (
+                  <div className="flex h-full w-full items-center justify-center p-2">
                     <video
                       controls
                       loop
                       src={previews[shown.artifactId]}
                       className="max-h-full max-w-full rounded bg-black object-contain"
                     />
-                  ) : (
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
+                    title={t("Studio.result.expand")}
+                    aria-label={t("Studio.result.expand")}
+                    onClick={() => setLightbox(shown)}
+                  >
                     <img
                       src={previews[shown.artifactId]}
                       alt={shown.prompt}
                       className="max-h-full max-w-full rounded object-contain"
                     />
-                  )}
-                </button>
+                  </button>
+                )}
                 <div className="absolute right-2 top-2 z-10 flex gap-1.5">
+                  {shown.mediaType.startsWith("video/") && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.result.expand")}
+                      title={t("Studio.result.expand")}
+                      onClick={() => setLightbox(shown)}
+                    >
+                      <Maximize2 size={14} />
+                    </IconButton>
+                  )}
                   {selected && editTaskFor(selected) && (
                     <IconButton
                       size="sm"
