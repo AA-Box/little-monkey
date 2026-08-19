@@ -51,6 +51,8 @@ interface LlamaStatusPayload {
   status: 'stopped' | 'starting' | 'ready' | 'error';
   port: number;
   model_path: string | null;
+  projector_path: string | null;
+  vision_enabled: boolean;
 }
 
 /**
@@ -71,6 +73,8 @@ async function resolveBaseUrl(): Promise<string> {
     const installed = useModelStore.getState().installed;
     useModelStore.setState((state) => ({
       llamaStatus: status.status,
+      llamaVisionEnabled: status.vision_enabled === true,
+      llamaProjectorPath: status.projector_path ?? null,
       active: status.model_path
         ? installed.find((model) => model.path === status.model_path) ?? state.active
         : state.active,

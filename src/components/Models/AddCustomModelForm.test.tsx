@@ -1,14 +1,19 @@
+// @vitest-environment jsdom
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const modelStoreState = vi.hoisted(() => ({
   addExternalModel: vi.fn(),
+  detectProjectors: vi.fn(),
+  setProjector: vi.fn(),
   resolveModelReference: vi.fn(),
   installModelReference: vi.fn(),
   downloadProgress: {},
 }));
+const openMock = vi.hoisted(() => vi.fn());
 
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 vi.mock("../../store/modelStore", () => ({
   useModelStore: (selector: (state: typeof modelStoreState) => unknown) =>
     selector(modelStoreState),
@@ -17,6 +22,11 @@ vi.mock("../../lib/i18n", () => {
   const labels: Record<string, string> = {
     "AddCustomModelForm.openGgufDescription": "Open a local GGUF",
     "AddCustomModelForm.openModelFileButton": "Open model file",
+    "AddCustomModelForm.chooseProjectorButton": "Choose projector",
+    "AddCustomModelForm.detectedProjector": "Detected projector",
+    "AddCustomModelForm.selectedProjector": "selected",
+    "AddCustomModelForm.projectorCompatibilityNote": "Compatibility will be verified when started.",
+    "AddCustomModelForm.saveProjectorButton": "Save projector",
     "AddCustomModelForm.referenceDescription": "Install from a model reference",
     "AddCustomModelForm.publicSingleFileOnly":
       "Only public, single-file GGUF models are supported right now.",
@@ -65,6 +75,14 @@ const resolved: ResolvedModelReference = {
 };
 
 describe("AddCustomModelForm", () => {
+  afterEach(() => {
+    cleanup();
+    openMock.mockReset();
+    modelStoreState.addExternalModel.mockReset();
+    modelStoreState.detectProjectors.mockReset();
+    modelStoreState.setProjector.mockReset();
+  });
+
   it("renders one reference flow, both supported examples, and the public single-file limit", () => {
     const markup = renderToStaticMarkup(<AddCustomModelForm />);
 
@@ -98,5 +116,34 @@ describe("AddCustomModelForm", () => {
       "AddCustomModelForm.sourceHuggingFace",
     );
     expect(resolvedModelSourceKey("custom")).toBeNull();
+  });
+
+  it("shows one detected projector as selected without persisting until Save", async () => {
+    openMock.mockResolvedValueOnce("/models/model.gguf");
+    modelStoreState.addExternalModel.mockResolvedValue({
+      path: "/models/model.gguf",
+      components: { projector: null },
+    });
+    modelStoreState.detectProjectors.mockResolvedValue([
+      { path: "/models/mmproj-F16.gguf", file: "mmproj-F16.gguf", sizeBytes: 12 },
+    ]);
+    modelStoreState.setProjector.mockResolvedValue({
+      components: { projector: { file: "mmproj-F16.gguf" } },
+    });
+
+    render(<AddCustomModelForm />);
+    fireEvent.click(screen.getByRole("button", { name: "Open model file" }));
+
+    await waitFor(() => expect(screen.getByText(/Detected projector: mmproj-F16.gguf/)).toBeTruthy());
+    expect(screen.getByText("[selected]")).toBeTruthy();
+    expect(modelStoreState.setProjector).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Save projector" }));
+    await waitFor(() =>
+      expect(modelStoreState.setProjector).toHaveBeenCalledWith(
+        "/models/model.gguf",
+        "/models/mmproj-F16.gguf",
+      ),
+    );
   });
 });

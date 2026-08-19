@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use little_monkey_lib::egress;
 use little_monkey_lib::model_sources::{
-    self, InstalledModelReference, ModelDownloadProgress, ModelReferenceSource,
+    self, InstalledModelReference, ModelDownloadProgress, ModelReferenceSource, ProjectorSelection,
 };
 
 const CHAT_CONTEXT_TOKENS: u32 = 4096;
@@ -83,9 +83,9 @@ impl InstallProgress {
 
     fn update(&mut self, event: ModelDownloadProgress) {
         let percent = event
-            .downloaded
+            .overall_downloaded
             .saturating_mul(100)
-            .checked_div(event.total.max(1))
+            .checked_div(event.overall_total.max(1))
             .unwrap_or(0)
             .min(100);
         if self.interactive {
@@ -93,8 +93,8 @@ impl InstallProgress {
                 "\rDownloading {:<36} {:>6.1}%  {} / {}",
                 truncate_label(&event.file, 36),
                 percent as f64,
-                human_bytes(event.downloaded),
-                human_bytes(event.total)
+                human_bytes(event.overall_downloaded),
+                human_bytes(event.overall_total)
             );
             let _ = std::io::stderr().flush();
             self.last_bucket = Some(percent / 10);
@@ -106,8 +106,8 @@ impl InstallProgress {
             eprintln!(
                 "Downloading {}: {percent}% ({} / {})",
                 event.file,
-                human_bytes(event.downloaded),
-                human_bytes(event.total)
+                human_bytes(event.overall_downloaded),
+                human_bytes(event.overall_total)
             );
             self.last_bucket = Some(bucket);
         }
@@ -129,10 +129,32 @@ fn truncate_label(value: &str, max_chars: usize) -> String {
     format!("{}…", value.chars().take(keep).collect::<String>())
 }
 
+pub fn projector_selection(
+    projector: Option<&str>,
+    no_projector: bool,
+) -> Result<ProjectorSelection, String> {
+    if projector.is_some() && no_projector {
+        return Err("--projector and --no-projector cannot be used together".to_string());
+    }
+    if no_projector {
+        return Ok(ProjectorSelection::Disabled);
+    }
+    match projector.map(str::trim) {
+        Some(value) if value.is_empty() => {
+            Err("--projector requires a SHA-256 digest or projector filename".to_string())
+        }
+        Some(value) => Ok(ProjectorSelection::Selected(value.to_string())),
+        None => Ok(ProjectorSelection::Automatic),
+    }
+}
+
 /// Resolves and installs one supported public reference into
 /// `<app_data>/models`. Install performs its own second resolution and rejects
 /// any digest drift before writing bytes.
-async fn install_from_source(reference: &str) -> Result<InstalledModelReference, String> {
+async fn install_from_source(
+    reference: &str,
+    projector_selection: ProjectorSelection,
+) -> Result<InstalledModelReference, String> {
     let reference = reference.trim();
     if reference.is_empty() {
         return Err("Model reference cannot be empty".to_string());
@@ -148,6 +170,18 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
         human_bytes(resolved.size_bytes)
     );
     eprintln!("SHA-256: {}", resolved.sha256);
+    if let Some(projector) = resolved
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.role == model_sources::ModelArtifactRole::Projector)
+    {
+        eprintln!(
+            "Projector: {} ({})",
+            projector.file_name,
+            human_bytes(projector.size_bytes)
+        );
+        eprintln!("Projector SHA-256: {}", projector.sha256);
+    }
     if let Some(license) = resolved.license_name.as_deref() {
         eprintln!("License: {license}");
     }
@@ -156,13 +190,17 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
     let models = managed_models_dir(&data)?;
     let expected_sha256 = resolved.sha256.clone();
     let mut progress = InstallProgress::new();
-    let installed =
-        model_sources::install_reference(&models, reference, &expected_sha256, |event| {
-            progress.update(event)
-        })
-        .await;
+    let installed = model_sources::install_reference_with_projector_selection(
+        &models,
+        reference,
+        &expected_sha256,
+        projector_selection,
+        |event| progress.update(event),
+    )
+    .await;
     progress.finish();
     let installed = installed?;
+    little_monkey_lib::models::associate_installed_bundle(&data, &models, &installed).await?;
     eprintln!("Installed: {}", installed.local_path.display());
     if !installed.provenance.tool_calling {
         eprintln!(
@@ -176,26 +214,66 @@ async fn install_from_source(reference: &str) -> Result<InstalledModelReference,
 /// models work without network access. Provenance retains both the requested
 /// reference and its immutable canonical resolution, allowing either form to
 /// select the same verified local file later.
-pub async fn install_for_run(reference: &str) -> Result<InstalledModelReference, String> {
+pub async fn install_for_run(
+    reference: &str,
+    projector_selection: ProjectorSelection,
+) -> Result<InstalledModelReference, String> {
     let data = app_data_dir()?;
     let models = managed_models_dir(&data)?;
-    if let Some(installed) = model_sources::find_installed_reference(&models, reference)? {
+    if let Some(mut installed) = model_sources::find_installed_reference(&models, reference)? {
+        let component =
+            little_monkey_lib::models::projector_for_model(&data, &installed.local_path)?;
+        installed.projector_path = match projector_selection {
+            ProjectorSelection::Automatic => {
+                component.map(|component| PathBuf::from(component.path))
+            }
+            ProjectorSelection::Disabled => None,
+            ProjectorSelection::Selected(selector) => {
+                let component = component.filter(|component| {
+                    component.file == selector
+                        || component.file.ends_with(&format!("-{selector}"))
+                        || component
+                            .sha256
+                            .as_deref()
+                            .is_some_and(|sha256| sha256.eq_ignore_ascii_case(&selector))
+                });
+                Some(PathBuf::from(
+                    component
+                        .ok_or_else(|| {
+                            format!(
+                        "The installed model has no associated projector matching '{selector}'"
+                    )
+                        })?
+                        .path,
+                ))
+            }
+        };
         eprintln!("Using installed model: {}", installed.local_path.display());
         return Ok(installed);
     }
-    install_from_source(reference).await
+    install_from_source(reference, projector_selection).await
 }
 
 /// Managed `pull` rejects `--insecure`: the shared installer intentionally
 /// accepts only authenticated public HTTPS sources and never downgrades TLS.
 pub async fn pull(reference: &str, insecure: bool) -> Result<(), String> {
+    pull_with_projector(reference, insecure, None, false).await
+}
+
+pub async fn pull_with_projector(
+    reference: &str,
+    insecure: bool,
+    projector: Option<&str>,
+    no_projector: bool,
+) -> Result<(), String> {
     if insecure {
         return Err(
             "`--insecure` is not supported for app-owned model installs. Little Monkey only downloads verified public models over HTTPS. Use `monkey --provider ollama pull ... --insecure` only when you explicitly want the legacy Ollama daemon path."
                 .to_string(),
         );
     }
-    let _ = install_from_source(reference).await?;
+    let selection = projector_selection(projector, no_projector)?;
+    let _ = install_from_source(reference, selection).await?;
     Ok(())
 }
 
@@ -238,6 +316,7 @@ pub fn context_tokens(requested: Option<i64>) -> Result<u32, String> {
 
 fn chat_server_args(
     model_path: &Path,
+    projector_path: Option<&Path>,
     port: u16,
     context_tokens: u32,
     alias: &str,
@@ -255,6 +334,12 @@ fn chat_server_args(
         CHAT_GPU_LAYERS.to_string().into(),
         "--jinja".into(),
     ];
+    if let Some(projector_path) = projector_path {
+        args.splice(
+            2..2,
+            ["--mmproj".into(), projector_path.as_os_str().to_owned()],
+        );
+    }
     args.push("--alias".into());
     args.push(alias.into());
     args
@@ -392,15 +477,30 @@ fn models_payload_reports_alias(bytes: &[u8], expected_alias: &str) -> bool {
 pub async fn start_server(
     client: &reqwest::Client,
     model_path: &Path,
+    projector_path: Option<&Path>,
     context_tokens: u32,
 ) -> Result<ManagedServerSession, String> {
     model_sources::verify_managed_model_for_runtime(model_path)?;
+    if let Some(projector_path) = projector_path {
+        let data = app_data_dir()?;
+        little_monkey_lib::models::verify_projector_for_model(
+            &data,
+            &model_path.to_string_lossy(),
+            &projector_path.to_string_lossy(),
+        )?;
+    }
     let data = app_data_dir()?;
     let binary = managed_llama_server(&data)?;
     for attempt in 1..=MAX_START_ATTEMPTS {
         let port = candidate_loopback_port()?;
         let startup_alias = little_monkey_lib::llama::fresh_server_alias();
-        let args = chat_server_args(model_path, port, context_tokens, &startup_alias);
+        let args = chat_server_args(
+            model_path,
+            projector_path,
+            port,
+            context_tokens,
+            &startup_alias,
+        );
         eprintln!("Starting Little Monkey's managed llama-server on 127.0.0.1:{port}...");
 
         let mut command = Command::new(&binary);
@@ -455,6 +555,7 @@ mod tests {
     fn managed_server_args_bind_only_loopback_and_enable_jinja_tools() {
         let args = chat_server_args(
             Path::new("/models/model.gguf"),
+            None,
             32123,
             8192,
             "hf:org/repo@commit#model.gguf",
@@ -480,6 +581,30 @@ mod tests {
                 "hf:org/repo@commit#model.gguf",
             ]
         );
+    }
+
+    #[test]
+    fn managed_server_args_place_projector_before_server_options() {
+        let args = chat_server_args(
+            Path::new("/models/model.gguf"),
+            Some(Path::new("/models/components/mmproj.gguf")),
+            32123,
+            8192,
+            "little-monkey-test",
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..4],
+            &[
+                "-m".to_string(),
+                "/models/model.gguf".to_string(),
+                "--mmproj".to_string(),
+                "/models/components/mmproj.gguf".to_string(),
+            ]
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--jinja", "--alias"]));
     }
 
     #[test]
@@ -559,6 +684,20 @@ mod tests {
         let error = runtime.block_on(pull("qwen3", true)).unwrap_err();
         assert!(error.contains("--insecure"));
         assert!(error.contains("--provider ollama"));
+    }
+
+    #[test]
+    fn projector_selection_accepts_digest_filename_or_text_only() {
+        assert_eq!(
+            projector_selection(Some("mmproj.gguf"), false).unwrap(),
+            ProjectorSelection::Selected("mmproj.gguf".to_string())
+        );
+        assert_eq!(
+            projector_selection(None, true).unwrap(),
+            ProjectorSelection::Disabled
+        );
+        assert!(projector_selection(Some("mmproj.gguf"), true).is_err());
+        assert!(projector_selection(Some("  "), false).is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: () => Promise.resolve(() => {}),
 }));
 
-import { snapshotForResolvedTarget, resolveTarget } from "./targetRouting";
+import { resolvedTargetSupportsVision, snapshotForResolvedTarget, resolveTarget } from "./targetRouting";
 import { useModelStore, type ModelInfo, type OllamaModelInfo } from "../store/modelStore";
 
 function localModel(): ModelInfo {
@@ -59,7 +59,13 @@ describe("resolveTarget", () => {
     useModelStore.setState({ installed: [model] });
     invokeMock.mockImplementation((command: string) => {
       if (command === "llama_status") {
-        return Promise.resolve({ status: "ready", port: 8090, model_path: model.path });
+        return Promise.resolve({
+          status: "ready",
+          port: 8090,
+          model_path: model.path,
+          projector_path: "/models/mmproj.gguf",
+          vision_enabled: true,
+        });
       }
       return Promise.resolve(command === "models_list_installed" ? [model] : []);
     });
@@ -68,6 +74,9 @@ describe("resolveTarget", () => {
 
     expect(target).toMatchObject({ kind: "local", modelLabel: model.name });
     expect(useModelStore.getState().llamaStatus).toBe("ready");
+    expect(useModelStore.getState().llamaVisionEnabled).toBe(true);
+    expect(useModelStore.getState().llamaProjectorPath).toBe("/models/mmproj.gguf");
+    expect(resolvedTargetSupportsVision(target)).toBe(true);
     expect(snapshotForResolvedTarget(target)).toMatchObject({
       kind: "local",
       modelPath: model.path,
