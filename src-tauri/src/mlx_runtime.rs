@@ -1753,13 +1753,8 @@ fn reject_unexpected_install_entries(
             .ok_or_else(|| invalid("install", "entry path is not UTF-8"))?
             .replace(std::path::MAIN_SEPARATOR, "/");
         if metadata.is_dir() {
-            // Python creates bytecode caches while the verified service is
-            // running. They are derived, untrusted files and are not part of
-            // the signed package manifest, so they must not make a healthy
-            // installation fail its next startup verification.
-            if entry.file_name() == "__pycache__" {
-                continue;
-            }
+            // Recurse into Python bytecode caches so only regenerable caches
+            // corresponding to signed source files are accepted.
             reject_unexpected_install_entries(root, &path, expected_paths)?;
         } else if metadata.is_file()
             && relative_text != INSTALL_MANIFEST_FILE

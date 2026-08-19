@@ -1,6 +1,9 @@
 use sha2::{Digest, Sha256};
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    compile_macos_dictation_bridge();
+
     emit_managed_runtime_trust();
 
     #[allow(unused_mut)]
@@ -33,6 +36,18 @@ fn main() {
     }
 
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
+}
+
+#[cfg(target_os = "macos")]
+fn compile_macos_dictation_bridge() {
+    println!("cargo:rerun-if-changed=src/dictation/macos_bridge.m");
+    cc::Build::new()
+        .file("src/dictation/macos_bridge.m")
+        .flag("-fobjc-arc")
+        .compile("little_monkey_dictation_macos");
+    println!("cargo:rustc-link-lib=framework=AVFoundation");
+    println!("cargo:rustc-link-lib=framework=Speech");
+    println!("cargo:rustc-link-lib=framework=Foundation");
 }
 
 /// Each staged runtime's manifest digest is baked into the binary so

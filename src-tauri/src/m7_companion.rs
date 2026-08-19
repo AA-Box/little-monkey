@@ -166,6 +166,12 @@ pub struct VoiceConfig {
     pub wake_phrase: String,
     #[serde(default)]
     pub always_listening: bool,
+    /// Native composer dictation locale; None selects the system default.
+    #[serde(default)]
+    pub dictation_language: Option<String>,
+    /// macOS only: never fall back to network-backed Apple recognition.
+    #[serde(default)]
+    pub dictation_require_on_device: bool,
 }
 
 impl Default for VoiceConfig {
@@ -195,6 +201,8 @@ impl Default for VoiceConfig {
             wake_phrase_enabled: false,
             wake_phrase: default_wake_phrase(),
             always_listening: false,
+            dictation_language: None,
+            dictation_require_on_device: false,
         }
     }
 }
@@ -777,6 +785,13 @@ fn validate_config(config: &CompanionConfig) -> Result<(), String> {
         || config.voice.provider_model.is_empty()
         || config.voice.provider_model.len() > 256
         || config.voice.language.len() > 32
+        || config
+            .voice
+            .dictation_language
+            .as_deref()
+            .is_some_and(|language| {
+                language.is_empty() || language.len() > 64 || language.chars().any(char::is_control)
+            })
         || !(50..=2_000).contains(&config.voice.vad_min_speech_ms)
         || !(400..=2_000).contains(&config.voice.vad_silence_ms)
         || !(1_000..=90_000).contains(&config.voice.vad_max_utterance_ms)
