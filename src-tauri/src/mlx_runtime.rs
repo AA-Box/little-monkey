@@ -2536,14 +2536,20 @@ pub(crate) mod tests {
 
         let cache = installed.version_directory.join("service/__pycache__");
         fs::create_dir_all(&cache).expect("create Python cache");
-        fs::write(cache.join("mlx_server.cpython-314.pyc"), b"derived bytecode")
-            .expect("write Python cache");
+        fs::write(
+            cache.join("mlx_server.cpython-314.pyc"),
+            b"derived bytecode",
+        )
+        .expect("write Python cache");
         installer
             .verify_active()
             .expect("bytecode cache is not package content");
 
-        fs::write(installed.version_directory.join("service/unexpected.py"), b"unexpected")
-            .expect("write unexpected file");
+        fs::write(
+            installed.version_directory.join("service/unexpected.py"),
+            b"unexpected",
+        )
+        .expect("write unexpected file");
         assert!(matches!(
             installer.verify_active(),
             Err(MlxError::Invalid { .. })

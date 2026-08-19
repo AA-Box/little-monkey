@@ -35,6 +35,8 @@ vi.mock("../../lib/studioClient", async (importOriginal) => {
       engineStatus: async () => ({
         supported: true,
         engineInstalled: true,
+        mfluxSupported: true,
+        mfluxInstalled: false,
         loadedModelId: null,
         totalRamBytes: 32_000_000_000,
       }),
@@ -57,6 +59,8 @@ const MODEL: GenerationModel = {
   // puts the init image, the mask and the extension controls on screen.
   tasks: ["image_to_image"],
   components: [],
+  source: { kind: "components" },
+  quantizationBits: null,
   defaults: {
     width: 512,
     height: 512,

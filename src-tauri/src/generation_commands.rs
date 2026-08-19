@@ -12,6 +12,7 @@
 //! exclude whole territories (see [`crate::generation::LicenseGate`]).
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +36,27 @@ const GALLERY_FILE: &str = "studio-gallery.json";
 /// the whole registry, and it starts empty.
 const MODELS_FILE: &str = "studio-models.json";
 const ACCEPTED_LICENSES_FILE: &str = "studio-accepted-licenses.json";
+static HUGGING_FACE_TOKEN_SERVICE: OnceLock<String> = OnceLock::new();
+
+fn hugging_face_token_service() -> &'static str {
+    HUGGING_FACE_TOKEN_SERVICE
+        .get_or_init(|| crate::profiles::keychain_service("com.littlemonkey.app"))
+}
+
+fn hugging_face_token_account(model_id: &str) -> String {
+    format!("studio-hugging-face:{model_id}")
+}
+
+fn read_hugging_face_token(model_id: &str) -> Result<Option<String>, String> {
+    let account = hugging_face_token_account(model_id);
+    let entry = keyring::Entry::new(hugging_face_token_service(), &account)
+        .map_err(|error| format!("Failed to access the secure credential store: {error}"))?;
+    match entry.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Failed to read the saved model token: {error}")),
+    }
+}
 /// The user's LoRA library. Separate from the model registry because a LoRA is
 /// not a model: it fills no slot, launches no engine, and is chosen per run.
 const LORAS_FILE: &str = "studio-loras.json";
@@ -121,6 +143,8 @@ pub struct GenerationEngineStatus {
     /// hides itself rather than offering a surface that cannot run.
     pub supported: bool,
     pub engine_installed: bool,
+    pub mflux_supported: bool,
+    pub mflux_installed: bool,
     pub loaded_model_id: Option<String>,
     pub total_ram_bytes: u64,
 }
@@ -247,6 +271,7 @@ fn engine_command(app: &AppHandle, spec: &GenerationModelSpec) -> Result<EngineC
         .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
     match spec.engine {
         GenerationEngineKind::MlxVideo => mlx_video_command(&app_data),
+        GenerationEngineKind::MfluxImage => mflux_image_command(&app_data),
         GenerationEngineKind::StableDiffusionCpp => {
             let resource_dir = app.path().resource_dir().ok();
             if let Ok(Some(path)) = managed_runtime::materialize_bundled_runtime_for(
@@ -265,6 +290,39 @@ fn engine_command(app: &AppHandle, spec: &GenerationModelSpec) -> Result<EngineC
         }
     }
 }
+
+#[cfg(target_os = "macos")]
+fn mflux_image_command(app_data: &Path) -> Result<EngineCommand, String> {
+    if !cfg!(target_arch = "aarch64") {
+        return Err("The MFLUX image engine runs on Apple silicon only.".to_string());
+    }
+    let installer = crate::m3_production::production_mflux_installer(&app_data.join("m3"))
+        .map_err(|error| error.to_string())?;
+    let install = installer.verify_active().map_err(|error| {
+        format!(
+            "The MFLUX image engine is not ready: {error}. Install the MFLUX Image Runtime from Settings → Runtime Hub → Components."
+        )
+    })?;
+    let service = install.version_directory.join(MFLUX_IMAGE_SERVICE_ENTRY);
+    if !service.is_file() {
+        return Err(format!(
+            "The installed MFLUX Image Runtime has no image service ({}). Install a package built after this feature shipped.",
+            MFLUX_IMAGE_SERVICE_ENTRY
+        ));
+    }
+    Ok(EngineCommand {
+        program: install.python_executable,
+        prefix_args: vec![service.to_string_lossy().to_string()],
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mflux_image_command(_app_data: &Path) -> Result<EngineCommand, String> {
+    Err("The MFLUX image engine runs on Apple silicon only.".to_string())
+}
+
+#[cfg(target_os = "macos")]
+const MFLUX_IMAGE_SERVICE_ENTRY: &str = "service/mflux_image_server.py";
 
 /// The MLX package's own interpreter running the video service inside it.
 ///
@@ -382,12 +440,29 @@ pub fn generation_engine_status(app: AppHandle) -> Result<GenerationEngineStatus
     // called unsupported for it: a fresh install has nothing under app data
     // until Studio first materializes the bundle.
     let supported = target_supported && present.as_deref().is_none_or(engine_starts);
+    let mflux_supported = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let mflux_installed = app_data.as_deref().is_some_and(mflux_runtime_installed);
     Ok(GenerationEngineStatus {
         supported,
         engine_installed: supported && present.is_some(),
+        mflux_supported,
+        mflux_installed,
         loaded_model_id: app.state::<AppState>().generation_engine.loaded_model(),
         total_ram_bytes: total_ram_bytes(),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn mflux_runtime_installed(app_data: &Path) -> bool {
+    cfg!(target_arch = "aarch64")
+        && crate::m3_production::production_mflux_installer(&app_data.join("m3"))
+            .ok()
+            .is_some_and(|installer| installer.verify_active().is_ok())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mflux_runtime_installed(_app_data: &Path) -> bool {
+    false
 }
 
 /// Every model the user has added.
@@ -448,8 +523,9 @@ pub fn generation_models(app: AppHandle) -> Result<Vec<GenerationModelView>, Str
         .map(|spec| {
             let missing = spec.missing_components(&root);
             let missing_bytes = missing.iter().map(|entry| entry.size_bytes).sum();
+            let missing_source = spec.missing_model_source(&root);
             GenerationModelView {
-                installed: missing.is_empty(),
+                installed: missing.is_empty() && !missing_source,
                 total_bytes: spec.size_on_disk(&root),
                 missing_bytes,
                 license_accepted: !spec.license.acceptance_required
@@ -481,6 +557,41 @@ pub fn generation_accept_license(app: AppHandle, license_id: String) -> Result<(
     write_state(&app, ACCEPTED_LICENSES_FILE, &accepted)
 }
 
+/// Stores a model-source access token in the OS credential store. The token is
+/// intentionally not part of the persisted model JSON or the generation IPC
+/// payload after this command returns.
+#[tauri::command(rename_all = "camelCase")]
+pub fn generation_set_hugging_face_token(
+    app: AppHandle,
+    model_id: String,
+    token: String,
+) -> Result<(), String> {
+    let spec = find_registered(&app, &model_id)?;
+    if !matches!(
+        spec.source,
+        crate::generation::ModelSource::HuggingFaceRepo { .. }
+    ) {
+        return Err("Only a repository-backed model can use a model access token".to_string());
+    }
+    let token = token.trim();
+    if token.len() > 16 * 1024 || token.chars().any(char::is_control) {
+        return Err("The model access token is invalid or too long".to_string());
+    }
+    let account = hugging_face_token_account(&model_id);
+    let entry = keyring::Entry::new(hugging_face_token_service(), &account)
+        .map_err(|error| format!("Failed to access the secure credential store: {error}"))?;
+    if token.is_empty() {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(format!("Failed to remove the saved model token: {error}")),
+        }
+    } else {
+        entry
+            .set_password(token)
+            .map_err(|error| format!("Failed to save the model token securely: {error}"))
+    }
+}
+
 /// Downloads whatever components of `model_id` are missing, straight from each
 /// component's own Hugging Face repo. Progress rides the existing
 /// `models://download-progress` event so Studio and the model manager show the
@@ -492,6 +603,15 @@ pub async fn generation_download_model(
     model_id: String,
 ) -> Result<(), String> {
     let spec = find_registered(&app, &model_id)?;
+    if spec.engine == GenerationEngineKind::MfluxImage
+        && matches!(
+            spec.source,
+            crate::generation::ModelSource::HuggingFaceRepo { .. }
+        )
+        && (!spec.license.acceptance_required || spec.license.id.trim().is_empty())
+    {
+        return Err("This remote MFLUX model has no terms acceptance gate".to_string());
+    }
     if spec.license.acceptance_required {
         let accepted: BTreeSet<String> = read_state(&app, ACCEPTED_LICENSES_FILE)?;
         if !accepted.contains(&spec.license.id) {
@@ -502,9 +622,10 @@ pub async fn generation_download_model(
         }
     }
 
-    let root = model_root(&app)?.join(&spec.id);
-    std::fs::create_dir_all(&root)
-        .map_err(|error| format!("Failed to create {}: {error}", root.display()))?;
+    let models_root = model_root(&app)?;
+    let model_dir = models_root.join(&spec.id);
+    std::fs::create_dir_all(&model_dir)
+        .map_err(|error| format!("Failed to create {}: {error}", model_dir.display()))?;
 
     let cancel = Arc::new(CancellationToken::new());
     {
@@ -516,6 +637,50 @@ pub async fn generation_download_model(
     }
 
     let result = async {
+        if spec.engine == GenerationEngineKind::MfluxImage {
+            let crate::generation::ModelSource::HuggingFaceRepo { repo, revision } = &spec.source
+            else {
+                return Ok(());
+            };
+            let bearer_token = read_hugging_face_token(&spec.id)?;
+            let destination = spec
+                .model_source_path(&models_root)
+                .ok_or_else(|| "MFLUX model source is not configured".to_string())?;
+            // A model entry may keep its id while changing repository or
+            // revision, and a cancelled transfer has no trustworthy identity
+            // marker. Do not resume an unknown snapshot: remove only the
+            // app-owned source directory, then stage the new snapshot and
+            // write a matching marker at the end.
+            if destination.is_dir() && !spec.model_source_marker_matches(&models_root) {
+                std::fs::remove_dir_all(&destination).map_err(|error| {
+                    format!(
+                        "Failed to replace the old model source at {}: {error}",
+                        destination.display()
+                    )
+                })?;
+            }
+            std::fs::create_dir_all(&destination)
+                .map_err(|error| format!("Failed to create {}: {error}", destination.display()))?;
+            crate::models::download_repo_snapshot(
+                &app,
+                repo,
+                revision.as_deref().unwrap_or("main"),
+                &destination,
+                &cancel,
+                bearer_token.as_deref(),
+            )
+            .await?;
+            std::fs::write(
+                destination.join(crate::generation::MODEL_SOURCE_MARKER_FILE),
+                serde_json::to_vec(&json!({
+                    "repo": repo,
+                    "revision": revision.as_deref().unwrap_or("main"),
+                }))
+                .map_err(|error| format!("Failed to encode the model source marker: {error}"))?,
+            )
+            .map_err(|error| format!("Failed to mark the model source complete: {error}"))?;
+            return Ok(());
+        }
         for component in &spec.components {
             // A component the user supplied from their own disk is present or
             // it is not; there is nothing to fetch and nothing to own.
@@ -523,13 +688,13 @@ pub async fn generation_download_model(
             else {
                 continue;
             };
-            let destination = root.join(component.file_name());
+            let destination = model_dir.join(component.file_name());
             if destination.is_file() {
                 continue;
             }
             // Download beside the destination and rename, so an interrupted
             // transfer never leaves a half file that looks installed.
-            let temporary = root.join(format!(
+            let temporary = model_dir.join(format!(
                 ".{}.{}.part",
                 component.file_name(),
                 Uuid::new_v4()
@@ -950,9 +1115,8 @@ async fn run_remote(
 /// The `sd-server` half of [`generation_run`]: ensure the engine is serving
 /// this model, submit, and poll to a terminal state.
 ///
-/// The job API has no step counter, so the percentage in each progress event
-/// is scraped from the engine's own output by
-/// [`generation::GenerationEngineState`] rather than read from the poll body.
+/// The native image service reports a step counter in its job body. Other
+/// engines still use the shared stderr progress reader as a fallback.
 async fn run_diffusion(
     app: &AppHandle,
     state: &tauri::State<'_, AppState>,
@@ -994,16 +1158,23 @@ async fn run_diffusion(
             GenerationProgressEvent::new(&job_id, "submitted"),
         );
 
-        let mut moving = (engine.output_mark(), u32::MAX);
+        let mut moving = (engine.output_mark(), u32::MAX, None);
         let mut moved_at = tokio::time::Instant::now();
         loop {
             match generation::poll_job(&client, &base_url, &job_id).await? {
-                JobProgress::Running { queue_position } => {
+                JobProgress::Running {
+                    queue_position,
+                    progress,
+                } => {
                     let mut event = GenerationProgressEvent::new(&job_id, "running")
-                        .with_progress(engine.progress());
+                        .with_progress(progress.or_else(|| engine.progress()));
                     event.queue_position = queue_position;
                     let _ = app.emit("studio://progress", event);
-                    let now = (engine.output_mark(), queue_position);
+                    let now = (
+                        engine.output_mark(),
+                        queue_position,
+                        progress.or_else(|| engine.progress()),
+                    );
                     if now != moving {
                         moving = now;
                         moved_at = tokio::time::Instant::now();

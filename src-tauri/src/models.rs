@@ -1224,7 +1224,7 @@ fn is_safe_path_component(s: &str) -> bool {
 /// charset. This string is interpolated directly into the download URL, so
 /// a malformed value could otherwise be used to smuggle extra path segments
 /// or unexpected characters into the request.
-fn validate_repo(repo: &str) -> Result<(), String> {
+pub(crate) fn validate_repo(repo: &str) -> Result<(), String> {
     let valid_charset = |s: &str| {
         s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -1462,7 +1462,28 @@ pub(crate) async fn download_to_file(
     tmp_path: &Path,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+    download_to_file_at_revision(app, repo, "main", file, tmp_path, cancel, None).await
+}
+
+async fn download_to_file_at_revision(
+    app: &AppHandle,
+    repo: &str,
+    revision: &str,
+    file: &str,
+    tmp_path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+    bearer_token: Option<&str>,
+) -> Result<(), String> {
+    let mut url = reqwest::Url::parse("https://huggingface.co")
+        .map_err(|error| format!("Failed to build model URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "Failed to build model URL".to_string())?;
+        segments.extend(repo.split('/'));
+        segments.push("resolve").push(revision);
+        segments.extend(file.split('/'));
+    }
 
     // Same silence budget as every other download path, for the same reason: this
     // client had no timeout of any kind, so a Hugging Face connection that
@@ -1477,11 +1498,24 @@ pub(crate) async fn download_to_file(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-    let response = crate::egress::send(client.get(&url))
+    let mut request = client.get(url.clone());
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = crate::egress::send(request)
         .await
         .map_err(|e| format!("Failed to reach Hugging Face at {url}: {e}"))?;
 
     if !response.status().is_success() {
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(
+                "Hugging Face authentication or accepted model terms are required for this download"
+                    .to_string(),
+            );
+        }
         return Err(format!(
             "Download failed with HTTP {} for {url}",
             response.status()
@@ -1490,6 +1524,11 @@ pub(crate) async fn download_to_file(
 
     let total = response.content_length().unwrap_or(0);
 
+    if let Some(parent) = tmp_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
     let mut out = tokio::fs::File::create(tmp_path)
         .await
         .map_err(|e| format!("Failed to create file {}: {e}", tmp_path.display()))?;
@@ -1542,6 +1581,113 @@ pub(crate) async fn download_to_file(
         }),
     );
 
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct HuggingFaceTreeEntry {
+    path: String,
+    #[serde(rename = "type")]
+    entry_type: String,
+}
+
+fn validate_repo_file_path(path: &str) -> Result<(), String> {
+    let candidate = Path::new(path);
+    if path.trim().is_empty()
+        || candidate.is_absolute()
+        || candidate.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        })
+    {
+        return Err(format!("Repository contains an unsafe file path: {path}"));
+    }
+    Ok(())
+}
+
+/// Downloads a complete repository snapshot into a directory. The caller
+/// writes its own completion marker only after this returns, so a cancelled
+/// transfer is never reported as an installed model.
+pub(crate) async fn download_repo_snapshot(
+    app: &AppHandle,
+    repo: &str,
+    revision: &str,
+    destination: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+    bearer_token: Option<&str>,
+) -> Result<(), String> {
+    let mut url = reqwest::Url::parse("https://huggingface.co")
+        .map_err(|error| format!("Failed to build model repository URL: {error}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| "Failed to build model repository URL".to_string())?;
+        segments.push("api").push("models");
+        segments.extend(repo.split('/'));
+        segments.push("tree").push(revision);
+    }
+    url.query_pairs_mut().append_pair("recursive", "true");
+    let client = reqwest::Client::builder()
+        .user_agent("LittleMonkey-Desktop/0.1")
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .read_timeout(crate::egress::READ_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Failed to build HTTP client: {error}"))?;
+    let mut request = client.get(url.clone()).header("Accept", "application/json");
+    if let Some(token) = bearer_token {
+        request = request.bearer_auth(token);
+    }
+    let response = crate::egress::send(request)
+        .await
+        .map_err(|error| format!("Failed to list model repository: {error}"))?;
+    if !response.status().is_success() {
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(
+                "Hugging Face authentication or accepted model terms are required to list this repository"
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "Model repository listing failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let entries: Vec<HuggingFaceTreeEntry> = response
+        .json()
+        .await
+        .map_err(|error| format!("Model repository listing was unreadable: {error}"))?;
+    let files: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| entry.entry_type == "file")
+        .map(|entry| entry.path)
+        .map(|path| {
+            validate_repo_file_path(&path)?;
+            Ok(path)
+        })
+        .collect::<Result<_, String>>()?;
+    if files.is_empty() {
+        return Err("Model repository contains no files".to_string());
+    }
+    for file in files {
+        if cancel.is_cancelled() {
+            return Err("Download cancelled".to_string());
+        }
+        let destination_file = destination.join(&file);
+        if destination_file.is_file() {
+            continue;
+        }
+        let temporary = destination_file.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
+        download_to_file_at_revision(app, repo, revision, &file, &temporary, cancel, bearer_token)
+            .await?;
+        tokio::fs::rename(&temporary, &destination_file)
+            .await
+            .map_err(|error| format!("Failed to install model file {file}: {error}"))?;
+    }
     Ok(())
 }
 

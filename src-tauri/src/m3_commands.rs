@@ -1553,6 +1553,40 @@ pub fn m3_mlx_install_component(
     crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact).map_err(command_error)
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn m3_mflux_install_component(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    component_id: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    let installed = state
+        .component_hub
+        .list_installed()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|component| component.component_id == component_id)
+        .ok_or_else(|| format!("No component named '{component_id}' is installed"))?;
+    if installed.kind != M3ComponentKind::MfluxImageRuntime {
+        return Err(format!(
+            "'{component_id}' is a {:?} component, not an MFLUX image runtime",
+            installed.kind
+        ));
+    }
+    let artifact = installed
+        .versions
+        .iter()
+        .find(|version| version.version_key == installed.active_version_key)
+        .ok_or("The installed MFLUX image runtime has no active version")?
+        .artifact_path
+        .clone();
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mflux_from_artifact(&app_data_dir, &artifact)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub fn m3_component_registry_entries(
     state: tauri::State<'_, M3CommandState>,
@@ -1674,9 +1708,22 @@ pub async fn m3_component_install(
     let app_data_dir = app
         .profile_data_dir()
         .map_err(|error| command_error(M3HubError::Runtime(error.to_string())))?;
-    component_install_impl(&state, operation_id, timeout_ms, request, |artifact| {
-        crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
-    })
+    component_install_impl(
+        &state,
+        operation_id,
+        timeout_ms,
+        request,
+        |kind, artifact| match kind {
+            M3ComponentKind::MlxRuntime => {
+                crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
+            }
+            M3ComponentKind::MfluxImageRuntime => {
+                crate::m3_production::install_mflux_from_artifact(&app_data_dir, artifact)
+                    .map(|_| ())
+            }
+            _ => Ok(()),
+        },
+    )
     .await
 }
 
@@ -1688,7 +1735,7 @@ pub async fn m3_component_install(
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
-    component_install_impl(&state, operation_id, timeout_ms, request, |_| Ok(())).await
+    component_install_impl(&state, operation_id, timeout_ms, request, |_, _| Ok(())).await
 }
 
 async fn component_install_impl<F>(
@@ -1699,21 +1746,28 @@ async fn component_install_impl<F>(
     mlx_precommit: F,
 ) -> Result<M3InstalledComponentView, String>
 where
-    F: Fn(&Path) -> M3HubResult<()>,
+    F: Fn(M3ComponentKind, &Path) -> M3HubResult<()>,
 {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result: M3HubResult<M3InstalledComponentView> = async {
-        if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
+        if matches!(
+            request.entry.kind,
+            M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime
+        ) && !cfg!(target_os = "macos")
+        {
             return Err(M3HubError::Unsupported(
-                "MLX runtime components require macOS".to_string(),
+                "Apple Silicon image runtime components require macOS".to_string(),
             ));
         }
         #[cfg(target_os = "macos")]
-        if request.entry.kind == M3ComponentKind::MlxRuntime {
+        if matches!(
+            request.entry.kind,
+            M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime
+        ) {
             return state
                 .component_hub
                 .install_component_with_precommit(&request, &context, |artifact| {
-                    mlx_precommit(artifact)
+                    mlx_precommit(request.entry.kind, artifact)
                 })
                 .await;
         }
@@ -2407,7 +2461,7 @@ mod tests {
                 M3InstallComponentRequest {
                     entry: adopted.clone(),
                 },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,
@@ -2436,7 +2490,7 @@ mod tests {
                 M3InstallComponentRequest {
                     entry: bad_entry.clone(),
                 },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,
@@ -2460,7 +2514,7 @@ mod tests {
                 "mlx-op".into(),
                 None,
                 M3InstallComponentRequest { entry: adopted },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,
