@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { useRef, useState } from 'react';
+import { StrictMode, useRef, useState } from 'react';
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -206,6 +206,47 @@ describe('DictationButton', () => {
     await screen.findByRole('button', { name: 'Stop dictation' });
 
     resolveStart({ sessionId });
+  });
+
+  it('does not cancel a completed start under React StrictMode', async () => {
+    let resolveStart!: (value: { sessionId: string }) => void;
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'dictation_capabilities') {
+        return Promise.resolve({
+          supported: true,
+          platform: 'macos',
+          engine: 'Apple Speech',
+          supportsPartialResults: true,
+          supportsOnDevice: true,
+          languages: [{ id: 'en-US', label: 'English (US)' }],
+        });
+      }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      if (command === 'dictation_start') {
+        return new Promise((resolve) => {
+          resolveStart = resolve as (value: { sessionId: string }) => void;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <StrictMode>
+        <Harness />
+      </StrictMode>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+    await screen.findByRole('button', { name: 'Starting dictation' });
+    await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
+    const startCall = mocks.invoke.mock.calls.find(([command]) => command === 'dictation_start');
+    const sessionId = (startCall?.[1] as { sessionId: string }).sessionId;
+
+    emit('dictation://state', { sessionId, state: 'listening' });
+    await screen.findByRole('button', { name: 'Stop dictation' });
+    resolveStart({ sessionId });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(mocks.invoke).not.toHaveBeenCalledWith('dictation_cancel', { sessionId });
   });
 
   it('waits for startup to finish before settling Send', async () => {

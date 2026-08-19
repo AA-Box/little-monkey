@@ -316,8 +316,11 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
     };
   }, [rejectWaiters, sessionId]);
 
-  useEffect(() => () => {
-    mountedRef.current = false;
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
 
   const start = useCallback(() => {

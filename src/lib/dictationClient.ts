@@ -56,10 +56,15 @@ const FINAL_EVENT = "dictation://final";
 const ERROR_EVENT = "dictation://error";
 
 export function createDictationSessionId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+  if (typeof crypto === "undefined") {
+    throw new Error("Secure randomness is unavailable");
+  }
+  if (typeof crypto.randomUUID === "function") {
     return `dictation-${crypto.randomUUID()}`;
   }
-  return `dictation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const suffix = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `dictation-${suffix}`;
 }
 
 export type DictationUnlisten = UnlistenFn;
