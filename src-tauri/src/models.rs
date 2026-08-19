@@ -496,6 +496,52 @@ pub fn set_projector_for_model(
     save_bundle_registry_to_path(&registry_path, &registry)
 }
 
+/// Associates a freshly installed bundle and rolls back any newly published
+/// components if the registry write fails. The caller keeps the install lock in
+/// `installed` until this function returns, so component GC cannot race the
+/// association.
+pub async fn associate_installed_bundle(
+    profile_data_dir: &Path,
+    models_dir: &Path,
+    installed: &model_sources::InstalledModelReference,
+) -> Result<(), String> {
+    let Some(projector_path) = installed.projector_path.as_ref() else {
+        return Ok(());
+    };
+    if let Err(error) = set_projector_for_model(
+        profile_data_dir,
+        models_dir,
+        &installed.local_path,
+        projector_path,
+    ) {
+        rollback_installed_bundle(profile_data_dir, models_dir, installed).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn rollback_installed_bundle(
+    profile_data_dir: &Path,
+    models_dir: &Path,
+    installed: &model_sources::InstalledModelReference,
+) {
+    if installed.model_was_new {
+        let _ = model_sources::delete_installed_model(models_dir, &installed.local_path).await;
+    }
+    if installed.projector_was_new {
+        let registry_path = profile_data_dir.join("local_model_bundles.json");
+        if let Ok(_registry_lock) = lock_bundle_registry(&registry_path) {
+            if let Ok(registry) = load_bundle_registry_from_path(&registry_path) {
+                if let Some(projector_path) = installed.projector_path.as_ref() {
+                    if !managed_projector_referenced(&registry, projector_path) {
+                        let _ = std::fs::remove_file(projector_path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn save_bundle_registry_to_path(
     path: &Path,
     registry: &LocalModelBundleRegistry,
@@ -1273,6 +1319,9 @@ pub async fn models_install_reference(
     expected_sha256: String,
     expected_projector_sha256: Option<String>,
 ) -> Result<ModelInfo, String> {
+    let profile_data_dir = app
+        .profile_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
     let dir = models_dir(&app)?;
     let _bundle_cleanup = begin_bundle_install(&reference)?;
     let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
@@ -1323,32 +1372,11 @@ pub async fn models_install_reference(
         debug_assert!(installed.projector_install_lock_is_held());
     }
     let model = managed_model_info(&installed.local_path, &installed.provenance);
-    if let Some(projector_path) = installed.projector_path.as_ref() {
-        let result = models_set_projector(
-            app.clone(),
-            installed.local_path.to_string_lossy().into_owned(),
-            projector_path.to_string_lossy().into_owned(),
-        );
+    if installed.projector_path.is_some() {
+        let result = associate_installed_bundle(&profile_data_dir, &dir, &installed).await;
         return match result {
-            Ok(model) => Ok(model),
-            Err(error) => {
-                if installed.model_was_new {
-                    let _ =
-                        model_sources::delete_installed_model(&dir, &installed.local_path).await;
-                }
-                if installed.projector_was_new {
-                    if let Ok(registry_path) = bundle_registry_path(&app) {
-                        if let Ok(_registry_lock) = lock_bundle_registry(&registry_path) {
-                            if let Ok(registry) = load_bundle_registry_from_path(&registry_path) {
-                                if !managed_projector_referenced(&registry, projector_path) {
-                                    let _ = std::fs::remove_file(projector_path);
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(error)
-            }
+            Ok(()) => model_info_for_path(&app, &installed.local_path),
+            Err(error) => Err(error),
         };
     }
     Ok(model)

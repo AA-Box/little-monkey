@@ -327,6 +327,16 @@ enum Cmd {
         /// Legacy Ollama daemon only; managed installs reject insecure transport
         #[arg(long)]
         insecure: bool,
+        /// Select a projector by SHA-256 digest or filename
+        #[arg(
+            long,
+            conflicts_with = "no_projector",
+            value_name = "SHA256_OR_FILENAME"
+        )]
+        projector: Option<String>,
+        /// Install or use the model without a multimodal projector
+        #[arg(long, conflicts_with = "projector")]
+        no_projector: bool,
     },
     /// Remove one or more models
     Rm {
@@ -389,6 +399,16 @@ enum Cmd {
         /// System prompt overriding the model's default
         #[arg(long)]
         system: Option<String>,
+        /// Select a projector by SHA-256 digest or filename when installing
+        #[arg(
+            long,
+            conflicts_with = "no_projector",
+            value_name = "SHA256_OR_FILENAME"
+        )]
+        projector: Option<String>,
+        /// Install or use the model without a multimodal projector
+        #[arg(long, conflicts_with = "projector")]
+        no_projector: bool,
     },
     /// Configure and inspect messaging channels — the accounts Little Monkey
     /// receives external messages on, who may talk to it, and where those
@@ -1256,7 +1276,17 @@ async fn run_cli(mut cli: Cli) {
                 } else {
                     ModelCommandBackend::Ollama
                 };
-                run_model(&cli, &client, &launch.model, None, None, backend).await;
+                run_model(
+                    &cli,
+                    &client,
+                    &launch.model,
+                    None,
+                    None,
+                    None,
+                    false,
+                    backend,
+                )
+                .await;
                 return;
             }
             Ok(None) => return,
@@ -1329,6 +1359,8 @@ async fn run_model(
     model: &str,
     prompt: Option<String>,
     system: Option<&str>,
+    projector: Option<&str>,
+    no_projector: bool,
     backend: ModelCommandBackend,
 ) {
     // Validate chat-side flags before a potentially long verified install
@@ -1363,10 +1395,16 @@ async fn run_model(
             // Managed llama-server consumes this at process startup;
             // do not forward it as an OpenAI-compatible request option.
             options.num_ctx = None;
-            let installed = match managed_model_cli::install_for_run(model).await {
-                Ok(installed) => installed,
-                Err(error) => fail(&error),
-            };
+            let projector_selection =
+                match managed_model_cli::projector_selection(projector, no_projector) {
+                    Ok(selection) => selection,
+                    Err(error) => fail(&error),
+                };
+            let installed =
+                match managed_model_cli::install_for_run(model, projector_selection).await {
+                    Ok(installed) => installed,
+                    Err(error) => fail(&error),
+                };
             let session = match managed_model_cli::start_server(
                 client,
                 &installed.local_path,
@@ -1429,8 +1467,25 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
     let result = match cmd {
         Cmd::List => cmds::list(client).await,
         Cmd::Ps => cmds::ps(client).await,
-        Cmd::Pull { model, insecure } => match model_command_backend(cli) {
-            Ok(ModelCommandBackend::Managed) => managed_model_cli::pull(model, *insecure).await,
+        Cmd::Pull {
+            model,
+            insecure,
+            projector,
+            no_projector,
+        } => match model_command_backend(cli) {
+            Ok(ModelCommandBackend::Managed) => {
+                managed_model_cli::pull_with_projector(
+                    model,
+                    *insecure,
+                    projector.as_deref(),
+                    *no_projector,
+                )
+                .await
+            }
+            Ok(ModelCommandBackend::Ollama) if projector.is_some() || *no_projector => Err(
+                "--projector and --no-projector are only supported with the managed backend"
+                    .to_string(),
+            ),
             Ok(ModelCommandBackend::Ollama) => cmds::pull(client, model, *insecure).await,
             Err(error) => Err(error),
         },
@@ -1472,17 +1527,24 @@ async fn run_subcommand(cli: &Cli, cmd: &Cmd, client: &reqwest::Client) {
             model,
             prompt,
             system,
+            projector,
+            no_projector,
         } => {
             let backend = match model_command_backend(cli) {
                 Ok(backend) => backend,
                 Err(error) => fail(&error),
             };
+            if backend == ModelCommandBackend::Ollama && (projector.is_some() || *no_projector) {
+                fail("--projector and --no-projector are only supported with the managed backend");
+            }
             run_model(
                 cli,
                 client,
                 model,
                 joined_prompt(prompt),
                 system.as_deref(),
+                projector.as_deref(),
+                *no_projector,
                 backend,
             )
             .await;
@@ -1978,6 +2040,52 @@ mod tests {
             model_command_backend(&run).unwrap(),
             ModelCommandBackend::Managed
         );
+    }
+
+    #[test]
+    fn model_commands_expose_explicit_projector_selection() {
+        let pull = Cli::try_parse_from([
+            "monkey",
+            "pull",
+            "hf:owner/repo#model.gguf",
+            "--projector",
+            "mmproj-F16.gguf",
+        ])
+        .unwrap();
+        assert!(matches!(
+            pull.cmd,
+            Some(Cmd::Pull {
+                projector: Some(ref value),
+                no_projector: false,
+                ..
+            }) if value == "mmproj-F16.gguf"
+        ));
+
+        let run = Cli::try_parse_from([
+            "monkey",
+            "run",
+            "hf:owner/repo#model.gguf",
+            "--no-projector",
+        ])
+        .unwrap();
+        assert!(matches!(
+            run.cmd,
+            Some(Cmd::Run {
+                projector: None,
+                no_projector: true,
+                ..
+            })
+        ));
+
+        assert!(Cli::try_parse_from([
+            "monkey",
+            "pull",
+            "hf:owner/repo#model.gguf",
+            "--projector",
+            "mmproj-F16.gguf",
+            "--no-projector",
+        ])
+        .is_err());
     }
 
     #[test]

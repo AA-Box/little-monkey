@@ -74,6 +74,13 @@ pub enum ModelArtifactRole {
     Projector,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectorSelection {
+    Automatic,
+    Selected(String),
+    Disabled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedModelArtifact {
@@ -413,7 +420,7 @@ where
             models_dir,
             reference,
             expected_sha256,
-            None,
+            ProjectorSelection::Automatic,
             None,
             on_progress,
         ),
@@ -431,13 +438,36 @@ pub async fn install_reference_with_projector<F>(
 where
     F: FnMut(ModelDownloadProgress),
 {
+    let selection = expected_projector_sha256
+        .map(|value| ProjectorSelection::Selected(value.to_string()))
+        .unwrap_or(ProjectorSelection::Automatic);
+    install_reference_with_projector_selection(
+        models_dir,
+        reference,
+        expected_sha256,
+        selection,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn install_reference_with_projector_selection<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    projector_selection: ProjectorSelection,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
     crate::run_scope::scoped(
         crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
         install_within_scope(
             models_dir,
             reference,
             expected_sha256,
-            expected_projector_sha256,
+            projector_selection,
             None,
             on_progress,
         ),
@@ -456,13 +486,38 @@ pub async fn install_reference_with_projector_and_cancel<F>(
 where
     F: FnMut(ModelDownloadProgress),
 {
+    let selection = expected_projector_sha256
+        .map(|value| ProjectorSelection::Selected(value.to_string()))
+        .unwrap_or(ProjectorSelection::Automatic);
+    install_reference_with_projector_selection_and_cancel(
+        models_dir,
+        reference,
+        expected_sha256,
+        selection,
+        cancel,
+        on_progress,
+    )
+    .await
+}
+
+pub async fn install_reference_with_projector_selection_and_cancel<F>(
+    models_dir: &Path,
+    reference: &str,
+    expected_sha256: &str,
+    projector_selection: ProjectorSelection,
+    cancel: &CancellationToken,
+    on_progress: F,
+) -> Result<InstalledModelReference, String>
+where
+    F: FnMut(ModelDownloadProgress),
+{
     crate::run_scope::scoped(
         crate::run_scope::RunScope::Unattributed(crate::run_scope::Unattributed::UserAction),
         install_within_scope(
             models_dir,
             reference,
             expected_sha256,
-            expected_projector_sha256,
+            projector_selection,
             Some(cancel),
             on_progress,
         ),
@@ -475,7 +530,7 @@ async fn install_within_scope<F>(
     models_dir: &Path,
     reference: &str,
     expected_sha256: &str,
-    expected_projector_sha256: Option<&str>,
+    projector_selection: ProjectorSelection,
     cancel: Option<&CancellationToken>,
     mut on_progress: F,
 ) -> Result<InstalledModelReference, String>
@@ -491,8 +546,7 @@ where
         return Err("Model bundle installation cancelled".to_string());
     }
     let expected_sha256 = validate_expected_digest(&resolution.public, expected_sha256)?;
-    let selected_projector =
-        select_projector_artifact(&resolution.public, expected_projector_sha256)?;
+    let selected_projector = select_projector_artifact(&resolution.public, &projector_selection)?;
     let projector_size = selected_projector
         .map(|artifact| artifact.size_bytes)
         .unwrap_or(0);
@@ -1412,30 +1466,36 @@ fn hf_artifact(
 
 fn select_projector_artifact<'a>(
     resolved: &'a ResolvedModelReference,
-    expected_sha256: Option<&str>,
+    selection: &ProjectorSelection,
 ) -> Result<Option<&'a ResolvedModelArtifact>, String> {
     let selected = resolved
         .artifacts
         .iter()
         .find(|artifact| artifact.role == ModelArtifactRole::Projector);
-    if let Some(expected) = expected_sha256 {
-        let expected = normalize_sha256(expected, "expectedProjectorSha256")?;
-        return resolved
+    match selection {
+        ProjectorSelection::Disabled => Ok(None),
+        ProjectorSelection::Selected(selector) => resolved
             .projector_candidates
             .iter()
             .chain(selected)
-            .find(|artifact| artifact.sha256 == expected)
+            .find(|artifact| {
+                artifact.file_name == selector.as_str()
+                    || artifact.sha256.eq_ignore_ascii_case(selector)
+            })
             .map(Some)
             .ok_or_else(|| {
                 "The selected projector is no longer part of the resolved model bundle".to_string()
-            });
+            }),
+        ProjectorSelection::Automatic => {
+            if resolved.projector_candidates.len() > 1 && selected.is_none() {
+                return Err(
+                    "Multiple projector artifacts were found; choose one before installing"
+                        .to_string(),
+                );
+            }
+            Ok(selected)
+        }
     }
-    if resolved.projector_candidates.len() > 1 && selected.is_none() {
-        return Err(
-            "Multiple projector artifacts were found; choose one before installing".to_string(),
-        );
-    }
-    Ok(selected)
 }
 
 async fn install_projector_artifact<F>(
@@ -4103,6 +4163,71 @@ mod tests {
             select_hf_sibling(&ambiguous, &HuggingFaceSelector::DefaultQ4Km)
                 .unwrap_err()
                 .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn projector_selection_supports_filename_digest_and_text_only_modes() {
+        let first = ResolvedModelArtifact {
+            role: ModelArtifactRole::Projector,
+            file_name: "mmproj-F16.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/mmproj-F16.gguf".to_string(),
+            sha256: digest('a'),
+            size_bytes: 12,
+        };
+        let second = ResolvedModelArtifact {
+            role: ModelArtifactRole::Projector,
+            file_name: "mmproj-Q8.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/mmproj-Q8.gguf".to_string(),
+            sha256: digest('b'),
+            size_bytes: 13,
+        };
+        let resolved = ResolvedModelReference {
+            source: ModelReferenceSource::HuggingFace,
+            canonical_reference: "hf:owner/repo#model.gguf".to_string(),
+            display_name: "owner/repo".to_string(),
+            repo: "owner/repo".to_string(),
+            revision: "main".to_string(),
+            file_name: "model.gguf".to_string(),
+            download_url: "https://huggingface.co/owner/repo/model.gguf".to_string(),
+            sha256: digest('c'),
+            size_bytes: 14,
+            tool_calling: false,
+            license_name: None,
+            license_url: None,
+            artifacts: Vec::new(),
+            projector_candidates: vec![first.clone(), second.clone()],
+        };
+
+        assert!(
+            select_projector_artifact(&resolved, &ProjectorSelection::Automatic)
+                .unwrap_err()
+                .contains("Multiple projector")
+        );
+        assert_eq!(
+            select_projector_artifact(
+                &resolved,
+                &ProjectorSelection::Selected("mmproj-F16.gguf".to_string())
+            )
+            .unwrap()
+            .unwrap()
+            .sha256,
+            first.sha256
+        );
+        assert_eq!(
+            select_projector_artifact(
+                &resolved,
+                &ProjectorSelection::Selected(second.sha256.to_uppercase())
+            )
+            .unwrap()
+            .unwrap()
+            .file_name,
+            second.file_name
+        );
+        assert!(
+            select_projector_artifact(&resolved, &ProjectorSelection::Disabled)
+                .unwrap()
+                .is_none()
         );
     }
 
