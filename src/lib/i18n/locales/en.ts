@@ -970,6 +970,7 @@ export const en: Record<string, string> = {
   "ModelCard.projectorMissing": "Projector missing",
   "ModelCard.embeddingsUnavailableWithProjector": "Embeddings mode is unavailable while a multimodal projector is attached.",
   "ModelCard.addProjectorButton": "Add vision component",
+  "ModelCard.replaceProjectorButton": "Replace projector",
   "ModelCard.removeProjectorButton": "Remove projector",
   "ModelCard.startFailedMessage": "llama-server failed to start. Check the install and try again.",
   "ModelCard.downloadProgressLabel": "{{downloaded}} / {{total}} ({{pct}}%)",

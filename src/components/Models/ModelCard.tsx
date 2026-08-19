@@ -176,7 +176,7 @@ export function ModelCard({
 
             {!busy && onAddProjector && (
               <Button variant="secondary" size="sm" onClick={onAddProjector}>
-                {t("ModelCard.addProjectorButton")}
+                {t(model.components?.projector ? "ModelCard.replaceProjectorButton" : "ModelCard.addProjectorButton")}
               </Button>
             )}
             {!busy && model.components?.projector && onRemoveProjector && (

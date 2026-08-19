@@ -50,6 +50,10 @@ const KEYCHAIN_PROBE_ACCOUNT: &str = "diagnostics:keychain-probe";
 /// model's GGUF metadata, so there's only one place that decision is made.
 const LLAMA_RESTART_GPU_LAYERS: i32 = 999;
 
+fn llama_restart_paths(llama: &crate::llama::LlamaState) -> (Option<String>, Option<String>) {
+    (llama.model_path.clone(), llama.projector_path.clone())
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticStatus {
@@ -771,19 +775,20 @@ pub async fn diagnostics_apply_fix(
     finding_id: String,
 ) -> Result<DiagnosticFinding, String> {
     if finding_id == "llama.reachability" {
-        let model_path = state
-            .llama
-            .lock()
-            .map_err(|_| "Llama state lock poisoned".to_string())?
-            .model_path
-            .clone();
+        let (model_path, projector_path) = {
+            let llama = state
+                .llama
+                .lock()
+                .map_err(|_| "Llama state lock poisoned".to_string())?;
+            llama_restart_paths(&llama)
+        };
         crate::llama::llama_stop(app.clone(), state.clone()).await?;
         if let Some(model_path) = model_path {
             crate::llama::llama_start(
                 app.clone(),
                 state.clone(),
                 model_path,
-                None,
+                projector_path,
                 None,
                 LLAMA_RESTART_GPU_LAYERS,
                 false,
@@ -1035,6 +1040,21 @@ mod tests {
         assert_eq!(finding.status, DiagnosticStatus::Critical);
         assert!(finding.fixable);
         assert_eq!(report.summary.critical, 1);
+    }
+
+    #[test]
+    fn llama_restart_paths_preserve_the_loaded_projector() {
+        let mut llama = crate::llama::LlamaState::default();
+        llama.model_path = Some("/models/chat.gguf".to_string());
+        llama.projector_path = Some("/models/mmproj.gguf".to_string());
+
+        assert_eq!(
+            llama_restart_paths(&llama),
+            (
+                Some("/models/chat.gguf".to_string()),
+                Some("/models/mmproj.gguf".to_string())
+            )
+        );
     }
 
     #[test]

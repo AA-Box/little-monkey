@@ -11,6 +11,7 @@ vi.mock("../../lib/i18n", () => ({
         "ModelCard.visionConfiguredBadge": "Vision configured",
         "ModelCard.visionReadyBadge": "Vision ready",
         "ModelCard.embeddingsUnavailableWithProjector": "Embeddings unavailable with projector",
+        "ModelCard.replaceProjectorButton": "Replace projector",
         "ModelCard.statusSelected": "Selected",
         "ModelCard.startButton": "Start",
         "ModelCard.deleteWeightsTitle": "Delete weights",
@@ -53,6 +54,7 @@ describe("ModelCard multimodal state", () => {
         onDelete={() => {}}
         onStart={() => {}}
         onStop={() => {}}
+        onAddProjector={() => {}}
       />,
     );
 
@@ -60,6 +62,8 @@ describe("ModelCard multimodal state", () => {
     expect(markup).not.toContain("Vision ready");
     expect(markup).toContain("Multimodal projector: mmproj.gguf");
     expect(markup).toContain("Embeddings unavailable with projector");
+    expect(markup).toContain("Replace projector");
+    expect(markup).not.toContain("Add vision component");
     expect(markup).not.toContain("Projector missing");
   });
 
