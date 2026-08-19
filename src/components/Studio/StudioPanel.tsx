@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import {
   ArrowDown,
   ArrowLeft,
@@ -117,6 +118,12 @@ async function imageSize(base64: string): Promise<{ width: number; height: numbe
 function extensionFor(mediaType: string): string {
   const subtype = mediaType.split("/")[1] ?? "bin";
   return subtype === "jpeg" ? "jpg" : subtype.replace(/[^a-z0-9]/gi, "");
+}
+
+function dataUrlBytes(dataUrl: string): Uint8Array {
+  const encoded = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  const binary = atob(encoded);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
 /** A slider paired with the number it sets, because a slider alone cannot be
@@ -532,6 +539,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const busy = active !== null;
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [savingEntryId, setSavingEntryId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
 
@@ -772,6 +780,25 @@ export function StudioPanel({ mode, railSlot }: Props) {
   useEffect(() => {
     if (shown) void loadPreview(shown);
   }, [shown, loadPreview]);
+
+  const saveEntry = async (entry: GenerationEntry) => {
+    setSavingEntryId(entry.entryId);
+    setError(null);
+    try {
+      const dataUrl = previews[entry.artifactId] ?? (await studioClient.mediaDataUrl(entry.artifactId));
+      const extension = extensionFor(entry.mediaType);
+      const destination = await save({
+        defaultPath: `${entry.entryId}.${extension}`,
+        filters: [{ name: entry.mediaType.toUpperCase(), extensions: [extension] }],
+      });
+      if (!destination) return;
+      await writeFile(destination, dataUrlBytes(dataUrl));
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setSavingEntryId(null);
+    }
+  };
 
   const download = async (model: GenerationModel) => {
     setError(null);
@@ -2312,27 +2339,75 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 <audio controls src={previews[shown.artifactId]} className="w-full max-w-md" />
               </div>
             ) : (
-              <button
-                type="button"
-                className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
-                title={t("Studio.result.expand")}
-                onClick={() => setLightbox(shown)}
-              >
-                {shown.mediaType.startsWith("video/") ? (
-                  <video
-                    controls
-                    loop
-                    src={previews[shown.artifactId]}
-                    className="max-h-full max-w-full rounded bg-black object-contain"
-                  />
-                ) : (
-                  <img
-                    src={previews[shown.artifactId]}
-                    alt={shown.prompt}
-                    className="max-h-full max-w-full rounded object-contain"
-                  />
-                )}
-              </button>
+              <div className="absolute inset-0">
+                <button
+                  type="button"
+                  className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
+                  title={t("Studio.result.expand")}
+                  aria-label={t("Studio.result.expand")}
+                  onClick={() => setLightbox(shown)}
+                >
+                  {shown.mediaType.startsWith("video/") ? (
+                    <video
+                      controls
+                      loop
+                      src={previews[shown.artifactId]}
+                      className="max-h-full max-w-full rounded bg-black object-contain"
+                    />
+                  ) : (
+                    <img
+                      src={previews[shown.artifactId]}
+                      alt={shown.prompt}
+                      className="max-h-full max-w-full rounded object-contain"
+                    />
+                  )}
+                </button>
+                <div className="absolute right-2 top-2 z-10 flex gap-1.5">
+                  {selected && editTaskFor(selected) && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.result.edit")}
+                      title={t("Studio.result.edit")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void editEntry(shown);
+                      }}
+                    >
+                      <Wand2 size={14} />
+                    </IconButton>
+                  )}
+                  <IconButton
+                    size="sm"
+                    variant="secondary"
+                    aria-label={t("Studio.result.save")}
+                    title={t("Studio.result.save")}
+                    disabled={savingEntryId === shown.entryId}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void saveEntry(shown);
+                    }}
+                  >
+                    {savingEntryId === shown.entryId ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <Download size={14} />
+                    )}
+                  </IconButton>
+                  <IconButton
+                    size="sm"
+                    variant="danger"
+                    aria-label={t("Studio.result.delete")}
+                    title={t("Studio.result.delete")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void removeEntry(shown);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </IconButton>
+                </div>
+              </div>
             )}
           </div>
 
@@ -2422,14 +2497,15 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   {t("Studio.result.edit")}
                 </Button>
               )}
-              <a
-                className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-muted hover:text-foreground"
-                href={previews[lightbox.artifactId]}
-                download={`${lightbox.entryId}.${extensionFor(lightbox.mediaType)}`}
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={savingEntryId === lightbox.entryId}
+                onClick={() => void saveEntry(lightbox)}
               >
                 <Download size={12} />
                 {t("Studio.result.save")}
-              </a>
+              </Button>
               <Button size="sm" variant="danger" onClick={() => void removeEntry(lightbox)}>
                 <Trash2 size={12} />
                 {t("Studio.result.delete")}
