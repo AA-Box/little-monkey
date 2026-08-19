@@ -52,6 +52,16 @@ const MAX_REF_IMAGES: usize = 8;
 /// A 15 s 2K clip with audio stays far under this; it exists so a runaway
 /// server response can never be buffered without bound.
 const MAX_MEDIA_BYTES: usize = 256 * 1024 * 1024;
+/// A status GET is safe to repeat: it does not mutate the job, and the local
+/// engine can briefly drop a keep-alive connection while a long generation is
+/// still running. Keep the retry window bounded so a dead engine still fails.
+const POLL_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 /// Images one request may ask for. The engine samples a batch serially, so a
 /// large count is a long run rather than a parallel one; this keeps a
 /// mistyped number from turning into an hour of sampling.
@@ -2438,9 +2448,21 @@ pub async fn poll_job(
     base_url: &str,
     job_id: &str,
 ) -> Result<JobProgress, String> {
-    let response = crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}")))
-        .await
-        .map_err(|error| format!("Poll generation job: {error}"))?;
+    let mut retries = POLL_RETRY_DELAYS.iter();
+    let response = loop {
+        match crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))).await {
+            Ok(response) => break response,
+            Err(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
+                let Some(delay) = retries.next() else {
+                    return Err(format!("Poll generation job: {error}"));
+                };
+                // The job remains in the engine, so retrying this read cannot
+                // submit duplicate work or lose a completed result.
+                tokio::time::sleep(*delay).await;
+            }
+            Err(error) => return Err(format!("Poll generation job: {error}")),
+        }
+    };
     if !response.status().is_success() {
         return Err(format!(
             "Generation job {job_id} is no longer available ({})",
@@ -4068,6 +4090,45 @@ mod tests {
         }))
         .is_err());
         assert!(decode_job_status(&json!({"status": "invented"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn poll_job_retries_transient_transport_error() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let body = r#"{"status":"queued","queue_position":0}"#;
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let progress = poll_job(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "job-test",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            progress,
+            JobProgress::Running {
+                queue_position: 0,
+                progress: None,
+            }
+        );
+        server.join().unwrap();
     }
 
     /// A batch is an image-only idea, and only travels when it is asked for.
