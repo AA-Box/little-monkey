@@ -40,6 +40,7 @@ export interface DictationErrorEvent {
 }
 
 export interface DictationStartOptions {
+  sessionId: string;
   language: string | null;
   requireOnDevice: boolean;
 }
@@ -53,12 +54,20 @@ const PARTIAL_EVENT = "dictation://partial";
 const FINAL_EVENT = "dictation://final";
 const ERROR_EVENT = "dictation://error";
 
+export function createDictationSessionId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `dictation-${crypto.randomUUID()}`;
+  }
+  return `dictation-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export type DictationUnlisten = UnlistenFn;
 
 export const dictationClient = {
   capabilities: () => invoke<DictationCapabilities>("dictation_capabilities"),
   start: (options: DictationStartOptions) =>
     invoke<DictationStartResult>("dictation_start", {
+      sessionId: options.sessionId,
       language: options.language,
       requireOnDevice: options.requireOnDevice,
     }),

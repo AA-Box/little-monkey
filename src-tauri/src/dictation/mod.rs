@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
-use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -94,7 +93,8 @@ pub type NativeCallback = Arc<dyn Fn(NativeEvent) + Send + Sync + 'static>;
 /// Native backends may report an immediate startup failure on their worker
 /// thread. Hold those events until the application has published the session
 /// in `DictationRuntime`, so an error cannot arrive before the frontend knows
-/// which session it belongs to.
+/// which session it belongs to. The frontend owns the session ID, so it can
+/// publish its insertion state before calling the native start command.
 struct EventGate {
     pending: Mutex<Option<Vec<NativeEvent>>>,
 }
@@ -184,6 +184,16 @@ fn ensure_main_window(window: &tauri::Window) -> Result<(), String> {
     } else {
         Err("Composer dictation is available only in the main window".to_string())
     }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.trim().is_empty()
+        || session_id.len() > 128
+        || session_id.chars().any(char::is_control)
+    {
+        return Err("Invalid dictation session id".to_string());
+    }
+    Ok(())
 }
 
 fn emit_native_event(app: &tauri::AppHandle, event: NativeEvent) {
@@ -279,6 +289,7 @@ pub fn dictation_capabilities(window: tauri::Window) -> Result<DictationCapabili
 pub fn dictation_start(
     window: tauri::Window,
     runtime: tauri::State<'_, DictationRuntime>,
+    session_id: String,
     language: Option<String>,
     require_on_device: bool,
 ) -> Result<DictationStartResult, String> {
@@ -288,6 +299,7 @@ pub fn dictation_start(
     if !capabilities.supported {
         return Err("Native OS speech recognition is not supported on this platform".to_string());
     }
+    validate_session_id(&session_id)?;
 
     if let Some(previous) = runtime
         .active
@@ -298,7 +310,6 @@ pub fn dictation_start(
         let _ = previous.native.cancel();
     }
 
-    let session_id = format!("dictation-{}", Uuid::new_v4());
     let gate = Arc::new(EventGate::default());
     let callback_gate = Arc::clone(&gate);
     let callback_app = app.clone();
@@ -360,35 +371,18 @@ pub fn shutdown(runtime: &DictationRuntime) {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Lifecycle {
-        Idle,
-        Starting,
-        Listening,
-        Stopping,
-        Finished,
-        Cancelled,
-    }
-
-    fn transition(state: Lifecycle, event: &str) -> Lifecycle {
-        match (state, event) {
-            (Lifecycle::Idle, "start") => Lifecycle::Starting,
-            (Lifecycle::Starting, "listening") => Lifecycle::Listening,
-            (Lifecycle::Starting | Lifecycle::Listening, "stop") => Lifecycle::Stopping,
-            (Lifecycle::Starting | Lifecycle::Listening, "cancel") => Lifecycle::Cancelled,
-            (Lifecycle::Stopping, "idle") => Lifecycle::Finished,
-            (state, _) => state,
-        }
-    }
-
-    fn accepts_event(active_session: Option<&str>, event_session: &str) -> bool {
-        active_session == Some(event_session)
-    }
-
     #[test]
     fn session_ids_are_scoped_and_stale_stop_is_a_noop() {
         let runtime = DictationRuntime::default();
         assert!(take_session(&runtime, "dictation-old").unwrap().is_none());
+    }
+
+    #[test]
+    fn frontend_session_ids_are_validated_before_start() {
+        assert!(validate_session_id("dictation-current").is_ok());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("dictation\ncurrent").is_err());
+        assert!(validate_session_id(&"x".repeat(129)).is_err());
     }
 
     #[test]
@@ -397,31 +391,5 @@ mod tests {
         assert_eq!(PARTIAL_EVENT, "dictation://partial");
         assert_eq!(FINAL_EVENT, "dictation://final");
         assert_eq!(ERROR_EVENT, "dictation://error");
-    }
-
-    #[test]
-    fn lifecycle_accepts_start_stop_cancel_and_ignores_late_transitions() {
-        let listening = transition(transition(Lifecycle::Idle, "start"), "listening");
-        assert_eq!(transition(listening, "stop"), Lifecycle::Stopping);
-        assert_eq!(transition(Lifecycle::Stopping, "idle"), Lifecycle::Finished);
-        assert_eq!(transition(listening, "cancel"), Lifecycle::Cancelled);
-        assert_eq!(
-            transition(Lifecycle::Finished, "listening"),
-            Lifecycle::Finished
-        );
-        assert_eq!(
-            transition(Lifecycle::Cancelled, "idle"),
-            Lifecycle::Cancelled
-        );
-    }
-
-    #[test]
-    fn late_or_wrong_session_events_are_ignored() {
-        assert!(accepts_event(
-            Some("dictation-current"),
-            "dictation-current"
-        ));
-        assert!(!accepts_event(Some("dictation-current"), "dictation-old"));
-        assert!(!accepts_event(None, "dictation-current"));
     }
 }

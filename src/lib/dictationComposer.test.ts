@@ -15,12 +15,12 @@ describe('dictation composer insertion', () => {
     let state = beginDictationInsertion('session-1', 'alpha omega', 6, 6);
     state = withDictationPartial(state, 'beta');
 
-    expect(renderDictationInsertion(state)).toBe('alpha betaomega');
+    expect(renderDictationInsertion(state)).toBe('alpha beta omega');
     expect(caretAfterDictation(state)).toBe(10);
 
     state = commitDictationFinal(state, 'beta');
     expect(dictationInsertedText(state)).toBe('beta');
-    expect(renderDictationInsertion(state)).toBe('alpha betaomega');
+    expect(renderDictationInsertion(state)).toBe('alpha beta omega');
   });
 
   it('replaces a selection without losing text outside that selection', () => {
@@ -31,6 +31,13 @@ describe('dictation composer insertion', () => {
 
     expect(renderDictationInsertion(state)).toBe('say that please');
     expect(caretAfterDictation(state)).toBe(8);
+  });
+
+  it('leaves the original value and selection unchanged when no speech is recognized', () => {
+    const state = beginDictationInsertion('session-empty', 'say this', 4, 8);
+
+    expect(renderDictationInsertion(state)).toBe('say this');
+    expect(caretAfterDictation(state)).toBe(4);
   });
 
   it('replaces a provisional partial instead of appending it', () => {
@@ -47,6 +54,8 @@ describe('dictation composer insertion', () => {
     expect(joinDictationSegments('hello', 'world')).toBe('hello world');
     expect(joinDictationSegments('hello ', 'world')).toBe('hello world');
     expect(joinDictationSegments('hello', ' world')).toBe('hello world');
+    expect(joinDictationSegments('in', 'the login service')).toBe('in the login service');
+    expect(joinDictationSegments('hello', ', world')).toBe('hello, world');
   });
 
   it('clamps an invalid native selection safely', () => {

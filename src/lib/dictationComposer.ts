@@ -31,25 +31,33 @@ export function beginDictationInsertion(
   };
 }
 
-/** Join finalized recognition segments without creating `helloWorld` or gaps. */
+const NO_SPACE_BEFORE = /^[,.;:!?%)\]}]/;
+const NO_SPACE_AFTER = /[([{\/]$/;
+
+/** Join prose at a boundary without duplicating or dropping meaningful spaces. */
 export function joinDictationSegments(left: string, right: string): string {
-  const next = right.trim();
-  if (!left) return next;
-  if (!next) return left;
-  if (/\s$/.test(left)) return `${left}${next}`;
-  return `${left} ${next}`;
+  if (!left || !right) return `${left}${right}`;
+  if (/\s$/.test(left) || /^\s/.test(right)) {
+    if (/\s$/.test(left) && /^\s/.test(right)) return `${left}${right.replace(/^\s+/, "")}`;
+    return `${left}${right}`;
+  }
+  if (NO_SPACE_BEFORE.test(right) || NO_SPACE_AFTER.test(left)) return `${left}${right}`;
+  return `${left} ${right}`;
 }
 
 export function dictationInsertedText(state: DictationInsertionState): string {
-  return `${state.committed}${state.partial}`;
+  return joinDictationSegments(state.committed, state.partial);
 }
 
 export function renderDictationInsertion(state: DictationInsertionState): string {
-  return `${state.prefix}${dictationInsertedText(state)}${state.suffix}`;
+  const inserted = dictationInsertedText(state);
+  if (!inserted) return state.originalValue;
+  return joinDictationSegments(joinDictationSegments(state.prefix, inserted), state.suffix);
 }
 
 export function caretAfterDictation(state: DictationInsertionState): number {
-  return state.prefix.length + dictationInsertedText(state).length;
+  const inserted = dictationInsertedText(state);
+  return inserted ? joinDictationSegments(state.prefix, inserted).length : state.selectionStart;
 }
 
 export function withDictationPartial(

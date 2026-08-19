@@ -82,19 +82,22 @@ function Harness({ initial = 'alpha ', onSettled }: { initial?: string; onSettle
   );
 }
 
-async function startDictation(): Promise<HTMLButtonElement> {
+async function startDictation(): Promise<string> {
   const button = await screen.findByRole('button', { name: 'Start dictation' }) as HTMLButtonElement;
   fireEvent.click(button);
   await screen.findByRole('button', { name: 'Starting dictation' });
-  emit('dictation://state', { sessionId: 'dictation-1', state: 'listening' });
-  const active = await screen.findByRole('button', { name: 'Stop dictation' }) as HTMLButtonElement;
-  return active;
+  await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
+  const startCall = mocks.invoke.mock.calls.find(([command]) => command === 'dictation_start');
+  const sessionId = (startCall?.[1] as { sessionId: string }).sessionId;
+  emit('dictation://state', { sessionId, state: 'listening' });
+  await screen.findByRole('button', { name: 'Stop dictation' });
+  return sessionId;
 }
 
 beforeEach(() => {
   mocks.invoke.mockReset();
   mocks.listeners.clear();
-  mocks.invoke.mockImplementation((command: string) => {
+  mocks.invoke.mockImplementation((command: string, args?: { sessionId?: string }) => {
     if (command === 'dictation_capabilities') {
       return Promise.resolve({
         supported: true,
@@ -106,7 +109,7 @@ beforeEach(() => {
       });
     }
     if (command === 'm7_config_get') return Promise.resolve(CONFIG);
-    if (command === 'dictation_start') return Promise.resolve({ sessionId: 'dictation-1' });
+    if (command === 'dictation_start') return Promise.resolve({ sessionId: args?.sessionId });
     return Promise.resolve(undefined);
   });
 });
@@ -121,15 +124,15 @@ describe('DictationButton', () => {
     render(<Harness />);
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     textarea.setSelectionRange(6, 6);
-    await startDictation();
+    const sessionId = await startDictation();
 
-    emit('dictation://partial', { sessionId: 'dictation-1', text: 'beta wor' });
+    emit('dictation://partial', { sessionId, text: 'beta wor' });
     await waitFor(() => expect(textarea.value).toBe('alpha beta wor'));
     emit('dictation://partial', { sessionId: 'dictation-old', text: 'stale' });
     expect(textarea.value).toBe('alpha beta wor');
 
-    emit('dictation://final', { sessionId: 'dictation-1', text: 'beta world' });
-    emit('dictation://state', { sessionId: 'dictation-1', state: 'idle' });
+    emit('dictation://final', { sessionId, text: 'beta world' });
+    emit('dictation://state', { sessionId, state: 'idle' });
     await waitFor(() => expect((screen.getByRole('button', { name: 'Start dictation' }) as HTMLButtonElement).disabled).toBe(false));
     expect(textarea.value).toBe('alpha beta world');
     expect(textarea.selectionStart).toBe('alpha beta world'.length);
@@ -139,16 +142,17 @@ describe('DictationButton', () => {
     render(<Harness initial="say this" />);
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     textarea.setSelectionRange(4, 8);
-    await startDictation();
+    const sessionId = await startDictation();
 
-    emit('dictation://partial', { sessionId: 'dictation-1', text: 'that' });
+    emit('dictation://partial', { sessionId, text: 'that' });
     await waitFor(() => expect(textarea.value).toBe('say that'));
     fireEvent.keyDown(window, { key: 'Escape' });
 
     await waitFor(() => expect((screen.getByRole('button', { name: 'Start dictation' }) as HTMLButtonElement).disabled).toBe(false));
     expect(textarea.value).toBe('say this');
     await waitFor(() => expect(textarea.selectionStart).toBe(4));
-    expect(mocks.invoke).toHaveBeenCalledWith('dictation_cancel', { sessionId: 'dictation-1' });
+    expect(textarea.selectionEnd).toBe(8);
+    expect(mocks.invoke).toHaveBeenCalledWith('dictation_cancel', { sessionId });
   });
 
   it('settles the final recognition before a caller sends the composer', async () => {
@@ -156,16 +160,94 @@ describe('DictationButton', () => {
     render(<Harness onSettled={(value) => value && settled.push(value)} />);
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-    await startDictation();
+    const sessionId = await startDictation();
 
-    emit('dictation://partial', { sessionId: 'dictation-1', text: 'beta wor' });
+    emit('dictation://partial', { sessionId, text: 'beta wor' });
     await waitFor(() => expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('alpha beta wor'));
     fireEvent.click(screen.getByRole('button', { name: 'Send' }));
     await Promise.resolve();
     expect(settled).toEqual([]);
 
-    emit('dictation://final', { sessionId: 'dictation-1', text: 'beta world' });
-    emit('dictation://state', { sessionId: 'dictation-1', state: 'idle' });
+    emit('dictation://final', { sessionId, text: 'beta world' });
+    emit('dictation://state', { sessionId, state: 'idle' });
     await waitFor(() => expect(settled).toEqual(['alpha beta world']));
+  });
+
+  it('accepts a native listening event before dictation_start resolves', async () => {
+    let resolveStart!: (value: { sessionId: string }) => void;
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'dictation_capabilities') {
+        return Promise.resolve({
+          supported: true,
+          platform: 'macos',
+          engine: 'Apple Speech',
+          supportsPartialResults: true,
+          supportsOnDevice: true,
+          languages: [{ id: 'en-US', label: 'English (US)' }],
+        });
+      }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      if (command === 'dictation_start') {
+        return new Promise((resolve) => {
+          resolveStart = resolve as (value: { sessionId: string }) => void;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+    await screen.findByRole('button', { name: 'Starting dictation' });
+    await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
+    const startCall = mocks.invoke.mock.calls.find(([command]) => command === 'dictation_start');
+    const sessionId = (startCall?.[1] as { sessionId: string }).sessionId;
+
+    emit('dictation://state', { sessionId, state: 'listening' });
+    await screen.findByRole('button', { name: 'Stop dictation' });
+
+    resolveStart({ sessionId });
+  });
+
+  it('waits for startup to finish before settling Send', async () => {
+    let resolveStart!: (value: { sessionId: string }) => void;
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'dictation_capabilities') {
+        return Promise.resolve({
+          supported: true,
+          platform: 'macos',
+          engine: 'Apple Speech',
+          supportsPartialResults: true,
+          supportsOnDevice: true,
+          languages: [{ id: 'en-US', label: 'English (US)' }],
+        });
+      }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      if (command === 'dictation_start') {
+        return new Promise((resolve) => {
+          resolveStart = resolve as (value: { sessionId: string }) => void;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const settled: string[] = [];
+    render(<Harness onSettled={(value) => value && settled.push(value)} />);
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+    await screen.findByRole('button', { name: 'Starting dictation' });
+    await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
+    const startCall = mocks.invoke.mock.calls.find(([command]) => command === 'dictation_start');
+    const sessionId = (startCall?.[1] as { sessionId: string }).sessionId;
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await Promise.resolve();
+    expect(settled).toEqual([]);
+
+    resolveStart({ sessionId });
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith('dictation_stop', { sessionId }));
+    emit('dictation://final', { sessionId, text: 'hello' });
+    emit('dictation://state', { sessionId, state: 'idle' });
+    await waitFor(() => expect(settled).toEqual(['alpha hello']));
   });
 });

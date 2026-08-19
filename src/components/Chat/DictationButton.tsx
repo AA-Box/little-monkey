@@ -7,11 +7,13 @@ import {
   beginDictationInsertion,
   caretAfterDictation,
   commitDictationFinal,
+  dictationInsertedText,
   renderDictationInsertion,
   withDictationPartial,
   type DictationInsertionState,
 } from "../../lib/dictationComposer";
 import {
+  createDictationSessionId,
   dictationClient,
   type DictationCapabilities,
   type DictationState,
@@ -31,6 +33,13 @@ interface SettleWaiter {
   reject: (reason: unknown) => void;
 }
 
+interface PendingStart {
+  selectionStart: number;
+  selectionEnd: number;
+  sessionId: string;
+  settleRequested: boolean;
+}
+
 export interface DictationButtonHandle {
   isActive: () => boolean;
   settleForSend: () => Promise<string | null>;
@@ -45,11 +54,15 @@ export interface DictationButtonProps {
   disabled?: boolean;
 }
 
-function focusTextarea(textareaRef: RefObject<HTMLTextAreaElement | null>, caret: number): void {
+function focusTextarea(
+  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  selectionStart: number,
+  selectionEnd = selectionStart,
+): void {
   const textarea = textareaRef.current;
   if (!textarea) return;
   textarea.focus();
-  textarea.setSelectionRange(caret, caret);
+  textarea.setSelectionRange(selectionStart, selectionEnd);
 }
 
 export const DictationButton = forwardRef<DictationButtonHandle, DictationButtonProps>(function DictationButton(
@@ -62,14 +75,9 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   const [capabilities, setCapabilities] = useState<DictationCapabilities | null>(null);
   const [capabilityError, setCapabilityError] = useState<string | null>(null);
   const [active, setActive] = useState<ActiveDictation | null>(null);
-  const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRef = useRef<ActiveDictation | null>(null);
-  const pendingStartRef = useRef<{
-    value: string;
-    selectionStart: number;
-    selectionEnd: number;
-  } | null>(null);
+  const pendingStartRef = useRef<PendingStart | null>(null);
   const mountedRef = useRef(true);
   const listenersReadyRef = useRef<Promise<void> | null>(null);
   const unlistenRef = useRef<DictationUnlisten[]>([]);
@@ -96,11 +104,24 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const finishActive = useCallback((session: ActiveDictation) => {
-    const finalValue = renderDictationInsertion(session.insertion);
+    const hasInsertedText = Boolean(dictationInsertedText(session.insertion));
+    const finalValue = hasInsertedText ? renderDictationInsertion(session.insertion) : session.insertion.originalValue;
+    if (pendingStartRef.current?.sessionId === session.insertion.sessionId) {
+      pendingStartRef.current = null;
+    }
     setActiveSession(null);
     updateComposer(session.insertion);
     requestAnimationFrame(() => {
-      focusTextarea(textareaRef, caretAfterDictation(session.insertion));
+      if (hasInsertedText) {
+        const caret = caretAfterDictation(session.insertion);
+        focusTextarea(textareaRef, caret);
+      } else {
+        focusTextarea(
+          textareaRef,
+          session.insertion.selectionStart,
+          session.insertion.selectionEnd,
+        );
+      }
       resizeTextarea?.();
     });
     resolveWaiters(finalValue);
@@ -112,11 +133,18 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       setError(errorMessage(reason));
       return;
     }
+    if (pendingStartRef.current?.sessionId === session.insertion.sessionId) {
+      pendingStartRef.current = null;
+    }
     setActiveSession(null);
     if (restore) {
       onChange(session.insertion.originalValue);
       resizeTextarea?.();
-      requestAnimationFrame(() => focusTextarea(textareaRef, session.insertion.selectionStart));
+      requestAnimationFrame(() => focusTextarea(
+        textareaRef,
+        session.insertion.selectionStart,
+        session.insertion.selectionEnd,
+      ));
     }
     const message = errorMessage(reason);
     setError(message);
@@ -127,11 +155,18 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   const cancelActive = useCallback((restore: boolean) => {
     const session = activeRef.current;
     if (!session) return Promise.resolve();
+    if (pendingStartRef.current?.sessionId === session.insertion.sessionId) {
+      pendingStartRef.current = null;
+    }
     setActiveSession(null);
     if (restore) {
       onChange(session.insertion.originalValue);
       resizeTextarea?.();
-      requestAnimationFrame(() => focusTextarea(textareaRef, session.insertion.selectionStart));
+      requestAnimationFrame(() => focusTextarea(
+        textareaRef,
+        session.insertion.selectionStart,
+        session.insertion.selectionEnd,
+      ));
     }
     rejectWaiters(new Error(t("DictationButton.cancelled")));
     return dictationClient.cancel(session.insertion.sessionId).catch((reason) => {
@@ -151,10 +186,16 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
     settleForSend: () => {
       const session = activeRef.current;
       if (!session) return Promise.resolve(null);
+      const pendingStart = pendingStartRef.current;
+      if (pendingStart?.sessionId === session.insertion.sessionId) {
+        pendingStart.settleRequested = true;
+      }
       setActiveSession({ ...session, phase: "stopping" });
       return new Promise<string>((resolve, reject) => {
         settleWaitersRef.current.push({ resolve, reject });
-        void dictationClient.stop(session.insertion.sessionId).catch((reason) => failActive(reason));
+        if (!pendingStart || pendingStart.sessionId !== session.insertion.sessionId) {
+          void dictationClient.stop(session.insertion.sessionId).catch((reason) => failActive(reason));
+        }
       });
     },
   }), [failActive, setActiveSession]);
@@ -189,7 +230,10 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
             finishActive(current);
             return;
           }
-          setActiveSession({ ...current, phase: event.state });
+          setActiveSession({
+            ...current,
+            phase: current.phase === "stopping" ? "stopping" : event.state,
+          });
         }),
         dictationClient.onPartial((event) => {
           const current = activeRef.current;
@@ -232,12 +276,15 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
     const onManualInput = () => {
       const current = activeRef.current;
       if (!current) {
-        // A click can be awaiting the OS permission/configuration prompt. Do
-        // not let that in-flight start overwrite text the user typed meanwhile.
+        // A start can still be awaiting the OS permission/configuration prompt.
+        // Do not let that in-flight start overwrite text the user typed meanwhile.
         pendingStartRef.current = null;
         return;
       }
       const editedValue = textarea.value;
+      if (pendingStartRef.current?.sessionId === current.insertion.sessionId) {
+        pendingStartRef.current = null;
+      }
       setActiveSession(null);
       setError(null);
       void dictationClient.cancel(current.insertion.sessionId).catch(() => undefined);
@@ -263,7 +310,6 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       const current = activeRef.current;
       activeRef.current = null;
       pendingStartRef.current = null;
-      setStarting(false);
       setActive(null);
       if (current) void dictationClient.cancel(current.insertion.sessionId).catch(() => undefined);
       rejectWaiters(new Error(tRef.current("DictationButton.unmounted")));
@@ -274,46 +320,63 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
     mountedRef.current = false;
   }, []);
 
-  const start = useCallback(async () => {
+  const start = useCallback(() => {
     if (disabled || !capabilities?.supported || activeRef.current || pendingStartRef.current) return;
     const textarea = textareaRef.current;
     const selectionStart = textarea?.selectionStart ?? value.length;
     const selectionEnd = textarea?.selectionEnd ?? selectionStart;
-    const snapshot = { value, selectionStart, selectionEnd };
-    pendingStartRef.current = snapshot;
-    setStarting(true);
+    const sessionId = createDictationSessionId();
+    const pendingStart: PendingStart = {
+      selectionStart,
+      selectionEnd,
+      sessionId,
+      settleRequested: false,
+    };
+    pendingStartRef.current = pendingStart;
+    setActiveSession({
+      insertion: beginDictationInsertion(sessionId, value, selectionStart, selectionEnd),
+      phase: "starting",
+    });
     setError(null);
-    try {
-      await (listenersReadyRef.current ?? Promise.resolve());
-      const config = await companionClient.config();
-      const started = await dictationClient.start({
-        language: config.voice.dictationLanguage,
-        requireOnDevice: capabilities.platform === "macos" && config.voice.dictationRequireOnDevice,
-      });
-      if (!mountedRef.current || pendingStartRef.current !== snapshot) {
-        void dictationClient.cancel(started.sessionId).catch(() => undefined);
-        return;
+    void (async () => {
+      try {
+        await (listenersReadyRef.current ?? Promise.resolve());
+        if (pendingStartRef.current !== pendingStart) return;
+        const config = await companionClient.config();
+        if (pendingStartRef.current !== pendingStart) return;
+        const started = await dictationClient.start({
+          sessionId,
+          language: config.voice.dictationLanguage,
+          requireOnDevice: capabilities.platform === "macos" && config.voice.dictationRequireOnDevice,
+        });
+        if (!mountedRef.current || pendingStartRef.current !== pendingStart) {
+          void dictationClient.cancel(started.sessionId).catch(() => undefined);
+          return;
+        }
+        if (started.sessionId !== sessionId) {
+          void dictationClient.cancel(started.sessionId).catch(() => undefined);
+          throw new Error("Native dictation returned a mismatched session id");
+        }
+        pendingStartRef.current = null;
+        if (pendingStart.settleRequested) {
+          const current = activeRef.current;
+          if (current?.insertion.sessionId === sessionId) {
+            setActiveSession({ ...current, phase: "stopping" });
+            await dictationClient.stop(sessionId);
+          }
+        }
+      } catch (reason) {
+        if (mountedRef.current && activeRef.current?.insertion.sessionId === sessionId) {
+          failActive(reason);
+        }
+      } finally {
+        if (pendingStartRef.current === pendingStart) pendingStartRef.current = null;
       }
-      const insertion = beginDictationInsertion(
-        started.sessionId,
-        snapshot.value,
-        snapshot.selectionStart,
-        snapshot.selectionEnd,
-      );
-      setActiveSession({ insertion, phase: "starting" });
-    } catch (reason) {
-      if (mountedRef.current && pendingStartRef.current === snapshot) {
-        setError(errorMessage(reason));
-        requestAnimationFrame(() => focusTextarea(textareaRef, snapshot.value.length));
-      }
-    } finally {
-      if (pendingStartRef.current === snapshot) pendingStartRef.current = null;
-      if (mountedRef.current) setStarting(false);
-    }
-  }, [capabilities, disabled, setActiveSession, textareaRef, value]);
+    })();
+  }, [capabilities, disabled, failActive, setActiveSession, textareaRef, value]);
 
   const isActive = active !== null;
-  const isStarting = starting || active?.phase === "starting";
+  const isStarting = active?.phase === "starting";
   const unavailable = capabilityError ?? (!capabilities?.supported ? t("DictationButton.unavailable") : null);
   const tooltipText = error ?? unavailable ?? (isStarting ? t("DictationButton.starting") : isActive ? t("DictationButton.stop") : t("DictationButton.dictate"));
   const ariaLabel = isActive ? t("DictationButton.stop") : t("DictationButton.startAriaLabel");

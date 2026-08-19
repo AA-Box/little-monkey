@@ -29,10 +29,12 @@ static const char *lm_utf8(NSString *value) {
 @property(nonatomic, strong) AVAudioEngine *audioEngine;
 @property(nonatomic, strong) AVAudioInputNode *inputNode;
 @property(nonatomic, strong) dispatch_queue_t callbackQueue;
-@property(nonatomic, copy) NSString *latestText;
+@property(nonatomic) dispatch_semaphore_t stopSemaphore;
 @property(nonatomic) BOOL stopped;
 @property(nonatomic) BOOL stopping;
 - (void)failWithCode:(NSString *)code message:(NSString *)message;
+- (void)finishStoppingWithError:(NSString *)message;
+- (void)cancelRecognitionTask;
 @end
 
 @implementation LMDictationSession
@@ -56,26 +58,29 @@ static const char *lm_utf8(NSString *value) {
     [self emitState:@"starting"];
     __weak LMDictationSession *weakSelf = self;
     [SFSpeechRecognizer requestAuthorization:^(SFSpeechRecognizerAuthorizationStatus status) {
-        dispatch_async(weakSelf.callbackQueue, ^{
-            LMDictationSession *strongSelf = weakSelf;
-            if (!strongSelf || strongSelf.stopped) return;
+        LMDictationSession *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        dispatch_queue_t callbackQueue = strongSelf.callbackQueue;
+        dispatch_async(callbackQueue, ^{
+            if (strongSelf.stopped) return;
             if (status != SFSpeechRecognizerAuthorizationStatusAuthorized) {
                 NSString *message = status == SFSpeechRecognizerAuthorizationStatusDenied
                     ? @"Speech recognition permission is disabled."
                     : @"Speech recognition permission is required for composer dictation.";
-                [strongSelf emitError:@"speech_permission_denied" message:message];
-                strongSelf.stopped = YES;
+                [strongSelf failWithCode:@"speech_permission_denied" message:message];
                 return;
             }
             [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
-                dispatch_async(strongSelf.callbackQueue, ^{
-                    if (strongSelf.stopped) return;
+                LMDictationSession *microphoneSelf = strongSelf;
+                if (!microphoneSelf) return;
+                dispatch_queue_t microphoneQueue = microphoneSelf.callbackQueue;
+                dispatch_async(microphoneQueue, ^{
+                    if (microphoneSelf.stopped) return;
                     if (!granted) {
-                        [strongSelf emitError:@"microphone_permission_denied" message:@"Microphone access is disabled."];
-                        strongSelf.stopped = YES;
+                        [microphoneSelf failWithCode:@"microphone_permission_denied" message:@"Microphone access is disabled."];
                         return;
                     }
-                    [strongSelf beginRecognition];
+                    [microphoneSelf beginRecognition];
                 });
             }];
         });
@@ -101,21 +106,30 @@ static const char *lm_utf8(NSString *value) {
 
     __weak LMDictationSession *weakSelf = self;
     self.task = [self.recognizer recognitionTaskWithRequest:self.request resultHandler:^(SFSpeechRecognitionResult *result, NSError *error) {
-        dispatch_async(weakSelf.callbackQueue, ^{
-            LMDictationSession *strongSelf = weakSelf;
-            if (!strongSelf || strongSelf.stopped) return;
+        LMDictationSession *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        dispatch_queue_t callbackQueue = strongSelf.callbackQueue;
+        dispatch_async(callbackQueue, ^{
+            if (strongSelf.stopped) return;
+            BOOL isFinalResult = NO;
             if (result) {
                 NSString *text = result.bestTranscription.formattedString ?: @"";
                 if (result.isFinal) {
-                    strongSelf.latestText = @"";
+                    isFinalResult = YES;
                     [strongSelf emitKind:"final" text:text code:strongSelf.sessionId message:@""];
                 } else {
-                    strongSelf.latestText = text;
                     [strongSelf emitKind:"partial" text:text code:strongSelf.sessionId message:@""];
                 }
             }
             if (error) {
-                [strongSelf failWithCode:@"recognition_failed" message:error.localizedDescription ?: @"Speech recognition failed."];
+                NSString *message = error.localizedDescription ?: @"Speech recognition failed.";
+                if (strongSelf.stopping) {
+                    [strongSelf finishStoppingWithError:message];
+                } else {
+                    [strongSelf failWithCode:@"recognition_failed" message:message];
+                }
+            } else if (isFinalResult && strongSelf.stopping) {
+                [strongSelf finishStoppingWithError:nil];
             }
         });
     }];
@@ -128,7 +142,9 @@ static const char *lm_utf8(NSString *value) {
     }
     [self.inputNode installTapOnBus:0 bufferSize:1024 format:format block:^(AVAudioPCMBuffer *buffer, AVAudioTime *_when) {
         (void)_when;
-        if (!weakSelf.stopped) [weakSelf.request appendAudioPCMBuffer:buffer];
+        LMDictationSession *strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.stopped) return;
+        [strongSelf.request appendAudioPCMBuffer:buffer];
     }];
     [self.audioEngine prepare];
     NSError *startError = nil;
@@ -145,6 +161,9 @@ static const char *lm_utf8(NSString *value) {
     }
     [self.audioEngine stop];
     [self.request endAudio];
+}
+
+- (void)cancelRecognitionTask {
     [self.task cancel];
     self.task = nil;
     self.request = nil;
@@ -154,25 +173,50 @@ static const char *lm_utf8(NSString *value) {
     if (self.stopped) return;
     [self removeAudio];
     self.stopped = YES;
+    [self cancelRecognitionTask];
     [self emitError:code message:message];
     [self emitState:@"idle"];
 }
 
+- (void)finishStoppingWithError:(NSString *)message {
+    @synchronized (self) {
+        if (self.stopped) return;
+        if (message.length > 0) {
+            [self emitError:@"recognition_failed" message:message];
+        }
+        self.stopped = YES;
+        [self cancelRecognitionTask];
+        [self emitState:@"idle"];
+        dispatch_semaphore_signal(self.stopSemaphore);
+    }
+}
+
 - (void)stop {
+    BOOL shouldWaitForRecognition = NO;
     @synchronized (self) {
         if (self.stopped || self.stopping) return;
         self.stopping = YES;
         [self emitState:@"stopping"];
         [self removeAudio];
-    }
-    dispatch_sync(self.callbackQueue, ^{});
-    @synchronized (self) {
-        if (self.latestText.length > 0) {
-            [self emitKind:"final" text:self.latestText code:self.sessionId message:@""];
+        shouldWaitForRecognition = self.task != nil;
+        if (!shouldWaitForRecognition) {
+            self.stopped = YES;
+            [self emitState:@"idle"];
         }
-        self.latestText = @"";
-        self.stopped = YES;
-        [self emitState:@"idle"];
+    }
+    if (!shouldWaitForRecognition) return;
+
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC));
+    if (dispatch_semaphore_wait(self.stopSemaphore, deadline) != 0) {
+        @synchronized (self) {
+            if (!self.stopped) {
+                self.stopped = YES;
+                [self cancelRecognitionTask];
+                [self emitError:@"recognition_timeout" message:@"Speech recognition did not finish before stopping."];
+                [self emitState:@"idle"];
+            }
+        }
+        dispatch_sync(self.callbackQueue, ^{});
     }
 }
 
@@ -185,6 +229,7 @@ static const char *lm_utf8(NSString *value) {
         self.stopping = YES;
         self.stopped = YES;
         [self removeAudio];
+        [self cancelRecognitionTask];
     }
     dispatch_sync(self.callbackQueue, ^{});
     [self emitState:@"idle"];
@@ -217,7 +262,7 @@ int little_monkey_dictation_macos_start(
         session.recognizer = recognizer;
         session.audioEngine = [[AVAudioEngine alloc] init];
         session.callbackQueue = dispatch_queue_create("com.littlemonkey.dictation", DISPATCH_QUEUE_SERIAL);
-        session.latestText = @"";
+        session.stopSemaphore = dispatch_semaphore_create(0);
         *out_session = (__bridge_retained void *)session;
         [session begin];
         return 0;
