@@ -87,11 +87,31 @@ afterEach(() => {
 });
 
 describe("ChatSessionList across environments", () => {
-  it("shows the working state beside the animated marker", () => {
-    useSessionStore.setState({ runningTurns: { "local-1": true }, turnOutcomes: {} });
+  it("renders the four session marker states without text badges", () => {
+    useSessionStore.setState({
+      sessions: [
+        session(),
+        session({ id: "done", title: "Done" }),
+        session({ id: "error", title: "Error" }),
+        session({ id: "idle", title: "Idle" }),
+      ],
+      activeSessionId: "local-1",
+      runningTurns: { "local-1": true },
+      turnOutcomes: { done: "done", error: "error" },
+    });
     render(<ChatSessionList />);
 
-    expect(screen.getByText("Working")).toBeTruthy();
+    const working = screen.getByRole("img", { name: "Working" });
+    expect(working.querySelector(".animate-pulse")).toBeTruthy();
+
+    const finished = screen.getByRole("img", { name: "Finished" });
+    expect(finished.querySelector(".bg-accent")).toBeTruthy();
+    expect(finished.querySelector(".animate-pulse")).toBeNull();
+
+    const idle = screen.getByRole("img", { name: "Idle" });
+    expect(idle.querySelector(".border-faint")).toBeTruthy();
+
+    expect(screen.getByRole("img", { name: "Failed" }).querySelector("svg")).toBeTruthy();
   });
 
   it("lists a conversation the daemon owns beside the local sessions", async () => {
