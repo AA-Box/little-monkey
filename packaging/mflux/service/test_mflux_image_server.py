@@ -27,11 +27,13 @@ class FakeModel:
     def __init__(self, started, delay):
         self.callbacks = FakeRegistry()
         self.calls = 0
+        self.seeds = []
         self.started = started
         self.delay = delay
 
     def generate_image(self, **kwargs):
         self.calls += 1
+        self.seeds.append(kwargs["seed"])
         self.started.set()
         steps = kwargs["num_inference_steps"]
         for step in range(steps):
@@ -102,11 +104,30 @@ class MfluxServiceTest(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(len(result["result"]["images"]), 1)
         self.assertEqual(result["result"]["output_format"], "png")
+        self.assertEqual(result["progress"]["total"], 2)
+        self.assertNotIn("total_steps", result["progress"])
         status, created = self.request("POST", "/sdcpp/v1/img_gen", request)
         self.assertEqual(status, 202)
         self.assertEqual(self.wait_for(created["id"])["status"], "completed")
         self.assertEqual(len(self.models), 1)
         self.assertEqual(self.models[0].calls, 2)
+
+    def test_fixed_seed_advances_across_batch(self):
+        status, created = self.request(
+            "POST",
+            "/sdcpp/v1/img_gen",
+            {
+                "prompt": "one",
+                "seed": 100,
+                "batch_count": 4,
+                "sample_params": {"sample_steps": 1},
+            },
+        )
+        self.assertEqual(status, 202)
+        result = self.wait_for(created["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(result["result"]["images"]), 4)
+        self.assertEqual(self.models[0].seeds, [100, 101, 102, 103])
 
     def test_negative_prompt_is_rejected(self):
         status, payload = self.request(

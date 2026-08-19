@@ -491,6 +491,18 @@ pub struct GenerationModelSpec {
     pub quantization_bits: Option<u8>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelSourceMarker {
+    repo: String,
+    revision: String,
+}
+
+pub(crate) const MODEL_SOURCE_MARKER_FILE: &str = ".little-monkey-source.json";
+
+fn effective_model_revision(revision: Option<&str>) -> &str {
+    revision.unwrap_or("main")
+}
+
 impl GenerationModelSpec {
     pub fn total_bytes(&self) -> u64 {
         self.components.iter().map(|entry| entry.size_bytes).sum()
@@ -509,11 +521,32 @@ impl GenerationModelSpec {
     pub fn model_source_installed(&self, model_root: &Path) -> bool {
         match (&self.source, self.model_source_path(model_root)) {
             (ModelSource::HuggingFaceRepo { .. }, Some(path)) => {
-                path.is_dir() && path.join(".little-monkey-source.json").is_file()
+                path.is_dir() && self.model_source_marker_matches(model_root)
             }
             (ModelSource::LocalDirectory { .. }, Some(path)) => path.is_dir(),
             _ => false,
         }
+    }
+
+    /// A completion marker is part of the source identity, not just a flag
+    /// saying that some files once arrived. A model id can be edited in place
+    /// to point at a different repository or revision, so accepting any old
+    /// marker would launch stale weights under the new name.
+    pub fn model_source_marker_matches(&self, model_root: &Path) -> bool {
+        let ModelSource::HuggingFaceRepo { repo, revision } = &self.source else {
+            return false;
+        };
+        let Some(path) = self.model_source_path(model_root) else {
+            return false;
+        };
+        let marker = path.join(MODEL_SOURCE_MARKER_FILE);
+        let Ok(bytes) = std::fs::read(marker) else {
+            return false;
+        };
+        let Ok(found) = serde_json::from_slice::<ModelSourceMarker>(&bytes) else {
+            return false;
+        };
+        found.repo == *repo && found.revision == effective_model_revision(revision.as_deref())
     }
 
     pub fn supports(&self, task: GenerationTask) -> bool {
@@ -3380,9 +3413,14 @@ mod tests {
         let spec = mflux_model();
         validate_model_spec(&spec).unwrap();
         let args = launch_args(&spec, Path::new("/models"), 4312);
-        assert!(args.windows(2).any(|pair| {
-            pair[0] == "--model-path" && pair[1] == "/models/flux-dev/model-source"
-        }));
+        let expected_model_path = Path::new("/models")
+            .join("flux-dev")
+            .join("model-source")
+            .to_string_lossy()
+            .to_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair[0] == "--model-path" && pair[1] == expected_model_path }));
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--quantize" && pair[1] == "8"));
@@ -3409,6 +3447,97 @@ mod tests {
         assert_eq!(body["negative_prompt"], Value::Null);
         assert!(body["sample_params"].get("sample_method").is_none());
         assert_eq!(body["sample_params"]["sample_steps"], json!(20));
+    }
+
+    #[test]
+    fn mflux_source_installation_requires_the_current_source_marker() {
+        let spec = mflux_model();
+        let root = std::env::temp_dir().join(format!(
+            "little-monkey-mflux-source-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = spec.model_source_path(&root).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        std::fs::write(
+            source.join(MODEL_SOURCE_MARKER_FILE),
+            serde_json::to_vec(&json!({
+                "repo": "someone/else",
+                "revision": "main",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!spec.model_source_installed(&root));
+
+        std::fs::write(
+            source.join(MODEL_SOURCE_MARKER_FILE),
+            serde_json::to_vec(&json!({
+                "repo": "black-forest-labs/FLUX.1-dev",
+                "revision": "a-different-revision",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!spec.model_source_installed(&root));
+
+        std::fs::write(
+            source.join(MODEL_SOURCE_MARKER_FILE),
+            serde_json::to_vec(&json!({
+                "repo": "black-forest-labs/FLUX.1-dev",
+                "revision": "main",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(spec.model_source_installed(&root));
+
+        let mut different_revision = spec.clone();
+        if let ModelSource::HuggingFaceRepo { revision, .. } = &mut different_revision.source {
+            *revision = Some("refs/changes/1".to_string());
+        }
+        assert!(!different_revision.model_source_installed(&root));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mflux_download_install_and_startup_share_one_source_directory() {
+        let spec = mflux_model();
+        let models_root = std::env::temp_dir().join(format!(
+            "little-monkey-mflux-path-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let model_dir = models_root.join(&spec.id);
+        let download_destination = spec.model_source_path(&models_root).unwrap();
+
+        assert_eq!(
+            download_destination,
+            model_dir.join("model-source"),
+            "the downloader must not append the model id twice"
+        );
+
+        std::fs::create_dir_all(&download_destination).unwrap();
+        std::fs::write(
+            download_destination.join(MODEL_SOURCE_MARKER_FILE),
+            serde_json::to_vec(&json!({
+                "repo": "black-forest-labs/FLUX.1-dev",
+                "revision": "main",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(spec.model_source_installed(&models_root));
+
+        let args = launch_args(&spec, &models_root, 4312);
+        let launch_destination = args
+            .windows(2)
+            .find(|pair| pair[0] == "--model-path")
+            .map(|pair| PathBuf::from(&pair[1]))
+            .expect("MFLUX startup must pass a model source path");
+        assert_eq!(launch_destination, download_destination);
+
+        let _ = std::fs::remove_dir_all(models_root);
     }
 
     fn local_component(slot: ComponentSlot, name: &str) -> ModelComponent {
