@@ -2452,7 +2452,11 @@ pub async fn poll_job(
     let response = loop {
         match crate::egress::send(client.get(format!("{base_url}/sdcpp/v1/jobs/{job_id}"))).await {
             Ok(response) => break response,
-            Err(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
+            // Polling is an idempotent GET. Reqwest classifies a malformed or
+            // prematurely closed response differently on different hosts, so
+            // retry every pre-response transport failure except errors that
+            // describe the request itself or an explicit redirect/status rule.
+            Err(error) if !error.is_builder() && !error.is_redirect() && !error.is_status() => {
                 let Some(delay) = retries.next() else {
                     return Err(format!("Poll generation job: {error}"));
                 };
