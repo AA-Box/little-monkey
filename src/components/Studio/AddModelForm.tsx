@@ -105,7 +105,7 @@ function componentPath(component: ModelComponent | undefined): string {
 }
 
 /**
- * Adds a model to the user's library.
+ * Adds a model to the user's library or edits an existing library entry.
  *
  * The first file named says most of what the entry needs: its name, its
  * architecture family, and — through that family — what it can make and how it
@@ -113,9 +113,16 @@ function componentPath(component: ModelComponent | undefined): string {
  * because these guesses are cheap to correct on screen and expensive to
  * discover wrong several minutes into a load.
  */
-export function AddModelForm({ onSaved }: { onSaved: () => void }) {
+interface AddModelFormProps {
+  onSaved: () => void;
+  /** When present, the form edits this library entry rather than creating one. */
+  initialSpec?: GenerationModelSpec;
+  editing?: boolean;
+}
+
+export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModelFormProps) {
   const { t } = useT();
-  const [spec, setSpec] = useState<GenerationModelSpec>(emptyModelSpec);
+  const [spec, setSpec] = useState<GenerationModelSpec>(() => initialSpec ?? emptyModelSpec());
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [huggingFaceToken, setHuggingFaceToken] = useState("");
@@ -182,7 +189,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
 
   return (
     <div className="grid gap-3 rounded border border-border p-3">
-      <p className="text-xs font-medium">{t("Studio.add.title")}</p>
+      <p className="text-xs font-medium">{t(editing ? "Studio.add.editTitle" : "Studio.add.title")}</p>
       <p className="text-[11px] text-faint">{t("Studio.add.slotHint")}</p>
       {spec.tasks.includes("text_to_speech") && (
         <p className="text-[11px] text-faint">{t("Studio.add.speechHint")}</p>
@@ -525,7 +532,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         }
         onClick={() => void save()}
       >
-        {t("Studio.add.save")}
+        {t(editing ? "Studio.add.saveChanges" : "Studio.add.save")}
       </Button>
     </div>
   );

@@ -228,7 +228,18 @@ function localTarget(model: ModelInfo): LocalModelTargetSnapshot {
     estimatedMemoryBytes: estimatedResidentBytes(model.size_gb * 1_000_000_000),
     capabilities: capabilities(
       capability(model.tool_calling ? "yes" : "no", `Local model metadata reports tool_calling=${model.tool_calling}.`),
-      capability("unknown", "Local model metadata does not report vision capability."),
+      capability(
+        model.capabilities === undefined
+          ? "unknown"
+          : model.capabilities.image_input
+            ? "yes"
+            : "no",
+        model.capabilities === undefined
+          ? "Older local model metadata does not report vision capability."
+          : model.capabilities.image_input
+          ? "This local bundle has an associated multimodal projector."
+          : "This local bundle has no associated multimodal projector.",
+      ),
     ),
     availability: availability("available", "The local llama.cpp server reports ready for this model."),
   });
