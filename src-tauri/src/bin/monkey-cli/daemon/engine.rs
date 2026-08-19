@@ -1131,7 +1131,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // serving until something restarts it; `daemon ensure` compares this
         // against its own version to notice exactly that.
         self.store.set_meta("version", env!("CARGO_PKG_VERSION"))?;
-        if self.store.kill_switch()? {
+        let kill_switch = self.store.kill_switch()?;
+        if kill_switch {
             self.store.request_cancel_all(now)?;
         }
 
@@ -1149,10 +1150,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.tick_active(&job_id, now)?;
         }
 
-        if !self.store.kill_switch()? {
-            self.schedule(now)?;
-        } else {
+        if kill_switch {
             self.cancel_queued(now, "global kill switch is engaged")?;
+        } else {
+            // A queued stop is not visible to `tick_active`, and `ready_jobs`
+            // deliberately excludes cancelled rows. Reap it here so the
+            // durable run cannot remain in `cancelling` forever without ever
+            // becoming an active process.
+            self.cancel_queued(now, "Cancellation requested by daemon controller")?;
+            self.schedule(now)?;
         }
 
         // Reconciled once per tick from whatever the job store now says, rather
@@ -2729,7 +2735,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
     fn cancel_queued(&mut self, now: u64, reason: &str) -> Result<(), String> {
         for job in self.store.nonterminal_jobs()? {
-            if job.state == JobState::Queued || job.state == JobState::Preparing {
+            if (job.state == JobState::Queued || job.state == JobState::Preparing)
+                && job.cancel_requested
+            {
                 if let Some(run_id) = job.run_id.as_deref() {
                     self.ensure_cancelling(run_id, reason)?;
                     self.cancel_run(run_id, reason)?;
@@ -4414,6 +4422,37 @@ pub(super) mod tests {
         engine.tick().unwrap();
         assert!(signals.lock().unwrap().contains(&ProcessSignal::Terminate));
         assert_eq!(engine.active_count(), 0);
+        assert_eq!(
+            engine.shared.load_run(&run_id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_terminalizes_a_queued_job_without_starting_it() {
+        let (paths, store, shared, _recorder, run_id) = fixture("queued-cancel");
+        let adapter = fake_adapter();
+        let spawns = adapter.spawns.clone();
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+
+        engine.store.request_cancel(&run_id, 2_001).unwrap();
+        engine.tick().unwrap();
+
+        assert_eq!(*spawns.lock().unwrap(), 0);
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(
+            engine.store.get_job(&run_id).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
         assert_eq!(
             engine.shared.load_run(&run_id).unwrap().unwrap().status,
             RunStatus::Cancelled
