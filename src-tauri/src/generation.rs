@@ -155,6 +155,9 @@ pub enum GenerationEngineKind {
     /// The video service in the installed MLX package. Apple silicon only,
     /// and only present once the user installs that package.
     MlxVideo,
+    /// The native MFLUX image service. Apple silicon only, and installed as
+    /// its own verified runtime because it has a different dependency tree.
+    MfluxImage,
 }
 
 /// What to spawn for a model: a program, and the arguments that must precede
@@ -269,6 +272,24 @@ pub enum ComponentSource {
     /// A file the user already has. Referenced where it lies and never copied,
     /// moved, or deleted by the app — these weights are not ours to manage.
     LocalFile { path: String },
+}
+
+/// Where a complete model comes from. Existing entries keep using component
+/// files; image engines can instead use a model directory or an app-managed
+/// snapshot of a remote repository.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelSource {
+    #[default]
+    Components,
+    HuggingFaceRepo {
+        repo: String,
+        #[serde(default)]
+        revision: Option<String>,
+    },
+    LocalDirectory {
+        path: String,
+    },
 }
 
 impl ModelComponent {
@@ -447,6 +468,8 @@ pub struct GenerationModelSpec {
     pub family: String,
     pub tasks: Vec<GenerationTask>,
     pub components: Vec<ModelComponent>,
+    #[serde(default)]
+    pub source: ModelSource,
     pub defaults: GenerationDefaults,
     /// Total RAM (or unified memory) below which this model will swap rather
     /// than run. Checked before launch so the failure is a sentence, not a
@@ -462,11 +485,35 @@ pub struct GenerationModelSpec {
     /// to parse if one of them cannot deserialize.
     #[serde(default)]
     pub engine: GenerationEngineKind,
+    /// MFLUX supports a small, explicit set of on-the-fly quantization sizes.
+    /// Other engines leave this unset.
+    #[serde(default)]
+    pub quantization_bits: Option<u8>,
 }
 
 impl GenerationModelSpec {
     pub fn total_bytes(&self) -> u64 {
         self.components.iter().map(|entry| entry.size_bytes).sum()
+    }
+
+    pub fn model_source_path(&self, model_root: &Path) -> Option<PathBuf> {
+        match &self.source {
+            ModelSource::Components => None,
+            ModelSource::HuggingFaceRepo { .. } => {
+                Some(model_root.join(&self.id).join("model-source"))
+            }
+            ModelSource::LocalDirectory { path } => Some(PathBuf::from(path)),
+        }
+    }
+
+    pub fn model_source_installed(&self, model_root: &Path) -> bool {
+        match (&self.source, self.model_source_path(model_root)) {
+            (ModelSource::HuggingFaceRepo { .. }, Some(path)) => {
+                path.is_dir() && path.join(".little-monkey-source.json").is_file()
+            }
+            (ModelSource::LocalDirectory { .. }, Some(path)) => path.is_dir(),
+            _ => false,
+        }
     }
 
     pub fn supports(&self, task: GenerationTask) -> bool {
@@ -489,14 +536,21 @@ impl GenerationModelSpec {
     /// the entry claimed. So every present file is stat'd and only the absent
     /// ones fall back to the declared number.
     pub fn size_on_disk(&self, model_root: &Path) -> u64 {
-        self.components
+        let component_bytes = self
+            .components
             .iter()
             .map(|component| {
                 std::fs::metadata(component.resolved_path(model_root, &self.id))
                     .map(|entry| entry.len())
                     .unwrap_or(component.size_bytes)
             })
-            .sum()
+            .sum::<u64>();
+        component_bytes
+            + self
+                .model_source_path(model_root)
+                .filter(|path| path.is_dir())
+                .map(|path| directory_size(&path))
+                .unwrap_or(0)
     }
 
     /// Components still missing from disk, so the UI can show what a download
@@ -510,6 +564,28 @@ impl GenerationModelSpec {
             })
             .collect()
     }
+
+    pub fn missing_model_source(&self, model_root: &Path) -> bool {
+        matches!(self.source, ModelSource::HuggingFaceRepo { .. })
+            && !self.model_source_installed(model_root)
+    }
+}
+
+fn directory_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let child = entry.path();
+            if child.is_dir() {
+                directory_size(&child)
+            } else {
+                entry.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+            }
+        })
+        .sum()
 }
 
 /// Validates a user-defined model before it is stored or launched.
@@ -541,8 +617,38 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
     if spec.tasks.is_empty() {
         return Err("Pick at least one thing this model can do".to_string());
     }
-    if spec.components.is_empty() {
+    let mflux = spec.engine == GenerationEngineKind::MfluxImage;
+    if !mflux && spec.components.is_empty() {
         return Err("A model needs at least one weight file".to_string());
+    }
+    if mflux {
+        if !matches!(
+            spec.source,
+            ModelSource::HuggingFaceRepo { .. } | ModelSource::LocalDirectory { .. }
+        ) {
+            return Err("An MFLUX model needs a repository or local model directory".to_string());
+        }
+        if !spec.components.is_empty() {
+            return Err("MFLUX models use one model source instead of component files".to_string());
+        }
+        if spec
+            .tasks
+            .iter()
+            .any(|task| task.is_video() || task.is_speech())
+            || spec.tasks.iter().all(|task| {
+                !matches!(
+                    task,
+                    GenerationTask::TextToImage | GenerationTask::ImageToImage
+                )
+            })
+        {
+            return Err("MFLUX supports text-to-image and image-to-image only".to_string());
+        }
+        if let Some(bits) = spec.quantization_bits {
+            if !matches!(bits, 3 | 4 | 5 | 6 | 8) {
+                return Err("MFLUX quantization must be 3, 4, 5, 6, or 8 bits".to_string());
+            }
+        }
     }
     let denoisers = spec
         .components
@@ -554,7 +660,7 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
             )
         })
         .count();
-    if denoisers != 1 {
+    if !mflux && denoisers != 1 {
         return Err("Exactly one file must be the checkpoint or the diffusion model".to_string());
     }
     let mut slots = BTreeSet::new();
@@ -587,6 +693,27 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
                 if !Path::new(path).is_absolute() {
                     return Err("A file on this machine needs an absolute path".to_string());
                 }
+            }
+        }
+    }
+    match &spec.source {
+        ModelSource::Components => {}
+        ModelSource::HuggingFaceRepo { repo, revision } => {
+            crate::models::validate_repo(repo)
+                .map_err(|_| "A model repository needs a safe '<owner>/<name>' name".to_string())?;
+            if revision
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty() || value.contains(".."))
+            {
+                return Err("A model revision must be a safe non-empty name".to_string());
+            }
+            if mflux && (!spec.license.acceptance_required || spec.license.id.trim().is_empty()) {
+                return Err("A remote MFLUX model needs a terms acceptance gate".to_string());
+            }
+        }
+        ModelSource::LocalDirectory { path } => {
+            if !Path::new(path).is_absolute() {
+                return Err("A model directory needs an absolute path".to_string());
             }
         }
     }
@@ -702,6 +829,30 @@ fn link_lora(source: &Path, staged: &Path) -> Result<(), String> {
 /// Builds the `sd-server` command line for a model. Every weight path is
 /// absolute and app-owned; nothing is read from a user shell or PATH.
 pub fn launch_args(spec: &GenerationModelSpec, model_root: &Path, port: u16) -> Vec<String> {
+    if spec.engine == GenerationEngineKind::MfluxImage {
+        let mut args = vec![
+            "--listen-ip".to_string(),
+            "127.0.0.1".to_string(),
+            "--listen-port".to_string(),
+            port.to_string(),
+            "--model-path".to_string(),
+            spec.model_source_path(model_root)
+                .expect("validated MFLUX model source")
+                .to_string_lossy()
+                .to_string(),
+            "--base-model".to_string(),
+            if spec.family.trim().is_empty() {
+                "dev".to_string()
+            } else {
+                spec.family.trim().to_string()
+            },
+        ];
+        if let Some(bits) = spec.quantization_bits {
+            args.push("--quantize".to_string());
+            args.push(bits.to_string());
+        }
+        return args;
+    }
     let mut args = vec![
         "--listen-ip".to_string(),
         "127.0.0.1".to_string(),
@@ -1170,6 +1321,32 @@ pub fn validate_request(
     if request.prompt.len() > MAX_PROMPT_BYTES || request.negative_prompt.len() > MAX_PROMPT_BYTES {
         return Err("Prompt exceeds its size limit".to_string());
     }
+    if spec.engine == GenerationEngineKind::MfluxImage {
+        if !request.negative_prompt.trim().is_empty() {
+            return Err("MFLUX does not support negative prompts".to_string());
+        }
+        if request.hires.is_some()
+            || request.mask_image_base64.is_some()
+            || request.control_image_base64.is_some()
+            || request.ip_adapter_image_base64.is_some()
+            || !request.ref_images_base64.is_empty()
+            || !request.loras.is_empty()
+            || !request.component_overrides.is_empty()
+            || request.ad_prompt.is_some()
+            || request.ad_negative_prompt.is_some()
+            || request.control_strength.is_some()
+            || request.ip_adapter_strength.is_some()
+            || request.increase_ref_index
+            || (!request.task.needs_init_image() && request.init_image_base64.is_some())
+            || request.clip_skip != -1
+            || request.eta.is_some()
+            || !request.scheduler.trim().is_empty()
+            || (!request.sample_method.trim().is_empty()
+                && request.sample_method.trim() != "linear")
+        {
+            return Err("This MFLUX model supports only prompt, canvas, steps, guidance, seed, and an optional source image".to_string());
+        }
+    }
     // Speech runs on `llama-tts`, which has no canvas, no sampler and no
     // guidance — validating it against the diffusion bounds below would reject
     // a request over fields that do not reach the engine at all.
@@ -1379,6 +1556,14 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
         "clip_skip": request.clip_skip,
         "sample_params": sample_params,
     });
+    if spec.engine == GenerationEngineKind::MfluxImage {
+        body["task"] = json!(request.task);
+        body["negative_prompt"] = Value::Null;
+        body["sample_params"] = json!({
+            "sample_steps": request.steps,
+            "guidance": { "txt_cfg": request.cfg_scale },
+        });
+    }
     // Only the image-driven tasks have something to denoise away from.
     if let (true, Some(strength)) = (request.task.needs_init_image(), request.strength) {
         body["strength"] = json!(strength);
@@ -1407,8 +1592,10 @@ pub fn request_body(spec: &GenerationModelSpec, request: &GenerationRequest) -> 
                 .collect(),
         );
     }
-    if let Some(image) = &request.init_image_base64 {
-        body["init_image"] = json!(image);
+    if request.task.needs_init_image() {
+        if let Some(image) = &request.init_image_base64 {
+            body["init_image"] = json!(image);
+        }
     }
     if let Some(mask) = &request.mask_image_base64 {
         body["mask_image"] = json!(mask);
@@ -1468,6 +1655,7 @@ pub struct GeneratedMedia {
 pub enum JobProgress {
     Running {
         queue_position: u32,
+        progress: Option<(u32, u32)>,
     },
     /// Every artifact the job produced, in the engine's own order. One for a
     /// clip or a single image; `batch_count` of them for a batch.
@@ -1501,13 +1689,24 @@ pub fn decode_job_status(value: &Value) -> Result<JobProgress, String> {
         .and_then(Value::as_str)
         .ok_or("Generation job status is missing")?;
     match status {
-        "queued" | "generating" => Ok(JobProgress::Running {
-            queue_position: value
-                .get("queue_position")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                .min(u32::MAX as u64) as u32,
-        }),
+        "queued" | "generating" => {
+            let progress = value.get("progress").and_then(|value| {
+                let step = value.get("step")?.as_u64()?;
+                let total = value.get("total")?.as_u64()?;
+                (total > 0).then_some((
+                    step.min(u32::MAX as u64) as u32,
+                    total.min(u32::MAX as u64) as u32,
+                ))
+            });
+            Ok(JobProgress::Running {
+                queue_position: value
+                    .get("queue_position")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32,
+                progress,
+            })
+        }
         "cancelled" => Ok(JobProgress::Cancelled),
         "failed" => Ok(JobProgress::Failed(
             engine_error_text(value)
@@ -1987,13 +2186,26 @@ impl GenerationEngineState {
         let port = free_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
 
-        for path in spec.component_paths(model_root) {
-            if !path.is_file() {
+        if spec.engine == GenerationEngineKind::MfluxImage {
+            let path = spec
+                .model_source_path(model_root)
+                .ok_or_else(|| "MFLUX model source is not configured".to_string())?;
+            if !spec.model_source_installed(model_root) {
                 return Err(format!(
-                    "{} is missing a weight file: {}",
+                    "{} is missing its model directory: {}",
                     spec.name,
                     path.display()
                 ));
+            }
+        } else {
+            for path in spec.component_paths(model_root) {
+                if !path.is_file() {
+                    return Err(format!(
+                        "{} is missing a weight file: {}",
+                        spec.name,
+                        path.display()
+                    ));
+                }
             }
         }
 
@@ -2030,14 +2242,20 @@ impl GenerationEngineState {
 
         let client = reqwest::Client::new();
         let capabilities = format!("{base_url}/sdcpp/v1/capabilities");
-        let expected_model_path = identifying_component(spec)
-            .map(|component| {
-                component
-                    .resolved_path(model_root, &spec.id)
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .unwrap_or_default();
+        let expected_model_path = if spec.engine == GenerationEngineKind::MfluxImage {
+            spec.model_source_path(model_root)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default()
+        } else {
+            identifying_component(spec)
+                .map(|component| {
+                    component
+                        .resolved_path(model_root, &spec.id)
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .unwrap_or_default()
+        };
         let mut spoken = self.output_mark();
         let mut spoke_at = Instant::now();
         loop {
@@ -2615,6 +2833,7 @@ mod tests {
                 "split_files/diffusion_models/model.safetensors",
                 10,
             )],
+            source: ModelSource::Components,
             defaults: GenerationDefaults {
                 width: 704,
                 height: 1280,
@@ -2630,6 +2849,7 @@ mod tests {
             license: LicenseGate::default(),
             extra_launch_args: vec!["--diffusion-fa".to_string()],
             engine: GenerationEngineKind::default(),
+            quantization_bits: None,
         }
     }
 
@@ -2906,6 +3126,8 @@ mod tests {
         });
         let spec: GenerationModelSpec = serde_json::from_value(stored).unwrap();
         assert_eq!(spec.engine, GenerationEngineKind::StableDiffusionCpp);
+        assert!(matches!(spec.source, ModelSource::Components));
+        assert_eq!(spec.quantization_bits, None);
         // And the name it round-trips under is the one the frontend sends.
         assert_eq!(
             serde_json::to_value(GenerationEngineKind::MlxVideo).unwrap(),
@@ -3129,6 +3351,64 @@ mod tests {
         request.width = 1024;
         request.height = 1024;
         request
+    }
+
+    fn mflux_model() -> GenerationModelSpec {
+        let mut spec = image_model();
+        spec.id = "flux-dev".to_string();
+        spec.name = "FLUX.1-dev".to_string();
+        spec.family = "dev".to_string();
+        spec.components.clear();
+        spec.source = ModelSource::HuggingFaceRepo {
+            repo: "black-forest-labs/FLUX.1-dev".to_string(),
+            revision: None,
+        };
+        spec.engine = GenerationEngineKind::MfluxImage;
+        spec.quantization_bits = Some(8);
+        spec.license = LicenseGate {
+            id: "mflux:black-forest-labs/FLUX.1-dev".to_string(),
+            name: "MFLUX model terms".to_string(),
+            url: "https://huggingface.co/black-forest-labs/FLUX.1-dev".to_string(),
+            excluded_territories: Vec::new(),
+            acceptance_required: true,
+        };
+        spec
+    }
+
+    #[test]
+    fn mflux_model_source_and_request_rules_are_explicit() {
+        let spec = mflux_model();
+        validate_model_spec(&spec).unwrap();
+        let args = launch_args(&spec, Path::new("/models"), 4312);
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--model-path" && pair[1] == "/models/flux-dev/model-source"
+        }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--quantize" && pair[1] == "8"));
+        assert_eq!(
+            serde_json::to_value(&spec.source).unwrap()["kind"],
+            json!("hugging_face_repo")
+        );
+
+        let mut invalid_quantization = spec.clone();
+        invalid_quantization.quantization_bits = Some(7);
+        assert!(validate_model_spec(&invalid_quantization).is_err());
+
+        let mut invalid_license = spec.clone();
+        invalid_license.license.acceptance_required = false;
+        assert!(validate_model_spec(&invalid_license).is_err());
+
+        let mut request = image_request(GenerationTask::TextToImage);
+        request.model_id = spec.id.clone();
+        request.negative_prompt = "blur".to_string();
+        assert!(validate_request(&spec, &request).is_err());
+        request.negative_prompt.clear();
+        let normalized = validate_request(&spec, &request).unwrap();
+        let body = request_body(&spec, &normalized);
+        assert_eq!(body["negative_prompt"], Value::Null);
+        assert!(body["sample_params"].get("sample_method").is_none());
+        assert_eq!(body["sample_params"]["sample_steps"], json!(20));
     }
 
     fn local_component(slot: ComponentSlot, name: &str) -> ModelComponent {
@@ -3560,7 +3840,22 @@ mod tests {
     fn job_status_decoding_covers_every_terminal_state() {
         assert_eq!(
             decode_job_status(&json!({"status": "queued", "queue_position": 2})).unwrap(),
-            JobProgress::Running { queue_position: 2 }
+            JobProgress::Running {
+                queue_position: 2,
+                progress: None,
+            }
+        );
+        assert_eq!(
+            decode_job_status(&json!({
+                "status": "generating",
+                "queue_position": 0,
+                "progress": {"step": 7, "total": 25}
+            }))
+            .unwrap(),
+            JobProgress::Running {
+                queue_position: 0,
+                progress: Some((7, 25)),
+            }
         );
         assert_eq!(
             decode_job_status(&json!({"status": "cancelled"})).unwrap(),
