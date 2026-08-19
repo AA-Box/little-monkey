@@ -31,18 +31,10 @@ import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from ".
  * How the whole list is filtered, grouped and ordered lives in
  * `sessionListView.ts`, behind the header's view menu.
  */
-/** Tailwind classes for each status' dot. `working` animates — a row that
- * is doing something should be the one thing moving in the sidebar. */
-const STATUS_DOT: Record<Exclude<SessionStatus, "attention">, string> = {
-  working: "bg-accent animate-pulse",
-  finished: "bg-accent",
-  error: "bg-danger",
-};
-
-/** The leading status marker on a session row. Never color alone: the
- * hover/screen-reader label names the state, and the two states worth
- * interrupting for carry a shape of their own (a pulse, a triangle). */
-function StatusMarker({ status, label }: { status: SessionStatus; label: string }) {
+/** The leading status marker on a session row. Working is the only animated
+ * state; finished is a solid dot, read/idle is hollow, and failures use an
+ * icon so the state is not conveyed by color or motion alone. */
+function StatusMarker({ status, label }: { status: SessionStatus | null; label: string }) {
   return (
     <span
       role="img"
@@ -50,10 +42,16 @@ function StatusMarker({ status, label }: { status: SessionStatus; label: string 
       title={label}
       className="mr-1.5 inline-flex shrink-0 items-center align-middle"
     >
-      {status === "attention" ? (
+      {status === "error" ? (
+        <AlertTriangle size={12} className="text-danger" aria-hidden />
+      ) : status === "attention" ? (
         <AlertTriangle size={12} className="text-warning" aria-hidden />
+      ) : status === null ? (
+        <span className="h-1.5 w-1.5 rounded-full border border-faint" />
       ) : (
-        <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[status]}`} />
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${status === "working" ? "bg-accent animate-pulse motion-reduce:animate-none" : "bg-accent"}`}
+        />
       )}
     </span>
   );
@@ -278,9 +276,10 @@ export default function ChatSessionList() {
           />
         ) : (
           <span className={`truncate ${session.unread ? "font-semibold" : ""}`}>
-            {row.status && (
-              <StatusMarker status={row.status} label={t(`ChatSessionList.status.${row.status}`)} />
-            )}
+            <StatusMarker
+              status={row.status}
+              label={row.status ? t(`ChatSessionList.status.${row.status}`) : t("ChatSessionList.view.stateIdle")}
+            />
             {row.title}
           </span>
         )}

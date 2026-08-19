@@ -185,7 +185,16 @@ export function matchesEnvironment(row: SessionRow, environments: readonly strin
 export function comparatorFor(sortBy: SortBy): (a: SessionRow, b: SessionRow) => number {
   switch (sortBy) {
     case "recency":
-      return (a, b) => b.updatedAt - a.updatedAt;
+      return (a, b) => {
+        // Keep active work together at the top, but never compare two
+        // working rows by updatedAt: streaming patches update that field and
+        // would otherwise make the rows swap places continuously. Returning
+        // 0 preserves their existing order through the stable sort.
+        if (a.status === "working" && b.status !== "working") return -1;
+        if (a.status !== "working" && b.status === "working") return 1;
+        if (a.status === "working" && b.status === "working") return 0;
+        return b.updatedAt - a.updatedAt;
+      };
     case "created":
       return (a, b) => b.createdAt - a.createdAt;
     case "alphabetical":
