@@ -10,7 +10,7 @@
  * "always listening" can never quietly mean "always uploading".
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Gauge, Mic, Radio, Save, Trash2, Volume2 } from 'lucide-react';
 
 import {
@@ -20,7 +20,9 @@ import {
   type TranscriptionBackendKind,
   type VoiceConfig,
 } from '../../lib/companionClient';
+import { dictationClient, type DictationCapabilities } from '../../lib/dictationClient';
 import { errorMessage } from '../../lib/errors';
+import { useT } from '../../lib/i18n';
 import { base64AudioBlob } from '../../lib/talkAudio';
 import { latencySummary, talkClient, type TalkMetricsSnapshot } from '../../lib/talkClient';
 import { createTalkPlayer } from '../../lib/talkPlayback';
@@ -62,10 +64,13 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [dictationCapabilities, setDictationCapabilities] = useState<DictationCapabilities | null>(null);
+  const clearedDictationLanguageRef = useRef<string | null>(null);
   /** Second step before always-listening arms. Reset whenever it is turned off. */
   const [confirmingAlwaysListening, setConfirmingAlwaysListening] = useState(false);
 
   const voice = config.voice;
+  const { t } = useT();
   const player = useMemo(() => createTalkPlayer(), []);
 
   const loadDevices = useCallback(async () => {
@@ -86,7 +91,21 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
   useEffect(() => {
     void loadDevices().catch((reason) => setError(errorMessage(reason)));
     void talkClient.metrics().then(setMetrics).catch(() => undefined);
+    void dictationClient.capabilities().then(setDictationCapabilities).catch(() => undefined);
   }, [loadDevices]);
+
+  useEffect(() => {
+    const selected = voice.dictationLanguage;
+    if (!selected || !dictationCapabilities) return;
+    const available = dictationCapabilities.languages;
+    if (available.length === 0 || !available.some((language) => language.id === selected)) {
+      if (clearedDictationLanguageRef.current === selected) return;
+      clearedDictationLanguageRef.current = selected;
+      onChange({ ...voice, dictationLanguage: null });
+    } else {
+      clearedDictationLanguageRef.current = null;
+    }
+  }, [dictationCapabilities, onChange, voice.dictationLanguage]);
 
   const patch = (change: Partial<VoiceConfig>) => onChange({ ...voice, ...change });
 
@@ -191,6 +210,57 @@ export function VoiceSettingsSection({ config, onChange, onSave }: VoiceSettings
         nothing: “Persist raw audio artifacts” there does not apply to a conversation, and no
         recording of one is written anywhere.
       </p>
+
+      <div className="mt-4 rounded-md border border-border p-3">
+        <div className="flex items-center gap-2">
+          <Mic size={14} />
+          <h4 className="text-xs font-semibold">{t('VoiceSettings.composerDictation')}</h4>
+        </div>
+        <p className="mt-1 text-[11px] text-faint">
+          {t('VoiceSettings.composerDictationDescription')}
+        </p>
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          <label className="text-xs text-muted">
+            {t('VoiceSettings.recognition')}
+            <select className={`${INPUT} mt-1`} value="native" disabled>
+              <option value="native">{t('VoiceSettings.systemSpeechRecognition')}</option>
+            </select>
+          </label>
+          <label className="text-xs text-muted">
+            {t('VoiceSettings.language')}
+            <select
+              className={`${INPUT} mt-1`}
+              value={voice.dictationLanguage ?? ''}
+              onChange={(event) => patch({ dictationLanguage: event.target.value || null })}
+            >
+              <option value="">{t('VoiceSettings.systemDefault')}</option>
+              {dictationCapabilities?.languages.map((language) => (
+                <option key={language.id} value={language.id}>{language.label}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {dictationCapabilities?.platform === 'macos' && (
+          <label className="mt-3 flex items-start gap-2 text-xs text-muted">
+            <input
+              className="mt-0.5"
+              type="checkbox"
+              checked={voice.dictationRequireOnDevice}
+              disabled={!dictationCapabilities.supportsOnDevice}
+              onChange={(event) => patch({ dictationRequireOnDevice: event.target.checked })}
+            />
+            <span>
+              {t('VoiceSettings.requireOnDevice')}
+              {!dictationCapabilities.supportsOnDevice && (
+                <span className="mt-1 block text-[11px] text-faint">{t('VoiceSettings.onDeviceUnavailable')}</span>
+              )}
+            </span>
+          </label>
+        )}
+        {dictationCapabilities && !dictationCapabilities.supported && (
+          <p className="mt-2 text-[11px] text-warning">{t('VoiceSettings.speechRecognitionUnavailable')}</p>
+        )}
+      </div>
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <label className="text-xs text-muted">

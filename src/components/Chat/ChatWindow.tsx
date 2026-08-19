@@ -34,6 +34,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
+import { DictationButton, type DictationButtonHandle } from "./DictationButton";
 import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
 import { useT } from "../../lib/i18n";
@@ -376,6 +377,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const pendingTerminalEvidence = useTerminalStore((state) => state.pendingEvidenceByChat[sessionId] ?? null);
   const consumeTerminalEvidence = useTerminalStore((state) => state.consumeEvidence);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictationButtonRef = useRef<DictationButtonHandle>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
   // controls whether the popup is rendered at all.
@@ -1021,7 +1023,17 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   }, [appendCommandNotice, availableSkills, onOpenPmCopilot, onOpenSettingsTab, sessionId]);
 
   const handleSend = useCallback(async () => {
-    const text = input.trim();
+    let settledInput = input;
+    if (dictationButtonRef.current?.isActive()) {
+      try {
+        const finalValue = await dictationButtonRef.current.settleForSend();
+        if (finalValue !== null) settledInput = finalValue;
+      } catch (reason) {
+        setError(reason);
+        return;
+      }
+    }
+    const text = settledInput.trim();
     if (!text) return;
     const builtIn = parseBuiltInSlashCommand(text);
     if (builtIn) {
@@ -1631,6 +1643,15 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </div>
                 )}
               </div>
+              <DictationButton
+                ref={dictationButtonRef}
+                sessionId={sessionId}
+                value={input}
+                onChange={setInput}
+                textareaRef={textareaRef}
+                resizeTextarea={resizeTextarea}
+                disabled={sending || preparingTurn || startingComparison || startingCrew}
+              />
               <span className="group/action relative shrink-0">
                 <button
                   type="button"

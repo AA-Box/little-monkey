@@ -135,6 +135,7 @@ pub mod runtime_telemetry;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
+pub mod dictation;
 pub mod m7_companion;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
 // shortcut's persisted configuration and "bring the palette to the front"
@@ -955,6 +956,7 @@ pub fn run() {
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
+        .manage(dictation::DictationRuntime::default())
         .manage(palette_state)
         .manage(desktop_control_state)
         // Tier-2 interactive-artifact protocol — serves a previously
@@ -1875,6 +1877,10 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            dictation::dictation_capabilities,
+            dictation::dictation_start,
+            dictation::dictation_stop,
+            dictation::dictation_cancel,
             command_palette::palette_show,
             command_palette::palette_config_get,
             command_palette::palette_config_save,
@@ -1928,6 +1934,9 @@ pub fn run() {
 
             let companion = app_handle.state::<m7_companion::M7CompanionState>();
             let _ = companion.emergency_stop();
+
+            let dictation = app_handle.state::<dictation::DictationRuntime>();
+            dictation::shutdown(dictation.inner());
 
             let desktop_control = app_handle.state::<desktop_control::DesktopControlState>();
             let _ = desktop_control.emergency_stop();
