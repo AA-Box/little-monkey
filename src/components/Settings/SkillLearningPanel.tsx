@@ -822,7 +822,7 @@ export function SkillLearningPanel() {
                         <span className="mt-1 font-medium text-muted">History</span>
                         {summary.history.map((version) => (
                           <span key={version.sha256}>
-                            {shortHash(version.sha256)} · {version.version} · {version.sha256 === summary.active_sha256 ? "current" : "previous"}
+                            {shortHash(version.sha256)} · {version.version} · {version.sha256 === summary.active_sha256 ? "current" : "previous"} · {version.uses} use{version.uses === 1 ? "" : "s"} · {version.failures} failure{version.failures === 1 ? "" : "s"} · {version.corrections} correction{version.corrections === 1 ? "" : "s"}
                           </span>
                         ))}
                       </>

@@ -192,6 +192,9 @@ export interface EvaluationCase {
    * arm verifies too. A missing result leaves the evaluation unevaluated —
    * scored in the backend, never here. */
   verification_required: boolean;
+  /** The evidence run changed files and must be checked from its own
+   * pre-task checkpoint before either arm runs. */
+  observed_mutation?: boolean;
 }
 
 export interface EvaluationPlan {
@@ -300,6 +303,10 @@ export interface SkillVersionHistory {
   parent_sha256: string | null;
   promoted_at_unix_ms: number;
   evaluation_ids: string[];
+  uses: number;
+  failures: number;
+  corrections: number;
+  last_used_at_unix_ms: number | null;
 }
 
 export interface ImprovementEvidence {

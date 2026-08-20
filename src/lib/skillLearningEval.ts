@@ -90,6 +90,10 @@ function sandboxArm(arm: Arm, testCase: EvaluationCase): string {
  * behind in an arm's. */
 const STARTING_STATE_ARM = "starting-state";
 
+function startingStateArm(testCase: EvaluationCase): string {
+  return testCase.case_id === "positive" ? STARTING_STATE_ARM : `starting-state-${testCase.case_id}`;
+}
+
 function unevaluatedReport(testCase: EvaluationCase, arm: Arm, error: string): EvaluationCaseReport {
   return {
     case_id: testCase.case_id,
@@ -206,12 +210,15 @@ export async function runCandidateEvaluation(
   // Only where success is a change of state. A read-only procedure was never
   // supposed to alter anything, so a workspace that already passes its own
   // verification is its normal condition — not evidence of a pre-solved task.
-  const selfChecking = plan.observed_mutation
-    ? plan.cases.find((testCase) => testCase.kind === "positive" && testCase.verification_required)
-    : undefined;
+  const selfCheckingCases = plan.cases.filter(
+    (testCase) =>
+      testCase.kind === "positive" &&
+      testCase.verification_required &&
+      (testCase.observed_mutation ?? plan.observed_mutation),
+  );
   const arms = [
     ...plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase))),
-    ...(selfChecking ? [STARTING_STATE_ARM] : []),
+    ...selfCheckingCases.map(startingStateArm),
   ];
   let sandboxes: Awaited<ReturnType<typeof client.createSandboxes>>;
   try {
@@ -228,12 +235,12 @@ export async function runCandidateEvaluation(
     // starting state already satisfies the verification, the positive case is
     // a solved problem and an arm "passing" it proves nothing — whatever the
     // reason the state survived.
-    if (selfChecking) {
-      const startingState = pathFor.get(STARTING_STATE_ARM);
+    for (const testCase of selfCheckingCases) {
+      const startingState = pathFor.get(startingStateArm(testCase));
       const already = startingState
         ? await runSandboxVerification(
             startingState,
-            `${plan.evaluation_id}-starting-state`,
+            `${plan.evaluation_id}-${startingStateArm(testCase)}`,
             signal,
             plan.workspace_path ?? undefined,
           ).catch(() => null)
@@ -241,7 +248,7 @@ export async function runCandidateEvaluation(
       if (already?.passed) {
         return await client.markUnevaluated(
           plan.evaluation_id,
-          "the rebuilt starting state already passes this workspace's verification, so reproducing the observed task there would prove nothing",
+          `the rebuilt starting state already passes ${testCase.name}, so reproducing the observed task there would prove nothing`,
         );
       }
     }

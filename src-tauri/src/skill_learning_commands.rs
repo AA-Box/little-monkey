@@ -6,6 +6,7 @@
 //! reaches exactly the same behaviour through the same store rather than a
 //! parallel implementation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,9 +20,10 @@ use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
     ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
-    EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, ImprovementEvidence,
-    ImprovementParent, LearnedSkillSummary, LearningCandidate, LearningMode, LearningSettings,
-    PreTaskFile, PreTaskSource, PreTaskState, PromotionOutcome, RunEvidence, SkillLearningStore,
+    EvaluationCaseReport, EvaluationEnvironment, EvaluationMode, EvaluationPlan, EvaluationRecord,
+    ImprovementEvidence, ImprovementParent, LearnedSkillSummary, LearningCandidate, LearningMode,
+    LearningSettings, PreTaskFile, PreTaskSource, PreTaskState, PromotionOutcome, RunEvidence,
+    SkillLearningStore,
 };
 use crate::AppState;
 
@@ -350,26 +352,44 @@ pub async fn skill_learning_create_sandboxes(
                     .to_string(),
             )
         })?;
-        // What the run did decides what has to be put back, and the evidence
-        // is the authority on that — not the checkpoint, which a read-only
-        // turn discards while its `checkpoint_linked` event lives on.
-        let pre_task = match pre_task_source(&environment) {
-            PreTaskSource::NothingToUndo => PreTaskState { files: Vec::new(), complete: true },
-            PreTaskSource::Unreproducible(reason) => return Err(invalid(reason)),
-            PreTaskSource::Checkpoint(checkpoint_id) => {
-                let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, &checkpoint_id)
-                    .map_err(invalid)?;
-                PreTaskState {
-                    files: state
-                        .files
-                        .into_iter()
-                        .map(|file| PreTaskFile { path: file.path, contents: file.contents })
-                        .collect(),
-                    complete: !state.shell_ran,
+        // What each run did decides what has to be put back, and its own
+        // evidence is the authority on that. Multi-run improvements therefore
+        // get one checkpoint per case instead of reusing the first selection.
+        let mut pre_tasks = BTreeMap::new();
+        for arm in &arms {
+            let evidence = evidence_for_arm(&environment, arm);
+            let arm_environment = EvaluationEnvironment {
+                workspace: environment.workspace.clone(),
+                checkpoint_id: evidence.and_then(|entry| entry.checkpoint_id.clone()),
+                requires_pre_task_state: evidence
+                    .is_some_and(RunEvidence::mutated_the_workspace),
+                used_shell: evidence.is_some_and(RunEvidence::used_shell),
+                evidence_runs: evidence.cloned().into_iter().collect(),
+            };
+            let pre_task = match pre_task_source(&arm_environment) {
+                PreTaskSource::NothingToUndo => PreTaskState { files: Vec::new(), complete: true },
+                PreTaskSource::Unreproducible(reason) => return Err(invalid(reason)),
+                PreTaskSource::Checkpoint(checkpoint_id) => {
+                    let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, &checkpoint_id)
+                        .map_err(invalid)?;
+                    PreTaskState {
+                        files: state
+                            .files
+                            .into_iter()
+                            .map(|file| PreTaskFile { path: file.path, contents: file.contents })
+                            .collect(),
+                        complete: !state.shell_ran,
+                    }
                 }
-            }
-        };
-        let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms, &pre_task)?;
+            };
+            pre_tasks.insert(arm.clone(), pre_task);
+        }
+        let created = store.create_eval_sandboxes_with_pre_tasks(
+            &evaluation_id,
+            &source,
+            &arms,
+            &pre_tasks,
+        )?;
         Ok(created
             .into_iter()
             .map(|(arm, path)| EvaluationSandbox {
@@ -379,6 +399,23 @@ pub async fn skill_learning_create_sandboxes(
             .collect::<Vec<_>>())
     })
     .await
+}
+
+fn evidence_for_arm<'a>(
+    environment: &'a EvaluationEnvironment,
+    arm: &str,
+) -> Option<&'a RunEvidence> {
+    let case_id = arm
+        .strip_prefix("baseline-")
+        .or_else(|| arm.strip_prefix("candidate-"))
+        .unwrap_or(arm);
+    if let Some(index) = case_id
+        .strip_prefix("improvement-")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return environment.evidence_runs.get(index.saturating_sub(1));
+    }
+    environment.evidence_runs.first()
 }
 
 #[derive(serde::Serialize)]

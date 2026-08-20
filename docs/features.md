@@ -164,8 +164,11 @@ a possible duplicate. Content that tries to talk a future turn out of its
 permission gates, and a command that collides with a skill this loop did not
 install, are refused outright rather than prompted for.
 
-**Evaluation.** Each candidate gets a positive case reproducing the observed
-task and a regression case an unrelated turn must not be hijacked by. Every arm
+**Evaluation.** Each ordinary candidate gets a positive case reproducing the
+observed task and a regression case an unrelated turn must not be hijacked by.
+An explicit improvement keeps each selected evidence run as an independent
+positive case, plus that unrelated regression case; it never unions unrelated
+prompts or tool requirements. Every arm
 of every case runs in its own disposable copy of the workspace the candidate
 was learned in, and all of those copies are made from the same starting state
 *before* any arm runs — the baseline never hands its mutated files to the
@@ -234,6 +237,12 @@ timestamp, keyed by the installed content hash. Nothing later rewrites it: an
 update writes a new record, and a rollback surfaces the restored version's own
 provenance, so a historical run's evidence stays true.
 
+An automatic update candidate freezes the exact matched parent descriptor when
+it is staged — instructions, title, scope, tools, and requirements — so its
+baseline is the version that produced the evidence. If that parent is no
+longer active, staging supersedes the candidate instead of retargeting it to a
+newer version.
+
 **Quality and improvement.** Settings shows quality for the exact active
 command, scope, and skill hash. **Healthy** means at least three
 verification-bearing runs with no hard negative signal; **Needs attention** is
@@ -255,6 +264,13 @@ structured capability changes, then uses the same real-isolated baseline vs
 candidate evaluation, digest-bound approval, versioned promotion, and rollback
 path. The active skill is never edited in place, and activation policy/pinning
 survive promotion because they belong to the stable skill identity.
+
+Cancelled rows are visible in quality history but cannot be selected as
+improvement evidence. A correction stores the corrected run's bounded evidence
+on the original version-specific row, so reflection receives both the failure
+and the successful corrected procedure even when the correction turn did not
+invoke the skill. Version history reports uses, failures, and corrections per
+SHA.
 
 **How approval works.** There is no "approved" flag a window can set. When you
 install a candidate, the app raises its ordinary permission prompt describing

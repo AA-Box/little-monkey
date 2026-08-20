@@ -524,6 +524,10 @@ pub struct EvaluationCase {
     /// evidence that the procedure works. See [`score_evaluation`].
     #[serde(default)]
     pub verification_required: bool,
+    /// Whether the observed evidence changed files and needs a pre-task
+    /// starting-state check before this case runs.
+    #[serde(default)]
+    pub observed_mutation: bool,
 }
 
 /// Everything a runtime needs to execute one evaluation, handed out by the
@@ -587,6 +591,10 @@ pub struct EvaluationEnvironment {
     /// shell created, changed or deleted, so its starting state cannot be
     /// shown to be the task — see [`PreTaskState::complete`].
     pub used_shell: bool,
+    /// Bounded evidence in evaluation-case order. Multi-run improvements use
+    /// the matching run's checkpoint for each case rather than reusing the
+    /// first selected run's starting state.
+    pub evidence_runs: Vec<RunEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -676,6 +684,15 @@ pub struct EffectivenessRecord {
     pub failure_signature: Option<String>,
     #[serde(default)]
     pub user_corrected: bool,
+    /// The later run in which the user supplied a correction for this use.
+    /// Kept on the original version-specific row so the correction remains
+    /// attributable even when it did not invoke the learned skill again.
+    #[serde(default)]
+    pub correction_run_id: Option<String>,
+    #[serde(default)]
+    pub correction_evidence: Option<RunEvidence>,
+    #[serde(default)]
+    pub corrected_at_unix_ms: Option<u64>,
     pub recorded_at_unix_ms: u64,
     /// Bounded durable evidence for an improvement flow. Older rows may not
     /// have this field; they remain useful telemetry but are not selectable as
@@ -769,6 +786,14 @@ pub struct SkillVersionHistory {
     pub parent_sha256: Option<String>,
     pub promoted_at_unix_ms: u64,
     pub evaluation_ids: Vec<String>,
+    #[serde(default)]
+    pub uses: usize,
+    #[serde(default)]
+    pub failures: usize,
+    #[serde(default)]
+    pub corrections: usize,
+    #[serde(default)]
+    pub last_used_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1557,7 +1582,10 @@ fn quality_summary_for(
         .filter(|entry| entry.outcome == RunOutcome::Cancelled)
         .count();
     let corrections = rows.iter().filter(|entry| entry.user_corrected).count();
-    let improvement_evidence_count = rows.iter().filter(|entry| entry.evidence.is_some()).count();
+    let improvement_evidence_count = rows
+        .iter()
+        .filter(|entry| entry.outcome != RunOutcome::Cancelled && entry.evidence.is_some())
+        .count();
 
     let mut signatures = BTreeMap::<String, usize>::new();
     for signature in rows
@@ -1700,6 +1728,27 @@ fn quality_summary_for(
             .max(),
         open_improvement_candidate_id,
     }
+}
+
+fn version_metrics(
+    state: &StoreState,
+    command: &str,
+    scope: SkillScope,
+    skill_sha256: &str,
+) -> (usize, usize, usize, Option<u64>) {
+    let rows = state
+        .effectiveness
+        .iter()
+        .filter(|entry| {
+            entry.command == command && entry.scope == scope && entry.skill_sha256 == skill_sha256
+        })
+        .collect::<Vec<_>>();
+    (
+        rows.len(),
+        rows.iter().filter(|entry| entry.failed()).count(),
+        rows.iter().filter(|entry| entry.user_corrected).count(),
+        rows.iter().map(|entry| entry.recorded_at_unix_ms).max(),
+    )
 }
 
 /// Durable, backend-owned learning store. Authoritative state lives on disk;
@@ -1848,18 +1897,32 @@ impl SkillLearningStore {
             .get(evaluation_id)
             .ok_or_else(|| SkillError::NotFound(format!("evaluation {evaluation_id}")))?;
         let candidate = candidate_of(&state, &record.candidate_id)?;
-        let evidence = candidate.evidence.as_ref();
+        let evidence = if candidate.evidence_runs.is_empty() {
+            candidate.evidence.iter().collect::<Vec<_>>()
+        } else {
+            candidate.evidence_runs.iter().collect::<Vec<_>>()
+        };
+        let checkpoint_id = evidence
+            .iter()
+            .find(|entry| entry.mutated_the_workspace())
+            .and_then(|entry| entry.checkpoint_id.clone())
+            .or_else(|| {
+                evidence
+                    .first()
+                    .and_then(|entry| entry.checkpoint_id.clone())
+            });
         Ok(EvaluationEnvironment {
             workspace: candidate.workspace_path.clone().map(PathBuf::from),
-            checkpoint_id: evidence.and_then(|evidence| evidence.checkpoint_id.clone()),
+            checkpoint_id,
             // Both read from the evidence rather than from the checkpoint: a
             // read-only turn's checkpoint is discarded the moment it ends (it
             // recorded no file), while its `checkpoint_linked` event survives
             // in the ledger. Asking that deleted checkpoint what the run did
             // would refuse every read-only candidate — the very class the
             // auto-promote-safe policy exists for.
-            requires_pre_task_state: evidence.is_some_and(RunEvidence::mutated_the_workspace),
-            used_shell: evidence.is_some_and(RunEvidence::used_shell),
+            requires_pre_task_state: evidence.iter().any(|entry| entry.mutated_the_workspace()),
+            used_shell: evidence.iter().any(|entry| entry.used_shell()),
+            evidence_runs: evidence.into_iter().cloned().collect(),
         })
     }
 
@@ -1910,6 +1973,7 @@ impl SkillLearningStore {
                 entry.command == command
                     && entry.scope == scope
                     && entry.skill_sha256 == active_sha256
+                    && entry.outcome != RunOutcome::Cancelled
                     && entry.evidence.is_some()
             })
             .collect::<Vec<_>>();
@@ -2593,13 +2657,21 @@ impl SkillLearningStore {
         let descriptors = manager.discover(workspace.as_deref(), signed_packages)?;
         let (dedup, dedup_detail, parent) =
             classify_dedup(&validated, scope, &descriptors, &state, candidate_id);
-        if existing.source_kind == LearningSourceKind::ManualImprovement
-            && existing.parent_skill_sha256 != parent.as_ref().map(|entry| entry.sha256.clone())
-        {
-            return Err(SkillError::Conflict(
-                "the active skill changed since this improvement started; regenerate the improvement"
-                    .to_string(),
-            ));
+        if let Some(expected_parent) = existing.parent_skill_sha256.as_deref() {
+            if parent.as_ref().map(|entry| entry.sha256.as_str()) != Some(expected_parent) {
+                let entry = candidate_mut(&mut state, candidate_id)?;
+                entry.status = CandidateStatus::Superseded;
+                entry.rejection_reason = Some(
+                    "the active skill changed since this candidate was created; regenerate the improvement"
+                        .to_string(),
+                );
+                entry.updated_at_unix_ms = now_unix_ms();
+                self.save(&state)?;
+                return Err(SkillError::Conflict(
+                    "the active skill changed since this candidate was created; regenerate the improvement"
+                        .to_string(),
+                ));
+            }
         }
         let mode = state.mode;
 
@@ -2622,6 +2694,22 @@ impl SkillLearningStore {
         candidate.allowed_tools = validated.allowed_tools.clone();
         candidate.requirements = validated.requirements.clone();
         candidate.parent_skill_sha256 = parent.as_ref().map(|entry| entry.sha256.clone());
+        candidate.parent_skill_content = parent
+            .as_ref()
+            .map(|entry| bounded_text(&entry.instructions, MAX_SKILL_CONTENT_BYTES));
+        candidate.parent_skill_title = parent.as_ref().map(|entry| entry.title.clone());
+        candidate.parent_scope = parent.as_ref().map(|entry| entry.scope);
+        candidate.parent_allowed_tools = parent
+            .as_ref()
+            .map(|entry| entry.allowed_tools.clone())
+            .unwrap_or_default();
+        candidate.parent_requirements = parent
+            .as_ref()
+            .map(|entry| CandidateRequirements {
+                bins: entry.bins.clone(),
+                env: entry.env.clone(),
+            })
+            .unwrap_or_default();
         candidate.candidate_sha256 = preview.sha256.clone();
         candidate.approval_digest = Some(preview.approval_digest.clone());
         candidate.staging_path = Some(staging.to_string_lossy().to_string());
@@ -2699,10 +2787,17 @@ impl SkillLearningStore {
             baseline_sha256: entry.parent_skill_sha256.clone(),
             cases,
             workspace_path: entry.workspace_path.clone(),
-            observed_mutation: entry
-                .evidence
-                .as_ref()
-                .is_some_and(RunEvidence::mutated_the_workspace),
+            observed_mutation: if entry.evidence_runs.is_empty() {
+                entry
+                    .evidence
+                    .as_ref()
+                    .is_some_and(RunEvidence::mutated_the_workspace)
+            } else {
+                entry
+                    .evidence_runs
+                    .iter()
+                    .any(RunEvidence::mutated_the_workspace)
+            },
         };
         self.save(&state)?;
         Ok(plan)
@@ -3134,6 +3229,9 @@ impl SkillLearningStore {
             tool_failures,
             failure_signature: failure_signature.clone(),
             user_corrected: false,
+            correction_run_id: None,
+            correction_evidence: None,
+            corrected_at_unix_ms: None,
             recorded_at_unix_ms: now_unix_ms(),
             evidence: evidence.map(bounded_evidence),
         });
@@ -3180,7 +3278,7 @@ impl SkillLearningStore {
                 failure_signature: Some(signature),
                 corrected_execution_succeeded: false,
             },
-            evidence.cloned(),
+            evidence.cloned().into_iter().collect(),
         );
         self.save(&state)?;
         Ok(Some(candidate))
@@ -3267,6 +3365,9 @@ impl SkillLearningStore {
         for entry in state.effectiveness.iter_mut() {
             if entry.run_id == previous.run_id && entry.skill_sha256 == previous.skill_sha256 {
                 entry.user_corrected = true;
+                entry.correction_run_id = Some(correction_run_id.to_string());
+                entry.correction_evidence = corrected.evidence.as_ref().map(bounded_evidence);
+                entry.corrected_at_unix_ms = Some(now_unix_ms());
             }
         }
         if !corrected.succeeded
@@ -3279,6 +3380,15 @@ impl SkillLearningStore {
             // of a better procedure.
             self.save(&state)?;
             return Ok(None);
+        }
+        let mut evidence_runs = previous.evidence.clone().into_iter().collect::<Vec<_>>();
+        if let Some(evidence) = corrected.evidence.clone() {
+            if !evidence_runs
+                .iter()
+                .any(|entry| entry.run_id == evidence.run_id)
+            {
+                evidence_runs.push(bounded_evidence(&evidence));
+            }
         }
         let candidate = self.open_update_candidate(
             &mut state,
@@ -3297,7 +3407,7 @@ impl SkillLearningStore {
                 failure_signature: None,
                 corrected_execution_succeeded: true,
             },
-            corrected.evidence.clone(),
+            evidence_runs,
         );
         self.save(&state)?;
         Ok(Some(candidate))
@@ -3311,7 +3421,7 @@ impl SkillLearningStore {
         kind: LearningSourceKind,
         summary: String,
         correction: CorrectionEvidence,
-        evidence: Option<RunEvidence>,
+        evidence_runs: Vec<RunEvidence>,
     ) -> LearningCandidate {
         let now = now_unix_ms();
         let workspace_path = state
@@ -3323,6 +3433,7 @@ impl SkillLearningStore {
                     .get(&provenance.candidate_id)
                     .and_then(|candidate| candidate.workspace_path.clone())
             });
+        let evidence = evidence_runs.first().cloned();
         let candidate = LearningCandidate {
             candidate_id: format!("learn-{}", Uuid::new_v4().simple()),
             scope,
@@ -3364,18 +3475,18 @@ impl SkillLearningStore {
                 .as_ref()
                 .map(|entry| entry.user_text.clone())
                 .unwrap_or_default(),
-            observed_tools: evidence
-                .as_ref()
-                .map(|entry| {
+            observed_tools: evidence_runs
+                .iter()
+                .flat_map(|entry| {
                     entry
-                        .successful_tools()
+                        .tool_calls
                         .iter()
+                        .filter(|call| call.succeeded)
                         .map(|call| call.tool_name.clone())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect()
                 })
-                .unwrap_or_default(),
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
             evidence,
             correction: Some(correction),
             approval_id: None,
@@ -3384,7 +3495,7 @@ impl SkillLearningStore {
             parent_scope: None,
             parent_allowed_tools: Vec::new(),
             parent_requirements: CandidateRequirements::default(),
-            evidence_runs: Vec::new(),
+            evidence_runs,
         };
         prune_candidates(state);
         state
@@ -3479,6 +3590,8 @@ impl SkillLearningStore {
                     .and_then(|entry| entry.parent_skill_sha256.clone());
             }
             let native_history = manager.history(scope, workspace, &descriptor.command)?;
+            let (active_uses, active_failures, active_corrections, active_last_used) =
+                version_metrics(&state, &descriptor.command, scope, &descriptor.sha256);
             let mut history = vec![SkillVersionHistory {
                 sha256: descriptor.sha256.clone(),
                 version: descriptor.version.clone(),
@@ -3486,9 +3599,15 @@ impl SkillLearningStore {
                 parent_sha256: provenance.parent_skill_sha256.clone(),
                 promoted_at_unix_ms: provenance.promoted_at_unix_ms,
                 evaluation_ids: provenance.evaluation_ids.clone(),
+                uses: active_uses,
+                failures: active_failures,
+                corrections: active_corrections,
+                last_used_at_unix_ms: active_last_used,
             }];
             for archived in native_history {
                 if let Some(old_provenance) = state.provenance.get(&archived.sha256) {
+                    let (uses, failures, corrections, last_used_at_unix_ms) =
+                        version_metrics(&state, &descriptor.command, scope, &archived.sha256);
                     history.push(SkillVersionHistory {
                         sha256: archived.sha256,
                         version: archived.version,
@@ -3496,6 +3615,10 @@ impl SkillLearningStore {
                         parent_sha256: old_provenance.parent_skill_sha256.clone(),
                         promoted_at_unix_ms: old_provenance.promoted_at_unix_ms,
                         evaluation_ids: old_provenance.evaluation_ids.clone(),
+                        uses,
+                        failures,
+                        corrections,
+                        last_used_at_unix_ms,
                     });
                 }
             }
@@ -3760,18 +3883,29 @@ impl SkillLearningStore {
         arms: &[String],
         pre_task: &PreTaskState,
     ) -> Result<Vec<(String, PathBuf)>, SkillError> {
+        let pre_tasks = arms
+            .iter()
+            .map(|arm| (arm.clone(), pre_task.clone()))
+            .collect::<BTreeMap<_, _>>();
+        self.create_eval_sandboxes_with_pre_tasks(evaluation_id, source, arms, &pre_tasks)
+    }
+
+    /// Builds evaluation arms from their own observed-run starting states.
+    /// Multi-run improvements use this instead of silently applying the first
+    /// selected run's checkpoint to every independent case.
+    pub fn create_eval_sandboxes_with_pre_tasks(
+        &self,
+        evaluation_id: &str,
+        source: &Path,
+        arms: &[String],
+        pre_tasks: &BTreeMap<String, PreTaskState>,
+    ) -> Result<Vec<(String, PathBuf)>, SkillError> {
         validate_path_segment(evaluation_id, "an evaluation id")?;
         if !source.is_dir() {
             return Err(SkillError::Invalid(format!(
                 "{} is not a directory that can be copied for evaluation",
                 source.display()
             )));
-        }
-        if !pre_task.complete {
-            return Err(SkillError::Invalid(
-                "the observed run's starting state cannot be fully reproduced, so an isolated evaluation of it would not be measuring the task it claims to"
-                    .to_string(),
-            ));
         }
         let root = self.root.join(EVAL_DIR).join(evaluation_id);
         let _ = remove_tree(&root);
@@ -3780,6 +3914,17 @@ impl SkillLearningStore {
         let mut registered = Vec::new();
         for arm in arms {
             validate_path_segment(arm, "an evaluation arm")?;
+            let pre_task = pre_tasks.get(arm).ok_or_else(|| {
+                SkillError::Invalid(format!(
+                    "no starting state was supplied for evaluation arm {arm}"
+                ))
+            })?;
+            if !pre_task.complete {
+                return Err(SkillError::Invalid(
+                    "the observed run's starting state cannot be fully reproduced, so an isolated evaluation of it would not be measuring the task it claims to"
+                        .to_string(),
+                ));
+            }
             let target = root.join(arm);
             ensure_directory(&target)?;
             let mut budget = CopyBudget { files: 0, bytes: 0 };
@@ -4280,6 +4425,8 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), SkillError> {
 struct ParentSkill {
     sha256: String,
     version: String,
+    title: String,
+    instructions: String,
     allowed_tools: Vec<String>,
     bins: BTreeSet<String>,
     env: BTreeSet<String>,
@@ -4394,6 +4541,8 @@ fn classify_dedup(
         let parent = ParentSkill {
             sha256: descriptor.sha256.clone(),
             version: descriptor.version.clone(),
+            title: descriptor.name.clone(),
+            instructions: descriptor.instructions.clone(),
             allowed_tools: descriptor.allowed_tools.clone(),
             bins: descriptor.requirements.bins.clone(),
             env: descriptor.requirements.env.clone(),
@@ -4679,10 +4828,88 @@ fn assess_policy(
     }
 }
 
-/// Builds the reproducible evaluation cases from the observed run: one
-/// positive case replaying the task the candidate claims to generalize, and
-/// one regression case an unrelated turn must not be hijacked by.
+/// Builds reproducible evaluation cases from the bounded evidence. Explicit
+/// improvements keep every selected run as its own case, so a fix is checked
+/// against each failure and each verified behavior instead of an artificial
+/// union of prompts and tools.
 fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
+    if !candidate.evidence_runs.is_empty() {
+        let mut cases = candidate
+            .evidence_runs
+            .iter()
+            .enumerate()
+            .map(|(index, evidence)| {
+                let final_verification = evidence.final_verification();
+                let requires_verification = final_verification.is_some()
+                    || evidence.terminal_outcome() == RunOutcome::Failure;
+                let repaired = evidence.repaired();
+                let name = if repaired
+                    || evidence.terminal_outcome() == RunOutcome::Failure
+                    || final_verification == Some(false)
+                {
+                    format!(
+                        "Repairs evidence run {} for /{}",
+                        evidence.run_id, candidate.proposed_command
+                    )
+                } else if final_verification == Some(true) {
+                    format!("Preserves verified behavior from run {}", evidence.run_id)
+                } else {
+                    format!("Reproduces evidence run {}", evidence.run_id)
+                };
+                let case_id = if candidate.evidence_runs.len() == 1 {
+                    "positive".to_string()
+                } else {
+                    format!("improvement-{}", index + 1)
+                };
+                EvaluationCase {
+                    case_id,
+                    kind: EvaluationCaseKind::Positive,
+                    name,
+                    prompt: if evidence.user_text.trim().is_empty() {
+                        candidate.description.clone()
+                    } else {
+                        evidence.user_text.clone()
+                    },
+                    required_tools: evidence
+                        .successful_tools()
+                        .iter()
+                        .map(|call| call.tool_name.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    forbidden_tools: Vec::new(),
+                    verification_required: requires_verification,
+                    observed_mutation: evidence.mutated_the_workspace(),
+                }
+            })
+            .collect::<Vec<_>>();
+        cases.push(EvaluationCase {
+            case_id: "regression".to_string(),
+            kind: EvaluationCaseKind::Regression,
+            name: "Leaves an unrelated turn alone".to_string(),
+            prompt: "Reply with the single word OK. This turn needs no files, commands, or tools."
+                .to_string(),
+            required_tools: Vec::new(),
+            forbidden_tools: candidate
+                .observed_tools
+                .iter()
+                .cloned()
+                .chain([
+                    "write_file".to_string(),
+                    "edit_file".to_string(),
+                    "run_shell".to_string(),
+                ])
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            verification_required: false,
+            observed_mutation: false,
+        });
+        return cases;
+    }
+
+    // Legacy and automatic candidates created before bounded multi-run
+    // evidence existed retain the original single observed case.
     let prompt = if candidate.observed_prompt.trim().is_empty() {
         candidate.description.clone()
     } else {
@@ -4713,6 +4940,10 @@ fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
             required_tools: required,
             forbidden_tools: Vec::new(),
             verification_required,
+            observed_mutation: candidate
+                .evidence
+                .as_ref()
+                .is_some_and(RunEvidence::mutated_the_workspace),
         },
         EvaluationCase {
             case_id: "regression".to_string(),
@@ -4734,6 +4965,7 @@ fn evaluation_cases(candidate: &LearningCandidate) -> Vec<EvaluationCase> {
                 .into_iter()
                 .collect(),
             verification_required: false,
+            observed_mutation: false,
         },
     ]
 }
@@ -6588,7 +6820,11 @@ mod tests {
                     verification_passed: Some(true),
                     tool_failures: Vec::new(),
                 },
-                None,
+                Some(&evidence_from_events(
+                    "run-5",
+                    "the original procedure",
+                    &verified_procedure_events(),
+                )),
             )
             .unwrap();
         let update = store
@@ -6620,6 +6856,18 @@ mod tests {
         );
         assert_eq!(staged.dedup, Some(DedupOutcome::UpdateExisting));
         assert_eq!(staged.parent_skill_sha256, Some(original_sha.clone()));
+        assert!(staged
+            .parent_skill_content
+            .as_deref()
+            .is_some_and(|content| content.contains("Version one.")));
+        assert_eq!(
+            staged.parent_skill_title.as_deref(),
+            Some("Retry wrapper for retry-wrapper")
+        );
+        assert_eq!(staged.parent_allowed_tools, vec!["edit_file", "read_file"]);
+        assert_eq!(staged.parent_scope, Some(SkillScope::Global));
+        assert!(staged.parent_requirements.bins.is_empty());
+        assert!(staged.parent_requirements.env.is_empty());
         pass_evaluation(&store, &update.candidate_id);
         store
             .promote(
@@ -8023,6 +8271,7 @@ mod tests {
                 checkpoint_id: checkpoint.map(str::to_string),
                 requires_pre_task_state: mutated,
                 used_shell: shell,
+                evidence_runs: Vec::new(),
             };
 
         // Read-only, and its checkpoint was discarded at turn end because it
@@ -8282,7 +8531,11 @@ mod tests {
                     verification_passed: Some(true),
                     tool_failures: Vec::new(),
                 },
-                None,
+                Some(&evidence_from_events(
+                    "run-5",
+                    "the original procedure",
+                    &verified_procedure_events(),
+                )),
             )
             .unwrap();
 
@@ -8355,7 +8608,11 @@ mod tests {
                     succeeded: true,
                     verification_passed: Some(true),
                     event_ids: vec!["event-9".to_string()],
-                    evidence: None,
+                    evidence: Some(evidence_from_events(
+                        "run-9",
+                        "that is wrong, use the helper instead",
+                        &verified_procedure_events(),
+                    )),
                 },
             )
             .unwrap()
@@ -8365,6 +8622,17 @@ mod tests {
         assert_eq!(correction.previous_run_id, "run-5");
         assert_eq!(correction.correction_run_id, "run-9");
         assert!(correction.corrected_execution_succeeded);
+        let row = restarted
+            .effectiveness()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.run_id == "run-5")
+            .unwrap();
+        assert_eq!(row.correction_run_id.as_deref(), Some("run-9"));
+        assert_eq!(row.correction_evidence.as_ref().unwrap().run_id, "run-9");
+        assert_eq!(update.evidence_runs.len(), 2);
+        assert_eq!(update.evidence_runs[0].run_id, "run-5");
+        assert_eq!(update.evidence_runs[1].run_id, "run-9");
     }
 
     #[test]
@@ -9206,6 +9474,13 @@ mod tests {
             .unwrap();
         assert_eq!(summary.uses, 3);
         assert_eq!(summary.failures, 2);
+        let restored_history = summary
+            .history
+            .iter()
+            .find(|entry| entry.sha256 == first_sha)
+            .unwrap();
+        assert_eq!(restored_history.uses, 3);
+        assert_eq!(restored_history.failures, 2);
     }
 
     fn effectiveness_row(
@@ -9228,6 +9503,9 @@ mod tests {
                 .is_some_and(|passed| !passed)
                 .then(|| "verification:failed".to_string()),
             user_corrected: false,
+            correction_run_id: None,
+            correction_evidence: None,
+            corrected_at_unix_ms: None,
             recorded_at_unix_ms,
             evidence: None,
         }
@@ -9373,6 +9651,16 @@ mod tests {
             sha256: descriptor.sha256.clone(),
         }];
         store.record_run(&use_evidence, Some("session-1")).unwrap();
+        let mut cancelled = use_evidence.clone();
+        cancelled.run_id = "cancelled-use".to_string();
+        cancelled.completed = false;
+        cancelled.cancelled = true;
+        store.record_run(&cancelled, Some("session-1")).unwrap();
+        assert!(!store
+            .improvement_evidence(SkillScope::Global, &descriptor.command, &descriptor.sha256)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.run_id == "cancelled-use"));
         store.set_mode(LearningMode::Off).unwrap();
 
         let parent = ImprovementParent {
@@ -9413,5 +9701,153 @@ mod tests {
             store.begin_improvement(&parent, &["missing".to_string()]),
             Err(SkillError::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn automatic_update_keeps_its_parent_snapshot_and_cannot_retarget() {
+        let directory = TestDirectory::new("automatic-parent");
+        let workspace_directory = TestDirectory::new("automatic-parent-workspace");
+        let workspace = workspace_directory.path();
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let detected = store
+            .detect(
+                &evidence_from_events("run-1", "add retries", &verified_procedure_events()),
+                SkillScope::Workspace,
+                Some(workspace),
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .propose(
+                &detected.candidate_id,
+                None,
+                &workspace_proposal("retry-wrapper", "Version one."),
+                &manager,
+                Some(workspace),
+                &[],
+            )
+            .unwrap();
+        pass_evaluation(&store, &detected.candidate_id);
+        store
+            .promote(
+                &detected.candidate_id,
+                Some(&approve(&store, &detected.candidate_id)),
+                false,
+                &manager,
+                Some(workspace),
+            )
+            .unwrap();
+        let original_sha = manager
+            .discover(Some(workspace), &[])
+            .unwrap()
+            .into_iter()
+            .find(|entry| {
+                entry.command == "retry-wrapper"
+                    && descriptor_scope(entry) == Some(SkillScope::Workspace)
+            })
+            .unwrap()
+            .sha256;
+        for run_id in ["failure-1", "failure-2"] {
+            let evidence = evidence_from_events(
+                run_id,
+                "same task",
+                &run_that_used(
+                    run_id,
+                    "retry-wrapper",
+                    &original_sha,
+                    Some("connection reset"),
+                ),
+            );
+            store.record_run(&evidence, Some("session-a")).unwrap();
+        }
+        let update = store
+            .list_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.source_kind == LearningSourceKind::RepeatedFailureResolution
+            })
+            .unwrap();
+
+        let replacement = TestDirectory::new("automatic-parent-replacement");
+        fs::write(
+            replacement.path().join("SKILL.md"),
+            "---\nname: Retry wrapper\ndescription: Replacement\ncommand: retry-wrapper\nversion: 2.0.0\n---\n\nVersion two.\n",
+        )
+        .unwrap();
+        let preview = manager
+            .preview_local(replacement.path(), SkillScope::Workspace, Some(workspace))
+            .unwrap();
+        manager
+            .install_local(
+                replacement.path(),
+                SkillScope::Workspace,
+                Some(workspace),
+                &preview.approval_digest,
+                true,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.propose(
+                &update.candidate_id,
+                None,
+                &workspace_proposal("retry-wrapper", "Version three."),
+                &manager,
+                Some(workspace),
+                &[],
+            ),
+            Err(SkillError::Conflict(_))
+        ));
+        let stale = store.candidate(&update.candidate_id).unwrap();
+        assert_eq!(stale.status, CandidateStatus::Superseded);
+        assert_eq!(stale.parent_skill_sha256, Some(original_sha));
+    }
+
+    #[test]
+    fn improvement_evaluation_keeps_selected_runs_as_independent_cases() {
+        let directory = TestDirectory::new("multi-evidence-cases");
+        let store = store(&directory);
+        let mut candidate = store
+            .detect(
+                &evidence_from_events("seed", "seed procedure", &verified_procedure_events()),
+                SkillScope::Global,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        candidate.proposed_command = "retry-wrapper".to_string();
+        candidate.description = "Improve retry behavior".to_string();
+        let failed = evidence_from_events(
+            "failed-run",
+            "repair the uploader",
+            &run_that_used(
+                "failed-run",
+                "retry-wrapper",
+                &"a".repeat(64),
+                Some("connection reset"),
+            ),
+        );
+        let successful = evidence_from_events(
+            "successful-run",
+            "preserve the downloader",
+            &run_that_used("successful-run", "retry-wrapper", &"a".repeat(64), None),
+        );
+        candidate.evidence_runs = vec![failed.clone(), successful.clone()];
+        candidate.evidence = Some(failed);
+        candidate.observed_tools = vec!["edit_file".to_string(), "read_file".to_string()];
+
+        let cases = evaluation_cases(&candidate);
+        assert_eq!(cases.len(), 3);
+        assert_eq!(cases[0].case_id, "improvement-1");
+        assert_eq!(cases[1].case_id, "improvement-2");
+        assert_eq!(cases[0].prompt, "repair the uploader");
+        assert_eq!(cases[1].prompt, "preserve the downloader");
+        assert!(cases[0].verification_required);
+        assert!(cases[1].verification_required);
+        assert_eq!(cases[0].required_tools, Vec::<String>::new());
+        assert_eq!(cases[1].required_tools, vec!["edit_file"]);
+        assert_eq!(cases[2].kind, EvaluationCaseKind::Regression);
     }
 }
