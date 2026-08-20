@@ -462,9 +462,12 @@ interface Props {
   /** Sidebar node to render the settings rail into. Null until the sidebar has
    *  mounted, and in Chat, where there is no rail to show. */
   railSlot: HTMLElement | null;
+  /** Entry points from the shared plugin card back to Studio's libraries. */
+  onOpenModels?: () => void;
+  onOpenTools?: () => void;
 }
 
-export function StudioPanel({ mode, railSlot }: Props) {
+export function StudioPanel({ mode, railSlot, onOpenModels, onOpenTools }: Props) {
   const { t } = useT();
   const [status, setStatus] = useState<GenerationEngineStatus | null>(null);
   /** What the running engine says it supports. Null until one has run — the
@@ -600,6 +603,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const remote = isRemoteModelId(selected?.id ?? null);
   const mlxModelSelected = !remote && selected?.engine === "mlx_video";
   const mfluxModelSelected = !remote && selected?.engine === "mflux_image";
+  const loraSupported =
+    !remote &&
+    !mfluxModelSelected &&
+    !isSpeechTask(task) &&
+    engineSupports(capabilities, "lora");
   const mlxRuntimeReady = useRuntimeHubStore((state) =>
     state.runtimes.some((runtime) => runtime.descriptor.kind === "mlx" && runtime.canInfer),
   );
@@ -1136,7 +1144,9 @@ export function StudioPanel({ mode, railSlot }: Props) {
       increaseRefIndex:
         conditioning.has("reference") && refImages.length > 1 && numberRefImages,
       // Blank rows are a half-typed path, not a LoRA the user meant.
-      loras: loras.filter((lora) => lora.path.trim().length > 0),
+      loras: loraSupported
+        ? loras.filter((lora) => lora.path.trim().length > 0)
+        : [],
       componentOverrides: overrides,
     });
   };
@@ -2219,23 +2229,63 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </>
           )}
 
-          {!isSpeechTask(task) && !remote && !mfluxModelSelected && (
-            <details className="rounded border border-border p-3">
-              <summary className="cursor-pointer text-xs font-medium">
-                {t("Studio.lora.title")}
-              </summary>
-              <div className="mt-3 grid [&>*]:min-w-0">
-                <LoraStack
-                  loras={loras}
-                  library={loraLibrary}
-                  onChange={setLoras}
-                  showHighNoise={selected.components.some(
-                    (component) => component.slot === "high_noise_diffusion_model",
-                  )}
-                />
+          <SettingsCard title={t("Studio.plugins.title")} hint={t("Studio.plugins.hint")}>
+            {isSpeechTask(task) ? (
+              <div className="grid gap-2">
+                <p className="text-[11px] text-faint">{t("Studio.plugins.audioHint")}</p>
+                {selected.components.some((component) =>
+                  ["audio_vae", "mmproj", "vocoder"].includes(component.slot),
+                ) ? (
+                  <div className="grid gap-1 rounded bg-background/60 p-2">
+                    <span className="text-[11px] font-medium text-muted">
+                      {t("Studio.plugins.audioComponents")}
+                    </span>
+                    {selected.components
+                      .filter((component) =>
+                        ["audio_vae", "mmproj", "vocoder"].includes(component.slot),
+                      )
+                      .map((component) => (
+                        <span key={component.slot} className="text-[11px] text-faint">
+                          {t(`Studio.slot.${component.slot}`)}
+                        </span>
+                      ))}
+                  </div>
+                ) : null}
+                {onOpenModels && (
+                  <Button size="sm" variant="secondary" onClick={onOpenModels}>
+                    {t("Studio.plugins.openModels")}
+                  </Button>
+                )}
               </div>
-            </details>
-          )}
+            ) : loraSupported ? (
+              <LoraStack
+                loras={loras}
+                library={loraLibrary}
+                onChange={setLoras}
+                showHighNoise={selected.components.some(
+                  (component) => component.slot === "high_noise_diffusion_model",
+                )}
+              />
+            ) : (
+              <p className="text-[11px] text-faint">
+                {remote
+                  ? t("Studio.plugins.remoteHint")
+                  : mfluxModelSelected
+                    ? t("Studio.plugins.mfluxHint")
+                    : t("Studio.plugins.loraUnavailable")}
+              </p>
+            )}
+            {loraSupported && onOpenModels && (
+              <Button size="sm" variant="secondary" onClick={onOpenModels}>
+                {t("Studio.plugins.openModels")}
+              </Button>
+            )}
+            {onOpenTools && (
+              <Button size="sm" variant="secondary" onClick={onOpenTools}>
+                {t("Studio.plugins.openTools")}
+              </Button>
+            )}
+          </SettingsCard>
 
           {/* Choosing only. Files are added in the Models tab, and a slot the
               model does not already load is a different model rather than a
