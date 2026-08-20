@@ -2874,6 +2874,15 @@ async function runAgentTurnBody(
   // skills too, not just the ones known up front.
   const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
   const explicitSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command.toLowerCase()));
+  const invokedSkillSnapshots = new Map<string, { sha256: string; sourcePath: string }>();
+  for (const invocation of skillInvocations) {
+    if (invocation.skill.sourcePath) {
+      invokedSkillSnapshots.set(invocation.skill.command.toLowerCase(), {
+        sha256: invocation.skill.contentSha256,
+        sourcePath: invocation.skill.sourcePath,
+      });
+    }
+  }
   const skillPoliciesHydrated = useSkillActivationPolicyStore.getState().hydrated;
   const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
   let rankingSignals = new Map<string, import('./skills').SkillRankingSignals>();
@@ -2890,6 +2899,7 @@ async function runAgentTurnBody(
   const skillToolContext: SkillToolContext = {
     availableSkills,
     invokedCommands: invokedSkillCommands,
+    invokedSkillSnapshots,
     explicitCommands: explicitSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
     rankingSignals,

@@ -19,7 +19,9 @@ export const studioLocale: Record<string, string> = {
   "Studio.mlx.preparing": "Preparing the MLX video service…",
   "Studio.mlx.notReady": "The MLX video service is not ready yet.",
   "Studio.mlx.retry": "Retry MLX setup",
-  "Studio.mflux.notReady": "Install the MFLUX Image Runtime from Settings → Runtime Hub → Components before generating.",
+  "Studio.mflux.preparing": "Preparing the MFLUX Image Runtime…",
+  "Studio.mflux.notReady": "The MFLUX Image Runtime could not be prepared automatically.",
+  "Studio.mflux.retry": "Retry MFLUX setup",
   "Studio.add.speechHint":
     "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",
