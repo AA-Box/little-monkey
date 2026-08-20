@@ -1679,10 +1679,12 @@ export async function runAgentTurn(
     }
     // Re-read the profile-owned policy file before each turn so CLI changes
     // converge even when no Tauri event was available to this renderer.
-    await useSkillActivationPolicyStore.getState().refresh();
-    availableSkills = availableSkills.map((candidate) => candidate.policyKey
-      ? { ...candidate, activationPolicy: skillActivationPolicyFor(candidate.policyKey) }
-      : candidate);
+    if (availableSkills.length > 0) {
+      await useSkillActivationPolicyStore.getState().refresh();
+      availableSkills = availableSkills.map((candidate) => candidate.policyKey
+        ? { ...candidate, activationPolicy: skillActivationPolicyFor(candidate.policyKey) }
+        : candidate);
+    }
     const mutationRequired = requiresWorkspaceMutation(
       userText,
       usePermissionStore.getState().mode,
