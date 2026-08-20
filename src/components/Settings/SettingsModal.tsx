@@ -446,7 +446,7 @@ export function SettingsModal({ open, onClose, initialTab, initialTabRequest = 0
 
           <div className="relative min-h-0 flex-1">
             <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-4 bg-gradient-to-b from-background to-transparent" />
-            <div className="h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
+            <div className="settings-controls h-full overflow-y-auto px-6 pb-6 pt-4 [overscroll-behavior:contain]">
               {tab === "local" && <ModelManager />}
               {tab === "ollama" && <OllamaPanel />}
               {selectedProvider && (
