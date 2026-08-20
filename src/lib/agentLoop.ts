@@ -2348,24 +2348,27 @@ async function runTurnGuarded(
       // succeeded must never surface a learning failure as its own.
       await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
       if (cleanlyCompleted) {
-        const scope = await skillLearningClient
+        const runScope = await skillLearningClient
+          .scopeForRun(durable.recorder.runId)
+          .catch(() => null);
+        const captureScope = await skillLearningClient
           .captureEligibility(durable.recorder.runId, userText)
           .catch(() => null);
-        if (scope) {
+        if (captureScope) {
           useSessionStore.getState().addMessage(sessionId, {
             role: 'system',
             content: formatSaveSkillNotice({
               runId: durable.recorder.runId,
               userText,
-              scope,
+              scope: captureScope,
             }),
           });
         }
-        if (scope && durable.reflect !== null) {
+        if (runScope && durable.reflect !== null) {
           const candidate = await learnFromFinishedRun(
             durable.recorder.runId,
             userText,
-            scope,
+            runScope,
             durable.reflect,
             signal,
           );

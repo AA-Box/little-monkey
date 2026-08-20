@@ -324,6 +324,8 @@ export const skillLearningClient = {
     invoke<LearningCandidate | null>("skill_learning_detect", { runId, userText, scope }),
   captureEligibility: (runId: string, userText: string) =>
     invoke<NativeSkillScope | null>("skill_learning_capture_eligibility", { runId, userText }),
+  scopeForRun: (runId: string) =>
+    invoke<NativeSkillScope | null>("skill_learning_scope_for_run", { runId }),
   capture: (runId: string, userText: string) =>
     invoke<LearningCandidate>("skill_learning_capture", { runId, userText }),
   listCandidates: () => invoke<LearningCandidate[]>("skill_learning_list_candidates"),

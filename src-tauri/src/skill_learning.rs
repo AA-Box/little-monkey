@@ -1867,6 +1867,7 @@ impl SkillLearningStore {
         candidate.staging_path = Some(staging.to_string_lossy().to_string());
         candidate.dedup = Some(dedup);
         candidate.dedup_detail = dedup_detail;
+        candidate.evaluation_ids.clear();
         candidate.evaluation_verdict = None;
         candidate.evaluation_summary = None;
         candidate.approval_id = None;
@@ -6246,6 +6247,14 @@ mod tests {
             &detected.candidate_id,
             &proposal("retry-wrapper", "Version the user read and approved."),
         );
+        pass_evaluation(&store, &detected.candidate_id);
+        let old_evaluation_id = store
+            .candidate(&detected.candidate_id)
+            .unwrap()
+            .evaluation_ids
+            .first()
+            .cloned()
+            .expect("initial evaluation is attached to the candidate");
         // The user approves what they were shown…
         let grant = approve(&store, &detected.candidate_id);
         // …and then the candidate is edited and re-staged.
@@ -6258,6 +6267,9 @@ mod tests {
                 "Something else entirely, added afterwards.",
             ),
         );
+        let restaged = store.candidate(&detected.candidate_id).unwrap();
+        assert!(restaged.evaluation_ids.is_empty());
+        assert!(store.evaluation(&old_evaluation_id).is_ok());
         let outcome = store
             .promote(&detected.candidate_id, Some(&grant), false, &manager, None)
             .unwrap();

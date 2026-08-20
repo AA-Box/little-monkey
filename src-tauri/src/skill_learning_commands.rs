@@ -181,6 +181,29 @@ pub async fn skill_learning_capture_eligibility(
     .await
 }
 
+/// Returns the immutable scope recorded on a run. Automatic learning uses
+/// this independently of the manual-save eligibility policy, so tightening
+/// the latter cannot disable automatic detection later.
+#[tauri::command]
+pub async fn skill_learning_scope_for_run(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<SkillScope>, String> {
+    let exists = with_ledger(&app, &state, |ledger| {
+        Ok(ledger.load_run(&run_id)?.is_some())
+    })?;
+    if !exists {
+        return Ok(None);
+    }
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    Ok(Some(if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    }))
+}
+
 /// Explicitly saves a completed run as a candidate. Unlike detection, this
 /// command is user-directed and therefore remains available in `Off` mode;
 /// the backend still reconstructs and validates the run from its own ledger.
