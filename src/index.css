@@ -248,6 +248,17 @@ body {
 
 ::selection { background-color: var(--color-accent-soft); }
 
+/* Settings uses one comfortable height for its interactive controls.
+ * Checkboxes, switches, and multiline fields keep their purpose-built sizes. */
+.settings-controls :where(
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]):not([type="color"]),
+  select,
+  button:not([role="switch"])
+) {
+  height: 2.75rem;
+  min-height: 2.75rem;
+}
+
 :root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after {
   animation-duration: 0.01ms !important;
   transition-duration: 0.01ms !important;
