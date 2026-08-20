@@ -19,6 +19,7 @@ import type { LearningCandidate, CaptureOutcome } from "../../lib/skillLearningC
 function candidate(overrides: Partial<LearningCandidate> = {}): LearningCandidate {
   return {
     candidate_id: "learn-1",
+    scope: "workspace",
     status: "detected",
     proposed_command: "retry-wrapper",
     ...overrides,
@@ -51,7 +52,7 @@ describe("SaveSkillRow", () => {
     await waitFor(() => {
       expect(capture).toHaveBeenCalledWith("run-1", "make this reusable");
       expect(draftCandidate).toHaveBeenCalledWith("learn-1");
-      expect(useSkillLearningFocusStore.getState().candidateId).toBe("learn-1");
+      expect(useSkillLearningFocusStore.getState().focus).toEqual({ kind: "candidate", candidateId: "learn-1" });
       expect(onOpenSettingsTab).toHaveBeenCalledWith("prompts");
     });
   });
@@ -65,7 +66,7 @@ describe("SaveSkillRow", () => {
 
     await waitFor(() => {
       expect(draftCandidate).not.toHaveBeenCalled();
-      expect(useSkillLearningFocusStore.getState().candidateId).toBe("learn-1");
+      expect(useSkillLearningFocusStore.getState().focus).toEqual({ kind: "candidate", candidateId: "learn-1" });
       expect(onOpenSettingsTab).toHaveBeenCalledWith("prompts");
     });
   });
@@ -82,9 +83,13 @@ describe("SaveSkillRow", () => {
 
     expect(await screen.findByText("Already saved as /retry-wrapper")).toBeTruthy();
     expect(draftCandidate).not.toHaveBeenCalled();
-    expect(useSkillLearningFocusStore.getState().candidateId).toBeNull();
+    expect(useSkillLearningFocusStore.getState().focus).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "View skill" }));
+    expect(useSkillLearningFocusStore.getState().focus).toEqual({
+      kind: "installed",
+      scope: "workspace",
+      command: "retry-wrapper",
+    });
     expect(onOpenSettingsTab).toHaveBeenCalledWith("prompts");
   });
 });
-

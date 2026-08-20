@@ -6,6 +6,7 @@ import { draftCandidate } from "../../lib/skillLearningReflection";
 import { skillLearningClient } from "../../lib/skillLearningClient";
 import type { SaveSkillNotice } from "../../lib/skillLearning";
 import { errorMessage } from "../../lib/errors";
+import type { NativeSkillScope } from "../../lib/nativeSkillsClient";
 import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore";
 import type { SettingsTab } from "../Settings/SettingsModal";
 
@@ -18,7 +19,10 @@ export function SaveSkillRow({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [alreadyInstalled, setAlreadyInstalled] = useState<string | null>(null);
+  const [alreadyInstalled, setAlreadyInstalled] = useState<{
+    scope: NativeSkillScope;
+    command: string;
+  } | null>(null);
 
   const save = async () => {
     setBusy(true);
@@ -26,7 +30,10 @@ export function SaveSkillRow({
     try {
       const action = captureAction(await skillLearningClient.capture(notice.runId, notice.userText));
       if (action.kind === "already_installed") {
-        setAlreadyInstalled(action.candidate.proposed_command || "");
+        setAlreadyInstalled({
+          scope: action.candidate.scope,
+          command: action.candidate.proposed_command || "",
+        });
         return;
       }
       if (action.kind === "draft") {
@@ -34,7 +41,7 @@ export function SaveSkillRow({
         if (outcome.error) throw new Error(outcome.error);
         if (outcome.declined) throw new Error("No reusable procedure was found in this run.");
       }
-      useSkillLearningFocusStore.getState().focus(action.candidate.candidate_id);
+      useSkillLearningFocusStore.getState().focusCandidate(action.candidate.candidate_id);
       onOpenSettingsTab?.("prompts");
     } catch (cause) {
       setError(errorMessage(cause));
@@ -50,13 +57,18 @@ export function SaveSkillRow({
         {alreadyInstalled !== null ? (
           <>
             <span className="truncate font-medium text-foreground">
-              Already saved{alreadyInstalled && ` as /${alreadyInstalled}`}
+              Already saved{alreadyInstalled.command && ` as /${alreadyInstalled.command}`}
             </span>
             {onOpenSettingsTab && (
               <button
                 type="button"
                 className="ml-auto shrink-0 cursor-pointer whitespace-nowrap underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-foreground"
-                onClick={() => onOpenSettingsTab("prompts")}
+                onClick={() => {
+                  useSkillLearningFocusStore
+                    .getState()
+                    .focusInstalled(alreadyInstalled.scope, alreadyInstalled.command);
+                  onOpenSettingsTab("prompts");
+                }}
               >
                 View skill
               </button>
@@ -81,4 +93,3 @@ export function SaveSkillRow({
     </div>
   );
 }
-

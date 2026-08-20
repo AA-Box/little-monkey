@@ -1041,7 +1041,7 @@ const LearningRow = memo(function LearningRow({
             type="button"
             className="ml-auto shrink-0 cursor-pointer whitespace-nowrap underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-foreground"
             onClick={() => {
-              useSkillLearningFocusStore.getState().focus(notice.candidateId);
+              useSkillLearningFocusStore.getState().focusCandidate(notice.candidateId);
               onOpenSettingsTab("prompts");
             }}
           >

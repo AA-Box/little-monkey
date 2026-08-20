@@ -140,8 +140,9 @@ export function SkillLearningPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
-  const focusedCandidateId = useSkillLearningFocusStore((state) => state.candidateId);
+  const skillFocus = useSkillLearningFocusStore((state) => state.focus);
   const clearFocus = useSkillLearningFocusStore((state) => state.clear);
+  const [focusedInstalledKey, setFocusedInstalledKey] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -171,13 +172,25 @@ export function SkillLearningPanel() {
     void refresh();
   }, [refresh]);
 
-  /** A run notice's "Review it" button names an exact candidate — open it,
-   * then release the focus so a later normal visit is not hijacked. */
+  /** A learning notice names an exact candidate or installed skill — open it,
+   * scroll it into view when the async Settings data arrives, then release the
+   * focus so a later normal visit is not hijacked. */
   useEffect(() => {
-    if (!focusedCandidateId) return;
-    setExpanded(focusedCandidateId);
+    if (!skillFocus) return;
+    if (skillFocus.kind === "candidate") {
+      setFocusedInstalledKey(null);
+      setExpanded(skillFocus.candidateId);
+      clearFocus();
+      return;
+    }
+
+    const key = `${skillFocus.scope}:${skillFocus.command}`;
+    if (!learned.some((summary) => `${summary.scope}:${summary.command}` === key)) return;
+
+    setFocusedInstalledKey(key);
+    document.getElementById(`learned-skill-${key}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
     clearFocus();
-  }, [focusedCandidateId, clearFocus]);
+  }, [skillFocus, learned, clearFocus]);
 
   const run = async (key: string, operation: () => Promise<unknown>) => {
     setBusy(key);
@@ -573,7 +586,12 @@ export function SkillLearningPanel() {
           learned.map((summary) => (
             <div
               key={`${summary.scope}:${summary.command}:${summary.active_sha256}`}
-              className="rounded-md border border-border bg-background px-2.5 py-2 text-xs"
+              id={`learned-skill-${summary.scope}:${summary.command}`}
+              className={`rounded-md border bg-background px-2.5 py-2 text-xs transition-colors ${
+                focusedInstalledKey === `${summary.scope}:${summary.command}`
+                  ? "border-accent bg-accent/10 ring-2 ring-accent/40"
+                  : "border-border"
+              }`}
             >
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-foreground">/{summary.command}</span>
