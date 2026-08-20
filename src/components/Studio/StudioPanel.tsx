@@ -606,6 +606,10 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const mlxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mlx-auto-install"]));
   const mlxInstallError = useRuntimeHubStore((state) => state.errors["mlx-auto-install"]);
   const ensureMlxRuntime = useRuntimeHubStore((state) => state.ensureMlxRuntime);
+  const mfluxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mflux-auto-install"]));
+  const mfluxInstallError = useRuntimeHubStore((state) => state.errors["mflux-auto-install"]);
+  const ensureMfluxRuntime = useRuntimeHubStore((state) => state.ensureMfluxRuntime);
+  const mfluxAutoInstallAttempted = useRef(false);
 
   // MLX is a managed package shared by chat and Studio. Selecting an MLX video
   // model is enough to prepare it; users should not have to visit Runtime Hub
@@ -732,6 +736,32 @@ export function StudioPanel({ mode, railSlot }: Props) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (!mfluxModelSelected) {
+      mfluxAutoInstallAttempted.current = false;
+      return;
+    }
+    if (
+      status?.mfluxInstalled ||
+      mfluxInstalling ||
+      mfluxInstallError ||
+      mfluxAutoInstallAttempted.current
+    ) {
+      return;
+    }
+    mfluxAutoInstallAttempted.current = true;
+    void ensureMfluxRuntime()
+      .then(() => refresh())
+      .catch(() => {});
+  }, [
+    ensureMfluxRuntime,
+    mfluxInstallError,
+    mfluxInstalling,
+    mfluxModelSelected,
+    refresh,
+    status?.mfluxInstalled,
+  ]);
 
   // A finished run put its images in the store the gallery is read from, and
   // may also have left the engine holding a different model.
@@ -1225,8 +1255,26 @@ export function StudioPanel({ mode, railSlot }: Props) {
       )}
 
       {mfluxModelSelected && !status?.mfluxInstalled && (
-        <div className="mb-3 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
-          {t("Studio.mflux.notReady")}
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          <span>
+            {mfluxInstalling
+              ? t("Studio.mflux.preparing")
+              : mfluxInstallError ?? t("Studio.mflux.notReady")}
+          </span>
+          {!mfluxInstalling && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => {
+                mfluxAutoInstallAttempted.current = true;
+                void ensureMfluxRuntime()
+                  .then(() => refresh())
+                  .catch(() => {});
+              }}
+            >
+              {t("Studio.mflux.retry")}
+            </Button>
+          )}
         </div>
       )}
 
