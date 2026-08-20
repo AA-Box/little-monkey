@@ -21,7 +21,7 @@ import {
   type LearningSettings,
   type LearningSourceKind,
 } from "../../lib/skillLearningClient";
-import { nativeSkillsClient } from "../../lib/nativeSkillsClient";
+import { nativeSkillsClient, type NativeSkillScope } from "../../lib/nativeSkillsClient";
 import { runCandidateEvaluation } from "../../lib/skillLearningEval";
 import { draftCandidate } from "../../lib/skillLearningReflection";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
@@ -30,7 +30,11 @@ import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
 const MODE_LABELS: Array<{ value: LearningMode; label: string; detail: string }> = [
-  { value: "off", label: "Off", detail: "No candidates are detected or stored." },
+  {
+    value: "off",
+    label: "Off",
+    detail: "Automatic candidates are disabled. You can still explicitly save a completed run as a skill.",
+  },
   {
     value: "suggest_only",
     label: "Suggest only",
@@ -52,6 +56,7 @@ const MODE_LABELS: Array<{ value: LearningMode; label: string; detail: string }>
 
 const SOURCE_LABELS: Record<LearningSourceKind, string> = {
   explicit_user_instruction: "you asked for it",
+  manual_run_capture: "you saved the run",
   user_correction: "your correction verified",
   verification_repair: "verification repair",
   successful_novel_procedure: "verified procedure",
@@ -60,6 +65,43 @@ const SOURCE_LABELS: Record<LearningSourceKind, string> = {
 
 function shortHash(value: string | null | undefined): string {
   return value ? `${value.slice(0, 12)}…` : "—";
+}
+
+type CandidateDraft = {
+  id: string;
+  scope: NativeSkillScope;
+  title: string;
+  description: string;
+  command: string;
+  content: string;
+  allowedTools: string;
+  bins: string;
+  env: string;
+};
+
+function listField(values: string[]): string {
+  return values.join(", ");
+}
+
+function parseList(value: string): string[] {
+  return value
+    .split(/[\n,]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function candidateDraft(candidate: LearningCandidate): CandidateDraft {
+  return {
+    id: candidate.candidate_id,
+    scope: candidate.scope,
+    title: candidate.title,
+    description: candidate.description,
+    command: candidate.proposed_command,
+    content: candidate.proposed_skill_content,
+    allowedTools: listField(candidate.allowed_tools),
+    bins: listField(candidate.requirements.bins),
+    env: listField(candidate.requirements.env),
+  };
 }
 
 /** The candidate's own permission surface, spelled out rather than hidden
@@ -89,7 +131,7 @@ export function SkillLearningPanel() {
   const [learned, setLearned] = useState<LearnedSkillSummary[]>([]);
   const [evaluations, setEvaluations] = useState<Record<string, EvaluationRecord[]>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [draft, setDraft] = useState<{ id: string; content: string } | null>(null);
+  const [draft, setDraft] = useState<CandidateDraft | null>(null);
   /** The instructions each installed learned skill carries right now, keyed by
    * command — the "before" half of an update candidate's diff. Loaded from the
    * same discovery the native skill list uses, so it is what a future run
@@ -98,8 +140,9 @@ export function SkillLearningPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
-  const focusedCandidateId = useSkillLearningFocusStore((state) => state.candidateId);
+  const skillFocus = useSkillLearningFocusStore((state) => state.focus);
   const clearFocus = useSkillLearningFocusStore((state) => state.clear);
+  const [focusedInstalledKey, setFocusedInstalledKey] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -129,13 +172,25 @@ export function SkillLearningPanel() {
     void refresh();
   }, [refresh]);
 
-  /** A run notice's "Review it" button names an exact candidate — open it,
-   * then release the focus so a later normal visit is not hijacked. */
+  /** A learning notice names an exact candidate or installed skill — open it,
+   * scroll it into view when the async Settings data arrives, then release the
+   * focus so a later normal visit is not hijacked. */
   useEffect(() => {
-    if (!focusedCandidateId) return;
-    setExpanded(focusedCandidateId);
+    if (!skillFocus) return;
+    if (skillFocus.kind === "candidate") {
+      setFocusedInstalledKey(null);
+      setExpanded(skillFocus.candidateId);
+      clearFocus();
+      return;
+    }
+
+    const key = `${skillFocus.scope}:${skillFocus.command}`;
+    if (!learned.some((summary) => `${summary.scope}:${summary.command}` === key)) return;
+
+    setFocusedInstalledKey(key);
+    document.getElementById(`learned-skill-${key}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
     clearFocus();
-  }, [focusedCandidateId, clearFocus]);
+  }, [skillFocus, learned, clearFocus]);
 
   const run = async (key: string, operation: () => Promise<unknown>) => {
     setBusy(key);
@@ -303,12 +358,104 @@ export function SkillLearningPanel() {
                       </div>
                     )}
                     {editing ? (
-                      <textarea
-                        value={draft.content}
-                        onChange={(event) => setDraft({ id: candidate.candidate_id, content: event.target.value })}
-                        rows={10}
-                        className="w-full rounded border border-border bg-surface p-2 font-mono text-[11px] text-foreground"
-                      />
+                      <div className="flex flex-col gap-1.5">
+                        <div className="grid gap-1.5 sm:grid-cols-2">
+                          <label className="flex flex-col gap-1">
+                            <span className="text-faint">Display name</span>
+                            <input
+                              value={draft.title}
+                              onChange={(event) => setDraft({ ...draft, title: event.target.value })}
+                              className="h-8 rounded border border-border bg-surface px-2 text-xs text-foreground"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            <span className="text-faint">Slash command</span>
+                            <input
+                              value={draft.command}
+                              onChange={(event) => setDraft({ ...draft, command: event.target.value })}
+                              placeholder="my-skill"
+                              className="h-8 rounded border border-border bg-surface px-2 font-mono text-xs text-foreground"
+                            />
+                          </label>
+                        </div>
+                        <fieldset className="flex flex-col gap-1">
+                          <legend className="text-faint">Scope</legend>
+                          <div className="flex flex-wrap gap-3 text-xs text-muted">
+                            <label className="flex items-center gap-1.5">
+                              <input
+                                type="radio"
+                                name={`skill-scope-${candidate.candidate_id}`}
+                                checked={draft.scope === "workspace"}
+                                disabled={!candidate.workspace_path}
+                                onChange={() => setDraft({ ...draft, scope: "workspace" })}
+                              />
+                              This workspace
+                            </label>
+                            <label className="flex items-center gap-1.5">
+                              <input
+                                type="radio"
+                                name={`skill-scope-${candidate.candidate_id}`}
+                                checked={draft.scope === "global"}
+                                disabled={!settings.allow_global_scope}
+                                onChange={() => setDraft({ ...draft, scope: "global" })}
+                              />
+                              Global
+                            </label>
+                          </div>
+                          <span className="text-faint">
+                            {candidate.workspace_path
+                              ? "This workspace uses the folder recorded by the original run."
+                              : "This run has no recorded workspace, so only global scope is available."}
+                          </span>
+                        </fieldset>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-faint">Trigger description</span>
+                          <textarea
+                            value={draft.description}
+                            onChange={(event) => setDraft({ ...draft, description: event.target.value })}
+                            rows={2}
+                            className="rounded border border-border bg-surface p-2 text-xs text-foreground"
+                          />
+                        </label>
+                        <div className="grid gap-1.5 sm:grid-cols-3">
+                          <label className="flex flex-col gap-1">
+                            <span className="text-faint">Allowed tools</span>
+                            <input
+                              value={draft.allowedTools}
+                              onChange={(event) => setDraft({ ...draft, allowedTools: event.target.value })}
+                              placeholder="read_file, edit_file"
+                              className="h-8 rounded border border-border bg-surface px-2 text-xs text-foreground"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            <span className="text-faint">Required binaries</span>
+                            <input
+                              value={draft.bins}
+                              onChange={(event) => setDraft({ ...draft, bins: event.target.value })}
+                              placeholder="cargo"
+                              className="h-8 rounded border border-border bg-surface px-2 text-xs text-foreground"
+                            />
+                          </label>
+                          <label className="flex flex-col gap-1">
+                            <span className="text-faint">Required environment</span>
+                            <input
+                              value={draft.env}
+                              onChange={(event) => setDraft({ ...draft, env: event.target.value })}
+                              placeholder="API_KEY"
+                              className="h-8 rounded border border-border bg-surface px-2 text-xs text-foreground"
+                            />
+                          </label>
+                        </div>
+                        <label className="flex flex-col gap-1">
+                          <span className="text-faint">Instructions</span>
+                          <textarea
+                            value={draft.content}
+                            onChange={(event) => setDraft({ ...draft, content: event.target.value })}
+                            rows={10}
+                            className="w-full rounded border border-border bg-surface p-2 font-mono text-[11px] text-foreground"
+                          />
+                        </label>
+                      </div>
                     ) : (
                       <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded border border-border bg-surface p-2 font-mono text-[11px] text-foreground">
                         {candidate.proposed_skill_content || "(no draft yet — generate one to see the proposed procedure)"}
@@ -362,14 +509,14 @@ export function SkillLearningPanel() {
                       onClick={() =>
                         void run(`edit:${candidate.candidate_id}`, async () => {
                           await skillLearningClient.stage(candidate.candidate_id, {
-                            scope: candidate.scope,
-                            title: candidate.title,
-                            description: candidate.description,
-                            proposed_command: candidate.proposed_command,
+                            scope: draft.scope,
+                            title: draft.title,
+                            description: draft.description,
+                            proposed_command: draft.command,
                             proposed_skill_content: draft.content,
                             proposed_resource_files: candidate.proposed_resource_files,
-                            allowed_tools: candidate.allowed_tools,
-                            requirements: candidate.requirements,
+                            allowed_tools: parseList(draft.allowedTools),
+                            requirements: { bins: parseList(draft.bins), env: parseList(draft.env) },
                           });
                           setDraft(null);
                         })
@@ -384,7 +531,7 @@ export function SkillLearningPanel() {
                       disabled={busy !== null || !drafted}
                       onClick={() => {
                         setExpanded(candidate.candidate_id);
-                        setDraft({ id: candidate.candidate_id, content: candidate.proposed_skill_content });
+                        setDraft(candidateDraft(candidate));
                       }}
                     >
                       Edit before install
@@ -397,7 +544,7 @@ export function SkillLearningPanel() {
                   <Button
                     variant="secondary"
                     size="sm"
-                    disabled={busy !== null || !candidate.candidate_sha256}
+                    disabled={busy !== null || editing || !candidate.candidate_sha256}
                     onClick={() =>
                       void run(`promote:${candidate.candidate_id}`, async () => {
                         const outcome = await skillLearningClient.promote(candidate.candidate_id);
@@ -439,7 +586,12 @@ export function SkillLearningPanel() {
           learned.map((summary) => (
             <div
               key={`${summary.scope}:${summary.command}:${summary.active_sha256}`}
-              className="rounded-md border border-border bg-background px-2.5 py-2 text-xs"
+              id={`learned-skill-${summary.scope}:${summary.command}`}
+              className={`rounded-md border bg-background px-2.5 py-2 text-xs transition-colors ${
+                focusedInstalledKey === `${summary.scope}:${summary.command}`
+                  ? "border-accent bg-accent/10 ring-2 ring-accent/40"
+                  : "border-border"
+              }`}
             >
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-foreground">/{summary.command}</span>
