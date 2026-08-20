@@ -1143,7 +1143,12 @@ function App() {
                 section === "studio" ? "flex min-h-0 flex-1 flex-col" : "hidden"
               }
             >
-              <StudioPanel mode={studioMode} railSlot={studioRail} />
+              <StudioPanel
+                mode={studioMode}
+                railSlot={studioRail}
+                onOpenModels={() => setStudioMode("models")}
+                onOpenTools={() => setStudioMode("tools")}
+              />
             </div>
             {section === "studio" ? null : globalSearchOpen ? (
               <GlobalSearch
