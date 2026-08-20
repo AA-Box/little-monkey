@@ -428,6 +428,7 @@ pub(crate) fn safetensors_index_shards(index_path: &Path) -> Result<Vec<PathBuf>
             .ok_or_else(|| format!("Safetensors index has an invalid shard for tensor {tensor}"))?;
         let relative = Path::new(name);
         if name.trim().is_empty()
+            || name.contains('\\')
             || relative
                 .components()
                 .any(|component| !matches!(component, PathComponent::Normal(_)))
