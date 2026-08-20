@@ -133,6 +133,60 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
   const patch = (next: Partial<GenerationModelSpec>) =>
     setSpec((current) => ({ ...current, ...next }));
 
+  /** A complete repository/directory is the MFLUX model shape; component rows
+   *  are the bundled engine shape. Keep this decision next to the source
+   *  picker so the engine cannot drift from the model the user selected. */
+  const chooseModelSource = (kind: GenerationModelSpec["source"]["kind"]) => {
+    if (kind === "components") {
+      patch({
+        engine: "stable_diffusion_cpp",
+        source: { kind: "components" },
+        quantizationBits: null,
+      });
+      return;
+    }
+    const imageTasks = spec.tasks.filter(
+      (task) => task === "text_to_image" || task === "image_to_image",
+    );
+    if (kind === "hugging_face_repo") {
+      const repo = repositorySource?.repo?.trim() || DEFAULT_MFLUX_REPOSITORY;
+      patch({
+        engine: "mflux_image",
+        components: [],
+        source: {
+          kind,
+          repo,
+          revision: repositorySource?.revision ?? null,
+        },
+        quantizationBits: spec.quantizationBits ?? 8,
+        family: spec.family || "dev",
+        defaults: { ...spec.defaults, sampleMethod: "linear" },
+        tasks: imageTasks.length ? imageTasks : ["text_to_image", "image_to_image"],
+        license: mfluxLicense(repo),
+      });
+      return;
+    }
+    patch({
+      engine: "mflux_image",
+      components: [],
+      source: {
+        kind,
+        path: directorySource?.path ?? "",
+      },
+      quantizationBits: spec.quantizationBits ?? 8,
+      family: spec.family || "dev",
+      defaults: { ...spec.defaults, sampleMethod: "linear" },
+      tasks: imageTasks.length ? imageTasks : ["text_to_image", "image_to_image"],
+      license: {
+        id: "",
+        name: "",
+        url: "",
+        excludedTerritories: [],
+        acceptanceRequired: false,
+      },
+    });
+  };
+
   /** Fills every blank the first file can speak for. Only blanks: once the
    *  user has typed a name or picked a task, that is the answer. */
   const patchComponents = (components: ModelComponent[]) =>
@@ -237,44 +291,30 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
         </div>
       </fieldset>
 
-      {!mfluxSelected && <div className="grid gap-2">
+      <label className="grid gap-1 text-[11px] text-muted">
+        {t("Studio.add.mfluxSource")}
+        <select
+          className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+          aria-label={t("Studio.add.mfluxSource")}
+          value={spec.source.kind}
+          onChange={(event) =>
+            chooseModelSource(event.target.value as GenerationModelSpec["source"]["kind"])
+          }
+        >
+          <option value="components">{t("Studio.add.componentFiles")}</option>
+          <option value="hugging_face_repo">{t("Studio.add.mfluxRepository")}</option>
+          <option value="local_directory">{t("Studio.add.mfluxDirectory")}</option>
+        </select>
+        <span className="text-faint">{t("Studio.add.engineAutoHint")}</span>
+      </label>
+
+      {spec.source.kind === "components" && <div className="grid gap-2">
         <span className="text-[11px] text-muted">{t("Studio.add.files")}</span>
         <ModelFiles components={spec.components} onChange={patchComponents} />
       </div>}
 
-      {mfluxSelected && (
+      {spec.source.kind !== "components" && (
         <div className="grid gap-2 rounded border border-border p-2">
-          <span className="text-[11px] text-muted">{t("Studio.add.mfluxSource")}</span>
-          <select
-            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
-            value={spec.source.kind === "local_directory" ? "local_directory" : "hugging_face_repo"}
-            onChange={(event) =>
-              patch(
-                  event.target.value === "local_directory"
-                  ? {
-                      source: { kind: "local_directory", path: "" },
-                      license: {
-                        id: "",
-                        name: "",
-                        url: "",
-                        excludedTerritories: [],
-                        acceptanceRequired: false,
-                      },
-                    }
-                  : {
-                      source: {
-                        kind: "hugging_face_repo",
-                        repo: DEFAULT_MFLUX_REPOSITORY,
-                        revision: null,
-                      },
-                      license: mfluxLicense(DEFAULT_MFLUX_REPOSITORY),
-                    },
-              )
-            }
-          >
-            <option value="hugging_face_repo">{t("Studio.add.mfluxRepository")}</option>
-            <option value="local_directory">{t("Studio.add.mfluxDirectory")}</option>
-          </select>
           {spec.source.kind === "local_directory" ? (
             <span className="flex items-center gap-2">
               <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
@@ -431,6 +471,7 @@ export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModel
         {t("Studio.add.engine")}
         <select
           className="rounded border border-border bg-background px-2 py-1 text-[11px] text-foreground"
+          aria-label={t("Studio.add.engine")}
           value={spec.engine}
           onChange={(event) => {
             const engine = event.target.value as GenerationEngineKind;
