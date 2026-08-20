@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const client = vi.hoisted(() => ({
   addModel: vi.fn(),
@@ -29,10 +29,23 @@ vi.mock("./ModelFiles", () => ({
 import { AddModelForm } from "./AddModelForm";
 
 describe("AddModelForm MFLUX mode", () => {
+  afterEach(cleanup);
+
+  it("selects MFLUX automatically for a complete repository source", () => {
+    render(<AddModelForm onSaved={vi.fn()} />);
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Studio.add.mfluxSource" }), {
+      target: { value: "hugging_face_repo" },
+    });
+
+    expect(screen.getByRole("combobox", { name: "Studio.add.engine" })).toHaveProperty("value", "mflux_image");
+    expect(screen.getByDisplayValue("black-forest-labs/FLUX.1-dev")).toBeTruthy();
+  });
+
   it("shows the repository and quantization controls and hides component files", () => {
     render(<AddModelForm onSaved={vi.fn()} />);
 
-    fireEvent.change(screen.getAllByRole("combobox")[1], {
+    fireEvent.change(screen.getByRole("combobox", { name: "Studio.add.engine" }), {
       target: { value: "mflux_image" },
     });
 

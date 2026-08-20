@@ -6,7 +6,7 @@ import time
 import unittest
 from http.client import HTTPConnection
 
-from mflux_image_server import MfluxRunner, create_server
+from mflux_image_server import MfluxRunner, _flux_swift_key_targets, create_server
 
 
 class FakeRegistry:
@@ -156,6 +156,28 @@ class MfluxServiceTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["cancelled"])
         self.assertEqual(self.wait_for(created["id"])["status"], "cancelled")
+
+    def test_flux_swift_transformer_keys_are_native_mflux_keys(self):
+        self.assertEqual(
+            _flux_swift_key_targets("transformer", "transformer_blocks.0.ff.linear1.scales"),
+            ["transformer_blocks.0.ff.linear1.scales"],
+        )
+
+    def test_flux_swift_t5_keys_are_mapped_and_shared_bias_is_reused(self):
+        self.assertEqual(
+            _flux_swift_key_targets(
+                "text_encoder_2",
+                "encoder.block.3.layer.1.DenseReluDense.wi_0.weight",
+            ),
+            ["t5_blocks.3.ff.DenseReluDense.wi_0.weight"],
+        )
+        self.assertEqual(len(_flux_swift_key_targets("text_encoder_2", "relative_attention_bias.weight")), 24)
+
+    def test_flux_swift_vae_wrapper_convs_are_mapped(self):
+        self.assertEqual(
+            _flux_swift_key_targets("vae", "decoder.conv_in.weight"),
+            ["decoder.conv_in.conv2d.weight"],
+        )
 
 
 if __name__ == "__main__":
