@@ -225,6 +225,20 @@ export const studioLocale: Record<string, string> = {
   "Studio.lora.empty": "No LoRAs in your library. Add one in the Models tab.",
   "Studio.lora.pick": "Which LoRA",
   "Studio.lora.forget": "Remove from library",
+  "Studio.plugins.title": "Plugins & tools",
+  "Studio.plugins.hint":
+    "Adapters and sidecar tools stay visible from every generation tab. Only controls supported by the selected model are enabled.",
+  "Studio.plugins.audioHint":
+    "Audio models use speech components and reference voices instead of image LoRAs.",
+  "Studio.plugins.audioComponents": "Audio components",
+  "Studio.plugins.loraUnavailable":
+    "This model or engine does not expose LoRA support.",
+  "Studio.plugins.remoteHint":
+    "Remote backends own their plugin graph; local LoRAs and model components are not sent.",
+  "Studio.plugins.mfluxHint":
+    "MFLUX currently supports prompt, canvas, steps, guidance, seed and an optional source image.",
+  "Studio.plugins.openModels": "Open model library",
+  "Studio.plugins.openTools": "Open tools",
   "Studio.parts": "Model parts",
   "Studio.partsHint":
     "Pick which CLIP, text encoder or VAE this run loads. Add them in the Models tab; this only chooses between them.",
