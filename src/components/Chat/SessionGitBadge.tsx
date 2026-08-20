@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import {
@@ -37,7 +37,7 @@ interface GitReviewSnapshot {
 type CheckState = "success" | "pending" | "failure";
 
 const POPOVER_WIDTH = 320;
-const POPOVER_HEIGHT = 220;
+const POPOVER_HEIGHT = 160;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -63,6 +63,66 @@ function numberValue(value: unknown, ...keys: string[]): number | null {
 
 function workspaceLabel(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function relativeTimeLabel(timestamp: number): string {
+  const elapsed = Math.max(0, Date.now() - timestamp);
+  const minutes = Math.floor(elapsed / 60_000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d`;
+  return `${Math.floor(days / 7)}w`;
+}
+
+export function SessionPreviewCard({
+  session,
+  workspacePath,
+  anchorRect,
+  onPointerEnter,
+  onPointerLeave,
+}: {
+  session: ChatSession;
+  workspacePath: string;
+  anchorRect: DOMRect;
+  onPointerEnter: () => void;
+  onPointerLeave: () => void;
+}) {
+  const top = Math.min(Math.max(anchorRect.top, 8), Math.max(8, window.innerHeight - 72));
+  const left = Math.min(
+    anchorRect.right + 8,
+    Math.max(8, window.innerWidth - 320 - 8),
+  );
+
+  return createPortal(
+    <div
+      role="tooltip"
+      style={{ position: "fixed", top, left, width: 320 }}
+      className="z-40 rounded-xl border border-border bg-background px-2.5 py-2 shadow-xl"
+      onPointerEnter={onPointerEnter}
+      onPointerLeave={onPointerLeave}
+    >
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <p className="min-w-0 truncate text-xs font-medium text-foreground" title={session.title}>
+          {session.title}
+        </p>
+        <time
+          className="shrink-0 text-[10px] text-faint"
+          dateTime={new Date(session.updatedAt).toISOString()}
+          title={new Date(session.updatedAt).toLocaleString()}
+        >
+          {relativeTimeLabel(session.updatedAt)}
+        </time>
+      </div>
+      <div className="mt-1.5 flex min-w-0 items-center gap-2 text-xs text-muted">
+        <Folder size={14} className="shrink-0 text-faint" aria-hidden />
+        <span className="truncate" title={workspacePath}>{workspaceLabel(workspacePath)}</span>
+      </div>
+    </div>,
+    document.body,
+  );
 }
 
 function summarizePullRequest(value: Record<string, unknown> | null) {
@@ -105,10 +165,6 @@ function summarizeChecks(value: Record<string, unknown> | null): CheckState | nu
   return "pending";
 }
 
-function pathLabel(value: string | null): string | null {
-  return value?.split(/[\\/]/).filter(Boolean).pop() ?? value;
-}
-
 function GitContextPopover({
   session,
   context,
@@ -130,6 +186,7 @@ function GitContextPopover({
   const pullRequest = summarizePullRequest(context.pullRequest);
   const checkState = summarizeChecks(context.checks);
   const reviewChangedFiles = review?.files.length ?? null;
+  const showChecks = checkState !== null || reviewChangedFiles !== null || context.changedFiles !== null;
   const hasChanges = reviewChangedFiles !== null
     ? reviewChangedFiles > 0
     : context.changedFiles !== null && context.changedFiles > 0;
@@ -171,9 +228,13 @@ function GitContextPopover({
         <p className="min-w-0 truncate text-xs font-medium text-foreground" title={session.title}>
           {session.title}
         </p>
-        {context.worktreeName && (
-          <span className="shrink-0 text-[10px] text-faint">{context.worktreeName}</span>
-        )}
+        <time
+          className="shrink-0 text-[10px] text-faint"
+          dateTime={new Date(session.updatedAt).toISOString()}
+          title={new Date(session.updatedAt).toLocaleString()}
+        >
+          {relativeTimeLabel(session.updatedAt)}
+        </time>
       </div>
 
       <div className="mt-2 space-y-2 text-xs">
@@ -185,7 +246,7 @@ function GitContextPopover({
           <GitBranch size={14} className="shrink-0 text-faint" aria-hidden />
           <span className="truncate font-mono text-[11px]" title={context.branch}>{context.branch}</span>
         </div>
-        {prLabel && prUrl && (
+        {prLabel && (prUrl ? (
           <a
             href={prUrl}
             target="_blank"
@@ -196,8 +257,13 @@ function GitContextPopover({
             <GitPullRequest size={14} className="shrink-0 text-faint" aria-hidden />
             <span className="truncate" title={prLabel}>{prLabel}</span>
           </a>
-        )}
-        <div className="flex items-center gap-2 border-t border-border pt-2">
+        ) : (
+          <div className="flex min-w-0 items-center gap-2 text-foreground">
+            <GitPullRequest size={14} className="shrink-0 text-faint" aria-hidden />
+            <span className="truncate" title={prLabel}>{prLabel}</span>
+          </div>
+        ))}
+        {showChecks && <div className="flex items-center gap-2 border-t border-border pt-2">
           {loading ? (
             <LoaderCircle size={14} className="shrink-0 animate-spin text-faint motion-reduce:animate-none" aria-hidden />
           ) : statusState === "success" ? (
@@ -206,15 +272,7 @@ function GitContextPopover({
             <CircleDot size={14} className={`shrink-0 ${statusState === "failure" ? "text-danger" : "text-warning"}`} aria-hidden />
           )}
           <span className="text-muted">{loading ? t("ChatSessionList.gitLoading") : statusLabel}</span>
-        </div>
-        {(review?.target || review?.branch || context.repositorySlug) && (
-          <p className="truncate pl-5 text-[10px] text-faint">
-            {context.repositorySlug ?? ""}
-            {context.repositorySlug && (review?.target || review?.branch) ? " · " : ""}
-            {review?.target ? `${pathLabel(review.target)} → ` : ""}
-            {review?.branch ?? context.branch}
-          </p>
-        )}
+        </div>}
       </div>
     </div>,
     document.body,
@@ -224,9 +282,13 @@ function GitContextPopover({
 export function SessionGitBadge({
   session,
   context,
+  rowHovered = false,
+  rowAnchorRect = null,
 }: {
   session: ChatSession;
   context: SessionGitContext | null;
+  rowHovered?: boolean;
+  rowAnchorRect?: DOMRect | null;
 }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
@@ -234,8 +296,6 @@ export function SessionGitBadge({
   const [review, setReview] = useState<GitReviewSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  if (!context) return null;
 
   const clearCloseTimer = () => {
     if (closeTimer.current) clearTimeout(closeTimer.current);
@@ -248,7 +308,7 @@ export function SessionGitBadge({
   };
 
   const loadReview = async () => {
-    if (!context.canReview || !isTauri() || review || loading) return;
+    if (!context || !context.canReview || !isTauri() || review || loading) return;
     setLoading(true);
     try {
       const payload = await invoke<{
@@ -275,6 +335,20 @@ export function SessionGitBadge({
     }
   };
 
+  useEffect(() => {
+    if (!rowHovered || !rowAnchorRect) return;
+    clearCloseTimer();
+    setAnchorRect(rowAnchorRect);
+    setOpen(true);
+    void loadReview();
+  }, [rowHovered, rowAnchorRect]);
+
+  useEffect(() => {
+    if (!rowHovered) scheduleClose();
+  }, [rowHovered]);
+
+  if (!context) return null;
+
   const showPopover = (target: HTMLElement) => {
     clearCloseTimer();
     setAnchorRect(target.getBoundingClientRect());
@@ -292,7 +366,9 @@ export function SessionGitBadge({
         className="relative inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         onPointerEnter={(event) => showPopover(event.currentTarget)}
         onFocus={(event) => showPopover(event.currentTarget)}
-        onPointerLeave={scheduleClose}
+        onPointerLeave={() => {
+          if (!rowHovered) scheduleClose();
+        }}
         onClick={(event) => {
           event.stopPropagation();
           setOpen((visible) => !visible);

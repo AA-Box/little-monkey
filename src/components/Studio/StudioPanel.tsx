@@ -2497,7 +2497,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
         onClick={(event) => {
           if (event.target === lightboxRef.current) setLightbox(null);
         }}
-        className="fixed left-1/2 top-1/2 m-0 max-h-[calc(100vh-2rem)] w-[min(92vw,1100px)] max-w-[92vw] -translate-x-1/2 -translate-y-1/2 overflow-auto rounded-lg border border-border bg-surface p-3 text-foreground outline-none backdrop:bg-black/70 focus:outline-none"
+        className="fixed left-1/2 top-1/2 m-0 max-h-[calc(100vh-2rem)] w-[min(69vw,825px)] max-w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 overflow-auto rounded-lg border border-border bg-surface p-3 text-foreground outline-none backdrop:bg-black/70 focus:outline-none"
       >
         {lightbox && previews[lightbox.artifactId] && (
           <div className="grid gap-2">
@@ -2512,21 +2512,23 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 <X size={14} />
               </IconButton>
             </div>
-            {lightbox.mediaType.startsWith("video/") ? (
-              <video
-                controls
-                loop
-                autoPlay
-                src={previews[lightbox.artifactId]}
-                className="max-h-[74vh] rounded bg-black object-contain"
-              />
-            ) : (
-              <img
-                src={previews[lightbox.artifactId]}
-                alt={lightbox.prompt}
-                className="max-h-[74vh] rounded object-contain"
-              />
-            )}
+            <div className="flex justify-center">
+              {lightbox.mediaType.startsWith("video/") ? (
+                <video
+                  controls
+                  loop
+                  autoPlay
+                  src={previews[lightbox.artifactId]}
+                  className="max-h-[74vh] max-w-full rounded bg-black object-contain"
+                />
+              ) : (
+                <img
+                  src={previews[lightbox.artifactId]}
+                  alt={lightbox.prompt}
+                  className="max-h-[74vh] max-w-full rounded object-contain"
+                />
+              )}
+            </div>
             <p className="max-w-prose text-[11px] text-muted">{lightbox.prompt}</p>
             <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-faint">
               <span className="mr-auto">

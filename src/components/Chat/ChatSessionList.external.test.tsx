@@ -124,6 +124,35 @@ describe("ChatSessionList across environments", () => {
     expect(useSessionStore.getState().sessions[0]?.archived).toBe(true);
   });
 
+  it("only reveals session shortcuts while the primary modifier is held", () => {
+    useSessionStore.setState({
+      sessions: [session(), session({ id: "second", title: "Second session" })],
+      activeSessionId: "local-1",
+    });
+    render(<ChatSessionList />);
+
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+    expect(screen.getByText(/⌘2|Ctrl\+2/)).toBeTruthy();
+    const row = screen.getByText("Local session").closest("[role=button]")!;
+    fireEvent.pointerEnter(row);
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    fireEvent.pointerLeave(row);
+    fireEvent.keyUp(window, { key: "Control", ctrlKey: false });
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+  });
+
+  it("shows the workspace in the hover preview for chats without Git context", () => {
+    useSessionStore.setState({
+      sessions: [session({ workspacePath: "/work/newApp" })],
+      activeSessionId: "local-1",
+    });
+    render(<ChatSessionList />);
+
+    fireEvent.pointerEnter(screen.getByText("Local session").closest("[role=button]")!);
+    expect(screen.getByText("newApp")).toBeTruthy();
+  });
+
   it("lists a conversation the daemon owns beside the local sessions", async () => {
     render(<ChatSessionList />);
 
