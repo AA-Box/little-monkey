@@ -5,7 +5,6 @@ import { StrictMode, useRef, useState } from 'react';
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
-  openUrl: vi.fn(),
   listeners: new Map<string, Set<(event: { payload: unknown }) => void>>(),
 }));
 
@@ -20,10 +19,6 @@ vi.mock('@tauri-apps/api/event', () => ({
     return () => handlers.delete(handler);
   },
 }));
-vi.mock('@tauri-apps/plugin-opener', () => ({
-  openUrl: (...args: unknown[]) => mocks.openUrl(...args),
-}));
-
 import { DictationButton, type DictationButtonHandle } from './DictationButton';
 
 const CONFIG = {
@@ -100,8 +95,6 @@ async function startDictation(): Promise<string> {
 
 beforeEach(() => {
   mocks.invoke.mockReset();
-  mocks.openUrl.mockReset();
-  mocks.openUrl.mockResolvedValue(undefined);
   mocks.listeners.clear();
   mocks.invoke.mockImplementation((command: string, args?: { sessionId?: string }) => {
     if (command === 'dictation_capabilities') {
@@ -126,7 +119,7 @@ afterEach(() => {
 });
 
 describe('DictationButton', () => {
-  it('opens macOS speech settings when native recognition is unavailable', async () => {
+  it('opens macOS speech settings through the native command when recognition is unavailable', async () => {
     mocks.invoke.mockImplementation((command: string) => {
       if (command === 'dictation_capabilities') {
         return Promise.resolve({
@@ -146,8 +139,9 @@ describe('DictationButton', () => {
     expect(button.disabled).toBe(false);
     fireEvent.click(button);
 
-    await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(
-      'x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition',
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      'dictation_open_permission_settings',
+      { kind: 'speech' },
     ));
   });
 
@@ -201,8 +195,9 @@ describe('DictationButton', () => {
       message: 'Microphone access is disabled.',
     });
 
-    await waitFor(() => expect(mocks.openUrl).toHaveBeenCalledWith(
-      'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone',
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      'dictation_open_permission_settings',
+      { kind: 'microphone' },
     ));
   });
 

@@ -1,7 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { LoaderCircle, Mic } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { companionClient } from "../../lib/companionClient";
 import {
@@ -17,7 +16,6 @@ import {
   createDictationSessionId,
   dictationClient,
   type DictationCapabilities,
-  type DictationPlatform,
   type DictationState,
   type DictationUnlisten,
 } from "../../lib/dictationClient";
@@ -67,18 +65,10 @@ function focusTextarea(
   textarea.setSelectionRange(selectionStart, selectionEnd);
 }
 
-function dictationSettingsUrl(platform: DictationPlatform | undefined, code: string): string | null {
-  if (platform === "macos") {
-    if (code.startsWith("microphone_")) {
-      return "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-    }
-    if (code === "speech_permission_denied" || code === "speech_unavailable") {
-      return "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition";
-    }
-  }
-  if (platform === "windows") {
-    if (code.startsWith("microphone_")) return "ms-settings:privacy-microphone";
-    if (code === "sapi_unavailable" || code === "speech_unavailable") return "ms-settings:privacy-speech";
+function dictationPermissionKind(code: string): "microphone" | "speech" | null {
+  if (code.startsWith("microphone_")) return "microphone";
+  if (code === "speech_permission_denied" || code === "speech_unavailable" || code === "sapi_unavailable") {
+    return "speech";
   }
   return null;
 }
@@ -122,14 +112,14 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const openPermissionSettings = useCallback(async (code: string) => {
-    const url = dictationSettingsUrl(capabilities?.platform, code);
-    if (!url) return;
+    const kind = dictationPermissionKind(code);
+    if (!kind) return;
     try {
-      await openUrl(url);
+      await dictationClient.openPermissionSettings(kind);
     } catch (reason) {
       if (mountedRef.current) setError(errorMessage(reason));
     }
-  }, [capabilities?.platform]);
+  }, []);
 
   const finishActive = useCallback((session: ActiveDictation) => {
     const hasInsertedText = Boolean(dictationInsertedText(session.insertion));

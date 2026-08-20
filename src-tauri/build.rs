@@ -46,6 +46,7 @@ fn compile_macos_dictation_bridge() {
         .flag("-fobjc-arc")
         .compile("little_monkey_dictation_macos");
     println!("cargo:rustc-link-lib=framework=AVFoundation");
+    println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=Speech");
     println!("cargo:rustc-link-lib=framework=Foundation");
 }

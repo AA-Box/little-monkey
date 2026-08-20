@@ -1,4 +1,5 @@
 #import <AVFoundation/AVFoundation.h>
+#import <AppKit/AppKit.h>
 #import <Speech/Speech.h>
 
 #include <stdbool.h>
@@ -290,6 +291,21 @@ void little_monkey_dictation_macos_release(void *opaque_session) {
     @autoreleasepool {
         (void)(__bridge_transfer LMDictationSession *)opaque_session;
     }
+}
+
+bool little_monkey_dictation_macos_open_permission_settings(const char *kind) {
+    if (!kind) return false;
+    NSString *permissionKind = [NSString stringWithUTF8String:kind];
+    NSString *urlString = nil;
+    if ([permissionKind isEqualToString:@"microphone"]) {
+        urlString = @"x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+    } else if ([permissionKind isEqualToString:@"speech"]) {
+        urlString = @"x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition";
+    } else {
+        return false;
+    }
+    NSURL *url = [NSURL URLWithString:urlString];
+    return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
 }
 
 char *little_monkey_dictation_macos_capabilities_json(void) {

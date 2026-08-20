@@ -17,6 +17,10 @@ pub fn start() -> Result<Session, String> {
     Err("Native OS speech recognition is not supported on this platform".to_string())
 }
 
+pub fn open_permission_settings() -> Result<(), String> {
+    Err("This platform has no native dictation permission settings".to_string())
+}
+
 impl Session {
     pub fn stop(&self) -> Result<(), String> {
         Ok(())

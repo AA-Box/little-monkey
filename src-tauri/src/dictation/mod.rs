@@ -288,6 +288,34 @@ pub fn dictation_capabilities(window: tauri::Window) -> Result<DictationCapabili
 }
 
 #[tauri::command]
+pub fn dictation_open_permission_settings(
+    window: tauri::Window,
+    kind: String,
+) -> Result<(), String> {
+    ensure_main_window(&window)?;
+    match kind.as_str() {
+        "microphone" | "speech" => open_permission_settings(&kind),
+        _ => Err("Invalid dictation permission kind".to_string()),
+    }
+}
+
+fn open_permission_settings(kind: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        return macos::open_permission_settings(kind);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return windows::open_permission_settings(kind);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = kind;
+        unsupported::open_permission_settings()
+    }
+}
+
+#[tauri::command]
 pub fn dictation_start(
     window: tauri::Window,
     runtime: tauri::State<'_, DictationRuntime>,

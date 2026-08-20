@@ -46,6 +46,8 @@ export interface DictationStartOptions {
   requireOnDevice: boolean;
 }
 
+export type DictationPermissionKind = "microphone" | "speech";
+
 export interface DictationStartResult {
   sessionId: string;
 }
@@ -79,6 +81,8 @@ export const dictationClient = {
     }),
   stop: (sessionId: string) => invoke<void>("dictation_stop", { sessionId }),
   cancel: (sessionId: string) => invoke<void>("dictation_cancel", { sessionId }),
+  openPermissionSettings: (kind: DictationPermissionKind) =>
+    invoke<void>("dictation_open_permission_settings", { kind }),
   onState: (handler: (event: DictationStateEvent) => void) =>
     listen<DictationStateEvent>(STATE_EVENT, (event) => handler(event.payload)),
   onPartial: (handler: (event: DictationPartialEvent) => void) =>
