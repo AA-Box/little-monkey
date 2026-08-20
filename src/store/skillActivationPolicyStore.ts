@@ -42,7 +42,7 @@ export function skillActivationPolicyKey(
   id?: string,
 ): string {
   if (source === "local") return `local:${id ?? command}`;
-  if (source === "package") return `package:${id ?? command}`;
+  if (source === "package") return `package:${id ?? "any"}:${command}`;
   return `native:${id ?? "any"}:${command}`;
 }
 

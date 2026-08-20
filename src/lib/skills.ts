@@ -10,6 +10,12 @@ import {
   type SkillActivationPolicy,
 } from "../store/skillActivationPolicyStore";
 
+function nativeSkillPolicyIdentity(source: import("./nativeSkillsClient").NativeSkillSource): string {
+  if (source.kind === "global") return "global";
+  if (source.kind === "workspace") return source.path;
+  return `signed-package:${source.package_id}`;
+}
+
 export const MAX_SKILLS_PER_TURN = 5;
 export const MAX_MODEL_SKILLS = 10;
 export const MAX_SKILL_SEARCH_RESULTS = 20;
@@ -86,7 +92,9 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
-      activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("native", entry.command, entry.source.kind)),
+      activationPolicy: skillActivationPolicyFor(
+        skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source)),
+      ),
       allowedTools: entry.allowed_tools,
       resourceFiles: entry.resource_files,
     }));

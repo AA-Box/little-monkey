@@ -1,13 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Download, FileDown, FileUp, PackageCheck, Pin, RefreshCw, RotateCcw, Search, ShieldCheck, Trash2 } from "lucide-react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, stat, writeTextFile } from "@tauri-apps/plugin-fs";
 import { Button, StatusPill } from "../ui";
-import { ecosystemClient, type InstalledPackageState, type PackageCatalogEntry, type PackagePermission, type PortablePackageExport } from "../../lib/ecosystemClient";
+import { ecosystemClient, type ActiveSkillDescriptor, type InstalledPackageState, type PackageCatalogEntry, type PackagePermission, type PortablePackageExport } from "../../lib/ecosystemClient";
 import { ResolutionSection } from "./PackageResolution";
 import { useT } from "../../lib/i18n";
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import { errorMessage } from "../../lib/errors";
+import { skillActivationPolicyKey, useSkillActivationPolicyStore, type SkillActivationPolicy } from "../../store/skillActivationPolicyStore";
 
 type PreviewIntent = "install" | "update";
 
@@ -47,6 +48,27 @@ function newestCatalogEntry(entries: PackageCatalogEntry[]): PackageCatalogEntry
   return [...entries].sort((a, b) => compareVersions(b.manifest.version, a.manifest.version))[0];
 }
 
+function PackageSkillPolicySelect({ skill }: { skill: ActiveSkillDescriptor }) {
+  const key = skillActivationPolicyKey("package", skill.command, skill.package_id);
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  return (
+    <label className="flex items-center gap-1 text-[10px] text-faint">
+      Policy
+      <select
+        aria-label={`/${skill.command} activation policy`}
+        value={policy}
+        onChange={(event) => setPolicy(key, event.target.value as SkillActivationPolicy)}
+        className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+      >
+        <option value="automatic">Automatic</option>
+        <option value="ask">Ask</option>
+        <option value="manual">Manual</option>
+      </select>
+    </label>
+  );
+}
+
 export function EcosystemPackages({ view }: { view: "marketplace" | "installed" }) {
   const { t } = useT();
   const {
@@ -67,6 +89,16 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
   const [expectedImportDigest, setExpectedImportDigest] = useState("");
   const [previewIntent, setPreviewIntent] = useState<PreviewIntent>("install");
   const [confirmUninstall, setConfirmUninstall] = useState<string | null>(null);
+  const [activeSkills, setActiveSkills] = useState<ActiveSkillDescriptor[]>([]);
+
+  useEffect(() => {
+    if (view !== "installed") return;
+    let cancelled = false;
+    void ecosystemClient.activeSkills()
+      .then((skills) => { if (!cancelled) setActiveSkills(skills); })
+      .catch(() => { if (!cancelled) setActiveSkills([]); });
+    return () => { cancelled = true; };
+  }, [installed, view]);
 
   const entries = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -221,6 +253,7 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
             .filter((item) => !query.trim() || item.package_id.toLowerCase().includes(query.trim().toLowerCase()))
             .map((item) => {
               const available = newestCatalogEntry(catalogById.get(item.package_id) ?? []);
+              const packageSkills = activeSkills.filter((skill) => skill.package_id === item.package_id);
               const canUpdate = Boolean(available && item.active_version && compareVersions(available.manifest.version, item.active_version) > 0);
               const rollbackVersions = item.activation_history.filter((version, index, all) => all.indexOf(version) === index && version !== item.active_version);
               return (
@@ -285,6 +318,20 @@ export function EcosystemPackages({ view }: { view: "marketplace" | "installed" 
                       </Button>
                     )}
                   </div>
+                  {packageSkills.length > 0 && (
+                    <div className="mt-4 rounded-lg border border-border bg-surface-2 p-2.5">
+                      <p className="text-xs font-medium text-foreground">Skill activation policy</p>
+                      <p className="mt-1 text-[11px] text-muted">Controls whether each package skill may be discovered and loaded implicitly.</p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {packageSkills.map((skill) => (
+                          <div key={skill.command} className="flex items-center gap-2 rounded-md border border-border bg-surface px-2 py-1.5">
+                            <span className="font-mono text-xs text-foreground">/{skill.command}</span>
+                            <PackageSkillPolicySelect skill={skill} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {item.pinned_version && <p className="mt-3 flex items-center gap-1 text-xs text-warning"><Pin size={12} />{t("EcosystemPackages.pinnedNotice", { version: item.pinned_version })}</p>}
                 </article>
               );

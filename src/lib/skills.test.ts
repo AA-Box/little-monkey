@@ -15,6 +15,7 @@ import {
   skillCommandMap,
   type SlashSkill,
 } from "./skills";
+import { skillActivationPolicyKey } from "../store/skillActivationPolicyStore";
 
 function skill(command: string, id = command): SlashSkill {
   return {
@@ -291,5 +292,19 @@ describe("composeSkillCatalog", () => {
     const manual = { ...skill("deploy"), activationPolicy: "manual" as const };
     expect(composeSkillCatalog([manual], new Set())).toBe("");
     expect(JSON.parse(formatSkillSearchResults([manual], new Set(), "deploy")).results).toEqual([]);
+  });
+});
+
+describe("skill activation policy identity", () => {
+  it("separates native workspace identities", () => {
+    expect(skillActivationPolicyKey("native", "deploy", "/workspace/a/.agents/skills/deploy"))
+      .not.toBe(skillActivationPolicyKey("native", "deploy", "/workspace/b/.agents/skills/deploy"));
+    expect(skillActivationPolicyKey("native", "deploy", "global"))
+      .toBe("native:global:deploy");
+  });
+
+  it("separates skills within the same package", () => {
+    expect(skillActivationPolicyKey("package", "review", "github-tools"))
+      .not.toBe(skillActivationPolicyKey("package", "testing", "github-tools"));
   });
 });

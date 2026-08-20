@@ -24,6 +24,12 @@ function descriptorScope(skill: NativeSkillDescriptor): NativeSkillScope | null 
   return skill.source.kind === "global" || skill.source.kind === "workspace" ? skill.source.kind : null;
 }
 
+function descriptorPolicyIdentity(skill: NativeSkillDescriptor): string {
+  if (skill.source.kind === "global") return "global";
+  if (skill.source.kind === "workspace") return skill.source.path;
+  return `signed-package:${skill.source.package_id}`;
+}
+
 /** Strips the scheme/`.git` suffix so a card header reads `org/repo` instead of the full clone URL. */
 function repoDisplayName(url: string): string {
   return url.replace(/^https?:\/\//, "").replace(/\.git$/, "");
@@ -35,8 +41,9 @@ const ACTIVATION_POLICIES: Array<{ value: SkillActivationPolicy; label: string }
   { value: "manual", label: "Manual" },
 ];
 
-function SkillPolicySelect({ command, scope }: { command: string; scope: NativeSkillScope }) {
-  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(skillActivationPolicyKey("native", command, scope)));
+function SkillPolicySelect({ command, identity }: { command: string; identity: string }) {
+  const key = skillActivationPolicyKey("native", command, identity);
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
   const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
   return (
@@ -46,7 +53,7 @@ function SkillPolicySelect({ command, scope }: { command: string; scope: NativeS
         aria-label={`/${command} activation policy`}
         value={policy}
         onChange={(event) => {
-          setPolicy(skillActivationPolicyKey("native", command, scope), event.target.value as SkillActivationPolicy);
+          setPolicy(key, event.target.value as SkillActivationPolicy);
           bumpNativeSkills();
         }}
         className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
@@ -376,7 +383,10 @@ export function NativeSkillsManager() {
                     {group.skills.map((skill) => (
                       <span key={skill.command} className="flex items-center gap-1 rounded-md border border-border px-2 py-1">
                         <span className={`font-mono ${skill.enabled ? "text-foreground" : "text-faint line-through"}`} title={`${skill.name} · ${skill.version}`}>/{skill.command}</span>
-                        <SkillPolicySelect command={skill.command} scope={group.scope} />
+                        <SkillPolicySelect
+                          command={skill.command}
+                          identity={descriptorPolicyIdentity(skill)}
+                        />
                       </span>
                     ))}
                   </div>
@@ -403,7 +413,10 @@ export function NativeSkillsManager() {
                     </span>
                   )}
                   <span className="ml-auto font-mono text-[10px] text-faint">{skill.sha256.slice(0, 12)}…</span>
-                  <SkillPolicySelect command={skill.command} scope={skillScope} />
+                  <SkillPolicySelect
+                    command={skill.command}
+                    identity={descriptorPolicyIdentity(skill)}
+                  />
                   <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
                     {skill.enabled ? "Disable" : "Enable"}
                   </Button>
