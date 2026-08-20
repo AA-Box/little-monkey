@@ -13,12 +13,14 @@ import { describe, expect, it, vi } from "vitest";
 import {
   autoReflectAllowed,
   buildReflectionMessages,
+  captureAction,
   candidateNotice,
   finalizeLearningForRun,
   formatLearningNotice,
   parseLearningNotice,
   parseReflectionCall,
   reflectOnCandidate,
+  selectFinishedRunNotice,
 } from "./skillLearning";
 import { toolsForSettings } from "./agentLoop";
 import { composeSkillCatalog, nativeSkills } from "./skills";
@@ -217,6 +219,44 @@ describe("candidateNotice", () => {
     const notice = candidateNotice(candidate({ status: "staged", proposed_command: "retry-wrapper" }));
     expect(parseLearningNotice(formatLearningNotice(notice))).toEqual(notice);
     expect(parseLearningNotice("Reusable procedure suggested — review it in Settings.")).toBeNull();
+  });
+});
+
+describe("finished-run notice precedence", () => {
+  it("does not offer manual save when capture is not eligible", () => {
+    // A completed chat-only turn has no successful durable tool evidence.
+    expect(selectFinishedRunNotice(null, null)).toBeNull();
+  });
+
+  it("offers manual save for an eligible workspace run", () => {
+    expect(selectFinishedRunNotice(null, "workspace")).toEqual({ kind: "save", scope: "workspace" });
+  });
+
+  it("prefers the automatic candidate over the redundant save affordance", () => {
+    const learned = candidate({ status: "staged", proposed_command: "retry-wrapper" });
+    expect(selectFinishedRunNotice(learned, "workspace")).toEqual({ kind: "learning", candidate: learned });
+  });
+
+  it("keeps a no-workspace run global", () => {
+    expect(selectFinishedRunNotice(null, "global")).toEqual({ kind: "save", scope: "global" });
+  });
+});
+
+describe("captureAction", () => {
+  it("drafts a newly created or detected candidate", () => {
+    expect(captureAction({ kind: "created", candidate: candidate({ status: "detected" }) }).kind).toBe("draft");
+  });
+
+  it("focuses an existing staged candidate without regenerating it", () => {
+    expect(captureAction({ kind: "existing", candidate: candidate({ status: "staged" }) }).kind).toBe("focus");
+  });
+
+  it("presents an installed candidate as already saved", () => {
+    const installed = candidate({ status: "promoted", proposed_command: "retry-wrapper" });
+    expect(captureAction({ kind: "already_installed", candidate: installed })).toEqual({
+      kind: "already_installed",
+      candidate: installed,
+    });
   });
 });
 

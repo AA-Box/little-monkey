@@ -281,6 +281,11 @@ export type PromotionOutcome =
   | { kind: "awaiting_approval"; candidate: LearningCandidate; reasons: string[] }
   | { kind: "refused"; candidate: LearningCandidate; reasons: string[] };
 
+export type CaptureOutcome =
+  | { kind: "created"; candidate: LearningCandidate }
+  | { kind: "existing"; candidate: LearningCandidate }
+  | { kind: "already_installed"; candidate: LearningCandidate };
+
 /**
  * Last mode the backend reported. Read synchronously by `agentLoop.ts` to
  * decide whether to offer `manage_skill_learning` at all — a per-turn IPC
@@ -327,7 +332,7 @@ export const skillLearningClient = {
   scopeForRun: (runId: string) =>
     invoke<NativeSkillScope | null>("skill_learning_scope_for_run", { runId }),
   capture: (runId: string, userText: string) =>
-    invoke<LearningCandidate>("skill_learning_capture", { runId, userText }),
+    invoke<CaptureOutcome>("skill_learning_capture", { runId, userText }),
   listCandidates: () => invoke<LearningCandidate[]>("skill_learning_list_candidates"),
   candidate: (candidateId: string) => invoke<LearningCandidate>("skill_learning_candidate", { candidateId }),
   beginReflection: (candidateId: string) =>

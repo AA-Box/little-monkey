@@ -34,6 +34,7 @@ import {
   formatSaveSkillNotice,
   formatLearningNotice,
   learnFromFinishedRun,
+  selectFinishedRunNotice,
   type InvokedSkillUse,
   type ReflectionCall,
 } from './skillLearning';
@@ -2351,33 +2352,35 @@ async function runTurnGuarded(
         const runScope = await skillLearningClient
           .scopeForRun(durable.recorder.runId)
           .catch(() => null);
-        const captureScope = await skillLearningClient
-          .captureEligibility(durable.recorder.runId, userText)
-          .catch(() => null);
-        if (captureScope) {
+        const candidate = runScope && durable.reflect !== null
+          ? await learnFromFinishedRun(
+              durable.recorder.runId,
+              userText,
+              runScope,
+              durable.reflect,
+              signal,
+            )
+          : null;
+        const captureScope = candidate
+          ? null
+          : await skillLearningClient
+              .captureEligibility(durable.recorder.runId, userText)
+              .catch(() => null);
+        const notice = selectFinishedRunNotice(candidate, captureScope);
+        if (notice?.kind === 'learning') {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatLearningNotice(candidateNotice(notice.candidate)),
+          });
+        } else if (notice?.kind === 'save') {
           useSessionStore.getState().addMessage(sessionId, {
             role: 'system',
             content: formatSaveSkillNotice({
               runId: durable.recorder.runId,
               userText,
-              scope: captureScope,
+              scope: notice.scope,
             }),
           });
-        }
-        if (runScope && durable.reflect !== null) {
-          const candidate = await learnFromFinishedRun(
-            durable.recorder.runId,
-            userText,
-            runScope,
-            durable.reflect,
-            signal,
-          );
-          if (candidate) {
-            useSessionStore.getState().addMessage(sessionId, {
-              role: 'system',
-              content: formatLearningNotice(candidateNotice(candidate)),
-            });
-          }
         }
       }
     }

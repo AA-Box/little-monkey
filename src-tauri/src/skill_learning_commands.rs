@@ -18,7 +18,7 @@ use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
-    ApprovalGrant, CandidateProposal, CorrectedExecution, EffectivenessRecord,
+    ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
     EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary,
     LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
     PromotionOutcome, RunEvidence, SkillLearningStore,
@@ -215,7 +215,7 @@ pub async fn skill_learning_capture(
     learning: tauri::State<'_, SkillLearningCommandState>,
     run_id: String,
     user_text: String,
-) -> Result<LearningCandidate, String> {
+) -> Result<CaptureOutcome, String> {
     require_main_window(&window)?;
     let workspace = workspace_for_run(&app, &state, &run_id)?;
     let scope = if workspace.is_some() {

@@ -1351,6 +1351,17 @@ pub enum PromotionOutcome {
     },
 }
 
+/// What an explicit save request found in the durable candidate history.
+/// Terminal rejected/superseded/rolled-back candidates do not block a fresh
+/// capture from the same immutable run; a currently promoted candidate does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CaptureOutcome {
+    Created { candidate: LearningCandidate },
+    Existing { candidate: LearningCandidate },
+    AlreadyInstalled { candidate: LearningCandidate },
+}
+
 impl SkillLearningStore {
     pub fn new(app_data_dir: impl AsRef<Path>) -> Result<Self, SkillError> {
         let root = app_data_dir.as_ref().join(LEARNING_ROOT);
@@ -1620,7 +1631,7 @@ impl SkillLearningStore {
         evidence: &RunEvidence,
         scope: SkillScope,
         workspace: Option<&Path>,
-    ) -> Result<LearningCandidate, SkillError> {
+    ) -> Result<CaptureOutcome, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
         if !capture_is_eligible(&state, evidence, scope) {
@@ -1628,17 +1639,42 @@ impl SkillLearningStore {
                 "this run has no completed successful tool evidence to save as a skill".to_string(),
             ));
         }
-        if let Some(existing_id) = state
+        if let Some(existing) = state
             .candidates
             .values()
-            .find(|candidate| {
+            .filter(|candidate| {
                 candidate
                     .source_run_ids
                     .iter()
                     .any(|id| id == &evidence.run_id)
             })
-            .map(|candidate| candidate.candidate_id.clone())
+            .filter(|candidate| candidate.status == CandidateStatus::Promoted)
+            .max_by_key(|candidate| (candidate.updated_at_unix_ms, candidate.candidate_id.clone()))
         {
+            return Ok(CaptureOutcome::AlreadyInstalled {
+                candidate: existing.clone(),
+            });
+        }
+        let existing_id = state
+            .candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .source_run_ids
+                    .iter()
+                    .any(|id| id == &evidence.run_id)
+                    && matches!(
+                        candidate.status,
+                        CandidateStatus::Detected
+                            | CandidateStatus::Reflecting
+                            | CandidateStatus::Staged
+                            | CandidateStatus::Evaluating
+                            | CandidateStatus::AwaitingApproval
+                    )
+            })
+            .max_by_key(|candidate| (candidate.updated_at_unix_ms, candidate.candidate_id.clone()))
+            .map(|candidate| candidate.candidate_id.clone());
+        if let Some(existing_id) = existing_id {
             let existing = candidate_mut(&mut state, &existing_id)?;
             if matches!(
                 existing.status,
@@ -1651,7 +1687,7 @@ impl SkillLearningStore {
             }
             let updated = existing.clone();
             self.save(&state)?;
-            return Ok(updated);
+            return Ok(CaptureOutcome::Existing { candidate: updated });
         }
 
         let now = now_unix_ms();
@@ -1715,7 +1751,7 @@ impl SkillLearningStore {
             .candidates
             .insert(candidate.candidate_id.clone(), candidate.clone());
         self.save(&state)?;
-        Ok(candidate)
+        Ok(CaptureOutcome::Created { candidate })
     }
 
     /// Marks a detected candidate as being reflected on. Idempotent, so a
@@ -4875,18 +4911,44 @@ mod tests {
             &verified_procedure_events(),
         );
 
-        let candidate = store
+        let candidate = match store
             .capture_run(&evidence, SkillScope::Global, None)
-            .unwrap();
+            .unwrap()
+        {
+            CaptureOutcome::Created { candidate } => candidate,
+            outcome => panic!("expected a new capture, got {outcome:?}"),
+        };
         assert_eq!(candidate.source_kind, LearningSourceKind::ManualRunCapture);
         assert_eq!(candidate.status, CandidateStatus::Detected);
-        assert_eq!(
-            store
-                .capture_run(&evidence, SkillScope::Global, None)
-                .unwrap()
-                .candidate_id,
-            candidate.candidate_id
-        );
+        let existing = store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap();
+        assert!(matches!(
+            existing,
+            CaptureOutcome::Existing { candidate: ref same }
+                if same.candidate_id == candidate.candidate_id
+        ));
+
+        store.reject(&candidate.candidate_id, "try again").unwrap();
+        let recaptured = match store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap()
+        {
+            CaptureOutcome::Created { candidate } => candidate,
+            outcome => panic!("expected a fresh capture after rejection, got {outcome:?}"),
+        };
+        assert_ne!(recaptured.candidate_id, candidate.candidate_id);
+
+        let mut state = store.load().unwrap();
+        let installed = state.candidates.get_mut(&recaptured.candidate_id).unwrap();
+        installed.status = CandidateStatus::Promoted;
+        installed.proposed_command = "retry-wrapper".to_string();
+        store.save(&state).unwrap();
+        assert!(matches!(
+            store.capture_run(&evidence, SkillScope::Global, None).unwrap(),
+            CaptureOutcome::AlreadyInstalled { candidate: ref same }
+                if same.candidate_id == recaptured.candidate_id
+        ));
     }
 
     #[test]

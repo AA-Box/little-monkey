@@ -18,6 +18,7 @@ import type { ChatMessage, ToolCall } from "./llamaClient";
 import { MANAGE_SKILL_LEARNING_TOOL } from "./tools";
 import {
   skillLearningClient,
+  type CaptureOutcome,
   type LearningCandidate,
   type LearningMode,
   type LearningSourceKind,
@@ -413,5 +414,39 @@ export function candidateNotice(candidate: LearningCandidate): LearningNotice {
     state: candidate.status === "promoted" ? "installed" : "suggested",
     command: candidate.proposed_command,
     why: SOURCE_KIND_LABELS[candidate.source_kind],
+  };
+}
+
+export type FinishedRunNotice =
+  | { kind: "learning"; candidate: LearningCandidate }
+  | { kind: "save"; scope: NativeSkillScope };
+
+/** Automatic learning owns the first opportunity to explain a completed run.
+ * Manual save is only the fallback when no automatic candidate was produced. */
+export function selectFinishedRunNotice(
+  candidate: LearningCandidate | null,
+  captureScope: NativeSkillScope | null,
+): FinishedRunNotice | null {
+  if (candidate) return { kind: "learning", candidate };
+  if (captureScope) return { kind: "save", scope: captureScope };
+  return null;
+}
+
+export type CaptureAction =
+  | { kind: "draft"; candidate: LearningCandidate }
+  | { kind: "focus"; candidate: LearningCandidate }
+  | { kind: "already_installed"; candidate: LearningCandidate };
+
+/** Converts the backend's typed capture result into the one UI action that is
+ * valid for that lifecycle state. Terminal candidates never get focused as
+ * editable drafts. */
+export function captureAction(outcome: CaptureOutcome): CaptureAction {
+  if (outcome.kind === "already_installed") {
+    return { kind: "already_installed", candidate: outcome.candidate };
+  }
+  const candidate = outcome.candidate;
+  return {
+    kind: candidate.status === "detected" || candidate.status === "reflecting" ? "draft" : "focus",
+    candidate,
   };
 }
