@@ -1,7 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { LoaderCircle, Mic } from "lucide-react";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { companionClient } from "../../lib/companionClient";
 import {
@@ -17,7 +16,6 @@ import {
   createDictationSessionId,
   dictationClient,
   type DictationCapabilities,
-  type DictationPlatform,
   type DictationState,
   type DictationUnlisten,
 } from "../../lib/dictationClient";
@@ -67,19 +65,19 @@ function focusTextarea(
   textarea.setSelectionRange(selectionStart, selectionEnd);
 }
 
-function dictationSettingsUrl(platform: DictationPlatform | undefined, code: string): string | null {
-  if (platform === "macos") {
-    if (code.startsWith("microphone_")) {
-      return "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-    }
-    if (code === "speech_permission_denied" || code === "speech_unavailable") {
-      return "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition";
-    }
+function dictationPermissionKind(code: string): "microphone" | "speech" | null {
+  if (code.startsWith("microphone_")) return "microphone";
+  if (code === "speech_permission_denied" || code === "speech_unavailable" || code === "sapi_unavailable") {
+    return "speech";
   }
-  if (platform === "windows") {
-    if (code.startsWith("microphone_")) return "ms-settings:privacy-microphone";
-    if (code === "sapi_unavailable" || code === "speech_unavailable") return "ms-settings:privacy-speech";
-  }
+  return null;
+}
+
+function blockedPermissionKind(capabilities: DictationCapabilities): "microphone" | "speech" | null {
+  const microphone = capabilities.permissions?.microphone;
+  if (microphone === "denied" || microphone === "restricted") return "microphone";
+  const speech = capabilities.permissions?.speech;
+  if (speech === "denied" || speech === "restricted") return "speech";
   return null;
 }
 
@@ -122,14 +120,14 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const openPermissionSettings = useCallback(async (code: string) => {
-    const url = dictationSettingsUrl(capabilities?.platform, code);
-    if (!url) return;
+    const kind = code === "microphone" || code === "speech" ? code : dictationPermissionKind(code);
+    if (!kind) return;
     try {
-      await openUrl(url);
+      await dictationClient.openPermissionSettings(kind);
     } catch (reason) {
       if (mountedRef.current) setError(errorMessage(reason));
     }
-  }, [capabilities?.platform]);
+  }, []);
 
   const finishActive = useCallback((session: ActiveDictation) => {
     const hasInsertedText = Boolean(dictationInsertedText(session.insertion));
@@ -245,6 +243,10 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
             supportsPartialResults: false,
             supportsOnDevice: false,
             languages: [],
+            permissions: {
+              microphone: "unavailable",
+              speech: "unavailable",
+            },
           });
         }
       });
@@ -353,7 +355,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const start = useCallback(() => {
-    if (disabled || !capabilities?.supported || activeRef.current || pendingStartRef.current) return;
+    if (disabled || !capabilities || capabilities.platform === "unsupported" || activeRef.current || pendingStartRef.current) return;
     const textarea = textareaRef.current;
     const selectionStart = textarea?.selectionStart ?? value.length;
     const selectionEnd = textarea?.selectionEnd ?? selectionStart;
@@ -374,6 +376,11 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       try {
         await (listenersReadyRef.current ?? Promise.resolve());
         if (pendingStartRef.current !== pendingStart) return;
+        const blockedKind = blockedPermissionKind(capabilities);
+        if (blockedKind) {
+          await openPermissionSettings(blockedKind);
+          throw new Error(`${blockedKind} permission is disabled for Little Monkey.`);
+        }
         const config = await companionClient.config();
         if (pendingStartRef.current !== pendingStart) return;
         const started = await dictationClient.start({
@@ -405,20 +412,18 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
         if (pendingStartRef.current === pendingStart) pendingStartRef.current = null;
       }
     })();
-  }, [capabilities, disabled, failActive, setActiveSession, textareaRef, value]);
+  }, [capabilities, disabled, failActive, openPermissionSettings, setActiveSession, textareaRef, value]);
 
   const isActive = active !== null;
   const isStarting = active?.phase === "starting";
-  const unavailable = capabilityError ?? (!capabilities?.supported ? t("DictationButton.unavailable") : null);
+  const unavailable = capabilityError;
   const tooltipText = error ?? unavailable ?? (isStarting ? t("DictationButton.starting") : isActive ? t("DictationButton.stop") : t("DictationButton.dictate"));
   const ariaLabel = isActive ? t("DictationButton.stop") : t("DictationButton.startAriaLabel");
   const handleClick = () => {
     if (isActive) {
       void stopActive();
-    } else if (capabilities?.supported) {
-      start();
     } else {
-      void openPermissionSettings("speech_unavailable");
+      start();
     }
   };
 
@@ -427,7 +432,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       <button
         type="button"
         onClick={handleClick}
-        disabled={disabled || isStarting || !capabilities}
+        disabled={disabled || isStarting || !capabilities || capabilities.platform === "unsupported"}
         aria-label={isStarting ? t("DictationButton.starting") : ariaLabel}
         aria-pressed={isActive || undefined}
         className={`flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background ${isActive ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent" : ""}`}

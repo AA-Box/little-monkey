@@ -323,7 +323,7 @@ seccompiler = "0.5.0"
 # implementation time.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Media_Speech", "Win32_System_Com"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Media_Speech", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # cli_install.rs: broadcasts WM_SETTINGCHANGE after the PATH registry write
 # so already-open shells/Explorer notice without a logoff — the same
 # notification Windows installers send. Only the Win32 feature modules
