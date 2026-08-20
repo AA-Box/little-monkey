@@ -1,4 +1,7 @@
 import { create } from "zustand";
+import { isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   skillActivationClient,
   type SkillActivationEntry,
@@ -8,6 +11,9 @@ import {
 export type { SkillActivationPolicy } from "../lib/skillActivationClient";
 
 const STORAGE_KEY = "little-monkey.skill-activation-policies";
+const SKILL_ACTIVATION_CHANGED_EVENT = "skill-activation://changed";
+
+let subscribed = false;
 
 function legacyEntries(): SkillActivationEntry[] {
   if (typeof localStorage === "undefined") return [];
@@ -32,6 +38,7 @@ export interface SkillActivationPolicyStore {
   hydrating: boolean;
   error: string | null;
   hydrate: () => Promise<void>;
+  refresh: () => Promise<void>;
   getPolicy: (key: string) => SkillActivationPolicy;
   isPinned: (key: string) => boolean;
   setPolicy: (key: string, policy: SkillActivationPolicy) => Promise<void>;
@@ -46,10 +53,30 @@ export const useSkillActivationPolicyStore = create<SkillActivationPolicyStore>(
   hydrating: false,
   error: null,
 
+  refresh: async () => {
+    if (!isTauri()) return;
+    try {
+      const entries = await skillActivationClient.list();
+      set({ policies: mapEntries(entries), error: null });
+    } catch (error) {
+      // Unknown backend state must not leave an old Automatic cache active.
+      // The next turn retries against the profile-owned store.
+      set({ hydrated: false, error: String(error) });
+    }
+  },
+
   hydrate: async () => {
     if (get().hydrating || get().hydrated) return;
     set({ hydrating: true, error: null });
     try {
+      if (isTauri() && !subscribed) {
+        const ownLabel = getCurrentWindow().label;
+        await listen<string>(SKILL_ACTIVATION_CHANGED_EVENT, (event) => {
+          if (event.payload === ownLabel) return;
+          void get().refresh();
+        });
+        subscribed = true;
+      }
       let entries = await skillActivationClient.list();
       const migrated = await skillActivationClient.migrate(legacyEntries());
       entries = migrated.length === entries.length && migrated.every((entry) =>

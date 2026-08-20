@@ -92,7 +92,7 @@ import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRu
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
 import { requestSkillActivationApproval } from '../store/skillActivationApprovalStore';
-import { useSkillActivationPolicyStore } from '../store/skillActivationPolicyStore';
+import { skillActivationPolicyFor, useSkillActivationPolicyStore } from '../store/skillActivationPolicyStore';
 import {
   describeRedactions,
   gatePrivacyWireMessages,
@@ -1677,6 +1677,12 @@ export async function runAgentTurn(
       await watchResumedDesktopTurn(sessionId, resume, controller, origin);
       return;
     }
+    // Re-read the profile-owned policy file before each turn so CLI changes
+    // converge even when no Tauri event was available to this renderer.
+    await useSkillActivationPolicyStore.getState().refresh();
+    availableSkills = availableSkills.map((candidate) => candidate.policyKey
+      ? { ...candidate, activationPolicy: skillActivationPolicyFor(candidate.policyKey) }
+      : candidate);
     const mutationRequired = requiresWorkspaceMutation(
       userText,
       usePermissionStore.getState().mode,

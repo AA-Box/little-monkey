@@ -292,16 +292,15 @@ fn workspace_for_scope(state: &AppState, scope: SkillScope) -> Result<Option<Pat
 /// `pub(crate)` for the same reason as `optional_primary_workspace` above —
 /// `tools.rs`'s `tool_read_skill_resource` reuses this rather than a second
 /// `spawn_blocking`/`SkillError`-to-`String` wrapper.
-pub(crate) async fn run_blocking<T, E, F>(operation: F) -> Result<T, String>
+pub(crate) async fn run_blocking<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-    F: FnOnce() -> Result<T, E> + Send + 'static,
+    F: FnOnce() -> Result<T, crate::native_skills::SkillError> + Send + 'static,
 {
     tauri::async_runtime::spawn_blocking(operation)
         .await
         .map_err(|error| format!("Native skill worker failed: {error}"))?
-        .map_err(|error| error.to_string())
+        .map_err(command_error)
 }
 
 fn command_error(error: crate::native_skills::SkillError) -> String {

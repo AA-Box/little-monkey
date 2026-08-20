@@ -60,6 +60,21 @@ function catalogTokens(value: string): string[] {
   return value.toLocaleLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]*/gu) ?? [];
 }
 
+function normalizeRankingPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  // Windows drive and UNC paths are case-insensitive; preserve case for
+  // ordinary Unix paths, where it is significant.
+  return (/^[A-Za-z]:\//.test(normalized) || normalized.startsWith("//"))
+    ? normalized.toLowerCase()
+    : normalized;
+}
+
+function isWithinWorkspace(sourcePath: string, workspaceRoot: string): boolean {
+  const source = normalizeRankingPath(sourcePath);
+  const root = normalizeRankingPath(workspaceRoot);
+  return source === root || source.startsWith(`${root}/`);
+}
+
 export interface SkillRankingSignals {
   pinned?: boolean;
   workspaceRelevant?: boolean;
@@ -128,9 +143,9 @@ export function skillRankingSignalsFor(
       record.command.toLowerCase() === skill.command.toLowerCase()
       && record.skill_sha256 === skill.contentSha256,
     );
-    const successes = matching.filter((record) => record.outcome === "success" && record.verification_passed !== false);
+    const verifiedSuccesses = matching.filter((record) => record.outcome === "success" && record.verification_passed === true);
     const failures = matching.filter((record) => record.outcome === "failure" || record.verification_passed === false);
-    const lastSuccessfulAtUnixMs = successes.reduce(
+    const lastSuccessfulAtUnixMs = verifiedSuccesses.reduce(
       (latest, record) => Math.max(latest, record.recorded_at_unix_ms),
       0,
     );
@@ -139,10 +154,10 @@ export function skillRankingSignalsFor(
       workspaceRelevant: Boolean(
         skill.sourcePath
         && workspaceRoot
-        && (skill.sourcePath === workspaceRoot || skill.sourcePath.startsWith(`${workspaceRoot}/`)),
+        && isWithinWorkspace(skill.sourcePath, workspaceRoot),
       ),
-      verifiedSuccesses: successes.length,
-      recentSuccesses: successes.filter((record) => Date.now() - record.recorded_at_unix_ms <= 30 * 86_400_000).length,
+      verifiedSuccesses: verifiedSuccesses.length,
+      recentSuccesses: verifiedSuccesses.filter((record) => Date.now() - record.recorded_at_unix_ms <= 30 * 86_400_000).length,
       failures: failures.length,
       corrections: matching.filter((record) => record.user_corrected).length,
       lastSuccessfulAtUnixMs: lastSuccessfulAtUnixMs || undefined,

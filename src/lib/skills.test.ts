@@ -319,6 +319,32 @@ describe("composeSkillCatalog", () => {
     expect(ranked[0].id).toBe("deploy-v1");
     expect(rankSkillCatalog([preferred], "déployer").length).toBe(1);
   });
+
+  it("only counts verified successes and normalizes workspace paths", () => {
+    const windowsSkill = { ...skill("deploy", "windows"), sourcePath: "C:\\workspace\\app\\.agents\\skills\\deploy\\" };
+    const outsideSkill = { ...skill("other", "outside"), sourcePath: "C:\\workspace\\other\\.agents\\skills\\other" };
+    const records = [{
+      command: "deploy",
+      scope: "workspace" as const,
+      skill_sha256: windowsSkill.contentSha256,
+      run_id: "run-unverified",
+      session_id: null,
+      outcome: "success" as const,
+      verification_passed: null,
+      tool_failures: [],
+      failure_signature: null,
+      user_corrected: false,
+      recorded_at_unix_ms: Date.now(),
+    }];
+    const signals = skillRankingSignalsFor([windowsSkill, outsideSkill], records, "C:/workspace/app/");
+    expect(signals.get(windowsSkill.id)).toMatchObject({
+      workspaceRelevant: true,
+      verifiedSuccesses: 0,
+      recentSuccesses: 0,
+      lastSuccessfulAtUnixMs: undefined,
+    });
+    expect(signals.get(outsideSkill.id)?.workspaceRelevant).toBe(false);
+  });
 });
 
 describe("skill activation policy identity", () => {

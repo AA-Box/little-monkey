@@ -233,22 +233,32 @@ impl SkillActivationStore {
 mod tests {
     use super::*;
 
+    fn test_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "little-monkey-skill-activation-{name}-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&directory).expect("test directory");
+        directory
+    }
+
     #[test]
     fn missing_preferences_fail_closed_to_ask_at_the_boundary() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = SkillActivationStore::new(directory.path()).expect("store");
+        let directory = test_directory("missing");
+        let store = SkillActivationStore::new(&directory).expect("store");
         assert!(store.get("native:global:test").expect("get").is_none());
         let entry = store
             .set("native:global:test", SkillActivationPolicy::Automatic, true)
             .expect("set");
         assert_eq!(entry.preference.policy, SkillActivationPolicy::Automatic);
         assert!(entry.preference.pinned);
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[test]
     fn migration_is_one_time_and_backend_entries_win() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = SkillActivationStore::new(directory.path()).expect("store");
+        let directory = test_directory("migration");
+        let store = SkillActivationStore::new(&directory).expect("store");
         store
             .set("local:existing", SkillActivationPolicy::Manual, false)
             .expect("set");
@@ -301,5 +311,6 @@ mod tests {
                 .policy,
             SkillActivationPolicy::Manual
         );
+        fs::remove_dir_all(directory).expect("cleanup");
     }
 }

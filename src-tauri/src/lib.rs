@@ -1,4 +1,4 @@
-#![recursion_limit = "2048"]
+#![recursion_limit = "4096"]
 
 // `pub` so every module below (and `monkey-cli`, which has no `AppHandle`)
 // resolves the app-data directory through one shared `data_dir()` instead of

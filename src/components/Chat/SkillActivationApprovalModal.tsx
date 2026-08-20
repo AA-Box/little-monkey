@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { ShieldCheck, X } from "lucide-react";
 import { useSkillActivationApprovalStore } from "../../store/skillActivationApprovalStore";
 import { Button } from "../ui";
@@ -6,6 +7,18 @@ export function SkillActivationApprovalModal() {
   const pending = useSkillActivationApprovalStore((state) => state.pending);
   const allowOnce = useSkillActivationApprovalStore((state) => state.allowOnce);
   const deny = useSkillActivationApprovalStore((state) => state.deny);
+
+  useEffect(() => {
+    if (!pending) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.repeat || event.isComposing) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      deny();
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [pending, deny]);
 
   if (!pending) return null;
   return (

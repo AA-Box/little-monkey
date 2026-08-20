@@ -1734,7 +1734,7 @@ function App() {
         </Suspense>
       )}
       <PrivacyFirewallGate />
-      <SkillActivationApprovalModal />
+      {!permissionPending && <SkillActivationApprovalModal />}
       {(settingsOpen || settingsMounted) && (
         <Suspense fallback={null}>
           <SettingsModal
