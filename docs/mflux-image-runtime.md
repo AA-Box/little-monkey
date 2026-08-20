@@ -4,7 +4,7 @@ MFLUX is an Apple Silicon-only Studio engine. It is installed as its own signed 
 
 ## Setup
 
-1. Open Settings → Runtime Hub → Components and install **MFLUX Image Runtime**.
+1. Select an MFLUX model in Studio; the signed **MFLUX Image Runtime** is fetched and installed automatically through Runtime Hub. Settings → Runtime Hub → Components remains available for inspection, updates, and repair.
 2. In Studio, choose **Add model** and select **MFLUX image**.
 3. Keep the default repository `black-forest-labs/FLUX.1-dev`, choose **8-bit**, and enable text-to-image and/or image-to-image.
 4. If the repository requires it, enter an access token. It is stored in the OS credential store and is not written to the model JSON.

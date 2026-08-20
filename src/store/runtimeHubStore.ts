@@ -180,6 +180,9 @@ interface RuntimeHubStoreState {
   /** Fetches the trusted MLX catalog and installs its newest package when the
    * supported MLX runtime is present but has no working package. */
   ensureMlxRuntime: () => Promise<void>;
+  /** Fetches the trusted MFLUX catalog and installs or repairs its package
+   * when Studio selects an MFLUX image model on Apple Silicon. */
+  ensureMfluxRuntime: () => Promise<void>;
   /** Installs a signed MLX service package from a directory on this machine. */
   installMlxPackage: (packageDirectory: string) => Promise<void>;
   activateComponentVersion: (componentId: string, versionKey: string) => Promise<void>;
@@ -256,10 +259,17 @@ function modelAssetId(match: M3CatalogMatch): string {
 }
 
 const MLX_COMPONENT_ID = "mlx-runtime-apple-silicon";
+const MFLUX_COMPONENT_ID = "mflux-image-runtime-apple-silicon";
 
 function latestMlxComponent(entries: M3ComponentCatalogEntry[]): M3ComponentCatalogEntry | undefined {
   return entries
     .filter((entry) => entry.componentId === MLX_COMPONENT_ID && entry.kind === "mlx_runtime")
+    .sort((left, right) => right.publishedAtMs - left.publishedAtMs)[0];
+}
+
+function latestMfluxComponent(entries: M3ComponentCatalogEntry[]): M3ComponentCatalogEntry | undefined {
+  return entries
+    .filter((entry) => entry.componentId === MFLUX_COMPONENT_ID && entry.kind === "mflux_image_runtime")
     .sort((left, right) => right.publishedAtMs - left.publishedAtMs)[0];
 }
 
@@ -719,6 +729,56 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
         }
         if (!entry) {
           throw new Error("The published MLX runtime is not available in the component catalog.");
+        }
+
+        await get().installComponent(entry);
+      } catch (error) {
+        fail(key, error);
+        throw error;
+      } finally {
+        finish(key);
+      }
+    },
+
+    ensureMfluxRuntime: async () => {
+      const key = "mflux-auto-install";
+      if (get().busy[key]) return;
+      begin(key);
+      try {
+        if (!get().hardware || get().componentRegistry.length === 0) {
+          await Promise.all([get().refreshOverview(), get().refreshComponents()]);
+        }
+        const platform = get().hardware?.platform;
+        if (
+          !platform ||
+          platform.os !== "macos" ||
+          !["aarch64", "arm64"].includes(platform.arch)
+        ) {
+          return;
+        }
+
+        const installed = get().installedComponents.find(
+          (component) => component.componentId === MFLUX_COMPONENT_ID,
+        );
+        const active = installed?.versions.find((version) => version.active);
+        if (active) {
+          // The component hub can retain a verified artifact while the
+          // production package tree is missing or damaged. Reinstalling from
+          // that artifact repairs the tree without another download.
+          await runtimeHubClient.mfluxInstallComponent(MFLUX_COMPONENT_ID);
+          return;
+        }
+
+        const knownEntry = latestMfluxComponent(get().componentRegistry);
+        let entry = knownEntry;
+        try {
+          await get().syncComponentCatalog();
+          entry = latestMfluxComponent(get().componentRegistry) ?? knownEntry;
+        } catch (error) {
+          if (!knownEntry) throw error;
+        }
+        if (!entry) {
+          throw new Error("The published MFLUX Image Runtime is not available in the component catalog.");
         }
 
         await get().installComponent(entry);
