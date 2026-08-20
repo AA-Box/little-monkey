@@ -324,8 +324,9 @@ char *little_monkey_dictation_macos_capabilities_json(void) {
                 @"supportsOnDevice": @(supportsOnDevice),
             }];
         }
+        BOOL supported = defaultRecognizer != nil;
         NSData *data = [NSJSONSerialization dataWithJSONObject:@{
-            @"supported": @([SFSpeechRecognizer class] != Nil && languages.count > 0),
+            @"supported": @(supported),
             @"supportsPartialResults": @YES,
             @"supportsOnDevice": @(defaultSupportsOnDevice),
             @"languages": languages,

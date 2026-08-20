@@ -119,8 +119,8 @@ afterEach(() => {
 });
 
 describe('DictationButton', () => {
-  it('opens macOS speech settings through the native command when recognition is unavailable', async () => {
-    mocks.invoke.mockImplementation((command: string) => {
+  it('still attempts native dictation when capability metadata is unavailable', async () => {
+    mocks.invoke.mockImplementation((command: string, args?: { sessionId?: string }) => {
       if (command === 'dictation_capabilities') {
         return Promise.resolve({
           supported: false,
@@ -131,6 +131,8 @@ describe('DictationButton', () => {
           languages: [],
         });
       }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      if (command === 'dictation_start') return Promise.resolve({ sessionId: args?.sessionId });
       return Promise.resolve(undefined);
     });
 
@@ -139,10 +141,7 @@ describe('DictationButton', () => {
     expect(button.disabled).toBe(false);
     fireEvent.click(button);
 
-    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
-      'dictation_open_permission_settings',
-      { kind: 'speech' },
-    ));
+    await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
   });
 
   it('replaces provisional text, commits the final, and restores the caret', async () => {

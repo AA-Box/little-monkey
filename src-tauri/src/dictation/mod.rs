@@ -325,10 +325,6 @@ pub fn dictation_start(
 ) -> Result<DictationStartResult, String> {
     ensure_main_window(&window)?;
     let app = window.app_handle().clone();
-    let capabilities = platform_capabilities();
-    if !capabilities.supported {
-        return Err("Native OS speech recognition is not supported on this platform".to_string());
-    }
     validate_session_id(&session_id)?;
 
     if let Some(previous) = runtime

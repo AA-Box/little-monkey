@@ -343,7 +343,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const start = useCallback(() => {
-    if (disabled || !capabilities?.supported || activeRef.current || pendingStartRef.current) return;
+    if (disabled || !capabilities || activeRef.current || pendingStartRef.current) return;
     const textarea = textareaRef.current;
     const selectionStart = textarea?.selectionStart ?? value.length;
     const selectionEnd = textarea?.selectionEnd ?? selectionStart;
@@ -399,16 +399,14 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
 
   const isActive = active !== null;
   const isStarting = active?.phase === "starting";
-  const unavailable = capabilityError ?? (!capabilities?.supported ? t("DictationButton.unavailable") : null);
+  const unavailable = capabilityError;
   const tooltipText = error ?? unavailable ?? (isStarting ? t("DictationButton.starting") : isActive ? t("DictationButton.stop") : t("DictationButton.dictate"));
   const ariaLabel = isActive ? t("DictationButton.stop") : t("DictationButton.startAriaLabel");
   const handleClick = () => {
     if (isActive) {
       void stopActive();
-    } else if (capabilities?.supported) {
-      start();
     } else {
-      void openPermissionSettings("speech_unavailable");
+      start();
     }
   };
 
