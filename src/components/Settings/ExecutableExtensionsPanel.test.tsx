@@ -490,6 +490,7 @@ describe("ExecutableExtensionsPanel", () => {
     render(<ExecutableExtensionsPanel />);
     await screen.findByText("API token");
     const input = screen.getByPlaceholderText("Enter a new secret") as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe(""));
     fireEvent.change(input, { target: { value: "fixture-super-secret" } });
     await waitFor(() => expect(input.value).toBe("fixture-super-secret"));
     const save = screen.getByRole("button", { name: "Save secret" }) as HTMLButtonElement;

@@ -17,6 +17,7 @@ import {
   type TemplateFamily,
 } from "../../../lib/runtimeHubClient";
 import { useRuntimeHubStore, type RuntimeDetail } from "../../../store/runtimeHubStore";
+import { RuntimeHubStudioModels } from "./RuntimeHubStudioModels";
 import {
   BusyButton,
   CompatibilityWarningBanner,
@@ -795,6 +796,8 @@ export function RuntimeHubModels() {
           )}
         </div>
       </section>
+
+      <RuntimeHubStudioModels />
 
       <CapacityPlanner />
       <ChatTemplateLabSection />

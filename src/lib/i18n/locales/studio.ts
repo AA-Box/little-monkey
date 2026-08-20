@@ -16,6 +16,10 @@ export const studioLocale: Record<string, string> = {
   "Studio.audio.title": "Audio",
   "Studio.audio.subtitle":
     "Speak text in a chosen voice, or clone one from a recording. Nothing leaves this machine.",
+  "Studio.mlx.preparing": "Preparing the MLX video service…",
+  "Studio.mlx.notReady": "The MLX video service is not ready yet.",
+  "Studio.mlx.retry": "Retry MLX setup",
+  "Studio.mflux.notReady": "Install the MFLUX Image Runtime from Settings → Runtime Hub → Components before generating.",
   "Studio.add.speechHint":
     "A speech model is its backbone on --model plus its projector on --mmproj.",
   "Studio.task.text_to_speech": "Text to speech",
@@ -109,9 +113,11 @@ export const studioLocale: Record<string, string> = {
     "This page is open in a browser, where Studio cannot reach the generation engine. Open Little Monkey itself to add models and generate.",
   "Studio.emptyLibrary": "Your library is empty. Add a model to get started — nothing is preinstalled.",
   "Studio.forget": "Forget this model",
+  "Studio.editModel": "Edit model options",
   "Studio.add.open": "Add model",
   "Studio.add.cancel": "Cancel",
   "Studio.add.title": "Add a model",
+  "Studio.add.editTitle": "Edit model",
   "Studio.add.slotHint":
     "Each part is named from its own file name where that says enough — check them. A part named wrong fails inside the engine as a tensor-shape error, not here.",
   "Studio.add.slot": "What this part is",
@@ -164,10 +170,21 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.engine": "Engine",
   "Studio.add.engineBundled": "Built in (stable-diffusion.cpp)",
   "Studio.add.engineMlxVideo": "MLX video (Apple silicon)",
+  "Studio.add.engineMfluxImage": "MFLUX image (Apple silicon)",
   "Studio.add.engineHint":
     "Reads safetensors and GGUF weights. The right choice for everything except a checkpoint converted for MLX.",
   "Studio.add.engineMlxVideoHint":
     "For MLX conversions — a folder holding config.json beside model, t5_encoder and vae safetensors. Needs the MLX package from Settings → Runtime Hub, and makes video only.",
+  "Studio.add.engineMfluxImageHint":
+    "Native image generation with text-to-image and image-to-image. Needs the separate MFLUX Image Runtime from Settings → Runtime Hub.",
+  "Studio.add.mfluxSource": "Model source",
+  "Studio.add.mfluxRepository": "Repository",
+  "Studio.add.mfluxRepositoryPlaceholder": "owner/model",
+  "Studio.add.mfluxToken": "Access token (optional)",
+  "Studio.add.mfluxTokenPlaceholder": "hf_…",
+  "Studio.add.mfluxTokenHint": "Stored securely and used only for this model download.",
+  "Studio.add.mfluxDirectory": "Local directory",
+  "Studio.add.mfluxQuantization": "Quantization",
 
   // Launch-time engine switches. Each hint says what it costs as well as what
   // it buys — every one of these is a trade, and a checkbox that only promises
@@ -190,6 +207,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.engineArgsHint":
     "Passed to the engine as typed — no shell, so quote any path with spaces. This is how flags without their own field are reached: --vae-format, --model-args.",
   "Studio.add.save": "Add to library",
+  "Studio.add.saveChanges": "Save changes",
   "Studio.lora.title": "LoRAs",
   "Studio.lora.add": "Add LoRA",
   "Studio.lora.remove": "Remove this LoRA",

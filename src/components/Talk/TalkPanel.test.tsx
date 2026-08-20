@@ -57,6 +57,8 @@ const CONFIG: CompanionConfig = {
     wakePhraseEnabled: false,
     wakePhrase: 'hey little monkey',
     alwaysListening: false,
+    dictationLanguage: null,
+    dictationRequireOnDevice: false,
   },
   imageEndpoints: [],
 };

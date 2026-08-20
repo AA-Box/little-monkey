@@ -311,7 +311,7 @@ export function modelTargetToRunWire(target: ModelTargetSnapshot): ModelTargetSn
  * `workspace_id` on this same object was already derived this way; the root ids
  * were simply missed.
  */
-function protocolRootId(root: WorkspaceRootInfo): string {
+export function protocolRootId(root: WorkspaceRootInfo): string {
   return stableProtocolId("root", root.id);
 }
 

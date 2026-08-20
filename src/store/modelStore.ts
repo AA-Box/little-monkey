@@ -27,9 +27,37 @@ export interface ModelInfo {
   is_external: boolean;
   /** "chat" (tool-calling instruct model) or "embedding" — see `models.rs::ModelKind`. Defaults to "chat" on the Rust side for pre-existing entries, so this is always present in practice. */
   kind: "chat" | "embedding";
+  components?: ModelComponents;
+  capabilities?: ModelCapabilities;
 }
 
-/** Resolved metadata for a public single-file GGUF model reference. */
+export type ComponentOwnership = "managed" | "external";
+
+export interface ProjectorComponent {
+  path: string;
+  file: string;
+  size_bytes: number;
+  ownership: ComponentOwnership;
+  sha256: string | null;
+  missing?: boolean;
+}
+
+export interface ModelComponents {
+  projector: ProjectorComponent | null;
+}
+
+export interface ProjectorCandidate {
+  path: string;
+  file: string;
+  sizeBytes: number;
+}
+
+export interface ModelCapabilities {
+  text: boolean;
+  image_input: boolean;
+}
+
+/** Resolved metadata for a public GGUF model bundle reference. */
 export interface ResolvedModelReference {
   source: string;
   canonicalReference: string;
@@ -43,6 +71,18 @@ export interface ResolvedModelReference {
   toolCalling: boolean;
   licenseName: string | null;
   licenseUrl: string | null;
+  artifacts?: ResolvedModelArtifact[];
+  projectorCandidates?: ResolvedModelArtifact[];
+}
+
+export type ModelArtifactRole = "model" | "projector";
+
+export interface ResolvedModelArtifact {
+  role: ModelArtifactRole;
+  fileName: string;
+  downloadUrl: string;
+  sha256: string;
+  sizeBytes: number;
 }
 
 export type LlamaStatus = "stopped" | "starting" | "ready" | "error";
@@ -50,6 +90,9 @@ export type LlamaStatus = "stopped" | "starting" | "ready" | "error";
 export interface DownloadProgress {
   downloaded: number;
   total: number;
+  component?: "model" | "projector";
+  componentDownloaded?: number;
+  componentTotal?: number;
 }
 
 /** Payload of the `llama://status` Tauri event emitted by src-tauri/src/llama.rs. */
@@ -57,6 +100,8 @@ interface LlamaStatusEvent {
   status: LlamaStatus;
   port: number;
   model_path: string | null;
+  projector_path: string | null;
+  vision_enabled: boolean;
 }
 
 /** localStorage key for the "start with embeddings" preference — mirrors
@@ -75,6 +120,9 @@ function readInitialEmbeddingsEnabled(): boolean {
 interface DownloadProgressEvent {
   file: string;
   reference?: string;
+  component?: "model" | "projector";
+  componentDownloaded?: number;
+  componentTotal?: number;
   downloaded: number;
   total: number;
 }
@@ -82,7 +130,13 @@ interface DownloadProgressEvent {
 export function modelDownloadProgressEntries(
   event: DownloadProgressEvent,
 ): Record<string, DownloadProgress> {
-  const progress = { downloaded: event.downloaded, total: event.total };
+  const progress = {
+    downloaded: event.downloaded,
+    total: event.total,
+    ...(event.component ? { component: event.component } : {}),
+    ...(event.componentDownloaded !== undefined ? { componentDownloaded: event.componentDownloaded } : {}),
+    ...(event.componentTotal !== undefined ? { componentTotal: event.componentTotal } : {}),
+  };
   return {
     [event.file]: progress,
     ...(event.reference ? { [event.reference]: progress } : {}),
@@ -268,6 +322,8 @@ export interface ModelStore {
   active: ModelInfo | null;
   downloadProgress: Record<string, DownloadProgress>;
   llamaStatus: LlamaStatus;
+  llamaVisionEnabled: boolean;
+  llamaProjectorPath: string | null;
   /** Why the last `start()` failed, verbatim from the backend. A generic
    * "llama-server failed to start" tells nobody whether the runtime is
    * unverified, the port is taken or the GGUF is corrupt — so the real message
@@ -286,14 +342,15 @@ export interface ModelStore {
   refresh: () => Promise<void>;
   /** Download a curated model's GGUF weights, then refresh the installed list. */
   download: (model: ModelInfo) => Promise<void>;
-  /** Cancel an in-flight `download()` for `model.file` — interrupts the backend stream and clears its progress entry. */
-  cancelDownload: (model: ModelInfo) => Promise<void>;
+  /** Cancel an in-flight curated download or public bundle install. */
+  cancelDownload: (modelOrReference: ModelInfo | string) => Promise<void>;
   /** Resolve an Ollama tag or Hugging Face reference into a verified public GGUF artifact. */
   resolveModelReference: (reference: string) => Promise<ResolvedModelReference>;
   /** Install a previously-resolved artifact and refresh the installed model list. */
   installModelReference: (
     reference: string,
     expectedSha256: string,
+    expectedProjectorSha256?: string,
   ) => Promise<ModelInfo>;
   /** Start llama-server on the given (installed) model. */
   start: (model: ModelInfo) => Promise<void>;
@@ -303,6 +360,9 @@ export interface ModelStore {
   removeModel: (model: ModelInfo) => Promise<void>;
   /** Register an arbitrary on-disk `.gguf` file (outside the app's models dir) as a usable local model. */
   addExternalModel: (path: string) => Promise<ModelInfo>;
+  detectProjectors: (modelPath: string) => Promise<ProjectorCandidate[]>;
+  setProjector: (modelPath: string, projectorPath: string) => Promise<ModelInfo>;
+  removeProjector: (modelPath: string) => Promise<ModelInfo>;
 
   // --- Ollama (second, sibling model provider) ---
   ollamaReachable: boolean;
@@ -416,6 +476,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
   active: null,
   downloadProgress: {},
   llamaStatus: "stopped",
+  llamaVisionEnabled: false,
+  llamaProjectorPath: null,
   llamaError: null,
   embeddingsEnabled: readInitialEmbeddingsEnabled(),
 
@@ -462,6 +524,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       const status = await invoke<LlamaStatusEvent>("llama_status");
       set((state) => ({
         llamaStatus: status.status,
+        llamaVisionEnabled: status.vision_enabled === true,
+        llamaProjectorPath: status.projector_path ?? null,
         active: status.model_path
           ? installed.find((m) => m.path === status.model_path) ?? state.active
           : state.active,
@@ -507,18 +571,18 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     }
   },
 
-  cancelDownload: async (model) => {
-    await invoke("models_cancel_download", { file: model.file });
+  cancelDownload: async (modelOrReference) => {
+    const file = typeof modelOrReference === "string" ? modelOrReference : modelOrReference.file;
+    await invoke("models_cancel_download", { file });
   },
 
   resolveModelReference: async (reference) =>
     invoke<ResolvedModelReference>("models_resolve_reference", { reference }),
 
-  installModelReference: async (reference, expectedSha256) => {
-    const model = await invoke<ModelInfo>("models_install_reference", {
-      reference,
-      expectedSha256,
-    });
+  installModelReference: async (reference, expectedSha256, expectedProjectorSha256) => {
+    const args: Record<string, unknown> = { reference, expectedSha256 };
+    if (expectedProjectorSha256) args.expectedProjectorSha256 = expectedProjectorSha256;
+    const model = await invoke<ModelInfo>("models_install_reference", args);
     await get().refresh();
     return model;
   },
@@ -530,6 +594,8 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     set({
       active: model,
       llamaStatus: "starting",
+      llamaVisionEnabled: false,
+      llamaProjectorPath: null,
       llamaError: null,
       activeProvider: "local",
     });
@@ -539,11 +605,21 @@ export const useModelStore = create<ModelStore>((set, get) => ({
       // from the model's own GGUF metadata (`llama.rs::resolve_ctx_size`)
       // instead of one fixed guess for every model — it returns whatever it
       // actually launched with.
-      resolvedCtxSize = await invoke<number>("llama_start", {
+      const startArgs: Record<string, unknown> = {
         modelPath: model.path,
         gpuLayers: DEFAULT_GPU_LAYERS,
-        embeddings: get().embeddingsEnabled,
-      });
+      };
+      const projector = model.components?.projector;
+      if (projector?.missing) {
+        throw new Error("The multimodal projector configured for this model no longer exists.");
+      }
+      if (projector) {
+        startArgs.projectorPath = projector.path;
+        startArgs.embeddings = false;
+      } else {
+        startArgs.embeddings = get().embeddingsEnabled;
+      }
+      resolvedCtxSize = await invoke<number>("llama_start", startArgs);
     } catch (err) {
       // `llama_start` can reject before ever spawning the process (e.g.
       // model verification or runtime binary resolution failure) — those
@@ -560,7 +636,7 @@ export const useModelStore = create<ModelStore>((set, get) => ({
 
   stop: async () => {
     await invoke("llama_stop");
-    set({ llamaStatus: "stopped", llamaError: null });
+    set({ llamaStatus: "stopped", llamaError: null, llamaVisionEnabled: false, llamaProjectorPath: null });
   },
 
   removeModel: async (model) => {
@@ -579,11 +655,29 @@ export const useModelStore = create<ModelStore>((set, get) => ({
     return model;
   },
 
+  detectProjectors: (modelPath) =>
+    invoke<ProjectorCandidate[]>("models_detect_projectors", { modelPath }),
+
+  setProjector: async (modelPath, projectorPath) => {
+    const model = await invoke<ModelInfo>("models_set_projector", { modelPath, projectorPath });
+    await get().refresh();
+    return model;
+  },
+
+  removeProjector: async (modelPath) => {
+    const model = await invoke<ModelInfo>("models_remove_projector", { modelPath });
+    await get().refresh();
+    return model;
+  },
+
   refreshOllama: async () => {
     const [status, models, exampleTags] = await Promise.all([
       invoke<OllamaStatusEvent>("ollama_status"),
       invoke<OllamaModelInfo[]>("ollama_list_models").catch(() => [] as OllamaModelInfo[]),
-      invoke<string[]>("ollama_example_cloud_tags"),
+      // The local tag inventory is still valid when the optional cloud
+      // catalog is unavailable. Do not discard usable local Ollama/MLX
+      // models because that separate catalog request failed.
+      invoke<string[]>("ollama_example_cloud_tags").catch(() => [] as string[]),
     ]);
     set({
       ollamaReachable: status.reachable,
@@ -838,6 +932,8 @@ if (isTauri()) {
   void listen<LlamaStatusEvent>("llama://status", (event) => {
     useModelStore.setState((state) => ({
       llamaStatus: event.payload.status,
+      llamaVisionEnabled: event.payload.vision_enabled === true,
+      llamaProjectorPath: event.payload.projector_path ?? null,
       active: event.payload.model_path
         ? state.installed.find((m) => m.path === event.payload.model_path) ??
           state.active

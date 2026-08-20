@@ -209,6 +209,24 @@
   to { opacity: 1; }
 }
 
+@keyframes session-title-marquee {
+  0%, 18% { transform: translateX(0); }
+  48%, 68% { transform: translateX(calc(-1 * var(--session-title-overflow))); }
+  100% { transform: translateX(0); }
+}
+
+.group:hover .session-title-marquee,
+.group:focus-within .session-title-marquee {
+  animation: session-title-marquee 4.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .group:hover .session-title-marquee,
+  .group:focus-within .session-title-marquee {
+    animation: none;
+  }
+}
+
 html, body, #root { height: 100%; }
 
 html {

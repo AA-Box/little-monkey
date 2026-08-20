@@ -54,7 +54,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// Bounded per-runtime max for the runtime log tails a support bundle can
 /// embed — mirrors `M3RuntimeHub::runtime_logs`'s own cap on a single
@@ -130,6 +132,9 @@ pub trait M3OwnedProcessShutdown: Send + Sync {
 
 pub struct M3CommandState {
     pub hub: Arc<M3RuntimeHub>,
+    /// Shared application-level arbitration between Studio's MLX video
+    /// process and Runtime Hub's MLX chat process.
+    pub(crate) mlx_ownership: crate::mlx_ownership::MlxOwnershipCoordinator,
     /// Runtime component (llama.cpp/MLX/tokenizer/converter/projector/
     /// accelerator-support) version manager. Kept as a separate hub from
     /// `hub` — see `m3_runtime_hub`'s "Runtime Component Update Channels"
@@ -150,6 +155,7 @@ impl M3CommandState {
     pub fn new(hub: Arc<M3RuntimeHub>, component_hub: Arc<M3ComponentHub>) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -165,6 +171,7 @@ impl M3CommandState {
     ) -> Self {
         Self {
             hub,
+            mlx_ownership: Default::default(),
             component_hub,
             telemetry: Arc::new(RuntimeTelemetryState::new()),
             operations: Mutex::new(BTreeMap::new()),
@@ -224,6 +231,67 @@ impl M3CommandState {
             Ok(false)
         }
     }
+}
+
+/// Hands the MLX memory slot to Studio before an MLX video run. Chat and video
+/// use different service entry points, so they cannot share one resident
+/// process, but they must not keep both tens-of-gigabytes weight sets alive.
+#[cfg(target_os = "macos")]
+pub async fn unload_mlx_for_studio(state: &M3CommandState) -> Result<(), String> {
+    let _owner = state.mlx_ownership.acquire().await;
+    unload_mlx_for_studio_locked(state).await
+}
+
+/// Unloads Runtime Hub's MLX resident while the caller already holds the
+/// application-wide MLX ownership guard. Studio uses this form because it
+/// keeps the guard through `ensure_ready` and the complete generation.
+#[cfg(target_os = "macos")]
+pub(crate) async fn unload_mlx_for_studio_locked(state: &M3CommandState) -> Result<(), String> {
+    let has_mlx = state
+        .hub
+        .list_runtimes()
+        .map_err(command_error)?
+        .iter()
+        .any(|runtime| runtime.descriptor.kind == M3RuntimeKind::Mlx);
+    if !has_mlx {
+        return Ok(());
+    }
+
+    let operation_id = format!("studio-mlx-handoff-{}", Uuid::new_v4());
+    let context = state.begin_operation(&operation_id, Some(30_000))?;
+    let result = async {
+        match state.hub.runtime_status("mlx", &context).await? {
+            M3RuntimeStatusView::Mlx {
+                status: crate::mlx_runtime::MlxRuntimeStatus::Running { handle, .. },
+            } => {
+                state
+                    .hub
+                    .unload_model(
+                        &M3UnloadModelRequest {
+                            runtime_id: "mlx".to_string(),
+                            model_id: handle.model_id,
+                            force_exact_owner: true,
+                        },
+                        &context,
+                    )
+                    .await
+            }
+            _ => Ok(()),
+        }
+    }
+    .await;
+    state.finish_operation(&operation_id);
+    result.map_err(command_error)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn unload_mlx_for_studio_locked(_state: &M3CommandState) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub async fn unload_mlx_for_studio(_state: &M3CommandState) -> Result<(), String> {
+    Ok(())
 }
 
 fn command_error(error: M3HubError) -> String {
@@ -854,11 +922,22 @@ pub async fn m3_runtime_inventory(
 
 #[tauri::command]
 pub async fn m3_runtime_load_model(
+    app: tauri::AppHandle,
     state: tauri::State<'_, M3CommandState>,
     operation_id: String,
     timeout_ms: Option<u64>,
     request: M3LoadModelRequest,
 ) -> Result<(), String> {
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
+    if request.runtime_id == "mlx" {
+        if let Some(app_state) = app.try_state::<crate::AppState>() {
+            app_state.generation_engine.stop()?;
+        }
+    }
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result = state.hub.load_model(&request, &context).await;
     finish(&state, &operation_id, result).await
@@ -1112,6 +1191,11 @@ pub async fn m3_api_dispatch(
 ) -> Result<M3ApiDispatchResponse, String> {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let request = request.into_hub_request(trusted_now_ms());
+    let _owner = if request.runtime_id == "mlx" {
+        Some(state.mlx_ownership.acquire().await)
+    } else {
+        None
+    };
     let result = state.hub.dispatch_api(&request, &context).await;
     finish(&state, &operation_id, result).await
 }
@@ -1469,6 +1553,40 @@ pub fn m3_mlx_install_component(
     crate::m3_production::install_mlx_from_artifact(&app_data_dir, &artifact).map_err(command_error)
 }
 
+#[cfg(target_os = "macos")]
+#[tauri::command]
+pub fn m3_mflux_install_component(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, M3CommandState>,
+    component_id: String,
+) -> Result<crate::m3_production::MlxInstalledPackageView, String> {
+    let installed = state
+        .component_hub
+        .list_installed()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|component| component.component_id == component_id)
+        .ok_or_else(|| format!("No component named '{component_id}' is installed"))?;
+    if installed.kind != M3ComponentKind::MfluxImageRuntime {
+        return Err(format!(
+            "'{component_id}' is a {:?} component, not an MFLUX image runtime",
+            installed.kind
+        ));
+    }
+    let artifact = installed
+        .versions
+        .iter()
+        .find(|version| version.version_key == installed.active_version_key)
+        .ok_or("The installed MFLUX image runtime has no active version")?
+        .artifact_path
+        .clone();
+    let app_data_dir = app
+        .profile_data_dir()
+        .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
+    crate::m3_production::install_mflux_from_artifact(&app_data_dir, &artifact)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub fn m3_component_registry_entries(
     state: tauri::State<'_, M3CommandState>,
@@ -1590,9 +1708,22 @@ pub async fn m3_component_install(
     let app_data_dir = app
         .profile_data_dir()
         .map_err(|error| command_error(M3HubError::Runtime(error.to_string())))?;
-    component_install_impl(&state, operation_id, timeout_ms, request, |artifact| {
-        crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
-    })
+    component_install_impl(
+        &state,
+        operation_id,
+        timeout_ms,
+        request,
+        |kind, artifact| match kind {
+            M3ComponentKind::MlxRuntime => {
+                crate::m3_production::install_mlx_from_artifact(&app_data_dir, artifact).map(|_| ())
+            }
+            M3ComponentKind::MfluxImageRuntime => {
+                crate::m3_production::install_mflux_from_artifact(&app_data_dir, artifact)
+                    .map(|_| ())
+            }
+            _ => Ok(()),
+        },
+    )
     .await
 }
 
@@ -1604,7 +1735,7 @@ pub async fn m3_component_install(
     timeout_ms: Option<u64>,
     request: M3InstallComponentRequest,
 ) -> Result<M3InstalledComponentView, String> {
-    component_install_impl(&state, operation_id, timeout_ms, request, |_| Ok(())).await
+    component_install_impl(&state, operation_id, timeout_ms, request, |_, _| Ok(())).await
 }
 
 async fn component_install_impl<F>(
@@ -1615,21 +1746,28 @@ async fn component_install_impl<F>(
     mlx_precommit: F,
 ) -> Result<M3InstalledComponentView, String>
 where
-    F: Fn(&Path) -> M3HubResult<()>,
+    F: Fn(M3ComponentKind, &Path) -> M3HubResult<()>,
 {
     let context = state.begin_operation(&operation_id, timeout_ms)?;
     let result: M3HubResult<M3InstalledComponentView> = async {
-        if request.entry.kind == M3ComponentKind::MlxRuntime && !cfg!(target_os = "macos") {
+        if matches!(
+            request.entry.kind,
+            M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime
+        ) && !cfg!(target_os = "macos")
+        {
             return Err(M3HubError::Unsupported(
-                "MLX runtime components require macOS".to_string(),
+                "Apple Silicon image runtime components require macOS".to_string(),
             ));
         }
         #[cfg(target_os = "macos")]
-        if request.entry.kind == M3ComponentKind::MlxRuntime {
+        if matches!(
+            request.entry.kind,
+            M3ComponentKind::MlxRuntime | M3ComponentKind::MfluxImageRuntime
+        ) {
             return state
                 .component_hub
                 .install_component_with_precommit(&request, &context, |artifact| {
-                    mlx_precommit(artifact)
+                    mlx_precommit(request.entry.kind, artifact)
                 })
                 .await;
         }
@@ -2323,7 +2461,7 @@ mod tests {
                 M3InstallComponentRequest {
                     entry: adopted.clone(),
                 },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,
@@ -2352,7 +2490,7 @@ mod tests {
                 M3InstallComponentRequest {
                     entry: bad_entry.clone(),
                 },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,
@@ -2376,7 +2514,7 @@ mod tests {
                 "mlx-op".into(),
                 None,
                 M3InstallComponentRequest { entry: adopted },
-                |p| {
+                |_, p| {
                     crate::m3_production::install_mlx_from_artifact_for_test(
                         &app,
                         p,

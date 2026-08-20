@@ -18,8 +18,10 @@
 //! never has to fight the chat model for the same server slot, and so
 //! stopping/restarting one never interrupts the other.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -50,6 +52,7 @@ pub const EMBED_GPU_LAYERS: u32 = 999;
 /// fixed port is untrusted until it proves the exact alias we passed to the
 /// child, so never buffer an arbitrarily large `/v1/models` body.
 const MAX_MODELS_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_STDERR_TAIL: usize = 16 * 1024;
 
 /// Generates a per-process identity that cannot be predicted from the model
 /// path. Fixed ports may still have an orphan or unrelated server listening;
@@ -60,6 +63,7 @@ pub fn fresh_server_alias() -> String {
 
 fn chat_server_args(
     model_path: &str,
+    projector_path: Option<&str>,
     port: u16,
     ctx_size: u32,
     gpu_layers: i32,
@@ -81,6 +85,9 @@ fn chat_server_args(
         "--alias".into(),
         alias.to_string(),
     ];
+    if let Some(projector_path) = projector_path {
+        args.splice(2..2, ["--mmproj".into(), projector_path.to_string()]);
+    }
     if embeddings {
         args.push("--embeddings".into());
     }
@@ -150,8 +157,11 @@ pub fn embed_server_args(model_path: &str, alias: &str) -> Vec<String> {
 /// In-memory state for a managed `llama-server` child process.
 pub struct LlamaState {
     pub process: Option<std::process::Child>,
+    stderr_tail: Option<Arc<Mutex<String>>>,
     pub port: u16,
     pub model_path: Option<String>,
+    pub projector_path: Option<String>,
+    pub vision_enabled: bool,
     pub status: String,
     /// Whether the currently-running (or most recently started) process was
     /// launched with `--embeddings`. The local API server (`server.rs`,
@@ -166,8 +176,11 @@ impl Default for LlamaState {
     fn default() -> Self {
         LlamaState {
             process: None,
+            stderr_tail: None,
             port: CHAT_PORT,
             model_path: None,
+            projector_path: None,
+            vision_enabled: false,
             status: "stopped".to_string(),
             embeddings_enabled: false,
         }
@@ -270,6 +283,8 @@ fn emit_status(
     status: &str,
     port: u16,
     model_path: &Option<String>,
+    projector_path: &Option<String>,
+    vision_enabled: bool,
 ) {
     let _ = app.emit(
         event_name,
@@ -277,6 +292,8 @@ fn emit_status(
             "status": status,
             "port": port,
             "model_path": model_path,
+            "projector_path": projector_path,
+            "vision_enabled": vision_enabled,
         }),
     );
 }
@@ -336,22 +353,61 @@ pub async fn server_reports_alias(
 /// managed state. This check deliberately runs both before probing the port
 /// and again after HTTP identity succeeds: a different service can answer on
 /// a fixed port while our child is still in the process of failing its bind.
-fn spawned_child_failure(state: &std::sync::Mutex<LlamaState>) -> Result<Option<String>, String> {
-    let mut guard = state.lock().map_err(|error| error.to_string())?;
-    let Some(child) = guard.process.as_mut() else {
-        return Ok(Some(
-            "Managed llama-server child disappeared during startup".to_string(),
-        ));
+fn stderr_detail(state: &Mutex<LlamaState>) -> Option<String> {
+    let tail = state.lock().ok()?.stderr_tail.clone()?;
+    let detail = tail.lock().ok()?.trim().to_string();
+    (!detail.is_empty()).then_some(detail)
+}
+
+fn spawned_child_failure(state: &Mutex<LlamaState>) -> Result<Option<String>, String> {
+    let outcome = {
+        let mut guard = state.lock().map_err(|error| error.to_string())?;
+        let Some(child) = guard.process.as_mut() else {
+            return Ok(Some(
+                "Managed llama-server child disappeared during startup".to_string(),
+            ));
+        };
+        match child.try_wait() {
+            Ok(Some(exit_status)) => Some(format!(
+                "llama-server exited unexpectedly before becoming ready (status: {exit_status})"
+            )),
+            Ok(None) => None,
+            Err(error) => Some(format!(
+                "Failed to check llama-server process status: {error}"
+            )),
+        }
     };
-    match child.try_wait() {
-        Ok(Some(exit_status)) => Ok(Some(format!(
-            "llama-server exited unexpectedly before becoming ready (status: {exit_status})"
-        ))),
-        Ok(None) => Ok(None),
-        Err(error) => Ok(Some(format!(
-            "Failed to check llama-server process status: {error}"
-        ))),
-    }
+    Ok(outcome.map(|message| match stderr_detail(state) {
+        Some(detail) => format!("{message}:\n{detail}"),
+        None => message,
+    }))
+}
+
+fn drain_llama_stderr(stream: impl Read + Send + 'static, tail: Arc<Mutex<String>>) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let Ok(mut buffer) = tail.lock() else {
+                        break;
+                    };
+                    buffer.push_str(&line);
+                    if buffer.len() > MAX_STDERR_TAIL {
+                        let (capped, _) = crate::output_cap::cap_tail(
+                            std::mem::take(&mut *buffer),
+                            MAX_STDERR_TAIL,
+                        );
+                        *buffer = capped;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// Shared spawn + health-poll body for a managed `llama-server` instance —
@@ -376,6 +432,7 @@ async fn spawn_and_wait_healthy(
     args: &[String],
     port: u16,
     model_path: &str,
+    projector_path: Option<&str>,
     expected_alias: &str,
 ) -> Result<(), String> {
     {
@@ -385,7 +442,10 @@ async fn spawn_and_wait_healthy(
             let _ = child.wait();
         }
         guard.status = "starting".to_string();
+        guard.stderr_tail = None;
         guard.model_path = Some(model_path.to_string());
+        guard.projector_path = projector_path.map(str::to_string);
+        guard.vision_enabled = false;
     }
     emit_status(
         app,
@@ -393,6 +453,8 @@ async fn spawn_and_wait_healthy(
         "starting",
         port,
         &Some(model_path.to_string()),
+        &projector_path.map(str::to_string),
+        false,
     );
 
     let mut command = Command::new(binary);
@@ -400,14 +462,16 @@ async fn spawn_and_wait_healthy(
     let spawn_result = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn();
 
-    let child = match spawn_result {
+    let mut child = match spawn_result {
         Ok(child) => child,
         Err(e) => {
             let mut guard = state.lock().map_err(|e| e.to_string())?;
             guard.status = "error".to_string();
+            guard.projector_path = None;
+            guard.vision_enabled = false;
             drop(guard);
             emit_status(
                 app,
@@ -415,14 +479,21 @@ async fn spawn_and_wait_healthy(
                 "error",
                 port,
                 &Some(model_path.to_string()),
+                &None,
+                false,
             );
             return Err(format!("Failed to spawn llama-server: {e}"));
         }
     };
 
     {
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        if let Some(stderr) = child.stderr.take() {
+            drain_llama_stderr(stderr, Arc::clone(&stderr_tail));
+        }
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.process = Some(child);
+        guard.stderr_tail = Some(stderr_tail);
     }
 
     // Poll the health endpoint until it responds successfully, the process
@@ -463,6 +534,7 @@ async fn spawn_and_wait_healthy(
     if ready {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
         guard.status = "ready".to_string();
+        guard.vision_enabled = projector_path.is_some();
         drop(guard);
         emit_status(
             app,
@@ -470,10 +542,12 @@ async fn spawn_and_wait_healthy(
             "ready",
             port,
             &Some(model_path.to_string()),
+            &projector_path.map(str::to_string),
+            projector_path.is_some(),
         );
         Ok(())
     } else {
-        let error_message = failure.unwrap_or_else(|| {
+        let headline = failure.unwrap_or_else(|| {
             "Timed out waiting for llama-server to become healthy after 60s".to_string()
         });
 
@@ -484,7 +558,13 @@ async fn spawn_and_wait_healthy(
                 let _ = child.wait();
             }
             guard.status = "error".to_string();
+            guard.projector_path = None;
+            guard.vision_enabled = false;
         }
+        let error_message = match stderr_detail(state) {
+            Some(detail) if !headline.contains(&detail) => format!("{headline}:\n{detail}"),
+            _ => headline,
+        };
 
         emit_status(
             app,
@@ -492,6 +572,8 @@ async fn spawn_and_wait_healthy(
             "error",
             port,
             &Some(model_path.to_string()),
+            &None,
+            false,
         );
         Err(error_message)
     }
@@ -509,16 +591,23 @@ pub async fn llama_start(
     app: AppHandle,
     state: State<'_, AppState>,
     model_path: String,
+    projector_path: Option<String>,
     ctx_size: Option<u32>,
     gpu_layers: i32,
     embeddings: bool,
 ) -> Result<u32, String> {
+    if embeddings && projector_path.is_some() {
+        return Err("A multimodal projector cannot be used when the chat server is started in embedding mode".to_string());
+    }
     let verification_path = PathBuf::from(&model_path);
     tokio::task::spawn_blocking(move || {
         crate::model_sources::verify_managed_model_for_runtime(&verification_path)
     })
     .await
     .map_err(|error| format!("Managed model verification task failed: {error}"))??;
+    if let Some(projector_path) = projector_path.as_deref() {
+        crate::models::verify_projector_for_runtime(&app, &model_path, projector_path)?;
+    }
 
     let binary = find_llama_server_binary_for_app(&app)?;
     let port = state.llama.lock().map_err(|e| e.to_string())?.port;
@@ -532,6 +621,7 @@ pub async fn llama_start(
     let startup_alias = fresh_server_alias();
     let args = chat_server_args(
         &model_path,
+        projector_path.as_deref(),
         port,
         resolved_ctx_size,
         gpu_layers,
@@ -547,6 +637,7 @@ pub async fn llama_start(
         &args,
         port,
         &model_path,
+        projector_path.as_deref(),
         &startup_alias,
     )
     .await?;
@@ -556,7 +647,7 @@ pub async fn llama_start(
 
 /// Kill the managed chat `llama-server` process, if any, and mark it stopped.
 #[tauri::command]
-pub async fn llama_stop(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn llama_stop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut llama = state.llama.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = llama.process.take() {
         child
@@ -565,7 +656,21 @@ pub async fn llama_stop(state: State<'_, AppState>) -> Result<(), String> {
         let _ = child.wait();
     }
     llama.status = "stopped".to_string();
+    llama.stderr_tail = None;
+    llama.model_path = None;
+    llama.projector_path = None;
+    llama.vision_enabled = false;
     llama.embeddings_enabled = false;
+    let _ = app.emit(
+        "llama://status",
+        json!({
+            "status": "stopped",
+            "port": llama.port,
+            "model_path": null,
+            "projector_path": null,
+            "vision_enabled": false,
+        }),
+    );
     Ok(())
 }
 
@@ -577,6 +682,8 @@ pub fn llama_status(state: State<'_, AppState>) -> Result<serde_json::Value, Str
         "status": llama.status,
         "port": llama.port,
         "model_path": llama.model_path,
+        "projector_path": llama.projector_path,
+        "vision_enabled": llama.vision_enabled,
         "embeddings_enabled": llama.embeddings_enabled,
     }))
 }
@@ -616,6 +723,7 @@ pub async fn embed_server_start(
         &args,
         EMBED_PORT,
         &model_path,
+        None,
         &startup_alias,
     )
     .await?;
@@ -637,6 +745,7 @@ pub async fn embed_server_start(
             let _ = child.wait();
         }
         guard.status = "error".to_string();
+        guard.stderr_tail = None;
         drop(guard);
         emit_status(
             &app,
@@ -644,6 +753,8 @@ pub async fn embed_server_start(
             "error",
             EMBED_PORT,
             &Some(model_path),
+            &None,
+            false,
         );
         return Err(
             "The embedding server process started but a test /v1/embeddings request failed — this build of \
@@ -667,6 +778,10 @@ pub async fn embed_server_stop(state: State<'_, AppState>) -> Result<(), String>
         let _ = child.wait();
     }
     embed.status = "stopped".to_string();
+    embed.stderr_tail = None;
+    embed.model_path = None;
+    embed.projector_path = None;
+    embed.vision_enabled = false;
     Ok(())
 }
 
@@ -697,6 +812,10 @@ pub fn stop_all_blocking(state: &AppState) {
             let _ = child.wait();
         }
         guard.status = "stopped".to_string();
+        guard.stderr_tail = None;
+        guard.model_path = None;
+        guard.projector_path = None;
+        guard.vision_enabled = false;
     }
     if let Ok(mut guard) = state.embed_llama.lock() {
         if let Some(mut child) = guard.process.take() {
@@ -704,6 +823,10 @@ pub fn stop_all_blocking(state: &AppState) {
             let _ = child.wait();
         }
         guard.status = "stopped".to_string();
+        guard.stderr_tail = None;
+        guard.model_path = None;
+        guard.projector_path = None;
+        guard.vision_enabled = false;
     }
 }
 
@@ -740,6 +863,7 @@ mod tests {
         assert_eq!(
             chat_server_args(
                 "/models/chat.gguf",
+                None,
                 8090,
                 4096,
                 99,
@@ -761,6 +885,34 @@ mod tests {
                 "--alias",
                 "little-monkey-chat-nonce",
                 "--embeddings",
+            ]
+        );
+        assert_eq!(
+            chat_server_args(
+                "/models/chat.gguf",
+                Some("/models/mmproj.gguf"),
+                8090,
+                4096,
+                99,
+                false,
+                "little-monkey-chat-nonce",
+            ),
+            [
+                "-m",
+                "/models/chat.gguf",
+                "--mmproj",
+                "/models/mmproj.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8090",
+                "-c",
+                "4096",
+                "-ngl",
+                "99",
+                "--jinja",
+                "--alias",
+                "little-monkey-chat-nonce",
             ]
         );
         assert_eq!(

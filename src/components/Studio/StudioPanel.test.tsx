@@ -27,6 +27,12 @@ vi.mock("../../lib/outpaint", async (importOriginal) => ({
   runOutpaint,
 }));
 
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onCloseRequested: vi.fn(async () => vi.fn()),
+  }),
+}));
+
 vi.mock("../../lib/studioClient", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/studioClient")>();
   return {
@@ -35,6 +41,8 @@ vi.mock("../../lib/studioClient", async (importOriginal) => {
       engineStatus: async () => ({
         supported: true,
         engineInstalled: true,
+        mfluxSupported: true,
+        mfluxInstalled: false,
         loadedModelId: null,
         totalRamBytes: 32_000_000_000,
       }),
@@ -57,6 +65,8 @@ const MODEL: GenerationModel = {
   // puts the init image, the mask and the extension controls on screen.
   tasks: ["image_to_image"],
   components: [],
+  source: { kind: "components" },
+  quantizationBits: null,
   defaults: {
     width: 512,
     height: 512,

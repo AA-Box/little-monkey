@@ -5,6 +5,8 @@ IDEs. It captures the active file, selection, exact document modification
 stamp, and editor diagnostics, then queues an immutable durable run through
 `monkey acp`.
 
+The current release is version 1.0.0. Install the `little-monkey-jetbrains-1.0.0.zip` asset from a Little Monkey GitHub release; marketplace publishing is not automatic.
+
 The plugin intentionally has no approval or file-write API. Little Monkey
 owns permissions, checkpoints, execution, and cancellation. JetBrains opens
 native read-only diff previews for run results and never auto-applies them.

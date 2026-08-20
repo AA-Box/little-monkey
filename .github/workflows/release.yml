@@ -174,6 +174,9 @@ jobs:
             - **Windows** — `-setup.exe` or `_en-US.msi` (`arm64` or `x64`)
             - **Linux** — `.AppImage`, `.deb`, or `.rpm` (`aarch64`/`arm64` or `amd64`/`x86_64`)
 
+            IDE clients are attached to this release as `little-monkey-vscode-1.0.0.vsix`
+            and `little-monkey-jetbrains-1.0.0.zip`.
+
             Linux installers ship a detached signature. To check one:
 
             ```
@@ -243,6 +246,51 @@ jobs:
           # no-op rather than a collision.
           gpg --armor --export "$KEY_ID" > little-monkey-release-key.asc
           gh release upload "$VERSION" little-monkey-release-key.asc --clobber
+
+  ide-extensions:
+    needs: release
+    name: package IDE extensions
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test and package VS Code extension
+        working-directory: extensions/little-monkey-vscode
+        run: |
+          npm test
+          npx --yes @vscode/vsce@3.6.0 package --no-dependencies \
+            --out "$GITHUB_WORKSPACE/little-monkey-vscode-1.0.0.vsix"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Test and package JetBrains plugin
+        working-directory: extensions/little-monkey-jetbrains
+        run: |
+          gradle test buildPlugin --no-daemon
+          cp build/distributions/*.zip "$GITHUB_WORKSPACE/little-monkey-jetbrains-1.0.0.zip"
+
+      - name: Attach IDE extension packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version src-tauri/tauri.conf.json)"
+          gh release upload "$VERSION" \
+            little-monkey-vscode-1.0.0.vsix \
+            little-monkey-jetbrains-1.0.0.zip \
+            --clobber
 
   # Installs what the matrix just built, on the platform it was built for
   # (roadmap K22). Between `release` and `publish` deliberately: a release that
@@ -330,7 +378,7 @@ jobs:
   publish:
     # Waits on the smoke test too: a release that cannot be installed must not
     # be published. A skipped leg does not block — it is reported, not fatal.
-    needs: [release, install-smoke]
+    needs: [release, install-smoke, ide-extensions]
     runs-on: ubuntu-22.04
 
     steps:

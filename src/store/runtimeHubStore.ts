@@ -449,7 +449,7 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           runtimeHubClient.storageStatus(),
           runtimeHubClient.installedModels(),
           runtimeHubClient.catalogSources(),
-        ]);
+          ]);
         set({ hardware, profile, storage, installedModels, catalogSources, runtimes, loaded: true });
       } catch (error) {
         fail(key, error);
@@ -667,19 +667,29 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
     ensureMlxRuntime: async () => {
       const key = "mlx-auto-install";
       if (get().busy[key]) return;
-      const platform = get().hardware?.platform;
-      const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
-      if (
-        !platform ||
-        platform.os !== "macos" ||
-        !["aarch64", "arm64"].includes(platform.arch) ||
-        !mlxRuntime
-      ) {
-        return;
-      }
-
+      // Claim the setup operation before any lazy hydration. Both Studio and
+      // Runtime Hub can request this concurrently, and hydration itself is
+      // asynchronous, so claiming after it would still allow duplicate
+      // repairs/downloads through.
       begin(key);
+      // Studio can request MLX without the user ever opening Runtime Hub.
+      // Hydrate the same hardware/runtime/component snapshot lazily so the
+      // install path is shared instead of making Studio point at Settings.
       try {
+        if (!get().hardware || get().runtimes.length === 0 || get().componentRegistry.length === 0) {
+          await Promise.all([get().refreshOverview(), get().refreshComponents()]);
+        }
+        const platform = get().hardware?.platform;
+        const mlxRuntime = get().runtimes.find((runtime) => runtime.descriptor.kind === "mlx");
+        if (
+          !platform ||
+          platform.os !== "macos" ||
+          !["aarch64", "arm64"].includes(platform.arch) ||
+          !mlxRuntime
+        ) {
+          return;
+        }
+
         const installed = get().installedComponents.find(
           (component) => component.componentId === MLX_COMPONENT_ID,
         );
@@ -692,6 +702,9 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           // active MLX tree. Rehydrate it from the already digest-verified
           // component artifact before downloading anything new.
           await runtimeHubClient.mlxInstallComponent(MLX_COMPONENT_ID);
+          // Repair can change the runtime capability from canInfer=false to
+          // true, so refresh the capability snapshot as well as diagnostics.
+          await get().refreshOverview();
           await get().refreshRuntime("mlx");
           return;
         }
@@ -939,12 +952,13 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
           ]);
         if (statusResult.status === "rejected") throw statusResult.reason;
         if (inventoryResult.status === "rejected") throw inventoryResult.reason;
-        if (logsResult.status === "rejected") throw logsResult.reason;
-        if (metricsResult.status === "rejected") throw metricsResult.reason;
         if (configResult.status === "rejected") throw configResult.reason;
-        // Context/cache state is diagnostic, additive information (like the
-        // Hardware Compatibility report): a failure here must never block
-        // the rest of the runtime card from refreshing.
+        // Status, inventory, and config are the runtime snapshot. Logs,
+        // metrics, and context/cache state are additive diagnostics: a stopped
+        // managed service may legitimately reject those calls, and that must
+        // not hide the installed/stopped state from the card. Failed
+        // diagnostics are omitted from this refreshed snapshot so samples
+        // from a previous resident process cannot be rendered as live.
         const contextCache = contextCacheResult.status === "fulfilled" ? contextCacheResult.value : undefined;
         set((state) => ({
           runtimeDetails: {
@@ -953,8 +967,8 @@ export const useRuntimeHubStore = create<RuntimeHubStoreState>((set, get) => {
               ...state.runtimeDetails[runtimeId],
               status: statusResult.value,
               inventory: inventoryResult.value,
-              logs: logsResult.value,
-              metrics: metricsResult.value,
+              logs: logsResult.status === "fulfilled" ? logsResult.value : undefined,
+              metrics: metricsResult.status === "fulfilled" ? metricsResult.value : undefined,
               config: configResult.value ?? undefined,
               contextCache,
               refreshedAt: Date.now(),

@@ -21,6 +21,20 @@ export interface ModelInfo {
   is_external: boolean;
   /** "chat" or "embedding" — see `models.rs::ModelKind`. Every entry in this frontend copy is a chat model; the two curated embedding models (nomic-embed-text-v1.5, bge-m3) are fetched live from the backend instead (see `stackStore.ts`), not duplicated here. */
   kind: "chat" | "embedding";
+  components?: {
+    projector: {
+      path: string;
+      file: string;
+      size_bytes: number;
+      ownership: "managed" | "external";
+      sha256: string | null;
+      missing?: boolean;
+    } | null;
+  };
+  capabilities?: {
+    text: boolean;
+    image_input: boolean;
+  };
 }
 
 /**
