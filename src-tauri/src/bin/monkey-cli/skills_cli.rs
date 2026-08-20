@@ -680,6 +680,7 @@ pub fn run(action: &SkillsCmd, data_dir: &Path, workspace: Option<&Path>) -> Res
             Ok(())
         }
         SkillsCmd::Learned(action) => run_learned(action, data_dir, workspace),
+        SkillsCmd::Activation(action) => run_activation(action, data_dir),
     }
 }
 
