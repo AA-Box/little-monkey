@@ -3943,7 +3943,7 @@ pub fn production_mflux_installer(root: &Path) -> M3HubResult<Arc<MlxPackageInst
         MlxPackageInstaller::new(
             root.join("runtimes").join("mflux"),
             Arc::new(ProductionMlxSignatureVerifier),
-            MlxInstallLimits::default(),
+            MlxInstallLimits::for_mflux(),
         )
         .map_err(|error| M3HubError::Runtime(error.to_string()))?,
     ))
@@ -4066,7 +4066,7 @@ fn install_mflux_from_artifact_with_verifier(
     artifact_path: &Path,
     verifier: Arc<dyn MlxSignatureVerifier>,
 ) -> M3HubResult<MlxInstalledPackageView> {
-    let limits = MlxInstallLimits::default();
+    let limits = MlxInstallLimits::for_mflux();
     let staging = std::env::temp_dir().join(format!("mflux-unpack-{}", uuid::Uuid::new_v4()));
     let unpacked = (|| {
         mlx_runtime::extract_package_archive(artifact_path, &staging, &limits)?;

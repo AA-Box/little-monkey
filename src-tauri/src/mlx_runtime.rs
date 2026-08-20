@@ -316,6 +316,19 @@ impl Default for MlxInstallLimits {
     }
 }
 
+impl MlxInstallLimits {
+    /// MFLUX ships a larger Python dependency tree than the MLX service.
+    /// Keep MLX's tighter default while allowing the separately installed
+    /// Apple-silicon image runtime to stay bounded by its own higher ceiling.
+    pub fn for_mflux() -> Self {
+        Self {
+            max_files: 50_000,
+            max_manifest_bytes: 16 * 1024 * 1024,
+            ..Self::default()
+        }
+    }
+}
+
 pub trait MlxSignatureVerifier: Send + Sync {
     /// Verify `signature` over the exact canonical `signed_payload` bytes.
     /// Production implementations must use a pinned publisher key and an
@@ -2233,6 +2246,16 @@ pub(crate) mod tests {
         let payload =
             canonical_json(&UnsignedMlxPackageManifest::from(&manifest)).expect("canonical");
         assert_eq!(String::from_utf8(payload).unwrap(), FIXTURE);
+    }
+
+    #[test]
+    fn mflux_limits_cover_its_larger_python_runtime_without_relaxing_mlx() {
+        assert_eq!(MlxInstallLimits::default().max_files, 20_000);
+        assert_eq!(MlxInstallLimits::for_mflux().max_files, 50_000);
+        assert_eq!(
+            MlxInstallLimits::for_mflux().max_manifest_bytes,
+            16 * 1024 * 1024
+        );
     }
 
     /// A built package directory is read into exactly the bundle the installer
