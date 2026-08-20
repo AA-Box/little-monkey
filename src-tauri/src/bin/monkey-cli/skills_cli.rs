@@ -12,7 +12,8 @@ use little_monkey_lib::native_skills::{
 };
 use little_monkey_lib::prompts::PromptEntry;
 use little_monkey_lib::skill_learning::{
-    EvaluationCaseReport, LearningMode, PromotionOutcome, SkillLearningStore,
+    EvaluationCaseReport, LearningMode, LearningPolicy, LearningSettings, PromotionOutcome,
+    SkillLearningStore,
 };
 
 const MAX_SKILLS_PER_TURN: usize = 5;
@@ -179,6 +180,11 @@ pub enum LearnedCmd {
         #[arg(value_enum)]
         mode: Option<CliLearningMode>,
     },
+    /// Read or change the three-state learning policy shared with the desktop app.
+    Policy {
+        #[arg(value_enum)]
+        policy: Option<CliLearningPolicy>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -187,6 +193,23 @@ pub enum CliLearningMode {
     SuggestOnly,
     AutoStage,
     AutoPromoteSafe,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliLearningPolicy {
+    Automatic,
+    Ask,
+    Manual,
+}
+
+impl From<CliLearningPolicy> for LearningPolicy {
+    fn from(value: CliLearningPolicy) -> Self {
+        match value {
+            CliLearningPolicy::Automatic => Self::Automatic,
+            CliLearningPolicy::Ask => Self::Ask,
+            CliLearningPolicy::Manual => Self::Manual,
+        }
+    }
 }
 
 impl From<CliLearningMode> for LearningMode {
@@ -638,6 +661,20 @@ fn run_learned(
                 None => store.mode().map_err(|error| error.to_string())?,
             };
             println!("Learning mode: {current:?}");
+            Ok(())
+        }
+        LearnedCmd::Policy { policy } => {
+            let current = store.settings().map_err(|error| error.to_string())?;
+            let next = match policy {
+                Some(policy) => store
+                    .set_settings(LearningSettings {
+                        policy: LearningPolicy::from(*policy),
+                        allow_global_scope: current.allow_global_scope,
+                    })
+                    .map_err(|error| error.to_string())?,
+                None => current,
+            };
+            println!("Learning policy: {:?}", next.policy);
             Ok(())
         }
         LearnedCmd::List { json } => {

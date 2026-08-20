@@ -3206,7 +3206,7 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
-        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands, userText)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled

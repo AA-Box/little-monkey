@@ -17,7 +17,7 @@ import {
   type EvaluationRecord,
   type LearnedSkillSummary,
   type LearningCandidate,
-  type LearningMode,
+  type LearningPolicy,
   type LearningSettings,
   type LearningSourceKind,
 } from "../../lib/skillLearningClient";
@@ -29,26 +29,21 @@ import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore"
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
-const MODE_LABELS: Array<{ value: LearningMode; label: string; detail: string }> = [
+const POLICY_LABELS: Array<{ value: LearningPolicy; label: string; detail: string }> = [
   {
-    value: "off",
-    label: "Off",
+    value: "manual",
+    label: "Manual",
     detail: "Automatic candidates are disabled. You can still explicitly save a completed run as a skill.",
   },
   {
-    value: "suggest_only",
-    label: "Suggest only",
+    value: "ask",
+    label: "Ask",
     detail:
       "Signals are recorded and listed below. A draft is written when you ask for one — or straight away when you explicitly asked the agent to learn a procedure. Nothing installs without your approval.",
   },
   {
-    value: "auto_stage",
-    label: "Auto-stage",
-    detail: "Drafts every detected signal into a staged candidate. Nothing installs without your approval.",
-  },
-  {
-    value: "auto_promote_safe",
-    label: "Auto-promote safe improvements",
+    value: "automatic",
+    label: "Automatic",
     detail:
       "Additionally installs a candidate that passed a real isolated evaluation, adds no tool access, and declares no new executables or environment variables. Anything else still waits for you.",
   },
@@ -126,7 +121,7 @@ function PolicyNotes({ candidate }: { candidate: LearningCandidate }) {
 }
 
 export function SkillLearningPanel() {
-  const [settings, setSettings] = useState<LearningSettings>({ mode: "suggest_only", allow_global_scope: true });
+  const [settings, setSettings] = useState<LearningSettings>({ policy: "ask", allow_global_scope: true });
   const [candidates, setCandidates] = useState<LearningCandidate[]>([]);
   const [learned, setLearned] = useState<LearnedSkillSummary[]>([]);
   const [evaluations, setEvaluations] = useState<Record<string, EvaluationRecord[]>>({});
@@ -237,24 +232,24 @@ export function SkillLearningPanel() {
       {error && <p className="rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">{error}</p>}
 
       <label className="flex flex-col gap-1 text-xs">
-        <span className="text-muted">Learning mode</span>
+        <span className="text-muted">Learning policy</span>
         <select
-          value={settings.mode}
+          value={settings.policy}
           disabled={busy !== null}
           onChange={(event) =>
-            void run("mode", () =>
-              skillLearningClient.setSettings({ ...settings, mode: event.target.value as LearningMode }),
+            void run("policy", () =>
+              skillLearningClient.setSettings({ ...settings, policy: event.target.value as LearningPolicy }),
             )
           }
           className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground"
         >
-          {MODE_LABELS.map((entry) => (
+          {POLICY_LABELS.map((entry) => (
             <option key={entry.value} value={entry.value}>
               {entry.label}
             </option>
           ))}
         </select>
-        <span className="text-faint">{MODE_LABELS.find((entry) => entry.value === settings.mode)?.detail}</span>
+        <span className="text-faint">{POLICY_LABELS.find((entry) => entry.value === settings.policy)?.detail}</span>
       </label>
 
       <label className="flex items-start gap-2 text-xs">

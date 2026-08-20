@@ -33,6 +33,36 @@ export interface SlashSkill {
   resourceFiles?: string[];
 }
 
+function catalogTokens(value: string): string[] {
+  return value.toLowerCase().match(/[a-z0-9][a-z0-9_-]*/g) ?? [];
+}
+
+function skillCatalogScore(skill: SlashSkill, requestText: string): number {
+  const query = requestText.trim().toLowerCase();
+  if (!query) return 0;
+  const command = skill.command.toLowerCase();
+  const name = skill.name.toLowerCase();
+  const description = (skill.description ?? "").toLowerCase();
+  const searchable = `${name} ${description}`;
+  let score = query.includes(`/${command}`) ? 1_000 : 0;
+  for (const token of catalogTokens(query)) {
+    if (token === command) score += 120;
+    else if (command.startsWith(token)) score += 70;
+    else if (command.includes(token)) score += 35;
+    if (name.includes(token)) score += 20;
+    if (searchable.includes(token)) score += 8;
+  }
+  return score;
+}
+
+/** Orders the model-facing catalog by relevance to the current request. */
+export function rankSkillCatalog(skills: readonly SlashSkill[], requestText = ""): SlashSkill[] {
+  return skills
+    .map((skill, index) => ({ skill, index, score: skillCatalogScore(skill, requestText) }))
+    .sort((left, right) => right.score - left.score || left.skill.command.localeCompare(right.skill.command) || left.index - right.index)
+    .map(({ skill }) => skill);
+}
+
 export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkillDescriptor[]): SlashSkill[] {
   return entries
     .filter((entry) => entry.source.kind !== "signed_package" && entry.enabled && entry.eligibility.eligible)
@@ -387,13 +417,15 @@ export function composeSkillSystemPrompt(
 export function composeSkillCatalog(
   availableSkills: SlashSkill[],
   alreadyInvokedCommands: ReadonlySet<string>,
+  requestText = "",
 ): string {
   const remaining = availableSkills.filter((skill) => !alreadyInvokedCommands.has(skill.command));
   if (remaining.length === 0) return "";
+  const ranked = rankSkillCatalog(remaining, requestText);
   return [
     "## Available skills",
-    "Call the `skill` tool with one of these commands to invoke it when it matches the user's request — its full instructions are then returned as the tool result. Do not invoke a skill the request doesn't actually need.",
-    ...remaining.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name}`),
+    "These skills are ranked by relevance to the user's request. Call the `skill` tool with a matching command to invoke it — its full instructions are then returned as the tool result. Do not invoke a skill the request doesn't actually need.",
+    ...ranked.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name}`),
   ].join("\n");
 }
 

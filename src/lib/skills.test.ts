@@ -9,6 +9,7 @@ import {
   packageAssistantSkills,
   packageRuleInvocations,
   parseSkillTurn,
+  rankSkillCatalog,
   skillCommandMap,
   type SlashSkill,
 } from "./skills";
@@ -263,5 +264,16 @@ describe("composeSkillCatalog", () => {
   it("prefers the skill's description, falling back to its name", () => {
     const named: SlashSkill = { ...skill("review"), description: undefined, name: "Reviewer" };
     expect(composeSkillCatalog([named], new Set())).toContain("- /review — Reviewer");
+  });
+
+  it("ranks the catalog by request relevance", () => {
+    const available = [
+      { ...skill("testing"), description: "Run the test suite" },
+      { ...skill("review"), description: "Review the pull request" },
+    ];
+    const ranked = rankSkillCatalog(available, "please review this pull request");
+    expect(ranked.map((entry) => entry.command)).toEqual(["review", "testing"]);
+    const catalog = composeSkillCatalog(available, new Set(), "please review this pull request");
+    expect(catalog.indexOf("/review")).toBeLessThan(catalog.indexOf("/testing"));
   });
 });
