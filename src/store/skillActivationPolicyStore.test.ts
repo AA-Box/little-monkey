@@ -59,4 +59,21 @@ describe("skill activation policy cross-window refresh", () => {
     });
     expect(mocks.listen).toHaveBeenCalledWith("skill-activation://changed", expect.any(Function));
   });
+
+  it("reactivates implicit policies after a transient backend failure", async () => {
+    mocks.invoke.mockRejectedValueOnce(new Error("temporary backend failure"));
+
+    await useSkillActivationPolicyStore.getState().hydrate();
+    expect(useSkillActivationPolicyStore.getState().hydrated).toBe(false);
+
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "skill_activation_list") return [entry("automatic")];
+      if (command === "skill_activation_migrate") return [entry("automatic")];
+      throw new Error(`unexpected command ${command}`);
+    });
+
+    await useSkillActivationPolicyStore.getState().refresh();
+    expect(useSkillActivationPolicyStore.getState().hydrated).toBe(true);
+    expect(useSkillActivationPolicyStore.getState().getPolicy("native:global:deploy")).toBe("automatic");
+  });
 });

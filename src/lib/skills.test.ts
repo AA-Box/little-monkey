@@ -191,6 +191,8 @@ describe("skill slash invocation", () => {
     expect(assistants[0].instructions).toContain("Act as a focused reviewer.");
     expect(assistants[0].instructions).toContain("Report concrete defects first.");
     expect(assistants[0].description).toContain("saved chat persona is unchanged");
+    expect(assistants[0].activationPolicy).toBe("manual");
+    expect(composeSkillCatalog(assistants, new Set(), "review")).toBe("");
 
     const parsed = parseSkillTurn(`/${assistants[0].command} auth.ts`, assistants)!;
     expect(parsed.invocations[0].activation).toBe("explicit");
@@ -293,6 +295,14 @@ describe("composeSkillCatalog", () => {
     const manual = { ...skill("deploy"), activationPolicy: "manual" as const };
     expect(composeSkillCatalog([manual], new Set())).toBe("");
     expect(JSON.parse(formatSkillSearchResults([manual], new Set(), "deploy")).results).toEqual([]);
+  });
+
+  it("describes Ask skills as tool requests gated by user approval", () => {
+    const ask = { ...skill("review"), activationPolicy: "ask" as const };
+    const catalog = composeSkillCatalog([ask], new Set());
+    expect(catalog).toContain("may also be requested with the `skill` tool");
+    expect(catalog).toContain("pause and ask the user");
+    expect(catalog).not.toContain("explicit /command approval");
   });
 
   it("uses Unicode tokens and durable effectiveness signals", () => {

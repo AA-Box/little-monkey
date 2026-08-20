@@ -57,7 +57,7 @@ export const useSkillActivationPolicyStore = create<SkillActivationPolicyStore>(
     if (!isTauri()) return;
     try {
       const entries = await skillActivationClient.list();
-      set({ policies: mapEntries(entries), error: null });
+      set({ policies: mapEntries(entries), hydrated: true, error: null });
     } catch (error) {
       // Unknown backend state must not leave an old Automatic cache active.
       // The next turn retries against the profile-owned store.
@@ -87,7 +87,7 @@ export const useSkillActivationPolicyStore = create<SkillActivationPolicyStore>(
     } catch (error) {
       // Keep hydrated=false and therefore fail closed. A transient backend
       // failure must not turn an unknown skill into Automatic.
-      set({ hydrating: false, error: String(error) });
+      set({ hydrated: false, hydrating: false, error: String(error) });
     }
   },
 

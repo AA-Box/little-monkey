@@ -339,6 +339,7 @@ export function packageAssistantSkills(
       command: packageAssistantCommand(snapshot.package_id),
       name: snapshot.manifest.display_name,
       description: `${snapshot.manifest.description} Explicit for one turn; the saved chat persona is unchanged.`,
+      activationPolicy: "manual",
       instructions: [
         "Use this explicitly selected package assistant for the current turn only. Do not change the saved chat persona. Do not auto-run starter workflows.",
         ...instructionBlocks,
@@ -545,7 +546,7 @@ export function composeSkillCatalog(
   const visible = ranked.slice(0, MAX_MODEL_SKILLS);
   return [
     "## Available skills",
-    "These skills are ranked by relevance. Automatic skills may be loaded with the `skill` tool. Ask skills are identified here but require the user's explicit /command approval before their instructions load. Manual skills are never listed for implicit discovery.",
+    "These skills are ranked by relevance. Automatic skills may be loaded immediately with the `skill` tool. Ask skills may also be requested with the `skill` tool; Little Monkey will pause and ask the user before their instructions are loaded. Manual skills are available only through explicit /command invocation.",
     ...visible.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name} [policy: ${skill.activationPolicy ?? "automatic"}]`),
     ...(ranked.length > visible.length
       ? ["More skills are available. Use the `search_skills` tool when the relevant skill is not listed here."]
