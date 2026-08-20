@@ -121,7 +121,12 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
   // on a shared ancestor with the row.
   useEffect(() => {
     function handlePointerDown(event: PointerEvent) {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+      const target = event.target as Element | null;
+      if (
+        menuRef.current &&
+        !menuRef.current.contains(event.target as Node) &&
+        !target?.closest("[data-session-menu-trigger]")
+      ) {
         onClose();
       }
     }
@@ -264,7 +269,7 @@ export function SessionMenu({ session, anchorRect, onClose, onRename }: SessionM
     <div
       ref={menuRef}
       style={{ position: "fixed", top, left, width: MENU_WIDTH }}
-      className="z-30 rounded-lg border border-border bg-background py-1 shadow-lg"
+      className="z-50 rounded-lg border border-border bg-background py-1 shadow-lg"
       onClick={(event) => event.stopPropagation()}
       onPointerDown={(event) => event.stopPropagation()}
     >
