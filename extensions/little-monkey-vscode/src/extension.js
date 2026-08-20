@@ -168,7 +168,7 @@ async function activate(context) {
     const initialized = await connection.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-      clientInfo: { name: "little-monkey-vscode", title: "Little Monkey for VS Code", version: "0.1.0" }
+      clientInfo: { name: "little-monkey-vscode", title: "Little Monkey for VS Code", version: "1.0.0" }
     });
     const storedSessionId = context.workspaceState.get(persistedSessionKey);
     const canResume = initialized?.agentCapabilities?.sessionCapabilities?.resume != null;

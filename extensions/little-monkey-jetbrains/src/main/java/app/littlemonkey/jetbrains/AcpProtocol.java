@@ -24,7 +24,7 @@ final class AcpProtocol {
         JsonObject info = new JsonObject();
         info.addProperty("name", "little-monkey-jetbrains");
         info.addProperty("title", "Little Monkey for JetBrains");
-        info.addProperty("version", "0.1.0");
+        info.addProperty("version", "1.0.0");
 
         JsonObject params = new JsonObject();
         params.addProperty("protocolVersion", 1);

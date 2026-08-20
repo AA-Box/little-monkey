@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use little_monkey_lib::m3_runtime_hub::M3ModelFootprint;
 use little_monkey_lib::run_protocol::{
     ClientIdentity, ClientKind, ModelTargetSnapshot, PermissionDecision, RepositoryPolicy,
-    RunEvent, RunStatus,
+    RunEvent, RunKind, RunStatus,
 };
 use little_monkey_lib::runtime_adapter::MemoryRequirement;
 
@@ -1131,7 +1131,8 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
         // serving until something restarts it; `daemon ensure` compares this
         // against its own version to notice exactly that.
         self.store.set_meta("version", env!("CARGO_PKG_VERSION"))?;
-        if self.store.kill_switch()? {
+        let kill_switch = self.store.kill_switch()?;
+        if kill_switch {
             self.store.request_cancel_all(now)?;
         }
 
@@ -1149,10 +1150,15 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
             self.tick_active(&job_id, now)?;
         }
 
-        if !self.store.kill_switch()? {
-            self.schedule(now)?;
-        } else {
+        if kill_switch {
             self.cancel_queued(now, "global kill switch is engaged")?;
+        } else {
+            // A queued stop is not visible to `tick_active`, and `ready_jobs`
+            // deliberately excludes cancelled rows. Reap it here so the
+            // durable run cannot remain in `cancelling` forever without ever
+            // becoming an active process.
+            self.cancel_queued(now, "Cancellation requested by daemon controller")?;
+            self.schedule(now)?;
         }
 
         // Reconciled once per tick from whatever the job store now says, rather
@@ -2729,7 +2735,9 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
     fn cancel_queued(&mut self, now: u64, reason: &str) -> Result<(), String> {
         for job in self.store.nonterminal_jobs()? {
-            if job.state == JobState::Queued || job.state == JobState::Preparing {
+            if (job.state == JobState::Queued || job.state == JobState::Preparing)
+                && job.cancel_requested
+            {
                 if let Some(run_id) = job.run_id.as_deref() {
                     self.ensure_cancelling(run_id, reason)?;
                     self.cancel_run(run_id, reason)?;
@@ -2874,6 +2882,17 @@ impl<P: ProcessAdapter, N: NotificationAdapter, C: Clock> DaemonEngine<P, N, C> 
 
     fn notify(&self, run_id: &str, title: &str, body: &str) {
         if !self.config.notifications {
+            return;
+        }
+        // Interactive desktop turns already surface their progress and answer
+        // in the app. OS banners are for unattended work only.
+        if self
+            .shared
+            .load_run(run_id)
+            .ok()
+            .and_then(|run| run.map(|stored| stored.spec.kind))
+            .is_some_and(|kind| kind == RunKind::Interactive)
+        {
             return;
         }
         let _ = self.notifier.notify(&DaemonNotification {
@@ -3199,6 +3218,36 @@ pub(super) mod tests {
             signals: Arc::new(Mutex::new(Vec::new())),
             memory: Arc::new(Mutex::new(Some(1024))),
         }
+    }
+
+    #[test]
+    fn interactive_runs_do_not_emit_os_notifications() {
+        let (paths, store, shared, _recorder, background_run_id) = fixture("notifications");
+        let interactive_run_id = "run-interactive";
+        let mut interactive_spec = spec(interactive_run_id, 1_000);
+        interactive_spec.kind = RunKind::Interactive;
+        let ledger = RunLedger::open(&paths.ledger_db).unwrap();
+        DurableRunRecorder::submit(ledger, &interactive_spec, "daemon-fixture".into()).unwrap();
+
+        let notifier = FakeNotifier::default();
+        let notifications = notifier.0.clone();
+        let engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            fake_adapter(),
+            notifier,
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+
+        engine.notify(&background_run_id, "Background run started", "background");
+        engine.notify(interactive_run_id, "Background run started", "interactive");
+
+        let notifications = notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].run_id, background_run_id);
     }
 
     /// A 16 GiB machine with 16 GiB free, so admission is decided by the
@@ -4373,6 +4422,37 @@ pub(super) mod tests {
         engine.tick().unwrap();
         assert!(signals.lock().unwrap().contains(&ProcessSignal::Terminate));
         assert_eq!(engine.active_count(), 0);
+        assert_eq!(
+            engine.shared.load_run(&run_id).unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_terminalizes_a_queued_job_without_starting_it() {
+        let (paths, store, shared, _recorder, run_id) = fixture("queued-cancel");
+        let adapter = fake_adapter();
+        let spawns = adapter.spawns.clone();
+        let mut engine = DaemonEngine::new(
+            store,
+            shared,
+            paths,
+            DaemonConfig::default(),
+            adapter,
+            FakeNotifier::default(),
+            FakeClock(Arc::new(Mutex::new(2_000))),
+            "daemon-test-owner".into(),
+        );
+
+        engine.store.request_cancel(&run_id, 2_001).unwrap();
+        engine.tick().unwrap();
+
+        assert_eq!(*spawns.lock().unwrap(), 0);
+        assert_eq!(engine.active_count(), 0);
+        assert_eq!(
+            engine.store.get_job(&run_id).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
         assert_eq!(
             engine.shared.load_run(&run_id).unwrap().unwrap().status,
             RunStatus::Cancelled

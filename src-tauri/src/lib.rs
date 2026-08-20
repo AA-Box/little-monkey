@@ -109,6 +109,7 @@ pub mod m3_commands;
 pub mod m3_http_server;
 pub mod m3_production;
 pub mod m3_runtime_hub;
+pub mod mlx_ownership;
 // Local Agent Integration Launcher (ROADMAP.md, Phase 8, item 13): generates
 // safe external-tool (Continue.dev/aider/OpenAI-SDK-compatible) config
 // pointed at the M3 HTTP server's real endpoint, and detects drift in a
@@ -134,6 +135,7 @@ pub mod runtime_telemetry;
 // Explicit-grant desktop companion, local/BYOK speech, and user-owned image
 // endpoints. The module owns its media jobs so normal app shutdown can revoke
 // every grant and cancel every child/network task before Tauri exits.
+pub mod dictation;
 pub mod m7_companion;
 // Global Command Palette (ROADMAP.md, Phase 1): owns only the OS-level
 // shortcut's persisted configuration and "bring the palette to the front"
@@ -954,6 +956,7 @@ pub fn run() {
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
+        .manage(dictation::DictationRuntime::default())
         .manage(palette_state)
         .manage(desktop_control_state)
         // Tier-2 interactive-artifact protocol — serves a previously
@@ -979,18 +982,27 @@ pub fn run() {
             // opens the ledger — the closure reads it on demand and caches per run.
             run_commands::install_run_egress_policy_source(app.handle());
 
-            // Verify and copy the bundled llama.cpp runtime into app data at
-            // launch so the separately installed `monkey` CLI can use the
-            // same app-owned runtime without Ollama or a system install.
-            // A source/dev build may intentionally have no staged bundle;
-            // model start still fails closed if a present bundle is invalid.
+            // Verify and copy every bundled native runtime into app data at
+            // launch so the separately installed `monkey` CLI and the desktop
+            // process use the same app-owned runtimes. This is also the repair
+            // pass for a previous app version that used the same runtime
+            // version directory but shipped different signed bytes. A
+            // source/dev build may intentionally have no staged bundle; model
+            // start still fails closed if a present bundle is invalid.
             if let Ok(runtime_app_data) = app.profile_data_dir() {
                 let resource_dir = app.path().resource_dir().ok();
-                if let Err(error) = managed_runtime::materialize_bundled_runtime(
-                    resource_dir.as_deref(),
-                    &runtime_app_data,
-                ) {
-                    eprintln!("Managed llama.cpp runtime setup failed: {error}");
+                for spec in [
+                    &managed_runtime::LLAMA,
+                    &managed_runtime::LLAMA_TTS,
+                    &managed_runtime::STABLE_DIFFUSION,
+                ] {
+                    if let Err(error) = managed_runtime::materialize_bundled_runtime_for(
+                        spec,
+                        resource_dir.as_deref(),
+                        &runtime_app_data,
+                    ) {
+                        eprintln!("Managed {} runtime setup failed: {error}", spec.id);
+                    }
                 }
             }
 
@@ -1243,6 +1255,9 @@ pub fn run() {
             models::models_delete,
             models::models_add_external,
             models::models_remove_external,
+            models::models_detect_projectors,
+            models::models_set_projector,
+            models::models_remove_projector,
             process_commands::process_list,
             process_commands::process_get,
             process_commands::process_descendants,
@@ -1546,6 +1561,8 @@ pub fn run() {
             m3_commands::m3_mlx_install,
             #[cfg(target_os = "macos")]
             m3_commands::m3_mlx_install_component,
+            #[cfg(target_os = "macos")]
+            m3_commands::m3_mflux_install_component,
             m3_commands::m3_telemetry_record_load,
             m3_commands::m3_telemetry_record_request,
             m3_commands::m3_telemetry_recent_traces,
@@ -1834,6 +1851,7 @@ pub fn run() {
             generation_commands::generation_add_model,
             generation_commands::generation_remove_model,
             generation_commands::generation_accept_license,
+            generation_commands::generation_set_hugging_face_token,
             generation_commands::generation_download_model,
             generation_commands::generation_cancel_download,
             generation_commands::generation_parts,
@@ -1865,6 +1883,10 @@ pub fn run() {
             m7_companion::m7_image_data_url,
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
+            dictation::dictation_capabilities,
+            dictation::dictation_start,
+            dictation::dictation_stop,
+            dictation::dictation_cancel,
             command_palette::palette_show,
             command_palette::palette_config_get,
             command_palette::palette_config_save,
@@ -1918,6 +1940,9 @@ pub fn run() {
 
             let companion = app_handle.state::<m7_companion::M7CompanionState>();
             let _ = companion.emergency_stop();
+
+            let dictation = app_handle.state::<dictation::DictationRuntime>();
+            dictation::shutdown(dictation.inner());
 
             let desktop_control = app_handle.state::<desktop_control::DesktopControlState>();
             let _ = desktop_control.emergency_stop();

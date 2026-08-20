@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowDown,
   ArrowLeft,
@@ -10,7 +12,9 @@ import {
   Download,
   Image as ImageIcon,
   Loader2,
+  Maximize2,
   Plus,
+  Pencil,
   RectangleHorizontal,
   RectangleVertical,
   Redo2,
@@ -35,6 +39,7 @@ import type { StudioMode } from "./StudioNav";
 import { ToolPanel } from "./ToolPanel";
 import { useT } from "../../lib/i18n";
 import { MAX_STUDIO_QUEUE, useStudioRunStore } from "../../store/studioRunStore";
+import { useRuntimeHubStore } from "../../store/runtimeHubStore";
 import { describeWeightFile } from "../../lib/weightFileHints";
 import { PREPROCESSORS, runPreprocessor, type Preprocessor } from "../../lib/preprocess";
 import { NO_MARGINS, runOutpaint, type Margins } from "../../lib/outpaint";
@@ -115,6 +120,12 @@ async function imageSize(base64: string): Promise<{ width: number; height: numbe
 function extensionFor(mediaType: string): string {
   const subtype = mediaType.split("/")[1] ?? "bin";
   return subtype === "jpeg" ? "jpg" : subtype.replace(/[^a-z0-9]/gi, "");
+}
+
+function dataUrlBytes(dataUrl: string): Uint8Array {
+  const encoded = dataUrl.slice(dataUrl.indexOf(",") + 1);
+  const binary = atob(encoded);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
 }
 
 /** A slider paired with the number it sets, because a slider alone cannot be
@@ -516,6 +527,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const [partsDraft, setPartsDraft] = useState<Record<string, ModelComponent[]>>({});
   const [settings, setSettings] = useState<RunSettings | null>(null);
   const [adding, setAdding] = useState(false);
+  const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   // The run itself lives in a store, not here: this panel unmounts whenever
   // the user switches to Chat, and a generation must survive that.
@@ -529,8 +541,11 @@ export function StudioPanel({ mode, railSlot }: Props) {
   const busy = active !== null;
   const [error, setError] = useState<string | null>(null);
   const [previews, setPreviews] = useState<Record<string, string>>({});
+  const [savingEntryId, setSavingEntryId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<GenerationEntry | null>(null);
   const lightboxRef = useRef<HTMLDialogElement>(null);
+  const lightboxOpenRef = useRef(false);
+  lightboxOpenRef.current = lightbox !== null;
 
   // `showModal` is the only way into the top layer, so open and close are
   // driven from state rather than the `open` attribute.
@@ -540,6 +555,30 @@ export function StudioPanel({ mode, railSlot }: Props) {
     if (lightbox) dialog.showModal();
     else dialog.close();
   }, [lightbox]);
+
+  // The macOS traffic-light close control belongs to the app window, not the
+  // HTML dialog. If it is clicked while the lightbox is open, consume that
+  // close request for the dialog so a near-miss cannot quit the whole app.
+  useEffect(() => {
+    if (!IN_DESKTOP_APP) return undefined;
+
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onCloseRequested((event) => {
+        if (!lightboxOpenRef.current) return;
+        event.preventDefault();
+        setLightbox(null);
+      })
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else unlisten = cleanup;
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // A segment shows only the models that can do something in it, so the
   // picker never offers a video model under Image.
@@ -559,6 +598,23 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // process against weights this app never sees, so those controls are hidden
   // rather than shown and then silently dropped on the way out.
   const remote = isRemoteModelId(selected?.id ?? null);
+  const mlxModelSelected = !remote && selected?.engine === "mlx_video";
+  const mfluxModelSelected = !remote && selected?.engine === "mflux_image";
+  const mlxRuntimeReady = useRuntimeHubStore((state) =>
+    state.runtimes.some((runtime) => runtime.descriptor.kind === "mlx" && runtime.canInfer),
+  );
+  const mlxInstalling = useRuntimeHubStore((state) => Boolean(state.busy["mlx-auto-install"]));
+  const mlxInstallError = useRuntimeHubStore((state) => state.errors["mlx-auto-install"]);
+  const ensureMlxRuntime = useRuntimeHubStore((state) => state.ensureMlxRuntime);
+
+  // MLX is a managed package shared by chat and Studio. Selecting an MLX video
+  // model is enough to prepare it; users should not have to visit Runtime Hub
+  // before the first Studio run.
+  useEffect(() => {
+    if (mlxModelSelected && !mlxRuntimeReady) {
+      void ensureMlxRuntime().catch(() => {});
+    }
+  }, [ensureMlxRuntime, mlxModelSelected, mlxRuntimeReady]);
   // This tab's results, newest first: the newest fills the canvas, the rest is
   // the strip under it.
   const shownGallery = useMemo(
@@ -606,13 +662,17 @@ export function StudioPanel({ mode, railSlot }: Props) {
   // where the engine takes a `mask_image` at all, so an older build is never
   // sent a field it rejects.
   const canMask =
-    task === "image_to_image" && !remote && engineSupports(capabilities, "mask_image");
+    task === "image_to_image" && !remote && !mfluxModelSelected && engineSupports(capabilities, "mask_image");
 
   // The lists the pickers offer: the running engine's own, falling back to the
   // pinned build's while nothing is running. An engine answering with an empty
   // list is treated as not having answered — an empty sampler picker is never
   // the right thing to show.
-  const samplers = capabilities?.samplers.length ? capabilities.samplers : SAMPLERS;
+  const samplers = mfluxModelSelected
+    ? ["linear"]
+    : capabilities?.samplers.length
+      ? capabilities.samplers
+      : SAMPLERS;
   const schedulers = capabilities?.schedulers.length ? capabilities.schedulers : SCHEDULERS;
   const upscalers = capabilities?.upscalers.length ? capabilities.upscalers : UPSCALERS;
 
@@ -711,7 +771,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
       height: alignDimension(selected.defaults.height),
       steps: selected.defaults.steps,
       cfgScale: selected.defaults.cfgScale,
-      sampler: selected.defaults.sampleMethod,
+      sampler: selected.engine === "mflux_image" ? "linear" : selected.defaults.sampleMethod,
       scheduler: "",
       clipSkip: -1,
       eta: null,
@@ -748,6 +808,25 @@ export function StudioPanel({ mode, railSlot }: Props) {
   useEffect(() => {
     if (shown) void loadPreview(shown);
   }, [shown, loadPreview]);
+
+  const saveEntry = async (entry: GenerationEntry) => {
+    setSavingEntryId(entry.entryId);
+    setError(null);
+    try {
+      const dataUrl = previews[entry.artifactId] ?? (await studioClient.mediaDataUrl(entry.artifactId));
+      const extension = extensionFor(entry.mediaType);
+      const destination = await save({
+        defaultPath: `${entry.entryId}.${extension}`,
+        filters: [{ name: entry.mediaType.toUpperCase(), extensions: [extension] }],
+      });
+      if (!destination) return;
+      await writeFile(destination, dataUrlBytes(dataUrl));
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setSavingEntryId(null);
+    }
+  };
 
   const download = async (model: GenerationModel) => {
     setError(null);
@@ -1081,7 +1160,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
     );
   }
 
-  if (status && !status.supported) {
+  if (status && !status.supported && !status.mfluxSupported) {
     return (
       <div className="flex min-h-0 flex-1 items-center justify-center p-8 text-center">
         <div className="max-w-md">
@@ -1103,6 +1182,8 @@ export function StudioPanel({ mode, railSlot }: Props) {
     // A run in flight no longer blocks the button: the next one queues behind
     // it, up to the cap that keeps a leaned-on button from queueing forever.
     runQueue.length + (busy ? 1 : 0) < MAX_STUDIO_QUEUE &&
+    (!mlxModelSelected || mlxRuntimeReady) &&
+    (!mfluxModelSelected || !!status?.mfluxInstalled) &&
     (!needsInitImage(task) || !!initImage);
 
   // Tools share nothing with generation — no model, no prompt, no sampler —
@@ -1126,6 +1207,27 @@ export function StudioPanel({ mode, railSlot }: Props) {
         <p className="mb-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
           {error ?? runError}
         </p>
+      )}
+
+      {mlxModelSelected && !mlxRuntimeReady && (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          <span>
+            {mlxInstalling
+              ? t("Studio.mlx.preparing")
+              : mlxInstallError ?? t("Studio.mlx.notReady")}
+          </span>
+          {!mlxInstalling && (
+            <Button size="sm" variant="secondary" onClick={() => void ensureMlxRuntime().catch(() => {})}>
+              {t("Studio.mlx.retry")}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {mfluxModelSelected && !status?.mfluxInstalled && (
+        <div className="mb-3 rounded border border-warning/40 bg-warning-soft px-3 py-2 text-xs text-warning">
+          {t("Studio.mflux.notReady")}
+        </div>
       )}
 
       {mode === "models" ? (
@@ -1200,10 +1302,51 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   </span>
                 </button>
 
+                {!isRemoteModelId(model.id) && (
+                  <div className="mt-2">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        setAdding(false);
+                        setEditingModelId((current) => (current === model.id ? null : model.id));
+                      }}
+                    >
+                      <Pencil size={12} />
+                      {t(editingModelId === model.id ? "Studio.add.cancel" : "Studio.editModel")}
+                    </Button>
+                  </div>
+                )}
+
+                {editingModelId === model.id && (
+                  <div className="mt-2">
+                    <AddModelForm
+                      initialSpec={toSpec(model)}
+                      editing
+                      onSaved={() => {
+                        setEditingModelId(null);
+                        void (async () => {
+                          try {
+                            if (status?.loadedModelId === model.id) {
+                              await studioClient.unloadEngine();
+                            }
+                            await refresh();
+                          } catch (reason) {
+                            setError(errorText(reason));
+                          }
+                        })();
+                      }}
+                    />
+                  </div>
+                )}
+
                 {/* Adding and swapping files happens here and only here. The
                     generation tabs pick from what this produces. A backend's
                     models have no files here to swap. */}
-                <details className="mt-2" hidden={isRemoteModelId(model.id)}>
+                <details
+                  className="mt-2"
+                  hidden={isRemoteModelId(model.id) || model.engine === "mflux_image"}
+                >
                   <summary className="cursor-pointer text-[11px] text-muted">
                     {t("Studio.parts")}
                     <span className="ml-1.5 text-faint">
@@ -1812,25 +1955,27 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 />
               </div>
 
-              <label className="grid gap-1 text-[11px] text-muted">
-                {t("Studio.sampler")}
-                <Select
-                  mono
-                  value={settings.sampler}
-                  onChange={(sampler) => setSettings({ ...settings, sampler })}
-                >
-                  {/* A model may name a sampler this build does not list; keep
-                      it selectable rather than silently switching it. */}
-                  {(samplers.includes(settings.sampler)
-                    ? samplers
-                    : [settings.sampler, ...samplers]
-                  ).map((entry) => (
-                    <option key={entry} value={entry}>
-                      {entry}
-                    </option>
-                  ))}
-                </Select>
-              </label>
+              {!mfluxModelSelected && (
+                <label className="grid gap-1 text-[11px] text-muted">
+                  {t("Studio.sampler")}
+                  <Select
+                    mono
+                    value={settings.sampler}
+                    onChange={(sampler) => setSettings({ ...settings, sampler })}
+                  >
+                    {/* A model may name a sampler this build does not list; keep
+                        it selectable rather than silently switching it. */}
+                    {(samplers.includes(settings.sampler)
+                      ? samplers
+                      : [settings.sampler, ...samplers]
+                    ).map((entry) => (
+                      <option key={entry} value={entry}>
+                        {entry}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+              )}
 
               <div className="grid gap-3">
                 <SliderField
@@ -1875,7 +2020,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 />
               )}
 
-              <details className="grid gap-2" hidden={remote}>
+              <details className="grid gap-2" hidden={remote || mfluxModelSelected}>
                 <summary className="cursor-pointer text-[11px] text-muted">
                   {t("Studio.advanced")}
                 </summary>
@@ -1907,7 +2052,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 </div>
               </details>
 
-              <div className="grid gap-2 rounded bg-background/60 p-2">
+              <div className="grid gap-2 rounded bg-background/60 p-2" hidden={mfluxModelSelected}>
                 <label className="flex items-center gap-2 text-[11px] font-medium">
                   <input
                     type="checkbox"
@@ -2026,7 +2171,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </>
           )}
 
-          {!isSpeechTask(task) && !remote && (
+          {!isSpeechTask(task) && !remote && !mfluxModelSelected && (
             <details className="rounded border border-border p-3">
               <summary className="cursor-pointer text-xs font-medium">
                 {t("Studio.lora.title")}
@@ -2123,7 +2268,7 @@ export function StudioPanel({ mode, railSlot }: Props) {
             </Button>
           </div>
 
-          {!isSpeechTask(task) && (
+          {!isSpeechTask(task) && !mfluxModelSelected && (
             <div className="flex shrink-0 items-stretch gap-2">
               <input
                 className="min-w-0 flex-1 rounded border border-border bg-background p-2 text-xs"
@@ -2222,27 +2367,88 @@ export function StudioPanel({ mode, railSlot }: Props) {
                 <audio controls src={previews[shown.artifactId]} className="w-full max-w-md" />
               </div>
             ) : (
-              <button
-                type="button"
-                className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
-                title={t("Studio.result.expand")}
-                onClick={() => setLightbox(shown)}
-              >
+              <div className="absolute inset-0">
                 {shown.mediaType.startsWith("video/") ? (
-                  <video
-                    controls
-                    loop
-                    src={previews[shown.artifactId]}
-                    className="max-h-full max-w-full rounded bg-black object-contain"
-                  />
+                  <div className="flex h-full w-full items-center justify-center p-2">
+                    <video
+                      controls
+                      loop
+                      src={previews[shown.artifactId]}
+                      className="max-h-full max-w-full rounded bg-black object-contain"
+                    />
+                  </div>
                 ) : (
-                  <img
-                    src={previews[shown.artifactId]}
-                    alt={shown.prompt}
-                    className="max-h-full max-w-full rounded object-contain"
-                  />
+                  <button
+                    type="button"
+                    className="absolute inset-0 flex cursor-zoom-in items-center justify-center p-2"
+                    title={t("Studio.result.expand")}
+                    aria-label={t("Studio.result.expand")}
+                    onClick={() => setLightbox(shown)}
+                  >
+                    <img
+                      src={previews[shown.artifactId]}
+                      alt={shown.prompt}
+                      className="max-h-full max-w-full rounded object-contain"
+                    />
+                  </button>
                 )}
-              </button>
+                <div className="absolute right-2 top-2 z-10 flex gap-1.5">
+                  {shown.mediaType.startsWith("video/") && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.result.expand")}
+                      title={t("Studio.result.expand")}
+                      onClick={() => setLightbox(shown)}
+                    >
+                      <Maximize2 size={14} />
+                    </IconButton>
+                  )}
+                  {selected && editTaskFor(selected) && (
+                    <IconButton
+                      size="sm"
+                      variant="secondary"
+                      aria-label={t("Studio.result.edit")}
+                      title={t("Studio.result.edit")}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void editEntry(shown);
+                      }}
+                    >
+                      <Wand2 size={14} />
+                    </IconButton>
+                  )}
+                  <IconButton
+                    size="sm"
+                    variant="secondary"
+                    aria-label={t("Studio.result.save")}
+                    title={t("Studio.result.save")}
+                    disabled={savingEntryId === shown.entryId}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void saveEntry(shown);
+                    }}
+                  >
+                    {savingEntryId === shown.entryId ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : (
+                      <Download size={14} />
+                    )}
+                  </IconButton>
+                  <IconButton
+                    size="sm"
+                    variant="danger"
+                    aria-label={t("Studio.result.delete")}
+                    title={t("Studio.result.delete")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void removeEntry(shown);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </IconButton>
+                </div>
+              </div>
             )}
           </div>
 
@@ -2291,25 +2497,38 @@ export function StudioPanel({ mode, railSlot }: Props) {
         onClick={(event) => {
           if (event.target === lightboxRef.current) setLightbox(null);
         }}
-        className="max-h-[92vh] max-w-[92vw] rounded-lg border border-border bg-surface p-3 text-foreground backdrop:bg-black/70"
+        className="fixed left-1/2 top-1/2 m-0 max-h-[calc(100vh-2rem)] w-[min(69vw,825px)] max-w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 overflow-auto rounded-lg border border-border bg-surface p-3 text-foreground outline-none backdrop:bg-black/70 focus:outline-none"
       >
         {lightbox && previews[lightbox.artifactId] && (
           <div className="grid gap-2">
-            {lightbox.mediaType.startsWith("video/") ? (
-              <video
-                controls
-                loop
-                autoPlay
-                src={previews[lightbox.artifactId]}
-                className="max-h-[74vh] rounded bg-black object-contain"
-              />
-            ) : (
-              <img
-                src={previews[lightbox.artifactId]}
-                alt={lightbox.prompt}
-                className="max-h-[74vh] rounded object-contain"
-              />
-            )}
+            <div className="flex justify-end">
+              <IconButton
+                size="sm"
+                variant="secondary"
+                aria-label={t("Studio.result.close")}
+                title={t("Studio.result.close")}
+                onClick={() => setLightbox(null)}
+              >
+                <X size={14} />
+              </IconButton>
+            </div>
+            <div className="flex justify-center">
+              {lightbox.mediaType.startsWith("video/") ? (
+                <video
+                  controls
+                  loop
+                  autoPlay
+                  src={previews[lightbox.artifactId]}
+                  className="max-h-[74vh] max-w-full rounded bg-black object-contain"
+                />
+              ) : (
+                <img
+                  src={previews[lightbox.artifactId]}
+                  alt={lightbox.prompt}
+                  className="max-h-[74vh] max-w-full rounded object-contain"
+                />
+              )}
+            </div>
             <p className="max-w-prose text-[11px] text-muted">{lightbox.prompt}</p>
             <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-faint">
               <span className="mr-auto">
@@ -2332,14 +2551,15 @@ export function StudioPanel({ mode, railSlot }: Props) {
                   {t("Studio.result.edit")}
                 </Button>
               )}
-              <a
-                className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-muted hover:text-foreground"
-                href={previews[lightbox.artifactId]}
-                download={`${lightbox.entryId}.${extensionFor(lightbox.mediaType)}`}
+              <Button
+                size="sm"
+                variant="secondary"
+                disabled={savingEntryId === lightbox.entryId}
+                onClick={() => void saveEntry(lightbox)}
               >
                 <Download size={12} />
                 {t("Studio.result.save")}
-              </a>
+              </Button>
               <Button size="sm" variant="danger" onClick={() => void removeEntry(lightbox)}>
                 <Trash2 size={12} />
                 {t("Studio.result.delete")}

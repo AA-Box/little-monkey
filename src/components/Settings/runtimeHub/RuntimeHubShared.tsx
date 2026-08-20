@@ -79,11 +79,21 @@ export function Toggle({
   );
 }
 
-export function SectionHeading({ title, description, action }: { title: string; description?: string; action?: ReactNode }) {
+export function SectionHeading({
+  title,
+  description,
+  action,
+  id,
+}: {
+  title: string;
+  description?: string;
+  action?: ReactNode;
+  id?: string;
+}) {
   return (
     <div className="flex flex-wrap items-start justify-between gap-3">
       <div className="min-w-0">
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+        <h3 id={id} className="text-sm font-semibold text-foreground">{title}</h3>
         {description && <p className="mt-1 text-xs leading-5 text-muted">{description}</p>}
       </div>
       {action}

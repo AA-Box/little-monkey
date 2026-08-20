@@ -124,6 +124,22 @@ describe("buildSessionListView", () => {
     ]);
   });
 
+  it("keeps working sessions together without reordering them during streaming", () => {
+    const rows = [
+      local({ id: "working-first", updatedAt: NOW - DAY }, "working"),
+      local({ id: "working-second", updatedAt: NOW }, "working"),
+      local({ id: "idle", updatedAt: NOW + DAY }),
+    ];
+
+    expect(flat(view(rows).sections)).toEqual(["working-first", "working-second", "idle"]);
+
+    const afterStreaming = rows.map((row, index) => ({
+      ...row,
+      updatedAt: NOW + DAY + index,
+    }));
+    expect(flat(view(afterStreaming).sections)).toEqual(["working-first", "working-second", "idle"]);
+  });
+
   it("offers the built-in environments even when nothing has arrived on one", () => {
     expect(environmentOptions([local()])).toEqual([
       LOCAL_ENVIRONMENT,

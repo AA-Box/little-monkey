@@ -151,6 +151,8 @@ Take the installer for your platform from the [**latest release**](https://githu
 
 Bundles ship a pinned, checksum-verified `llama.cpp` runtime and install the `monkey` command on first launch without elevation. Every release carries per-asset signatures, the signing public key and a CycloneDX SBOM. Optional runtimes are listed in **[Setup](docs/setup.md)**.
 
+Release assets also include the versioned IDE clients: `little-monkey-vscode-1.0.0.vsix` for VS Code and `little-monkey-jetbrains-1.0.0.zip` for JetBrains IDEs. Install them from the release page; marketplace publishing is not automatic.
+
 Building from source instead: [Development](#development).
 
 ## Quick start
@@ -195,7 +197,7 @@ Serves the OpenAI-compatible routes, the Anthropic Messages subset, and native-O
 | **Agent tools** | File, shell, memory, web, knowledge, MCP, subagent, plan and verification tools — every one behind the permission gate, with checkpoints you can rewind |
 | **Knowledge 2.0** | Ingest files, sites, chats and WebDAV; hybrid lexical and vector retrieval with reranking; inspect the whole pipeline end to end |
 | **Runtime hub** | Offload planning from a live hardware snapshot, versioned runtime components, and a Driver Doctor that says what *executes*, not only what is detected |
-| **Studio** | Text-to-image, image-to-image, text-to-video, image-to-video and speech, from weights on your own disk |
+| **Studio** | Native MFLUX image generation on Apple Silicon, managed `sd-server` image/video, MLX video, gallery export and local speech, from weights on your own disk |
 | **Skills &amp; workflows** | Digest-approved skills, signed packages, MCP Apps, and typed workflow DAGs with triggers, replay and human-approval nodes |
 | **Runs &amp; limits** | Ten tracked process kinds, durable stop/suspend/resume from anywhere, and budgets that record *which* limit fired |
 

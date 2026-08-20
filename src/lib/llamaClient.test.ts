@@ -92,6 +92,28 @@ describe('SseEventParser', () => {
 });
 
 describe('streamChat request shape', () => {
+  it('preserves image_url content for a vision-capable local request', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } }),
+    );
+    const messages = [{
+      role: 'user' as const,
+      content: [
+        { type: 'text' as const, text: 'What is this?' },
+        { type: 'image_url' as const, image_url: { url: 'data:image/png;base64,AAAA' } },
+      ],
+    }];
+
+    for await (const _event of streamChat('http://127.0.0.1:8080', messages, [], 'model')) {
+      // Drain the stream.
+    }
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as { messages: typeof messages };
+    expect(body.messages).toEqual(messages);
+    fetchMock.mockRestore();
+  });
+
   it('omits tools and tool_choice entirely for a no-tools request', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response('data: [DONE]\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })

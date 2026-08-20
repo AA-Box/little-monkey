@@ -1,5 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { AlertTriangle, MessagesSquare, MoreVertical, Plus, SlidersHorizontal, Smartphone } from "lucide-react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import {
+  AlertTriangle,
+  Archive,
+  ArchiveRestore,
+  MessagesSquare,
+  MoreVertical,
+  Pin,
+  Plus,
+  SlidersHorizontal,
+  Smartphone,
+} from "lucide-react";
 
 import { type ChatSession, useSessionStore } from "../../store/sessionStore";
 import { Button } from "../ui";
@@ -9,7 +20,11 @@ import { SessionListMenu, useEnvironmentLabel } from "./SessionListMenu";
 import { usePermissionStore } from "../../store/permissionStore";
 import { useSessionListViewStore } from "../../store/sessionListViewStore";
 import { useExternalConversationStore } from "../../store/externalConversationStore";
+import { useGitDeliveryStore } from "../../store/gitDeliveryStore";
+import { primaryRoot, useWorkspaceStore } from "../../store/workspaceStore";
 import { REMOTE_CONTROL_ENVIRONMENT } from "../../lib/conversationsClient";
+import { detectShortcutPlatform } from "../../lib/shortcuts";
+import { SessionGitBadge, SessionPreviewCard, type SessionGitContext } from "./SessionGitBadge";
 import {
   buildSessionListView,
   environmentOptions,
@@ -18,6 +33,31 @@ import {
   type SessionRow,
 } from "./sessionListView";
 import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from "./sessionStatus";
+
+interface GitStatusSnapshot {
+  is_repo: boolean;
+  branch: string | null;
+  changed_files: number;
+  is_worktree: boolean;
+  worktree_name: string | null;
+}
+
+const EMPTY_GIT_STATUS: GitStatusSnapshot = {
+  is_repo: false,
+  branch: null,
+  changed_files: 0,
+  is_worktree: false,
+  worktree_name: null,
+};
+
+function normalizedPath(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  return normalized || path;
+}
+
+function pathsEqual(left: string | null, right: string | null): boolean {
+  return Boolean(left && right && normalizedPath(left) === normalizedPath(right));
+}
 
 /**
  * Claude-Desktop-style session list for the left sidebar: a "New session"
@@ -31,18 +71,10 @@ import { sessionsAwaitingPermission, sessionStatus, type SessionStatus } from ".
  * How the whole list is filtered, grouped and ordered lives in
  * `sessionListView.ts`, behind the header's view menu.
  */
-/** Tailwind classes for each status' dot. `working` animates — a row that
- * is doing something should be the one thing moving in the sidebar. */
-const STATUS_DOT: Record<Exclude<SessionStatus, "attention">, string> = {
-  working: "bg-accent animate-pulse",
-  finished: "bg-accent",
-  error: "bg-danger",
-};
-
-/** The leading status marker on a session row. Never color alone: the
- * hover/screen-reader label names the state, and the two states worth
- * interrupting for carry a shape of their own (a pulse, a triangle). */
-function StatusMarker({ status, label }: { status: SessionStatus; label: string }) {
+/** The leading status marker on a session row. Working is the only animated
+ * state; finished is a solid dot, read/idle is hollow, and failures use an
+ * icon so the state is not conveyed by color or motion alone. */
+function StatusMarker({ status, label }: { status: SessionStatus | null; label: string }) {
   return (
     <span
       role="img"
@@ -50,10 +82,16 @@ function StatusMarker({ status, label }: { status: SessionStatus; label: string 
       title={label}
       className="mr-1.5 inline-flex shrink-0 items-center align-middle"
     >
-      {status === "attention" ? (
+      {status === "error" ? (
+        <AlertTriangle size={12} className="text-danger" aria-hidden />
+      ) : status === "attention" ? (
         <AlertTriangle size={12} className="text-warning" aria-hidden />
+      ) : status === null ? (
+        <span className="h-1.5 w-1.5 rounded-full border border-faint" />
       ) : (
-        <span className={`h-1.5 w-1.5 rounded-full ${STATUS_DOT[status]}`} />
+        <span
+          className={`h-1.5 w-1.5 rounded-full ${status === "working" ? "bg-accent animate-pulse motion-reduce:animate-none" : "bg-accent"}`}
+        />
       )}
     </span>
   );
@@ -67,6 +105,51 @@ function EnvironmentMarker({ environment, label }: { environment: string; label:
   return (
     <span role="img" aria-label={label} title={label} className="mr-1.5 inline-flex shrink-0 items-center align-middle">
       <Icon size={12} className="text-faint" aria-hidden />
+    </span>
+  );
+}
+
+function SessionTitle({
+  title,
+  status,
+  statusLabel,
+  unread,
+}: {
+  title: string;
+  status: SessionStatus | null;
+  statusLabel: string;
+  unread: boolean;
+}) {
+  const viewportRef = useRef<HTMLSpanElement>(null);
+  const contentRef = useRef<HTMLSpanElement>(null);
+  const [overflow, setOverflow] = useState(0);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const content = contentRef.current;
+    if (!viewport || !content) return;
+    const measure = () => setOverflow(Math.max(0, content.scrollWidth - viewport.clientWidth));
+    measure();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", measure);
+      return () => window.removeEventListener("resize", measure);
+    }
+    const observer = new ResizeObserver(measure);
+    observer.observe(viewport);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [title]);
+
+  return (
+    <span ref={viewportRef} className="block min-w-0 overflow-hidden whitespace-nowrap">
+      <span
+        ref={contentRef}
+        className={`inline-block whitespace-nowrap ${overflow > 0 ? "session-title-marquee" : ""} ${unread ? "font-semibold" : ""}`}
+        style={{ "--session-title-overflow": `${overflow}px` } as CSSProperties}
+      >
+        <StatusMarker status={status} label={statusLabel} />
+        {title}
+      </span>
     </span>
   );
 }
@@ -99,6 +182,15 @@ export default function ChatSessionList() {
   const selectedExternal = useExternalConversationStore((state) => state.selected);
   const selectExternal = useExternalConversationStore((state) => state.select);
   const refreshExternal = useExternalConversationStore((state) => state.refresh);
+  const primaryWorkspacePath = useWorkspaceStore((state) => primaryRoot(state.roots)?.path ?? null);
+  const deliveryWorktrees = useGitDeliveryStore((state) => state.worktrees);
+  const deliverySelectedWorktreeId = useGitDeliveryStore((state) => state.selectedWorktreeId);
+  const deliveryPullRequest = useGitDeliveryStore((state) => state.pullRequest);
+  const deliveryChecks = useGitDeliveryStore((state) => state.checks);
+  const refreshDelivery = useGitDeliveryStore((state) => state.refresh);
+  const togglePin = useSessionStore((state) => state.togglePin);
+  const archiveSession = useSessionStore((state) => state.archiveSession);
+  const unarchiveSession = useSessionStore((state) => state.unarchiveSession);
   const { t } = useT();
   const environmentLabel = useEnvironmentLabel();
 
@@ -108,7 +200,46 @@ export default function ChatSessionList() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [archivedOpen, setArchivedOpen] = useState(false);
+  const [gitStatus, setGitStatus] = useState<GitStatusSnapshot | null>(null);
+  const [shortcutModifierPressed, setShortcutModifierPressed] = useState(false);
+  const [hoveredRow, setHoveredRow] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const [preview, setPreview] = useState<{ sessionId: string; anchorRect: DOMRect } | null>(null);
+  const previewCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prefs = useSessionListViewStore((state) => state.prefs);
+
+  // The delivery store owns the durable list of application-created
+  // worktrees. Loading it here lets the sidebar identify a chat that is
+  // attached to one of those branches without making the list depend on the
+  // Git Delivery settings panel being open first.
+  useEffect(() => {
+    if (!isTauri()) return;
+    void refreshDelivery().catch(() => undefined);
+  }, [refreshDelivery]);
+
+  // The lightweight status command is scoped to the current primary
+  // workspace. It is enough for ordinary branch badges; the heavier review
+  // snapshot is deferred until a user hovers or focuses the badge.
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      if (!isTauri() || !primaryWorkspacePath) {
+        setGitStatus(null);
+        return;
+      }
+      try {
+        const status = await invoke<GitStatusSnapshot>("git_status");
+        if (!disposed) setGitStatus(status);
+      } catch {
+        if (!disposed) setGitStatus(EMPTY_GIT_STATUS);
+      }
+    };
+    void load();
+    window.addEventListener("focus", load);
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", load);
+    };
+  }, [primaryWorkspacePath]);
 
   // The daemon owns the outside conversations, so this list is fetched rather
   // than subscribed to. Refreshed on mount and whenever the window comes back
@@ -174,6 +305,100 @@ export default function ChatSessionList() {
     },
   });
 
+  const sessionGitContexts = useMemo(() => {
+    const contexts = new Map<string, SessionGitContext>();
+    for (const session of sessions) {
+      if (!session.workspacePath) continue;
+      const deliveryWorktree = deliveryWorktrees.find((item) =>
+        pathsEqual(session.workspacePath, item.marker.canonicalPath),
+      );
+      const isCurrentWorkspace = pathsEqual(session.workspacePath, primaryWorkspacePath);
+      const branch = deliveryWorktree?.marker.branch ?? (isCurrentWorkspace ? gitStatus?.branch : null);
+      if (!branch) continue;
+
+      const selectedDeliveryWorktree = deliveryWorktree &&
+        deliveryWorktree.marker.worktreeId === deliverySelectedWorktreeId;
+      contexts.set(session.id, {
+        workspacePath: session.workspacePath,
+        branch,
+        worktreeName: deliveryWorktree?.marker.branch ?? (isCurrentWorkspace ? gitStatus?.worktree_name ?? null : null),
+        repositorySlug: deliveryWorktree?.marker.repositorySlug ?? null,
+        changedFiles: isCurrentWorkspace ? gitStatus?.changed_files ?? null : null,
+        pullRequest: selectedDeliveryWorktree ? deliveryPullRequest : null,
+        checks: selectedDeliveryWorktree ? deliveryChecks : null,
+        canReview: isCurrentWorkspace,
+      });
+    }
+    return contexts;
+  }, [deliveryChecks, deliveryPullRequest, deliverySelectedWorktreeId, deliveryWorktrees, gitStatus, primaryWorkspacePath, sessions]);
+
+  // Recent chats get the compact primary-modifier hints shown in the
+  // reference UI. Pinned chats stay in their own section and do not consume
+  // the recent-chat number range, so Cmd/Ctrl+2…9 remains stable as the list
+  // is reordered by pinning.
+  const shortcutTargets = useMemo(() => {
+    const targets = new Map<number, string>();
+    let key = 2;
+    for (const row of [...sections.flatMap((section) => section.items), ...pinned]) {
+      if (key > 9 || row.kind !== "local" || row.session.pinned) continue;
+      targets.set(key, row.session.id);
+      key += 1;
+    }
+    return targets;
+  }, [pinned, sections]);
+
+  const shortcutBySessionId = useMemo(() => {
+    const labels = new Map<string, string>();
+    for (const [key, sessionId] of shortcutTargets) {
+      labels.set(sessionId, `${detectShortcutPlatform() === "macos" ? "⌘" : "Ctrl+"}${key}`);
+    }
+    return labels;
+  }, [shortcutTargets]);
+
+  useEffect(() => {
+    const platform = detectShortcutPlatform();
+    const primaryKey = platform === "macos" ? "Meta" : "Control";
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === primaryKey || (platform === "macos" ? event.metaKey : event.ctrlKey)) {
+        setShortcutModifierPressed(true);
+      }
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === primaryKey || !(platform === "macos" ? event.metaKey : event.ctrlKey)) {
+        setShortcutModifierPressed(false);
+      }
+    };
+    const onBlur = () => setShortcutModifierPressed(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+
+  useEffect(() => {
+    const platform = detectShortcutPlatform();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat || event.isComposing || event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target && typeof target.closest === "function" && target.closest("input, textarea, select, [contenteditable=\"true\"]")) return;
+      const primaryPressed = platform === "macos" ? event.metaKey : event.ctrlKey;
+      if (!primaryPressed || event.altKey || event.shiftKey) return;
+      const key = Number(event.key);
+      if (!Number.isInteger(key) || !shortcutTargets.has(key)) return;
+      const sessionId = shortcutTargets.get(key);
+      if (!sessionId) return;
+      event.preventDefault();
+      selectExternal(null);
+      switchSession(sessionId);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectExternal, shortcutTargets, switchSession]);
+
   const startRename = (session: ChatSession) => {
     setRenameValue(session.title);
     setRenamingId(session.id);
@@ -202,9 +427,32 @@ export default function ChatSessionList() {
   }, [renameRequestId]);
 
   const rowClass = (highlighted: boolean) =>
-    `group relative flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1 text-sm ${
+    `group relative flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2.5 py-1 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
       highlighted ? "bg-surface-2 text-foreground" : "hover:bg-surface-2"
     }`;
+
+  const clearPreviewCloseTimer = () => {
+    if (previewCloseTimer.current) clearTimeout(previewCloseTimer.current);
+    previewCloseTimer.current = null;
+  };
+
+  const schedulePreviewClose = () => {
+    clearPreviewCloseTimer();
+    previewCloseTimer.current = setTimeout(() => setPreview(null), 120);
+  };
+
+  const showPreview = (session: ChatSession, target: HTMLElement, gitContext: SessionGitContext | null) => {
+    const anchorRect = target.getBoundingClientRect();
+    setHoveredRow({ sessionId: session.id, anchorRect });
+    if (gitContext) {
+      setPreview(null);
+      return;
+    }
+    const workspacePath = session.workspacePath ?? primaryWorkspacePath;
+    if (!workspacePath) return;
+    clearPreviewCloseTimer();
+    setPreview({ sessionId: session.id, anchorRect });
+  };
 
   const renderRow = (row: SessionRow) => {
     if (row.kind === "external") {
@@ -240,6 +488,13 @@ export default function ChatSessionList() {
     const isActive = session.id === activeSessionId && selectedExternal === null;
     const isRenaming = renamingId === session.id;
     const isMenuOpen = menuOpenId === session.id;
+    const gitContext = sessionGitContexts.get(session.id) ?? null;
+    const shortcutLabel = shortcutBySessionId.get(session.id) ?? null;
+    const workspacePath = session.workspacePath ?? primaryWorkspacePath;
+    const closeMenu = () => {
+      setMenuOpenId(null);
+      setMenuAnchor(null);
+    };
     const open = () => {
       // Opening a local session takes the main pane back from whatever
       // outside conversation was being read.
@@ -253,6 +508,18 @@ export default function ChatSessionList() {
         role="button"
         tabIndex={0}
         onClick={() => !isRenaming && open()}
+        onPointerEnter={(event) => showPreview(session, event.currentTarget, gitContext)}
+        onPointerLeave={() => {
+          setHoveredRow(null);
+          schedulePreviewClose();
+        }}
+        onFocus={(event) => showPreview(session, event.currentTarget, gitContext)}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+            setHoveredRow(null);
+            schedulePreviewClose();
+          }
+        }}
         onKeyDown={(event) => {
           if (isRenaming) return;
           if (event.key === "Enter" || event.key === " ") {
@@ -277,41 +544,102 @@ export default function ChatSessionList() {
             className="w-full rounded-md border border-border bg-surface px-1.5 py-0.5 text-sm text-foreground outline-none focus-visible:border-accent"
           />
         ) : (
-          <span className={`truncate ${session.unread ? "font-semibold" : ""}`}>
-            {row.status && (
-              <StatusMarker status={row.status} label={t(`ChatSessionList.status.${row.status}`)} />
-            )}
-            {row.title}
+          <span className={`min-w-0 flex-1 truncate ${gitContext ? "pr-28" : "pr-20"} ${session.unread ? "font-semibold" : ""}`}>
+            <SessionTitle
+              title={row.title}
+              status={row.status}
+              statusLabel={row.status ? t(`ChatSessionList.status.${row.status}`) : t("ChatSessionList.view.stateIdle")}
+              unread={session.unread}
+            />
           </span>
         )}
 
         {!isRenaming && (
-          <button
-            type="button"
-            onClick={(event) => {
-              event.stopPropagation();
-              if (isMenuOpen) {
-                setMenuOpenId(null);
-              } else {
-                setMenuAnchor(event.currentTarget.getBoundingClientRect());
-                setMenuOpenId(session.id);
-              }
-            }}
-            aria-label={t("ChatSessionList.sessionMenuAriaLabel")}
-            className={`shrink-0 rounded p-0.5 text-faint hover:bg-surface hover:text-foreground ${
-              isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-            }`}
-          >
-            <MoreVertical size={14} />
-          </button>
+          <div className={`absolute right-1 flex items-center gap-0.5 rounded-md pl-0.5 ${
+            gitContext || session.pinned || isMenuOpen ? "bg-surface-2/95" : "group-hover:bg-surface-2/95 group-focus-within:bg-surface-2/95"
+          }`}>
+            {shortcutLabel && !gitContext && shortcutModifierPressed && hoveredRow?.sessionId !== session.id && (
+              <kbd className="mr-0.5 shrink-0 rounded bg-surface px-1 font-mono text-[11px] text-faint">
+                {shortcutLabel}
+              </kbd>
+            )}
+            {gitContext && (
+              <SessionGitBadge
+                session={session}
+                context={gitContext}
+                rowHovered={hoveredRow?.sessionId === session.id}
+                rowAnchorRect={hoveredRow?.sessionId === session.id ? hoveredRow.anchorRect : null}
+              />
+            )}
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                togglePin(session.id);
+                closeMenu();
+              }}
+              aria-label={session.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
+              aria-pressed={session.pinned}
+              title={session.pinned ? t("SessionMenu.unpin") : t("SessionMenu.pin")}
+              className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                session.pinned || isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+              }`}
+            >
+              <Pin size={14} aria-hidden />
+            </button>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                (session.archived ? unarchiveSession : archiveSession)(session.id);
+                closeMenu();
+              }}
+              aria-label={session.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
+              title={session.archived ? t("SessionMenu.unarchive") : t("SessionMenu.archive")}
+              className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+              }`}
+            >
+              {session.archived ? <ArchiveRestore size={14} aria-hidden /> : <Archive size={14} aria-hidden />}
+            </button>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                if (isMenuOpen) {
+                  closeMenu();
+                } else {
+                  setMenuAnchor(event.currentTarget.getBoundingClientRect());
+                  setMenuOpenId(session.id);
+                }
+              }}
+              aria-label={t("ChatSessionList.sessionMenuAriaLabel")}
+              title={t("ChatSessionList.sessionMenuAriaLabel")}
+              className={`inline-flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded text-faint transition-colors duration-150 hover:bg-surface hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                isMenuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100"
+              }`}
+            >
+              <MoreVertical size={14} aria-hidden />
+            </button>
+          </div>
         )}
 
         {isMenuOpen && menuAnchor && (
           <SessionMenu
             session={session}
             anchorRect={menuAnchor}
-            onClose={() => setMenuOpenId(null)}
+            onClose={closeMenu}
             onRename={() => startRename(session)}
+          />
+        )}
+
+        {preview?.sessionId === session.id && workspacePath && (
+          <SessionPreviewCard
+            session={session}
+            workspacePath={workspacePath}
+            anchorRect={preview.anchorRect}
+            onPointerEnter={clearPreviewCloseTimer}
+            onPointerLeave={schedulePreviewClose}
           />
         )}
       </div>
