@@ -236,6 +236,11 @@ describe("allowed-tools and bundled resources", () => {
     expect(mapped.resourceFiles).toEqual(["references/info.md"]);
   });
 
+  it("defaults unmanaged agents skills to Ask", () => {
+    const [mapped] = nativeSkills([nativeDescriptor({ managed: false })]);
+    expect(mapped.activationPolicy).toBe("ask");
+  });
+
   it("lists allowed tools and bundled files in the composed system prompt", () => {
     const restricted: SlashSkill = {
       ...skill("review"),

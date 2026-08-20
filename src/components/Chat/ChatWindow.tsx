@@ -471,6 +471,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     () => [...baseAvailableSkills, ...activePackageAssistants],
     [baseAvailableSkills, activePackageAssistants],
   );
+  const availableSkillsRef = useRef(availableSkills);
+  useEffect(() => {
+    availableSkillsRef.current = availableSkills;
+  }, [availableSkills]);
   const slashCatalog = useMemo<SlashCatalogEntry[]>(
     () => [
       ...BUILT_IN_SLASH_COMMANDS.map((command) => ({
@@ -570,17 +574,29 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     const readyAssistantIds = new Set(
       runtimes.filter((runtime) => runtime.health === "healthy").map((runtime) => runtime.package_id),
     );
-    const parsed = parseSkillTurn(text, [
-      ...baseAvailableSkills,
+    // Native .agents/skills roots are user-editable and may change while this
+    // composer stays open. Freeze the exact current discovery immediately
+    // before parsing the turn so hashes, instructions, and resource paths
+    // all belong to one snapshot.
+    const freshNativeEntries = await nativeSkillsClient.discover();
+    const freshAvailableSkills = [
+      ...localPromptSkills(promptEntries),
+      ...nativeSkills(freshNativeEntries),
+      ...packageSkills(activePackageSkills),
       ...packageAssistantSkills(pluginSnapshots, readyAssistantIds),
+    ];
+    const parsed = parseSkillTurn(text, [
+      ...freshAvailableSkills,
     ]);
+    availableSkillsRef.current = freshAvailableSkills;
+    setActiveNativeSkills(freshNativeEntries);
     setActivePluginSnapshots(pluginSnapshots);
     setPluginRuntimes(runtimes);
     return [
       ...packageRuleInvocations(pluginSnapshots, parsed?.request ?? text.trim()),
       ...(parsed?.invocations ?? []),
     ];
-  }, [baseAvailableSkills]);
+  }, [activePackageSkills, promptEntries]);
 
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
@@ -834,7 +850,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // any skill not already explicitly invoked above — see
     // `settingsStore.skillAutoInvokeEnabled`.
     const messagesBefore = messageCount(sessionId);
-    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkills, ultracode)
+    void runAgentTurn(sessionId, text, pendingAttachments, undefined, undefined, skillInvocations, availableSkillsRef.current, ultracode)
       .catch((err: unknown) => {
         setError(err);
         // A send refused before it was accepted — an unavailable resident
@@ -851,7 +867,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       .finally(() => {
         textareaRef.current?.focus();
       });
-  }, [sessionId, availableSkills]);
+  }, [sessionId]);
 
   const appendCommandNotice = useCallback((command: BuiltInSlashCommandName, text: string, ok = true, targetSessionId = sessionId) => {
     useSessionStore.getState().addMessage(targetSessionId, {

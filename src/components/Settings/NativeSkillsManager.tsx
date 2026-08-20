@@ -41,9 +41,9 @@ const ACTIVATION_POLICIES: Array<{ value: SkillActivationPolicy; label: string }
   { value: "manual", label: "Manual" },
 ];
 
-function SkillPolicySelect({ command, identity }: { command: string; identity: string }) {
+function SkillPolicySelect({ command, identity, defaultPolicy = "automatic" }: { command: string; identity: string; defaultPolicy?: SkillActivationPolicy }) {
   const key = skillActivationPolicyKey("native", command, identity);
-  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key, defaultPolicy));
   const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
   const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
   const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
@@ -123,6 +123,9 @@ export function NativeSkillsManager() {
       // loop installed, so a learned skill is visibly one here rather than
       // only in the learning panel.
       setSkills(await skillLearningClient.discover());
+      // Refresh is also the explicit invalidation point for Chat's frozen
+      // native-skill snapshots, including edits made outside the app.
+      bumpNativeSkills();
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -138,9 +141,6 @@ export function NativeSkillsManager() {
       setPreview(null);
       setPreviewSource(null);
       setGitCandidates(null);
-      // Chat's "/" catalog only refetches on workspace/package changes —
-      // bump so a skill installed/toggled here shows up there immediately.
-      bumpNativeSkills();
       await refresh();
     } catch (reason) {
       setError(errorMessage(reason));
@@ -394,6 +394,7 @@ export function NativeSkillsManager() {
                         <SkillPolicySelect
                           command={skill.command}
                           identity={descriptorPolicyIdentity(skill)}
+                          defaultPolicy={skill.managed ? "automatic" : "ask"}
                         />
                       </span>
                     ))}
@@ -426,6 +427,7 @@ export function NativeSkillsManager() {
                   <SkillPolicySelect
                     command={skill.command}
                     identity={descriptorPolicyIdentity(skill)}
+                    defaultPolicy={skill.managed ? "automatic" : "ask"}
                   />
                   {managed ? (
                     <>

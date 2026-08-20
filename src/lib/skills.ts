@@ -179,14 +179,15 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
-      // The agent loop withholds implicit discovery until hydration completes.
-      // Keep direct data-only callers usable during that boot window; the
-      // runtime gate, not this display mapping, is the fail-closed boundary.
-      activationPolicy: useSkillActivationPolicyStore.getState().hydrated
-        ? skillActivationPolicyFor(skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source)))
-        : "automatic",
+      activationPolicy: (() => {
+        const policyKey = skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source));
+        const state = useSkillActivationPolicyStore.getState();
+        return state.hydrated
+          ? skillActivationPolicyFor(policyKey, entry.managed ? "automatic" : "ask")
+          : entry.managed ? "automatic" : "ask";
+      })(),
       policyKey: skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source)),
-      sourcePath: entry.source.kind === "workspace" ? entry.source.path : undefined,
+      sourcePath: entry.source.kind === "signed_package" ? undefined : entry.source.path,
       allowedTools: entry.allowed_tools,
       resourceFiles: entry.resource_files,
     }));

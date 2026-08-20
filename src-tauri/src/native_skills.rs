@@ -706,6 +706,38 @@ impl NativeSkillManager {
         relative_path: &str,
         primary_workspace: Option<&Path>,
     ) -> Result<String, SkillError> {
+        self.read_resource_with_snapshot(command, relative_path, primary_workspace, None, None)
+    }
+
+    /// Reads a resource only when the command still resolves to the exact
+    /// source folder and content hash that the frontend froze at invocation.
+    /// This is the trust boundary for mutable external `.agents/skills` roots.
+    pub fn read_resource_at_snapshot(
+        &self,
+        command: &str,
+        relative_path: &str,
+        primary_workspace: Option<&Path>,
+        expected_sha256: &str,
+        expected_source_path: &Path,
+    ) -> Result<String, SkillError> {
+        validate_sha256(expected_sha256, "expected skill digest")?;
+        self.read_resource_with_snapshot(
+            command,
+            relative_path,
+            primary_workspace,
+            Some(expected_sha256),
+            Some(expected_source_path),
+        )
+    }
+
+    fn read_resource_with_snapshot(
+        &self,
+        command: &str,
+        relative_path: &str,
+        primary_workspace: Option<&Path>,
+        expected_sha256: Option<&str>,
+        expected_source_path: Option<&Path>,
+    ) -> Result<String, SkillError> {
         let _guard = self.lock()?;
         let command = validate_command(command)?;
         let mut candidate_roots = vec![(self.global_root.clone(), true)];
@@ -722,6 +754,7 @@ impl NativeSkillManager {
             }
         }
         let mut skill_dir = None;
+        let mut source_mismatch = false;
         for (root, managed_root) in candidate_roots {
             if managed_root
                 && load_state(&root)?
@@ -735,12 +768,29 @@ impl NativeSkillManager {
             if fs::symlink_metadata(&candidate)
                 .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
             {
+                if let Some(expected_source_path) = expected_source_path {
+                    let current_source = fs::canonicalize(&candidate)
+                        .map_err(|error| io_at("canonicalize skill source", &candidate, error))?;
+                    let expected_source = fs::canonicalize(expected_source_path).map_err(|error| {
+                        io_at("canonicalize expected skill source", expected_source_path, error)
+                    })?;
+                    if current_source != expected_source {
+                        source_mismatch = true;
+                        continue;
+                    }
+                }
                 skill_dir = Some(candidate);
                 break;
             }
         }
         let skill_dir = skill_dir
-            .ok_or_else(|| SkillError::NotFound(format!("no skill installed at /{command}")))?;
+            .ok_or_else(|| {
+                if source_mismatch {
+                    SkillError::Conflict(format!("/{command} resolved to a different skill source after invocation"))
+                } else {
+                    SkillError::NotFound(format!("no skill installed at /{command}"))
+                }
+            })?;
         let relative = validate_relative_subdirectory(relative_path)?;
         if relative == Path::new("SKILL.md") {
             return Err(SkillError::Invalid(
@@ -749,6 +799,13 @@ impl NativeSkillManager {
             ));
         }
         let scanned = scan_skill_folder(&skill_dir)?;
+        if let Some(expected_sha256) = expected_sha256 {
+            if scanned.sha256 != expected_sha256 {
+                return Err(SkillError::Conflict(format!(
+                    "/{command} changed after invocation; refusing to read a resource from a different snapshot"
+                )));
+            }
+        }
         let file = scanned
             .files
             .iter()
@@ -4002,10 +4059,37 @@ esac
                 true,
             )
             .unwrap();
+        let descriptor = manager
+            .discover(None, &[])
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.command == "summarize")
+            .unwrap();
+        let source_path = match descriptor.source {
+            SkillSource::Global { path } => path,
+            _ => panic!("expected global source"),
+        };
         let contents = manager
-            .read_resource("summarize", "references/info.md", None)
+            .read_resource_at_snapshot(
+                "summarize",
+                "references/info.md",
+                None,
+                &descriptor.sha256,
+                Path::new(&source_path),
+            )
             .unwrap();
         assert_eq!(contents, "reference");
+        fs::write(Path::new(&source_path).join("references/info.md"), "changed").unwrap();
+        assert!(matches!(
+            manager.read_resource_at_snapshot(
+                "summarize",
+                "references/info.md",
+                None,
+                &descriptor.sha256,
+                Path::new(&source_path),
+            ),
+            Err(SkillError::Conflict(_))
+        ));
     }
 
     #[test]
