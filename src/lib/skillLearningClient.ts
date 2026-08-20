@@ -322,8 +322,10 @@ export const skillLearningClient = {
    * the ledger does not carry. */
   detect: (runId: string, userText: string, scope: NativeSkillScope) =>
     invoke<LearningCandidate | null>("skill_learning_detect", { runId, userText, scope }),
-  capture: (runId: string, userText: string, scope: NativeSkillScope) =>
-    invoke<LearningCandidate>("skill_learning_capture", { runId, userText, scope }),
+  captureEligibility: (runId: string, userText: string) =>
+    invoke<NativeSkillScope | null>("skill_learning_capture_eligibility", { runId, userText }),
+  capture: (runId: string, userText: string) =>
+    invoke<LearningCandidate>("skill_learning_capture", { runId, userText }),
   listCandidates: () => invoke<LearningCandidate[]>("skill_learning_list_candidates"),
   candidate: (candidateId: string) => invoke<LearningCandidate>("skill_learning_candidate", { candidateId }),
   beginReflection: (candidateId: string) =>

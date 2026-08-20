@@ -37,8 +37,7 @@ import {
   type InvokedSkillUse,
   type ReflectionCall,
 } from './skillLearning';
-import { cachedLearningMode } from './skillLearningClient';
-import type { NativeSkillScope } from './nativeSkillsClient';
+import { cachedLearningMode, skillLearningClient } from './skillLearningClient';
 import { mcpToolDefs } from './mcpTools';
 import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
@@ -2349,17 +2348,20 @@ async function runTurnGuarded(
       // succeeded must never surface a learning failure as its own.
       await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
       if (cleanlyCompleted) {
-        const scope: NativeSkillScope =
-          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
-        useSessionStore.getState().addMessage(sessionId, {
-          role: 'system',
-          content: formatSaveSkillNotice({
-            runId: durable.recorder.runId,
-            userText,
-            scope,
-          }),
-        });
-        if (durable.reflect !== null) {
+        const scope = await skillLearningClient
+          .captureEligibility(durable.recorder.runId, userText)
+          .catch(() => null);
+        if (scope) {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatSaveSkillNotice({
+              runId: durable.recorder.runId,
+              userText,
+              scope,
+            }),
+          });
+        }
+        if (scope && durable.reflect !== null) {
           const candidate = await learnFromFinishedRun(
             durable.recorder.runId,
             userText,

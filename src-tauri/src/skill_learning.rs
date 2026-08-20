@@ -1313,6 +1313,16 @@ impl Default for StoreState {
     }
 }
 
+fn capture_is_eligible(state: &StoreState, evidence: &RunEvidence, scope: SkillScope) -> bool {
+    (scope != SkillScope::Global || state.allow_global_scope)
+        && evidence.completed
+        && !evidence.failed
+        && evidence
+            .successful_tools()
+            .iter()
+            .any(|call| !call.event_id.is_empty())
+}
+
 /// Durable, backend-owned learning store. Authoritative state lives on disk;
 /// no learning state is ever authoritative in a frontend store.
 pub struct SkillLearningStore {
@@ -1466,6 +1476,19 @@ impl SkillLearningStore {
             .collect())
     }
 
+    /// Whether an explicit save affordance should be shown for this run.
+    /// Automatic learning mode is deliberately not part of this decision:
+    /// explicit capture remains available when automatic learning is off.
+    pub fn capture_eligibility(
+        &self,
+        evidence: &RunEvidence,
+        scope: SkillScope,
+    ) -> Result<bool, SkillError> {
+        let _guard = self.lock()?;
+        let state = self.load()?;
+        Ok(capture_is_eligible(&state, evidence, scope))
+    }
+
     /// Records the run's failure signatures and, when the deterministic rules
     /// fire, opens a `detected` candidate bound to that evidence. Returns
     /// `None` in `Off` mode and for any run without qualifying evidence.
@@ -1600,12 +1623,7 @@ impl SkillLearningStore {
     ) -> Result<LearningCandidate, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
-        if scope == SkillScope::Global && !state.allow_global_scope {
-            return Err(SkillError::Conflict(
-                "global-scope learning is turned off in the learning settings".to_string(),
-            ));
-        }
-        if !evidence.completed || evidence.failed || evidence.successful_tools().is_empty() {
+        if !capture_is_eligible(&state, evidence, scope) {
             return Err(SkillError::Conflict(
                 "this run has no completed successful tool evidence to save as a skill".to_string(),
             ));
@@ -1738,6 +1756,51 @@ impl SkillLearningStore {
         workspace: Option<&Path>,
         signed_packages: &[crate::native_skills::ExternalSignedSkill],
     ) -> Result<LearningCandidate, SkillError> {
+        self.propose_internal(
+            candidate_id,
+            reflection_run_id,
+            proposal,
+            manager,
+            workspace,
+            signed_packages,
+            false,
+        )
+    }
+
+    /// Stages an edit made by the user in Settings. Scope changes are allowed
+    /// here because the review UI is the explicit authorization boundary; the
+    /// model-facing learning tool continues through `propose`, which keeps the
+    /// signal's original scope locked.
+    pub fn propose_user_edit(
+        &self,
+        candidate_id: &str,
+        reflection_run_id: Option<&str>,
+        proposal: &CandidateProposal,
+        manager: &NativeSkillManager,
+        workspace: Option<&Path>,
+        signed_packages: &[crate::native_skills::ExternalSignedSkill],
+    ) -> Result<LearningCandidate, SkillError> {
+        self.propose_internal(
+            candidate_id,
+            reflection_run_id,
+            proposal,
+            manager,
+            workspace,
+            signed_packages,
+            true,
+        )
+    }
+
+    fn propose_internal(
+        &self,
+        candidate_id: &str,
+        reflection_run_id: Option<&str>,
+        proposal: &CandidateProposal,
+        manager: &NativeSkillManager,
+        workspace: Option<&Path>,
+        signed_packages: &[crate::native_skills::ExternalSignedSkill],
+        allow_scope_change: bool,
+    ) -> Result<LearningCandidate, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
         let existing = candidate_of(&state, candidate_id)?;
@@ -1748,7 +1811,12 @@ impl SkillLearningStore {
                 "learning is turned off; no candidate can be staged".to_string(),
             ));
         }
-        if proposal.scope == SkillScope::Global && !state.allow_global_scope {
+        let scope = if allow_scope_change {
+            proposal.scope
+        } else {
+            existing.scope
+        };
+        if scope == SkillScope::Global && !state.allow_global_scope {
             return Err(SkillError::Conflict(
                 "global-scope learning is turned off in the learning settings".to_string(),
             ));
@@ -1765,8 +1833,9 @@ impl SkillLearningStore {
                 existing.status
             )));
         }
-        let scope = existing.scope;
-        let workspace = self.workspace_for(existing, workspace)?;
+        let mut scoped_existing = existing.clone();
+        scoped_existing.scope = scope;
+        let workspace = self.workspace_for(&scoped_existing, workspace)?;
         let validated = validate_proposal(proposal, scope)?;
 
         let descriptors = manager.discover(workspace.as_deref(), signed_packages)?;
@@ -1784,6 +1853,7 @@ impl SkillLearningStore {
             })?;
 
         let candidate = candidate_mut(&mut state, candidate_id)?;
+        candidate.scope = scope;
         candidate.title = validated.title.clone();
         candidate.description = validated.description.clone();
         candidate.proposed_command = validated.command.clone();
@@ -1797,6 +1867,9 @@ impl SkillLearningStore {
         candidate.staging_path = Some(staging.to_string_lossy().to_string());
         candidate.dedup = Some(dedup);
         candidate.dedup_detail = dedup_detail;
+        candidate.evaluation_verdict = None;
+        candidate.evaluation_summary = None;
+        candidate.approval_id = None;
         candidate.status = CandidateStatus::Staged;
         candidate.updated_at_unix_ms = now_unix_ms();
         if let Some(run_id) = reflection_run_id {
@@ -4845,6 +4918,9 @@ mod tests {
             "remember this procedure and make this reusable",
             &events,
         );
+        assert!(!store
+            .capture_eligibility(&evidence, SkillScope::Global)
+            .unwrap());
         assert!(store
             .detect(&evidence, SkillScope::Global, None)
             .unwrap()

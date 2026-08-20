@@ -1068,7 +1068,7 @@ const SaveSkillRow = memo(function SaveSkillRow({
     setBusy(true);
     setError(null);
     try {
-      const candidate = await skillLearningClient.capture(notice.runId, notice.userText, notice.scope);
+      const candidate = await skillLearningClient.capture(notice.runId, notice.userText);
       if (candidate.status === "detected" || candidate.status === "reflecting") {
         const outcome = await draftCandidate(candidate.candidate_id);
         if (outcome.error) throw new Error(outcome.error);

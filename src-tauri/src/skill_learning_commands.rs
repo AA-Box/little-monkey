@@ -152,6 +152,35 @@ pub async fn skill_learning_detect(
     run_blocking(move || store.detect(&evidence, scope, workspace.as_deref())).await
 }
 
+/// Returns the immutable scope of a run when its durable evidence is enough
+/// for an explicit skill capture. `None` means the UI should not render the
+/// save affordance.
+#[tauri::command]
+pub async fn skill_learning_capture_eligibility(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    run_id: String,
+    user_text: String,
+) -> Result<Option<SkillScope>, String> {
+    let Some(evidence) = run_evidence(&app, &state, &run_id, &user_text) else {
+        return Ok(None);
+    };
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    let scope = if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    };
+    let store = learning.store.clone();
+    run_blocking(move || {
+        store
+            .capture_eligibility(&evidence, scope)
+            .map(|eligible| eligible.then_some(scope))
+    })
+    .await
+}
+
 /// Explicitly saves a completed run as a candidate. Unlike detection, this
 /// command is user-directed and therefore remains available in `Off` mode;
 /// the backend still reconstructs and validates the run from its own ledger.
@@ -163,10 +192,14 @@ pub async fn skill_learning_capture(
     learning: tauri::State<'_, SkillLearningCommandState>,
     run_id: String,
     user_text: String,
-    scope: SkillScope,
 ) -> Result<LearningCandidate, String> {
     require_main_window(&window)?;
     let workspace = workspace_for_run(&app, &state, &run_id)?;
+    let scope = if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    };
     let evidence = run_evidence(&app, &state, &run_id, &user_text).ok_or_else(|| {
         "the completed run has no durable evidence to save as a skill".to_string()
     })?;
@@ -203,6 +236,7 @@ pub async fn skill_learning_begin_reflection(
 /// Stages (or re-stages, for "Edit before install") a candidate's package.
 #[tauri::command]
 pub async fn skill_learning_stage(
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
     native: tauri::State<'_, NativeSkillsCommandState>,
     m4: tauri::State<'_, M4CommandState>,
@@ -211,12 +245,13 @@ pub async fn skill_learning_stage(
     proposal: CandidateProposal,
     run_id: Option<String>,
 ) -> Result<LearningCandidate, String> {
+    require_main_window(&window)?;
     let workspace = optional_primary_workspace(&state)?;
     let packages = signed_package_skills(&m4)?;
     let manager = native.manager.clone();
     let store = learning.store.clone();
     run_blocking(move || {
-        store.propose(
+        store.propose_user_edit(
             &candidate_id,
             run_id.as_deref(),
             &proposal,

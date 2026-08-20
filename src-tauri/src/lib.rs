@@ -1597,6 +1597,7 @@ pub fn run() {
             skill_learning_commands::skill_learning_mode,
             skill_learning_commands::skill_learning_set_mode,
             skill_learning_commands::skill_learning_detect,
+            skill_learning_commands::skill_learning_capture_eligibility,
             skill_learning_commands::skill_learning_capture,
             skill_learning_commands::skill_learning_list_candidates,
             skill_learning_commands::skill_learning_candidate,

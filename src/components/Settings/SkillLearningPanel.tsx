@@ -21,7 +21,7 @@ import {
   type LearningSettings,
   type LearningSourceKind,
 } from "../../lib/skillLearningClient";
-import { nativeSkillsClient } from "../../lib/nativeSkillsClient";
+import { nativeSkillsClient, type NativeSkillScope } from "../../lib/nativeSkillsClient";
 import { runCandidateEvaluation } from "../../lib/skillLearningEval";
 import { draftCandidate } from "../../lib/skillLearningReflection";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
@@ -69,6 +69,7 @@ function shortHash(value: string | null | undefined): string {
 
 type CandidateDraft = {
   id: string;
+  scope: NativeSkillScope;
   title: string;
   description: string;
   command: string;
@@ -92,6 +93,7 @@ function parseList(value: string): string[] {
 function candidateDraft(candidate: LearningCandidate): CandidateDraft {
   return {
     id: candidate.candidate_id,
+    scope: candidate.scope,
     title: candidate.title,
     description: candidate.description,
     command: candidate.proposed_command,
@@ -363,6 +365,36 @@ export function SkillLearningPanel() {
                             />
                           </label>
                         </div>
+                        <fieldset className="flex flex-col gap-1">
+                          <legend className="text-faint">Scope</legend>
+                          <div className="flex flex-wrap gap-3 text-xs text-muted">
+                            <label className="flex items-center gap-1.5">
+                              <input
+                                type="radio"
+                                name={`skill-scope-${candidate.candidate_id}`}
+                                checked={draft.scope === "workspace"}
+                                disabled={!candidate.workspace_path}
+                                onChange={() => setDraft({ ...draft, scope: "workspace" })}
+                              />
+                              This workspace
+                            </label>
+                            <label className="flex items-center gap-1.5">
+                              <input
+                                type="radio"
+                                name={`skill-scope-${candidate.candidate_id}`}
+                                checked={draft.scope === "global"}
+                                disabled={!settings.allow_global_scope}
+                                onChange={() => setDraft({ ...draft, scope: "global" })}
+                              />
+                              Global
+                            </label>
+                          </div>
+                          <span className="text-faint">
+                            {candidate.workspace_path
+                              ? "This workspace uses the folder recorded by the original run."
+                              : "This run has no recorded workspace, so only global scope is available."}
+                          </span>
+                        </fieldset>
                         <label className="flex flex-col gap-1">
                           <span className="text-faint">Trigger description</span>
                           <textarea
@@ -464,7 +496,7 @@ export function SkillLearningPanel() {
                       onClick={() =>
                         void run(`edit:${candidate.candidate_id}`, async () => {
                           await skillLearningClient.stage(candidate.candidate_id, {
-                            scope: candidate.scope,
+                            scope: draft.scope,
                             title: draft.title,
                             description: draft.description,
                             proposed_command: draft.command,
@@ -499,7 +531,7 @@ export function SkillLearningPanel() {
                   <Button
                     variant="secondary"
                     size="sm"
-                    disabled={busy !== null || !candidate.candidate_sha256}
+                    disabled={busy !== null || editing || !candidate.candidate_sha256}
                     onClick={() =>
                       void run(`promote:${candidate.candidate_id}`, async () => {
                         const outcome = await skillLearningClient.promote(candidate.candidate_id);
