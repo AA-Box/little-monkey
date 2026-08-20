@@ -222,6 +222,7 @@ pub enum CandidateStatus {
 #[serde(rename_all = "snake_case")]
 pub enum LearningSourceKind {
     ExplicitUserInstruction,
+    ManualRunCapture,
     UserCorrection,
     VerificationRepair,
     SuccessfulNovelProcedure,
@@ -232,6 +233,7 @@ impl LearningSourceKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::ExplicitUserInstruction => "explicit_user_instruction",
+            Self::ManualRunCapture => "manual_run_capture",
             Self::UserCorrection => "user_correction",
             Self::VerificationRepair => "verification_repair",
             Self::SuccessfulNovelProcedure => "successful_novel_procedure",
@@ -1311,6 +1313,16 @@ impl Default for StoreState {
     }
 }
 
+fn capture_is_eligible(state: &StoreState, evidence: &RunEvidence, scope: SkillScope) -> bool {
+    (scope != SkillScope::Global || state.allow_global_scope)
+        && evidence.completed
+        && !evidence.failed
+        && evidence
+            .successful_tools()
+            .iter()
+            .any(|call| !call.event_id.is_empty())
+}
+
 /// Durable, backend-owned learning store. Authoritative state lives on disk;
 /// no learning state is ever authoritative in a frontend store.
 pub struct SkillLearningStore {
@@ -1337,6 +1349,17 @@ pub enum PromotionOutcome {
         candidate: LearningCandidate,
         reasons: Vec<String>,
     },
+}
+
+/// What an explicit save request found in the durable candidate history.
+/// Terminal rejected/superseded/rolled-back candidates do not block a fresh
+/// capture from the same immutable run; a currently promoted candidate does.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum CaptureOutcome {
+    Created { candidate: LearningCandidate },
+    Existing { candidate: LearningCandidate },
+    AlreadyInstalled { candidate: LearningCandidate },
 }
 
 impl SkillLearningStore {
@@ -1464,6 +1487,19 @@ impl SkillLearningStore {
             .collect())
     }
 
+    /// Whether an explicit save affordance should be shown for this run.
+    /// Automatic learning mode is deliberately not part of this decision:
+    /// explicit capture remains available when automatic learning is off.
+    pub fn capture_eligibility(
+        &self,
+        evidence: &RunEvidence,
+        scope: SkillScope,
+    ) -> Result<bool, SkillError> {
+        let _guard = self.lock()?;
+        let state = self.load()?;
+        Ok(capture_is_eligible(&state, evidence, scope))
+    }
+
     /// Records the run's failure signatures and, when the deterministic rules
     /// fire, opens a `detected` candidate bound to that evidence. Returns
     /// `None` in `Off` mode and for any run without qualifying evidence.
@@ -1586,6 +1622,138 @@ impl SkillLearningStore {
         Ok(Some(candidate))
     }
 
+    /// Opens a candidate from an explicit user action. This is intentionally
+    /// separate from `detect`: saving a run is a direct request and must work
+    /// even when automatic learning is off, but it still requires durable,
+    /// successful tool evidence and the configured scope permission.
+    pub fn capture_run(
+        &self,
+        evidence: &RunEvidence,
+        scope: SkillScope,
+        workspace: Option<&Path>,
+    ) -> Result<CaptureOutcome, SkillError> {
+        let _guard = self.lock()?;
+        let mut state = self.load()?;
+        if !capture_is_eligible(&state, evidence, scope) {
+            return Err(SkillError::Conflict(
+                "this run has no completed successful tool evidence to save as a skill".to_string(),
+            ));
+        }
+        if let Some(existing) = state
+            .candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .source_run_ids
+                    .iter()
+                    .any(|id| id == &evidence.run_id)
+            })
+            .filter(|candidate| candidate.status == CandidateStatus::Promoted)
+            .max_by_key(|candidate| (candidate.updated_at_unix_ms, candidate.candidate_id.clone()))
+        {
+            return Ok(CaptureOutcome::AlreadyInstalled {
+                candidate: existing.clone(),
+            });
+        }
+        let existing_id = state
+            .candidates
+            .values()
+            .filter(|candidate| {
+                candidate
+                    .source_run_ids
+                    .iter()
+                    .any(|id| id == &evidence.run_id)
+                    && matches!(
+                        candidate.status,
+                        CandidateStatus::Detected
+                            | CandidateStatus::Reflecting
+                            | CandidateStatus::Staged
+                            | CandidateStatus::Evaluating
+                            | CandidateStatus::AwaitingApproval
+                    )
+            })
+            .max_by_key(|candidate| (candidate.updated_at_unix_ms, candidate.candidate_id.clone()))
+            .map(|candidate| candidate.candidate_id.clone());
+        if let Some(existing_id) = existing_id {
+            let existing = candidate_mut(&mut state, &existing_id)?;
+            if matches!(
+                existing.status,
+                CandidateStatus::Detected | CandidateStatus::Reflecting
+            ) {
+                existing.source_kind = LearningSourceKind::ManualRunCapture;
+                existing.signal_summary =
+                    "You explicitly saved this completed run as a reusable skill.".to_string();
+                existing.updated_at_unix_ms = now_unix_ms();
+            }
+            let updated = existing.clone();
+            self.save(&state)?;
+            return Ok(CaptureOutcome::Existing { candidate: updated });
+        }
+
+        let now = now_unix_ms();
+        let mut source_event_ids = evidence
+            .tool_calls
+            .iter()
+            .map(|call| call.event_id.clone())
+            .chain(
+                evidence
+                    .verifications
+                    .iter()
+                    .map(|entry| entry.event_id.clone()),
+            )
+            .collect::<Vec<_>>();
+        source_event_ids.truncate(MAX_SOURCE_EVENTS);
+        let candidate = LearningCandidate {
+            candidate_id: format!("learn-{}", Uuid::new_v4().simple()),
+            scope,
+            status: CandidateStatus::Detected,
+            title: String::new(),
+            description: String::new(),
+            source_run_ids: vec![evidence.run_id.clone()],
+            source_event_ids,
+            source_kind: LearningSourceKind::ManualRunCapture,
+            signal_summary: "You explicitly saved this completed run as a reusable skill."
+                .to_string(),
+            proposed_command: String::new(),
+            proposed_skill_content: String::new(),
+            proposed_resource_files: Vec::new(),
+            allowed_tools: Vec::new(),
+            requirements: CandidateRequirements::default(),
+            parent_skill_sha256: None,
+            candidate_sha256: String::new(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            evaluation_summary: None,
+            evaluation_ids: Vec::new(),
+            evaluation_verdict: None,
+            approval_digest: None,
+            installed_sha256: None,
+            dedup: None,
+            dedup_detail: None,
+            policy: None,
+            rejection_reason: None,
+            staging_path: None,
+            workspace_path: workspace.map(|path| path.to_string_lossy().to_string()),
+            observed_prompt: evidence.user_text.clone(),
+            observed_tools: evidence
+                .successful_tools()
+                .iter()
+                .map(|call| call.tool_name.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            evidence: Some(bounded_evidence(evidence)),
+            correction: None,
+            approval_id: None,
+        };
+        prune_candidates(&mut state);
+        state
+            .candidates
+            .insert(candidate.candidate_id.clone(), candidate.clone());
+        self.save(&state)?;
+        Ok(CaptureOutcome::Created { candidate })
+    }
+
     /// Marks a detected candidate as being reflected on. Idempotent, so a
     /// crash between this and `propose` leaves a resumable candidate rather
     /// than a stuck one.
@@ -1624,19 +1792,71 @@ impl SkillLearningStore {
         workspace: Option<&Path>,
         signed_packages: &[crate::native_skills::ExternalSignedSkill],
     ) -> Result<LearningCandidate, SkillError> {
+        self.propose_internal(
+            candidate_id,
+            reflection_run_id,
+            proposal,
+            manager,
+            workspace,
+            signed_packages,
+            false,
+        )
+    }
+
+    /// Stages an edit made by the user in Settings. Scope changes are allowed
+    /// here because the review UI is the explicit authorization boundary; the
+    /// model-facing learning tool continues through `propose`, which keeps the
+    /// signal's original scope locked.
+    pub fn propose_user_edit(
+        &self,
+        candidate_id: &str,
+        reflection_run_id: Option<&str>,
+        proposal: &CandidateProposal,
+        manager: &NativeSkillManager,
+        workspace: Option<&Path>,
+        signed_packages: &[crate::native_skills::ExternalSignedSkill],
+    ) -> Result<LearningCandidate, SkillError> {
+        self.propose_internal(
+            candidate_id,
+            reflection_run_id,
+            proposal,
+            manager,
+            workspace,
+            signed_packages,
+            true,
+        )
+    }
+
+    fn propose_internal(
+        &self,
+        candidate_id: &str,
+        reflection_run_id: Option<&str>,
+        proposal: &CandidateProposal,
+        manager: &NativeSkillManager,
+        workspace: Option<&Path>,
+        signed_packages: &[crate::native_skills::ExternalSignedSkill],
+        allow_scope_change: bool,
+    ) -> Result<LearningCandidate, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
-        if state.mode == LearningMode::Off {
+        let existing = candidate_of(&state, candidate_id)?;
+        if state.mode == LearningMode::Off
+            && existing.source_kind != LearningSourceKind::ManualRunCapture
+        {
             return Err(SkillError::Conflict(
                 "learning is turned off; no candidate can be staged".to_string(),
             ));
         }
-        if proposal.scope == SkillScope::Global && !state.allow_global_scope {
+        let scope = if allow_scope_change {
+            proposal.scope
+        } else {
+            existing.scope
+        };
+        if scope == SkillScope::Global && !state.allow_global_scope {
             return Err(SkillError::Conflict(
                 "global-scope learning is turned off in the learning settings".to_string(),
             ));
         }
-        let existing = candidate_of(&state, candidate_id)?;
         if !matches!(
             existing.status,
             CandidateStatus::Detected
@@ -1649,8 +1869,9 @@ impl SkillLearningStore {
                 existing.status
             )));
         }
-        let scope = existing.scope;
-        let workspace = self.workspace_for(existing, workspace)?;
+        let mut scoped_existing = existing.clone();
+        scoped_existing.scope = scope;
+        let workspace = self.workspace_for(&scoped_existing, workspace)?;
         let validated = validate_proposal(proposal, scope)?;
 
         let descriptors = manager.discover(workspace.as_deref(), signed_packages)?;
@@ -1668,6 +1889,7 @@ impl SkillLearningStore {
             })?;
 
         let candidate = candidate_mut(&mut state, candidate_id)?;
+        candidate.scope = scope;
         candidate.title = validated.title.clone();
         candidate.description = validated.description.clone();
         candidate.proposed_command = validated.command.clone();
@@ -1681,6 +1903,10 @@ impl SkillLearningStore {
         candidate.staging_path = Some(staging.to_string_lossy().to_string());
         candidate.dedup = Some(dedup);
         candidate.dedup_detail = dedup_detail;
+        candidate.evaluation_ids.clear();
+        candidate.evaluation_verdict = None;
+        candidate.evaluation_summary = None;
+        candidate.approval_id = None;
         candidate.status = CandidateStatus::Staged;
         candidate.updated_at_unix_ms = now_unix_ms();
         if let Some(run_id) = reflection_run_id {
@@ -4675,6 +4901,57 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_capture_works_when_automatic_learning_is_off() {
+        let directory = TestDirectory::new("capture-off");
+        let store = store(&directory);
+        store.set_mode(LearningMode::Off).unwrap();
+        let evidence = evidence_from_events(
+            "run-1",
+            "make the retry procedure reusable",
+            &verified_procedure_events(),
+        );
+
+        let candidate = match store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap()
+        {
+            CaptureOutcome::Created { candidate } => candidate,
+            outcome => panic!("expected a new capture, got {outcome:?}"),
+        };
+        assert_eq!(candidate.source_kind, LearningSourceKind::ManualRunCapture);
+        assert_eq!(candidate.status, CandidateStatus::Detected);
+        let existing = store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap();
+        assert!(matches!(
+            existing,
+            CaptureOutcome::Existing { candidate: ref same }
+                if same.candidate_id == candidate.candidate_id
+        ));
+
+        store.reject(&candidate.candidate_id, "try again").unwrap();
+        let recaptured = match store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap()
+        {
+            CaptureOutcome::Created { candidate } => candidate,
+            outcome => panic!("expected a fresh capture after rejection, got {outcome:?}"),
+        };
+        assert_ne!(recaptured.candidate_id, candidate.candidate_id);
+
+        let mut state = store.load().unwrap();
+        let installed = state.candidates.get_mut(&recaptured.candidate_id).unwrap();
+        installed.status = CandidateStatus::Promoted;
+        installed.proposed_command = "retry-wrapper".to_string();
+        store.save(&state).unwrap();
+        assert!(matches!(
+            store.capture_run(&evidence, SkillScope::Global, None).unwrap(),
+            CaptureOutcome::AlreadyInstalled { candidate: ref same }
+                if same.candidate_id == recaptured.candidate_id
+        ));
+    }
+
+    #[test]
     fn a_conversational_turn_produces_no_candidate() {
         let directory = TestDirectory::new("no-evidence");
         let store = store(&directory);
@@ -4704,6 +4981,9 @@ mod tests {
             "remember this procedure and make this reusable",
             &events,
         );
+        assert!(!store
+            .capture_eligibility(&evidence, SkillScope::Global)
+            .unwrap());
         assert!(store
             .detect(&evidence, SkillScope::Global, None)
             .unwrap()
@@ -6029,6 +6309,14 @@ mod tests {
             &detected.candidate_id,
             &proposal("retry-wrapper", "Version the user read and approved."),
         );
+        pass_evaluation(&store, &detected.candidate_id);
+        let old_evaluation_id = store
+            .candidate(&detected.candidate_id)
+            .unwrap()
+            .evaluation_ids
+            .first()
+            .cloned()
+            .expect("initial evaluation is attached to the candidate");
         // The user approves what they were shown…
         let grant = approve(&store, &detected.candidate_id);
         // …and then the candidate is edited and re-staged.
@@ -6041,6 +6329,9 @@ mod tests {
                 "Something else entirely, added afterwards.",
             ),
         );
+        let restaged = store.candidate(&detected.candidate_id).unwrap();
+        assert!(restaged.evaluation_ids.is_empty());
+        assert!(store.evaluation(&old_evaluation_id).is_ok());
         let outcome = store
             .promote(&detected.candidate_id, Some(&grant), false, &manager, None)
             .unwrap();

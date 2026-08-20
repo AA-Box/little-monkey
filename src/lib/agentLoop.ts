@@ -31,13 +31,14 @@ import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, REA
 import {
   candidateNotice,
   finalizeLearningForRun,
+  formatSaveSkillNotice,
   formatLearningNotice,
   learnFromFinishedRun,
+  selectFinishedRunNotice,
   type InvokedSkillUse,
   type ReflectionCall,
 } from './skillLearning';
-import { cachedLearningMode } from './skillLearningClient';
-import type { NativeSkillScope } from './nativeSkillsClient';
+import { cachedLearningMode, skillLearningClient } from './skillLearningClient';
 import { mcpToolDefs } from './mcpTools';
 import { executableExtensionToolDefs } from './executableExtensionTools';
 import { isVisionCapableLocalModel, isVisionCapableOllamaModel, isVisionCapableProviderModel } from './visionModels';
@@ -2347,20 +2348,38 @@ async function runTurnGuarded(
       // can be a candidate. Everything is best-effort — a turn that already
       // succeeded must never surface a learning failure as its own.
       await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
-      if (cleanlyCompleted && durable.reflect !== null) {
-        const scope: NativeSkillScope =
-          primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
-        const candidate = await learnFromFinishedRun(
-          durable.recorder.runId,
-          userText,
-          scope,
-          durable.reflect,
-          signal,
-        );
-        if (candidate) {
+      if (cleanlyCompleted) {
+        const runScope = await skillLearningClient
+          .scopeForRun(durable.recorder.runId)
+          .catch(() => null);
+        const candidate = runScope && durable.reflect !== null
+          ? await learnFromFinishedRun(
+              durable.recorder.runId,
+              userText,
+              runScope,
+              durable.reflect,
+              signal,
+            )
+          : null;
+        const captureScope = candidate
+          ? null
+          : await skillLearningClient
+              .captureEligibility(durable.recorder.runId, userText)
+              .catch(() => null);
+        const notice = selectFinishedRunNotice(candidate, captureScope);
+        if (notice?.kind === 'learning') {
           useSessionStore.getState().addMessage(sessionId, {
             role: 'system',
-            content: formatLearningNotice(candidateNotice(candidate)),
+            content: formatLearningNotice(candidateNotice(notice.candidate)),
+          });
+        } else if (notice?.kind === 'save') {
+          useSessionStore.getState().addMessage(sessionId, {
+            role: 'system',
+            content: formatSaveSkillNotice({
+              runId: durable.recorder.runId,
+              userText,
+              scope: notice.scope,
+            }),
           });
         }
       }

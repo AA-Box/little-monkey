@@ -18,6 +18,7 @@ import type { ChatMessage, ToolCall } from "./llamaClient";
 import { MANAGE_SKILL_LEARNING_TOOL } from "./tools";
 import {
   skillLearningClient,
+  type CaptureOutcome,
   type LearningCandidate,
   type LearningMode,
   type LearningSourceKind,
@@ -45,6 +46,7 @@ export type ReflectionCall = (
 /** Why the app opened a candidate, in words a user reads in the run UI. */
 export const SOURCE_KIND_LABELS: Record<LearningSourceKind, string> = {
   explicit_user_instruction: "you asked for this to be reusable",
+  manual_run_capture: "you saved this run as a skill",
   user_correction: "your correction verified",
   verification_repair: "a verification failure was repaired",
   successful_novel_procedure: "a verified multi-step procedure",
@@ -364,6 +366,46 @@ export function parseLearningNotice(content: unknown): LearningNotice | null {
   }
 }
 
+/** A completed-run affordance. Unlike `[Learning]`, this is not an automatic
+ * suggestion: it records enough context for the user to explicitly create a
+ * candidate from the durable run evidence. */
+export const SAVE_SKILL_NOTE_PREFIX = "[SaveSkill]";
+
+export interface SaveSkillNotice {
+  runId: string;
+  userText: string;
+  scope: NativeSkillScope;
+}
+
+function isSaveSkillNoticePayload(value: unknown): value is SaveSkillNotice {
+  const notice = value as SaveSkillNotice | null;
+  return (
+    !!notice &&
+    typeof notice === "object" &&
+    typeof notice.runId === "string" &&
+    typeof notice.userText === "string" &&
+    (notice.scope === "workspace" || notice.scope === "global")
+  );
+}
+
+export function formatSaveSkillNotice(notice: SaveSkillNotice): string {
+  return `${SAVE_SKILL_NOTE_PREFIX}${JSON.stringify(notice)}`;
+}
+
+export function isSaveSkillNotice(content: unknown): boolean {
+  return typeof content === "string" && content.startsWith(SAVE_SKILL_NOTE_PREFIX);
+}
+
+export function parseSaveSkillNotice(content: unknown): SaveSkillNotice | null {
+  if (!isSaveSkillNotice(content)) return null;
+  try {
+    const parsed: unknown = JSON.parse((content as string).slice(SAVE_SKILL_NOTE_PREFIX.length));
+    return isSaveSkillNoticePayload(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /** The run-UI notice for a candidate. A staged candidate is a suggestion;
  * only a promoted one is something the app actually learned. */
 export function candidateNotice(candidate: LearningCandidate): LearningNotice {
@@ -372,5 +414,39 @@ export function candidateNotice(candidate: LearningCandidate): LearningNotice {
     state: candidate.status === "promoted" ? "installed" : "suggested",
     command: candidate.proposed_command,
     why: SOURCE_KIND_LABELS[candidate.source_kind],
+  };
+}
+
+export type FinishedRunNotice =
+  | { kind: "learning"; candidate: LearningCandidate }
+  | { kind: "save"; scope: NativeSkillScope };
+
+/** Automatic learning owns the first opportunity to explain a completed run.
+ * Manual save is only the fallback when no automatic candidate was produced. */
+export function selectFinishedRunNotice(
+  candidate: LearningCandidate | null,
+  captureScope: NativeSkillScope | null,
+): FinishedRunNotice | null {
+  if (candidate) return { kind: "learning", candidate };
+  if (captureScope) return { kind: "save", scope: captureScope };
+  return null;
+}
+
+export type CaptureAction =
+  | { kind: "draft"; candidate: LearningCandidate }
+  | { kind: "focus"; candidate: LearningCandidate }
+  | { kind: "already_installed"; candidate: LearningCandidate };
+
+/** Converts the backend's typed capture result into the one UI action that is
+ * valid for that lifecycle state. Terminal candidates never get focused as
+ * editable drafts. */
+export function captureAction(outcome: CaptureOutcome): CaptureAction {
+  if (outcome.kind === "already_installed") {
+    return { kind: "already_installed", candidate: outcome.candidate };
+  }
+  const candidate = outcome.candidate;
+  return {
+    kind: candidate.status === "detected" || candidate.status === "reflecting" ? "draft" : "focus",
+    candidate,
   };
 }
