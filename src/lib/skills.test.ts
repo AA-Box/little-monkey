@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { ActivePluginRuntimeSnapshot } from "./ecosystemClient";
 import type { NativeSkillDescriptor } from "./nativeSkillsClient";
 import {
+  MAX_MODEL_SKILLS,
   MAX_PACKAGE_RULES_PER_TURN,
   composeSkillCatalog,
   composeSkillSystemPrompt,
+  formatSkillSearchResults,
   nativeSkills,
   packageAssistantSkills,
   packageRuleInvocations,
@@ -275,5 +277,19 @@ describe("composeSkillCatalog", () => {
     expect(ranked.map((entry) => entry.command)).toEqual(["review", "testing"]);
     const catalog = composeSkillCatalog(available, new Set(), "please review this pull request");
     expect(catalog.indexOf("/review")).toBeLessThan(catalog.indexOf("/testing"));
+  });
+
+  it("bounds the model-facing catalog and advertises fallback search", () => {
+    const skills = Array.from({ length: MAX_MODEL_SKILLS + 2 }, (_, index) => skill(`skill-${index}`));
+    const catalog = composeSkillCatalog(skills, new Set(), "skill-11");
+    expect(catalog.match(/^- \/.*$/gm)).toHaveLength(MAX_MODEL_SKILLS);
+    expect(catalog).toContain("search_skills");
+    expect(catalog).toContain("/skill-11");
+  });
+
+  it("excludes Manual skills from implicit discovery and search", () => {
+    const manual = { ...skill("deploy"), activationPolicy: "manual" as const };
+    expect(composeSkillCatalog([manual], new Set())).toBe("");
+    expect(JSON.parse(formatSkillSearchResults([manual], new Set(), "deploy")).results).toEqual([]);
   });
 });

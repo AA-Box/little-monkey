@@ -1434,7 +1434,13 @@ impl SkillLearningStore {
     pub fn set_settings(&self, settings: LearningSettings) -> Result<LearningSettings, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
-        state.mode = settings.policy.into();
+        // `Automatic` intentionally represents both the legacy AutoStage and
+        // AutoPromoteSafe modes. Keep the more conservative mode when the UI
+        // only changes an unrelated setting, otherwise opening Settings and
+        // toggling global scope would silently grant install authority.
+        if LearningPolicy::from(state.mode) != settings.policy {
+            state.mode = settings.policy.into();
+        }
         state.allow_global_scope = settings.allow_global_scope;
         self.save(&state)?;
         Ok(settings)
@@ -4712,6 +4718,16 @@ mod tests {
             .unwrap();
         assert_eq!(store.mode().unwrap(), LearningMode::Off);
         assert_eq!(store.settings().unwrap().policy, LearningPolicy::Manual);
+
+        store.set_mode(LearningMode::AutoStage).unwrap();
+        store
+            .set_settings(LearningSettings {
+                policy: LearningPolicy::Automatic,
+                allow_global_scope: false,
+            })
+            .unwrap();
+        assert_eq!(store.mode().unwrap(), LearningMode::AutoStage);
+        assert!(!store.settings().unwrap().allow_global_scope);
     }
 
     fn identity() -> ClientIdentity {

@@ -48,7 +48,7 @@ import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
-import { formatSkillToolResult, type SlashSkill } from './skills';
+import { formatSkillSearchResults, formatSkillToolResult, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
 import {
@@ -614,6 +614,9 @@ export interface SkillToolContext {
    * rejected with a tool error rather than silently re-returning the same
    * instructions again. */
   invokedCommands: Set<string>;
+  /** Commands the user explicitly selected with `/command` this turn. These
+   * are the approval boundary for Ask and Manual skills. */
+  explicitCommands?: ReadonlySet<string>;
   /** Hard cap on total skills (explicit + model-invoked) per turn — mirrors
    * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
    * already enforces for stacked explicit invocations. */
@@ -1052,6 +1055,13 @@ async function executeToolCallInner(
       if (!matched) {
         return stringifyToolError(new Error(`No enabled skill named "/${command}".`));
       }
+      const policy = matched.activationPolicy ?? 'automatic';
+      if (!skill.explicitCommands?.has(command) && policy === 'manual') {
+        return stringifyToolError(new Error(`/${command} is Manual: it cannot be discovered or invoked implicitly. Ask the user to invoke /${command} explicitly.`));
+      }
+      if (!skill.explicitCommands?.has(command) && policy === 'ask') {
+        return stringifyToolError(new Error(`/${command} requires user approval before its instructions can load. Ask the user to invoke /${command} explicitly.`));
+      }
       // Recorded BEFORE returning the result (not after) so a second call
       // for the same command later in this same batch of parallel tool
       // calls is still caught by the duplicate check above — `Promise.all`
@@ -1063,6 +1073,19 @@ async function executeToolCallInner(
       skill.onInvoked?.(matched);
       const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
       return formatSkillToolResult(matched, argumentsText);
+    } catch (err) {
+      return stringifyToolError(err);
+    }
+  }
+
+  if (name === 'search_skills') {
+    try {
+      if (!skill) {
+        return stringifyToolError(new Error('The search_skills tool has no context configured for this turn.'));
+      }
+      const query = typeof args.query === 'string' ? args.query.trim() : '';
+      if (!query) return stringifyToolError(new Error('The search_skills tool requires a non-empty "query" argument.'));
+      return formatSkillSearchResults(skill.availableSkills, skill.invokedCommands, query);
     } catch (err) {
       return stringifyToolError(err);
     }

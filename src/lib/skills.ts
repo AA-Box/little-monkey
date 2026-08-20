@@ -4,8 +4,15 @@ import type {
   PackagePermission,
 } from "./ecosystemClient";
 import type { PromptEntry } from "../store/promptStore";
+import {
+  skillActivationPolicyFor,
+  skillActivationPolicyKey,
+  type SkillActivationPolicy,
+} from "../store/skillActivationPolicyStore";
 
 export const MAX_SKILLS_PER_TURN = 5;
+export const MAX_MODEL_SKILLS = 10;
+export const MAX_SKILL_SEARCH_RESULTS = 20;
 export const MAX_PACKAGE_RULES_PER_TURN = 20;
 export const MAX_PACKAGE_RULE_BYTES_PER_TURN = 64 * 1024;
 export const MAX_PACKAGE_ASSISTANT_BYTES = 64 * 1024;
@@ -21,6 +28,9 @@ export interface SlashSkill {
   contentSha256: string;
   bundleSha256?: string;
   permissions: PackagePermission[];
+  /** How the model may discover and load this skill. Explicit `/command`
+   * invocations always remain available as the user's approval. */
+  activationPolicy?: SkillActivationPolicy;
   /** Tool names this skill restricts the model to while active — only ever
    * populated for `source: "native"` (ecosystem `SKILL.md`) skills, which
    * are the only ones with an `allowed-tools` frontmatter concept. Empty or
@@ -76,6 +86,7 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
+      activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("native", entry.command, entry.source.kind)),
       allowedTools: entry.allowed_tools,
       resourceFiles: entry.resource_files,
     }));
@@ -105,6 +116,7 @@ export function localPromptSkills(entries: PromptEntry[]): SlashSkill[] {
       version: `local-${entry.updatedAt}`,
       contentSha256: `local:${entry.id}:${entry.updatedAt}`,
       permissions: [],
+      activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("local", entry.command, entry.id)),
     }));
 }
 
@@ -119,6 +131,7 @@ export function packageSkills(entries: ActiveSkillDescriptor[]): SlashSkill[] {
     version: entry.version,
     contentSha256: entry.content_sha256,
     permissions: entry.permissions,
+    activationPolicy: skillActivationPolicyFor(skillActivationPolicyKey("package", entry.command, entry.package_id)),
   }));
 }
 
@@ -403,14 +416,16 @@ export function composeSkillSystemPrompt(
 }
 
 /**
- * Compact `name`+`description` catalog of every available skill NOT already
+ * Compact `name`+`description` catalog of discoverable available skills NOT already
  * invoked this turn — the auto-invocation counterpart to
  * `composeSkillSystemPrompt` above: that function injects the FULL
  * instructions for skills already invoked (explicitly, or via an
  * always-on package rule); this one lists the rest by name only, so the
  * model can choose to invoke one itself (via the `skill` tool — see
  * `tools.ts`'s `SKILL_INVOKE_TOOL`) without every uninvoked skill's full
- * instructions being loaded into every turn's context up front. Returns
+ * instructions being loaded into every turn's context up front. The model
+ * sees only the bounded top-ranked slice; `search_skills` covers the rest.
+ * Returns
  * `""` when there's nothing left to list, so callers can `filter(Boolean)`
  * it straight into a section list without a separate emptiness check.
  */
@@ -419,14 +434,49 @@ export function composeSkillCatalog(
   alreadyInvokedCommands: ReadonlySet<string>,
   requestText = "",
 ): string {
-  const remaining = availableSkills.filter((skill) => !alreadyInvokedCommands.has(skill.command));
+  const remaining = availableSkills.filter(
+    (skill) => !alreadyInvokedCommands.has(skill.command) && skill.activationPolicy !== "manual",
+  );
   if (remaining.length === 0) return "";
   const ranked = rankSkillCatalog(remaining, requestText);
+  const visible = ranked.slice(0, MAX_MODEL_SKILLS);
   return [
     "## Available skills",
-    "These skills are ranked by relevance to the user's request. Call the `skill` tool with a matching command to invoke it — its full instructions are then returned as the tool result. Do not invoke a skill the request doesn't actually need.",
-    ...ranked.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name}`),
+    "These skills are ranked by relevance. Automatic skills may be loaded with the `skill` tool. Ask skills are identified here but require the user's explicit /command approval before their instructions load. Manual skills are never listed for implicit discovery.",
+    ...visible.map((skill) => `- /${skill.command} — ${skill.description ?? skill.name} [policy: ${skill.activationPolicy ?? "automatic"}]`),
+    ...(ranked.length > visible.length
+      ? ["More skills are available. Use the `search_skills` tool when the relevant skill is not listed here."]
+      : []),
   ].join("\n");
+}
+
+/** Compact fallback search over the full installed registry. It never returns
+ * instructions, and manual-only skills are intentionally undiscoverable. */
+export function formatSkillSearchResults(
+  availableSkills: readonly SlashSkill[],
+  alreadyInvokedCommands: ReadonlySet<string>,
+  query: string,
+): string {
+  const tokens = catalogTokens(query);
+  const candidates = availableSkills.filter(
+    (skill) => !alreadyInvokedCommands.has(skill.command) && skill.activationPolicy !== "manual",
+  );
+  const matches = rankSkillCatalog(candidates, query)
+    .filter((skill) => {
+      const searchable = `${skill.command} ${skill.name} ${skill.description ?? ""}`.toLowerCase();
+      return query.toLowerCase().includes(`/${skill.command.toLowerCase()}`)
+        || tokens.some((token) => searchable.includes(token));
+    })
+    .slice(0, MAX_SKILL_SEARCH_RESULTS);
+  return JSON.stringify({
+    query,
+    results: matches.map((skill) => ({
+      command: `/${skill.command}`,
+      name: skill.name,
+      description: skill.description ?? skill.name,
+      policy: skill.activationPolicy ?? "automatic",
+    })),
+  });
 }
 
 /**

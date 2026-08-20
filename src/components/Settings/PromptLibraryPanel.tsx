@@ -20,6 +20,11 @@ import { SkillLearningPanel } from "./SkillLearningPanel";
 import { RevisionHistoryPanel } from "./RevisionHistoryPanel";
 import { PROMPT_ENTRY_KIND } from "../../store/configRevisionStore";
 import { errorMessage } from "../../lib/errors";
+import {
+  skillActivationPolicyKey,
+  useSkillActivationPolicyStore,
+  type SkillActivationPolicy,
+} from "../../store/skillActivationPolicyStore";
 
 /** Same slash-trigger slug shape the design doc pins for `PromptEntry.command`. */
 const COMMAND_PATTERN = /^[a-z0-9-]{1,32}$/;
@@ -34,6 +39,27 @@ const JSON_FILTERS = [{ name: "JSON", extensions: ["json"] }];
 function firstLine(content: string): string {
   const line = content.split("\n").find((l) => l.trim().length > 0) ?? "";
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
+}
+
+function LocalSkillPolicySelect({ id, command }: { id: string; command: string }) {
+  const key = skillActivationPolicyKey("local", command, id);
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  return (
+    <label className="flex items-center gap-1 text-[10px] text-faint">
+      Policy
+      <select
+        aria-label={`/${command} activation policy`}
+        value={policy}
+        onChange={(event) => setPolicy(key, event.target.value as SkillActivationPolicy)}
+        className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+      >
+        <option value="automatic">Automatic</option>
+        <option value="ask">Ask</option>
+        <option value="manual">Manual</option>
+      </select>
+    </label>
+  );
 }
 
 /** Local draft state for the inline create/edit form. `id: null` means
@@ -369,6 +395,7 @@ export function PromptLibraryPanel() {
                 </span>
                 <span className="truncate text-sm font-medium text-foreground">{entry.name}</span>
                 <span className="truncate font-mono text-xs text-faint">/{entry.command}</span>
+                {entry.kind === "skill" && <LocalSkillPolicySelect id={entry.id} command={entry.command} />}
                 {entry.kind === "persona" && entry.id === defaultPersonaId && (
                   <span className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-accent-soft text-accent">
                     {t("PromptLibraryPanel.defaultBadge")}
