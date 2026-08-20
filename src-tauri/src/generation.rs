@@ -25,7 +25,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component as PathComponent, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -71,6 +72,9 @@ const MAX_BATCH_COUNT: u32 = 8;
 /// anything, and llama.cpp clamps the number to the layers a model actually
 /// has rather than erroring on an overshoot.
 const SPEECH_GPU_LAYERS: u32 = 999;
+/// Index files are small metadata documents, but an unbounded read would let
+/// a model entry consume arbitrary memory before the engine sees it.
+const MAX_SAFETENSORS_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 /// How long the engine may say *nothing at all* before a launch is called
 /// dead.
 ///
@@ -328,12 +332,43 @@ impl ModelComponent {
         }
     }
 
+    /// The path kept under the app-owned model directory. Ordinary component
+    /// files retain their historical flat layout; shard indexes keep their
+    /// repository-relative directory so the engine can resolve shard names
+    /// exactly as written in `weight_map`.
+    pub fn relative_path(&self) -> PathBuf {
+        match &self.source {
+            ComponentSource::HuggingFace { file, .. }
+                if is_safetensors_index_path(Path::new(file)) =>
+            {
+                PathBuf::from(file)
+            }
+            _ => PathBuf::from(self.file_name()),
+        }
+    }
+
     /// Where this component actually lives once available.
     pub fn resolved_path(&self, model_root: &Path, model_id: &str) -> PathBuf {
         match &self.source {
-            ComponentSource::HuggingFace { .. } => model_root.join(model_id).join(self.file_name()),
+            ComponentSource::HuggingFace { .. } => {
+                model_root.join(model_id).join(self.relative_path())
+            }
             ComponentSource::LocalFile { path } => PathBuf::from(path),
         }
+    }
+
+    /// Whether the component and every shard named by its index are present.
+    pub fn is_installed(&self, model_root: &Path, model_id: &str) -> bool {
+        let path = self.resolved_path(model_root, model_id);
+        if !path.is_file() {
+            return false;
+        }
+        if !is_safetensors_index_path(&path) {
+            return true;
+        }
+        safetensors_index_shards(&path)
+            .map(|shards| shards.into_iter().all(|shard| shard.is_file()))
+            .unwrap_or(false)
     }
 
     /// Only downloadable components can be fetched; a user's own file is
@@ -341,6 +376,75 @@ impl ModelComponent {
     pub fn is_downloadable(&self) -> bool {
         matches!(self.source, ComponentSource::HuggingFace { .. })
     }
+}
+
+/// Whether a path is the standard safetensors shard index accepted by the
+/// bundled cross-platform engine.
+pub(crate) fn is_safetensors_index_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.to_ascii_lowercase()
+                .ends_with(".safetensors.index.json")
+        })
+        .unwrap_or(false)
+}
+
+/// Reads a safetensors `weight_map` and resolves its shard paths relative to
+/// the index. Only normal relative path components are accepted: the same
+/// rule protects both app-owned downloads and the engine's file access.
+pub(crate) fn safetensors_index_shards(index_path: &Path) -> Result<Vec<PathBuf>, String> {
+    let size = fs::metadata(index_path)
+        .map_err(|error| format!("Failed to inspect {}: {error}", index_path.display()))?
+        .len();
+    if size > MAX_SAFETENSORS_INDEX_BYTES {
+        return Err(format!(
+            "Safetensors index {} is too large",
+            index_path.display()
+        ));
+    }
+    let bytes = fs::read(index_path)
+        .map_err(|error| format!("Failed to read {}: {error}", index_path.display()))?;
+    let document: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "Safetensors index {} is invalid: {error}",
+            index_path.display()
+        )
+    })?;
+    let weight_map = document
+        .get("weight_map")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            format!(
+                "Safetensors index {} has no weight_map",
+                index_path.display()
+            )
+        })?;
+    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut shards = BTreeSet::new();
+    for (tensor, value) in weight_map {
+        let name = value
+            .as_str()
+            .ok_or_else(|| format!("Safetensors index has an invalid shard for tensor {tensor}"))?;
+        let relative = Path::new(name);
+        if name.trim().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, PathComponent::Normal(_)))
+        {
+            return Err(format!(
+                "Safetensors index has an unsafe shard path: {name}"
+            ));
+        }
+        shards.insert(parent.join(relative));
+    }
+    if shards.is_empty() {
+        return Err(format!(
+            "Safetensors index {} has no shards",
+            index_path.display()
+        ));
+    }
+    Ok(shards.into_iter().collect())
 }
 
 /// A LoRA in the user's library.
@@ -583,9 +687,23 @@ impl GenerationModelSpec {
             .components
             .iter()
             .map(|component| {
-                std::fs::metadata(component.resolved_path(model_root, &self.id))
-                    .map(|entry| entry.len())
-                    .unwrap_or(component.size_bytes)
+                let path = component.resolved_path(model_root, &self.id);
+                if let Ok(metadata) = std::fs::metadata(&path) {
+                    let shards = if is_safetensors_index_path(&path) {
+                        safetensors_index_shards(&path).ok()
+                    } else {
+                        None
+                    };
+                    metadata.len()
+                        + shards
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|shard| std::fs::metadata(shard).ok())
+                            .map(|entry| entry.len())
+                            .sum::<u64>()
+                } else {
+                    component.size_bytes
+                }
             })
             .sum::<u64>();
         component_bytes
@@ -602,8 +720,7 @@ impl GenerationModelSpec {
         self.components
             .iter()
             .filter(|component| {
-                component.is_downloadable()
-                    && !component.resolved_path(model_root, &self.id).is_file()
+                component.is_downloadable() && !component.is_installed(model_root, &self.id)
             })
             .collect()
     }
@@ -715,9 +832,11 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
                 component.slot.flag()
             ));
         }
-        // Components land in one flat directory per model, so two files
-        // sharing a basename would overwrite each other.
-        if !names.insert(component.file_name().to_string()) {
+        // Ordinary components land in one flat directory. Index files retain
+        // their repository-relative path so two logical components may both
+        // use the conventional index basename in different directories.
+        let component_name = component.relative_path().to_string_lossy().to_string();
+        if !names.insert(component_name) {
             return Err(format!(
                 "Two files are both named {}",
                 component.file_name()
@@ -728,7 +847,14 @@ pub fn validate_model_spec(spec: &GenerationModelSpec) -> Result<(), String> {
                 if repo.trim().is_empty() || file.trim().is_empty() {
                     return Err("A downloaded file needs a repo and a path".to_string());
                 }
-                if repo.contains("..") || file.contains("..") {
+                let path = Path::new(file);
+                if repo.contains("..")
+                    || file.contains('\\')
+                    || !path.is_relative()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, PathComponent::Normal(_)))
+                {
                     return Err("Repo and file paths may not contain ..".to_string());
                 }
             }
@@ -2241,8 +2367,9 @@ impl GenerationEngineState {
                 ));
             }
         } else {
-            for path in spec.component_paths(model_root) {
-                if !path.is_file() {
+            for component in &spec.components {
+                let path = component.resolved_path(model_root, &spec.id);
+                if !component.is_installed(model_root, &spec.id) {
                     return Err(format!(
                         "{} is missing a weight file: {}",
                         spec.name,
@@ -3023,6 +3150,64 @@ mod tests {
         let mut no_tasks = video_model();
         no_tasks.tasks.clear();
         assert!(validate_model_spec(&no_tasks).is_err());
+    }
+
+    #[test]
+    fn safetensors_index_resolves_relative_shards_without_merging() {
+        let root = std::env::temp_dir().join(format!("lm-shards-{}", uuid::Uuid::new_v4()));
+        let index = root.join("transformer/diffusion_pytorch_model.safetensors.index.json");
+        std::fs::create_dir_all(index.parent().unwrap()).unwrap();
+        std::fs::write(
+            &index,
+            serde_json::to_vec(&serde_json::json!({
+                "metadata": {"total_size": 6},
+                "weight_map": {
+                    "block.0.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+                    "block.1.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+                    "block.1.bias": "diffusion_pytorch_model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let shards = safetensors_index_shards(&index).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert!(shards.iter().all(|path| path.parent() == index.parent()));
+        assert!(is_safetensors_index_path(&index));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn indexed_component_is_missing_until_every_shard_is_present() {
+        let root = std::env::temp_dir().join(format!("lm-index-install-{}", uuid::Uuid::new_v4()));
+        let index = root.join("model.safetensors.index.json");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            &index,
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {
+                    "a": "model-00001-of-00002.safetensors",
+                    "b": "model-00002-of-00002.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let component = ModelComponent {
+            slot: ComponentSlot::DiffusionModel,
+            source: ComponentSource::LocalFile {
+                path: index.to_string_lossy().to_string(),
+            },
+            size_bytes: 0,
+        };
+
+        assert!(!component.is_installed(Path::new("/unused"), "model"));
+        std::fs::write(root.join("model-00001-of-00002.safetensors"), b"one").unwrap();
+        assert!(!component.is_installed(Path::new("/unused"), "model"));
+        std::fs::write(root.join("model-00002-of-00002.safetensors"), b"two").unwrap();
+        assert!(component.is_installed(Path::new("/unused"), "model"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A card built from declared sizes reads "0 GB" for a model that is
