@@ -178,7 +178,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.add.engineMfluxImageHint":
     "Native image generation with text-to-image and image-to-image. Needs the separate MFLUX Image Runtime from Settings → Runtime Hub.",
   "Studio.add.mfluxSource": "Model source",
-  "Studio.add.mfluxRepository": "Repository",
+  "Studio.add.mfluxRepository": "Hugging Face repository",
   "Studio.add.mfluxRepositoryPlaceholder": "owner/model",
   "Studio.add.mfluxToken": "Access token (optional)",
   "Studio.add.mfluxTokenPlaceholder": "hf_…",
