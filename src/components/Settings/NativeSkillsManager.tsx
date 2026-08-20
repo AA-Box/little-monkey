@@ -25,7 +25,7 @@ function descriptorScope(skill: NativeSkillDescriptor): NativeSkillScope | null 
 }
 
 function descriptorPolicyIdentity(skill: NativeSkillDescriptor): string {
-  if (skill.source.kind === "global") return "global";
+  if (skill.source.kind === "global") return skill.managed ? "global" : skill.source.path;
   if (skill.source.kind === "workspace") return skill.source.path;
   return `signed-package:${skill.source.package_id}`;
 }

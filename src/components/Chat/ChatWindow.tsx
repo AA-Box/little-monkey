@@ -578,7 +578,13 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // composer stays open. Freeze the exact current discovery immediately
     // before parsing the turn so hashes, instructions, and resource paths
     // all belong to one snapshot.
-    const freshNativeEntries = await nativeSkillsClient.discover();
+    let freshNativeEntries: NativeSkillDescriptor[] = [];
+    try {
+      freshNativeEntries = await nativeSkillsClient.discover();
+    } catch {
+      // Never reuse a stale external snapshot after discovery fails. Native
+      // skills disappear for this turn, but ordinary chat remains available.
+    }
     const freshAvailableSkills = [
       ...localPromptSkills(promptEntries),
       ...nativeSkills(freshNativeEntries),

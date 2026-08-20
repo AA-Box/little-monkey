@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { ActivePluginRuntimeSnapshot } from "./ecosystemClient";
 import type { NativeSkillDescriptor } from "./nativeSkillsClient";
 import {
@@ -16,7 +16,7 @@ import {
   skillCommandMap,
   type SlashSkill,
 } from "./skills";
-import { skillActivationPolicyKey } from "../store/skillActivationPolicyStore";
+import { skillActivationPolicyKey, useSkillActivationPolicyStore } from "../store/skillActivationPolicyStore";
 
 function skill(command: string, id = command): SlashSkill {
   return {
@@ -364,6 +364,41 @@ describe("composeSkillCatalog", () => {
 });
 
 describe("skill activation policy identity", () => {
+  afterEach(() => {
+    useSkillActivationPolicyStore.setState({
+      policies: {},
+      hydrated: false,
+      hydrating: false,
+      error: null,
+    });
+  });
+
+  it("does not let a disabled managed global skill authorize its external fallback", () => {
+    const managedKey = skillActivationPolicyKey("native", "review", "global");
+    useSkillActivationPolicyStore.setState({
+      policies: {
+        [managedKey]: { key: managedKey, policy: "automatic", pinned: true, updated_at_unix_ms: 1 },
+      },
+      hydrated: true,
+    });
+    const [external] = nativeSkills([
+      nativeDescriptor({
+        enabled: false,
+        managed: true,
+        source: { kind: "global", path: "/app-data/native-skills-v1/global/review" },
+      }),
+      nativeDescriptor({
+        managed: false,
+        source: { kind: "global", path: "/home/user/.agents/skills/review" },
+        sha256: "b".repeat(64),
+      }),
+    ]);
+
+    expect(external.activationPolicy).toBe("ask");
+    expect(external.policyKey).toBe("native:/home/user/.agents/skills/review:review");
+    expect(external.policyKey).not.toBe(managedKey);
+  });
+
   it("separates native workspace identities", () => {
     expect(skillActivationPolicyKey("native", "deploy", "/workspace/a/.agents/skills/deploy"))
       .not.toBe(skillActivationPolicyKey("native", "deploy", "/workspace/b/.agents/skills/deploy"));
