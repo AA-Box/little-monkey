@@ -39,7 +39,7 @@ export interface SkillActivationPolicyStore {
   error: string | null;
   hydrate: () => Promise<void>;
   refresh: () => Promise<void>;
-  getPolicy: (key: string) => SkillActivationPolicy;
+  getPolicy: (key: string, fallback?: SkillActivationPolicy) => SkillActivationPolicy;
   isPinned: (key: string) => boolean;
   setPolicy: (key: string, policy: SkillActivationPolicy) => Promise<void>;
   setPinned: (key: string, pinned: boolean) => Promise<void>;
@@ -91,13 +91,9 @@ export const useSkillActivationPolicyStore = create<SkillActivationPolicyStore>(
     }
   },
 
-  getPolicy: (key) => {
+  getPolicy: (key, fallback = "automatic") => {
     if (!get().hydrated) return "ask";
-    // Missing keys are new skills, which retain the existing Automatic
-    // default once the backend snapshot is known. During hydration the
-    // fail-closed Ask result above is never offered to the model because the
-    // agent loop withholds implicit skill tools entirely.
-    return get().policies[key]?.policy ?? "automatic";
+    return get().policies[key]?.policy ?? fallback;
   },
 
   isPinned: (key) => get().hydrated && get().policies[key]?.pinned === true,
@@ -126,8 +122,8 @@ export function skillActivationPolicyKey(
   return `native:${id ?? "any"}:${command}`;
 }
 
-export function skillActivationPolicyFor(key: string): SkillActivationPolicy {
-  return useSkillActivationPolicyStore.getState().getPolicy(key);
+export function skillActivationPolicyFor(key: string, fallback?: SkillActivationPolicy): SkillActivationPolicy {
+  return useSkillActivationPolicyStore.getState().getPolicy(key, fallback);
 }
 
 export function skillActivationIsPinned(key: string): boolean {

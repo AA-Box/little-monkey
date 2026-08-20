@@ -92,6 +92,7 @@ const skill: NativeSkillDescriptor = {
   file_count: 1,
   total_bytes: 100,
   enabled: true,
+  managed: true,
   eligibility: { eligible: true, current_os: "darwin", unsupported_os: false, missing_bins: [], missing_env: [] },
   supported_os: ["darwin"],
   requirements: { bins: [], env: [] },
