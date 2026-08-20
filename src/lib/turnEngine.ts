@@ -403,6 +403,9 @@ interface ReservedArgContext {
   workspaceRootOverride?: string;
   /** This turn's durable run id — see the `run_id` entry in `RESERVED_ARGS`. */
   learningRunId?: string;
+  /** Immutable native-skill provenance injected into a resource read after
+   * the corresponding skill was invoked. Model-supplied values are scrubbed. */
+  skillResourceSnapshot?: { sha256: string; sourcePath: string };
 }
 
 /** The tools whose path/cwd resolution honours a worktree override — the
@@ -482,11 +485,16 @@ const RESERVED_ARGS: ReadonlyArray<{ key: string; resolve: (ctx: ReservedArgCont
   // the reflection turn to a candidate's evidence — the runs a candidate is
   // founded on were written by the backend when it detected the signal.
   { key: 'run_id', resolve: (ctx) => (ctx.name === 'manage_skill_learning' ? ctx.learningRunId : undefined) },
+  // Binds a native resource read to the exact skill snapshot that was
+  // invoked this turn. The model can provide neither the hash nor the path.
+  { key: 'expected_sha256', resolve: (ctx) => (ctx.name === 'read_skill_resource' ? ctx.skillResourceSnapshot?.sha256 : undefined) },
+  { key: 'expected_source_path', resolve: (ctx) => (ctx.name === 'read_skill_resource' ? ctx.skillResourceSnapshot?.sourcePath : undefined) },
 ];
 
 function scrubReservedArgs(args: Record<string, unknown>): void {
   for (const { key } of RESERVED_ARGS) {
     delete args[key];
+    delete args[key.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase())];
   }
 }
 
@@ -614,6 +622,10 @@ export interface SkillToolContext {
    * rejected with a tool error rather than silently re-returning the same
    * instructions again. */
   invokedCommands: Set<string>;
+  /** Exact native skill provenance for commands invoked this turn. Resource
+   * reads use this map to prevent a mutable folder from being re-resolved at
+   * a different hash or source after discovery. */
+  invokedSkillSnapshots?: Map<string, { sha256: string; sourcePath: string }>;
   /** Commands the user explicitly selected with `/command` this turn. These
    * are the approval boundary for Ask and Manual skills. */
   explicitCommands?: ReadonlySet<string>;
@@ -861,6 +873,9 @@ async function executeToolCallInner(
     riskClassification,
     workspaceRootOverride,
     learningRunId: skill?.runId,
+    skillResourceSnapshot: name === 'read_skill_resource' && typeof args.command === 'string'
+      ? skill?.invokedSkillSnapshots?.get(args.command.trim().replace(/^\//, '').toLowerCase())
+      : undefined,
   });
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
@@ -1078,6 +1093,12 @@ async function executeToolCallInner(
       // synchronous bookkeeping (no `await` happens between the checks above
       // and this line).
       skill.invokedCommands.add(command);
+      if (matched.sourcePath) {
+        skill.invokedSkillSnapshots?.set(command, {
+          sha256: matched.contentSha256,
+          sourcePath: matched.sourcePath,
+        });
+      }
       skill.onInvoked?.(matched);
       const argumentsText = typeof args.arguments === 'string' ? args.arguments : '';
       return formatSkillToolResult(matched, argumentsText);
@@ -1115,6 +1136,9 @@ async function executeToolCallInner(
       return stringifyToolError(
         new Error(`/${command || '(missing)'} has not been invoked this turn — invoke it via the skill tool or /command first.`)
       );
+    }
+    if (!skill.invokedSkillSnapshots?.has(command)) {
+      return stringifyToolError(new Error(`/${command} has no immutable native-skill snapshot for this turn.`));
     }
   }
 

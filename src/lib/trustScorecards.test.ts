@@ -206,6 +206,7 @@ describe("trustScorecards", () => {
         file_count: 2,
         total_bytes: 4096,
         enabled: true,
+        managed: true,
         eligibility: { eligible: true, current_os: "darwin", unsupported_os: false, missing_bins: [], missing_env: [] },
         supported_os: ["darwin"],
         requirements: { bins: [], env: [] },
