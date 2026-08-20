@@ -19,9 +19,9 @@ use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
     ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
-    EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary,
-    LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
-    PromotionOutcome, RunEvidence, SkillLearningStore,
+    EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, ImprovementEvidence,
+    ImprovementParent, LearnedSkillSummary, LearningCandidate, LearningMode, LearningSettings,
+    PreTaskFile, PreTaskSource, PreTaskState, PromotionOutcome, RunEvidence, SkillLearningStore,
 };
 use crate::AppState;
 
@@ -676,6 +676,161 @@ pub async fn skill_learning_learned_skills(
     let manager = native.manager.clone();
     let store = learning.store.clone();
     run_blocking(move || store.learned_skills(&manager, workspace.as_deref(), &packages)).await
+}
+
+fn improvement_parent(
+    store: &SkillLearningStore,
+    manager: &crate::native_skills::NativeSkillManager,
+    packages: &[ExternalSignedSkill],
+    workspace: Option<&Path>,
+    scope: SkillScope,
+    command: &str,
+) -> Result<ImprovementParent, crate::native_skills::SkillError> {
+    let mut matching = manager
+        .discover(workspace, packages)
+        .map_err(|error| crate::native_skills::SkillError::Conflict(error.to_string()))?
+        .into_iter()
+        .filter(|entry| {
+            entry.command == command
+                && crate::skill_learning::descriptor_scope(entry) == Some(scope)
+        })
+        .collect::<Vec<_>>();
+    // A disabled managed skill and an external fallback may legitimately have
+    // the same command. Improve must still target the managed learned bytes,
+    // never whichever descriptor happened to sort first.
+    matching.sort_by_key(|entry| !entry.managed);
+    let descriptor = matching.into_iter().next().ok_or_else(|| {
+        crate::native_skills::SkillError::NotFound(format!("active /{command} skill was not found"))
+    })?;
+    if !descriptor.managed {
+        return Err(crate::native_skills::SkillError::Conflict(
+            "Improve skill is available only for managed learned skills".to_string(),
+        ));
+    }
+    if !store
+        .is_learned_version(&descriptor.sha256)
+        .map_err(|error| crate::native_skills::SkillError::Conflict(error.to_string()))?
+    {
+        return Err(crate::native_skills::SkillError::Conflict(format!(
+            "/{command} is not an active learned skill"
+        )));
+    }
+    Ok(ImprovementParent {
+        command: descriptor.command,
+        scope,
+        sha256: descriptor.sha256,
+        title: descriptor.name,
+        version: descriptor.version,
+        instructions: descriptor.instructions,
+        allowed_tools: descriptor.allowed_tools,
+        requirements: crate::skill_learning::CandidateRequirements {
+            bins: descriptor.requirements.bins,
+            env: descriptor.requirements.env,
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn skill_learning_quality_summaries(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+) -> Result<Vec<LearnedSkillSummary>, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || store.learned_skills(&manager, workspace.as_deref(), &packages)).await
+}
+
+#[tauri::command]
+pub async fn skill_learning_improvement_evidence(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+) -> Result<Vec<ImprovementEvidence>, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store
+            .improvement_evidence(scope, &parent.command, &parent.sha256)
+            .map_err(|error| error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_learning_run_evidence(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+    run_id: String,
+) -> Result<RunEvidence, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store.run_evidence(scope, &parent.command, &parent.sha256, &run_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_learning_begin_improvement(
+    window: tauri::Window,
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+    selected_run_ids: Vec<String>,
+) -> Result<LearningCandidate, String> {
+    require_main_window(&window)?;
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store
+            .begin_improvement(&parent, &selected_run_ids)
+            .map_err(|error| error)
+    })
+    .await
 }
 
 #[tauri::command]

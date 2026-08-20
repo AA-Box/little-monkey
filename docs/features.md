@@ -136,6 +136,11 @@ source kinds: `explicit_user_instruction`, `user_correction`,
 the durable ledger, plus your turn text (the one input the ledger does not
 carry). A run only ever opens one candidate.
 
+An installed managed learned skill can also receive an explicit
+`manual_improvement` update candidate. That action is not autonomous
+classification: it validates selected effectiveness rows against the active
+version's exact hash before entering the same reflection and review flow.
+
 **What does not.** A conversational turn, a cancelled or failed run, a run
 with no successful tool call, and any web page, MCP result, subprocess output,
 or model claim that says it should be learned. Untrusted content can be
@@ -228,6 +233,28 @@ parent hash, installed hash, evaluation ids, promotion policy, approval id and
 timestamp, keyed by the installed content hash. Nothing later rewrites it: an
 update writes a new record, and a rollback surfaces the restored version's own
 provenance, so a historical run's evidence stays true.
+
+**Quality and improvement.** Settings shows quality for the exact active
+command, scope, and skill hash. **Healthy** means at least three
+verification-bearing runs with no hard negative signal; **Needs attention** is
+driven by a correction, a repeated failure signature, the latest verified
+failure, or two failures in the last five verification-bearing runs;
+**Not enough data** means fewer than three verification-bearing runs unless a
+hard negative already exists. Unknown verification is never counted as a
+success, and cancellation is never counted as a failure. Older-version rows
+remain in history but cannot make a newly promoted hash unhealthy.
+
+**Improve skill** is explicit and available even when Learning Policy is
+**Manual**. It is only available for managed learned skills with durable
+evidence. The backend validates selected runs against the exact active hash,
+deduplicates open update candidates, and freezes that hash as the parent.
+Reflection is told to make the smallest evidence-grounded change; it preserves
+scope, tools, binaries, environment requirements, and unrelated instructions
+by default. The result is reviewed as a bounded instruction diff plus
+structured capability changes, then uses the same real-isolated baseline vs
+candidate evaluation, digest-bound approval, versioned promotion, and rollback
+path. The active skill is never edited in place, and activation policy/pinning
+survive promotion because they belong to the stable skill identity.
 
 **How approval works.** There is no "approved" flag a window can set. When you
 install a candidate, the app raises its ordinary permission prompt describing

@@ -54,6 +54,9 @@ pub const MAX_EFFECTIVENESS_RECORDS: usize = 256;
 pub const MAX_FAILURE_SIGNATURES: usize = 256;
 pub const MAX_EVALUATIONS: usize = 128;
 pub const MAX_USER_TEXT_BYTES: usize = 4 * 1024;
+pub const MAX_IMPROVEMENT_EVIDENCE: usize = 5;
+pub const MAX_RECENT_QUALITY_RUNS: usize = 10;
+pub const QUALITY_VERIFICATION_THRESHOLD: usize = 3;
 /// Bounds on the evidence snapshot persisted with a candidate. The snapshot is
 /// what the reflection pass reads, so it has to carry the shape of the
 /// procedure — but it is stored durably and shipped to a model, so every part
@@ -255,6 +258,7 @@ pub enum CandidateStatus {
 pub enum LearningSourceKind {
     ExplicitUserInstruction,
     ManualRunCapture,
+    ManualImprovement,
     UserCorrection,
     VerificationRepair,
     SuccessfulNovelProcedure,
@@ -266,6 +270,7 @@ impl LearningSourceKind {
         match self {
             Self::ExplicitUserInstruction => "explicit_user_instruction",
             Self::ManualRunCapture => "manual_run_capture",
+            Self::ManualImprovement => "manual_improvement",
             Self::UserCorrection => "user_correction",
             Self::VerificationRepair => "verification_repair",
             Self::SuccessfulNovelProcedure => "successful_novel_procedure",
@@ -375,6 +380,21 @@ pub struct LearningCandidate {
     /// told from a missing one without a provenance lookup.
     #[serde(default)]
     pub approval_id: Option<String>,
+    /// Snapshot of the active parent skill used by an explicit improvement.
+    /// It is evidence for reflection only; promotion still re-resolves the
+    /// active parent and refuses stale candidates.
+    #[serde(default)]
+    pub parent_skill_content: Option<String>,
+    #[serde(default)]
+    pub parent_skill_title: Option<String>,
+    #[serde(default)]
+    pub parent_scope: Option<SkillScope>,
+    #[serde(default)]
+    pub parent_allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub parent_requirements: CandidateRequirements,
+    #[serde(default)]
+    pub evidence_runs: Vec<RunEvidence>,
 }
 
 /// What the correction run itself did. A correction only becomes an update
@@ -523,6 +543,15 @@ pub struct EvaluationPlan {
     pub candidate_sha256: String,
     pub skill_instructions: String,
     pub allowed_tools: Vec<String>,
+    /// Improvement candidates carry the exact active parent as the baseline;
+    /// ordinary new-skill candidates leave this empty and evaluate without a
+    /// skill on the baseline arm.
+    #[serde(default)]
+    pub baseline_skill_instructions: Option<String>,
+    #[serde(default)]
+    pub baseline_allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub baseline_sha256: Option<String>,
     pub cases: Vec<EvaluationCase>,
     /// The workspace the observed run happened in, so a runtime can make each
     /// arm a disposable copy of the state the procedure was learned against.
@@ -619,7 +648,8 @@ impl RunOutcome {
     /// Whether this outcome is evidence the skill did not work. Only a real
     /// failure is; a cancellation is not, and a success obviously is not.
     pub fn counts_as_failure(self, verification_passed: Option<bool>) -> bool {
-        matches!(self, Self::Failure) || verification_passed == Some(false)
+        !matches!(self, Self::Cancelled)
+            && (matches!(self, Self::Failure) || verification_passed == Some(false))
     }
 }
 
@@ -647,6 +677,11 @@ pub struct EffectivenessRecord {
     #[serde(default)]
     pub user_corrected: bool,
     pub recorded_at_unix_ms: u64,
+    /// Bounded durable evidence for an improvement flow. Older rows may not
+    /// have this field; they remain useful telemetry but are not selectable as
+    /// improvement evidence.
+    #[serde(default)]
+    pub evidence: Option<RunEvidence>,
 }
 
 impl EffectivenessRecord {
@@ -673,6 +708,90 @@ pub struct LearnedSkillSummary {
     pub failures: usize,
     pub corrections: usize,
     pub last_used_at_unix_ms: Option<u64>,
+    pub quality: SkillQualitySummary,
+    pub history: Vec<SkillVersionHistory>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillQualityState {
+    InsufficientData,
+    Healthy,
+    NeedsAttention,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillQualityRun {
+    pub run_id: String,
+    pub outcome: RunOutcome,
+    pub verification_passed: Option<bool>,
+    pub user_corrected: bool,
+    pub failure_signature: Option<String>,
+    pub recorded_at_unix_ms: u64,
+    pub summary: String,
+    pub evidence_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillQualityFailureSignature {
+    pub signature: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillQualitySummary {
+    pub command: String,
+    pub scope: SkillScope,
+    pub active_sha256: String,
+    pub state: SkillQualityState,
+    pub reasons: Vec<String>,
+    pub total_runs: usize,
+    pub verified_successes: usize,
+    pub verified_failures: usize,
+    pub unknown_verification: usize,
+    pub cancelled_runs: usize,
+    pub corrections: usize,
+    pub improvement_evidence_count: usize,
+    pub recent_runs: Vec<SkillQualityRun>,
+    pub repeated_failure_signatures: Vec<SkillQualityFailureSignature>,
+    pub last_used_at_unix_ms: Option<u64>,
+    pub last_verified_success_at_unix_ms: Option<u64>,
+    pub last_failure_at_unix_ms: Option<u64>,
+    pub last_correction_at_unix_ms: Option<u64>,
+    pub open_improvement_candidate_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillVersionHistory {
+    pub sha256: String,
+    pub version: String,
+    pub candidate_id: String,
+    pub parent_sha256: Option<String>,
+    pub promoted_at_unix_ms: u64,
+    pub evaluation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImprovementEvidence {
+    pub run_id: String,
+    pub outcome: RunOutcome,
+    pub verification_passed: Option<bool>,
+    pub user_corrected: bool,
+    pub failure_signature: Option<String>,
+    pub recorded_at_unix_ms: u64,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImprovementParent {
+    pub command: String,
+    pub scope: SkillScope,
+    pub sha256: String,
+    pub title: String,
+    pub version: String,
+    pub instructions: String,
+    pub allowed_tools: Vec<String>,
+    pub requirements: CandidateRequirements,
 }
 
 /// What a runtime reports about one learned-skill use, once the run it
@@ -1055,8 +1174,52 @@ pub fn reflection_brief(candidate: &LearningCandidate) -> String {
             &parent[..parent.len().min(12)]
         ));
     }
+    if let Some(parent) = &candidate.parent_skill_content {
+        out.push_str("\nCurrent skill instructions (the exact parent bytes):\n");
+        out.push_str(parent);
+        out.push('\n');
+        let parent_tools = join_set(&candidate.parent_allowed_tools.iter().cloned().collect());
+        out.push_str(&format!(
+            "Existing allowed tools: {}\n",
+            if candidate.parent_allowed_tools.is_empty() {
+                "unrestricted".to_string()
+            } else {
+                parent_tools
+            }
+        ));
+        out.push_str(&format!(
+            "Existing required binaries: {}\nExisting required environment: {}\n",
+            join_set(&candidate.parent_requirements.bins),
+            join_set(&candidate.parent_requirements.env)
+        ));
+    }
+    if !candidate.evidence_runs.is_empty() {
+        out.push_str("\nSelected improvement evidence:\n");
+        for evidence in &candidate.evidence_runs {
+            out.push_str(&format!(
+                "\n--- Run {} ---\nOutcome: {:?}\nVerification: {:?}\nTools: {}\nFailures: {}\nSummary: {}\n",
+                evidence.run_id,
+                evidence.terminal_outcome(),
+                evidence.final_verification(),
+                evidence
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                evidence.failure_signatures.join(" | "),
+                bounded_text(&evidence.summary, MAX_BRIEF_EXCERPT_BYTES),
+            ));
+        }
+    }
     let Some(evidence) = &candidate.evidence else {
-        out.push_str("\nNo bounded evidence snapshot was captured for this candidate.\n");
+        if candidate.evidence_runs.is_empty() {
+            out.push_str("\nNo bounded evidence snapshot was captured for this candidate.\n");
+            return out;
+        }
+        out.push_str("\nThe selected runs above are the complete bounded evidence set.\n");
         return out;
     };
     out.push_str(&format!(
@@ -1355,6 +1518,190 @@ fn capture_is_eligible(state: &StoreState, evidence: &RunEvidence, scope: SkillS
             .any(|call| !call.event_id.is_empty())
 }
 
+fn quality_summary_for(
+    state: &StoreState,
+    command: &str,
+    scope: SkillScope,
+    active_sha256: &str,
+) -> SkillQualitySummary {
+    let mut rows = state
+        .effectiveness
+        .iter()
+        .filter(|entry| {
+            entry.command == command && entry.scope == scope && entry.skill_sha256 == active_sha256
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| right.recorded_at_unix_ms.cmp(&left.recorded_at_unix_ms));
+
+    let verified_successes = rows
+        .iter()
+        .filter(|entry| {
+            entry.outcome != RunOutcome::Cancelled && entry.verification_passed == Some(true)
+        })
+        .count();
+    let verified_failures = rows
+        .iter()
+        .filter(|entry| {
+            entry.outcome != RunOutcome::Cancelled && entry.verification_passed == Some(false)
+        })
+        .count();
+    let verification_bearing = verified_successes + verified_failures;
+    let unknown_verification = rows
+        .iter()
+        .filter(|entry| {
+            entry.outcome != RunOutcome::Cancelled && entry.verification_passed.is_none()
+        })
+        .count();
+    let cancelled_runs = rows
+        .iter()
+        .filter(|entry| entry.outcome == RunOutcome::Cancelled)
+        .count();
+    let corrections = rows.iter().filter(|entry| entry.user_corrected).count();
+    let improvement_evidence_count = rows.iter().filter(|entry| entry.evidence.is_some()).count();
+
+    let mut signatures = BTreeMap::<String, usize>::new();
+    for signature in rows
+        .iter()
+        .filter_map(|entry| entry.failure_signature.clone())
+    {
+        *signatures.entry(signature).or_default() += 1;
+    }
+    let repeated_failure_signatures = signatures
+        .into_iter()
+        .filter(|(_, count)| *count >= REPEATED_FAILURE_THRESHOLD as usize)
+        .map(|(signature, count)| SkillQualityFailureSignature { signature, count })
+        .collect::<Vec<_>>();
+
+    let latest_verification_failure = rows
+        .iter()
+        .find(|entry| entry.outcome != RunOutcome::Cancelled && entry.verification_passed.is_some())
+        .is_some_and(|entry| entry.verification_passed == Some(false));
+    let last_five_verified_failures = rows
+        .iter()
+        .filter(|entry| {
+            entry.outcome != RunOutcome::Cancelled && entry.verification_passed.is_some()
+        })
+        .take(5)
+        .filter(|entry| entry.verification_passed == Some(false))
+        .count();
+    let hard_negative = corrections > 0
+        || !repeated_failure_signatures.is_empty()
+        || latest_verification_failure
+        || last_five_verified_failures >= 2;
+
+    let mut reasons = Vec::new();
+    if corrections > 0 {
+        reasons.push(format!(
+            "A user correction was recorded after this version ran."
+        ));
+    }
+    for repeated in &repeated_failure_signatures {
+        reasons.push(format!(
+            "The same failure occurred in {} runs: {}.",
+            repeated.count, repeated.signature
+        ));
+    }
+    if latest_verification_failure {
+        reasons.push("The last verification-bearing run failed.".to_string());
+    }
+    if last_five_verified_failures >= 2 {
+        reasons.push(format!(
+            "{} of the last 5 verification-bearing runs failed.",
+            last_five_verified_failures
+        ));
+    }
+
+    let state_value = if hard_negative {
+        SkillQualityState::NeedsAttention
+    } else if verification_bearing < QUALITY_VERIFICATION_THRESHOLD {
+        reasons.push(format!(
+            "Only {} verification-bearing run{} exist for this version.",
+            verification_bearing,
+            if verification_bearing == 1 { "" } else { "s" }
+        ));
+        SkillQualityState::InsufficientData
+    } else {
+        reasons.push(format!(
+            "{} verification-bearing runs completed with no unresolved corrections.",
+            verification_bearing
+        ));
+        SkillQualityState::Healthy
+    };
+
+    let recent_runs = rows
+        .iter()
+        .take(MAX_RECENT_QUALITY_RUNS)
+        .map(|entry| SkillQualityRun {
+            run_id: entry.run_id.clone(),
+            outcome: entry.outcome,
+            verification_passed: entry.verification_passed,
+            user_corrected: entry.user_corrected,
+            failure_signature: entry.failure_signature.clone(),
+            recorded_at_unix_ms: entry.recorded_at_unix_ms,
+            summary: entry
+                .evidence
+                .as_ref()
+                .map(|evidence| bounded_text(&evidence.summary, 240))
+                .unwrap_or_else(|| "No bounded run summary is available.".to_string()),
+            evidence_available: entry.evidence.is_some(),
+        })
+        .collect();
+    let open_improvement_candidate_id = state
+        .candidates
+        .values()
+        .filter(|candidate| {
+            candidate.scope == scope
+                && candidate.proposed_command == command
+                && candidate.parent_skill_sha256.as_deref() == Some(active_sha256)
+                && matches!(
+                    candidate.status,
+                    CandidateStatus::Detected
+                        | CandidateStatus::Reflecting
+                        | CandidateStatus::Staged
+                        | CandidateStatus::Evaluating
+                        | CandidateStatus::AwaitingApproval
+                )
+        })
+        .max_by_key(|candidate| candidate.updated_at_unix_ms)
+        .map(|candidate| candidate.candidate_id.clone());
+
+    SkillQualitySummary {
+        command: command.to_string(),
+        scope,
+        active_sha256: active_sha256.to_string(),
+        state: state_value,
+        reasons,
+        total_runs: rows.len(),
+        verified_successes,
+        verified_failures,
+        unknown_verification,
+        cancelled_runs,
+        corrections,
+        improvement_evidence_count,
+        recent_runs,
+        repeated_failure_signatures,
+        last_used_at_unix_ms: rows.iter().map(|entry| entry.recorded_at_unix_ms).max(),
+        last_verified_success_at_unix_ms: rows
+            .iter()
+            .filter(|entry| {
+                entry.outcome != RunOutcome::Cancelled && entry.verification_passed == Some(true)
+            })
+            .map(|entry| entry.recorded_at_unix_ms)
+            .max(),
+        last_failure_at_unix_ms: rows
+            .iter()
+            .filter(|entry| entry.failed())
+            .map(|entry| entry.recorded_at_unix_ms)
+            .max(),
+        last_correction_at_unix_ms: rows
+            .iter()
+            .filter(|entry| entry.user_corrected)
+            .map(|entry| entry.recorded_at_unix_ms)
+            .max(),
+        open_improvement_candidate_id,
+    }
+}
+
 /// Durable, backend-owned learning store. Authoritative state lives on disk;
 /// no learning state is ever authoritative in a frontend store.
 pub struct SkillLearningStore {
@@ -1539,6 +1886,321 @@ impl SkillLearningStore {
         Ok(capture_is_eligible(&state, evidence, scope))
     }
 
+    /// Returns only bounded effectiveness rows that belong to the exact
+    /// active learned version and still carry durable run evidence. The
+    /// ordering is deterministic and favors corrections, repeated failures,
+    /// verified failures, then recent verified successes.
+    pub fn improvement_evidence(
+        &self,
+        scope: SkillScope,
+        command: &str,
+        active_sha256: &str,
+    ) -> Result<Vec<ImprovementEvidence>, SkillError> {
+        let _guard = self.lock()?;
+        let state = self.load()?;
+        if !state.provenance.contains_key(active_sha256) {
+            return Err(SkillError::Conflict(format!(
+                "/{command} is not an active learned skill"
+            )));
+        }
+        let mut rows = state
+            .effectiveness
+            .iter()
+            .filter(|entry| {
+                entry.command == command
+                    && entry.scope == scope
+                    && entry.skill_sha256 == active_sha256
+                    && entry.evidence.is_some()
+            })
+            .collect::<Vec<_>>();
+        let mut signature_counts = BTreeMap::<String, usize>::new();
+        for signature in rows
+            .iter()
+            .filter_map(|entry| entry.failure_signature.as_ref())
+        {
+            *signature_counts.entry(signature.clone()).or_default() += 1;
+        }
+        rows.sort_by(|left, right| {
+            right
+                .user_corrected
+                .cmp(&left.user_corrected)
+                .then_with(|| {
+                    let left_repeated = left
+                        .failure_signature
+                        .as_ref()
+                        .and_then(|signature| signature_counts.get(signature))
+                        .is_some_and(|count| *count >= REPEATED_FAILURE_THRESHOLD as usize);
+                    let right_repeated = right
+                        .failure_signature
+                        .as_ref()
+                        .and_then(|signature| signature_counts.get(signature))
+                        .is_some_and(|count| *count >= REPEATED_FAILURE_THRESHOLD as usize);
+                    right_repeated.cmp(&left_repeated)
+                })
+                .then_with(|| {
+                    (right.verification_passed == Some(false))
+                        .cmp(&(left.verification_passed == Some(false)))
+                })
+                .then_with(|| {
+                    (right.verification_passed == Some(true))
+                        .cmp(&(left.verification_passed == Some(true)))
+                })
+                .then_with(|| right.recorded_at_unix_ms.cmp(&left.recorded_at_unix_ms))
+        });
+        Ok(rows
+            .into_iter()
+            .take(MAX_RECENT_QUALITY_RUNS)
+            .map(|entry| ImprovementEvidence {
+                run_id: entry.run_id.clone(),
+                outcome: entry.outcome,
+                verification_passed: entry.verification_passed,
+                user_corrected: entry.user_corrected,
+                failure_signature: entry.failure_signature.clone(),
+                recorded_at_unix_ms: entry.recorded_at_unix_ms,
+                summary: entry
+                    .evidence
+                    .as_ref()
+                    .map(|evidence| bounded_text(&evidence.summary, 240))
+                    .unwrap_or_else(|| "No bounded run summary is available.".to_string()),
+            })
+            .collect())
+    }
+
+    /// Returns one bounded evidence snapshot for the exact active learned
+    /// version. The caller cannot use this endpoint to inspect another skill,
+    /// an old version, or a run that was only claimed by the frontend.
+    pub fn run_evidence(
+        &self,
+        scope: SkillScope,
+        command: &str,
+        active_sha256: &str,
+        run_id: &str,
+    ) -> Result<RunEvidence, SkillError> {
+        let _guard = self.lock()?;
+        let state = self.load()?;
+        if !state.provenance.contains_key(active_sha256) {
+            return Err(SkillError::Conflict(format!(
+                "/{command} is not an active learned skill"
+            )));
+        }
+        let evidence = state
+            .effectiveness
+            .iter()
+            .find(|entry| {
+                entry.command == command
+                    && entry.scope == scope
+                    && entry.skill_sha256 == active_sha256
+                    && entry.run_id == run_id
+            })
+            .and_then(|entry| entry.evidence.clone())
+            .ok_or_else(|| {
+                SkillError::NotFound(format!(
+                    "bounded evidence for run {run_id} was not found for /{command}"
+                ))
+            })?;
+        if evidence.run_id != run_id
+            || !evidence.invoked_skills.iter().any(|invoked| {
+                invoked.command == command
+                    && invoked.sha256 == active_sha256
+                    && invoked.scope
+                        == match scope {
+                            SkillScope::Global => "global",
+                            SkillScope::Workspace => "workspace",
+                        }
+            })
+        {
+            return Err(SkillError::Conflict(format!(
+                "run {run_id} cannot be proven to have invoked the active /{command} version"
+            )));
+        }
+        Ok(bounded_evidence(&evidence))
+    }
+
+    /// Starts an explicit improvement from backend-owned evidence. The caller
+    /// supplies only the stable selection ids and a backend-resolved parent
+    /// snapshot; rows and evidence are re-read here, so the frontend cannot
+    /// manufacture a run, SHA, source, or parent.
+    pub fn begin_improvement(
+        &self,
+        parent: &ImprovementParent,
+        selected_run_ids: &[String],
+    ) -> Result<LearningCandidate, SkillError> {
+        let _guard = self.lock()?;
+        let mut state = self.load()?;
+        if selected_run_ids.is_empty() || selected_run_ids.len() > MAX_IMPROVEMENT_EVIDENCE {
+            return Err(SkillError::Invalid(format!(
+                "select between 1 and {MAX_IMPROVEMENT_EVIDENCE} improvement evidence runs"
+            )));
+        }
+        let unique = selected_run_ids.iter().collect::<BTreeSet<_>>();
+        if unique.len() != selected_run_ids.len() {
+            return Err(SkillError::Invalid(
+                "an improvement evidence run may only be selected once".to_string(),
+            ));
+        }
+        let provenance = state.provenance.get(&parent.sha256).ok_or_else(|| {
+            SkillError::Conflict("the selected parent is not a learned skill version".to_string())
+        })?;
+        let parent_candidate = candidate_of(&state, &provenance.candidate_id)?;
+        if parent_candidate.scope != parent.scope
+            || parent_candidate.proposed_command != parent.command
+        {
+            return Err(SkillError::Conflict(
+                "the selected parent does not belong to this command and scope".to_string(),
+            ));
+        }
+
+        let mut selected = Vec::new();
+        for run_id in selected_run_ids {
+            let row = state
+                .effectiveness
+                .iter()
+                .find(|entry| {
+                    entry.run_id == *run_id
+                        && entry.command == parent.command
+                        && entry.scope == parent.scope
+                        && entry.skill_sha256 == parent.sha256
+                })
+                .ok_or_else(|| {
+                    SkillError::Conflict(format!(
+                        "run {run_id} is not evidence for the active /{} version",
+                        parent.command
+                    ))
+                })?;
+            let evidence = row.evidence.clone().ok_or_else(|| {
+                SkillError::Conflict(format!(
+                    "run {run_id} has no bounded durable evidence for improvement"
+                ))
+            })?;
+            if evidence.run_id != *run_id
+                || !evidence.invoked_skills.iter().any(|invoked| {
+                    invoked.command == parent.command
+                        && invoked.sha256 == parent.sha256
+                        && invoked.scope
+                            == match parent.scope {
+                                SkillScope::Global => "global",
+                                SkillScope::Workspace => "workspace",
+                            }
+                })
+            {
+                return Err(SkillError::Conflict(format!(
+                    "run {run_id} cannot be proven to have invoked the selected parent version"
+                )));
+            }
+            selected.push(bounded_evidence(&evidence));
+        }
+
+        if let Some(existing) = state.candidates.values().find(|candidate| {
+            candidate.scope == parent.scope
+                && candidate.proposed_command == parent.command
+                && candidate.parent_skill_sha256.as_deref() == Some(parent.sha256.as_str())
+                && matches!(
+                    candidate.status,
+                    CandidateStatus::Detected
+                        | CandidateStatus::Reflecting
+                        | CandidateStatus::Staged
+                        | CandidateStatus::Evaluating
+                        | CandidateStatus::AwaitingApproval
+                )
+        }) {
+            return Ok(existing.clone());
+        }
+
+        let now = now_unix_ms();
+        let source_run_ids = selected
+            .iter()
+            .map(|evidence| evidence.run_id.clone())
+            .collect::<Vec<_>>();
+        let source_event_ids = selected
+            .iter()
+            .flat_map(|evidence| {
+                evidence
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.event_id.clone())
+                    .chain(
+                        evidence
+                            .verifications
+                            .iter()
+                            .map(|entry| entry.event_id.clone()),
+                    )
+            })
+            .take(MAX_SOURCE_EVENTS)
+            .collect::<Vec<_>>();
+        let candidate = LearningCandidate {
+            candidate_id: format!("learn-{}", Uuid::new_v4().simple()),
+            scope: parent.scope,
+            status: CandidateStatus::Detected,
+            title: format!("Improve /{}", parent.command),
+            description: format!("Evidence-backed improvement for /{}", parent.command),
+            source_run_ids,
+            source_event_ids,
+            source_kind: LearningSourceKind::ManualImprovement,
+            signal_summary: format!(
+                "You requested an improvement for /{} using {} selected run{}.",
+                parent.command,
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            ),
+            proposed_command: parent.command.clone(),
+            proposed_skill_content: String::new(),
+            proposed_resource_files: Vec::new(),
+            allowed_tools: parent.allowed_tools.clone(),
+            requirements: parent.requirements.clone(),
+            parent_skill_sha256: Some(parent.sha256.clone()),
+            candidate_sha256: String::new(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            evaluation_summary: None,
+            evaluation_ids: Vec::new(),
+            evaluation_verdict: None,
+            approval_digest: None,
+            installed_sha256: None,
+            dedup: Some(DedupOutcome::UpdateExisting),
+            dedup_detail: Some(format!(
+                "Improves the active /{} version {}.",
+                parent.command,
+                &parent.sha256[..12.min(parent.sha256.len())]
+            )),
+            policy: None,
+            rejection_reason: None,
+            staging_path: None,
+            workspace_path: parent_candidate.workspace_path.clone(),
+            observed_prompt: selected
+                .first()
+                .map(|evidence| evidence.user_text.clone())
+                .unwrap_or_default(),
+            observed_tools: selected
+                .iter()
+                .flat_map(|evidence| {
+                    evidence
+                        .tool_calls
+                        .iter()
+                        .filter(|call| call.succeeded)
+                        .map(|call| call.tool_name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            evidence: selected.first().cloned(),
+            correction: None,
+            approval_id: None,
+            parent_skill_content: Some(bounded_text(&parent.instructions, MAX_SKILL_CONTENT_BYTES)),
+            parent_skill_title: Some(parent.title.clone()),
+            parent_scope: Some(parent.scope),
+            parent_allowed_tools: parent.allowed_tools.clone(),
+            parent_requirements: parent.requirements.clone(),
+            evidence_runs: selected,
+        };
+        prune_candidates(&mut state);
+        state
+            .candidates
+            .insert(candidate.candidate_id.clone(), candidate.clone());
+        self.save(&state)?;
+        Ok(candidate)
+    }
+
     /// Records the run's failure signatures and, when the deterministic rules
     /// fire, opens a `detected` candidate bound to that evidence. Returns
     /// `None` in `Off` mode and for any run without qualifying evidence.
@@ -1652,6 +2314,12 @@ impl SkillLearningStore {
             evidence: Some(bounded_evidence(evidence)),
             correction: None,
             approval_id: None,
+            parent_skill_content: None,
+            parent_skill_title: None,
+            parent_scope: None,
+            parent_allowed_tools: Vec::new(),
+            parent_requirements: CandidateRequirements::default(),
+            evidence_runs: Vec::new(),
         };
         prune_candidates(&mut state);
         state
@@ -1784,6 +2452,12 @@ impl SkillLearningStore {
             evidence: Some(bounded_evidence(evidence)),
             correction: None,
             approval_id: None,
+            parent_skill_content: None,
+            parent_skill_title: None,
+            parent_scope: None,
+            parent_allowed_tools: Vec::new(),
+            parent_requirements: CandidateRequirements::default(),
+            evidence_runs: Vec::new(),
         };
         prune_candidates(&mut state);
         state
@@ -1880,7 +2554,10 @@ impl SkillLearningStore {
         let mut state = self.load()?;
         let existing = candidate_of(&state, candidate_id)?;
         if state.mode == LearningMode::Off
-            && existing.source_kind != LearningSourceKind::ManualRunCapture
+            && !matches!(
+                existing.source_kind,
+                LearningSourceKind::ManualRunCapture | LearningSourceKind::ManualImprovement
+            )
         {
             return Err(SkillError::Conflict(
                 "learning is turned off; no candidate can be staged".to_string(),
@@ -1916,6 +2593,14 @@ impl SkillLearningStore {
         let descriptors = manager.discover(workspace.as_deref(), signed_packages)?;
         let (dedup, dedup_detail, parent) =
             classify_dedup(&validated, scope, &descriptors, &state, candidate_id);
+        if existing.source_kind == LearningSourceKind::ManualImprovement
+            && existing.parent_skill_sha256 != parent.as_ref().map(|entry| entry.sha256.clone())
+        {
+            return Err(SkillError::Conflict(
+                "the active skill changed since this improvement started; regenerate the improvement"
+                    .to_string(),
+            ));
+        }
         let mode = state.mode;
 
         let staging = self.staging_root.join(candidate_id);
@@ -2009,6 +2694,9 @@ impl SkillLearningStore {
             candidate_sha256: entry.candidate_sha256.clone(),
             skill_instructions: entry.proposed_skill_content.clone(),
             allowed_tools: entry.allowed_tools.clone(),
+            baseline_skill_instructions: entry.parent_skill_content.clone(),
+            baseline_allowed_tools: entry.parent_allowed_tools.clone(),
+            baseline_sha256: entry.parent_skill_sha256.clone(),
             cases,
             workspace_path: entry.workspace_path.clone(),
             observed_mutation: entry
@@ -2250,6 +2938,35 @@ impl SkillLearningStore {
             ));
         }
         let workspace = self.workspace_for(&candidate, workspace)?;
+        let current_parent = manager
+            .discover(workspace.as_deref(), &[])?
+            .into_iter()
+            .filter(|entry| {
+                entry.command == candidate.proposed_command
+                    && descriptor_scope(entry) == Some(candidate.scope)
+            })
+            .find(|entry| {
+                candidate
+                    .parent_skill_sha256
+                    .as_deref()
+                    .is_none_or(|parent| entry.sha256 == parent)
+            })
+            .map(|entry| entry.sha256);
+        if candidate.parent_skill_sha256 != current_parent {
+            let entry = candidate_mut(&mut state, candidate_id)?;
+            entry.status = CandidateStatus::Superseded;
+            entry.rejection_reason = Some(
+                "the active skill changed since this candidate was created; regenerate the improvement"
+                    .to_string(),
+            );
+            entry.updated_at_unix_ms = now_unix_ms();
+            let stale = entry.clone();
+            self.save(&state)?;
+            return Err(SkillError::Conflict(format!(
+                "the active /{} version changed; regenerate the improvement",
+                stale.proposed_command
+            )));
+        }
         // Recomputed from the staged bytes rather than trusted from the stored
         // candidate: a digest is only meaningful if it is derived at the moment
         // it authorizes something.
@@ -2418,6 +3135,7 @@ impl SkillLearningStore {
             failure_signature: failure_signature.clone(),
             user_corrected: false,
             recorded_at_unix_ms: now_unix_ms(),
+            evidence: evidence.map(bounded_evidence),
         });
         if state.effectiveness.len() > MAX_EFFECTIVENESS_RECORDS {
             let excess = state.effectiveness.len() - MAX_EFFECTIVENESS_RECORDS;
@@ -2661,6 +3379,12 @@ impl SkillLearningStore {
             evidence,
             correction: Some(correction),
             approval_id: None,
+            parent_skill_content: None,
+            parent_skill_title: None,
+            parent_scope: None,
+            parent_allowed_tools: Vec::new(),
+            parent_requirements: CandidateRequirements::default(),
+            evidence_runs: Vec::new(),
         };
         prune_candidates(state);
         state
@@ -2734,8 +3458,14 @@ impl SkillLearningStore {
             let rows = state
                 .effectiveness
                 .iter()
-                .filter(|entry| entry.skill_sha256 == descriptor.sha256)
+                .filter(|entry| {
+                    entry.command == descriptor.command
+                        && entry.scope == scope
+                        && entry.skill_sha256 == descriptor.sha256
+                })
                 .collect::<Vec<_>>();
+            let quality =
+                quality_summary_for(&state, &descriptor.command, scope, &descriptor.sha256);
             let mut previous = Vec::new();
             let mut cursor = provenance.parent_skill_sha256.clone();
             while let Some(sha) = cursor {
@@ -2747,6 +3477,27 @@ impl SkillLearningStore {
                     .provenance
                     .get(&sha)
                     .and_then(|entry| entry.parent_skill_sha256.clone());
+            }
+            let native_history = manager.history(scope, workspace, &descriptor.command)?;
+            let mut history = vec![SkillVersionHistory {
+                sha256: descriptor.sha256.clone(),
+                version: descriptor.version.clone(),
+                candidate_id: provenance.candidate_id.clone(),
+                parent_sha256: provenance.parent_skill_sha256.clone(),
+                promoted_at_unix_ms: provenance.promoted_at_unix_ms,
+                evaluation_ids: provenance.evaluation_ids.clone(),
+            }];
+            for archived in native_history {
+                if let Some(old_provenance) = state.provenance.get(&archived.sha256) {
+                    history.push(SkillVersionHistory {
+                        sha256: archived.sha256,
+                        version: archived.version,
+                        candidate_id: old_provenance.candidate_id.clone(),
+                        parent_sha256: old_provenance.parent_skill_sha256.clone(),
+                        promoted_at_unix_ms: old_provenance.promoted_at_unix_ms,
+                        evaluation_ids: old_provenance.evaluation_ids.clone(),
+                    });
+                }
             }
             summaries.push(LearnedSkillSummary {
                 command: descriptor.command.clone(),
@@ -2762,6 +3513,8 @@ impl SkillLearningStore {
                 failures: rows.iter().filter(|entry| entry.failed()).count(),
                 corrections: rows.iter().filter(|entry| entry.user_corrected).count(),
                 last_used_at_unix_ms: rows.iter().map(|entry| entry.recorded_at_unix_ms).max(),
+                quality,
+                history,
             });
         }
         Ok(summaries)
@@ -2770,6 +3523,11 @@ impl SkillLearningStore {
     pub fn effectiveness(&self) -> Result<Vec<EffectivenessRecord>, SkillError> {
         let _guard = self.lock()?;
         Ok(self.load()?.effectiveness)
+    }
+
+    pub fn is_learned_version(&self, sha256: &str) -> Result<bool, SkillError> {
+        let _guard = self.lock()?;
+        Ok(self.load()?.provenance.contains_key(sha256))
     }
 
     /// Restart reconciliation. Resolves an interrupted promotion against what
@@ -4610,6 +5368,14 @@ fn bounded_text(value: &str, max: usize) -> String {
         end -= 1;
     }
     trimmed[..end].to_string()
+}
+
+fn join_set(values: &BTreeSet<String>) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<(), SkillError> {
@@ -8440,5 +9206,212 @@ mod tests {
             .unwrap();
         assert_eq!(summary.uses, 3);
         assert_eq!(summary.failures, 2);
+    }
+
+    fn effectiveness_row(
+        run_id: &str,
+        sha256: &str,
+        outcome: RunOutcome,
+        verification_passed: Option<bool>,
+        recorded_at_unix_ms: u64,
+    ) -> EffectivenessRecord {
+        EffectivenessRecord {
+            command: "review".to_string(),
+            scope: SkillScope::Workspace,
+            skill_sha256: sha256.to_string(),
+            run_id: run_id.to_string(),
+            session_id: None,
+            outcome,
+            verification_passed,
+            tool_failures: Vec::new(),
+            failure_signature: verification_passed
+                .is_some_and(|passed| !passed)
+                .then(|| "verification:failed".to_string()),
+            user_corrected: false,
+            recorded_at_unix_ms,
+            evidence: None,
+        }
+    }
+
+    #[test]
+    fn quality_is_scoped_to_the_active_sha_and_unknown_is_not_success() {
+        let mut state = StoreState::default();
+        let old = "a".repeat(64);
+        let active = "b".repeat(64);
+        state.effectiveness = vec![
+            effectiveness_row("old-1", &old, RunOutcome::Failure, Some(false), 1),
+            effectiveness_row("old-2", &old, RunOutcome::Failure, Some(false), 2),
+            effectiveness_row("new-1", &active, RunOutcome::Success, Some(true), 3),
+            effectiveness_row("new-2", &active, RunOutcome::Success, None, 4),
+            effectiveness_row("new-3", &active, RunOutcome::Cancelled, None, 5),
+        ];
+        let summary = quality_summary_for(&state, "review", SkillScope::Workspace, &active);
+        assert_eq!(summary.total_runs, 3);
+        assert_eq!(summary.verified_successes, 1);
+        assert_eq!(summary.verified_failures, 0);
+        assert_eq!(summary.unknown_verification, 1);
+        assert_eq!(summary.cancelled_runs, 1);
+        assert_eq!(summary.state, SkillQualityState::InsufficientData);
+    }
+
+    #[test]
+    fn quality_hard_negative_signals_are_deterministic() {
+        let mut state = StoreState::default();
+        let active = "c".repeat(64);
+        let mut rows = (0..3)
+            .map(|index| {
+                effectiveness_row(
+                    &format!("ok-{index}"),
+                    &active,
+                    RunOutcome::Success,
+                    Some(true),
+                    index + 1,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows[2].verification_passed = Some(false);
+        rows[2].outcome = RunOutcome::Failure;
+        rows[2].failure_signature = Some("same failure".to_string());
+        rows.push(effectiveness_row(
+            "fail-2",
+            &active,
+            RunOutcome::Failure,
+            Some(false),
+            4,
+        ));
+        rows[3].failure_signature = Some("same failure".to_string());
+        state.effectiveness = rows;
+        let summary = quality_summary_for(&state, "review", SkillScope::Workspace, &active);
+        assert_eq!(summary.state, SkillQualityState::NeedsAttention);
+        assert!(summary
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("same failure")));
+    }
+
+    #[test]
+    fn quality_counts_cancellation_as_neither_success_nor_failure() {
+        let mut state = StoreState::default();
+        let active = "d".repeat(64);
+        state.effectiveness = vec![effectiveness_row(
+            "cancelled",
+            &active,
+            RunOutcome::Cancelled,
+            Some(false),
+            1,
+        )];
+        let summary = quality_summary_for(&state, "review", SkillScope::Workspace, &active);
+        assert_eq!(summary.cancelled_runs, 1);
+        assert_eq!(summary.verified_successes, 0);
+        assert_eq!(summary.verified_failures, 0);
+        assert_eq!(summary.state, SkillQualityState::InsufficientData);
+    }
+
+    #[test]
+    fn quality_is_healthy_only_after_three_verified_runs_without_hard_negatives() {
+        let active = "e".repeat(64);
+        let mut state = StoreState::default();
+        state.effectiveness = (0..3)
+            .map(|index| {
+                effectiveness_row(
+                    &format!("success-{index}"),
+                    &active,
+                    RunOutcome::Success,
+                    Some(true),
+                    index + 1,
+                )
+            })
+            .collect();
+        let summary = quality_summary_for(&state, "review", SkillScope::Workspace, &active);
+        assert_eq!(summary.state, SkillQualityState::Healthy);
+        assert_eq!(summary.verified_successes, 3);
+    }
+
+    #[test]
+    fn explicit_improvement_uses_active_evidence_even_when_learning_is_manual() {
+        let directory = TestDirectory::new("manual-improvement");
+        let store = store(&directory);
+        let manager = manager(&directory);
+        let detected = store
+            .detect(
+                &evidence_from_events("run-1", "add retries", &verified_procedure_events()),
+                SkillScope::Global,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        stage(
+            &store,
+            &manager,
+            &detected.candidate_id,
+            &proposal("retry-wrapper", "Version one."),
+        );
+        pass_evaluation(&store, &detected.candidate_id);
+        store
+            .promote(
+                &detected.candidate_id,
+                Some(&approve(&store, &detected.candidate_id)),
+                false,
+                &manager,
+                None,
+            )
+            .unwrap();
+        let descriptor = manager
+            .discover(None, &[])
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.command == "retry-wrapper")
+            .unwrap();
+        let mut use_evidence = evidence_from_events(
+            "use-1",
+            "use the retry wrapper",
+            &verified_procedure_events(),
+        );
+        use_evidence.invoked_skills = vec![InvokedSkillEvidence {
+            command: descriptor.command.clone(),
+            scope: "global".to_string(),
+            sha256: descriptor.sha256.clone(),
+        }];
+        store.record_run(&use_evidence, Some("session-1")).unwrap();
+        store.set_mode(LearningMode::Off).unwrap();
+
+        let parent = ImprovementParent {
+            command: descriptor.command.clone(),
+            scope: SkillScope::Global,
+            sha256: descriptor.sha256.clone(),
+            title: descriptor.name.clone(),
+            version: descriptor.version.clone(),
+            instructions: descriptor.instructions.clone(),
+            allowed_tools: descriptor.allowed_tools.clone(),
+            requirements: CandidateRequirements {
+                bins: descriptor.requirements.bins.clone(),
+                env: descriptor.requirements.env.clone(),
+            },
+        };
+        let candidate = store
+            .begin_improvement(&parent, &["use-1".to_string()])
+            .unwrap();
+        assert_eq!(candidate.source_kind, LearningSourceKind::ManualImprovement);
+        assert_eq!(
+            candidate.parent_skill_sha256,
+            Some(descriptor.sha256.clone())
+        );
+        assert_eq!(candidate.evidence_runs.len(), 1);
+
+        let repeated = store
+            .begin_improvement(&parent, &["use-1".to_string()])
+            .unwrap();
+        assert_eq!(repeated.candidate_id, candidate.candidate_id);
+
+        let mut wrong_sha = parent.clone();
+        wrong_sha.sha256 = "f".repeat(64);
+        assert!(matches!(
+            store.begin_improvement(&wrong_sha, &["use-1".to_string()]),
+            Err(SkillError::Conflict(_))
+        ));
+        assert!(matches!(
+            store.begin_improvement(&parent, &["missing".to_string()]),
+            Err(SkillError::Conflict(_))
+        ));
     }
 }

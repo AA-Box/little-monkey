@@ -149,6 +149,32 @@ describe("runCandidateEvaluation", () => {
     expect(prompts.filter((prompt: string) => !prompt.includes("withRetry"))).toHaveLength(2);
   });
 
+  it("runs an improvement against the exact installed parent baseline", async () => {
+    const api = client(
+      {
+        planEvaluation: vi.fn(async () =>
+          plan({
+            baseline_skill_instructions: "The current retry helper.",
+            baseline_allowed_tools: ["read_file"],
+            baseline_sha256: "b".repeat(64),
+          }),
+        ),
+      },
+    );
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    const calls = new Map(
+      runHeadlessAgent.mock.calls.map((call: unknown[]) => {
+        const params = call[0] as { runId: string; systemPrompt: string; allowedTools?: string[] };
+        return [params.runId, params];
+      }),
+    );
+    expect(calls.get("eval-abc-baseline-positive")).toMatchObject({
+      allowedTools: ["read_file"],
+    });
+    expect(calls.get("eval-abc-baseline-positive")?.systemPrompt).toContain("current retry helper");
+    expect(calls.get("eval-abc-candidate-positive")?.systemPrompt).toContain("withRetry");
+  });
+
   it("runs the candidate arm under the restriction the skill will carry once installed", async () => {
     // Otherwise an arm could pass using a tool the installed skill will not
     // have, and the evaluation would not be measuring what ships.

@@ -27,6 +27,7 @@ export type CandidateStatus =
 export type LearningSourceKind =
   | "explicit_user_instruction"
   | "manual_run_capture"
+  | "manual_improvement"
   | "user_correction"
   | "verification_repair"
   | "successful_novel_procedure"
@@ -109,6 +110,12 @@ export interface LearningCandidate {
   evidence: RunEvidence | null;
   correction: CorrectionEvidence | null;
   approval_id: string | null;
+  parent_skill_content?: string | null;
+  parent_skill_title?: string | null;
+  parent_scope?: NativeSkillScope | null;
+  parent_allowed_tools?: string[];
+  parent_requirements?: CandidateRequirements;
+  evidence_runs?: RunEvidence[];
 }
 
 export interface ToolEvidence {
@@ -150,6 +157,7 @@ export interface RunEvidence {
   invoked_skills: InvokedSkillEvidence[];
   summary: string;
   failure_signatures: string[];
+  checkpoint_id?: string | null;
 }
 
 export interface CorrectionEvidence {
@@ -194,6 +202,9 @@ export interface EvaluationPlan {
   candidate_sha256: string;
   skill_instructions: string;
   allowed_tools: string[];
+  baseline_skill_instructions?: string | null;
+  baseline_allowed_tools?: string[];
+  baseline_sha256?: string | null;
   cases: EvaluationCase[];
   /** The workspace the observed run happened in. `null` means no reproducible
    * isolated environment can be built, which is an `unevaluated`, never a run
@@ -247,6 +258,60 @@ export interface LearnedProvenance {
   promoted_at_unix_ms: number;
 }
 
+export type SkillQualityState = "insufficient_data" | "healthy" | "needs_attention";
+
+export interface SkillQualityRun {
+  run_id: string;
+  outcome: RunOutcome;
+  verification_passed: boolean | null;
+  user_corrected: boolean;
+  failure_signature: string | null;
+  recorded_at_unix_ms: number;
+  summary: string;
+  evidence_available: boolean;
+}
+
+export interface SkillQualitySummary {
+  command: string;
+  scope: NativeSkillScope;
+  active_sha256: string;
+  state: SkillQualityState;
+  reasons: string[];
+  total_runs: number;
+  verified_successes: number;
+  verified_failures: number;
+  unknown_verification: number;
+  cancelled_runs: number;
+  corrections: number;
+  improvement_evidence_count: number;
+  recent_runs: SkillQualityRun[];
+  repeated_failure_signatures: Array<{ signature: string; count: number }>;
+  last_used_at_unix_ms: number | null;
+  last_verified_success_at_unix_ms: number | null;
+  last_failure_at_unix_ms: number | null;
+  last_correction_at_unix_ms: number | null;
+  open_improvement_candidate_id: string | null;
+}
+
+export interface SkillVersionHistory {
+  sha256: string;
+  version: string;
+  candidate_id: string;
+  parent_sha256: string | null;
+  promoted_at_unix_ms: number;
+  evaluation_ids: string[];
+}
+
+export interface ImprovementEvidence {
+  run_id: string;
+  outcome: RunOutcome;
+  verification_passed: boolean | null;
+  user_corrected: boolean;
+  failure_signature: string | null;
+  recorded_at_unix_ms: number;
+  summary: string;
+}
+
 export interface LearnedSkillSummary {
   command: string;
   scope: NativeSkillScope;
@@ -261,6 +326,8 @@ export interface LearnedSkillSummary {
   failures: number;
   corrections: number;
   last_used_at_unix_ms: number | null;
+  quality: SkillQualitySummary;
+  history: SkillVersionHistory[];
 }
 
 export interface EffectivenessRecord {
@@ -275,6 +342,7 @@ export interface EffectivenessRecord {
   failure_signature: string | null;
   user_corrected: boolean;
   recorded_at_unix_ms: number;
+  evidence?: RunEvidence | null;
 }
 
 export type PromotionOutcome =
@@ -382,6 +450,17 @@ export const skillLearningClient = {
     invoke<LearningCandidate | null>("skill_learning_record_correction", { sessionId, runId, userText }),
   effectiveness: () => invoke<EffectivenessRecord[]>("skill_learning_effectiveness"),
   learnedSkills: () => invoke<LearnedSkillSummary[]>("skill_learning_learned_skills"),
+  qualitySummaries: () => invoke<LearnedSkillSummary[]>("skill_learning_quality_summaries"),
+  improvementEvidence: (scope: NativeSkillScope, command: string) =>
+    invoke<ImprovementEvidence[]>("skill_learning_improvement_evidence", { scope, command }),
+  runEvidence: (scope: NativeSkillScope, command: string, runId: string) =>
+    invoke<RunEvidence>("skill_learning_run_evidence", { scope, command, runId }),
+  beginImprovement: (scope: NativeSkillScope, command: string, selectedRunIds: string[]) =>
+    invoke<LearningCandidate>("skill_learning_begin_improvement", {
+      scope,
+      command,
+      selectedRunIds,
+    }),
   deprecate: (scope: NativeSkillScope, command: string, reason: string) =>
     invoke<NativeSkillMutationResult>("skill_learning_deprecate", { scope, command, reason }),
   /** Discovery with learned provenance attached — the same descriptors

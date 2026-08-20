@@ -64,6 +64,23 @@ function stagedSkill(plan: EvaluationPlan): SlashSkill {
   };
 }
 
+function baselineSkill(plan: EvaluationPlan): SlashSkill | null {
+  if (!plan.baseline_skill_instructions || !plan.baseline_sha256) return null;
+  return {
+    id: `native:baseline:${plan.command}:${plan.baseline_sha256}`,
+    source: "native",
+    command: plan.command,
+    name: plan.title || plan.command,
+    description: "",
+    instructions: plan.baseline_skill_instructions,
+    version: "baseline",
+    contentSha256: plan.baseline_sha256,
+    permissions: [],
+    allowedTools: plan.baseline_allowed_tools,
+    resourceFiles: [],
+  };
+}
+
 function sandboxArm(arm: Arm, testCase: EvaluationCase): string {
   return `${arm}-${testCase.case_id}`;
 }
@@ -99,11 +116,12 @@ async function runArm(
 ): Promise<EvaluationCaseReport> {
   const runId = `${plan.evaluation_id}-${arm}-${testCase.case_id}`;
   const systemPrompt =
-    arm === "candidate"
-      ? composeSkillSystemPrompt(BASE_PROMPT, [
-          { skill: stagedSkill(plan), arguments: testCase.prompt, activation: "explicit" },
-        ])
-      : BASE_PROMPT;
+    (() => {
+      const skill = arm === "candidate" ? stagedSkill(plan) : baselineSkill(plan);
+      return skill
+        ? composeSkillSystemPrompt(BASE_PROMPT, [{ skill, arguments: testCase.prompt, activation: "explicit" }])
+        : BASE_PROMPT;
+    })();
   const startedAt = Date.now();
   let result: HeadlessAgentResult;
   try {
@@ -120,7 +138,12 @@ async function runArm(
       // will carry once installed, so it cannot pass an evaluation using a
       // tool it will not have afterwards. The baseline has no skill and so
       // keeps the profile's own list, which is what a normal turn has.
-      allowedTools: arm === "candidate" ? plan.allowed_tools : undefined,
+      allowedTools:
+        arm === "candidate"
+          ? plan.allowed_tools
+          : plan.baseline_skill_instructions
+            ? plan.baseline_allowed_tools ?? []
+            : undefined,
       durableRun: {
         task: `Learning evaluation ${arm}: ${testCase.name}`,
         instructions: `Candidate /${plan.command} (${plan.evaluation_id})`,
