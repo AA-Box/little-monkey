@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, GitBranch, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { FolderOpen, GitBranch, Loader2, Package, Pin, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
   nativeSkillsClient,
@@ -12,6 +12,11 @@ import {
 } from "../../lib/nativeSkillsClient";
 import { skillLearningClient } from "../../lib/skillLearningClient";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
+import {
+  skillActivationPolicyKey,
+  useSkillActivationPolicyStore,
+  type SkillActivationPolicy,
+} from "../../store/skillActivationPolicyStore";
 import { Button } from "../ui";
 import { errorMessage } from "../../lib/errors";
 
@@ -19,9 +24,52 @@ function descriptorScope(skill: NativeSkillDescriptor): NativeSkillScope | null 
   return skill.source.kind === "global" || skill.source.kind === "workspace" ? skill.source.kind : null;
 }
 
+function descriptorPolicyIdentity(skill: NativeSkillDescriptor): string {
+  if (skill.source.kind === "global") return "global";
+  if (skill.source.kind === "workspace") return skill.source.path;
+  return `signed-package:${skill.source.package_id}`;
+}
+
 /** Strips the scheme/`.git` suffix so a card header reads `org/repo` instead of the full clone URL. */
 function repoDisplayName(url: string): string {
   return url.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+}
+
+const ACTIVATION_POLICIES: Array<{ value: SkillActivationPolicy; label: string }> = [
+  { value: "automatic", label: "Automatic" },
+  { value: "ask", label: "Ask" },
+  { value: "manual", label: "Manual" },
+];
+
+function SkillPolicySelect({ command, identity }: { command: string; identity: string }) {
+  const key = skillActivationPolicyKey("native", command, identity);
+  const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
+  const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
+  const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
+  return (
+    <div className="flex items-center gap-1 text-[10px] text-faint">
+      <label className="flex items-center gap-1">
+        Policy
+        <select
+          aria-label={`/${command} activation policy`}
+          value={policy}
+          onChange={(event) => {
+            void setPolicy(key, event.target.value as SkillActivationPolicy);
+            bumpNativeSkills();
+          }}
+          className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+        >
+          {ACTIVATION_POLICIES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      </label>
+      <label className="ml-1 inline-flex items-center gap-0.5" title="Pin this skill higher in ranked discovery">
+        <input aria-label={`Pin /${command}`} type="checkbox" checked={pinned} onChange={(event) => void setPinned(key, event.target.checked)} />
+        <Pin size={10} />
+      </label>
+    </div>
+  );
 }
 
 interface RepoGroup {
@@ -341,12 +389,12 @@ export function NativeSkillsManager() {
                   </div>
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
                     {group.skills.map((skill) => (
-                      <span
-                        key={skill.command}
-                        className={`rounded-md border border-border px-2 py-1 font-mono ${skill.enabled ? "text-foreground" : "text-faint line-through"}`}
-                        title={`${skill.name} · ${skill.version}`}
-                      >
-                        /{skill.command}
+                      <span key={skill.command} className="flex items-center gap-1 rounded-md border border-border px-2 py-1">
+                        <span className={`font-mono ${skill.enabled ? "text-foreground" : "text-faint line-through"}`} title={`${skill.name} · ${skill.version}`}>/{skill.command}</span>
+                        <SkillPolicySelect
+                          command={skill.command}
+                          identity={descriptorPolicyIdentity(skill)}
+                        />
                       </span>
                     ))}
                   </div>
@@ -373,6 +421,10 @@ export function NativeSkillsManager() {
                     </span>
                   )}
                   <span className="ml-auto font-mono text-[10px] text-faint">{skill.sha256.slice(0, 12)}…</span>
+                  <SkillPolicySelect
+                    command={skill.command}
+                    identity={descriptorPolicyIdentity(skill)}
+                  />
                   <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
                     {skill.enabled ? "Disable" : "Enable"}
                   </Button>

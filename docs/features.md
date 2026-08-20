@@ -93,7 +93,7 @@ narrower than its name suggests, the boundary is in [Limitations](limitations.md
 - Invoke up to five installed skills at the start of a turn, for example `/review /testing check this patch`. The selected instructions, version, source, and digest are frozen into that turn and never expand tool permissions.
 - Create a quarantined skill proposal with `/learn command | instructions`. It activates only after its risk flags are reviewed and its exact digest approved, and it can be rejected or rolled back.
 - Learn a reusable skill from the agent's own verified work. After a run finishes, the backend classifies that run's durable events against fixed rules; only five things open a candidate: you explicitly asking for a procedure to be reusable, a correction of yours that then verified, a verification failure repaired inside the same run, a normalized failure that recurred and was finally resolved, or a multi-step procedure that changed files and ended with a passing verification. A turn without real execution evidence never opens one, whatever it says.
-- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated by really running it — and a baseline without it — in disposable copies of the workspace, with real tool execution and the workspace's own verification. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. Learning Mode is **Suggest only** by default; even **Auto-promote safe improvements** stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
+- A candidate is drafted by one bounded reflection pass, then built into an ordinary `SKILL.md` package by deterministic code under an app-owned staging directory, deduplicated against installed native, workspace, learned, and signed-package skills, and evaluated by really running it — and a baseline without it — in disposable copies of the workspace, with real tool execution and the workspace's own verification. It becomes a real versioned native skill only on installation, which is where rollback, disable, and uninstall come from. The three-state Learning Policy is **Ask** by default: **Manual** only learns from an explicit save, **Ask** surfaces detected candidates for review, and **Automatic** reflects, evaluates, and installs only safe improvements without approval. Automatic still stops for approval at a widened tool list, a new executable or environment requirement, global scope, or a possible duplicate, and refuses outright anything that would weaken permission policy. See [Learned skills](#learned-skills) for the full loop.
 - Manage signed declarative packages in **Settings → Ecosystem** with install and update permission previews, pins, enable and disable, rollback, revocation state, uninstall, offline cache, and portable export and import. Local unsigned development packages stay data-only behind an explicit warning; unsigned Git packages and executable payloads are rejected.
 - Start from a signed first-party catalog of six skills (review, testing, documentation, browser QA, release preparation, knowledge workflows) plus declarative GitHub, GitLab, WebDAV, and REST/webhook connector packages.
 - Inspect plugin health and component setup, use package assistants, activate package workflow templates, and apply verified package rules to normal, Compare, and Crew turns with provenance.
@@ -142,15 +142,15 @@ or model claim that says it should be learned. Untrusted content can be
 evidence; it can never authorize its own installation.
 
 **Where they live.** Candidates, evaluations, provenance, effectiveness rows
-and the learning mode are in a durable store under the active profile's data
+and the learning policy are in a durable store under the active profile's data
 directory (`skill-learning-v1/`), so they survive a restart and are shared
 with the CLI. Staged packages are written under that store's own `staging/`
 directory; resource paths are validated relative paths and nothing may be
 written outside it. Once promoted, a skill is an ordinary native skill in the
 global or workspace skill root.
 
-**When approval is required.** Always, unless you selected **Auto-promote safe
-improvements** *and* the candidate passed evaluation, adds no tool access,
+**When approval is required.** Always, unless you selected **Automatic** *and*
+the candidate passed evaluation, adds no tool access,
 declares no executables or environment variables, is workspace-scoped, and is
 a new skill or an update to a learned one. Approval is required for a widened
 allowed-tools list, removing an existing restriction, any new executable or
@@ -288,8 +288,10 @@ offered to the model *and* is refused if called anyway. The deny list on
 proposed skill text is defense in depth against a skill that tries to talk a
 future turn out of its gates — it is not the boundary.
 
-**Settings.** Learning Mode and whether this loop may work in global scope at
-all live in the backend store, so the UI and the CLI read the same values.
+**Settings.** Learning Policy and whether this loop may work in global scope at
+all live in the backend store, so the UI and the CLI read the same values. The
+CLI keeps the older granular `mode` command for compatibility; `policy` is the
+shared three-state interface.
 Turning global scope off confines every candidate to the workspace it was
 observed in. Nothing is ever re-scoped on its own in either direction; moving a
 workspace skill to global is a separate, explicitly approved change.

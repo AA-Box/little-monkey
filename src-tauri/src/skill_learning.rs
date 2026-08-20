@@ -204,6 +204,38 @@ impl LearningMode {
     }
 }
 
+/// User-facing learning policy. The durable store keeps the older, more
+/// granular mode internally so existing CLI state remains compatible; this is
+/// the smaller contract exposed to the desktop settings surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LearningPolicy {
+    Automatic,
+    #[default]
+    Ask,
+    Manual,
+}
+
+impl From<LearningMode> for LearningPolicy {
+    fn from(mode: LearningMode) -> Self {
+        match mode {
+            LearningMode::Off => Self::Manual,
+            LearningMode::SuggestOnly => Self::Ask,
+            LearningMode::AutoStage | LearningMode::AutoPromoteSafe => Self::Automatic,
+        }
+    }
+}
+
+impl From<LearningPolicy> for LearningMode {
+    fn from(policy: LearningPolicy) -> Self {
+        match policy {
+            LearningPolicy::Automatic => Self::AutoPromoteSafe,
+            LearningPolicy::Ask => Self::SuggestOnly,
+            LearningPolicy::Manual => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateStatus {
@@ -1242,7 +1274,7 @@ struct InFlightPromotion {
 /// read the same values and neither can hold an authoritative copy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LearningSettings {
-    pub mode: LearningMode,
+    pub policy: LearningPolicy,
     /// Whether this loop may work in global scope at all.
     ///
     /// On by default, because a session with no workspace open has nowhere
@@ -1258,7 +1290,7 @@ pub struct LearningSettings {
 impl Default for LearningSettings {
     fn default() -> Self {
         Self {
-            mode: LearningMode::default(),
+            policy: LearningPolicy::default(),
             allow_global_scope: true,
         }
     }
@@ -1386,14 +1418,15 @@ impl SkillLearningStore {
     }
 
     pub fn mode(&self) -> Result<LearningMode, SkillError> {
-        Ok(self.settings()?.mode)
+        let _guard = self.lock()?;
+        Ok(self.load()?.mode)
     }
 
     pub fn settings(&self) -> Result<LearningSettings, SkillError> {
         let _guard = self.lock()?;
         let state = self.load()?;
         Ok(LearningSettings {
-            mode: state.mode,
+            policy: state.mode.into(),
             allow_global_scope: state.allow_global_scope,
         })
     }
@@ -1401,7 +1434,13 @@ impl SkillLearningStore {
     pub fn set_settings(&self, settings: LearningSettings) -> Result<LearningSettings, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
-        state.mode = settings.mode;
+        // `Automatic` intentionally represents both the legacy AutoStage and
+        // AutoPromoteSafe modes. Keep the more conservative mode when the UI
+        // only changes an unrelated setting, otherwise opening Settings and
+        // toggling global scope would silently grant install authority.
+        if LearningPolicy::from(state.mode) != settings.policy {
+            state.mode = settings.policy.into();
+        }
         state.allow_global_scope = settings.allow_global_scope;
         self.save(&state)?;
         Ok(settings)
@@ -4647,6 +4686,48 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn user_learning_policies_map_to_compatible_internal_modes() {
+        assert_eq!(
+            LearningPolicy::from(LearningMode::Off),
+            LearningPolicy::Manual
+        );
+        assert_eq!(
+            LearningPolicy::from(LearningMode::SuggestOnly),
+            LearningPolicy::Ask
+        );
+        assert_eq!(
+            LearningPolicy::from(LearningMode::AutoStage),
+            LearningPolicy::Automatic
+        );
+        assert_eq!(
+            LearningMode::from(LearningPolicy::Automatic),
+            LearningMode::AutoPromoteSafe
+        );
+
+        let directory = TestDirectory::new("learning-policy");
+        let store = SkillLearningStore::new(directory.path()).unwrap();
+        assert_eq!(store.settings().unwrap().policy, LearningPolicy::Ask);
+        store
+            .set_settings(LearningSettings {
+                policy: LearningPolicy::Manual,
+                allow_global_scope: true,
+            })
+            .unwrap();
+        assert_eq!(store.mode().unwrap(), LearningMode::Off);
+        assert_eq!(store.settings().unwrap().policy, LearningPolicy::Manual);
+
+        store.set_mode(LearningMode::AutoStage).unwrap();
+        store
+            .set_settings(LearningSettings {
+                policy: LearningPolicy::Automatic,
+                allow_global_scope: false,
+            })
+            .unwrap();
+        assert_eq!(store.mode().unwrap(), LearningMode::AutoStage);
+        assert!(!store.settings().unwrap().allow_global_scope);
     }
 
     fn identity() -> ClientIdentity {

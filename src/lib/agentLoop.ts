@@ -27,7 +27,7 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import { allowedToolsRestriction, applyAllowedToolsRestriction } from './allowedTools';
 import { textContent } from './llamaClient';
 import type { ChatContentPart, ChatMessage, ToolCall, ToolDef } from './llamaClient';
-import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
+import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, READ_SKILL_RESOURCE_TOOL, SEARCH_SKILLS_TOOL, SKILL_INVOKE_TOOL, TASK_TOOL, WORKFLOW_TOOL, buildTools, toolsForWorkspace } from './tools';
 import {
   candidateNotice,
   finalizeLearningForRun,
@@ -68,7 +68,7 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
-import { composeSkillCatalog, composeSkillSystemPrompt, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { composeSkillCatalog, composeSkillSystemPrompt, skillRankingSignalsFor, MAX_MODEL_SKILLS, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { composeCustomAgentCatalog } from './customAgents';
@@ -91,6 +91,8 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
+import { requestSkillActivationApproval } from '../store/skillActivationApprovalStore';
+import { skillActivationPolicyFor, useSkillActivationPolicyStore } from '../store/skillActivationPolicyStore';
 import {
   describeRedactions,
   gatePrivacyWireMessages,
@@ -602,8 +604,9 @@ const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
  * pass it, so `task` is never accidentally offered by an existing caller
  * that hasn't been updated for it.
  *
- * `skillToolEnabled`/`readSkillResourceToolEnabled` follow the same posture,
- * appending `SKILL_INVOKE_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
+ * `skillToolEnabled`/`skillSearchToolEnabled`/`readSkillResourceToolEnabled`
+ * follow the same posture, appending `SKILL_INVOKE_TOOL`/
+ * `SEARCH_SKILLS_TOOL`/`READ_SKILL_RESOURCE_TOOL` — see
  * `runAgentTurnBody`'s call site for exactly what each is computed from.
  * They're independent: `readSkillResourceToolEnabled` is NOT gated on
  * `settingsStore.skillAutoInvokeEnabled` at all — reading a bundled file
@@ -618,6 +621,7 @@ export function toolsForSettings(
   skillToolEnabled = false,
   readSkillResourceToolEnabled = false,
   skillLearningToolEnabled = false,
+  skillSearchToolEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
@@ -630,6 +634,7 @@ export function toolsForSettings(
     ...(skillToolEnabled ? [SKILL_INVOKE_TOOL] : []),
     ...(readSkillResourceToolEnabled ? [READ_SKILL_RESOURCE_TOOL] : []),
     ...(skillLearningToolEnabled ? [MANAGE_SKILL_LEARNING_TOOL] : []),
+    ...(skillSearchToolEnabled ? [SEARCH_SKILLS_TOOL] : []),
   ];
 }
 
@@ -1671,6 +1676,14 @@ export async function runAgentTurn(
     if (resume !== null) {
       await watchResumedDesktopTurn(sessionId, resume, controller, origin);
       return;
+    }
+    // Re-read the profile-owned policy file before each turn so CLI changes
+    // converge even when no Tauri event was available to this renderer.
+    if (availableSkills.length > 0) {
+      await useSkillActivationPolicyStore.getState().refresh();
+      availableSkills = availableSkills.map((candidate) => candidate.policyKey
+        ? { ...candidate, activationPolicy: skillActivationPolicyFor(candidate.policyKey) }
+        : candidate);
     }
     const mutationRequired = requiresWorkspaceMutation(
       userText,
@@ -2860,11 +2873,28 @@ async function runAgentTurnBody(
   // (`toolsOfferedThisIteration`, inside the loop) see later model-invoked
   // skills too, not just the ones known up front.
   const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
+  const explicitSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command.toLowerCase()));
+  const skillPoliciesHydrated = useSkillActivationPolicyStore.getState().hydrated;
+  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
+  let rankingSignals = new Map<string, import('./skills').SkillRankingSignals>();
+  if (skillPoliciesHydrated && availableSkills.length > 0 && isTauri()) {
+    try {
+      rankingSignals = skillRankingSignalsFor(availableSkills, await skillLearningClient.effectiveness(), workspaceRootPath);
+    } catch {
+      // Ranking remains lexical/policy-only when telemetry is unavailable.
+    }
+  }
+  const modelDiscoverableSkills = skillPoliciesHydrated
+    ? availableSkills.filter((candidate) => candidate.activationPolicy !== 'manual')
+    : [];
   const skillToolContext: SkillToolContext = {
     availableSkills,
     invokedCommands: invokedSkillCommands,
+    explicitCommands: explicitSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    rankingSignals,
     runId: durable.recorder?.runId,
+    requestApproval: (skill, approvalSignal) => requestSkillActivationApproval(skill, approvalSignal),
     onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
   durable.skills = skillToolContext;
@@ -2874,7 +2904,9 @@ async function runAgentTurnBody(
   // the ones the model picked itself.
   for (const invocation of skillInvocations) recordSkillInvocation(durable, invocation.skill);
   const skillToolEnabled =
-    settings.skillAutoInvokeEnabled && availableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+    settings.skillAutoInvokeEnabled && modelDiscoverableSkills.some((candidate) => !invokedSkillCommands.has(candidate.command));
+  const skillSearchToolEnabled =
+    settings.skillAutoInvokeEnabled && modelDiscoverableSkills.length > MAX_MODEL_SKILLS;
   const readSkillResourceToolEnabled = availableSkills.some((candidate) => (candidate.resourceFiles?.length ?? 0) > 0);
   // `GENERATE_IMAGE_TOOL` is appended here (desktop chat's composition chain
   // only) rather than living in the base `TOOLS` array — see its doc comment
@@ -2907,6 +2939,7 @@ async function runAgentTurnBody(
       // "not offered" — see `cachedLearningMode`. It also needs a durable run:
       // without one there is no evidence chain for a proposal to append to.
       cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
+      skillSearchToolEnabled,
     ),
     hasWorkspace,
   );
@@ -2951,7 +2984,6 @@ async function runAgentTurnBody(
   // just wrapping `riskJudge.ts`'s `classifyToolCall` instead of a plain
   // summarization prompt (see that module's doc comment for why it takes this
   // callback as a parameter instead of importing `attemptStream` itself).
-  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
   const riskAnnotation: RiskAnnotationContext = {
     // "smart" mode (Phase 3) needs a classification for every mutating call
     // to decide whether it can auto-approve — so classification runs
@@ -3206,7 +3238,7 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
-        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands)] : []),
+        ...(settings.skillAutoInvokeEnabled && skillPoliciesHydrated ? [composeSkillCatalog(availableSkills, invokedSkillCommands, userText, rankingSignals)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled
