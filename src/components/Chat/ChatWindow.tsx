@@ -56,6 +56,7 @@ import {
 } from "../../lib/skills";
 import { useEcosystemStore } from "../../store/ecosystemStore";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
+import { useSkillActivationPolicyStore } from "../../store/skillActivationPolicyStore";
 import { companionClient } from "../../lib/companionClient";
 import { loadGeneratedImage, loadWorkspaceImage } from "../../lib/imageGeneration";
 import {
@@ -422,6 +423,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [pluginRuntimes, setPluginRuntimes] = useState<PluginRuntimeDescriptor[]>([]);
   const [activeNativeSkills, setActiveNativeSkills] = useState<NativeSkillDescriptor[]>([]);
   const nativeSkillsRevision = useNativeSkillsStore((state) => state.revision);
+  const skillActivationPolicies = useSkillActivationPolicyStore((state) => state.policies);
   useEffect(() => {
     let cancelled = false;
     void Promise.all([
@@ -456,7 +458,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   }, [installedPackageKey, rootsKey, nativeSkillsRevision]);
   const baseAvailableSkills = useMemo(
     () => [...localPromptSkills(promptEntries), ...nativeSkills(activeNativeSkills), ...packageSkills(activePackageSkills)],
-    [promptEntries, activeNativeSkills, activePackageSkills],
+    [promptEntries, activeNativeSkills, activePackageSkills, skillActivationPolicies],
   );
   const activePackageAssistants = useMemo(
     () => packageAssistantSkills(

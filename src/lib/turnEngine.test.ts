@@ -740,6 +740,40 @@ describe("executeToolCall / skill invocation", () => {
     const result = await executeToolCall(call("skill", { command: "verify" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
     expect(JSON.parse(result).error).toMatch(/at most 1 skill/);
   });
+
+  it("enforces Ask and Manual policies before loading instructions", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [
+        fakeSkill("testing", { activationPolicy: "ask" }),
+        fakeSkill("deploy", { activationPolicy: "manual" }),
+      ],
+      invokedCommands: new Set(),
+      maxSkillsPerTurn: 5,
+    };
+    const ask = await executeToolCall(call("skill", { command: "testing" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(ask).error).toMatch(/requires user approval/);
+    const manual = await executeToolCall(call("skill", { command: "deploy" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(manual).error).toMatch(/Manual/);
+    expect(context.invokedCommands.size).toBe(0);
+  });
+
+  it("treats an explicit slash invocation as approval and searches metadata only", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [fakeSkill("testing", { activationPolicy: "ask" }), fakeSkill("deploy", { activationPolicy: "manual" })],
+      invokedCommands: new Set(),
+      explicitCommands: new Set(["testing"]),
+      maxSkillsPerTurn: 5,
+    };
+    const approved = await executeToolCall(call("skill", { command: "testing" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(approved).toContain("Do testing carefully.");
+    context.availableSkills.push(fakeSkill("lint", { description: "Check style" }));
+    const searched = await executeToolCall(call("search_skills", { query: "lint" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(searched).results).toHaveLength(1);
+    expect(searched).toContain("/lint");
+    expect(searched).not.toContain("Do lint");
+    const manualSearch = await executeToolCall(call("search_skills", { query: "deploy" }), null, "turn-1", emptyMcpRegistry, undefined, undefined, undefined, undefined, undefined, context);
+    expect(JSON.parse(manualSearch).results).toEqual([]);
+  });
 });
 
 // `read_skill_resource` has a real `tool_read_skill_resource` Rust command

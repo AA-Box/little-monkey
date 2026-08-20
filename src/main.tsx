@@ -12,6 +12,7 @@ import { hydratePrompts } from "./store/promptStore";
 import { CompanionOverlay } from "./components/Companion";
 import { loadLocaleTranslations } from "./lib/i18n";
 import { useLocaleStore } from "./store/localeStore";
+import { useSkillActivationPolicyStore } from "./store/skillActivationPolicyStore";
 
 function committedAppearance() {
   const settings = useSettingsStore.getState();
@@ -72,7 +73,7 @@ if (isCompanionOverlay) {
       </React.StrictMode>,
     );
   });
-} else void Promise.all([hydrateSessions(), hydratePrompts(), localeReady]).finally(() => {
+} else void Promise.all([hydrateSessions(), hydratePrompts(), useSkillActivationPolicyStore.getState().hydrate(), localeReady]).finally(() => {
   // Secondary windows opened by the session menu's "Open in > Split view/New
   // window" (see src-tauri/src/system.rs `open_session_window`) load this
   // same entry point with `?session=<id>` — switch to it before the first

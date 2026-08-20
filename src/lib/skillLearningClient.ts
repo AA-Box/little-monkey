@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { NativeSkillDescriptor, NativeSkillMutationResult, NativeSkillScope } from "./nativeSkillsClient";
 
 export type LearningMode = "off" | "suggest_only" | "auto_stage" | "auto_promote_safe";
+export type LearningPolicy = "automatic" | "ask" | "manual";
 
 export type CandidateStatus =
   | "detected"
@@ -163,7 +164,7 @@ export interface CorrectionEvidence {
 /** Backend-owned learning settings. The UI and the CLI read the same values;
  * neither holds an authoritative copy. */
 export interface LearningSettings {
-  mode: LearningMode;
+  policy: LearningPolicy;
   allow_global_scope: boolean;
 }
 
@@ -299,6 +300,12 @@ export function cachedLearningMode(): LearningMode | null {
   return cachedMode;
 }
 
+function modeForPolicy(policy: LearningPolicy): LearningMode {
+  if (policy === "automatic") return "auto_promote_safe";
+  if (policy === "manual") return "off";
+  return "suggest_only";
+}
+
 export const skillLearningClient = {
   mode: async () => {
     cachedMode = await invoke<LearningMode>("skill_learning_mode");
@@ -310,12 +317,12 @@ export const skillLearningClient = {
   },
   settings: async () => {
     const settings = await invoke<LearningSettings>("skill_learning_settings");
-    cachedMode = settings.mode;
+    cachedMode = modeForPolicy(settings.policy);
     return settings;
   },
   setSettings: async (settings: LearningSettings) => {
     const next = await invoke<LearningSettings>("skill_learning_set_settings", { settings });
-    cachedMode = next.mode;
+    cachedMode = modeForPolicy(next.policy);
     return next;
   },
   /** The bounded evidence brief the reflection pass reads, rendered in Rust

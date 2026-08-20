@@ -682,14 +682,15 @@ export const WORKFLOW_TOOL: ToolDef = {
  * a skill the user explicitly typed `/command` for. Deliberately kept OUT of
  * the `TOOLS` array above (only appended to the per-turn tool list by
  * `agentLoop.ts`'s `toolsForSettings` when `settingsStore.skillAutoInvokeEnabled`
- * is on AND at least one skill remains uninvoked this turn — a user who
- * hasn't opted in should never even see the schema, same posture as
+ * is on AND at least one discoverable skill remains uninvoked this turn — a
+ * user who hasn't opted in should never even see the schema, same posture as
  * `TASK_TOOL`'s `subagentsEnabled` gate). Frontend-only, same as `TASK_TOOL`/
  * `PRESENT_PLAN_TOOL`: it has no `tool_skill` Rust command — `turnEngine.ts`'s
  * `executeToolCall` intercepts this name before the `invoke` dispatch and
  * resolves it against the turn's own `SkillToolContext.availableSkills`
  * instead, returning the matched skill's instructions (and any bundled
- * `resource_files` listing) as the tool result.
+ * `resource_files` listing) as the tool result. `SEARCH_SKILLS_TOOL` uses the
+ * same context to return bounded metadata from the full registry.
  */
 export const SKILL_INVOKE_TOOL: ToolDef = {
   type: 'function',
@@ -710,6 +711,29 @@ export const SKILL_INVOKE_TOOL: ToolDef = {
         },
       },
       required: ['command'],
+      additionalProperties: false,
+    },
+  },
+};
+
+/** Searches the complete compact skill registry when the bounded prompt
+ * catalog does not contain the relevant skill. This is frontend-only and
+ * never returns skill instructions. */
+export const SEARCH_SKILLS_TOOL: ToolDef = {
+  type: 'function',
+  function: {
+    name: 'search_skills',
+    description:
+      'Search the complete installed skill catalog by name, command, or description when the available-skills list does not contain a relevant skill. Results are metadata only; use the skill tool afterward for an Automatic skill, or ask the user to explicitly invoke an Ask skill.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'A concise search query describing the capability needed.',
+        },
+      },
+      required: ['query'],
       additionalProperties: false,
     },
   },
