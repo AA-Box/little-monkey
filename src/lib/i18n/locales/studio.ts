@@ -177,7 +177,10 @@ export const studioLocale: Record<string, string> = {
     "For MLX conversions — a folder holding config.json beside model, t5_encoder and vae safetensors. Needs the MLX package from Settings → Runtime Hub, and makes video only.",
   "Studio.add.engineMfluxImageHint":
     "Native image generation with text-to-image and image-to-image. Needs the separate MFLUX Image Runtime from Settings → Runtime Hub.",
+  "Studio.add.engineAutoHint":
+    "Complete repositories and local model directories select MFLUX automatically; weight files use the bundled engine.",
   "Studio.add.mfluxSource": "Model source",
+  "Studio.add.componentFiles": "Weight files",
   "Studio.add.mfluxRepository": "Hugging Face repository",
   "Studio.add.mfluxRepositoryPlaceholder": "owner/model",
   "Studio.add.mfluxToken": "Access token (optional)",
