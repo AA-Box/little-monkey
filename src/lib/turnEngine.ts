@@ -48,7 +48,7 @@ import { usePermissionStore } from '../store/permissionStore';
 import { runSubagentTask } from './subagent';
 import { resolveWorkflowSpec, runWorkflow } from './workflow';
 import { protocolToolCallId } from './durableRun';
-import { formatSkillSearchResults, formatSkillToolResult, type SlashSkill } from './skills';
+import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
 import {
@@ -621,12 +621,17 @@ export interface SkillToolContext {
    * `skills.ts`'s `MAX_SKILLS_PER_TURN`, the same bound `parseSkillTurn`
    * already enforces for stacked explicit invocations. */
   maxSkillsPerTurn: number;
+  /** Shared deterministic ranking signals for the catalog and search tool. */
+  rankingSignals?: ReadonlyMap<string, SkillRankingSignals>;
   /** Called with each skill this turn actually invokes, at the moment the
    * invocation is recorded — the seam the durable `skill_invoked` event is
    * written from (see `agentLoop.ts`'s `recordSkillInvocation`). A callback
    * rather than a recorder handle for the same reason `onRoutingDecision` is:
    * this module never learns what a durable run is. */
   onInvoked?: (skill: SlashSkill) => void;
+  /** Ask-policy approval is a separate gate from normal tool permissions.
+   * Bypass mode must never satisfy it implicitly. */
+  requestApproval?: (skill: SlashSkill, signal?: AbortSignal) => Promise<boolean>;
   /** This turn's durable run id, injected as `manage_skill_learning`'s
    * `run_id` (see `RESERVED_ARGS`). Lives here rather than as a thirteenth
    * positional parameter because it is skill-adjacent bookkeeping and every
@@ -1060,7 +1065,10 @@ async function executeToolCallInner(
         return stringifyToolError(new Error(`/${command} is Manual: it cannot be discovered or invoked implicitly. Ask the user to invoke /${command} explicitly.`));
       }
       if (!skill.explicitCommands?.has(command) && policy === 'ask') {
-        return stringifyToolError(new Error(`/${command} requires user approval before its instructions can load. Ask the user to invoke /${command} explicitly.`));
+        const approved = await skill.requestApproval?.(matched, signal) ?? false;
+        if (!approved || signal?.aborted) {
+          return stringifyToolError(new Error(`/${command} requires user approval before its instructions can load; the request was denied or cancelled.`));
+        }
       }
       // Recorded BEFORE returning the result (not after) so a second call
       // for the same command later in this same batch of parallel tool
@@ -1085,7 +1093,7 @@ async function executeToolCallInner(
       }
       const query = typeof args.query === 'string' ? args.query.trim() : '';
       if (!query) return stringifyToolError(new Error('The search_skills tool requires a non-empty "query" argument.'));
-      return formatSkillSearchResults(skill.availableSkills, skill.invokedCommands, query);
+      return formatSkillSearchResults(skill.availableSkills, skill.invokedCommands, query, skill.rankingSignals);
     } catch (err) {
       return stringifyToolError(err);
     }

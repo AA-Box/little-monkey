@@ -9,6 +9,7 @@ import { useExternalConversationStore } from "./store/externalConversationStore"
 import { StudioNav, type StudioMode } from "./components/Studio/StudioNav";
 import ChatWindow from "./components/Chat/ChatWindow";
 import { PrivacyFirewallGate } from "./components/Chat/PrivacyFirewallGate";
+import { SkillActivationApprovalModal } from "./components/Chat/SkillActivationApprovalModal";
 import { AppMenu } from "./components/AppMenu";
 import { UpdateCard } from "./components/Update";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -1733,6 +1734,7 @@ function App() {
         </Suspense>
       )}
       <PrivacyFirewallGate />
+      <SkillActivationApprovalModal />
       {(settingsOpen || settingsMounted) && (
         <Suspense fallback={null}>
           <SettingsModal

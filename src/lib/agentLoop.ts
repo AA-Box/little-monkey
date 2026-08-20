@@ -68,7 +68,7 @@ import {
   type ResolvedTextReference,
 } from './mentions';
 import { currentSystemPrompt, ULTRACODE_SYSTEM_SECTION, type AttachedStackPromptInfo } from './systemPrompt';
-import { composeSkillCatalog, composeSkillSystemPrompt, MAX_MODEL_SKILLS, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
+import { composeSkillCatalog, composeSkillSystemPrompt, skillRankingSignalsFor, MAX_MODEL_SKILLS, MAX_SKILLS_PER_TURN, type SkillInvocationSnapshot, type SlashSkill } from './skills';
 import { composeSavedWorkflowCatalog } from './workflow';
 import { selectSavedWorkflowList, useSavedWorkflowStore } from '../store/savedWorkflowStore';
 import { composeCustomAgentCatalog } from './customAgents';
@@ -91,6 +91,8 @@ import { primaryRoot, useWorkspaceStore } from '../store/workspaceStore';
 import { admitProcess, exitProcess, exitStatusFor, linkProcessRun, markProcessRunning, reconcileProcess } from './processTable';
 import { honourPause, forgetPause, isPauseRequested } from './pauseRegistry';
 import { usePrivacyFirewallStore } from '../store/privacyFirewallStore';
+import { requestSkillActivationApproval } from '../store/skillActivationApprovalStore';
+import { useSkillActivationPolicyStore } from '../store/skillActivationPolicyStore';
 import {
   describeRedactions,
   gatePrivacyWireMessages,
@@ -2864,13 +2866,27 @@ async function runAgentTurnBody(
   // skills too, not just the ones known up front.
   const invokedSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command));
   const explicitSkillCommands = new Set(skillInvocations.map((invocation) => invocation.skill.command.toLowerCase()));
-  const modelDiscoverableSkills = availableSkills.filter((candidate) => candidate.activationPolicy !== 'manual');
+  const skillPoliciesHydrated = useSkillActivationPolicyStore.getState().hydrated;
+  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
+  let rankingSignals = new Map<string, import('./skills').SkillRankingSignals>();
+  if (skillPoliciesHydrated && availableSkills.length > 0 && isTauri()) {
+    try {
+      rankingSignals = skillRankingSignalsFor(availableSkills, await skillLearningClient.effectiveness(), workspaceRootPath);
+    } catch {
+      // Ranking remains lexical/policy-only when telemetry is unavailable.
+    }
+  }
+  const modelDiscoverableSkills = skillPoliciesHydrated
+    ? availableSkills.filter((candidate) => candidate.activationPolicy !== 'manual')
+    : [];
   const skillToolContext: SkillToolContext = {
     availableSkills,
     invokedCommands: invokedSkillCommands,
     explicitCommands: explicitSkillCommands,
     maxSkillsPerTurn: MAX_SKILLS_PER_TURN,
+    rankingSignals,
     runId: durable.recorder?.runId,
+    requestApproval: (skill, approvalSignal) => requestSkillActivationApproval(skill, approvalSignal),
     onInvoked: (skill) => recordSkillInvocation(durable, skill),
   };
   durable.skills = skillToolContext;
@@ -2960,7 +2976,6 @@ async function runAgentTurnBody(
   // just wrapping `riskJudge.ts`'s `classifyToolCall` instead of a plain
   // summarization prompt (see that module's doc comment for why it takes this
   // callback as a parameter instead of importing `attemptStream` itself).
-  const workspaceRootPath = primaryRoot(useWorkspaceStore.getState().roots)?.path ?? '';
   const riskAnnotation: RiskAnnotationContext = {
     // "smart" mode (Phase 3) needs a classification for every mutating call
     // to decide whether it can auto-approve — so classification runs
@@ -3215,7 +3230,7 @@ async function runAgentTurnBody(
         ),
         ...(ultracode ? [ULTRACODE_SYSTEM_SECTION] : []),
         ...(programmaticToolOffered ? [PROGRAMMATIC_SYSTEM_GUIDANCE] : []),
-        ...(settings.skillAutoInvokeEnabled ? [composeSkillCatalog(availableSkills, invokedSkillCommands, userText)] : []),
+        ...(settings.skillAutoInvokeEnabled && skillPoliciesHydrated ? [composeSkillCatalog(availableSkills, invokedSkillCommands, userText, rankingSignals)] : []),
         // Saved workflows are only actionable when WORKFLOW_TOOL is offered,
         // so the catalog rides the same `subagentsEnabled` gate.
         ...(settings.subagentsEnabled

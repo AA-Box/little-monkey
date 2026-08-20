@@ -248,6 +248,8 @@ pub mod config_revisions;
 // the CLI cannot drift into two different learning behaviours.
 mod login_path;
 mod sessions;
+pub mod skill_activation;
+mod skill_activation_commands;
 pub mod skill_learning;
 mod skill_learning_commands;
 mod system;
@@ -849,6 +851,9 @@ pub fn run() {
     let skill_learning_state =
         skill_learning_commands::SkillLearningCommandState::production(&app_data_dir)
             .expect("failed to initialize the skill learning store");
+    let skill_activation_state =
+        skill_activation_commands::SkillActivationCommandState::production(&app_data_dir)
+            .expect("failed to initialize the skill activation store");
     // Resolves an interrupted promotion against what is actually installed
     // before anything can discover or invoke a half-published skill.
     skill_learning_commands::reconcile_at_startup(
@@ -953,6 +958,7 @@ pub fn run() {
         .manage(m4_state)
         .manage(native_skills_state)
         .manage(skill_learning_state)
+        .manage(skill_activation_state)
         .manage(browser_state)
         .manage(browser_pane::BrowserPaneState::default())
         .manage(m7_state)
@@ -1621,6 +1627,10 @@ pub fn run() {
             skill_learning_commands::skill_learning_effectiveness,
             skill_learning_commands::skill_learning_deprecate,
             skill_learning_commands::skill_learning_discover,
+            skill_activation_commands::skill_activation_list,
+            skill_activation_commands::skill_activation_get,
+            skill_activation_commands::skill_activation_set,
+            skill_activation_commands::skill_activation_migrate,
             security_commands::security_audit,
             self_integrity::self_integrity_report,
             update_rollback::update_install_info,

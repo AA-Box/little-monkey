@@ -51,21 +51,29 @@ function newestCatalogEntry(entries: PackageCatalogEntry[]): PackageCatalogEntry
 function PackageSkillPolicySelect({ skill }: { skill: ActiveSkillDescriptor }) {
   const key = skillActivationPolicyKey("package", skill.command, skill.package_id);
   const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
   const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
   return (
-    <label className="flex items-center gap-1 text-[10px] text-faint">
-      Policy
-      <select
-        aria-label={`/${skill.command} activation policy`}
-        value={policy}
-        onChange={(event) => setPolicy(key, event.target.value as SkillActivationPolicy)}
-        className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
-      >
-        <option value="automatic">Automatic</option>
-        <option value="ask">Ask</option>
-        <option value="manual">Manual</option>
-      </select>
-    </label>
+    <div className="flex items-center gap-1 text-[10px] text-faint">
+      <label className="flex items-center gap-1">
+        Policy
+        <select
+          aria-label={`/${skill.command} activation policy`}
+          value={policy}
+          onChange={(event) => void setPolicy(key, event.target.value as SkillActivationPolicy)}
+          className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+        >
+          <option value="automatic">Automatic</option>
+          <option value="ask">Ask</option>
+          <option value="manual">Manual</option>
+        </select>
+      </label>
+      <label className="ml-1 inline-flex items-center gap-0.5" title="Pin this skill higher in ranked discovery">
+        <input aria-label={`Pin /${skill.command}`} type="checkbox" checked={pinned} onChange={(event) => void setPinned(key, event.target.checked)} />
+        <Pin size={10} />
+      </label>
+    </div>
   );
 }
 

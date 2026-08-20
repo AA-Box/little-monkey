@@ -12,6 +12,7 @@ import {
   packageRuleInvocations,
   parseSkillTurn,
   rankSkillCatalog,
+  skillRankingSignalsFor,
   skillCommandMap,
   type SlashSkill,
 } from "./skills";
@@ -292,6 +293,31 @@ describe("composeSkillCatalog", () => {
     const manual = { ...skill("deploy"), activationPolicy: "manual" as const };
     expect(composeSkillCatalog([manual], new Set())).toBe("");
     expect(JSON.parse(formatSkillSearchResults([manual], new Set(), "deploy")).results).toEqual([]);
+  });
+
+  it("uses Unicode tokens and durable effectiveness signals", () => {
+    const preferred = { ...skill("deploy", "deploy-v1"), name: "Déployer", sourcePath: "/workspace/app/.agents/skills/deploy" };
+    const fallback = { ...skill("deploy-old", "old") };
+    const signals = skillRankingSignalsFor(
+      [preferred, fallback],
+      [{
+        command: "deploy",
+        scope: "workspace",
+        skill_sha256: preferred.contentSha256,
+        run_id: "run-1",
+        session_id: null,
+        outcome: "success",
+        verification_passed: true,
+        tool_failures: [],
+        failure_signature: null,
+        user_corrected: false,
+        recorded_at_unix_ms: Date.now(),
+      }],
+      "/workspace/app",
+    );
+    const ranked = rankSkillCatalog([preferred, fallback], "déployer", signals);
+    expect(ranked[0].id).toBe("deploy-v1");
+    expect(rankSkillCatalog([preferred], "déployer").length).toBe(1);
   });
 });
 

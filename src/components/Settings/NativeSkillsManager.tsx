@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpen, GitBranch, Loader2, Package, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { FolderOpen, GitBranch, Loader2, Package, Pin, RefreshCw, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 
 import {
   nativeSkillsClient,
@@ -44,23 +44,31 @@ const ACTIVATION_POLICIES: Array<{ value: SkillActivationPolicy; label: string }
 function SkillPolicySelect({ command, identity }: { command: string; identity: string }) {
   const key = skillActivationPolicyKey("native", command, identity);
   const policy = useSkillActivationPolicyStore((state) => state.getPolicy(key));
+  const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
   const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
+  const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
   return (
-    <label className="flex items-center gap-1 text-[10px] text-faint">
-      Policy
-      <select
-        aria-label={`/${command} activation policy`}
-        value={policy}
-        onChange={(event) => {
-          setPolicy(key, event.target.value as SkillActivationPolicy);
-          bumpNativeSkills();
-        }}
-        className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
-      >
-        {ACTIVATION_POLICIES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-      </select>
-    </label>
+    <div className="flex items-center gap-1 text-[10px] text-faint">
+      <label className="flex items-center gap-1">
+        Policy
+        <select
+          aria-label={`/${command} activation policy`}
+          value={policy}
+          onChange={(event) => {
+            void setPolicy(key, event.target.value as SkillActivationPolicy);
+            bumpNativeSkills();
+          }}
+          className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
+        >
+          {ACTIVATION_POLICIES.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      </label>
+      <label className="ml-1 inline-flex items-center gap-0.5" title="Pin this skill higher in ranked discovery">
+        <input aria-label={`Pin /${command}`} type="checkbox" checked={pinned} onChange={(event) => void setPinned(key, event.target.checked)} />
+        <Pin size={10} />
+      </label>
+    </div>
   );
 }
 

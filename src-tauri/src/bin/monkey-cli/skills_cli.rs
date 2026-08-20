@@ -11,6 +11,7 @@ use little_monkey_lib::native_skills::{
     SkillDescriptor, SkillScope,
 };
 use little_monkey_lib::prompts::PromptEntry;
+use little_monkey_lib::skill_activation::{SkillActivationPolicy, SkillActivationStore};
 use little_monkey_lib::skill_learning::{
     EvaluationCaseReport, LearningMode, LearningPolicy, LearningSettings, PromotionOutcome,
     SkillLearningStore,
@@ -128,6 +129,27 @@ pub enum SkillsCmd {
     /// candidates still waiting on evaluation or approval.
     #[command(subcommand)]
     Learned(LearnedCmd),
+    /// Read or change per-skill activation policy in the active profile.
+    #[command(subcommand)]
+    Activation(ActivationCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ActivationCmd {
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        #[arg(value_enum)]
+        policy: CliActivationPolicy,
+        #[arg(long)]
+        pinned: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -200,6 +222,23 @@ pub enum CliLearningPolicy {
     Automatic,
     Ask,
     Manual,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CliActivationPolicy {
+    Automatic,
+    Ask,
+    Manual,
+}
+
+impl From<CliActivationPolicy> for SkillActivationPolicy {
+    fn from(value: CliActivationPolicy) -> Self {
+        match value {
+            CliActivationPolicy::Automatic => Self::Automatic,
+            CliActivationPolicy::Ask => Self::Ask,
+            CliActivationPolicy::Manual => Self::Manual,
+        }
+    }
 }
 
 impl From<CliLearningPolicy> for LearningPolicy {
@@ -434,6 +473,9 @@ fn git_request(
 }
 
 pub fn run(action: &SkillsCmd, data_dir: &Path, workspace: Option<&Path>) -> Result<(), String> {
+    if let SkillsCmd::Activation(action) = action {
+        return run_activation(action, data_dir);
+    }
     let manager = manager(data_dir)?;
     match action {
         SkillsCmd::List { json } => {
@@ -638,6 +680,51 @@ pub fn run(action: &SkillsCmd, data_dir: &Path, workspace: Option<&Path>) -> Res
             Ok(())
         }
         SkillsCmd::Learned(action) => run_learned(action, data_dir, workspace),
+    }
+}
+
+fn run_activation(action: &ActivationCmd, data_dir: &Path) -> Result<(), String> {
+    let store = SkillActivationStore::new(data_dir).map_err(|error| error.to_string())?;
+    match action {
+        ActivationCmd::List { json } => {
+            let entries = store.list().map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&entries).map_err(|error| error.to_string())?
+                );
+            } else {
+                for entry in entries {
+                    println!(
+                        "{}  {:?}  pinned={}",
+                        entry.key, entry.preference.policy, entry.preference.pinned
+                    );
+                }
+            }
+            Ok(())
+        }
+        ActivationCmd::Get { key } => {
+            let entry = store.get(key).map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entry).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        ActivationCmd::Set {
+            key,
+            policy,
+            pinned,
+        } => {
+            let entry = store
+                .set(key, SkillActivationPolicy::from(*policy), *pinned)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}  {:?}  pinned={}",
+                entry.key, entry.preference.policy, entry.preference.pinned
+            );
+            Ok(())
+        }
     }
 }
 
