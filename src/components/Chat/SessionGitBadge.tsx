@@ -283,11 +283,15 @@ export function SessionGitBadge({
   session,
   context,
   rowHovered = false,
+  rowHoverReady = false,
+  closeImmediately = false,
   rowAnchorRect = null,
 }: {
   session: ChatSession;
   context: SessionGitContext | null;
   rowHovered?: boolean;
+  rowHoverReady?: boolean;
+  closeImmediately?: boolean;
   rowAnchorRect?: DOMRect | null;
 }) {
   const { t } = useT();
@@ -336,16 +340,25 @@ export function SessionGitBadge({
   };
 
   useEffect(() => {
-    if (!rowHovered || !rowAnchorRect) return;
+    if (!rowHovered) {
+      if (closeImmediately) {
+        clearCloseTimer();
+        setOpen(false);
+      } else {
+        scheduleClose();
+      }
+      return;
+    }
+    if (!rowHoverReady || !rowAnchorRect) {
+      clearCloseTimer();
+      setOpen(false);
+      return;
+    }
     clearCloseTimer();
     setAnchorRect(rowAnchorRect);
     setOpen(true);
     void loadReview();
-  }, [rowHovered, rowAnchorRect]);
-
-  useEffect(() => {
-    if (!rowHovered) scheduleClose();
-  }, [rowHovered]);
+  }, [closeImmediately, rowAnchorRect, rowHoverReady, rowHovered]);
 
   if (!context) return null;
 
