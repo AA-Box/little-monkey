@@ -1884,6 +1884,7 @@ pub fn run() {
             m7_companion::m7_image_insert_chat,
             m7_companion::m7_emergency_stop,
             dictation::dictation_capabilities,
+            dictation::dictation_open_permission_settings,
             dictation::dictation_start,
             dictation::dictation_stop,
             dictation::dictation_cancel,
