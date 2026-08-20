@@ -18,7 +18,7 @@ use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
-    ApprovalGrant, CandidateProposal, CorrectedExecution, EffectivenessRecord,
+    ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
     EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary,
     LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
     PromotionOutcome, RunEvidence, SkillLearningStore,
@@ -143,13 +143,91 @@ pub async fn skill_learning_detect(
     user_text: String,
     scope: SkillScope,
 ) -> Result<Option<LearningCandidate>, String> {
-    let workspace = optional_primary_workspace(&state)?;
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
     let events: Vec<RunEventEnvelope> = with_ledger(&app, &state, |ledger| {
         ledger.load_events(&run_id, 0, crate::skill_learning::MAX_SOURCE_EVENTS * 8)
     })?;
     let evidence = evidence_from_events(&run_id, &user_text, &events);
     let store = learning.store.clone();
     run_blocking(move || store.detect(&evidence, scope, workspace.as_deref())).await
+}
+
+/// Returns the immutable scope of a run when its durable evidence is enough
+/// for an explicit skill capture. `None` means the UI should not render the
+/// save affordance.
+#[tauri::command]
+pub async fn skill_learning_capture_eligibility(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    run_id: String,
+    user_text: String,
+) -> Result<Option<SkillScope>, String> {
+    let Some(evidence) = run_evidence(&app, &state, &run_id, &user_text) else {
+        return Ok(None);
+    };
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    let scope = if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    };
+    let store = learning.store.clone();
+    run_blocking(move || {
+        store
+            .capture_eligibility(&evidence, scope)
+            .map(|eligible| eligible.then_some(scope))
+    })
+    .await
+}
+
+/// Returns the immutable scope recorded on a run. Automatic learning uses
+/// this independently of the manual-save eligibility policy, so tightening
+/// the latter cannot disable automatic detection later.
+#[tauri::command]
+pub async fn skill_learning_scope_for_run(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<SkillScope>, String> {
+    let exists = with_ledger(&app, &state, |ledger| {
+        Ok(ledger.load_run(&run_id)?.is_some())
+    })?;
+    if !exists {
+        return Ok(None);
+    }
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    Ok(Some(if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    }))
+}
+
+/// Explicitly saves a completed run as a candidate. Unlike detection, this
+/// command is user-directed and therefore remains available in `Off` mode;
+/// the backend still reconstructs and validates the run from its own ledger.
+#[tauri::command]
+pub async fn skill_learning_capture(
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    run_id: String,
+    user_text: String,
+) -> Result<CaptureOutcome, String> {
+    require_main_window(&window)?;
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    let scope = if workspace.is_some() {
+        SkillScope::Workspace
+    } else {
+        SkillScope::Global
+    };
+    let evidence = run_evidence(&app, &state, &run_id, &user_text).ok_or_else(|| {
+        "the completed run has no durable evidence to save as a skill".to_string()
+    })?;
+    let store = learning.store.clone();
+    run_blocking(move || store.capture_run(&evidence, scope, workspace.as_deref())).await
 }
 
 #[tauri::command]
@@ -181,6 +259,7 @@ pub async fn skill_learning_begin_reflection(
 /// Stages (or re-stages, for "Edit before install") a candidate's package.
 #[tauri::command]
 pub async fn skill_learning_stage(
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
     native: tauri::State<'_, NativeSkillsCommandState>,
     m4: tauri::State<'_, M4CommandState>,
@@ -189,12 +268,13 @@ pub async fn skill_learning_stage(
     proposal: CandidateProposal,
     run_id: Option<String>,
 ) -> Result<LearningCandidate, String> {
+    require_main_window(&window)?;
     let workspace = optional_primary_workspace(&state)?;
     let packages = signed_package_skills(&m4)?;
     let manager = native.manager.clone();
     let store = learning.store.clone();
     run_blocking(move || {
-        store.propose(
+        store.propose_user_edit(
             &candidate_id,
             run_id.as_deref(),
             &proposal,
@@ -560,6 +640,28 @@ fn run_evidence(
         return None;
     }
     Some(evidence_from_events(run_id, user_text, &events))
+}
+
+/// Resolves the workspace from the run's immutable submission snapshot, not
+/// from whichever folder the user happens to have selected when they click a
+/// delayed learning action.
+fn workspace_for_run(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    run_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    with_ledger(app, state, |ledger| {
+        Ok(ledger.load_run(run_id)?.and_then(|run| {
+            run.spec.workspace.and_then(|workspace| {
+                let primary_root_id = workspace.primary_root_id;
+                workspace
+                    .roots
+                    .into_iter()
+                    .find(|root| root.root_id == primary_root_id)
+                    .map(|root| PathBuf::from(root.canonical_path))
+            })
+        }))
+    })
 }
 
 #[tauri::command]
