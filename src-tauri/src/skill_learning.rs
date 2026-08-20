@@ -222,6 +222,7 @@ pub enum CandidateStatus {
 #[serde(rename_all = "snake_case")]
 pub enum LearningSourceKind {
     ExplicitUserInstruction,
+    ManualRunCapture,
     UserCorrection,
     VerificationRepair,
     SuccessfulNovelProcedure,
@@ -232,6 +233,7 @@ impl LearningSourceKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::ExplicitUserInstruction => "explicit_user_instruction",
+            Self::ManualRunCapture => "manual_run_capture",
             Self::UserCorrection => "user_correction",
             Self::VerificationRepair => "verification_repair",
             Self::SuccessfulNovelProcedure => "successful_novel_procedure",
@@ -1586,6 +1588,118 @@ impl SkillLearningStore {
         Ok(Some(candidate))
     }
 
+    /// Opens a candidate from an explicit user action. This is intentionally
+    /// separate from `detect`: saving a run is a direct request and must work
+    /// even when automatic learning is off, but it still requires durable,
+    /// successful tool evidence and the configured scope permission.
+    pub fn capture_run(
+        &self,
+        evidence: &RunEvidence,
+        scope: SkillScope,
+        workspace: Option<&Path>,
+    ) -> Result<LearningCandidate, SkillError> {
+        let _guard = self.lock()?;
+        let mut state = self.load()?;
+        if scope == SkillScope::Global && !state.allow_global_scope {
+            return Err(SkillError::Conflict(
+                "global-scope learning is turned off in the learning settings".to_string(),
+            ));
+        }
+        if !evidence.completed || evidence.failed || evidence.successful_tools().is_empty() {
+            return Err(SkillError::Conflict(
+                "this run has no completed successful tool evidence to save as a skill".to_string(),
+            ));
+        }
+        if let Some(existing_id) = state
+            .candidates
+            .values()
+            .find(|candidate| {
+                candidate
+                    .source_run_ids
+                    .iter()
+                    .any(|id| id == &evidence.run_id)
+            })
+            .map(|candidate| candidate.candidate_id.clone())
+        {
+            let existing = candidate_mut(&mut state, &existing_id)?;
+            if matches!(
+                existing.status,
+                CandidateStatus::Detected | CandidateStatus::Reflecting
+            ) {
+                existing.source_kind = LearningSourceKind::ManualRunCapture;
+                existing.signal_summary =
+                    "You explicitly saved this completed run as a reusable skill.".to_string();
+                existing.updated_at_unix_ms = now_unix_ms();
+            }
+            let updated = existing.clone();
+            self.save(&state)?;
+            return Ok(updated);
+        }
+
+        let now = now_unix_ms();
+        let mut source_event_ids = evidence
+            .tool_calls
+            .iter()
+            .map(|call| call.event_id.clone())
+            .chain(
+                evidence
+                    .verifications
+                    .iter()
+                    .map(|entry| entry.event_id.clone()),
+            )
+            .collect::<Vec<_>>();
+        source_event_ids.truncate(MAX_SOURCE_EVENTS);
+        let candidate = LearningCandidate {
+            candidate_id: format!("learn-{}", Uuid::new_v4().simple()),
+            scope,
+            status: CandidateStatus::Detected,
+            title: String::new(),
+            description: String::new(),
+            source_run_ids: vec![evidence.run_id.clone()],
+            source_event_ids,
+            source_kind: LearningSourceKind::ManualRunCapture,
+            signal_summary: "You explicitly saved this completed run as a reusable skill."
+                .to_string(),
+            proposed_command: String::new(),
+            proposed_skill_content: String::new(),
+            proposed_resource_files: Vec::new(),
+            allowed_tools: Vec::new(),
+            requirements: CandidateRequirements::default(),
+            parent_skill_sha256: None,
+            candidate_sha256: String::new(),
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            evaluation_summary: None,
+            evaluation_ids: Vec::new(),
+            evaluation_verdict: None,
+            approval_digest: None,
+            installed_sha256: None,
+            dedup: None,
+            dedup_detail: None,
+            policy: None,
+            rejection_reason: None,
+            staging_path: None,
+            workspace_path: workspace.map(|path| path.to_string_lossy().to_string()),
+            observed_prompt: evidence.user_text.clone(),
+            observed_tools: evidence
+                .successful_tools()
+                .iter()
+                .map(|call| call.tool_name.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            evidence: Some(bounded_evidence(evidence)),
+            correction: None,
+            approval_id: None,
+        };
+        prune_candidates(&mut state);
+        state
+            .candidates
+            .insert(candidate.candidate_id.clone(), candidate.clone());
+        self.save(&state)?;
+        Ok(candidate)
+    }
+
     /// Marks a detected candidate as being reflected on. Idempotent, so a
     /// crash between this and `propose` leaves a resumable candidate rather
     /// than a stuck one.
@@ -1626,7 +1740,10 @@ impl SkillLearningStore {
     ) -> Result<LearningCandidate, SkillError> {
         let _guard = self.lock()?;
         let mut state = self.load()?;
-        if state.mode == LearningMode::Off {
+        let existing = candidate_of(&state, candidate_id)?;
+        if state.mode == LearningMode::Off
+            && existing.source_kind != LearningSourceKind::ManualRunCapture
+        {
             return Err(SkillError::Conflict(
                 "learning is turned off; no candidate can be staged".to_string(),
             ));
@@ -1636,7 +1753,6 @@ impl SkillLearningStore {
                 "global-scope learning is turned off in the learning settings".to_string(),
             ));
         }
-        let existing = candidate_of(&state, candidate_id)?;
         if !matches!(
             existing.status,
             CandidateStatus::Detected
@@ -4672,6 +4788,31 @@ mod tests {
             .detect(&evidence, SkillScope::Global, None)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn an_explicit_capture_works_when_automatic_learning_is_off() {
+        let directory = TestDirectory::new("capture-off");
+        let store = store(&directory);
+        store.set_mode(LearningMode::Off).unwrap();
+        let evidence = evidence_from_events(
+            "run-1",
+            "make the retry procedure reusable",
+            &verified_procedure_events(),
+        );
+
+        let candidate = store
+            .capture_run(&evidence, SkillScope::Global, None)
+            .unwrap();
+        assert_eq!(candidate.source_kind, LearningSourceKind::ManualRunCapture);
+        assert_eq!(candidate.status, CandidateStatus::Detected);
+        assert_eq!(
+            store
+                .capture_run(&evidence, SkillScope::Global, None)
+                .unwrap()
+                .candidate_id,
+            candidate.candidate_id
+        );
     }
 
     #[test]

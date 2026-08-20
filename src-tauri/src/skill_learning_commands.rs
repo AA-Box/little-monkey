@@ -143,13 +143,35 @@ pub async fn skill_learning_detect(
     user_text: String,
     scope: SkillScope,
 ) -> Result<Option<LearningCandidate>, String> {
-    let workspace = optional_primary_workspace(&state)?;
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
     let events: Vec<RunEventEnvelope> = with_ledger(&app, &state, |ledger| {
         ledger.load_events(&run_id, 0, crate::skill_learning::MAX_SOURCE_EVENTS * 8)
     })?;
     let evidence = evidence_from_events(&run_id, &user_text, &events);
     let store = learning.store.clone();
     run_blocking(move || store.detect(&evidence, scope, workspace.as_deref())).await
+}
+
+/// Explicitly saves a completed run as a candidate. Unlike detection, this
+/// command is user-directed and therefore remains available in `Off` mode;
+/// the backend still reconstructs and validates the run from its own ledger.
+#[tauri::command]
+pub async fn skill_learning_capture(
+    window: tauri::Window,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    run_id: String,
+    user_text: String,
+    scope: SkillScope,
+) -> Result<LearningCandidate, String> {
+    require_main_window(&window)?;
+    let workspace = workspace_for_run(&app, &state, &run_id)?;
+    let evidence = run_evidence(&app, &state, &run_id, &user_text).ok_or_else(|| {
+        "the completed run has no durable evidence to save as a skill".to_string()
+    })?;
+    let store = learning.store.clone();
+    run_blocking(move || store.capture_run(&evidence, scope, workspace.as_deref())).await
 }
 
 #[tauri::command]
@@ -560,6 +582,28 @@ fn run_evidence(
         return None;
     }
     Some(evidence_from_events(run_id, user_text, &events))
+}
+
+/// Resolves the workspace from the run's immutable submission snapshot, not
+/// from whichever folder the user happens to have selected when they click a
+/// delayed learning action.
+fn workspace_for_run(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+    run_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    with_ledger(app, state, |ledger| {
+        Ok(ledger.load_run(run_id)?.and_then(|run| {
+            run.spec.workspace.and_then(|workspace| {
+                let primary_root_id = workspace.primary_root_id;
+                workspace
+                    .roots
+                    .into_iter()
+                    .find(|root| root.root_id == primary_root_id)
+                    .map(|root| PathBuf::from(root.canonical_path))
+            })
+        }))
+    })
 }
 
 #[tauri::command]

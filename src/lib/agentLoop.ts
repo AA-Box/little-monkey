@@ -31,6 +31,7 @@ import { GENERATE_IMAGE_TOOL, MANAGE_SKILL_LEARNING_TOOL, PRESENT_PLAN_TOOL, REA
 import {
   candidateNotice,
   finalizeLearningForRun,
+  formatSaveSkillNotice,
   formatLearningNotice,
   learnFromFinishedRun,
   type InvokedSkillUse,
@@ -2347,21 +2348,31 @@ async function runTurnGuarded(
       // can be a candidate. Everything is best-effort — a turn that already
       // succeeded must never surface a learning failure as its own.
       await finalizeLearningForRun(sessionId, durable.recorder.runId, userText);
-      if (cleanlyCompleted && durable.reflect !== null) {
+      if (cleanlyCompleted) {
         const scope: NativeSkillScope =
           primaryRoot(useWorkspaceStore.getState().roots) !== null ? 'workspace' : 'global';
-        const candidate = await learnFromFinishedRun(
-          durable.recorder.runId,
-          userText,
-          scope,
-          durable.reflect,
-          signal,
-        );
-        if (candidate) {
-          useSessionStore.getState().addMessage(sessionId, {
-            role: 'system',
-            content: formatLearningNotice(candidateNotice(candidate)),
-          });
+        useSessionStore.getState().addMessage(sessionId, {
+          role: 'system',
+          content: formatSaveSkillNotice({
+            runId: durable.recorder.runId,
+            userText,
+            scope,
+          }),
+        });
+        if (durable.reflect !== null) {
+          const candidate = await learnFromFinishedRun(
+            durable.recorder.runId,
+            userText,
+            scope,
+            durable.reflect,
+            signal,
+          );
+          if (candidate) {
+            useSessionStore.getState().addMessage(sessionId, {
+              role: 'system',
+              content: formatLearningNotice(candidateNotice(candidate)),
+            });
+          }
         }
       }
     }

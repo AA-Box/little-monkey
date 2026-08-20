@@ -25,6 +25,7 @@ export type CandidateStatus =
 
 export type LearningSourceKind =
   | "explicit_user_instruction"
+  | "manual_run_capture"
   | "user_correction"
   | "verification_repair"
   | "successful_novel_procedure"
@@ -321,6 +322,8 @@ export const skillLearningClient = {
    * the ledger does not carry. */
   detect: (runId: string, userText: string, scope: NativeSkillScope) =>
     invoke<LearningCandidate | null>("skill_learning_detect", { runId, userText, scope }),
+  capture: (runId: string, userText: string, scope: NativeSkillScope) =>
+    invoke<LearningCandidate>("skill_learning_capture", { runId, userText, scope }),
   listCandidates: () => invoke<LearningCandidate[]>("skill_learning_list_candidates"),
   candidate: (candidateId: string) => invoke<LearningCandidate>("skill_learning_candidate", { candidateId }),
   beginReflection: (candidateId: string) =>

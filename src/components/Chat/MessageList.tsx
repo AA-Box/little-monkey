@@ -59,9 +59,14 @@ import {
 } from "../../lib/agentLoop";
 import {
   isLearningNotice,
+  isSaveSkillNotice,
   parseLearningNotice,
+  parseSaveSkillNotice,
   type LearningNotice,
+  type SaveSkillNotice,
 } from "../../lib/skillLearning";
+import { draftCandidate } from "../../lib/skillLearningReflection";
+import { skillLearningClient } from "../../lib/skillLearningClient";
 import { useSkillLearningFocusStore } from "../../store/skillLearningFocusStore";
 import type { SettingsTab } from "../Settings/SettingsModal";
 import { isCompactionMarker } from "../../lib/contextTrimmer";
@@ -148,6 +153,7 @@ type TimelineItem =
   | { kind: "memory"; key: string; notice: MemoryNotice; messageIndex: number }
   | { kind: "plan"; key: string; notice: PlanNotice; messageIndex: number }
   | { kind: "verify"; key: string; notice: VerifyNotice }
+  | { kind: "saveSkill"; key: string; notice: SaveSkillNotice }
   | { kind: "learning"; key: string; notice: LearningNotice }
   | { kind: "sources"; key: string; notice: SourcesNotice }
   | { kind: "recipe"; key: string; notice: RecipeNotice }
@@ -309,6 +315,13 @@ function buildTimeline(messages: ChatMessage[], messageIndexOffset = 0): Timelin
         const notice = parseLearningNotice(msg.content);
         if (notice) {
           items.push({ kind: "learning", key: `learning-${notice.candidateId}`, notice });
+        }
+        return;
+      }
+      if (isSaveSkillNotice(msg.content)) {
+        const notice = parseSaveSkillNotice(msg.content);
+        if (notice) {
+          items.push({ kind: "saveSkill", key: `save-skill-${notice.runId}`, notice });
         }
         return;
       }
@@ -1041,6 +1054,55 @@ const LearningRow = memo(function LearningRow({
   );
 });
 
+const SaveSkillRow = memo(function SaveSkillRow({
+  notice,
+  onOpenSettingsTab,
+}: {
+  notice: SaveSkillNotice;
+  onOpenSettingsTab?: (tab: SettingsTab) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const save = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const candidate = await skillLearningClient.capture(notice.runId, notice.userText, notice.scope);
+      if (candidate.status === "detected" || candidate.status === "reflecting") {
+        const outcome = await draftCandidate(candidate.candidate_id);
+        if (outcome.error) throw new Error(outcome.error);
+        if (outcome.declined) throw new Error("No reusable procedure was found in this run.");
+      }
+      useSkillLearningFocusStore.getState().focus(candidate.candidate_id);
+      onOpenSettingsTab?.("prompts");
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-center">
+      <div className="flex max-w-[85%] min-w-0 items-center gap-2 overflow-hidden rounded-md border border-border bg-surface-2 px-3 py-1.5 text-xs text-muted">
+        <Brain size={13} className="shrink-0 text-faint" />
+        <span className="truncate font-medium text-foreground">Save this run as a reusable skill?</span>
+        <button
+          type="button"
+          disabled={busy}
+          className="ml-auto flex shrink-0 cursor-pointer items-center gap-1 whitespace-nowrap underline decoration-dotted underline-offset-2 transition-colors duration-150 hover:text-foreground disabled:cursor-wait disabled:opacity-60"
+          onClick={() => void save()}
+        >
+          {busy && <LoaderCircle size={12} className="animate-spin" />}
+          {busy ? "Generating draft…" : "Save as skill"}
+        </button>
+        {error && <span className="truncate text-danger">{error}</span>}
+      </div>
+    </div>
+  );
+});
+
 const VerifyRow = memo(function VerifyRow({ notice }: { notice: VerifyNotice }) {
   const { t } = useT();
   const [open, setOpen] = useState(false);
@@ -1420,6 +1482,9 @@ export default function MessageList({
             }
             if (item.kind === "learning") {
               return <LearningRow key={item.key} notice={item.notice} onOpenSettingsTab={onOpenSettingsTab} />;
+            }
+            if (item.kind === "saveSkill") {
+              return <SaveSkillRow key={item.key} notice={item.notice} onOpenSettingsTab={onOpenSettingsTab} />;
             }
             if (item.kind === "sources") {
               return <SourcesRow key={item.key} notice={item.notice} />;
