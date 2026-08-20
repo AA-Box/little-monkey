@@ -58,6 +58,26 @@ cd extensions/little-monkey-vscode && npm test
 cd ../little-monkey-jetbrains && gradle test --no-daemon
 ```
 
+## IDE extension releases
+
+The VS Code extension and JetBrains plugin currently use independent version
+1.0.0. Desktop GitHub releases package them as
+`little-monkey-vscode-1.0.0.vsix` and `little-monkey-jetbrains-1.0.0.zip`.
+Download the assets from the release page and install them through the host
+IDE; marketplace publishing is not automatic. Both clients require a local
+Little Monkey daemon and `monkey acp`.
+
+To reproduce the release checks locally:
+
+```sh
+cd extensions/little-monkey-vscode
+npm test
+npx --yes @vscode/vsce@3.6.0 package --no-dependencies
+
+cd ../little-monkey-jetbrains
+gradle test buildPlugin --no-daemon
+```
+
 Opt-in checks that need real local models or hardware:
 
 ```sh

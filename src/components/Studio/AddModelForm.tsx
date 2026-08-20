@@ -83,6 +83,19 @@ function slugify(value: string): string {
     .slice(0, 128);
 }
 
+const DEFAULT_MFLUX_REPOSITORY = "black-forest-labs/FLUX.1-dev";
+
+function mfluxLicense(repo: string) {
+  const normalized = repo.trim() || DEFAULT_MFLUX_REPOSITORY;
+  return {
+    id: `mflux:${normalized}`,
+    name: "MFLUX model terms",
+    url: `https://huggingface.co/${normalized}`,
+    excludedTerritories: [],
+    acceptanceRequired: true,
+  };
+}
+
 /** The path a component reads from, whichever source it uses. */
 function componentPath(component: ModelComponent | undefined): string {
   const source = component?.source;
@@ -92,7 +105,7 @@ function componentPath(component: ModelComponent | undefined): string {
 }
 
 /**
- * Adds a model to the user's library.
+ * Adds a model to the user's library or edits an existing library entry.
  *
  * The first file named says most of what the entry needs: its name, its
  * architecture family, and — through that family — what it can make and how it
@@ -100,11 +113,22 @@ function componentPath(component: ModelComponent | undefined): string {
  * because these guesses are cheap to correct on screen and expensive to
  * discover wrong several minutes into a load.
  */
-export function AddModelForm({ onSaved }: { onSaved: () => void }) {
+interface AddModelFormProps {
+  onSaved: () => void;
+  /** When present, the form edits this library entry rather than creating one. */
+  initialSpec?: GenerationModelSpec;
+  editing?: boolean;
+}
+
+export function AddModelForm({ onSaved, initialSpec, editing = false }: AddModelFormProps) {
   const { t } = useT();
-  const [spec, setSpec] = useState<GenerationModelSpec>(emptyModelSpec);
+  const [spec, setSpec] = useState<GenerationModelSpec>(() => initialSpec ?? emptyModelSpec());
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [huggingFaceToken, setHuggingFaceToken] = useState("");
+  const mfluxSelected = spec.engine === "mflux_image";
+  const repositorySource = spec.source.kind === "hugging_face_repo" ? spec.source : null;
+  const directorySource = spec.source.kind === "local_directory" ? spec.source : null;
 
   const patch = (next: Partial<GenerationModelSpec>) =>
     setSpec((current) => ({ ...current, ...next }));
@@ -147,7 +171,14 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         ...spec,
         id: spec.id.trim() || slugify(spec.name),
       });
+      if (mfluxSelected && spec.source.kind === "hugging_face_repo") {
+        await studioClient.setHuggingFaceToken(
+          spec.id.trim() || slugify(spec.name),
+          huggingFaceToken,
+        );
+      }
       setSpec(emptyModelSpec());
+      setHuggingFaceToken("");
       onSaved();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -158,7 +189,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
 
   return (
     <div className="grid gap-3 rounded border border-border p-3">
-      <p className="text-xs font-medium">{t("Studio.add.title")}</p>
+      <p className="text-xs font-medium">{t(editing ? "Studio.add.editTitle" : "Studio.add.title")}</p>
       <p className="text-[11px] text-faint">{t("Studio.add.slotHint")}</p>
       {spec.tasks.includes("text_to_speech") && (
         <p className="text-[11px] text-faint">{t("Studio.add.speechHint")}</p>
@@ -206,16 +237,117 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         </div>
       </fieldset>
 
-      <div className="grid gap-2">
+      {!mfluxSelected && <div className="grid gap-2">
         <span className="text-[11px] text-muted">{t("Studio.add.files")}</span>
         <ModelFiles components={spec.components} onChange={patchComponents} />
-      </div>
+      </div>}
+
+      {mfluxSelected && (
+        <div className="grid gap-2 rounded border border-border p-2">
+          <span className="text-[11px] text-muted">{t("Studio.add.mfluxSource")}</span>
+          <select
+            className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+            value={spec.source.kind === "local_directory" ? "local_directory" : "hugging_face_repo"}
+            onChange={(event) =>
+              patch(
+                  event.target.value === "local_directory"
+                  ? {
+                      source: { kind: "local_directory", path: "" },
+                      license: {
+                        id: "",
+                        name: "",
+                        url: "",
+                        excludedTerritories: [],
+                        acceptanceRequired: false,
+                      },
+                    }
+                  : {
+                      source: {
+                        kind: "hugging_face_repo",
+                        repo: DEFAULT_MFLUX_REPOSITORY,
+                        revision: null,
+                      },
+                      license: mfluxLicense(DEFAULT_MFLUX_REPOSITORY),
+                    },
+              )
+            }
+          >
+            <option value="hugging_face_repo">{t("Studio.add.mfluxRepository")}</option>
+            <option value="local_directory">{t("Studio.add.mfluxDirectory")}</option>
+          </select>
+          {spec.source.kind === "local_directory" ? (
+            <span className="flex items-center gap-2">
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
+                {directorySource?.path || <span className="text-faint">{t("Studio.add.noFolder")}</span>}
+              </span>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={async () => {
+                  const picked = await open({ directory: true, multiple: false });
+                  if (typeof picked === "string") {
+                    patch({ source: { kind: "local_directory", path: picked } });
+                  }
+                }}
+              >
+                <FolderOpen size={13} />
+                {t("Studio.add.chooseFolder")}
+              </Button>
+            </span>
+          ) : (
+            <label className="grid gap-1 text-[11px] text-muted">
+              {t("Studio.add.mfluxRepository")}
+              <input
+                className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                value={repositorySource?.repo ?? ""}
+                placeholder={t("Studio.add.mfluxRepositoryPlaceholder")}
+                onChange={(event) =>
+                  patch({
+                    source: {
+                      kind: "hugging_face_repo",
+                      repo: event.target.value,
+                      revision: repositorySource?.revision ?? null,
+                    },
+                    license: mfluxLicense(event.target.value),
+                  })
+                }
+              />
+            </label>
+          )}
+          {spec.source.kind === "hugging_face_repo" && (
+            <label className="grid gap-1 text-[11px] text-muted">
+              {t("Studio.add.mfluxToken")}
+              <input
+                type="password"
+                autoComplete="off"
+                className="rounded border border-border bg-background px-2 py-1 font-mono text-xs text-foreground"
+                value={huggingFaceToken}
+                placeholder={t("Studio.add.mfluxTokenPlaceholder")}
+                onChange={(event) => setHuggingFaceToken(event.target.value)}
+              />
+              <span className="text-faint">{t("Studio.add.mfluxTokenHint")}</span>
+            </label>
+          )}
+          <label className="grid gap-1 text-[11px] text-muted">
+            {t("Studio.add.mfluxQuantization")}
+            <select
+              className="rounded border border-border bg-background px-2 py-1 text-xs text-foreground"
+              value={spec.quantizationBits ?? 8}
+              onChange={(event) => patch({ quantizationBits: Number(event.target.value) })}
+            >
+              {[8, 6, 5, 4, 3].map((bits) => (
+                <option key={bits} value={bits}>{bits}-bit</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
 
       {/* Canvas size, steps, guidance and sampler are per-generation and live
           on the Image and Video tabs. What stays here is what the architecture
           fixes rather than the run: how the family rounds a clip's length, and
           how fast it plays. */}
-      <div className="grid gap-2 sm:grid-cols-2">
+      {!mfluxSelected && <div className="grid gap-2 sm:grid-cols-2">
         <label className="grid gap-1 text-[11px] text-muted">
           {t("Studio.add.fps")}
           <input
@@ -247,14 +379,14 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
             <option value="up_to17k_plus5">{t("Studio.add.grid17k5")}</option>
           </select>
         </label>
-      </div>
+      </div>}
 
       {/* Both of these are directories, not weight files, which is why neither is
           a component slot: a slot resolves to one file. They write into the
           engine-args field below rather than carrying their own state, so a path
           typed there by hand and one picked here can never disagree about what
           actually launches. */}
-      {DIRECTORY_FLAGS.map(({ flag, labelKey, hintKey }) => {
+      {!mfluxSelected && DIRECTORY_FLAGS.map(({ flag, labelKey, hintKey }) => {
         const current = launchArgValue(spec.extraLaunchArgs, flag);
         return (
           <label key={flag} className="grid gap-1 text-[11px] text-muted">
@@ -300,13 +432,47 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
         <select
           className="rounded border border-border bg-background px-2 py-1 text-[11px] text-foreground"
           value={spec.engine}
-          onChange={(event) => patch({ engine: event.target.value as GenerationEngineKind })}
+          onChange={(event) => {
+            const engine = event.target.value as GenerationEngineKind;
+            if (engine === "mflux_image") {
+              const imageTasks = spec.tasks.filter(
+                (task) => task === "text_to_image" || task === "image_to_image",
+              );
+              patch({
+                engine,
+                components: [],
+                source: {
+                  kind: "hugging_face_repo",
+                  repo: DEFAULT_MFLUX_REPOSITORY,
+                  revision: null,
+                },
+                quantizationBits: 8,
+                family: spec.family || "dev",
+                defaults: { ...spec.defaults, sampleMethod: "linear" },
+                tasks: imageTasks.length ? imageTasks : ["text_to_image", "image_to_image"],
+                license: mfluxLicense(DEFAULT_MFLUX_REPOSITORY),
+              });
+            } else {
+              patch({
+                engine,
+                source: { kind: "components" },
+                quantizationBits: null,
+              });
+            }
+          }}
         >
           <option value="stable_diffusion_cpp">{t("Studio.add.engineBundled")}</option>
           <option value="mlx_video">{t("Studio.add.engineMlxVideo")}</option>
+          <option value="mflux_image">{t("Studio.add.engineMfluxImage")}</option>
         </select>
         <span className="text-faint">
-          {t(spec.engine === "mlx_video" ? "Studio.add.engineMlxVideoHint" : "Studio.add.engineHint")}
+          {t(
+            spec.engine === "mlx_video"
+              ? "Studio.add.engineMlxVideoHint"
+              : spec.engine === "mflux_image"
+                ? "Studio.add.engineMfluxImageHint"
+                : "Studio.add.engineHint",
+          )}
         </span>
       </label>
 
@@ -314,7 +480,7 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
           since the quote-aware parser landed, so this is discoverability rather
           than new capability — which is exactly why they are toggles over the
           same `extraLaunchArgs` and not a second place to store settings. */}
-      <div className="grid gap-1.5">
+      {!mfluxSelected && <div className="grid gap-1.5">
         <span className="text-[11px] text-muted">{t("Studio.add.engineOptions")}</span>
         {ENGINE_TOGGLES.map(({ flag, labelKey, hintKey }) => (
           <label key={flag} className="flex items-start gap-2 text-[11px]">
@@ -338,9 +504,9 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
             </span>
           </label>
         ))}
-      </div>
+      </div>}
 
-      <label className="grid gap-1 text-[11px] text-muted">
+      {!mfluxSelected && <label className="grid gap-1 text-[11px] text-muted">
         {t("Studio.add.engineArgs")}
         <input
           className="rounded border border-border bg-background px-2 py-1 font-mono text-[11px] text-foreground"
@@ -349,14 +515,24 @@ export function AddModelForm({ onSaved }: { onSaved: () => void }) {
           onChange={(event) => patch({ extraLaunchArgs: parseLaunchArgs(event.target.value) })}
         />
         <span className="text-faint">{t("Studio.add.engineArgsHint")}</span>
-      </label>
+      </label>}
 
       <Button
         variant="primary"
-        disabled={busy || !spec.name.trim() || spec.components.length === 0}
+        disabled={
+          busy ||
+          !spec.name.trim() ||
+          (mfluxSelected
+            ? (spec.source.kind === "hugging_face_repo"
+                ? !spec.source.repo.trim()
+                : spec.source.kind === "local_directory"
+                  ? !spec.source.path.trim()
+                  : true)
+            : spec.components.length === 0)
+        }
         onClick={() => void save()}
       >
-        {t("Studio.add.save")}
+        {t(editing ? "Studio.add.saveChanges" : "Studio.add.save")}
       </Button>
     </div>
   );

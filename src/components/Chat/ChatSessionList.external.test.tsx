@@ -87,6 +87,72 @@ afterEach(() => {
 });
 
 describe("ChatSessionList across environments", () => {
+  it("renders the four session marker states without text badges", () => {
+    useSessionStore.setState({
+      sessions: [
+        session(),
+        session({ id: "done", title: "Done" }),
+        session({ id: "error", title: "Error" }),
+        session({ id: "idle", title: "Idle" }),
+      ],
+      activeSessionId: "local-1",
+      runningTurns: { "local-1": true },
+      turnOutcomes: { done: "done", error: "error" },
+    });
+    render(<ChatSessionList />);
+
+    const working = screen.getByRole("img", { name: "Working" });
+    expect(working.querySelector(".animate-pulse")).toBeTruthy();
+
+    const finished = screen.getByRole("img", { name: "Finished" });
+    expect(finished.querySelector(".bg-accent")).toBeTruthy();
+    expect(finished.querySelector(".animate-pulse")).toBeNull();
+
+    const idle = screen.getByRole("img", { name: "Idle" });
+    expect(idle.querySelector(".border-faint")).toBeTruthy();
+
+    expect(screen.getByRole("img", { name: "Failed" }).querySelector("svg")).toBeTruthy();
+  });
+
+  it("exposes pin and archive actions on a local chat row", () => {
+    render(<ChatSessionList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Pin" }));
+    expect(useSessionStore.getState().sessions[0]?.pinned).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    expect(useSessionStore.getState().sessions[0]?.archived).toBe(true);
+  });
+
+  it("only reveals session shortcuts while the primary modifier is held", () => {
+    useSessionStore.setState({
+      sessions: [session(), session({ id: "second", title: "Second session" })],
+      activeSessionId: "local-1",
+    });
+    render(<ChatSessionList />);
+
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    fireEvent.keyDown(window, { key: "Control", ctrlKey: true });
+    expect(screen.getByText(/⌘2|Ctrl\+2/)).toBeTruthy();
+    const row = screen.getByText("Local session").closest("[role=button]")!;
+    fireEvent.pointerEnter(row);
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+    fireEvent.pointerLeave(row);
+    fireEvent.keyUp(window, { key: "Control", ctrlKey: false });
+    expect(screen.queryByText(/⌘2|Ctrl\+2/)).toBeNull();
+  });
+
+  it("shows the workspace in the hover preview for chats without Git context", () => {
+    useSessionStore.setState({
+      sessions: [session({ workspacePath: "/work/newApp" })],
+      activeSessionId: "local-1",
+    });
+    render(<ChatSessionList />);
+
+    fireEvent.pointerEnter(screen.getByText("Local session").closest("[role=button]")!);
+    expect(screen.getByText("newApp")).toBeTruthy();
+  });
+
   it("lists a conversation the daemon owns beside the local sessions", async () => {
     render(<ChatSessionList />);
 

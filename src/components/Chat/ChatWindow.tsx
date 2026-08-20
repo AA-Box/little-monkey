@@ -34,6 +34,7 @@ import { ContextUsageIndicator } from "./ContextUsageIndicator";
 import { CheckpointTimeline } from "./CheckpointTimeline";
 import { AttachMenu } from "./AttachMenu";
 import { AttachmentChip } from "./AttachmentChip";
+import { DictationButton, type DictationButtonHandle } from "./DictationButton";
 import { Tooltip } from "./MessageActions";
 import { WorkspaceBar } from "../Workspace/WorkspaceBar";
 import { useT } from "../../lib/i18n";
@@ -358,6 +359,9 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   // its Stop affordance wherever its session is shown), and a session
   // already running a turn stays locked in whichever pane displays it.
   const sending = useSessionStore(selectTurnRunning(sessionId));
+  const activeProvider = useModelStore((state) => state.activeProvider);
+  const llamaStatus = useModelStore((state) => state.llamaStatus);
+  const localModelStarting = activeProvider === "local" && llamaStatus === "starting";
   const [preparingTurn, setPreparingTurn] = useState(false);
   const preparingTurnRef = useRef(false);
   const [startingComparison, setStartingComparison] = useState(false);
@@ -376,6 +380,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const pendingTerminalEvidence = useTerminalStore((state) => state.pendingEvidenceByChat[sessionId] ?? null);
   const consumeTerminalEvidence = useTerminalStore((state) => state.consumeEvidence);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const dictationButtonRef = useRef<DictationButtonHandle>(null);
 
   // "@"-mention autocomplete state. `mentionQuery` being non-null is what
   // controls whether the popup is rendered at all.
@@ -1021,7 +1026,17 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   }, [appendCommandNotice, availableSkills, onOpenPmCopilot, onOpenSettingsTab, sessionId]);
 
   const handleSend = useCallback(async () => {
-    const text = input.trim();
+    let settledInput = input;
+    if (dictationButtonRef.current?.isActive()) {
+      try {
+        const finalValue = await dictationButtonRef.current.settleForSend();
+        if (finalValue !== null) settledInput = finalValue;
+      } catch (reason) {
+        setError(reason);
+        return;
+      }
+    }
+    const text = settledInput.trim();
     if (!text) return;
     const builtIn = parseBuiltInSlashCommand(text);
     if (builtIn) {
@@ -1037,7 +1052,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       });
       return;
     }
-    if (sending || startingComparison || startingCrew || preparingTurnRef.current) return;
+    if (sending || startingComparison || startingCrew || preparingTurnRef.current || localModelStarting) return;
 
     preparingTurnRef.current = true;
     setPreparingTurn(true);
@@ -1093,7 +1108,7 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // Ultracode rides the normal single-turn path — the flag only changes
     // what the agent loop layers into the system prompt and tool list.
     sendTurn(text, pendingAttachments, skillInvocations, ultracodeMode);
-  }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice]);
+  }, [input, sending, startingComparison, startingCrew, ultracodeMode, attachments, crewId, compareTargets, resizeTextarea, sendTurn, sessionId, prepareTurnInstructions, executeBuiltIn, appendCommandNotice, localModelStarting]);
 
   const handleStop = useCallback(() => {
     stopTurn(sessionId);
@@ -1631,11 +1646,20 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
                   </div>
                 )}
               </div>
+              <DictationButton
+                ref={dictationButtonRef}
+                sessionId={sessionId}
+                value={input}
+                onChange={setInput}
+                textareaRef={textareaRef}
+                resizeTextarea={resizeTextarea}
+                disabled={sending || preparingTurn || startingComparison || startingCrew}
+              />
               <span className="group/action relative shrink-0">
                 <button
                   type="button"
                   onClick={sending ? handleStop : handleSend}
-                  disabled={preparingTurn || startingComparison || startingCrew || (!sending && !input.trim())}
+                  disabled={preparingTurn || startingComparison || startingCrew || localModelStarting || (!sending && !input.trim())}
                   aria-label={sending ? t("ChatWindow.stopResponseAriaLabel") : t("ChatWindow.sendMessageAriaLabel")}
                   className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background"
                 >

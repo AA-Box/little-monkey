@@ -166,10 +166,12 @@ export function Listbox({ value, options, onChange, placeholder, ariaLabel }: Li
           setOpen(true);
         }}
       >
-        <span className="min-w-0 flex-1 truncate">
-          {selected?.label ?? placeholder ?? ""}
+        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+          <span className="min-w-0 flex-1 truncate">
+            {selected?.label ?? placeholder ?? ""}
+          </span>
           {selected?.detail && (
-            <span className="ml-1.5 text-faint">{selected.detail}</span>
+            <span className="max-w-[45%] shrink-0 truncate text-faint">{selected.detail}</span>
           )}
         </span>
         <ChevronDown size={12} className="shrink-0 text-muted" />
