@@ -157,6 +157,21 @@ describe("QuickJsProgrammaticRuntime", () => {
     expect(result.value).toEqual({ toolName: "mcp__server__lookup-v2", args: { id: "42" } });
   });
 
+  it("escapes line separators and markup in generated tool wrappers", async () => {
+    const hostileName = `mcp__server__</script>${String.fromCharCode(0x2029)}`;
+    const hostileTool: ToolDef = {
+      ...lookupTool,
+      function: { ...lookupTool.function, name: hostileName },
+    };
+    const result = await runtime.execute(makeRequest(
+      'return await tools["mcp__server__</script>" + String.fromCharCode(0x2029)]({id: "42"});',
+      { toolDefinitions: [hostileTool] },
+    ));
+
+    expect(result.status).toBe("succeeded");
+    expect(result.value).toEqual({ toolName: hostileName, args: { id: "42" } });
+  });
+
   it("leaves schema enforcement to the canonical dispatcher", async () => {
     const invoke = vi.fn().mockResolvedValue({ content: JSON.stringify({ accepted: true }), cancelled: false });
     const result = await runtime.execute(makeRequest(

@@ -173,6 +173,18 @@ function classifyRuntimeFailure(message: string, stop: StopReason | null): Progr
   return failure("runtime_exception", message || "The program raised an exception.");
 }
 
+const GENERATED_JS_STRING_ESCAPES: Record<string, string> = {
+  "<": "\\u003C",
+  ">": "\\u003E",
+  "/": "\\u002F",
+  "\u2028": "\\u2028",
+  "\u2029": "\\u2029",
+};
+
+function stringifyGeneratedJsString(value: string): string {
+  return JSON.stringify(value).replace(/[<>/\u2028\u2029]/g, (character) => GENERATED_JS_STRING_ESCAPES[character]);
+}
+
 function createProgramSource(source: string, toolNames: readonly string[]): string {
   // SECURITY REVIEW: programBody is JSON.stringify-quoted before it is placed
   // in the generated wrapper. This Function is created by the QuickJS guest
@@ -182,8 +194,10 @@ function createProgramSource(source: string, toolNames: readonly string[]): stri
   // behind the deleted global handles and the canonical dispatcher.
   const tools = toolNames
     .map(
-      (name) =>
-        `${JSON.stringify(name)}: async (args) => JSON.parse(await __lmInvoke(${JSON.stringify(name)}, __lmJson(args)))`,
+      (name) => {
+        const serializedName = stringifyGeneratedJsString(name);
+        return `${serializedName}: async (args) => JSON.parse(await __lmInvoke(${serializedName}, __lmJson(args)))`;
+      },
     )
     .join(",");
   const programBody = JSON.stringify(`"use strict"; return (async () => {
