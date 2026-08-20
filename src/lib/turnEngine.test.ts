@@ -813,10 +813,18 @@ describe("executeToolCall / read_skill_resource invocation gate", () => {
     const context: SkillToolContext = {
       availableSkills: [{ id: "review", source: "native", command: "review", name: "review", description: "d", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [] }],
       invokedCommands: new Set(["review"]),
+      invokedSkillSnapshots: new Map([["review", { sha256: "a".repeat(64), sourcePath: "/skills/review" }]]),
       maxSkillsPerTurn: 5,
     };
     const result = await executeToolCall(
-      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      call("read_skill_resource", {
+        command: "review",
+        path: "references/info.md",
+        expected_sha256: "f".repeat(64),
+        expectedSha256: "f".repeat(64),
+        expected_source_path: "/forged",
+        expectedSourcePath: "/forged",
+      }),
       null,
       "turn-1",
       emptyMcpRegistry,
@@ -827,7 +835,12 @@ describe("executeToolCall / read_skill_resource invocation gate", () => {
       undefined,
       context
     );
-    expect(invokeMock).toHaveBeenCalledWith("tool_read_skill_resource", { command: "review", path: "references/info.md" });
+    expect(invokeMock).toHaveBeenCalledWith("tool_read_skill_resource", {
+      command: "review",
+      path: "references/info.md",
+      expected_sha256: "a".repeat(64),
+      expected_source_path: "/skills/review",
+    });
     expect(result).toBe("resource contents");
   });
 

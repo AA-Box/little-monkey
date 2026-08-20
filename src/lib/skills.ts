@@ -13,10 +13,10 @@ import {
   type SkillActivationPolicy,
 } from "../store/skillActivationPolicyStore";
 
-function nativeSkillPolicyIdentity(source: import("./nativeSkillsClient").NativeSkillSource): string {
-  if (source.kind === "global") return "global";
-  if (source.kind === "workspace") return source.path;
-  return `signed-package:${source.package_id}`;
+function nativeSkillPolicyIdentity(entry: import("./nativeSkillsClient").NativeSkillDescriptor): string {
+  if (entry.source.kind === "global") return entry.managed ? "global" : entry.source.path;
+  if (entry.source.kind === "workspace") return entry.source.path;
+  return `signed-package:${entry.source.package_id}`;
 }
 
 export const MAX_SKILLS_PER_TURN = 5;
@@ -179,14 +179,15 @@ export function nativeSkills(entries: import("./nativeSkillsClient").NativeSkill
       version: entry.version,
       contentSha256: entry.sha256,
       permissions: [],
-      // The agent loop withholds implicit discovery until hydration completes.
-      // Keep direct data-only callers usable during that boot window; the
-      // runtime gate, not this display mapping, is the fail-closed boundary.
-      activationPolicy: useSkillActivationPolicyStore.getState().hydrated
-        ? skillActivationPolicyFor(skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source)))
-        : "automatic",
-      policyKey: skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry.source)),
-      sourcePath: entry.source.kind === "workspace" ? entry.source.path : undefined,
+      activationPolicy: (() => {
+        const policyKey = skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry));
+        const state = useSkillActivationPolicyStore.getState();
+        return state.hydrated
+          ? skillActivationPolicyFor(policyKey, entry.managed ? "automatic" : "ask")
+          : entry.managed ? "automatic" : "ask";
+      })(),
+      policyKey: skillActivationPolicyKey("native", entry.command, nativeSkillPolicyIdentity(entry)),
+      sourcePath: entry.source.kind === "signed_package" ? undefined : entry.source.path,
       allowedTools: entry.allowed_tools,
       resourceFiles: entry.resource_files,
     }));
