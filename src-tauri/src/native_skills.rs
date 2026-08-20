@@ -3339,7 +3339,8 @@ mod tests {
         assert_eq!(skills.len(), 2);
         let external_skill = skills.iter().find(|skill| !skill.managed).unwrap();
         assert!(
-            matches!(external_skill.source, SkillSource::Workspace { ref path } if path.ends_with(".agents/skills/review"))
+            matches!(external_skill.source, SkillSource::Workspace { ref path } if
+                Path::new(path).ends_with(Path::new(".agents").join("skills").join("review")))
         );
         assert_eq!(
             manager
