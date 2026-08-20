@@ -148,7 +148,7 @@ export function Listbox({ value, options, onChange, placeholder, ariaLabel }: Li
   };
 
   return (
-    <div ref={rootRef} className="relative" onKeyDown={handleKeyDown}>
+    <div ref={rootRef} className="relative min-w-0" onKeyDown={handleKeyDown}>
       <button
         ref={buttonRef}
         type="button"
