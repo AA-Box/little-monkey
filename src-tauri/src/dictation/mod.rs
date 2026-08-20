@@ -30,6 +30,46 @@ pub struct DictationLanguage {
     pub supports_on_device: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DictationPermissionStatus {
+    Granted,
+    Denied,
+    NotDetermined,
+    Restricted,
+    Unknown,
+    Unavailable,
+}
+
+impl Default for DictationPermissionStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictationPermissions {
+    pub microphone: DictationPermissionStatus,
+    pub speech: DictationPermissionStatus,
+}
+
+impl DictationPermissions {
+    pub fn unavailable() -> Self {
+        Self {
+            microphone: DictationPermissionStatus::Unavailable,
+            speech: DictationPermissionStatus::Unavailable,
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self {
+            microphone: DictationPermissionStatus::Unknown,
+            speech: DictationPermissionStatus::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DictationCapabilities {
@@ -39,6 +79,7 @@ pub struct DictationCapabilities {
     pub supports_partial_results: bool,
     pub supports_on_device: bool,
     pub languages: Vec<DictationLanguage>,
+    pub permissions: DictationPermissions,
 }
 
 #[derive(Clone, Debug, Serialize)]

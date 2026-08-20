@@ -144,6 +144,33 @@ describe('DictationButton', () => {
     await waitFor(() => expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(true));
   });
 
+  it('opens native settings instead of starting when a permission is denied', async () => {
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'dictation_capabilities') {
+        return Promise.resolve({
+          supported: true,
+          platform: 'macos',
+          engine: 'Apple Speech',
+          supportsPartialResults: true,
+          supportsOnDevice: false,
+          languages: [],
+          permissions: { microphone: 'granted', speech: 'denied' },
+        });
+      }
+      if (command === 'm7_config_get') return Promise.resolve(CONFIG);
+      return Promise.resolve(undefined);
+    });
+
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Start dictation' }));
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      'dictation_open_permission_settings',
+      { kind: 'speech' },
+    ));
+    expect(mocks.invoke.mock.calls.some(([command]) => command === 'dictation_start')).toBe(false);
+  });
+
   it('replaces provisional text, commits the final, and restores the caret', async () => {
     render(<Harness />);
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;

@@ -10,6 +10,19 @@ export interface DictationLanguage {
   supportsOnDevice: boolean;
 }
 
+export type DictationPermissionStatus =
+  | "granted"
+  | "denied"
+  | "notDetermined"
+  | "restricted"
+  | "unknown"
+  | "unavailable";
+
+export interface DictationPermissions {
+  microphone: DictationPermissionStatus;
+  speech: DictationPermissionStatus;
+}
+
 export interface DictationCapabilities {
   supported: boolean;
   platform: DictationPlatform;
@@ -17,6 +30,7 @@ export interface DictationCapabilities {
   supportsPartialResults: boolean;
   supportsOnDevice: boolean;
   languages: DictationLanguage[];
+  permissions: DictationPermissions;
 }
 
 export interface DictationPartialEvent {

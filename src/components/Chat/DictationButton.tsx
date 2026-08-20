@@ -73,6 +73,14 @@ function dictationPermissionKind(code: string): "microphone" | "speech" | null {
   return null;
 }
 
+function blockedPermissionKind(capabilities: DictationCapabilities): "microphone" | "speech" | null {
+  const microphone = capabilities.permissions?.microphone;
+  if (microphone === "denied" || microphone === "restricted") return "microphone";
+  const speech = capabilities.permissions?.speech;
+  if (speech === "denied" || speech === "restricted") return "speech";
+  return null;
+}
+
 export const DictationButton = forwardRef<DictationButtonHandle, DictationButtonProps>(function DictationButton(
   { sessionId, value, onChange, textareaRef, resizeTextarea, disabled = false },
   ref,
@@ -112,7 +120,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const openPermissionSettings = useCallback(async (code: string) => {
-    const kind = dictationPermissionKind(code);
+    const kind = code === "microphone" || code === "speech" ? code : dictationPermissionKind(code);
     if (!kind) return;
     try {
       await dictationClient.openPermissionSettings(kind);
@@ -235,6 +243,10 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
             supportsPartialResults: false,
             supportsOnDevice: false,
             languages: [],
+            permissions: {
+              microphone: "unavailable",
+              speech: "unavailable",
+            },
           });
         }
       });
@@ -343,7 +355,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
   }, []);
 
   const start = useCallback(() => {
-    if (disabled || !capabilities || activeRef.current || pendingStartRef.current) return;
+    if (disabled || !capabilities || capabilities.platform === "unsupported" || activeRef.current || pendingStartRef.current) return;
     const textarea = textareaRef.current;
     const selectionStart = textarea?.selectionStart ?? value.length;
     const selectionEnd = textarea?.selectionEnd ?? selectionStart;
@@ -364,6 +376,11 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       try {
         await (listenersReadyRef.current ?? Promise.resolve());
         if (pendingStartRef.current !== pendingStart) return;
+        const blockedKind = blockedPermissionKind(capabilities);
+        if (blockedKind) {
+          await openPermissionSettings(blockedKind);
+          throw new Error(`${blockedKind} permission is disabled for Little Monkey.`);
+        }
         const config = await companionClient.config();
         if (pendingStartRef.current !== pendingStart) return;
         const started = await dictationClient.start({
@@ -395,7 +412,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
         if (pendingStartRef.current === pendingStart) pendingStartRef.current = null;
       }
     })();
-  }, [capabilities, disabled, failActive, setActiveSession, textareaRef, value]);
+  }, [capabilities, disabled, failActive, openPermissionSettings, setActiveSession, textareaRef, value]);
 
   const isActive = active !== null;
   const isStarting = active?.phase === "starting";
@@ -415,7 +432,7 @@ export const DictationButton = forwardRef<DictationButtonHandle, DictationButton
       <button
         type="button"
         onClick={handleClick}
-        disabled={disabled || isStarting || !capabilities}
+        disabled={disabled || isStarting || !capabilities || capabilities.platform === "unsupported"}
         aria-label={isStarting ? t("DictationButton.starting") : ariaLabel}
         aria-pressed={isActive || undefined}
         className={`flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-faint transition-colors duration-150 hover:bg-surface-2 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-background ${isActive ? "bg-accent-soft text-accent hover:bg-accent-soft hover:text-accent" : ""}`}

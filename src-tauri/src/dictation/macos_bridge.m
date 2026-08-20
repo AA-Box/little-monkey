@@ -308,6 +308,34 @@ bool little_monkey_dictation_macos_open_permission_settings(const char *kind) {
     return url != nil && [[NSWorkspace sharedWorkspace] openURL:url];
 }
 
+static NSString *lm_speech_permission_status(void) {
+    switch ([SFSpeechRecognizer authorizationStatus]) {
+        case SFSpeechRecognizerAuthorizationStatusAuthorized:
+            return @"granted";
+        case SFSpeechRecognizerAuthorizationStatusDenied:
+            return @"denied";
+        case SFSpeechRecognizerAuthorizationStatusRestricted:
+            return @"restricted";
+        case SFSpeechRecognizerAuthorizationStatusNotDetermined:
+            return @"notDetermined";
+    }
+    return @"unknown";
+}
+
+static NSString *lm_microphone_permission_status(void) {
+    switch ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio]) {
+        case AVAuthorizationStatusAuthorized:
+            return @"granted";
+        case AVAuthorizationStatusDenied:
+            return @"denied";
+        case AVAuthorizationStatusRestricted:
+            return @"restricted";
+        case AVAuthorizationStatusNotDetermined:
+            return @"notDetermined";
+    }
+    return @"unknown";
+}
+
 char *little_monkey_dictation_macos_capabilities_json(void) {
     @autoreleasepool {
         NSMutableArray *languages = [NSMutableArray array];
@@ -330,6 +358,10 @@ char *little_monkey_dictation_macos_capabilities_json(void) {
             @"supportsPartialResults": @YES,
             @"supportsOnDevice": @(defaultSupportsOnDevice),
             @"languages": languages,
+            @"permissions": @{
+                @"microphone": lm_microphone_permission_status(),
+                @"speech": lm_speech_permission_status(),
+            },
         } options:0 error:nil];
         char *result = malloc(data.length + 1);
         if (!result) return NULL;

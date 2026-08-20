@@ -1,4 +1,4 @@
-use super::{DictationCapabilities, DictationLanguage};
+use super::{DictationCapabilities, DictationLanguage, DictationPermissions};
 
 pub struct Session;
 
@@ -10,6 +10,7 @@ pub fn capabilities() -> DictationCapabilities {
         supports_partial_results: false,
         supports_on_device: false,
         languages: Vec::<DictationLanguage>::new(),
+        permissions: DictationPermissions::unavailable(),
     }
 }
 

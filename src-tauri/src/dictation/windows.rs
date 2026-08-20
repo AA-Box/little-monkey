@@ -15,7 +15,9 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use super::{DictationCapabilities, DictationLanguage, NativeCallback, NativeEvent};
+use super::{
+    DictationCapabilities, DictationLanguage, DictationPermissions, NativeCallback, NativeEvent,
+};
 
 const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -89,6 +91,11 @@ pub fn capabilities() -> DictationCapabilities {
         supports_partial_results: true,
         supports_on_device: false,
         languages,
+        permissions: if supported {
+            DictationPermissions::unknown()
+        } else {
+            DictationPermissions::unavailable()
+        },
     }
 }
 

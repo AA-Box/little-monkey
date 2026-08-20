@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::ffi::{c_char, c_void, CStr, CString};
 
-use super::{DictationCapabilities, NativeCallback, NativeEvent};
+use super::{DictationCapabilities, DictationPermissions, NativeCallback, NativeEvent};
 
 type NativeCallbackFn = unsafe extern "C" fn(
     user_data: *mut c_void,
@@ -93,6 +93,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: true,
             supports_on_device: false,
             languages: Vec::new(),
+            permissions: DictationPermissions::unavailable(),
         };
     }
     let json = unsafe { CStr::from_ptr(raw).to_string_lossy().into_owned() };
@@ -104,6 +105,8 @@ pub fn capabilities() -> DictationCapabilities {
         supports_partial_results: bool,
         supports_on_device: bool,
         languages: Vec<super::DictationLanguage>,
+        #[serde(default)]
+        permissions: DictationPermissions,
     }
     match serde_json::from_str::<NativeCapabilities>(&json) {
         Ok(native) => DictationCapabilities {
@@ -113,6 +116,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: native.supports_partial_results,
             supports_on_device: native.supports_on_device,
             languages: native.languages,
+            permissions: native.permissions,
         },
         Err(_) => DictationCapabilities {
             supported: false,
@@ -121,6 +125,7 @@ pub fn capabilities() -> DictationCapabilities {
             supports_partial_results: true,
             supports_on_device: false,
             languages: Vec::new(),
+            permissions: DictationPermissions::unknown(),
         },
     }
 }
