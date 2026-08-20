@@ -214,6 +214,7 @@ function nativeDescriptor(overrides: Partial<NativeSkillDescriptor> = {}): Nativ
     file_count: 1,
     total_bytes: 10,
     enabled: true,
+    managed: true,
     eligibility: { eligible: true, current_os: "test", unsupported_os: false, missing_bins: [], missing_env: [] },
     supported_os: [],
     requirements: { bins: [], env: [] },

@@ -25,6 +25,8 @@ export interface NativeSkillDescriptor {
   file_count: number;
   total_bytes: number;
   enabled: boolean;
+  /** False for read-only skills discovered from standard `.agents/skills` roots. */
+  managed: boolean;
   eligibility: NativeSkillEligibility;
   supported_os: string[];
   requirements: { bins: string[]; env: string[] };

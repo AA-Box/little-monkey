@@ -85,7 +85,7 @@ function groupByRepository(skills: NativeSkillDescriptor[]): { groups: RepoGroup
   const standalone: NativeSkillDescriptor[] = [];
   for (const skill of skills) {
     const scope = descriptorScope(skill);
-    if (!scope || !skill.git_repository) {
+    if (!scope || !skill.git_repository || !skill.managed) {
       if (scope) standalone.push(skill);
       continue;
     }
@@ -405,13 +405,15 @@ export function NativeSkillsManager() {
             {standalone.map((skill) => {
               const skillScope = descriptorScope(skill);
               if (!skillScope) return null;
+              const managed = skill.managed;
               return (
                 <div key={`${skillScope}:${skill.command}:${skill.sha256}`} className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2 text-xs">
                   <span className="font-mono text-foreground">/{skill.command}</span>
                   <span className="text-muted">{skill.name} · {skill.version}</span>
                   <span className={`rounded px-1 py-0.5 text-[10px] ${skill.enabled && skill.eligibility.eligible ? "bg-success-soft text-success" : "bg-warning-soft text-warning"}`}>
-                    {!skill.enabled ? "disabled" : skill.eligibility.eligible ? skillScope : "ineligible"}
+                    {!skill.enabled ? "disabled" : skill.eligibility.eligible ? managed ? skillScope : "external" : "ineligible"}
                   </span>
+                  {!managed && <span className="text-faint">Read-only `.agents/skills`</span>}
                   {skill.learned && (
                     <span
                       className="rounded border border-border px-1 py-0.5 text-[10px] text-muted"
@@ -425,24 +427,28 @@ export function NativeSkillsManager() {
                     command={skill.command}
                     identity={descriptorPolicyIdentity(skill)}
                   />
-                  <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
-                    {skill.enabled ? "Disable" : "Enable"}
-                  </Button>
-                  <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`rollback:${skill.command}`, () => nativeSkillsClient.rollback(skillScope, skill.command))}>
-                    <RotateCcw size={12} /> Rollback
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={busy !== null}
-                    onClick={() => {
-                      if (window.confirm(`Uninstall /${skill.command}? Its active version is archived for rollback.`)) {
-                        void run(`uninstall:${skill.command}`, () => nativeSkillsClient.uninstall(skillScope, skill.command));
-                      }
-                    }}
-                  >
-                    <Trash2 size={12} /> Uninstall
-                  </Button>
+                  {managed ? (
+                    <>
+                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`toggle:${skill.command}`, () => nativeSkillsClient.setEnabled(skillScope, skill.command, !skill.enabled))}>
+                        {skill.enabled ? "Disable" : "Enable"}
+                      </Button>
+                      <Button variant="ghost" size="sm" disabled={busy !== null} onClick={() => void run(`rollback:${skill.command}`, () => nativeSkillsClient.rollback(skillScope, skill.command))}>
+                        <RotateCcw size={12} /> Rollback
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={busy !== null}
+                        onClick={() => {
+                          if (window.confirm(`Uninstall /${skill.command}? Its active version is archived for rollback.`)) {
+                            void run(`uninstall:${skill.command}`, () => nativeSkillsClient.uninstall(skillScope, skill.command));
+                          }
+                        }}
+                      >
+                        <Trash2 size={12} /> Uninstall
+                      </Button>
+                    </>
+                  ) : null}
                 </div>
               );
             })}

@@ -331,6 +331,7 @@ describe("a promoted learned skill in the model's catalog", () => {
     file_count: 2,
     total_bytes: 400,
     enabled: true,
+    managed: true,
     eligibility: { eligible: true, current_os: "macos", unsupported_os: false, missing_bins: [], missing_env: [] },
     supported_os: [],
     requirements: { bins: [], env: [] },
