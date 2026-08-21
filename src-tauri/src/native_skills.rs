@@ -586,6 +586,36 @@ impl NativeSkillManager {
         &self.global_root
     }
 
+    /// Returns the directories whose changes can affect native-skill
+    /// discovery. Existing skill directories are watched recursively; a
+    /// missing directory falls back to its nearest existing parent so the
+    /// watcher can notice the directory being created and resync itself.
+    pub fn watch_targets(
+        &self,
+        primary_workspace: Option<&Path>,
+    ) -> Result<Vec<(PathBuf, bool)>, SkillError> {
+        let mut targets = BTreeMap::<PathBuf, bool>::new();
+        add_watch_target(&mut targets, self.global_root.clone());
+        #[cfg(not(test))]
+        if let Some(home) = dirs::home_dir() {
+            add_watch_target(&mut targets, home.join(".agents").join("skills"));
+        }
+        if let Some(workspace) = primary_workspace {
+            let supplied = fs::symlink_metadata(workspace)
+                .map_err(|error| io_at("inspect primary workspace", workspace, error))?;
+            if supplied.file_type().is_symlink() || !supplied.is_dir() {
+                return Err(SkillError::Invalid(
+                    "primary workspace must be a real directory".to_string(),
+                ));
+            }
+            let workspace = fs::canonicalize(workspace)
+                .map_err(|error| io_at("canonicalize primary workspace", workspace, error))?;
+            add_watch_target(&mut targets, workspace.join(".littlemonkey").join("skills"));
+            add_watch_target(&mut targets, workspace.join(".agents").join("skills"));
+        }
+        Ok(targets.into_iter().collect())
+    }
+
     pub fn discover(
         &self,
         primary_workspace: Option<&Path>,
@@ -2715,6 +2745,31 @@ fn workspace_agents_skill_root(workspace: &Path) -> Result<Option<PathBuf>, Skil
     )
 }
 
+fn add_watch_target(targets: &mut BTreeMap<PathBuf, bool>, path: PathBuf) {
+    let (target, recursive) = match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => (path, true),
+        _ => (nearest_existing_directory(&path), false),
+    };
+    targets
+        .entry(target)
+        .and_modify(|existing| *existing |= recursive)
+        .or_insert(recursive);
+}
+
+fn nearest_existing_directory(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    loop {
+        if fs::symlink_metadata(&current)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return current;
+        }
+        if !current.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
 fn ensure_plain_directory(path: &Path, label: &str) -> Result<(), SkillError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -3240,6 +3295,32 @@ mod tests {
         )
         .unwrap();
         assert!(scan_skill_folder(&skill).is_err());
+    }
+
+    #[test]
+    fn watch_targets_follow_created_workspace_skill_directories() {
+        let root = TestDirectory::new("watch-targets");
+        let app_data = root.path().join("app-data");
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let manager = NativeSkillManager::new(&app_data).unwrap();
+
+        let initial = manager.watch_targets(Some(&workspace)).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+        assert!(initial
+            .iter()
+            .any(|(path, recursive)| path == manager.global_root() && *recursive));
+        assert!(initial
+            .iter()
+            .any(|(path, recursive)| path == &canonical_workspace && !*recursive));
+
+        let workspace_skill_root = workspace.join(".agents").join("skills");
+        fs::create_dir_all(&workspace_skill_root).unwrap();
+        let workspace_skill_root = fs::canonicalize(workspace_skill_root).unwrap();
+        let refreshed = manager.watch_targets(Some(&workspace)).unwrap();
+        assert!(refreshed
+            .iter()
+            .any(|(path, recursive)| { path == &workspace_skill_root && *recursive }));
     }
 
     #[test]
