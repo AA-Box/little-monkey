@@ -174,6 +174,7 @@ export function ToolPanel({ railSlot }: Props) {
           managed: true,
         }),
       );
+      setSelectedId(component.componentId);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -187,17 +188,19 @@ export function ToolPanel({ railSlot }: Props) {
     setError(null);
     try {
       const name = picked.split(/[/\\]/).pop() ?? picked;
+      const id = `local-${name.replace(/[^A-Za-z0-9._-]/g, "-")}`;
       setTools(
         await toolsClient.add({
           // Derived from the path so re-adding the same binary replaces its
           // entry instead of stacking duplicates.
-          id: `local-${name.replace(/[^A-Za-z0-9._-]/g, "-")}`,
+          id,
           name,
           path: picked,
           version: null,
           managed: false,
         }),
       );
+      setSelectedId(id);
     } catch (cause) {
       setError(String(cause));
     }
@@ -419,6 +422,25 @@ export function ToolPanel({ railSlot }: Props) {
                 <p className="text-xs text-faint">{t("Studio.tools.starting")}</p>
               ) : manifest ? (
                 <>
+                  {manifest.licenseNotice && !manifest.licenseNotice.commercialUseAllowed && (
+                    <div
+                      role="alert"
+                      className="rounded-lg border border-warning/50 bg-warning/10 p-3 text-xs"
+                    >
+                      <p className="font-medium text-warning">{manifest.licenseNotice.title}</p>
+                      <p className="mt-1 text-muted">{manifest.licenseNotice.message}</p>
+                      {manifest.licenseNotice.url && (
+                        <a
+                          className="mt-2 inline-block text-accent underline"
+                          href={manifest.licenseNotice.url}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {t("Studio.tools.licenseDetails")}
+                        </a>
+                      )}
+                    </div>
+                  )}
                   <SettingsCard
                     title={manifest.name}
                     hint={manifest.description ?? undefined}

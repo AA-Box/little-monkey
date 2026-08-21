@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+VENV="${FACE_SWAP_VENV:-$SCRIPT_DIR/.face-swap-venv}"
+PYTHON="$VENV/bin/python3"
+
+if [ ! -x "$PYTHON" ]; then
+  echo "Face Swap Python environment not found at $VENV. See docs/face-swap-tool.md." >&2
+  exit 1
+fi
+
+exec "$PYTHON" "$SCRIPT_DIR/studio-tool-face-swap.py" "$@"

@@ -137,12 +137,24 @@ pub struct ToolInput {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolLicenseNotice {
+    pub title: String,
+    pub message: String,
+    pub commercial_use_allowed: bool,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolManifest {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
+    pub license_notice: Option<ToolLicenseNotice>,
     pub inputs: Vec<ToolInput>,
 }
 
@@ -240,6 +252,19 @@ pub fn validate_manifest(manifest: &ToolManifest) -> Result<(), String> {
     if let Some(description) = &manifest.description {
         if description.chars().count() > 1_000 {
             return Err("The tool's description is too long".to_string());
+        }
+    }
+    if let Some(notice) = &manifest.license_notice {
+        if !bounded(&notice.title, 120) {
+            return Err("The tool's license notice needs a title".to_string());
+        }
+        if !bounded(&notice.message, 2_000) {
+            return Err("The tool's license notice needs a message".to_string());
+        }
+        if let Some(url) = &notice.url {
+            if !url.starts_with("https://") || url.chars().count() > 2_000 {
+                return Err("The tool's license notice URL must use HTTPS".to_string());
+            }
         }
     }
     if manifest.inputs.len() > MAX_INPUTS {
@@ -1149,6 +1174,7 @@ mod tests {
             id: "face-swap".to_string(),
             name: "Face Swap".to_string(),
             description: None,
+            license_notice: None,
             inputs,
         }
     }
@@ -1171,6 +1197,21 @@ mod tests {
             },
         ]);
         assert!(validate_manifest(&manifest).is_ok());
+    }
+
+    #[test]
+    fn a_noncommercial_license_notice_requires_a_safe_url() {
+        let mut manifest = manifest(Vec::new());
+        manifest.license_notice = Some(ToolLicenseNotice {
+            title: "Non-commercial use only".to_string(),
+            message: "Check the supplied model terms before use.".to_string(),
+            commercial_use_allowed: false,
+            url: Some("https://example.com/license".to_string()),
+        });
+        assert!(validate_manifest(&manifest).is_ok());
+
+        manifest.license_notice.as_mut().unwrap().url = Some("http://example.com".to_string());
+        assert!(validate_manifest(&manifest).is_err());
     }
 
     #[test]

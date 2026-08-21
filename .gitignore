@@ -46,6 +46,9 @@ src-tauri/resources/managed-runtime/*
 /models/
 *.gguf
 
+# Local face-swap Python environment (models live outside the repository)
+examples/.face-swap-venv/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

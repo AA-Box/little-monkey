@@ -40,7 +40,15 @@ export interface ToolManifest {
   id: string;
   name: string;
   description?: string | null;
+  licenseNotice?: ToolLicenseNotice | null;
   inputs: ToolInput[];
+}
+
+export interface ToolLicenseNotice {
+  title: string;
+  message: string;
+  commercialUseAllowed: boolean;
+  url?: string | null;
 }
 
 /** A tool in the user's library. */

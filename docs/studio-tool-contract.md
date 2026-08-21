@@ -47,6 +47,12 @@ and treats the first success as "loaded". You have 120 seconds.
   "id": "face-swap",
   "name": "Face Swap",
   "description": "Replace a face in the target with the one in the source.",
+  "licenseNotice": {
+    "title": "Non-commercial use only",
+    "message": "This tool's supplied model weights may not be used commercially.",
+    "commercialUseAllowed": false,
+    "url": "https://example.com/license"
+  },
   "inputs": [
     { "key": "source", "label": "Source face", "kind": "image", "required": true },
     { "key": "target", "label": "Target image", "kind": "image", "required": true },
@@ -59,6 +65,11 @@ and treats the first success as "loaded". You have 120 seconds.
   ]
 }
 ```
+
+`licenseNotice` is optional. When `commercialUseAllowed` is `false`, Studio
+shows the title, message, and HTTPS license URL on the selected tool's page
+before the user can run it. This is a prominent disclosure, not a legal
+license or a substitute for checking each supplied model's terms.
 
 **The manifest is your UI.** Studio draws a form from it and knows nothing else
 about your tool — that indirection is the whole design, and it is why a new tool
