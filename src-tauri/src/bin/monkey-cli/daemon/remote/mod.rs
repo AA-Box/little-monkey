@@ -1196,6 +1196,51 @@ async fn place(paths: &DaemonPaths, args: &RemotePlaceArgs) -> Result<(), String
     Ok(())
 }
 
+/// Submit one frozen autonomous node to a named remote node and wait for that
+/// node's own durable runner to finish it. The caller has already validated the
+/// node's placement requirement; this function owns only transport, polling,
+/// and the terminal result boundary.
+pub(crate) async fn execute_autonomous_node(
+    alias: &str,
+    spec: &little_monkey_lib::run_protocol::RunSpec,
+) -> Result<little_monkey_lib::node_placement::PlacedRunStatus, String> {
+    let paths = DaemonPaths::resolve()?;
+    let now = now_ms()?;
+    let response = client::place_run(
+        &paths,
+        alias,
+        &little_monkey_lib::node_placement::PlaceRunRequest {
+            protocol_version: little_monkey_lib::node_placement::NODE_PROTOCOL_VERSION,
+            spec: spec.clone(),
+            required_residency: None,
+            expected_runner_id: None,
+        },
+        now,
+    )
+    .await?;
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(spec.budgets.wall_time_ms);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "Remote autonomous node placement exceeded its frozen wall-time budget".to_string(),
+            );
+        }
+        let status =
+            client::placed_status(&paths, alias, &response.submitted_run_id, now_ms()?).await?;
+        if status.terminal {
+            return if status.state == "succeeded" {
+                Ok(status)
+            } else {
+                Err(status.last_error.unwrap_or_else(|| {
+                    format!("remote autonomous node ended in state '{}'", status.state)
+                }))
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 fn placements(paths: &DaemonPaths, json: bool) -> Result<(), String> {
     let records = RemoteStore::open(&paths.root)?.placements()?;
     if json {

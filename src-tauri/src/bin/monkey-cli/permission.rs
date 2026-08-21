@@ -148,6 +148,24 @@ impl TerminalPermissions {
         }
     }
 
+    /// Fork the durable permission context for an isolated autonomous worker.
+    /// Parallel workers must not share the mutable prompt state or nonce, but
+    /// they inherit the frozen policy and ledger sink exactly.
+    pub fn fork_for_parallel(&self) -> Self {
+        Self {
+            mode: self.mode,
+            session_allow: self.session_allow.clone(),
+            event_sink: self.event_sink.clone(),
+            current_tool: None,
+            next_permission_nonce: self.next_permission_nonce,
+            approval_timeout_ms: self.approval_timeout_ms,
+            quiet: self.quiet,
+            allow_network: self.allow_network,
+            allow_external_mutations: self.allow_external_mutations,
+            channel_send: self.channel_send.clone(),
+        }
+    }
+
     /// Adds the durable observer used by `task run`. Ordinary interactive
     /// CLI sessions continue to use [`new`](Self::new), which has no ledger
     /// dependency and therefore preserves their existing behavior.

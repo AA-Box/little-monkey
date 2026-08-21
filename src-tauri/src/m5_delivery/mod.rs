@@ -661,6 +661,16 @@ pub fn prepare_mutation_impl(
     })
 }
 
+/// Returns the durable execution state for an exact mutation digest. Autonomous
+/// delivery recovery uses this after a daemon restart so a completed local
+/// commit is not dispatched a second time when its task event was not flushed.
+pub fn mutation_execution_state_impl(digest: &str) -> Result<Option<String>, String> {
+    validate_digest(digest)?;
+    Ok(open_store()?
+        .execution(digest)?
+        .map(|execution| execution.state))
+}
+
 #[tauri::command]
 pub async fn m5_delivery_execute_mutation(
     mutation: DeliveryMutation,

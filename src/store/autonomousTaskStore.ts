@@ -123,12 +123,14 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       const current = get().tasks.find((task) => task.taskId === taskId);
       if (!current || current.outcome !== "RUNNING") throw new Error("Only a running autonomous task can continue in the background.");
       const control = controls.get(taskId);
-      control?.pause();
-      await control?.waitForSafePoint();
+      const frozenTask = control
+        ? await control.freezeForHandoff(() => get().tasks.find((task) => task.taskId === taskId))
+        : get().tasks.find((task) => task.taskId === taskId);
+      if (!frozenTask || frozenTask.outcome !== "RUNNING") throw new Error("Autonomous task changed before handoff could be frozen.");
       let accepted;
-      try { accepted = await submitAutonomousTaskToDaemon(current); }
+      try { accepted = await submitAutonomousTaskToDaemon(frozenTask); }
       catch (error) { control?.resume(); throw error; }
-      const next = { ...current, executionOwner: { kind: "daemon" as const, instanceId: accepted.job_id, leaseEpoch: current.executionOwner.leaseEpoch + 1, leaseExpiresAtMs: Date.now() + 60_000 }, updatedAtMs: Date.now() };
+      const next = { ...frozenTask, executionOwner: { kind: "daemon" as const, instanceId: `daemon-${taskId}`, leaseEpoch: frozenTask.executionOwner.leaseEpoch + 1, leaseExpiresAtMs: Date.now() + frozenTask.budgetSnapshot.wallTimeMs }, updatedAtMs: Date.now() };
       try {
         await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff", next, { job_id: accepted.job_id, run_id: accepted.run_id, owner: next.executionOwner })));
       } catch (error) {

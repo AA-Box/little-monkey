@@ -1821,6 +1821,7 @@ pub fn run() {
             daemon_commands::remote_placements,
             daemon_commands::remote_node_refresh,
             daemon_commands::remote_placement_sync,
+            daemon_commands::autonomous_task_place_node,
             daemon_commands::remote_node_label,
             m5_delivery::m5_delivery_prepare_mutation,
             m5_delivery::m5_delivery_execute_mutation,

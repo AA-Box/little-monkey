@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { buildWorkerContext, createAutonomousTask, createTaskPlan, validateTaskPlan, type AutonomousTask } from "./autonomousTask";
-import { runAutonomousTask, type AutonomousTaskRuntime } from "./autonomousTaskRunner";
+import { AutonomousTaskControl, runAutonomousTask, type AutonomousTaskRuntime } from "./autonomousTaskRunner";
 
 const target = { kind: "provider", key: "provider:test:model", label: "test" } as never;
 const roots = [{ id: "root", path: "/tmp", label: "workspace", is_primary: true }];
@@ -108,6 +108,45 @@ describe("autonomous task temporary-repository execution", () => {
     const result = await runAutonomousTask({ task: resumed, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: passingRuntime() });
     expect(result.outcome).toBe("SUCCEEDED");
     expect(result.plan?.nodes.find((node) => node.nodeId === "implement")?.status).toBe("succeeded");
+  });
+
+  it("does not read a stale snapshot while the coordinator consumes worker results", async () => {
+    const control = new AutonomousTaskControl();
+    const initial = makeTask();
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+    const executionPromise = new Promise<void>((resolve) => { release = resolve; });
+    let latest = initial;
+    const runtime: AutonomousTaskRuntime = {
+      ...passingRuntime(),
+      executeNode: async (_current, node) => {
+        if (node.taskClass === "implementation") {
+          entered();
+          await executionPromise;
+        }
+        return { ok: true, summary: node.nodeId, workspaceRevision: node.taskClass === "implementation" ? "r1" : undefined };
+      },
+    };
+    const completion = runAutonomousTask({ task: initial, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime, control, signal: control.signal, onUpdate: (task) => { latest = task; } });
+    await enteredPromise;
+    const frozen = control.freezeForHandoff(() => latest);
+    release();
+    const handoff = await frozen;
+    expect(handoff.plan?.nodes.find((node) => node.nodeId === "implement")?.status).toBe("succeeded");
+    control.resume();
+    expect((await completion).outcome).toBe("SUCCEEDED");
+  });
+
+  it("fails closed when the planner does not return structured acceptance criteria", async () => {
+    const initial = makeTask("planner contract test");
+    const result = await runAutonomousTask({
+      task: initial,
+      resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never,
+      runtime: { ...passingRuntime(), plan: async (task) => ({ plan: createTaskPlan(task.objective, "DIRECT", 1, task.planningContext) }) },
+    });
+    expect(result.outcome).toBe("FAILED");
+    expect(result.summary).toContain("acceptance criteria");
   });
 
   it("consumes operator guidance and preserves the daemon ownership boundary", async () => {
