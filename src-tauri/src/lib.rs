@@ -1413,7 +1413,6 @@ pub fn run() {
             git::git_file_diff,
             agent_worktrees::worktree_create,
             agent_worktrees::worktree_status,
-            agent_worktrees::worktree_workspace_revision,
             agent_worktrees::worktree_remove,
             agent_worktrees::worktree_apply,
             mcp::mcp_list_servers,
