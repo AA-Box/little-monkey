@@ -16,8 +16,8 @@ const target = { kind: "provider", key: "provider:test:model", label: "test", di
 const roots = [{ id: "root", path: "/tmp/task-test", label: "workspace", is_primary: true }];
 const permissions = { mode: "auto", unattended: true, allowNetwork: false, allowExternalMutations: false };
 
-function task(strategy: "DIRECT" | "PARALLEL_DELEGATE" = "DIRECT"): AutonomousTask {
-  return createAutonomousTask({ objective: "implement the requested change", sessionId: "session", targetSnapshot: target, workspaceRoots: roots, permissionSnapshot: permissions, constraints: { strategy, allowParallel: strategy === "PARALLEL_DELEGATE" } });
+function task(strategy: "DIRECT" | "PARALLEL_DELEGATE" = "DIRECT", planningContext?: { relevantFiles: string[] }): AutonomousTask {
+  return createAutonomousTask({ objective: "implement the requested change", sessionId: "session", targetSnapshot: target, workspaceRoots: roots, permissionSnapshot: permissions, constraints: { strategy, allowParallel: strategy === "PARALLEL_DELEGATE" }, planningContext });
 }
 
 function evidence(taskValue: AutonomousTask, criterionIndex: number, id: string) {
@@ -34,7 +34,7 @@ describe("autonomous task planning", () => {
     const direct = createTaskPlan("simple rename", "DIRECT");
     expect(validateTaskPlan(direct)).toEqual([]);
     expect(getReadyTaskPlanNodes(direct).map((node) => node.nodeId)).toEqual(["implement"]);
-    const parallel = createTaskPlan("parallel independent changes", "PARALLEL_DELEGATE", 3);
+    const parallel = createTaskPlan("parallel independent changes", "PARALLEL_DELEGATE", 3, { currentWorkspaceRevision: "r1", relevantFiles: ["src/a.ts", "lib/b.ts", "docs/c.md"], repositoryConventions: [], sourceMaterial: [], dependencyArtifactIds: [], upstreamDecisions: [] });
     expect(validateTaskPlan(parallel)).toEqual([]);
     expect(parallel.nodes.filter((node) => node.taskClass === "implementation")).toHaveLength(3);
     expect(canRunTaskNodesTogether(parallel.nodes[1], parallel.nodes[2])).toBe(true);
@@ -54,7 +54,7 @@ describe("autonomous task execution", () => {
     const runtime: AutonomousTaskRuntime = {
       executeNode: async (current, node) => ({ ok: true, summary: `${node.nodeId} complete`, evidence: node.taskClass === "investigation" ? [evidence(current, 0, "objective-worker")] : undefined }),
       verify: async (current) => ({ ok: true, summary: "checks passed", evidence: [evidence(current, 2, "verification")] }),
-      review: async (current) => ({ ok: true, summary: "review passed", evidence: [evidence(current, 1, "review")] }),
+      review: async (current) => ({ ok: true, summary: "review passed", evidence: current.acceptanceCriteria.filter((criterion) => criterion.method === "review").map((criterion) => ({ ...evidence(current, current.acceptanceCriteria.indexOf(criterion), `review-${criterion.id}`), criterionId: criterion.id })) }),
     };
     const events: string[] = [];
     const result = await runAutonomousTask({ task: initial, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime, eventSink: (event) => { events.push(event.eventType); } });
@@ -64,7 +64,7 @@ describe("autonomous task execution", () => {
   });
 
   it("executes independent worker nodes concurrently before integration", async () => {
-    const initial = task("PARALLEL_DELEGATE");
+    const initial = task("PARALLEL_DELEGATE", { relevantFiles: ["src/a.ts", "lib/b.ts", "docs/c.md"] });
     let active = 0;
     let maxActive = 0;
     const runtime: AutonomousTaskRuntime = {
@@ -74,10 +74,27 @@ describe("autonomous task execution", () => {
       },
       integrate: async () => ({ ok: true, summary: "integrated" }),
       verify: async (current) => ({ ok: true, summary: "verified", evidence: [evidence(current, 2, "verification")] }),
-      review: async (current) => ({ ok: true, summary: "reviewed", evidence: [evidence(current, 1, "review")] }),
+      review: async (current) => ({ ok: true, summary: "reviewed", evidence: current.acceptanceCriteria.filter((criterion) => criterion.method === "review").map((criterion) => ({ ...evidence(current, current.acceptanceCriteria.indexOf(criterion), `review-${criterion.id}`), criterionId: criterion.id })) }),
     };
     const result = await runAutonomousTask({ task: initial, resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime });
     expect(result.outcome).toBe("SUCCEEDED");
     expect(maxActive).toBeGreaterThan(1);
+  });
+
+  it("does not synthesize acceptance evidence", async () => {
+    const result = await runAutonomousTask({ task: task(), resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: { executeNode: async (_current, node) => ({ ok: true, summary: node.nodeId }), verify: async () => ({ ok: true, summary: "no evidence" }), review: async () => ({ ok: true, summary: "no evidence" }) } });
+    expect(result.outcome).toBe("WAITING_USER");
+    expect(hasAuthoritativeAcceptanceEvidence(result)).toBe(false);
+  });
+
+  it("inserts a distinct bounded repair node after failure", async () => {
+    let failed = false;
+    const result = await runAutonomousTask({ task: task(), resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: {
+      executeNode: async (_current, node) => { if (node.nodeId === "implement" && !failed) { failed = true; return { ok: false, summary: "compile failure" }; } return { ok: true, summary: node.nodeId }; },
+      verify: async (current) => ({ ok: true, summary: "checks passed", evidence: [evidence(current, current.acceptanceCriteria.length - 1, "verification-repair")] }),
+      review: async (current) => ({ ok: true, summary: "review passed", evidence: current.acceptanceCriteria.filter((criterion) => criterion.method === "review").map((criterion) => ({ ...evidence(current, current.acceptanceCriteria.indexOf(criterion), `review-${criterion.id}`), criterionId: criterion.id })) }),
+    } });
+    expect(result.plan?.nodes.some((node) => node.repairOf === "implement")).toBe(true);
+    expect(result.plan?.nodes.find((node) => node.repairOf === "implement")?.nodeId).not.toBe("implement");
   });
 });

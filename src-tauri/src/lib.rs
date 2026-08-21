@@ -1415,6 +1415,7 @@ pub fn run() {
             agent_worktrees::worktree_status,
             agent_worktrees::worktree_remove,
             agent_worktrees::worktree_apply,
+            agent_worktrees::worktree_workspace_revision,
             mcp::mcp_list_servers,
             mcp::mcp_add_server,
             mcp::mcp_current_revision,
