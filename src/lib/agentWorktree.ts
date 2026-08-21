@@ -40,4 +40,5 @@ export const agentWorktreeClient = {
    * conflict the command errors and the worktree is left in place. */
   apply: (path: string) => invoke<AgentWorktreeApplied>("worktree_apply", { path }),
   workspaceRevision: () => invoke<string>("worktree_workspace_revision"),
+  workspaceChangedFiles: async () => (await invoke<Array<{ path: string }>>("git_changed_files")).map((file) => file.path),
 };

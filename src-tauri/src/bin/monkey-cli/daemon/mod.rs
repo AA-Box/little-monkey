@@ -1581,6 +1581,7 @@ fn placed_recipe(
         channel_send: None,
         desktop_turn: None,
         placed_run: Some(snapshot),
+        autonomous_task: None,
     };
     little_monkey_lib::recipes::validate_recipe(&recipe)
         .map_err(|error| format!("the placed spec does not form a runnable recipe: {error}"))?;

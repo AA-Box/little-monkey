@@ -1798,6 +1798,7 @@ pub fn run() {
             daemon_commands::daemon_desktop_kill_switch,
             daemon_commands::daemon_desktop_triggers,
             m6a_desktop_bridge::m6a_desktop_turn_submit,
+            m6a_desktop_bridge::autonomous_task_submit,
             daemon_commands::daemon_desktop_sync_recipe_schedules,
             daemon_commands::remote_host_status,
             daemon_commands::remote_host_configure,

@@ -99,6 +99,7 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
         issueTitle: run.issueTitle,
         issueBody: run.issueBody,
         branch: run.branch,
+        worktreeId: run.worktreeId,
         workspaceLabel: run.workspaceLabel,
         signal: controller.signal,
         onToolActivity: (label) => {

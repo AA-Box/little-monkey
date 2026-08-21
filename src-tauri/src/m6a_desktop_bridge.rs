@@ -48,6 +48,13 @@ pub struct DesktopTurnSubmitResponse {
     pub state: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskSubmitRequest {
+    pub task_id: String,
+    pub recipe: Recipe,
+}
+
 fn validate_id(value: &str) -> Result<(), String> {
     named_id(value, "turn")
 }
@@ -320,6 +327,67 @@ pub async fn m6a_desktop_turn_submit(
         .map_err(|error| format!("Invalid desktop queue JSON: {error}"))?;
     serde_json::from_value(value)
         .map_err(|error| format!("Invalid desktop queue response: {error}"))
+}
+
+/// Moves a running desktop autonomous task to the same resident daemon queue
+/// used by the CLI. The recipe contains the frozen coordinator snapshot; the
+/// daemon never has to infer autonomy from a name or re-read desktop state.
+#[tauri::command]
+pub async fn autonomous_task_submit(
+    request: AutonomousTaskSubmitRequest,
+) -> Result<DesktopTurnSubmitResponse, String> {
+    named_id(&request.task_id, "autonomous task")?;
+    recipes::validate_recipe(&request.recipe)?;
+    let snapshot = request.recipe.autonomous_task.as_ref().ok_or_else(|| {
+        "Autonomous task submission requires an autonomous_task snapshot".to_string()
+    })?;
+    if snapshot.task_id != request.task_id {
+        return Err("Autonomous task id differs from its immutable recipe snapshot".to_string());
+    }
+    let status_text = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+    ])
+    .await?;
+    let status: Value = serde_json::from_str(status_text.trim())
+        .map_err(|error| format!("Invalid daemon status JSON: {error}"))?;
+    daemon_ready(&status)?;
+
+    let app_data = crate::app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey data directory".to_string())?;
+    let path = app_data
+        .join("daemon")
+        .join("autonomous-submissions")
+        .join(format!("{}.json", request.task_id));
+    let bytes = serde_json::to_vec_pretty(&request.recipe).map_err(|error| error.to_string())?;
+    let published = publish_private_snapshot(&path, &bytes)?;
+    let output = crate::daemon_commands::command(vec![
+        "daemon".to_string(),
+        "run".to_string(),
+        path.to_string_lossy().into_owned(),
+        "--run-key".to_string(),
+        format!("autonomous-task:{}", request.task_id),
+        "--priority".to_string(),
+        "100".to_string(),
+        "--max-attempts".to_string(),
+        "1".to_string(),
+        "--max-runtime-seconds".to_string(),
+        request
+            .recipe
+            .timeout_seconds
+            .unwrap_or(30 * 60)
+            .to_string(),
+        "--json".to_string(),
+    ])
+    .await;
+    if published == Published::Created {
+        let _ = std::fs::remove_file(&path);
+    }
+    let value: Value = serde_json::from_str(output?.trim())
+        .map_err(|error| format!("Invalid autonomous queue JSON: {error}"))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("Invalid autonomous queue response: {error}"))
 }
 
 #[cfg(test)]

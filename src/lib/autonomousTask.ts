@@ -9,7 +9,7 @@ export const MAX_TASK_GUIDANCE_ITEMS = 32;
 
 export type TaskExecutionStrategy = "DIRECT" | "PLAN" | "DELEGATE" | "PARALLEL_DELEGATE";
 export type TaskClass = "investigation" | "implementation" | "integration" | "verification" | "review" | "delivery";
-export type TaskNodeStatus = "pending" | "ready" | "running" | "succeeded" | "failed" | "blocked" | "cancelled";
+export type TaskNodeStatus = "pending" | "ready" | "running" | "waiting_approval" | "succeeded" | "failed" | "blocked" | "cancelled";
 export type TaskIsolation = "shared" | "worktree";
 export type ExecutionPlacementKind = "local" | "worktree" | "docker" | "remote_node";
 export type DeliveryIntent = "leave_worktree" | "commit" | "push_owned_branch" | "open_or_update_pr";
@@ -58,9 +58,18 @@ export interface TaskConstraints {
   executionPlacement?: TaskExecutionPlacement;
 }
 
-export interface TaskExecutionPlacement { kind: ExecutionPlacementKind; targetId: string; nodeId: string; reason: string; }
+export interface TaskExecutionRequirements { needsWorkspaceWrite: boolean; needsNetwork: boolean; isolation: TaskIsolation; platform?: string; }
+export interface TaskExecutionPlacement { kind: ExecutionPlacementKind; targetId: string; nodeId: string; reason: string; capabilities?: string[]; }
+export interface TaskExecutionOwner { kind: "desktop" | "daemon" | "remote"; instanceId: string; leaseEpoch: number; leaseExpiresAtMs: number; }
+export interface TaskDeliveryTarget { worktreeId: string; repositorySlug: string; branch: string; remote: string; base: string; title: string; body: string; changedFiles?: string[]; prNumber?: number; }
 export interface TaskPlanningContext { currentWorkspaceRevision: string; relevantFiles: string[]; repositoryConventions: string[]; sourceMaterial: string[]; dependencyArtifactIds: string[]; upstreamDecisions: string[]; }
 export interface TaskUsage { modelCalls: number; toolCalls: number; inputTokens: number; outputTokens: number; costMicros: number; artifactBytes: number; workersStarted: number; }
+
+export interface CriterionProvenance {
+  kind: "user" | "source_material" | "github_issue" | "test" | "standard" | "repository";
+  fragment: string;
+  location?: string;
+}
 
 export interface AcceptanceCriterion {
   id: string;
@@ -68,6 +77,7 @@ export interface AcceptanceCriterion {
   status: CriterionStatus;
   method: CriterionMethod;
   source: string;
+  provenance?: CriterionProvenance;
   evidenceIds: string[];
   blocking: boolean;
 }
@@ -86,6 +96,7 @@ export interface TaskPlanNode {
   relevantFiles?: string[];
   capabilities?: string[];
   executionPlacement?: TaskExecutionPlacement;
+  executionRequirements?: TaskExecutionRequirements;
   budget?: Partial<TaskBudgetSnapshot>;
   upstreamDecisions?: string[];
   repairOf?: string | null;
@@ -177,7 +188,11 @@ export interface AutonomousTask {
   workspaceRevision?: string;
   usage?: TaskUsage;
   deliveryIntent?: DeliveryIntent;
+  deliveryTarget?: TaskDeliveryTarget;
   waitingReason?: string | null;
+  waitingApproval?: { requestId: string; operationDigest: string; expiresAtMs: number; confirmationPhrase?: string; nodeId: string } | null;
+  deliveryStep?: "commit" | "push" | "create_draft_pr" | "update_draft_pr";
+  executionOwner: TaskExecutionOwner;
 }
 
 export interface CreateAutonomousTaskInput {
@@ -190,6 +205,7 @@ export interface CreateAutonomousTaskInput {
   constraints?: TaskConstraints;
   planningContext?: Partial<TaskPlanningContext>;
   deliveryIntent?: DeliveryIntent;
+  deliveryTarget?: TaskDeliveryTarget;
 }
 
 export interface TaskEvent {
@@ -227,15 +243,16 @@ export function deriveAcceptanceCriteriaFromContext(objective: string, source = 
     .filter((line) => line.length >= 8 && /\b(must|should|verify|accept|require|test|ensure|implement)\b/i.test(line))
     .slice(0, 8);
   return [
-    ...extracted.map((description, index) => ({ id: `${prefix}-extracted-${index + 1}`, description, status: "pending" as const, method: "review" as const, source, evidenceIds: [], blocking: true })),
-    { id: `${prefix}-objective`, description: `The requested objective is implemented: ${objective}`, status: "pending", method: "review", source, evidenceIds: [], blocking: true },
-    { id: `${prefix}-scope`, description: "The change stays within the requested scope and preserves unrelated behavior.", status: "pending", method: "review", source, evidenceIds: [], blocking: true },
-    { id: `${prefix}-verification`, description: "Relevant repository verification passes against the current workspace revision.", status: "pending", method: "verification_command", source, evidenceIds: [], blocking: true },
+    ...extracted.map((description, index) => ({ id: `${prefix}-extracted-${index + 1}`, description, provenance: { kind: "source_material" as const, fragment: description, location: `sourceMaterial:${index + 1}` }, status: "pending" as const, method: "review" as const, source, evidenceIds: [], blocking: true })),
+    { id: `${prefix}-objective`, description: `The requested objective is implemented: ${objective}`, provenance: { kind: "user" as const, fragment: objective }, status: "pending", method: "review", source, evidenceIds: [], blocking: true },
+    { id: `${prefix}-scope`, description: "The change stays within the requested scope and preserves unrelated behavior.", provenance: { kind: "repository" as const, fragment: "requested scope and unrelated behavior" }, status: "pending", method: "review", source, evidenceIds: [], blocking: true },
+    { id: `${prefix}-verification`, description: "Relevant repository verification passes against the current workspace revision.", provenance: { kind: "repository" as const, fragment: "configured repository verification" }, status: "pending", method: "verification_command", source, evidenceIds: [], blocking: true },
   ];
 }
 
 function node(nodeId: string, taskClass: TaskClass, objective: string, dependencies: string[], mutationScope: string[], isolation: TaskIsolation, context?: TaskPlanningContext): TaskPlanNode {
-  return { nodeId, taskClass, objective, dependencies, mutationScope, isolation, status: dependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, relevantFiles: context?.relevantFiles.slice(0, 64), capabilities: taskClass === "implementation" ? ["read", "mutate", "verify"] : ["read"], upstreamDecisions: context?.upstreamDecisions.slice(-16), repairOf: null, mutationRevision: context?.currentWorkspaceRevision ?? null };
+  const mutates = taskClass === "implementation" || taskClass === "integration";
+  return { nodeId, taskClass, objective, dependencies, mutationScope, isolation, status: dependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, relevantFiles: context?.relevantFiles.slice(0, 64), capabilities: mutates ? ["read", "mutate", "verify"] : ["read"], executionRequirements: { needsWorkspaceWrite: mutates, needsNetwork: false, isolation }, upstreamDecisions: context?.upstreamDecisions.slice(-16), repairOf: null, mutationRevision: context?.currentWorkspaceRevision ?? null };
 }
 
 function independentSlices(files: readonly string[], maxWorkers: number): string[][] {
@@ -271,7 +288,7 @@ export function createTaskPlan(objective: string, strategy: TaskExecutionStrateg
   return { planId, strategy, nodes, createdAtMs: now(), revision: 1, rationale: `Structured plan for ${strategy}; scopes come from repository context and are validated before mutation.` };
 }
 
-export function validateTaskPlan(plan: TaskPlan): string[] {
+export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext): string[] {
   const errors: string[] = [];
   if (plan.nodes.length === 0 || plan.nodes.length > MAX_TASK_PLAN_NODES) errors.push(`plan must contain 1..${MAX_TASK_PLAN_NODES} nodes`);
   const ids = new Set<string>();
@@ -281,7 +298,18 @@ export function validateTaskPlan(plan: TaskPlan): string[] {
   }
   const byId = new Map(plan.nodes.map((current) => [current.nodeId, current]));
   for (const current of plan.nodes) for (const dependency of current.dependencies) if (!byId.has(dependency)) errors.push(`${current.nodeId} depends on missing node ${dependency}`);
-  for (const current of plan.nodes) { if (current.taskClass === "implementation" && current.isolation === "worktree" && current.mutationScope.length === 0) errors.push(`${current.nodeId} worktree workers require a non-empty mutation scope`); if (current.mutationScope.some((scope) => scope.includes(".."))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`); if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`); }
+  for (const current of plan.nodes) {
+    if ((current.taskClass === "implementation" || current.taskClass === "integration") && current.mutationScope.length === 0) errors.push(`${current.nodeId} mutating nodes require a non-empty mutation scope`);
+    if (current.mutationScope.some((scope) => scope.includes("..") || scope.startsWith("/"))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`);
+    if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`);
+    if (current.capabilities?.some((capability) => !["read", "mutate", "verify", "network", "git", "delegate"].includes(capability))) errors.push(`${current.nodeId} requests an unknown capability`);
+    if (current.executionRequirements?.needsWorkspaceWrite && !current.capabilities?.includes("mutate")) errors.push(`${current.nodeId} requires workspace write capability but does not request mutate`);
+    if (current.executionRequirements?.needsNetwork && !current.capabilities?.includes("network")) errors.push(`${current.nodeId} requires network capability but does not request network`);
+    if (current.executionRequirements?.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);
+    if (current.executionPlacement?.kind === "worktree" && current.isolation !== "worktree") errors.push(`${current.nodeId} worktree placement requires worktree isolation`);
+    if (current.executionPlacement?.kind === "docker" || current.executionPlacement?.kind === "remote_node") errors.push(`${current.nodeId} requests unsupported placement '${current.executionPlacement.kind}' without a registered backend adapter`);
+    if (context && context.relevantFiles.length > 0 && current.relevantFiles?.some((file) => file !== "workspace" && !context.relevantFiles.includes(file))) errors.push(`${current.nodeId} references files outside the planner's repository context`);
+  }
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const visit = (currentId: string): void => {
@@ -293,6 +321,14 @@ export function validateTaskPlan(plan: TaskPlan): string[] {
   };
   for (const current of plan.nodes) visit(current.nodeId);
   if (plan.strategy === "PARALLEL_DELEGATE" && !plan.nodes.some((current) => current.taskClass === "integration")) errors.push("parallel plans require an integration node");
+  if (plan.strategy === "PARALLEL_DELEGATE") {
+    const workers = plan.nodes.filter((current) => current.taskClass === "implementation");
+    for (let index = 0; index < workers.length; index += 1) for (const right of workers.slice(index + 1)) {
+      if (workers[index].mutationScope.some((scope) => right.mutationScope.includes(scope))) errors.push(`parallel worker scopes overlap: ${workers[index].nodeId} and ${right.nodeId}`);
+    }
+  }
+  if (!plan.nodes.some((current) => current.taskClass === "verification")) errors.push("plans require a verification node");
+  if (!plan.nodes.some((current) => current.taskClass === "review")) errors.push("plans require a review node");
   return [...new Set(errors)];
 }
 
@@ -309,12 +345,12 @@ export function createAutonomousTask(input: CreateAutonomousTaskInput): Autonomo
     createdAtMs: timestamp, updatedAtMs: timestamp, targetSnapshot: structuredClone(input.targetSnapshot), workspaceRoots: structuredClone(input.workspaceRoots),
     permissionSnapshot: structuredClone(input.permissionSnapshot),
     budgetSnapshot: { wallTimeMs: 30 * 60_000, maxModelCalls: 64, maxToolCalls: 128, maxRepairRounds: 2, maxWorkers: 4, maxConcurrentWorkers: 4, maxNestingDepth: 1, maxArtifactBytes: 256 * 1024 * 1024, maxCostMicros: null, ...input.budgetSnapshot },
-    constraints: { ...constraints, strategy }, plan: null, acceptanceCriteria: deriveAcceptanceCriteriaFromContext(objective, constraints.source ?? "user", planningContext), workers: [], artifacts: [], verificationEvidence: [], guidance: [], outcome: "RUNNING", summary: null, repairRounds: 0, planningContext, workspaceRevision: planningContext.currentWorkspaceRevision, usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, costMicros: 0, artifactBytes: 0, workersStarted: 0 }, deliveryIntent: input.deliveryIntent ?? constraints.deliveryIntent ?? "leave_worktree", waitingReason: null,
+    constraints: { ...constraints, strategy }, plan: null, acceptanceCriteria: deriveAcceptanceCriteriaFromContext(objective, constraints.source ?? "user", planningContext), workers: [], artifacts: [], verificationEvidence: [], guidance: [], outcome: "RUNNING", summary: null, repairRounds: 0, planningContext, workspaceRevision: planningContext.currentWorkspaceRevision, usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, costMicros: 0, artifactBytes: 0, workersStarted: 0 }, deliveryIntent: input.deliveryIntent ?? constraints.deliveryIntent ?? "leave_worktree", deliveryTarget: input.deliveryTarget ? structuredClone(input.deliveryTarget) : undefined, waitingReason: null, waitingApproval: null, executionOwner: { kind: "desktop", instanceId: `desktop-${typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Date.now()}`, leaseEpoch: 1, leaseExpiresAtMs: timestamp + 60_000 },
   };
 }
 
 export function installTaskPlan(task: AutonomousTask, plan: TaskPlan): AutonomousTask {
-  const errors = validateTaskPlan(plan);
+  const errors = validateTaskPlan(plan, task.planningContext);
   if (errors.length) throw new Error(`Invalid task plan: ${errors.join("; ")}`);
   return { ...task, plan: structuredClone(plan), updatedAtMs: now() };
 }

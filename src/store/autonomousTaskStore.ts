@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 import { taskEvent, taskEventToRunEvent, type AutonomousTask, type TaskGuidance } from "../lib/autonomousTask";
-import { AutonomousTaskControl, resumeAutonomousTask, startAutonomousTask, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
+import { AutonomousTaskControl, resumeAutonomousTask, startAutonomousTask, submitAutonomousTaskToDaemon, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
 import { appendRunEvent, listRuns, loadRunEvents, requestRunCancellation } from "../lib/runProtocol";
 
 const controls = new Map<string, AutonomousTaskControl>();
@@ -24,6 +24,7 @@ function taskFromEvents(events: Awaited<ReturnType<typeof loadRunEvents>>): Auto
     if (snapshot && typeof snapshot === "object") {
       const candidate = snapshot as Partial<AutonomousTask>;
       if (typeof candidate.taskId !== "string" || typeof candidate.objective !== "string") continue;
+      if (!Array.isArray(candidate.acceptanceCriteria) || !Array.isArray(candidate.guidance) || !Array.isArray(candidate.artifacts) || !Array.isArray(candidate.verificationEvidence) || !candidate.executionOwner) continue;
       task = candidate as AutonomousTask;
     }
     if (envelope.event.payload.event_type === "guidance_received" && task) {
@@ -48,6 +49,8 @@ export interface AutonomousTaskStoreState {
   resume: (taskId: string) => Promise<void>;
   cancel: (taskId: string, reason?: string) => Promise<void>;
   guide: (taskId: string, text: string, appliesTo?: TaskGuidance["appliesTo"]) => Promise<void>;
+  approve: (taskId: string, confirmation: string) => Promise<void>;
+  continueInBackground: (taskId: string) => Promise<void>;
   clearError: () => void;
 }
 
@@ -99,6 +102,26 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       publish(next);
       controls.get(taskId)?.guide(guidance);
       await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("guidance_received", next, { guidance })));
+    }),
+    approve: (taskId, confirmation) => withBusy(set, get, `approve:${taskId}`, async () => {
+      const current = get().tasks.find((task) => task.taskId === taskId);
+      if (!current?.waitingApproval || !confirmation.trim()) throw new Error("Task approval requires the exact confirmation phrase.");
+      const existing = controls.get(taskId);
+      if (existing) existing.approve(current.waitingApproval.requestId, confirmation.trim(), current.waitingApproval.operationDigest);
+      else {
+        const handle = await resumeAutonomousTask({ task: current, approval: { requestId: current.waitingApproval.requestId, confirmation: confirmation.trim(), operationDigest: current.waitingApproval.operationDigest }, onUpdate: publish });
+        started.set(handle.runId, handle); controls.set(handle.runId, handle.control); publish(handle.task);
+        void handle.completion.then((result) => { publish(result); started.delete(handle.runId); controls.delete(handle.runId); });
+      }
+    }),
+    continueInBackground: (taskId) => withBusy(set, get, `handoff:${taskId}`, async () => {
+      const current = get().tasks.find((task) => task.taskId === taskId);
+      if (!current || current.outcome !== "RUNNING") throw new Error("Only a running autonomous task can continue in the background.");
+      const accepted = await submitAutonomousTaskToDaemon(current);
+      const next = { ...current, executionOwner: { kind: "daemon" as const, instanceId: accepted.job_id, leaseEpoch: current.executionOwner.leaseEpoch + 1, leaseExpiresAtMs: Date.now() + 60_000 }, updatedAtMs: Date.now() };
+      await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff", next, { job_id: accepted.job_id, run_id: accepted.run_id, owner: next.executionOwner })));
+      controls.get(taskId)?.cancel();
+      publish(next);
     }),
   };
 });

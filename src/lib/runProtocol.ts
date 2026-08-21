@@ -190,6 +190,7 @@ export type AutonomousTaskEventType =
   | "review_finished"
   | "guidance_received"
   | "delivery_started"
+  | "execution_handoff"
   | "task_completed";
 export type RunEventWire =
   | Event<"queued", { queue: string | null }>
