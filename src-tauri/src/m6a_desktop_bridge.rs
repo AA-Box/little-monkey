@@ -347,7 +347,11 @@ pub async fn autonomous_task_submit(
     let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
         "Autonomous task submission requires an execution owner lease".to_string()
     })?;
-    recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    if let Some(previous) = snapshot.previous_execution_owner.as_ref() {
+        recipes::transfer_autonomous_task_owner(&snapshot.task_id, previous, owner)?;
+    } else {
+        recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
     let status_text = crate::daemon_commands::command(vec![
         "daemon".to_string(),
         "status".to_string(),

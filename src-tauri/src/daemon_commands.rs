@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 use tauri::Emitter;
 
 const MAX_CLI_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
@@ -1375,6 +1376,172 @@ pub async fn remote_placement_sync() -> Result<String, String> {
         "placement-sync".into(),
     ])
     .await
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AutonomousTaskPlacementRequest {
+    pub kind: String,
+    pub target_id: String,
+    pub run_spec: crate::run_protocol::RunSpec,
+}
+
+/// Execute a frozen autonomous node through the selected placement backend.
+/// Remote nodes use the existing signed placement plane and wait for the node's
+/// durable placement to become terminal. Docker uses an explicit runner image
+/// contract; it never falls back to the host process or executes a shell.
+#[tauri::command]
+pub async fn autonomous_task_place_node(
+    request: AutonomousTaskPlacementRequest,
+) -> Result<Value, String> {
+    request
+        .run_spec
+        .validate()
+        .map_err(|error| error.to_string())?;
+    validate_token("placement kind", &request.kind, 32)?;
+    validate_token("placement target", &request.target_id, 512)?;
+    if request.target_id.starts_with('-') {
+        return Err("Placement target cannot start with '-'".to_string());
+    }
+    match request.kind.as_str() {
+        "remote_node" => {
+            validate_id("remote node alias", &request.target_id)?;
+            let data_dir = crate::app_paths::data_dir()
+                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+            let dir = data_dir.join("autonomous-placements");
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("Could not create placement directory: {error}"))?;
+            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+            let bytes = serde_json::to_vec_pretty(&request.run_spec)
+                .map_err(|error| format!("Could not serialize placement spec: {error}"))?;
+            std::fs::write(&spec_path, bytes)
+                .map_err(|error| format!("Could not persist placement spec: {error}"))?;
+            let result = async {
+                let output = command(vec![
+                    "daemon".into(),
+                    "remote".into(),
+                    "place".into(),
+                    "--spec".into(),
+                    spec_path.to_string_lossy().into_owned(),
+                    "--alias".into(),
+                    request.target_id.clone(),
+                    "--json".into(),
+                ])
+                .await?;
+                let accepted = parse_json(&output)?;
+                let submitted_run_id = accepted
+                    .get("placement")
+                    .and_then(|placement| placement.get("submitted_run_id"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "Remote placement response omitted submitted_run_id".to_string())?
+                    .to_string();
+                let deadline = Instant::now()
+                    + std::time::Duration::from_millis(request.run_spec.budgets.wall_time_ms);
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err("Remote autonomous node placement exceeded its frozen wall-time budget".to_string());
+                    }
+                    let _ = command(vec![
+                        "daemon".into(),
+                        "remote".into(),
+                        "placement-sync".into(),
+                    ])
+                    .await;
+                    let rows = parse_json(
+                        &command(vec![
+                            "daemon".into(),
+                            "remote".into(),
+                            "placements".into(),
+                            "--json".into(),
+                        ])
+                        .await?,
+                    )?;
+                    if let Some(row) = rows
+                        .get("placements")
+                        .and_then(Value::as_array)
+                        .and_then(|rows| rows.iter().find(|row| row.get("submitted_run_id").and_then(Value::as_str) == Some(submitted_run_id.as_str())))
+                    {
+                        let state = row.get("state").and_then(Value::as_str).unwrap_or_default();
+                        if matches!(state, "succeeded" | "failed" | "cancelled") {
+                            if state != "succeeded" {
+                                return Err(row
+                                    .get("last_error")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("remote autonomous node failed")
+                                    .to_string());
+                            }
+                            return Ok(serde_json::json!({
+                                "ok": true,
+                                "summary": format!("Remote autonomous node completed on {}.", request.target_id),
+                                "changedFiles": [],
+                                "workspaceRevision": null
+                            }));
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+            .await;
+            let _ = std::fs::remove_file(&spec_path);
+            result
+        }
+        "docker" => {
+            let data_dir = crate::app_paths::data_dir()
+                .ok_or_else(|| "Could not resolve app data directory".to_string())?;
+            let dir = data_dir.join("autonomous-placements");
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| format!("Could not create placement directory: {error}"))?;
+            let spec_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+            let mut spec = request.run_spec;
+            let host_workspace = spec
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.roots.first())
+                .map(|root| root.canonical_path.clone())
+                .ok_or_else(|| {
+                    "Docker autonomous placement requires a workspace root".to_string()
+                })?;
+            if let Some(workspace) = spec.workspace.as_mut() {
+                for root in &mut workspace.roots {
+                    root.canonical_path = "/workspace".to_string();
+                }
+            }
+            let bytes = serde_json::to_vec_pretty(&spec)
+                .map_err(|error| format!("Could not serialize Docker placement spec: {error}"))?;
+            std::fs::write(&spec_path, bytes)
+                .map_err(|error| format!("Could not persist Docker placement spec: {error}"))?;
+            let args = vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "--network".to_string(),
+                "none".to_string(),
+                "-v".to_string(),
+                format!("{}:/workspace", host_workspace),
+                "-v".to_string(),
+                format!("{}:/run/autonomous-spec.json:ro", spec_path.display()),
+                "-w".to_string(),
+                "/workspace".to_string(),
+                request.target_id,
+                "monkey-autonomous-runner".to_string(),
+                "/run/autonomous-spec.json".to_string(),
+            ];
+            let result = tokio::task::spawn_blocking(move || {
+                let output = Command::new("docker")
+                    .args(args)
+                    .output()
+                    .map_err(|error| format!("Docker backend could not start: {error}"))?;
+                let output_text = finish_cli_output(output)?;
+                parse_json(&output_text)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            let _ = std::fs::remove_file(&spec_path);
+            result
+        }
+        other => Err(format!(
+            "Unsupported autonomous placement backend '{other}'"
+        )),
+    }
 }
 
 /// States what this machine advertises to schedulers allowed to place work on

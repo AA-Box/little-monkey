@@ -676,9 +676,119 @@ fn autonomous_owner_path(task_id: &str) -> Result<PathBuf, String> {
         .join(format!("{task_id}.json")))
 }
 
-/// Claims the immutable execution owner for a task. The first writer wins;
-/// retries with the exact same lease are idempotent, while every competing
-/// epoch or instance is rejected instead of overwriting the checkpoint.
+fn read_autonomous_task_owner(path: &Path) -> Result<Option<AutonomousTaskOwnerSnapshot>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("Autonomous owner checkpoint is invalid: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read autonomous owner: {error}")),
+    }
+}
+
+fn owner_identity_matches(
+    left: &AutonomousTaskOwnerSnapshot,
+    right: &AutonomousTaskOwnerSnapshot,
+) -> bool {
+    left.kind == right.kind
+        && left.instance_id == right.instance_id
+        && left.lease_epoch == right.lease_epoch
+}
+
+struct AutonomousOwnerLock {
+    path: PathBuf,
+}
+
+impl Drop for AutonomousOwnerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_autonomous_task_owner(path: &Path) -> Result<AutonomousOwnerLock, String> {
+    let lock_path = path.with_extension("json.lock");
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| "Autonomous owner lock path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    for _ in 0..200 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or_default();
+                let _ = writeln!(file, "{} {now}", std::process::id());
+                let _ = file.sync_all();
+                return Ok(AutonomousOwnerLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|contents| contents.split_whitespace().next()?.parse::<u32>().ok())
+                    .is_some_and(|pid| !crate::os_signal::process_is_alive(pid));
+                let malformed_old_lock = !stale
+                    && std::fs::metadata(&lock_path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(60));
+                if stale || malformed_old_lock {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("Could not lock autonomous owner: {error}")),
+        }
+    }
+    Err("Autonomous owner checkpoint is busy; retry the compare-and-swap".to_string())
+}
+
+fn write_autonomous_task_owner_locked(
+    path: &Path,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Autonomous owner path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(owner)
+        .map_err(|error| format!("Could not serialize autonomous owner: {error}"))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        format!("{}-{nonce}", std::process::id())
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("Could not create autonomous owner replacement: {error}"))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("Could not persist autonomous owner: {error}"))?;
+    file.sync_all()
+        .map_err(|error| format!("Could not sync autonomous owner: {error}"))?;
+    std::fs::rename(&temp, path)
+        .map_err(|error| format!("Could not atomically replace autonomous owner: {error}"))?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+/// Claims the initial execution owner for a task. Retries with the exact same
+/// lease are idempotent; a competing owner cannot overwrite it.
 pub fn claim_autonomous_task_owner(
     task_id: &str,
     owner: &AutonomousTaskOwnerSnapshot,
@@ -720,19 +830,76 @@ pub fn claim_autonomous_task_owner(
     }
 }
 
+/// Compare-and-swap the owner and advance its epoch. The expected identity is
+/// checked without using its expiry, because a lease renewal may have safely
+/// extended that expiry since the handoff snapshot was created.
+pub fn transfer_autonomous_task_owner(
+    task_id: &str,
+    expected: &AutonomousTaskOwnerSnapshot,
+    next: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    if next.lease_epoch != expected.lease_epoch.saturating_add(1) {
+        return Err("Autonomous owner transfer must advance the lease epoch by one".to_string());
+    }
+    let path = autonomous_owner_path(task_id)?;
+    let _lock = lock_autonomous_task_owner(&path)?;
+    match read_autonomous_task_owner(&path)? {
+        None => claim_autonomous_task_owner(task_id, next),
+        Some(current) if current == *next => Ok(()),
+        Some(current) if owner_identity_matches(&current, expected) => {
+            write_autonomous_task_owner_locked(&path, next)
+        }
+        Some(current) => Err(format!(
+            "Autonomous task {task_id} owner CAS failed: current owner {} at lease epoch {}",
+            current.instance_id, current.lease_epoch
+        )),
+    }
+}
+
+/// Renew a live lease without changing its owner or epoch.
+pub fn renew_autonomous_task_owner(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+    lease_expires_at_ms: u64,
+) -> Result<AutonomousTaskOwnerSnapshot, String> {
+    if lease_expires_at_ms == 0 {
+        return Err("Autonomous owner renewal requires a non-zero expiry".to_string());
+    }
+    let path = autonomous_owner_path(task_id)?;
+    let _lock = lock_autonomous_task_owner(&path)?;
+    let current = read_autonomous_task_owner(&path)?
+        .ok_or_else(|| "Autonomous task owner checkpoint is missing".to_string())?;
+    if !owner_identity_matches(&current, owner) {
+        return Err("Autonomous owner renewal lost its compare-and-swap race".to_string());
+    }
+    if lease_expires_at_ms <= current.lease_expires_at_ms {
+        return Ok(current);
+    }
+    let next = AutonomousTaskOwnerSnapshot {
+        lease_expires_at_ms,
+        ..current
+    };
+    write_autonomous_task_owner_locked(&path, &next)?;
+    Ok(next)
+}
+
 pub fn autonomous_task_owner_matches(
     task_id: &str,
     owner: &AutonomousTaskOwnerSnapshot,
 ) -> Result<bool, String> {
     let path = autonomous_owner_path(task_id)?;
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("Could not read autonomous owner: {error}")),
+    Ok(read_autonomous_task_owner(&path)?.is_some_and(|existing| existing == *owner))
+}
+
+pub fn autonomous_task_owner_epoch_matches(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<Option<AutonomousTaskOwnerSnapshot>, String> {
+    let path = autonomous_owner_path(task_id)?;
+    let Some(existing) = read_autonomous_task_owner(&path)? else {
+        return Ok(None);
     };
-    let existing: AutonomousTaskOwnerSnapshot = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("Autonomous owner checkpoint is invalid: {error}"))?;
-    Ok(existing == *owner)
+    Ok(owner_identity_matches(&existing, owner).then_some(existing))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
@@ -752,6 +919,8 @@ pub struct AutonomousTaskSnapshot {
     pub delivery_intent: Option<String>,
     #[serde(default)]
     pub execution_owner: Option<AutonomousTaskOwnerSnapshot>,
+    #[serde(default)]
+    pub previous_execution_owner: Option<AutonomousTaskOwnerSnapshot>,
     /// The exact durable task state captured at handoff, when submitted by
     /// the desktop coordinator. CLI-created recipes may omit it.
     #[serde(default)]
@@ -944,7 +1113,7 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
                 return Err("autonomous task snapshot exceeds 512 KiB".to_string());
             }
         }
-        if let Some(owner) = &task.execution_owner {
+        let validate_owner = |owner: &AutonomousTaskOwnerSnapshot| -> Result<(), String> {
             if owner.instance_id.trim().is_empty()
                 || owner.lease_epoch == 0
                 || owner.lease_expires_at_ms == 0
@@ -956,6 +1125,21 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
                     "unsupported autonomous task execution owner '{}'",
                     owner.kind
                 ));
+            }
+            Ok(())
+        };
+        if let Some(owner) = &task.execution_owner {
+            validate_owner(owner)?;
+        }
+        if let Some(previous) = &task.previous_execution_owner {
+            validate_owner(previous)?;
+            let current = task.execution_owner.as_ref().ok_or_else(|| {
+                "autonomous task owner handoff requires a new execution owner".to_string()
+            })?;
+            if current.lease_epoch != previous.lease_epoch.saturating_add(1) {
+                return Err(
+                    "autonomous task owner handoff must advance the lease epoch by one".to_string(),
+                );
             }
         }
         if recipe.desktop_turn.is_some() {
@@ -1643,6 +1827,7 @@ mod tests {
                 lease_epoch: 1,
                 lease_expires_at_ms: 10,
             }),
+            previous_execution_owner: None,
             task_snapshot: None,
             completed_nodes: Vec::new(),
             next_node_id: Some("plan".to_string()),

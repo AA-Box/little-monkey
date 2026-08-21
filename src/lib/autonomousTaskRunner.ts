@@ -3,7 +3,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { agentWorktreeClient } from "./agentWorktree";
 import { resolveTarget, snapshotForResolvedTarget } from "./targetRouting";
 import type { ResolvedTarget } from "./turnEngine";
-import { attachDurableRun, beginDurableRun, defaultRunBudgets } from "./durableRun";
+import {
+  attachDurableRun, beginDurableRun, defaultRunBudgets, modelTargetToRunWire,
+  permissionPolicyForRun, workspaceToRunWire,
+} from "./durableRun";
 import { runSubagentTask, runSubagentTaskStructured } from "./subagent";
 import { executeDeliveryMutation, prepareDeliveryMutation, type DeliveryMutation } from "./gitDelivery";
 import {
@@ -13,6 +16,7 @@ import {
   type TaskExecutionPlacement, type TaskPlan, type TaskPlanNode, type TaskPlanningContext, type TaskUsage, type TaskWorker, type VerificationEvidence,
 } from "./autonomousTask";
 import { appendRunEvent } from "./runProtocol";
+import type { RunSpecWire } from "./runProtocol";
 import { usePermissionStore } from "../store/permissionStore";
 import { primaryRoot, useWorkspaceStore } from "../store/workspaceStore";
 import { effortForTarget } from "../store/modelStore";
@@ -67,6 +71,75 @@ export interface AutonomousTaskPlacementAdapters {
   remote_node?: AutonomousTaskPlacementAdapter;
 }
 
+function placementRunSpec(task: AutonomousTask, node: TaskPlanNode): RunSpecWire {
+  const taskSnapshot = {
+    ...structuredClone(task),
+    plan: task.plan ? { ...structuredClone(task.plan), nodes: [{ ...structuredClone(node), dependencies: [] }] } : null,
+    outcome: "RUNNING",
+    executionOwner: { kind: "remote", instanceId: `placement-${task.taskId}-${node.nodeId}`, leaseEpoch: 1, leaseExpiresAtMs: Date.now() + task.budgetSnapshot.wallTimeMs },
+    updatedAtMs: Date.now(),
+  };
+  return {
+    schema_version: 1,
+    run_id: `${task.taskId}-${node.nodeId}`,
+    idempotency_key: `autonomous-placement/${task.taskId}/${node.nodeId}/${node.attempt}`,
+    created_at_ms: Date.now(),
+    kind: "autonomous_task",
+    submitted_by: { client_id: "little-monkey-desktop-autonomous", instance_id: task.taskId, kind: "desktop", version: "1.0.0" },
+    task: node.objective,
+    instructions: "Execute only the frozen autonomous task node and return durable evidence.",
+    input_artifact_ids: [],
+    target: modelTargetToRunWire(task.targetSnapshot),
+    workspace: workspaceToRunWire(task.workspaceRoots, "read_write"),
+    permission_policy: permissionPolicyForRun(task.permissionSnapshot.mode as Parameters<typeof permissionPolicyForRun>[0], { unattended: true, allowNetwork: task.permissionSnapshot.allowNetwork, allowExternalMutations: task.permissionSnapshot.allowExternalMutations }),
+    budgets: {
+      wall_time_ms: task.budgetSnapshot.wallTimeMs,
+      max_iterations: Math.max(1, Math.min(10_000, task.budgetSnapshot.maxModelCalls)),
+      max_model_calls: task.budgetSnapshot.maxModelCalls,
+      max_tool_calls: task.budgetSnapshot.maxToolCalls,
+      max_input_tokens: 1_000_000_000,
+      max_output_tokens: 1_000_000_000,
+      max_cost_micros: task.budgetSnapshot.maxCostMicros ?? null,
+      max_artifact_bytes: task.budgetSnapshot.maxArtifactBytes ?? 1 << 30,
+      max_event_count: 1_000_000,
+    },
+    autonomous_task: {
+      schema_version: 1,
+      task_id: `${task.taskId}-${node.nodeId}`,
+      objective: node.objective,
+      source: task.source,
+      relevant_files: node.relevantFiles ?? task.planningContext?.relevantFiles ?? [],
+      current_workspace_revision: task.workspaceRevision ?? task.planningContext?.currentWorkspaceRevision ?? "unknown",
+      max_repair_rounds: task.budgetSnapshot.maxRepairRounds,
+      max_workers: 1,
+      guidance: task.guidance.map((item) => ({ guidance_id: item.guidanceId, text: item.text, applies_to: item.appliesTo })),
+      delivery_intent: "leave_worktree",
+      execution_owner: { kind: "remote", instance_id: `placement-${task.taskId}-${node.nodeId}`, lease_epoch: 1, lease_expires_at_ms: Date.now() + task.budgetSnapshot.wallTimeMs },
+      previous_execution_owner: null,
+      task_snapshot: taskSnapshot,
+      completed_nodes: [],
+      next_node_id: node.nodeId,
+    },
+  };
+}
+
+function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
+  const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
+    const spec = placementRunSpec(task, node);
+    const targetId = node.executionPlacement?.targetId?.trim();
+    if (!targetId) return { ok: false, summary: `Execution placement '${kind}' has no target id.` };
+    try {
+      return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
+    } catch (error) {
+      return { ok: false, summary: `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  };
+  return {
+    docker: (task, node) => execute("docker", task, node),
+    remote_node: (task, node) => execute("remote_node", task, node),
+  };
+}
+
 export interface AutonomousTaskEventSink {
   (event: TaskEvent): Promise<void> | void;
 }
@@ -89,6 +162,7 @@ export class AutonomousTaskControl {
   private guidance: AutonomousTask["guidance"] = [];
   private approval: { requestId: string; confirmation: string; operationDigest?: string } | null = null;
   private activeExecutions = 0;
+  private coordinatorWork = 0;
   private safePointWaiters: Array<() => void> = [];
 
   get signal(): AbortSignal { return this.controller.signal; }
@@ -99,14 +173,23 @@ export class AutonomousTaskControl {
   beginExecution(): void { this.activeExecutions += 1; }
   endExecution(): void {
     this.activeExecutions = Math.max(0, this.activeExecutions - 1);
-    if (this.activeExecutions === 0) {
-      const waiters = this.safePointWaiters.splice(0);
-      for (const resolve of waiters) resolve();
-    }
+    this.resolveSafePointWaiters();
+  }
+  beginCoordinatorWork(): void { this.coordinatorWork += 1; }
+  endCoordinatorWork(): void { this.coordinatorWork = Math.max(0, this.coordinatorWork - 1); this.resolveSafePointWaiters(); }
+  private resolveSafePointWaiters(): void {
+    if (this.activeExecutions !== 0 || this.coordinatorWork !== 0) return;
+    const waiters = this.safePointWaiters.splice(0);
+    for (const resolve of waiters) resolve();
   }
   waitForSafePoint(): Promise<void> {
-    if (this.activeExecutions === 0) return Promise.resolve();
+    if (this.activeExecutions === 0 && this.coordinatorWork === 0) return Promise.resolve();
     return new Promise((resolve) => this.safePointWaiters.push(resolve));
+  }
+  async freezeForHandoff<T>(readSnapshot: () => T): Promise<T> {
+    this.pause();
+    await this.waitForSafePoint();
+    return readSnapshot();
   }
   relinquish(): void { this.controller.abort(); this.resume(); }
   guide(guidance: AutonomousTask["guidance"][number]): void { this.guidance.push(structuredClone(guidance)); this.guidance = this.guidance.slice(-8); this.wake?.(); this.wake = null; }
@@ -212,12 +295,15 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       const planningNode: TaskPlanNode = { nodeId: "planner", taskClass: "investigation", objective: "Build a structured repository-aware plan.", dependencies: [], mutationScope: [], isolation: "shared", status: "running", attempt: 1, workerId: null, resultSummary: null };
       const planningWorker = workerFor(task, planningNode);
       const planningContext: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker: planningWorker, planningContext: task.planningContext };
+      const hasPlanner = Boolean(params.runtime.plan);
       const planned = await params.runtime.plan?.(task, planningContext);
       let acceptedPlan: TaskPlan | null = null;
       if (planned?.plan && validatePlannedTaskPlan(planned.plan, task)) acceptedPlan = planned.plan;
+      if (hasPlanner && !acceptedPlan) throw new Error("Autonomous planner returned an invalid or incomplete repository-aware DAG.");
       const plan = acceptedPlan ?? createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", Math.min(task.budgetSnapshot.maxWorkers, task.budgetSnapshot.maxConcurrentWorkers ?? task.budgetSnapshot.maxWorkers), task.planningContext);
       const plannedCriteria = planned?.acceptanceCriteria;
       const criteriaAreStructured = Boolean(plannedCriteria && plannedCriteria.length >= 3 && plannedCriteria.some((criterion) => criterion.method === "verification_command") && plannedCriteria.some((criterion) => criterion.method === "review") && plannedCriteria.every((criterion) => Boolean(criterion.provenance?.kind && criterion.provenance.fragment)));
+      if (hasPlanner && !criteriaAreStructured) throw new Error("Autonomous planner returned incomplete acceptance criteria; verification and review provenance are required.");
       if (acceptedPlan && criteriaAreStructured) task = { ...task, acceptanceCriteria: structuredClone(plannedCriteria!) };
       if (planned?.planningContext) task = { ...task, planningContext: { currentWorkspaceRevision: planned.planningContext.currentWorkspaceRevision ?? task.planningContext?.currentWorkspaceRevision ?? "unknown", relevantFiles: planned.planningContext.relevantFiles ?? task.planningContext?.relevantFiles ?? [], repositoryConventions: planned.planningContext.repositoryConventions ?? task.planningContext?.repositoryConventions ?? [], sourceMaterial: planned.planningContext.sourceMaterial ?? task.planningContext?.sourceMaterial ?? [], dependencyArtifactIds: planned.planningContext.dependencyArtifactIds ?? task.planningContext?.dependencyArtifactIds ?? [], upstreamDecisions: planned.planningContext.upstreamDecisions ?? task.planningContext?.upstreamDecisions ?? [] }, workspaceRevision: planned.planningContext.currentWorkspaceRevision ?? task.workspaceRevision };
       task = installTaskPlan(task, plan);
@@ -274,15 +360,17 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded };
         params.control?.beginExecution();
         try {
-          if (node.taskClass === "integration" && params.runtime.integrate) return params.runtime.integrate(task, node, [...results.values()], context);
-          if (node.taskClass === "verification" && params.runtime.verify) return params.runtime.verify(task, node, context);
-          if (node.taskClass === "review" && params.runtime.review) return params.runtime.review(task, node, context);
-          if (node.taskClass === "delivery" && params.runtime.deliver) return params.runtime.deliver(task, context);
-          return params.runtime.executeNode(task, node, context);
+          if (node.taskClass === "integration" && params.runtime.integrate) return await params.runtime.integrate(task, node, [...results.values()], context);
+          if (node.taskClass === "verification" && params.runtime.verify) return await params.runtime.verify(task, node, context);
+          if (node.taskClass === "review" && params.runtime.review) return await params.runtime.review(task, node, context);
+          if (node.taskClass === "delivery" && params.runtime.deliver) return await params.runtime.deliver(task, context);
+          return await params.runtime.executeNode(task, node, context);
         } finally { params.control?.endExecution(); }
       });
-      const completed = await Promise.all(executions);
-      for (let index = 0; index < completed.length; index += 1) {
+      params.control?.beginCoordinatorWork();
+      try {
+        const completed = await Promise.all(executions);
+        for (let index = 0; index < completed.length; index += 1) {
         stopIfNeeded();
         const worker = workers[index];
         const node = task.plan?.nodes.find((candidate) => candidate.nodeId === worker.nodeId);
@@ -321,18 +409,21 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if (node.taskClass === "verification") await emit("verification_finished", { node_id: node.nodeId, passed: result.ok, summary: result.summary });
         if (node.taskClass === "review") await emit("review_finished", { node_id: node.nodeId, passed: result.ok, summary: result.summary });
         if (node.taskClass === "integration" && result.ok) await emit("patch_integrated", { node_id: node.nodeId, summary: result.summary });
-      }
-      if (task.outcome === "WAITING_APPROVAL") break;
-      const failed = completed.some((result) => !result.ok);
-      if (failed) {
-        if (task.repairRounds < task.budgetSnapshot.maxRepairRounds) {
-          task = { ...task, repairRounds: task.repairRounds + 1, updatedAtMs: Date.now() };
-          for (const node of batch) { const failedNode = task.plan?.nodes.find((candidate) => candidate.nodeId === node.nodeId); const failedResult = completed.find((_result, resultIndex) => workers[resultIndex]?.nodeId === node.nodeId); if (failedNode?.status === "failed" && failedResult && !failedResult.ok) task = insertRepairNode(task, failedNode, failedResult.summary); }
-          await emit("plan_changed", { reason: "Bounded repair round requested after worker failure.", repair_round: task.repairRounds });
-        } else {
-          task = { ...task, outcome: task.plan?.nodes.some((node) => node.status === "succeeded") ? "PARTIALLY_COMPLETED" : "FAILED", summary: "One or more task nodes failed after bounded repair rounds.", updatedAtMs: Date.now() };
-          break;
         }
+        if (task.outcome === "WAITING_APPROVAL") break;
+        const failed = completed.some((result) => !result.ok);
+        if (failed) {
+          if (task.repairRounds < task.budgetSnapshot.maxRepairRounds) {
+            task = { ...task, repairRounds: task.repairRounds + 1, updatedAtMs: Date.now() };
+            for (const node of batch) { const failedNode = task.plan?.nodes.find((candidate) => candidate.nodeId === node.nodeId); const failedResult = completed.find((_result, resultIndex) => workers[resultIndex]?.nodeId === node.nodeId); if (failedNode?.status === "failed" && failedResult && !failedResult.ok) task = insertRepairNode(task, failedNode, failedResult.summary); }
+            await emit("plan_changed", { reason: "Bounded repair round requested after worker failure.", repair_round: task.repairRounds });
+          } else {
+            task = { ...task, outcome: task.plan?.nodes.some((node) => node.status === "succeeded") ? "PARTIALLY_COMPLETED" : "FAILED", summary: "One or more task nodes failed after bounded repair rounds.", updatedAtMs: Date.now() };
+            break;
+          }
+        }
+      } finally {
+        params.control?.endCoordinatorWork();
       }
     }
     if (task.outcome === "RUNNING" && task.plan) {
@@ -365,8 +456,14 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
     plan: async (task, context) => {
       const result = await runSubagentTask({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-planner`, description: "Plan autonomous task", prompt: `Inspect the repository and return JSON only. Build a context-aware DAG with real file scopes; never invent numbered scopes. Schema: {plan:{planId,strategy,nodes:[...]},acceptanceCriteria:[...],summary}\n${buildWorkerContext(task, { nodeId: "planner", taskClass: "investigation", objective: task.objective, dependencies: [], mutationScope: [], isolation: "shared", status: "running", attempt: 1, workerId: null, resultSummary: null })}`, profile: "explore", capabilities: ["read"], target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal });
       const candidate = result.match(/\{[\s\S]*\}/)?.[0];
-      if (candidate) { try { const parsed = JSON.parse(candidate) as Partial<TaskPlanResult>; if (parsed.plan && Array.isArray(parsed.plan.nodes)) return { plan: parsed.plan as TaskPlan, acceptanceCriteria: Array.isArray(parsed.acceptanceCriteria) ? parsed.acceptanceCriteria as AutonomousTask["acceptanceCriteria"] : undefined, summary: parsed.summary }; } catch { /* deterministic fallback below */ } }
-      return { plan: createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", task.budgetSnapshot.maxWorkers, task.planningContext), summary: "Model plan was invalid; used repository-context fallback." };
+      if (!candidate) throw new Error("Autonomous planner did not return structured JSON.");
+      try {
+        const parsed = JSON.parse(candidate) as Partial<TaskPlanResult>;
+        if (!parsed.plan || !Array.isArray(parsed.plan.nodes)) throw new Error("planner JSON did not contain plan.nodes");
+        return { plan: parsed.plan as TaskPlan, acceptanceCriteria: Array.isArray(parsed.acceptanceCriteria) ? parsed.acceptanceCriteria as AutonomousTask["acceptanceCriteria"] : undefined, planningContext: parsed.planningContext, summary: parsed.summary };
+      } catch (error) {
+        throw new Error(`Autonomous planner response was invalid: ${error instanceof Error ? error.message : String(error)}`);
+      }
     },
     executeNode: async (task, node, context) => {
       const placementKind = node.executionPlacement?.kind;
@@ -384,11 +481,12 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
       for (const capability of [...required]) if (!allowed.has(capability)) {
         return { ok: false, summary: `Node '${node.nodeId}' requested capability '${capability}' outside the frozen permission ceiling.` };
       }
+      const beforeRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision ?? "unknown");
       const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffect });
       const afterRevision = node.isolation === "shared" ? await agentWorktreeClient.workspaceRevision().catch(() => undefined) : result.worktree?.diffDigest;
       const changedFiles = node.isolation === "shared" ? await agentWorktreeClient.workspaceChangedFiles().catch(() => result.changedFiles ?? []) : result.changedFiles ?? [];
       const patchDigest = afterRevision ? await textDigest(JSON.stringify({ afterRevision, changedFiles })) ?? afterRevision : result.worktree?.diffDigest;
-      return { ok: result.outcome === "done", summary: result.report.slice(0, 8_000), worktree: result.worktree, changedFiles, mutation: (node.taskClass === "implementation" || node.taskClass === "integration") && afterRevision ? { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision, changedFiles, patchDigest: patchDigest ?? afterRevision } : undefined, artifacts: result.worktree ? [{ artifactId: `patch-${node.nodeId}-${Date.now()}`, kind: "patch", label: `Patch from ${node.nodeId}`, path: result.worktree.path, digest: result.worktree.diffDigest, createdAtMs: Date.now(), workspaceRevision: result.worktree.baseRevision }] : undefined, usage: result.usage };
+      return { ok: result.outcome === "done", summary: result.report.slice(0, 8_000), worktree: result.worktree, changedFiles, mutation: (node.taskClass === "implementation" || node.taskClass === "integration") && afterRevision ? { beforeRevision, afterRevision, changedFiles, patchDigest: patchDigest ?? afterRevision } : undefined, artifacts: result.worktree ? [{ artifactId: `patch-${node.nodeId}-${Date.now()}`, kind: "patch", label: `Patch from ${node.nodeId}`, path: result.worktree.path, digest: result.worktree.diffDigest, createdAtMs: Date.now(), workspaceRevision: result.worktree.baseRevision }] : undefined, usage: result.usage };
     },
     integrate: async (task, _node, results, context) => {
       const workerResults = results.filter((result) => result.worktree);
@@ -415,21 +513,24 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, pla
       const evidence: VerificationEvidence[] = [];
       for (const command of enabled) {
         const started = Date.now();
+        const beforeRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision);
         const result = await invoke<{ code: number | null; timedOut: boolean; stdout?: string; stderr?: string }>("verify_run", { commandId: command.id, turnId: task.taskId }).catch((error) => ({ code: null, timedOut: false, stdout: "", stderr: error instanceof Error ? error.message : String(error) }));
-        const passed = !result.timedOut && result.code === 0;
-        const criterion = task.acceptanceCriteria.find((candidate) => candidate.method === "verification_command");
         const testedRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision);
-        evidence.push(makeEvidence(command.label || command.id, criterion?.id ?? null, passed, `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim() || (passed ? "passed" : "failed"), true, result.code, Date.now() - started, { command: command.command, commandDigest: await textDigest(command.command), workspaceRevision: testedRevision, testedRevision, source: "command" }));
+        const stale = Boolean(beforeRevision && testedRevision && beforeRevision !== testedRevision);
+        const passed = !result.timedOut && result.code === 0 && !stale;
+        const criterion = task.acceptanceCriteria.find((candidate) => candidate.method === "verification_command");
+        evidence.push(makeEvidence(command.label || command.id, criterion?.id ?? null, passed, stale ? "Verification command ran while the workspace revision changed." : `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim() || (passed ? "passed" : "failed"), true, result.code, Date.now() - started, { stale, command: command.command, commandDigest: await textDigest(command.command), workspaceRevision: testedRevision, testedRevision, source: "command" }));
         if (!passed) return { ok: false, summary: evidence[evidence.length - 1].summary, evidence };
       }
       return { ok: true, summary: `${enabled.length} verification command(s) passed.`, evidence };
     },
     review: async (task, node, context) => {
       const result = await runSubagentTask({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: "Review task diff", prompt: `${buildWorkerContext(task, node)}\nReview only. Do not mutate files. Return strict JSON with verdict, findings, filesReviewed, acceptanceCriteria, securityFindings, testCoverageFindings.`, profile: "explore", target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal });
+      const testedRevision = await agentWorktreeClient.workspaceRevision().catch(() => task.workspaceRevision);
       const review = parseStructuredReview(result); const criteria = task.acceptanceCriteria.filter((candidate) => candidate.method === "review");
-      if (!review) return { ok: false, summary: "Review response was not valid structured JSON; no review evidence accepted.", evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, false, result, false, null, 0, { workspaceRevision: task.workspaceRevision, testedRevision: task.workspaceRevision, source: "review" })) };
+      if (!review) return { ok: false, summary: "Review response was not valid structured JSON; no review evidence accepted.", evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, false, result, false, null, 0, { workspaceRevision: testedRevision, testedRevision, source: "review" })) };
       const passed = review.verdict === "pass" && !review.findings.some((finding) => finding.severity === "blocking");
-      return { ok: passed, summary: JSON.stringify(review).slice(0, 8_000), review, evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, passed, JSON.stringify(review), true, passed ? 0 : 1, 0, { workspaceRevision: task.workspaceRevision, testedRevision: task.workspaceRevision, source: "review" })) };
+      return { ok: passed, summary: JSON.stringify(review).slice(0, 8_000), review, evidence: criteria.map((criterion) => makeEvidence("Structured worker diff review", criterion.id, passed, JSON.stringify(review), true, passed ? 0 : 1, 0, { workspaceRevision: testedRevision, testedRevision, source: "review" })) };
     },
     deliver: async (task, context) => {
       if (task.deliveryIntent === "leave_worktree") return { ok: true, summary: "Changes left in the managed worktree." };
@@ -534,6 +635,7 @@ export async function submitAutonomousTaskToDaemon(task: AutonomousTask): Promis
           guidance: task.guidance.map((item) => ({ guidance_id: item.guidanceId, text: item.text, applies_to: item.appliesTo })),
           delivery_intent: task.deliveryIntent ?? "leave_worktree",
           execution_owner: { kind: daemonOwner.kind, instance_id: daemonOwner.instanceId, lease_epoch: daemonOwner.leaseEpoch, lease_expires_at_ms: daemonOwner.leaseExpiresAtMs },
+          previous_execution_owner: { kind: task.executionOwner.kind, instance_id: task.executionOwner.instanceId, lease_epoch: task.executionOwner.leaseEpoch, lease_expires_at_ms: task.executionOwner.leaseExpiresAtMs },
           task_snapshot: { ...structuredClone(task), executionOwner: daemonOwner, updatedAtMs: Date.now() },
           completed_nodes: task.plan?.nodes.filter((node) => node.status === "succeeded").map((node) => node.nodeId) ?? [],
           next_node_id: task.plan?.nodes.find((node) => ["running", "waiting_approval", "ready", "pending", "waiting_user"].includes(node.status))?.nodeId ?? "plan",
@@ -564,7 +666,7 @@ export async function startAutonomousTask(params: StartAutonomousTaskParams): Pr
   const signal = mergeSignals(control.signal, params.signal);
   const recorder = await beginDurableRun({ runId: task.taskId, kind: "autonomous_task", task: task.objective, instructions: "Universal autonomous task coordinator", target: targetSnapshot, roots, permissionMode: permission.mode, allowNetwork: false, allowExternalMutations: false, budgets: runBudgets, workspaceAccess: "read_write" });
   const eventSink: AutonomousTaskEventSink = async (event) => { if (recorder) await appendRunEvent(task.taskId, taskEventToRunEvent(event)); };
-  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget), signal, eventSink, onUpdate: params.onUpdate, control }).then(async (result) => {
+  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control }).then(async (result) => {
     await finishAutonomousRun(recorder, result); return result;
   });
   void completion.catch(async (error) => { await recorder?.fail(error); });
@@ -578,7 +680,7 @@ export async function resumeAutonomousTask(params: ResumeAutonomousTaskParams): 
   const task = { ...params.task, outcome: "RUNNING" as const, repairRounds: ["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "WAITING_USER"].includes(params.task.outcome) ? 0 : params.task.repairRounds, plan: params.task.plan ? { ...params.task.plan, nodes: params.task.plan.nodes.map((node) => node.status === "running" || node.status === "failed" || node.status === "blocked" || (params.task.waitingApproval && node.nodeId === params.task.waitingApproval.nodeId) ? { ...node, status: "pending" as const, workerId: null } : node) } : null, waitingReason: null, waitingApproval: null, updatedAtMs: Date.now() };
   const recorder = await attachDurableRun({ runId: task.taskId, roots: task.workspaceRoots });
   const eventSink: AutonomousTaskEventSink = async (event) => { if (recorder) await appendRunEvent(task.taskId, taskEventToRunEvent(event)); };
-  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget), signal, eventSink, onUpdate: params.onUpdate, control, approval: params.approval }).then(async (result) => { await finishAutonomousRun(recorder, result); return result; });
+  const completion = runAutonomousTask({ task, resolvedTarget, runtime: params.runtime ?? defaultAutonomousTaskRuntime(resolvedTarget, defaultAutonomousTaskPlacementAdapters()), signal, eventSink, onUpdate: params.onUpdate, control, approval: params.approval }).then(async (result) => { await finishAutonomousRun(recorder, result); return result; });
   void completion.catch(async (error) => { await recorder?.fail(error); });
   return { task, runId: task.taskId, control, completion };
 }
