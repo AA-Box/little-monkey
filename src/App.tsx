@@ -38,6 +38,7 @@ import { usePermissionStore } from "./store/permissionStore";
 import { useShortcutStore } from "./store/shortcutStore";
 import { useRecipeStore, subscribeToRecipeChanges } from "./store/recipeStore";
 import { subscribeToLocalAppsChanges, subscribeToLocalAppRunRequests } from "./store/localAppsStore";
+import { subscribeToNativeSkillChanges } from "./store/nativeSkillsStore";
 import { hydrateAutomations } from "./store/automationsStore";
 import { useOnboardingStore } from "./store/onboardingStore";
 import { startScheduler } from "./lib/scheduler";
@@ -818,6 +819,10 @@ function App() {
     void refreshRecipes();
     void subscribeToRecipeChanges();
   }, [refreshRecipes]);
+
+  useEffect(() => {
+    void subscribeToNativeSkillChanges();
+  }, []);
 
   // The scheduler tick loop (design doc slice 3) must run in exactly one
   // place — every window shares the same `automations.json`/recipes, so

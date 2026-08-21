@@ -976,6 +976,11 @@ pub fn run() {
             artifacts::handle_request(ctx.app_handle().state::<AppState>().inner(), &request)
         })
         .setup(|app| {
+            // Keep the native-skill registry live for external edits and
+            // cross-window updates. Workspace restoration below triggers a
+            // second sync once the primary root is known.
+            native_skill_commands::sync_native_skill_watchers(app.handle());
+
             // Listens for `littlemonkey://` deep links (macOS/mobile live
             // events; Windows/Linux fresh-launch CLI-arg parsing — a
             // still-running instance on those platforms is covered by the
@@ -1624,6 +1629,10 @@ pub fn run() {
             skill_learning_commands::skill_learning_set_settings,
             skill_learning_commands::skill_learning_reflection_brief,
             skill_learning_commands::skill_learning_learned_skills,
+            skill_learning_commands::skill_learning_quality_summaries,
+            skill_learning_commands::skill_learning_improvement_evidence,
+            skill_learning_commands::skill_learning_run_evidence,
+            skill_learning_commands::skill_learning_begin_improvement,
             skill_learning_commands::skill_learning_effectiveness,
             skill_learning_commands::skill_learning_deprecate,
             skill_learning_commands::skill_learning_discover,

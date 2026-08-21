@@ -6,6 +6,7 @@
 //! reaches exactly the same behaviour through the same store rather than a
 //! parallel implementation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,8 +19,9 @@ use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
-    ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
-    EvaluationCaseReport, EvaluationMode, EvaluationPlan, EvaluationRecord, LearnedSkillSummary,
+    snapshot_skill_resources, ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution,
+    EffectivenessRecord, EvaluationCaseReport, EvaluationEnvironment, EvaluationMode,
+    EvaluationPlan, EvaluationRecord, ImprovementEvidence, ImprovementParent, LearnedSkillSummary,
     LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
     PromotionOutcome, RunEvidence, SkillLearningStore,
 };
@@ -350,26 +352,44 @@ pub async fn skill_learning_create_sandboxes(
                     .to_string(),
             )
         })?;
-        // What the run did decides what has to be put back, and the evidence
-        // is the authority on that — not the checkpoint, which a read-only
-        // turn discards while its `checkpoint_linked` event lives on.
-        let pre_task = match pre_task_source(&environment) {
-            PreTaskSource::NothingToUndo => PreTaskState { files: Vec::new(), complete: true },
-            PreTaskSource::Unreproducible(reason) => return Err(invalid(reason)),
-            PreTaskSource::Checkpoint(checkpoint_id) => {
-                let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, &checkpoint_id)
-                    .map_err(invalid)?;
-                PreTaskState {
-                    files: state
-                        .files
-                        .into_iter()
-                        .map(|file| PreTaskFile { path: file.path, contents: file.contents })
-                        .collect(),
-                    complete: !state.shell_ran,
+        // What each run did decides what has to be put back, and its own
+        // evidence is the authority on that. Multi-run improvements therefore
+        // get one checkpoint per case instead of reusing the first selection.
+        let mut pre_tasks = BTreeMap::new();
+        for arm in &arms {
+            let evidence = evidence_for_arm(&environment, arm);
+            let arm_environment = EvaluationEnvironment {
+                workspace: environment.workspace.clone(),
+                checkpoint_id: evidence.and_then(|entry| entry.checkpoint_id.clone()),
+                requires_pre_task_state: evidence
+                    .is_some_and(RunEvidence::mutated_the_workspace),
+                used_shell: evidence.is_some_and(RunEvidence::used_shell),
+                evidence_runs: evidence.cloned().into_iter().collect(),
+            };
+            let pre_task = match pre_task_source(&arm_environment) {
+                PreTaskSource::NothingToUndo => PreTaskState { files: Vec::new(), complete: true },
+                PreTaskSource::Unreproducible(reason) => return Err(invalid(reason)),
+                PreTaskSource::Checkpoint(checkpoint_id) => {
+                    let state = crate::checkpoints::pre_turn_state(&checkpoints_dir, &checkpoint_id)
+                        .map_err(invalid)?;
+                    PreTaskState {
+                        files: state
+                            .files
+                            .into_iter()
+                            .map(|file| PreTaskFile { path: file.path, contents: file.contents })
+                            .collect(),
+                        complete: !state.shell_ran,
+                    }
                 }
-            }
-        };
-        let created = store.create_eval_sandboxes(&evaluation_id, &source, &arms, &pre_task)?;
+            };
+            pre_tasks.insert(arm.clone(), pre_task);
+        }
+        let created = store.create_eval_sandboxes_with_pre_tasks(
+            &evaluation_id,
+            &source,
+            &arms,
+            &pre_tasks,
+        )?;
         Ok(created
             .into_iter()
             .map(|(arm, path)| EvaluationSandbox {
@@ -379,6 +399,56 @@ pub async fn skill_learning_create_sandboxes(
             .collect::<Vec<_>>())
     })
     .await
+}
+
+fn evidence_for_arm<'a>(
+    environment: &'a EvaluationEnvironment,
+    arm: &str,
+) -> Option<&'a RunEvidence> {
+    let case_id = arm
+        .strip_prefix("baseline-")
+        .or_else(|| arm.strip_prefix("candidate-"))
+        .or_else(|| arm.strip_prefix("starting-state-"))
+        .unwrap_or(arm);
+    if let Some(index) = case_id
+        .strip_prefix("improvement-")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return environment.evidence_runs.get(index.saturating_sub(1));
+    }
+    environment.evidence_runs.first()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_for_arm;
+    use crate::skill_learning::{EvaluationEnvironment, RunEvidence};
+
+    #[test]
+    fn starting_state_improvement_arm_uses_its_matching_evidence() {
+        let environment = EvaluationEnvironment {
+            workspace: None,
+            checkpoint_id: None,
+            requires_pre_task_state: true,
+            used_shell: false,
+            evidence_runs: vec![
+                RunEvidence {
+                    run_id: "run-1".to_string(),
+                    ..RunEvidence::default()
+                },
+                RunEvidence {
+                    run_id: "run-2".to_string(),
+                    ..RunEvidence::default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            evidence_for_arm(&environment, "starting-state-improvement-2")
+                .map(|evidence| evidence.run_id.as_str()),
+            Some("run-2")
+        );
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -676,6 +746,163 @@ pub async fn skill_learning_learned_skills(
     let manager = native.manager.clone();
     let store = learning.store.clone();
     run_blocking(move || store.learned_skills(&manager, workspace.as_deref(), &packages)).await
+}
+
+fn improvement_parent(
+    store: &SkillLearningStore,
+    manager: &crate::native_skills::NativeSkillManager,
+    packages: &[ExternalSignedSkill],
+    workspace: Option<&Path>,
+    scope: SkillScope,
+    command: &str,
+) -> Result<ImprovementParent, crate::native_skills::SkillError> {
+    let mut matching = manager
+        .discover(workspace, packages)
+        .map_err(|error| crate::native_skills::SkillError::Conflict(error.to_string()))?
+        .into_iter()
+        .filter(|entry| {
+            entry.command == command
+                && crate::skill_learning::descriptor_scope(entry) == Some(scope)
+        })
+        .collect::<Vec<_>>();
+    // A disabled managed skill and an external fallback may legitimately have
+    // the same command. Improve must still target the managed learned bytes,
+    // never whichever descriptor happened to sort first.
+    matching.sort_by_key(|entry| !entry.managed);
+    let descriptor = matching.into_iter().next().ok_or_else(|| {
+        crate::native_skills::SkillError::NotFound(format!("active /{command} skill was not found"))
+    })?;
+    if !descriptor.managed {
+        return Err(crate::native_skills::SkillError::Conflict(
+            "Improve skill is available only for managed learned skills".to_string(),
+        ));
+    }
+    if !store
+        .is_learned_version(&descriptor.sha256)
+        .map_err(|error| crate::native_skills::SkillError::Conflict(error.to_string()))?
+    {
+        return Err(crate::native_skills::SkillError::Conflict(format!(
+            "/{command} is not an active learned skill"
+        )));
+    }
+    let resource_files = snapshot_skill_resources(manager, &descriptor, workspace)?;
+    Ok(ImprovementParent {
+        command: descriptor.command,
+        scope,
+        sha256: descriptor.sha256,
+        title: descriptor.name,
+        version: descriptor.version,
+        instructions: descriptor.instructions,
+        allowed_tools: descriptor.allowed_tools,
+        requirements: crate::skill_learning::CandidateRequirements {
+            bins: descriptor.requirements.bins,
+            env: descriptor.requirements.env,
+        },
+        resource_files,
+    })
+}
+
+#[tauri::command]
+pub async fn skill_learning_quality_summaries(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+) -> Result<Vec<LearnedSkillSummary>, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || store.learned_skills(&manager, workspace.as_deref(), &packages)).await
+}
+
+#[tauri::command]
+pub async fn skill_learning_improvement_evidence(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+) -> Result<Vec<ImprovementEvidence>, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store
+            .improvement_evidence(scope, &parent.command, &parent.sha256)
+            .map_err(|error| error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_learning_run_evidence(
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+    run_id: String,
+) -> Result<RunEvidence, String> {
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store.run_evidence(scope, &parent.command, &parent.sha256, &run_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn skill_learning_begin_improvement(
+    window: tauri::Window,
+    state: tauri::State<'_, AppState>,
+    native: tauri::State<'_, NativeSkillsCommandState>,
+    m4: tauri::State<'_, M4CommandState>,
+    learning: tauri::State<'_, SkillLearningCommandState>,
+    scope: SkillScope,
+    command: String,
+    selected_run_ids: Vec<String>,
+) -> Result<LearningCandidate, String> {
+    require_main_window(&window)?;
+    let workspace = optional_primary_workspace(&state)?;
+    let packages = signed_package_skills(&m4)?;
+    let manager = native.manager.clone();
+    let store = learning.store.clone();
+    run_blocking(move || {
+        let parent = improvement_parent(
+            &store,
+            &manager,
+            &packages,
+            workspace.as_deref(),
+            scope,
+            command.trim_start_matches('/'),
+        )?;
+        store
+            .begin_improvement(&parent, &selected_run_ids)
+            .map_err(|error| error)
+    })
+    .await
 }
 
 #[tauri::command]

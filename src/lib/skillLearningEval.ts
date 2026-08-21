@@ -18,6 +18,7 @@
 import { runSandboxVerification } from "./agentLoop";
 import { runHeadlessAgent, type HeadlessAgentResult } from "./headlessAgentRunner";
 import { composeSkillSystemPrompt, type SlashSkill } from "./skills";
+import type { SkillToolContext } from "./turnEngine";
 import {
   skillLearningClient,
   type EvaluationCase,
@@ -60,7 +61,39 @@ function stagedSkill(plan: EvaluationPlan): SlashSkill {
     contentSha256: plan.candidate_sha256,
     permissions: [],
     allowedTools: plan.allowed_tools,
-    resourceFiles: [],
+    resourceFiles: (plan.candidate_resource_files ?? []).map((resource) => resource.path),
+  };
+}
+
+function baselineSkill(plan: EvaluationPlan): SlashSkill | null {
+  if (!plan.baseline_skill_instructions || !plan.baseline_sha256) return null;
+  return {
+    id: `native:baseline:${plan.command}:${plan.baseline_sha256}`,
+    source: "native",
+    command: plan.command,
+    name: plan.title || plan.command,
+    description: "",
+    instructions: plan.baseline_skill_instructions,
+    version: "baseline",
+    contentSha256: plan.baseline_sha256,
+    permissions: [],
+    allowedTools: plan.baseline_allowed_tools,
+    resourceFiles: (plan.baseline_resource_files ?? []).map((resource) => resource.path),
+  };
+}
+
+function evaluationSkillContext(
+  skill: SlashSkill,
+  resources: Array<{ path: string; content: string }>,
+): SkillToolContext {
+  return {
+    availableSkills: [skill],
+    invokedCommands: new Set([skill.command]),
+    explicitCommands: new Set([skill.command]),
+    maxSkillsPerTurn: 1,
+    resourceSnapshots: new Map([
+      [skill.command, new Map(resources.map((resource) => [resource.path, resource.content]))],
+    ]),
   };
 }
 
@@ -72,6 +105,10 @@ function sandboxArm(arm: Arm, testCase: EvaluationCase): string {
  * is actually the task. Its own sandbox so the check cannot leave anything
  * behind in an arm's. */
 const STARTING_STATE_ARM = "starting-state";
+
+function startingStateArm(testCase: EvaluationCase): string {
+  return testCase.case_id === "positive" ? STARTING_STATE_ARM : `starting-state-${testCase.case_id}`;
+}
 
 function unevaluatedReport(testCase: EvaluationCase, arm: Arm, error: string): EvaluationCaseReport {
   return {
@@ -98,12 +135,17 @@ async function runArm(
   signal: AbortSignal,
 ): Promise<EvaluationCaseReport> {
   const runId = `${plan.evaluation_id}-${arm}-${testCase.case_id}`;
+  const skill = arm === "candidate" ? stagedSkill(plan) : baselineSkill(plan);
   const systemPrompt =
-    arm === "candidate"
-      ? composeSkillSystemPrompt(BASE_PROMPT, [
-          { skill: stagedSkill(plan), arguments: testCase.prompt, activation: "explicit" },
-        ])
-      : BASE_PROMPT;
+    skill
+      ? composeSkillSystemPrompt(BASE_PROMPT, [{ skill, arguments: testCase.prompt, activation: "explicit" }])
+        : BASE_PROMPT;
+  const skillContext = skill
+    ? evaluationSkillContext(
+        skill,
+        arm === "candidate" ? plan.candidate_resource_files ?? [] : plan.baseline_resource_files ?? [],
+      )
+    : undefined;
   const startedAt = Date.now();
   let result: HeadlessAgentResult;
   try {
@@ -116,11 +158,17 @@ async function runArm(
       toolProfile: "code",
       executionSource: "skill-learning-evaluation",
       workspaceRootOverride: sandboxPath,
+      skill: skillContext,
       // The candidate arm runs under exactly the tool restriction the skill
       // will carry once installed, so it cannot pass an evaluation using a
       // tool it will not have afterwards. The baseline has no skill and so
       // keeps the profile's own list, which is what a normal turn has.
-      allowedTools: arm === "candidate" ? plan.allowed_tools : undefined,
+      allowedTools:
+        arm === "candidate"
+          ? plan.allowed_tools
+          : plan.baseline_skill_instructions
+            ? plan.baseline_allowed_tools ?? []
+            : undefined,
       durableRun: {
         task: `Learning evaluation ${arm}: ${testCase.name}`,
         instructions: `Candidate /${plan.command} (${plan.evaluation_id})`,
@@ -183,12 +231,15 @@ export async function runCandidateEvaluation(
   // Only where success is a change of state. A read-only procedure was never
   // supposed to alter anything, so a workspace that already passes its own
   // verification is its normal condition — not evidence of a pre-solved task.
-  const selfChecking = plan.observed_mutation
-    ? plan.cases.find((testCase) => testCase.kind === "positive" && testCase.verification_required)
-    : undefined;
+  const selfCheckingCases = plan.cases.filter(
+    (testCase) =>
+      testCase.kind === "positive" &&
+      testCase.verification_required &&
+      (testCase.observed_mutation ?? plan.observed_mutation),
+  );
   const arms = [
     ...plan.cases.flatMap((testCase) => ARMS.map((arm) => sandboxArm(arm, testCase))),
-    ...(selfChecking ? [STARTING_STATE_ARM] : []),
+    ...selfCheckingCases.map(startingStateArm),
   ];
   let sandboxes: Awaited<ReturnType<typeof client.createSandboxes>>;
   try {
@@ -205,12 +256,12 @@ export async function runCandidateEvaluation(
     // starting state already satisfies the verification, the positive case is
     // a solved problem and an arm "passing" it proves nothing — whatever the
     // reason the state survived.
-    if (selfChecking) {
-      const startingState = pathFor.get(STARTING_STATE_ARM);
+    for (const testCase of selfCheckingCases) {
+      const startingState = pathFor.get(startingStateArm(testCase));
       const already = startingState
         ? await runSandboxVerification(
             startingState,
-            `${plan.evaluation_id}-starting-state`,
+            `${plan.evaluation_id}-${startingStateArm(testCase)}`,
             signal,
             plan.workspace_path ?? undefined,
           ).catch(() => null)
@@ -218,7 +269,7 @@ export async function runCandidateEvaluation(
       if (already?.passed) {
         return await client.markUnevaluated(
           plan.evaluation_id,
-          "the rebuilt starting state already passes this workspace's verification, so reproducing the observed task there would prove nothing",
+          `the rebuilt starting state already passes ${testCase.name}, so reproducing the observed task there would prove nothing`,
         );
       }
     }
