@@ -549,9 +549,10 @@ impl DesktopControlRuntime {
         self.require_owned_session(device_id, &request.session_id)?;
         let gate = self
             .state
-            .begin_action(
+            .begin_action_for_target(
                 &request.session_id,
                 &request.target_application_id,
+                request.target_window_id.as_deref(),
                 request.action.clone(),
             )
             .map_err(|error| (409, error))?;
@@ -892,6 +893,7 @@ fn describe_action(action: &ControlAction) -> String {
         ControlAction::MouseMove { x, y } => format!("move the mouse to ({x}, {y})"),
         ControlAction::MouseClick { button } => format!("a {button:?} mouse click"),
         ControlAction::KeyPress { key } => format!("press the '{key}' key"),
+        other => format!("perform a {:?} desktop action", other),
     }
 }
 
@@ -1007,6 +1009,7 @@ mod tests {
         DesktopControlActionRequest {
             session_id: String::new(),
             target_application_id: "Notes".into(),
+            target_window_id: None,
             action: ControlAction::MouseMove { x: 1, y: 2 },
         }
     }
@@ -1114,11 +1117,17 @@ mod tests {
         let session = ControlSession {
             session_id: "desktop-control-test-1".into(),
             allowed_applications: vec!["Notes".into()],
+            allowed_windows: Vec::new(),
             created_at_ms: 1_000,
             expires_at_ms: 61_000,
             active: true,
+            paused: false,
             indicator_visible: true,
             approved_batch: false,
+            approval_policy: little_monkey_lib::desktop_control::ApprovalPolicy::PerAction,
+            allow_screenshots: true,
+            allow_keyboard_input: true,
+            allow_clipboard_read: false,
         };
         let spec = run_spec(&session);
         assert_eq!(spec.kind, RunKind::RemoteDesktopControl);
@@ -1135,6 +1144,7 @@ mod tests {
         let mut request = DesktopControlActionRequest {
             session_id,
             target_application_id: "Notes".into(),
+            target_window_id: None,
             action: ControlAction::MouseClick {
                 button: MouseButtonKind::Left,
             },

@@ -1,12 +1,9 @@
-//! Safe Desktop Control — a design-validation research spike (ROADMAP.md
-//! Phase 5, "Trust, Sandboxing, and PC Control" → "Safe Desktop Control",
-//! Status: Research). Full threat model and non-goals:
-//! `docs/safe-desktop-control-design.md`. Read that first.
+//! Safe Desktop Control — the production-gated native Computer Use substrate.
+//! Full threat model, platform boundaries, and recovery behavior:
+//! `docs/computer-use.md` and `docs/safe-desktop-control-design.md`.
 //!
-//! This is real, working, and gated, not a mock — but it is intentionally
-//! narrow: nothing here is offered to the model as an agent tool (unlike
-//! `tools.rs`'s `TOOLS`), it is reachable only from a human explicitly
-//! opening the Settings panel, exactly like `m7_companion`'s capture grants.
+//! All model-facing actions still require a human-created session grant with
+//! explicit scope, capability flags, bounded lifetime, and approval policy.
 //!
 //! Shape, deliberately mirrored from two existing modules rather than
 //! invented fresh:
@@ -50,11 +47,13 @@
 //! themselves are kept to a bare `enigo` call. See each block's own note.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use tokio::sync::oneshot;
@@ -87,6 +86,80 @@ pub enum MouseButtonKind {
     Middle,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    PerAction,
+    ApprovedBatch,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerTarget {
+    pub target_id: String,
+    pub application_id: String,
+    pub application_name: String,
+    pub window_id: String,
+    pub window_title: String,
+    pub bounds: ComputerBounds,
+    pub focused: bool,
+    pub sensitive: bool,
+    pub supported_actions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerElement {
+    pub id: String,
+    pub role: String,
+    pub label: String,
+    pub value: Option<String>,
+    pub bounds: ComputerBounds,
+    pub enabled: bool,
+    pub focused: bool,
+    pub actions: Vec<String>,
+    pub sensitive: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerInspection {
+    pub target: ComputerTarget,
+    pub elements: Vec<ComputerElement>,
+    pub truncated: bool,
+    pub query: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerScreenshot {
+    pub artifact_id: String,
+    pub audit_id: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub content_base64: String,
+    pub bounds: ComputerBounds,
+    pub target: ComputerTarget,
+}
+
 /// A single input action a control session may request. Internally tagged
 /// (`kind`) so the frontend's discriminated union matches this shape
 /// exactly, and so a future variant can carry its own fields without a
@@ -94,9 +167,65 @@ pub enum MouseButtonKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ControlAction {
-    MouseMove { x: i32, y: i32 },
-    MouseClick { button: MouseButtonKind },
-    KeyPress { key: String },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
+    MouseClick {
+        button: MouseButtonKind,
+    },
+    MouseClickAt {
+        x: i32,
+        y: i32,
+        button: MouseButtonKind,
+    },
+    MouseDoubleClick {
+        button: MouseButtonKind,
+    },
+    MouseDoubleClickAt {
+        x: i32,
+        y: i32,
+        button: MouseButtonKind,
+    },
+    MouseDrag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+    },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
+    TypeText {
+        text: String,
+    },
+    KeyPress {
+        key: String,
+    },
+    Hotkey {
+        keys: Vec<String>,
+    },
+    Focus,
+    SemanticClick {
+        element_id: String,
+        button: MouseButtonKind,
+    },
+    SemanticDoubleClick {
+        element_id: String,
+        button: MouseButtonKind,
+    },
+    Select {
+        element_id: String,
+        value: String,
+    },
+    SetValue {
+        element_id: String,
+        value: String,
+    },
+    Wait {
+        milliseconds: u64,
+    },
 }
 
 /// Seam between session/gating logic and the real OS. Every method takes
@@ -109,6 +238,42 @@ pub trait DesktopInputBackend: Send + Sync {
     fn move_mouse(&self, x: i32, y: i32) -> Result<(), String>;
     fn click(&self, button: MouseButtonKind) -> Result<(), String>;
     fn key_press(&self, key: &str) -> Result<(), String>;
+
+    fn double_click(&self, button: MouseButtonKind) -> Result<(), String> {
+        self.click(button)?;
+        self.click(button)
+    }
+
+    fn drag(&self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
+        self.move_mouse(from_x, from_y)?;
+        self.click(MouseButtonKind::Left)?;
+        self.move_mouse(to_x, to_y)?;
+        self.click(MouseButtonKind::Left)
+    }
+
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
+        if delta_x != 0 {
+            self.key_press(&format!("scroll_x:{delta_x}"))?;
+        }
+        if delta_y != 0 {
+            self.key_press(&format!("scroll_y:{delta_y}"))?;
+        }
+        Ok(())
+    }
+
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        for character in text.chars() {
+            self.key_press(&character.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn hotkey(&self, keys: &[String]) -> Result<(), String> {
+        for key in keys {
+            self.key_press(key)?;
+        }
+        Ok(())
+    }
 }
 
 /// Test double: every action always succeeds and touches nothing on the
@@ -145,6 +310,124 @@ impl DesktopInputBackend for UnsupportedBackend {
     }
     fn key_press(&self, _key: &str) -> Result<(), String> {
         Err(self.0.clone())
+    }
+}
+
+/// Semantic accessibility seam. The model never receives an unbounded raw OS
+/// handle: adapters return this normalized, bounded representation and every
+/// mutating operation re-resolves the target immediately before execution.
+pub trait DesktopSemanticBackend: Send + Sync {
+    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String>;
+    fn inspect(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<ComputerInspection, String>;
+    fn verify_target(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        require_frontmost: bool,
+    ) -> Result<ComputerTarget, String>;
+    fn focus(&self, target: &ComputerTarget) -> Result<(), String>;
+    fn click_element(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        button: MouseButtonKind,
+        double: bool,
+    ) -> Result<(), String>;
+    fn set_value(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        value: &str,
+        select: bool,
+    ) -> Result<(), String>;
+    fn screenshot(
+        &self,
+        target: &ComputerTarget,
+        bounds: Option<ComputerBounds>,
+    ) -> Result<(Vec<u8>, ComputerBounds), String>;
+}
+
+#[derive(Default)]
+pub struct NullSemanticBackend;
+
+impl DesktopSemanticBackend for NullSemanticBackend {
+    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
+        Ok(Vec::new())
+    }
+
+    fn inspect(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<ComputerInspection, String> {
+        let target = self.verify_target(application_id, window_id, false)?;
+        Ok(ComputerInspection {
+            target,
+            elements: Vec::new(),
+            truncated: false,
+            query: query.map(str::to_string),
+        })
+    }
+
+    fn verify_target(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        _require_frontmost: bool,
+    ) -> Result<ComputerTarget, String> {
+        Ok(ComputerTarget {
+            target_id: format!("{application_id}::{}", window_id.unwrap_or("window")),
+            application_id: application_id.to_string(),
+            application_name: application_id.to_string(),
+            window_id: window_id.unwrap_or("window").to_string(),
+            window_title: application_id.to_string(),
+            bounds: ComputerBounds::default(),
+            focused: true,
+            sensitive: false,
+            supported_actions: vec![
+                "inspect".to_string(),
+                "focus".to_string(),
+                "click".to_string(),
+            ],
+        })
+    }
+
+    fn focus(&self, _target: &ComputerTarget) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn click_element(
+        &self,
+        _target: &ComputerTarget,
+        _element_id: &str,
+        _button: MouseButtonKind,
+        _double: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_value(
+        &self,
+        _target: &ComputerTarget,
+        _element_id: &str,
+        _value: &str,
+        _select: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn screenshot(
+        &self,
+        target: &ComputerTarget,
+        bounds: Option<ComputerBounds>,
+    ) -> Result<(Vec<u8>, ComputerBounds), String> {
+        Ok((Vec::new(), bounds.unwrap_or_else(|| target.bounds.clone())))
     }
 }
 
@@ -191,6 +474,81 @@ impl DesktopInputBackend for EnigoBackend {
             .key(parsed, Direction::Click)
             .map_err(|error| error.to_string())
     }
+
+    fn double_click(&self, button: MouseButtonKind) -> Result<(), String> {
+        self.click(button)?;
+        self.click(button)
+    }
+
+    fn drag(&self, from_x: i32, from_y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
+        use enigo::{Button, Coordinate, Direction, Mouse};
+        let button = Button::Left;
+        let mut engine = self
+            .0
+            .lock()
+            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
+        engine
+            .move_mouse(from_x, from_y, Coordinate::Abs)
+            .map_err(|error| error.to_string())?;
+        engine
+            .button(button, Direction::Press)
+            .map_err(|error| error.to_string())?;
+        engine
+            .move_mouse(to_x, to_y, Coordinate::Abs)
+            .map_err(|error| error.to_string())?;
+        engine
+            .button(button, Direction::Release)
+            .map_err(|error| error.to_string())
+    }
+
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), String> {
+        use enigo::{Axis, Mouse};
+        let mut engine = self
+            .0
+            .lock()
+            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
+        if delta_y != 0 {
+            engine
+                .scroll(delta_y, Axis::Vertical)
+                .map_err(|error| error.to_string())?;
+        }
+        if delta_x != 0 {
+            engine
+                .scroll(delta_x, Axis::Horizontal)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn type_text(&self, text: &str) -> Result<(), String> {
+        use enigo::Keyboard;
+        self.0
+            .lock()
+            .map_err(|_| "desktop input backend lock is poisoned".to_string())?
+            .text(text)
+            .map_err(|error| error.to_string())
+    }
+
+    fn hotkey(&self, keys: &[String]) -> Result<(), String> {
+        use enigo::{Direction, Keyboard};
+        let parsed: Result<Vec<_>, _> = keys.iter().map(|key| parse_key(key)).collect();
+        let parsed = parsed?;
+        let mut engine = self
+            .0
+            .lock()
+            .map_err(|_| "desktop input backend lock is poisoned".to_string())?;
+        for key in &parsed {
+            engine
+                .key(*key, Direction::Press)
+                .map_err(|error| error.to_string())?;
+        }
+        for key in parsed.iter().rev() {
+            engine
+                .key(*key, Direction::Release)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 /// A single Unicode character is sent as itself; a small set of named keys
@@ -212,6 +570,10 @@ fn parse_key(key: &str) -> Result<enigo::Key, String> {
         "space" => Key::Space,
         "escape" | "esc" => Key::Escape,
         "backspace" => Key::Backspace,
+        "ctrl" | "control" => Key::Control,
+        "alt" | "option" => Key::Alt,
+        "shift" => Key::Shift,
+        "cmd" | "command" | "meta" | "super" | "windows" | "win" => Key::Meta,
         "delete" => Key::Delete,
         "up" => Key::UpArrow,
         "down" => Key::DownArrow,
@@ -319,6 +681,614 @@ fn backend_init_error_message(error: &str) -> String {
     format!("Could not initialize desktop input simulation — {hint}: {error}")
 }
 
+const MAX_NATIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TARGETS: usize = 64;
+const MAX_ELEMENTS: usize = 256;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const WAYLAND_PORTAL_MESSAGE: &str =
+    "Wayland requires an approved xdg-desktop-portal RemoteDesktop/InputCapture/libei path; \
+     Little Monkey will not bypass compositor security";
+
+#[derive(Default, Deserialize)]
+struct NativeSnapshot {
+    #[serde(default)]
+    targets: Vec<ComputerTarget>,
+    #[serde(default)]
+    elements: HashMap<String, Vec<ComputerElement>>,
+}
+
+struct NativeSemanticBackend {
+    input: Arc<dyn DesktopInputBackend>,
+}
+
+fn production_semantic_backend(
+    input: Arc<dyn DesktopInputBackend>,
+) -> Arc<dyn DesktopSemanticBackend> {
+    Arc::new(NativeSemanticBackend { input })
+}
+
+fn run_native_command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not start accessibility provider {program}: {error}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Accessibility provider {program} did not expose stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Accessibility provider {program} did not expose stderr"))?;
+    let stderr_reader = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut captured = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = stderr.read(&mut chunk).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            let remaining = 64 * 1024 - captured.len();
+            if remaining > 0 {
+                captured.extend_from_slice(&chunk[..count.min(remaining)]);
+            }
+        }
+        Ok::<Vec<u8>, String>(captured)
+    });
+
+    let mut stdout_bytes = Vec::new();
+    let mut chunk = [0_u8; 16 * 1024];
+    let mut oversized = false;
+    loop {
+        let count = match stdout.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!(
+                    "Could not read accessibility provider output: {error}"
+                ));
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        if stdout_bytes.len().saturating_add(count) > MAX_NATIVE_OUTPUT_BYTES {
+            oversized = true;
+            break;
+        }
+        stdout_bytes.extend_from_slice(&chunk[..count]);
+    }
+
+    if oversized {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(
+            "Accessibility provider returned more than the bounded output limit".to_string(),
+        );
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Could not wait for accessibility provider {program}: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| format!("Accessibility provider {program} error reader panicked"))?
+        .map_err(|error| format!("Could not read accessibility provider error output: {error}"))?;
+    if !status.success() {
+        let error = String::from_utf8_lossy(&stderr);
+        return Err(if error.trim().is_empty() {
+            format!("Accessibility provider {program} exited unsuccessfully")
+        } else {
+            format!("Accessibility provider {program} failed: {}", error.trim())
+        });
+    }
+    Ok(stdout_bytes)
+}
+
+fn read_clipboard_native() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let bytes = run_native_command("pbpaste", &[])?;
+    #[cfg(target_os = "windows")]
+    let bytes = run_native_command(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Clipboard -Raw",
+        ],
+    )?;
+    #[cfg(target_os = "linux")]
+    let bytes = {
+        if is_wayland_session_from_env() {
+            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+        }
+        run_native_command("xclip", &["-selection", "clipboard", "-o"])
+            .or_else(|_| run_native_command("xsel", &["--clipboard", "--output"]))?
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    let bytes = return Err("Clipboard access is not implemented on this platform".to_string());
+    if bytes.len() > 64 * 1024 {
+        return Err("Clipboard content exceeds the 64 KiB Computer Use read bound".to_string());
+    }
+    String::from_utf8(bytes).map_err(|_| "Clipboard content is not valid UTF-8".to_string())
+}
+
+fn native_snapshot() -> Result<NativeSnapshot, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = run_native_command("osascript", &["-l", "JavaScript", "-e", MACOS_AX_SCRIPT])?;
+        return serde_json::from_slice(&bytes)
+            .map_err(|error| format!("macOS Accessibility returned invalid data: {error}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = run_native_command(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_UIA_SCRIPT,
+            ],
+        )?;
+        return serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Windows UI Automation returned invalid data: {error}"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if is_wayland_session_from_env() {
+            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+        }
+        let bytes = run_native_command("python3", &["-c", LINUX_ATSPI_SCRIPT])?;
+        return serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Linux AT-SPI returned invalid data: {error}"));
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err("Semantic accessibility is not implemented on this platform".to_string())
+    }
+}
+
+fn target_is_sensitive(target: &ComputerTarget) -> bool {
+    target.sensitive
+        || sensitive_text(&format!(
+            "{} {} {} {}",
+            target.application_id, target.application_name, target.window_id, target.window_title
+        ))
+}
+
+fn sensitive_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    [
+        "1password",
+        "lastpass",
+        "bitwarden",
+        "password manager",
+        "keychain",
+        "securityagent",
+        "system settings",
+        "system preferences",
+        "terminal",
+        "iterm",
+        "powershell",
+        "command prompt",
+        "uac",
+        "sudo",
+        "authentication",
+        "auth dialog",
+        "biometric",
+        "loginwindow",
+        "full disk encryption",
+        "filevault",
+        "secure password",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+}
+
+fn target_matches(target: &ComputerTarget, application_id: &str, window_id: Option<&str>) -> bool {
+    let application_match = target.application_id == application_id
+        || target.application_name == application_id
+        || target.target_id == application_id;
+    application_match && window_id.is_none_or(|id| target.window_id == id || target.target_id == id)
+}
+
+fn checked_target(
+    snapshot: NativeSnapshot,
+    application_id: &str,
+    window_id: Option<&str>,
+    require_frontmost: bool,
+) -> Result<ComputerTarget, String> {
+    let target = snapshot
+        .targets
+        .into_iter()
+        .find(|target| target_matches(target, application_id, window_id))
+        .ok_or_else(|| "Target application/window is stale or no longer visible".to_string())?;
+    if target_is_sensitive(&target) {
+        return Err("Sensitive application/window targets are blocked".to_string());
+    }
+    if require_frontmost && !target.focused {
+        return Err("Target is not frontmost; focus it and retry".to_string());
+    }
+    Ok(target)
+}
+
+fn bounded_elements(
+    snapshot: &NativeSnapshot,
+    target: &ComputerTarget,
+    query: Option<&str>,
+) -> (Vec<ComputerElement>, bool) {
+    let query = query.map(str::to_ascii_lowercase);
+    let mut seen = std::collections::HashSet::new();
+    let mut elements = Vec::new();
+    let mut truncated = false;
+    for element in snapshot
+        .elements
+        .get(&target.target_id)
+        .into_iter()
+        .flatten()
+    {
+        if !seen.insert(element.id.clone()) {
+            continue;
+        }
+        if query.as_ref().is_some_and(|needle| {
+            !format!(
+                "{} {} {}",
+                element.role,
+                element.label,
+                element.value.as_deref().unwrap_or_default()
+            )
+            .to_ascii_lowercase()
+            .contains(needle)
+        }) {
+            continue;
+        }
+        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+            continue;
+        }
+        if elements.len() == MAX_ELEMENTS {
+            truncated = true;
+            break;
+        }
+        elements.push(element.clone());
+    }
+    (elements, truncated)
+}
+
+fn element_center(element: &ComputerElement) -> Result<(i32, i32), String> {
+    if element.bounds.width <= 0.0 || element.bounds.height <= 0.0 {
+        return Err("Accessibility element has no actionable bounds".to_string());
+    }
+    Ok((
+        (element.bounds.x + element.bounds.width / 2.0).round() as i32,
+        (element.bounds.y + element.bounds.height / 2.0).round() as i32,
+    ))
+}
+
+fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerElement, String> {
+    let snapshot = native_snapshot()?;
+    let verified = checked_target(
+        snapshot,
+        &target.application_id,
+        Some(&target.window_id),
+        false,
+    )?;
+    let (elements, _) = bounded_elements(&native_snapshot()?, &verified, None);
+    elements
+        .into_iter()
+        .find(|element| element.id == element_id)
+        .ok_or_else(|| {
+            "Accessibility element is stale or outside the bounded inspection".to_string()
+        })
+}
+
+impl DesktopSemanticBackend for NativeSemanticBackend {
+    fn list_targets(&self) -> Result<Vec<ComputerTarget>, String> {
+        let mut targets = native_snapshot()?.targets;
+        targets.retain(|target| !target_is_sensitive(target));
+        targets.truncate(MAX_TARGETS);
+        Ok(targets)
+    }
+
+    fn inspect(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<ComputerInspection, String> {
+        let snapshot = native_snapshot()?;
+        let target = checked_target(snapshot, application_id, window_id, false)?;
+        let snapshot = native_snapshot()?;
+        let (elements, truncated) = bounded_elements(&snapshot, &target, query);
+        Ok(ComputerInspection {
+            target,
+            elements,
+            truncated,
+            query: query.map(str::to_string),
+        })
+    }
+
+    fn verify_target(
+        &self,
+        application_id: &str,
+        window_id: Option<&str>,
+        require_frontmost: bool,
+    ) -> Result<ComputerTarget, String> {
+        checked_target(
+            native_snapshot()?,
+            application_id,
+            window_id,
+            require_frontmost,
+        )
+    }
+
+    fn focus(&self, target: &ComputerTarget) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let status = Command::new("open")
+                .args(["-b", &target.application_id])
+                .status();
+            return status
+                .map_err(|error| format!("Could not focus target: {error}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("Could not focus target".to_string())
+                    }
+                });
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let script = r#"Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class LMWindow { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd); }
+'@; [LMWindow]::SetForegroundWindow([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE)) | Out-Null"#;
+            return Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env("LM_WINDOW_HANDLE", &target.window_id)
+                .status()
+                .map_err(|error| format!("Could not focus target: {error}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("Could not focus target".to_string())
+                    }
+                });
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if is_wayland_session_from_env() {
+                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+            }
+            return Command::new("wmctrl")
+                .args(["-ia", &target.window_id])
+                .status()
+                .map_err(|error| format!("Could not focus X11 target: {error}"))
+                .and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err("Could not focus X11 target".to_string())
+                    }
+                });
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = target;
+            Err("Target focus is not implemented on this platform".to_string())
+        }
+    }
+
+    fn click_element(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        button: MouseButtonKind,
+        double: bool,
+    ) -> Result<(), String> {
+        let element = find_element(target, element_id)?;
+        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+            return Err("Sensitive accessibility elements are blocked".to_string());
+        }
+        let (x, y) = element_center(&element)?;
+        self.input.move_mouse(x, y)?;
+        if double {
+            self.input.double_click(button)
+        } else {
+            self.input.click(button)
+        }
+    }
+
+    fn set_value(
+        &self,
+        target: &ComputerTarget,
+        element_id: &str,
+        value: &str,
+        select: bool,
+    ) -> Result<(), String> {
+        if value.len() > 16 * 1024 || sensitive_text(value) {
+            return Err(
+                "Sensitive or oversized values cannot be sent through Computer Use".to_string(),
+            );
+        }
+        let element = find_element(target, element_id)?;
+        if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
+            return Err("Sensitive accessibility elements are blocked".to_string());
+        }
+        let (x, y) = element_center(&element)?;
+        self.input.move_mouse(x, y)?;
+        self.input.click(MouseButtonKind::Left)?;
+        if select {
+            self.input.hotkey(&["CTRL".to_string(), "A".to_string()])?;
+        }
+        self.input.type_text(value)
+    }
+
+    fn screenshot(
+        &self,
+        target: &ComputerTarget,
+        bounds: Option<ComputerBounds>,
+    ) -> Result<(Vec<u8>, ComputerBounds), String> {
+        let requested = bounds.unwrap_or_else(|| target.bounds.clone());
+        if requested.width <= 0.0 || requested.height <= 0.0 {
+            return Err("Target has no bounded screenshot region".to_string());
+        }
+        if target.bounds.width > 0.0
+            && (requested.x < target.bounds.x
+                || requested.y < target.bounds.y
+                || requested.x + requested.width > target.bounds.x + target.bounds.width
+                || requested.y + requested.height > target.bounds.y + target.bounds.height)
+        {
+            return Err("Screenshot region is outside the verified target bounds".to_string());
+        }
+        let path = std::env::temp_dir().join(format!("little-monkey-shot-{}.png", Uuid::new_v4()));
+        let x = requested.x.round().max(0.0) as i32;
+        let y = requested.y.round().max(0.0) as i32;
+        let width = requested.width.round() as u32;
+        let height = requested.height.round() as u32;
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err("Screenshot region is outside bounded dimensions".to_string());
+        }
+        #[cfg(target_os = "macos")]
+        let result = Command::new("screencapture")
+            .args(["-x", "-R", &format!("{x},{y},{width},{height}")])
+            .arg(&path)
+            .status()
+            .map_err(|error| format!("Could not capture macOS screenshot: {error}"));
+        #[cfg(target_os = "windows")]
+        let result = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_SCREENSHOT_SCRIPT,
+            ])
+            .env("LM_SCREENSHOT_PATH", &path)
+            .env("LM_SCREENSHOT_X", x.to_string())
+            .env("LM_SCREENSHOT_Y", y.to_string())
+            .env("LM_SCREENSHOT_W", width.to_string())
+            .env("LM_SCREENSHOT_H", height.to_string())
+            .status()
+            .map_err(|error| format!("Could not capture Windows screenshot: {error}"));
+        #[cfg(target_os = "linux")]
+        let result = {
+            if is_wayland_session_from_env() {
+                return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+            }
+            let geometry = format!("{x},{y} {width}x{height}");
+            let scrot = Command::new("scrot")
+                .args(["-a", &geometry])
+                .arg(&path)
+                .status();
+            match scrot {
+                Ok(status) if status.success() => Ok(status),
+                _ => Command::new("import")
+                    .args([
+                        "-window",
+                        "root",
+                        "-crop",
+                        &format!("{width}x{height}+{x}+{y}"),
+                    ])
+                    .arg(&path)
+                    .status()
+                    .map_err(|error| format!("Could not capture bounded X11 screenshot: {error}")),
+            }
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let result: Result<std::process::ExitStatus, std::io::Error> =
+            Err(std::io::Error::other("unsupported"));
+        let status = result?;
+        if !status.success() {
+            return Err("Screenshot provider exited unsuccessfully".to_string());
+        }
+        let bytes = std::fs::read(&path)
+            .map_err(|error| format!("Could not read screenshot artifact: {error}"));
+        let _ = std::fs::remove_file(&path);
+        let bytes = bytes?;
+        if bytes.len() > MAX_NATIVE_OUTPUT_BYTES {
+            return Err("Screenshot exceeds bounded artifact size".to_string());
+        }
+        Ok((bytes, requested))
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MACOS_AX_SCRIPT: &str = r#"
+ObjC.import('AppKit');
+const se = Application('System Events');
+const safe = (f, d) => { try { const v = f(); return v === undefined ? d : v; } catch (_) { return d; } };
+const rect = o => { const p = safe(() => o.position(), [0,0]); const s = safe(() => o.size(), [0,0]); return {x:Number(p[0])||0,y:Number(p[1])||0,width:Number(s[0])||0,height:Number(s[1])||0}; };
+const targets = [], elements = {};
+for (const p of safe(() => se.processes(), [])) {
+  if (!safe(() => p.visible(), false)) continue;
+  const name = String(safe(() => p.name(), '')); const app = String(safe(() => p.bundleIdentifier(), name));
+  const front = Boolean(safe(() => p.frontmost(), false)); let wi = 0;
+  for (const w of safe(() => p.windows(), [])) {
+    if (wi >= 32) break;
+    const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
+    const out=[]; let ei=0;
+    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const eb=rect(e); out.push({id:id+'::element-'+(ei-1),role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/password|secure|auth|credential/i.test(role+' '+label)}); }
+    elements[id]=out; wi++;
+  }
+}
+JSON.stringify({targets,elements});
+"#;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_UIA_SCRIPT: &str = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root=[System.Windows.Automation.AutomationElement]::RootElement
+$targets=@();$elements=@{}
+$windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
+for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=$false;supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$list+=[ordered]@{id="$targetId::element-$j";role=$role;label=$label;value=$null;bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=@('click','double_click','set_value','select');sensitive=($role -match 'Edit' -and $label -match 'password|credential|secret')};}$elements[$targetId]=$list}
+[ordered]@{targets=$targets;elements=$elements}|ConvertTo-Json -Compress -Depth 8
+"#;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_SCREENSHOT_SCRIPT: &str = r#"
+Add-Type -AssemblyName System.Drawing
+Add-Type @'
+using System; using System.Drawing; using System.Drawing.Imaging; using System.Windows.Forms;
+'@
+$x=[int]$env:LM_SCREENSHOT_X;$y=[int]$env:LM_SCREENSHOT_Y;$w=[int]$env:LM_SCREENSHOT_W;$h=[int]$env:LM_SCREENSHOT_H
+$bmp=New-Object Drawing.Bitmap $w,$h;$g=[Drawing.Graphics]::FromImage($bmp);$g.CopyFromScreen($x,$y,0,0,$bmp.Size);$bmp.Save($env:LM_SCREENSHOT_PATH,[Drawing.Imaging.ImageFormat]::Png);$g.Dispose();$bmp.Dispose()
+"#;
+
+#[cfg(target_os = "linux")]
+const LINUX_ATSPI_SCRIPT: &str = r#"
+import json
+try:
+ import pyatspi
+except Exception as e:
+ raise SystemExit('AT-SPI unavailable: '+str(e))
+def rect(o):
+ try:
+  b=o.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+  return {'x':b.x,'y':b.y,'width':b.width,'height':b.height}
+ except Exception: return {'x':0,'y':0,'width':0,'height':0}
+targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
+for app in list(desktop)[:64]:
+ name=str(getattr(app,'name','')); aid='atspi:'+name
+ for wi,w in enumerate(list(app)[:32]):
+  title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]
+  for ei,e in enumerate(list(w)[:256]):
+   role=str(e.getRoleName()); label=str(getattr(e,'name','')); out.append({'id':tid+'::element-'+str(ei),'role':role,'label':label,'value':None,'bounds':rect(e),'enabled':True,'focused':False,'actions':['click','double_click','set_value','select'],'sensitive':('password' in (role+' '+label).lower())})
+  elements[tid]=out
+print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
+"#;
+
 /// A single control session, scoped to an explicit, non-empty allowlist of
 /// application/window identifiers — see the module doc's comparison to
 /// `m7_companion::CaptureGrant`.
@@ -327,9 +1297,11 @@ fn backend_init_error_message(error: &str) -> String {
 pub struct ControlSession {
     pub session_id: String,
     pub allowed_applications: Vec<String>,
+    pub allowed_windows: Vec<String>,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
     pub active: bool,
+    pub paused: bool,
     /// Always `true` while `active`: the visible on-screen indicator is not
     /// optional in this design (see the design doc's threat-model table).
     /// Kept as an explicit field rather than implied by `active` so the
@@ -343,6 +1315,34 @@ pub struct ControlSession {
     /// the allowlist, never disables emergency stop, never escapes the
     /// session's own expiry.
     pub approved_batch: bool,
+    pub approval_policy: ApprovalPolicy,
+    pub allow_screenshots: bool,
+    pub allow_keyboard_input: bool,
+    pub allow_clipboard_read: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SessionGrantOptions {
+    pub allowed_windows: Vec<String>,
+    pub allow_screenshots: bool,
+    pub allow_keyboard_input: bool,
+    pub allow_clipboard_read: bool,
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+
+impl SessionGrantOptions {
+    fn for_legacy(approved_batch: bool) -> Self {
+        Self {
+            allow_screenshots: true,
+            allow_keyboard_input: true,
+            approval_policy: Some(if approved_batch {
+                ApprovalPolicy::ApprovedBatch
+            } else {
+                ApprovalPolicy::PerAction
+            }),
+            ..Self::default()
+        }
+    }
 }
 
 /// An in-flight approval request for one [`ControlAction`], keyed by a
@@ -350,8 +1350,18 @@ pub struct ControlSession {
 /// — the `oneshot::Sender` can't be, and nothing outside this module needs
 /// the whole struct; [`PendingActionSummary`] is the serializable view sent
 /// to the frontend.
+#[derive(Clone, Debug, Default)]
+struct AuditContext {
+    run_id: Option<String>,
+    tool_call_id: Option<String>,
+}
+
 struct PendingControlAction {
     session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    action: ControlAction,
+    context: AuditContext,
     sender: oneshot::Sender<bool>,
 }
 
@@ -362,6 +1372,9 @@ struct PendingControlAction {
 pub struct PendingActionSummary {
     pub action_id: String,
     pub session_id: String,
+    pub target_application_id: String,
+    pub target_window_id: Option<String>,
+    pub approval_level: ApprovalLevel,
     pub action: ControlAction,
 }
 
@@ -372,6 +1385,31 @@ pub struct PendingActionSummary {
 pub struct ActionOutcome {
     pub action_id: String,
     pub executed: bool,
+    pub input_sent: bool,
+    pub state_verified: bool,
+    pub verification: Option<String>,
+    pub audit_id: String,
+    pub approval_level: ApprovalLevel,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerAuditRecord {
+    pub audit_id: String,
+    pub run_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub session_id: String,
+    pub target_application_id: String,
+    pub target_window_id: Option<String>,
+    pub action: String,
+    pub approval_level: ApprovalLevel,
+    pub result: String,
+    pub approval: String,
+    pub input_sent: bool,
+    pub state_verified: bool,
+    pub verification: Option<String>,
+    pub screenshot_ref: Option<String>,
+    pub created_at_ms: u64,
 }
 
 /// Outcome of [`DesktopControlState::begin_action`]'s validation step —
@@ -381,13 +1419,101 @@ pub struct ActionOutcome {
 pub enum ActionGate {
     /// The session is in "approved batch" mode: the action already ran (or
     /// failed) against the backend, no approval needed.
-    Executed(Result<(), String>),
+    Executed(Result<ExecutionResult, String>),
     /// The session requires per-action approval: the caller must await
     /// `receiver`, then dispatch to the backend itself on `Ok(Ok(true))`.
     Pending {
         action_id: String,
         receiver: oneshot::Receiver<bool>,
     },
+}
+
+pub struct ExecutionResult {
+    input_sent: bool,
+    state_verified: bool,
+    verification: Option<String>,
+    audit_id: String,
+    approval_level: ApprovalLevel,
+}
+
+fn validate_coordinates(target: &ComputerTarget, x: i32, y: i32) -> Result<(), String> {
+    if target.bounds.width <= 0.0 || target.bounds.height <= 0.0 {
+        return Ok(());
+    }
+    let inside_x =
+        f64::from(x) >= target.bounds.x && f64::from(x) <= target.bounds.x + target.bounds.width;
+    let inside_y =
+        f64::from(y) >= target.bounds.y && f64::from(y) <= target.bounds.y + target.bounds.height;
+    if inside_x && inside_y {
+        Ok(())
+    } else {
+        Err("Coordinate is outside the verified target bounds".to_string())
+    }
+}
+
+fn action_summary(action: &ControlAction) -> String {
+    match action {
+        ControlAction::TypeText { .. } => "type_text (content redacted)".to_string(),
+        ControlAction::SetValue { .. } | ControlAction::Select { .. } => {
+            "set_value (content redacted)".to_string()
+        }
+        _ => serde_json::to_string(action).unwrap_or_else(|_| "unserializable_action".to_string()),
+    }
+}
+
+fn approval_level(action: &ControlAction) -> ApprovalLevel {
+    let summary = action_summary(action).to_ascii_lowercase();
+    if [
+        "delete", "destroy", "purchase", "payment", "confirm", "send",
+    ]
+    .iter()
+    .any(|token| summary.contains(token))
+    {
+        return ApprovalLevel::Critical;
+    }
+    match action {
+        ControlAction::Wait { .. } => ApprovalLevel::Low,
+        ControlAction::Focus | ControlAction::Scroll { .. } => ApprovalLevel::Medium,
+        _ => ApprovalLevel::High,
+    }
+}
+
+fn approval_level_for_name(action_name: &str) -> ApprovalLevel {
+    let summary = action_name.to_ascii_lowercase();
+    if [
+        "delete", "destroy", "purchase", "payment", "confirm", "send",
+    ]
+    .iter()
+    .any(|token| summary.contains(token))
+    {
+        ApprovalLevel::Critical
+    } else if summary.contains("screenshot")
+        || summary.contains("inspect")
+        || summary.contains("clipboard")
+    {
+        ApprovalLevel::Low
+    } else if summary.contains("focus") || summary.contains("scroll") {
+        ApprovalLevel::Medium
+    } else {
+        ApprovalLevel::High
+    }
+}
+
+fn redacted_action_for_ui(action: &ControlAction) -> ControlAction {
+    match action {
+        ControlAction::TypeText { text } => ControlAction::TypeText {
+            text: format!("[redacted typed text: {} characters]", text.chars().count()),
+        },
+        ControlAction::SetValue { element_id, value } => ControlAction::SetValue {
+            element_id: element_id.clone(),
+            value: format!("[redacted value: {} characters]", value.chars().count()),
+        },
+        ControlAction::Select { element_id, value } => ControlAction::Select {
+            element_id: element_id.clone(),
+            value: format!("[redacted value: {} characters]", value.chars().count()),
+        },
+        other => other.clone(),
+    }
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>, label: &str) -> Result<MutexGuard<'a, T>, String> {
@@ -469,8 +1595,10 @@ fn process_alive(pid: u32) -> bool {
 
 pub struct DesktopControlState {
     backend: Arc<dyn DesktopInputBackend>,
+    semantic: Arc<dyn DesktopSemanticBackend>,
     sessions: Mutex<BTreeMap<String, ControlSession>>,
     pending: Mutex<HashMap<String, PendingControlAction>>,
+    audit: Mutex<Vec<ComputerAuditRecord>>,
     /// Path of the machine-wide exclusive lock this state must hold while any
     /// session is active, or `None` to disable cross-process locking (the
     /// shape every in-module test and any pure in-process caller uses).
@@ -481,7 +1609,8 @@ pub struct DesktopControlState {
 
 impl DesktopControlState {
     pub fn production() -> Self {
-        Self::with_backend_and_lock(production_backend(), None)
+        let backend = production_backend();
+        Self::with_backends_and_lock(backend.clone(), production_semantic_backend(backend), None)
     }
 
     /// Production backend plus the machine-wide exclusive lock at
@@ -489,7 +1618,12 @@ impl DesktopControlState {
     /// resident daemon can never drive real OS input at the same time even
     /// though each constructs its own `DesktopControlState`.
     pub fn production_with_lock(lock_path: PathBuf) -> Self {
-        Self::with_backend_and_lock(production_backend(), Some(lock_path))
+        let backend = production_backend();
+        Self::with_backends_and_lock(
+            backend.clone(),
+            production_semantic_backend(backend),
+            Some(lock_path),
+        )
     }
 
     pub fn with_backend(backend: Arc<dyn DesktopInputBackend>) -> Self {
@@ -500,10 +1634,20 @@ impl DesktopControlState {
         backend: Arc<dyn DesktopInputBackend>,
         lock_path: Option<PathBuf>,
     ) -> Self {
+        Self::with_backends_and_lock(backend, Arc::new(NullSemanticBackend), lock_path)
+    }
+
+    pub fn with_backends_and_lock(
+        backend: Arc<dyn DesktopInputBackend>,
+        semantic: Arc<dyn DesktopSemanticBackend>,
+        lock_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             backend,
+            semantic,
             sessions: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(HashMap::new()),
+            audit: Mutex::new(Vec::new()),
             lock_path,
             held_lock: Mutex::new(None),
         }
@@ -622,6 +1766,21 @@ impl DesktopControlState {
         lifetime_ms: u64,
         approved_batch: bool,
     ) -> Result<ControlSession, String> {
+        self.start_session_with_options(
+            permission_mode,
+            allowed_applications,
+            lifetime_ms,
+            SessionGrantOptions::for_legacy(approved_batch),
+        )
+    }
+
+    pub fn start_session_with_options(
+        &self,
+        permission_mode: &str,
+        allowed_applications: Vec<String>,
+        lifetime_ms: u64,
+        options: SessionGrantOptions,
+    ) -> Result<ControlSession, String> {
         if permission_mode == "bypass" {
             return Err(
                 "Safe Desktop Control can never be started while permission mode is bypass — \
@@ -642,6 +1801,14 @@ impl DesktopControlState {
         for application_id in &allowed_applications {
             validate_application_id(application_id)?;
         }
+        if options.allowed_windows.len() > 64 {
+            return Err(
+                "Safe Desktop Control window allowlist is limited to 64 entries".to_string(),
+            );
+        }
+        for window_id in &options.allowed_windows {
+            validate_application_id(window_id)?;
+        }
         if lifetime_ms == 0 || lifetime_ms > MAX_SESSION_LIFETIME_MS {
             return Err(format!(
                 "Session lifetime must be between 1 ms and {MAX_SESSION_LIFETIME_MS} ms"
@@ -651,14 +1818,21 @@ impl DesktopControlState {
         // a refused start never leaves a half-created session behind.
         self.acquire_lock()?;
         let created_at_ms = now_ms();
+        let approval_policy = options.approval_policy.unwrap_or(ApprovalPolicy::PerAction);
         let session = ControlSession {
             session_id: format!("desktop-control-{}", Uuid::new_v4()),
             allowed_applications,
+            allowed_windows: options.allowed_windows,
             created_at_ms,
             expires_at_ms: created_at_ms.saturating_add(lifetime_ms),
             active: true,
+            paused: false,
             indicator_visible: true,
-            approved_batch,
+            approved_batch: matches!(approval_policy, ApprovalPolicy::ApprovedBatch),
+            approval_policy,
+            allow_screenshots: options.allow_screenshots,
+            allow_keyboard_input: options.allow_keyboard_input,
+            allow_clipboard_read: options.allow_clipboard_read,
         };
         lock(&self.sessions, "control sessions")?
             .insert(session.session_id.clone(), session.clone());
@@ -680,6 +1854,23 @@ impl DesktopControlState {
         self.deny_pending_for_session(session_id)?;
         self.release_lock_if_idle()?;
         Ok(was_active)
+    }
+
+    pub fn pause_session(&self, session_id: &str, paused: bool) -> Result<bool, String> {
+        let changed = lock(&self.sessions, "control sessions")?
+            .get_mut(session_id)
+            .map(|session| {
+                let changed = session.active && session.paused != paused;
+                if changed {
+                    session.paused = paused;
+                }
+                changed
+            })
+            .unwrap_or(false);
+        if paused {
+            self.deny_pending_for_session(session_id)?;
+        }
+        Ok(changed)
     }
 
     /// Read-only snapshot for the Settings panel, with lazily-expired
@@ -709,12 +1900,7 @@ impl DesktopControlState {
             .any(|session| session.active))
     }
 
-    fn require_active_session(
-        &self,
-        session_id: &str,
-        target_application_id: &str,
-    ) -> Result<ControlSession, String> {
-        validate_application_id(target_application_id)?;
+    fn active_session(&self, session_id: &str) -> Result<ControlSession, String> {
         let now = now_ms();
         let mut sessions = lock(&self.sessions, "control sessions")?;
         let session = sessions
@@ -726,24 +1912,478 @@ impl DesktopControlState {
         if !session.active {
             return Err("Control session is inactive or expired".to_string());
         }
-        if !session
-            .allowed_applications
-            .iter()
-            .any(|allowed| allowed == target_application_id)
-        {
-            return Err(
-                "Target application/window is outside this session's allowlist".to_string(),
-            );
+        if session.paused {
+            return Err("Control session is paused".to_string());
         }
         Ok(session.clone())
     }
 
-    fn execute(&self, action: &ControlAction) -> Result<(), String> {
-        match action {
-            ControlAction::MouseMove { x, y } => self.backend.move_mouse(*x, *y),
-            ControlAction::MouseClick { button } => self.backend.click(*button),
-            ControlAction::KeyPress { key } => self.backend.key_press(key),
+    pub fn list_targets_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ComputerTarget>, String> {
+        let session = self.active_session(session_id)?;
+        let mut targets = self.semantic.list_targets()?;
+        targets.retain(|target| {
+            !target_is_sensitive(target)
+                && session.allowed_applications.iter().any(|allowed| {
+                    allowed == &target.application_id
+                        || allowed == &target.application_name
+                        || allowed == &target.target_id
+                })
+                && (session.allowed_windows.is_empty()
+                    || session.allowed_windows.iter().any(|allowed| {
+                        allowed == &target.window_id || allowed == &target.target_id
+                    }))
+        });
+        targets.truncate(MAX_TARGETS);
+        Ok(targets)
+    }
+
+    pub fn inspect_for_session(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        query: Option<&str>,
+    ) -> Result<ComputerInspection, String> {
+        let _ = self.require_active_session_for_target(
+            session_id,
+            target_application_id,
+            target_window_id,
+            false,
+        )?;
+        self.semantic
+            .inspect(target_application_id, target_window_id, query)
+    }
+
+    pub fn screenshot_for_session(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        bounds: Option<ComputerBounds>,
+    ) -> Result<(ComputerTarget, Vec<u8>, ComputerBounds), String> {
+        let session = self.active_session(session_id)?;
+        if !session.allow_screenshots {
+            return Err("This session grant does not allow screenshots".to_string());
         }
+        let (_, target) = self.require_active_session_for_target(
+            session_id,
+            target_application_id,
+            target_window_id,
+            false,
+        )?;
+        let (bytes, captured_bounds) = self.semantic.screenshot(&target, bounds)?;
+        Ok((target, bytes, captured_bounds))
+    }
+
+    fn clipboard_for_session(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        context: &AuditContext,
+    ) -> Result<(String, String), String> {
+        let session = self.active_session(session_id)?;
+        if !session.allow_clipboard_read {
+            return Err("This session grant does not allow clipboard reads".to_string());
+        }
+        let _ = self.require_active_session_for_target(
+            session_id,
+            target_application_id,
+            target_window_id,
+            false,
+        )?;
+        let text = read_clipboard_native()?;
+        let audit_id = self.record_named_audit_with_context(
+            session_id,
+            target_application_id,
+            target_window_id,
+            "clipboard_read (content redacted)".to_string(),
+            "executed",
+            "granted",
+            false,
+            true,
+            Some("clipboard content returned to the model; content omitted from audit".to_string()),
+            context,
+        )?;
+        Ok((text, audit_id))
+    }
+
+    fn require_active_session_for_target(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        require_frontmost: bool,
+    ) -> Result<(ControlSession, ComputerTarget), String> {
+        validate_application_id(target_application_id)?;
+        if let Some(window_id) = target_window_id {
+            validate_application_id(window_id)?;
+        }
+        if sensitive_text(target_application_id) || target_window_id.is_some_and(sensitive_text) {
+            return Err("Sensitive application/window targets are blocked".to_string());
+        }
+        let now = now_ms();
+        let session = {
+            let mut sessions = lock(&self.sessions, "control sessions")?;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "Control session is missing or was stopped".to_string())?;
+            if session.expires_at_ms <= now {
+                session.active = false;
+            }
+            if !session.active {
+                return Err("Control session is inactive or expired".to_string());
+            }
+            if session.paused {
+                return Err("Control session is paused".to_string());
+            }
+            session.clone()
+        };
+        let target = self.semantic.verify_target(
+            target_application_id,
+            target_window_id,
+            require_frontmost,
+        )?;
+        if target_is_sensitive(&target) {
+            return Err("Sensitive application/window targets are blocked".to_string());
+        }
+        let app_allowed = session.allowed_applications.iter().any(|allowed| {
+            allowed == target_application_id
+                || allowed == &target.application_id
+                || allowed == &target.application_name
+                || allowed == &target.target_id
+        });
+        let window_allowed = session.allowed_windows.is_empty()
+            || session
+                .allowed_windows
+                .iter()
+                .any(|allowed| allowed == &target.window_id || allowed == &target.target_id);
+        if !app_allowed || !window_allowed {
+            return Err(
+                "Target application/window is outside this session's allowlist".to_string(),
+            );
+        }
+        Ok((session, target))
+    }
+
+    fn action_requires_frontmost(action: &ControlAction) -> bool {
+        !matches!(action, ControlAction::Focus | ControlAction::Wait { .. })
+    }
+
+    fn action_targets_sensitive_focus(
+        &self,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: &ControlAction,
+    ) -> Result<bool, String> {
+        if !matches!(
+            action,
+            ControlAction::TypeText { .. }
+                | ControlAction::KeyPress { .. }
+                | ControlAction::Hotkey { .. }
+        ) {
+            return Ok(false);
+        }
+        Ok(self
+            .semantic
+            .inspect(target_application_id, target_window_id, None)?
+            .elements
+            .iter()
+            .any(|element| element.focused && element.sensitive))
+    }
+
+    fn validate_action(
+        session: &ControlSession,
+        target: &ComputerTarget,
+        action: &ControlAction,
+    ) -> Result<(), String> {
+        let keyboard_action = matches!(
+            action,
+            ControlAction::TypeText { .. }
+                | ControlAction::KeyPress { .. }
+                | ControlAction::Hotkey { .. }
+                | ControlAction::Select { .. }
+                | ControlAction::SetValue { .. }
+        );
+        if keyboard_action && !session.allow_keyboard_input {
+            return Err("This session grant does not allow keyboard input".to_string());
+        }
+        match action {
+            ControlAction::TypeText { text } if text.len() > 16 * 1024 => {
+                Err("Typed text exceeds the 16 KiB action bound".to_string())
+            }
+            ControlAction::Hotkey { keys } if keys.is_empty() || keys.len() > 8 => {
+                Err("Hotkeys must contain between 1 and 8 named keys".to_string())
+            }
+            ControlAction::Hotkey { keys }
+                if keys.iter().any(|key| key.is_empty() || key.len() > 64) =>
+            {
+                Err("Hotkey names are bounded printable strings".to_string())
+            }
+            ControlAction::Scroll { delta_x, delta_y }
+                if delta_x.unsigned_abs() > 10_000 || delta_y.unsigned_abs() > 10_000 =>
+            {
+                Err("Scroll deltas exceed the bounded action limit".to_string())
+            }
+            ControlAction::Wait { milliseconds } if *milliseconds > 10_000 => {
+                Err("Wait is limited to 10 seconds".to_string())
+            }
+            ControlAction::MouseClickAt { x, y, .. }
+            | ControlAction::MouseDoubleClickAt { x, y, .. } => {
+                validate_coordinates(target, *x, *y)
+            }
+            ControlAction::MouseDrag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                validate_coordinates(target, *from_x, *from_y)?;
+                validate_coordinates(target, *to_x, *to_y)
+            }
+            ControlAction::SemanticClick { element_id, .. }
+            | ControlAction::SemanticDoubleClick { element_id, .. }
+            | ControlAction::Select { element_id, .. }
+            | ControlAction::SetValue { element_id, .. }
+                if element_id.len() > 512 || element_id.chars().any(char::is_control) =>
+            {
+                Err("Accessibility element id is invalid or too long".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn execute_for_target_with_context(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: &ControlAction,
+        context: &AuditContext,
+    ) -> Result<ExecutionResult, String> {
+        let (session, target) = self.require_active_session_for_target(
+            session_id,
+            target_application_id,
+            target_window_id,
+            Self::action_requires_frontmost(action),
+        )?;
+        Self::validate_action(&session, &target, action)?;
+        if self.action_targets_sensitive_focus(target_application_id, target_window_id, action)? {
+            return Err(
+                "Keyboard input into a sensitive or authentication element is blocked".to_string(),
+            );
+        }
+        let mut input_sent = false;
+        match action {
+            ControlAction::MouseMove { x, y } => {
+                validate_coordinates(&target, *x, *y)?;
+                self.backend.move_mouse(*x, *y)?;
+                input_sent = true;
+            }
+            ControlAction::MouseClick { button } => {
+                self.backend.click(*button)?;
+                input_sent = true;
+            }
+            ControlAction::MouseClickAt { x, y, button } => {
+                self.backend.move_mouse(*x, *y)?;
+                self.backend.click(*button)?;
+                input_sent = true;
+            }
+            ControlAction::MouseDoubleClick { button } => {
+                self.backend.double_click(*button)?;
+                input_sent = true;
+            }
+            ControlAction::MouseDoubleClickAt { x, y, button } => {
+                self.backend.move_mouse(*x, *y)?;
+                self.backend.double_click(*button)?;
+                input_sent = true;
+            }
+            ControlAction::MouseDrag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+            } => {
+                self.backend.drag(*from_x, *from_y, *to_x, *to_y)?;
+                input_sent = true;
+            }
+            ControlAction::Scroll { delta_x, delta_y } => {
+                self.backend.scroll(*delta_x, *delta_y)?;
+                input_sent = true;
+            }
+            ControlAction::TypeText { text } => {
+                self.backend.type_text(text)?;
+                input_sent = true;
+            }
+            ControlAction::KeyPress { key } => {
+                if key.is_empty() || key.len() > 64 || key.chars().any(char::is_control) {
+                    return Err("Key name is invalid or too long".to_string());
+                }
+                self.backend.key_press(key)?;
+                input_sent = true;
+            }
+            ControlAction::Hotkey { keys } => {
+                self.backend.hotkey(keys)?;
+                input_sent = true;
+            }
+            ControlAction::Focus => {
+                self.semantic.focus(&target)?;
+            }
+            ControlAction::SemanticClick { element_id, button } => {
+                self.semantic
+                    .click_element(&target, element_id, *button, false)?;
+                input_sent = true;
+            }
+            ControlAction::SemanticDoubleClick { element_id, button } => {
+                self.semantic
+                    .click_element(&target, element_id, *button, true)?;
+                input_sent = true;
+            }
+            ControlAction::Select { element_id, value } => {
+                self.semantic.set_value(&target, element_id, value, true)?;
+                input_sent = true;
+            }
+            ControlAction::SetValue { element_id, value } => {
+                self.semantic.set_value(&target, element_id, value, false)?;
+                input_sent = true;
+            }
+            ControlAction::Wait { milliseconds } => {
+                std::thread::sleep(Duration::from_millis(*milliseconds))
+            }
+        }
+        let verified = self
+            .semantic
+            .verify_target(
+                target_application_id,
+                target_window_id,
+                Self::action_requires_frontmost(action),
+            )
+            .is_ok();
+        let verification = Some(if verified {
+            "target revalidated after action".to_string()
+        } else {
+            "input was sent; target state could not be revalidated".to_string()
+        });
+        let audit_id = self.record_audit_with_context(
+            session_id,
+            target_application_id,
+            target_window_id,
+            action,
+            "executed",
+            "approved",
+            input_sent,
+            verified,
+            verification.clone(),
+            context,
+        )?;
+        Ok(ExecutionResult {
+            input_sent,
+            state_verified: verified,
+            verification,
+            audit_id,
+            approval_level: approval_level(action),
+        })
+    }
+
+    fn record_audit_with_context(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: &ControlAction,
+        result: &str,
+        approval: &str,
+        input_sent: bool,
+        state_verified: bool,
+        verification: Option<String>,
+        context: &AuditContext,
+    ) -> Result<String, String> {
+        self.record_named_audit_with_context(
+            session_id,
+            target_application_id,
+            target_window_id,
+            action_summary(action),
+            result,
+            approval,
+            input_sent,
+            state_verified,
+            verification,
+            context,
+        )
+    }
+
+    fn record_named_audit_with_context(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action_name: String,
+        result: &str,
+        approval: &str,
+        input_sent: bool,
+        state_verified: bool,
+        verification: Option<String>,
+        context: &AuditContext,
+    ) -> Result<String, String> {
+        let audit_id = format!("desktop-audit-{}", Uuid::new_v4());
+        let approval_level = approval_level_for_name(&action_name);
+        let record = ComputerAuditRecord {
+            audit_id: audit_id.clone(),
+            run_id: context.run_id.clone(),
+            tool_call_id: context.tool_call_id.clone(),
+            session_id: session_id.to_string(),
+            target_application_id: target_application_id.to_string(),
+            target_window_id: target_window_id.map(str::to_string),
+            action: action_name,
+            approval_level,
+            result: result.to_string(),
+            approval: approval.to_string(),
+            input_sent,
+            state_verified,
+            verification,
+            screenshot_ref: None,
+            created_at_ms: now_ms(),
+        };
+        let mut audit = lock(&self.audit, "desktop control audit")?;
+        if audit.len() >= 1024 {
+            audit.remove(0);
+        }
+        audit.push(record);
+        Ok(audit_id)
+    }
+
+    pub fn audit_snapshot(&self) -> Result<Vec<ComputerAuditRecord>, String> {
+        Ok(lock(&self.audit, "desktop control audit")?.clone())
+    }
+
+    fn record_screenshot_audit(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        artifact_id: &str,
+        context: &AuditContext,
+    ) -> Result<String, String> {
+        let audit_id = self.record_named_audit_with_context(
+            session_id,
+            target_application_id,
+            target_window_id,
+            "screenshot".to_string(),
+            "executed",
+            "grant",
+            false,
+            true,
+            Some("bounded screenshot captured".to_string()),
+            context,
+        )?;
+        let mut audit = lock(&self.audit, "desktop control audit")?;
+        if let Some(record) = audit.iter_mut().find(|record| record.audit_id == audit_id) {
+            record.screenshot_ref = Some(artifact_id.to_string());
+        }
+        Ok(audit_id)
     }
 
     /// Validates the session/allowlist, then either executes immediately
@@ -758,9 +2398,47 @@ impl DesktopControlState {
         target_application_id: &str,
         action: ControlAction,
     ) -> Result<ActionGate, String> {
-        let session = self.require_active_session(session_id, target_application_id)?;
+        self.begin_action_for_target(session_id, target_application_id, None, action)
+    }
+
+    pub fn begin_action_for_target(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: ControlAction,
+    ) -> Result<ActionGate, String> {
+        self.begin_action_for_target_with_context(
+            session_id,
+            target_application_id,
+            target_window_id,
+            action,
+            AuditContext::default(),
+        )
+    }
+
+    fn begin_action_for_target_with_context(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: ControlAction,
+        context: AuditContext,
+    ) -> Result<ActionGate, String> {
+        let (session, _) = self.require_active_session_for_target(
+            session_id,
+            target_application_id,
+            target_window_id,
+            Self::action_requires_frontmost(&action),
+        )?;
         if session.approved_batch {
-            return Ok(ActionGate::Executed(self.execute(&action)));
+            return Ok(ActionGate::Executed(self.execute_for_target_with_context(
+                session_id,
+                target_application_id,
+                target_window_id,
+                &action,
+                &context,
+            )));
         }
         let (sender, receiver) = oneshot::channel::<bool>();
         let action_id = format!("control-action-{}", Uuid::new_v4());
@@ -768,6 +2446,10 @@ impl DesktopControlState {
             action_id.clone(),
             PendingControlAction {
                 session_id: session_id.to_string(),
+                target_application_id: target_application_id.to_string(),
+                target_window_id: target_window_id.map(str::to_string),
+                action: action.clone(),
+                context,
                 sender,
             },
         );
@@ -811,15 +2493,37 @@ impl DesktopControlState {
         action: &ControlAction,
         approve: bool,
     ) -> Result<bool, String> {
-        if !self.resolve_if_pending(action_id, approve)? {
+        let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id)
+        else {
+            return Ok(false);
+        };
+        let _ = pending.sender.send(approve);
+        if !approve {
+            let _ = self.record_named_audit_with_context(
+                &pending.session_id,
+                &pending.target_application_id,
+                pending.target_window_id.as_deref(),
+                format!("{} (denied)", action_summary(&pending.action)),
+                "denied",
+                "operator_denied",
+                false,
+                false,
+                Some("operator denied the pending action".to_string()),
+                &pending.context,
+            );
             return Ok(false);
         }
-        if approve {
-            self.execute(action)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if &pending.action != action {
+            return Err("Pending action payload changed before approval".to_string());
         }
+        self.execute_for_target_with_context(
+            &pending.session_id,
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+            &pending.context,
+        )?;
+        Ok(true)
     }
 
     fn deny_pending_for_session(&self, session_id: &str) -> Result<(), String> {
@@ -884,6 +2588,17 @@ fn ensure_main_window(window: &tauri::Window) -> Result<(), String> {
     }
 }
 
+fn ensure_control_window(window: &tauri::Window) -> Result<(), String> {
+    if matches!(window.label(), "main" | "companion-overlay") {
+        Ok(())
+    } else {
+        Err(
+            "Desktop control can only be managed from the main window or visible control overlay"
+                .to_string(),
+        )
+    }
+}
+
 #[tauri::command]
 pub fn desktop_control_start_session(
     app: tauri::AppHandle,
@@ -893,11 +2608,30 @@ pub fn desktop_control_start_session(
     allowed_applications: Vec<String>,
     lifetime_ms: u64,
     approved_batch: bool,
+    allowed_windows: Option<Vec<String>>,
+    allow_screenshots: Option<bool>,
+    allow_keyboard_input: Option<bool>,
+    allow_clipboard_read: Option<bool>,
+    approval_policy: Option<ApprovalPolicy>,
 ) -> Result<ControlSession, String> {
     ensure_main_window(&window)?;
     let mode = crate::permissions::get_permission_mode_impl(&permissions_state);
-    let session =
-        state.start_session_impl(&mode, allowed_applications, lifetime_ms, approved_batch)?;
+    let session = state.start_session_with_options(
+        &mode,
+        allowed_applications,
+        lifetime_ms,
+        SessionGrantOptions {
+            allowed_windows: allowed_windows.unwrap_or_default(),
+            allow_screenshots: allow_screenshots.unwrap_or(true),
+            allow_keyboard_input: allow_keyboard_input.unwrap_or(true),
+            allow_clipboard_read: allow_clipboard_read.unwrap_or(false),
+            approval_policy: Some(approval_policy.unwrap_or(if approved_batch {
+                ApprovalPolicy::ApprovedBatch
+            } else {
+                ApprovalPolicy::PerAction
+            })),
+        },
+    )?;
     // Best-effort visible indicator — reuses the existing always-on-top
     // companion overlay window rather than building new window chrome (see
     // the design doc). A failure to show it never fails session start
@@ -905,6 +2639,7 @@ pub fn desktop_control_start_session(
     // Settings panel's own session list is a second, always-available
     // indicator.
     let _ = crate::m7_companion::show_overlay(&app);
+    let _ = app.emit("desktop-control://session-state", &session);
     Ok(session)
 }
 
@@ -915,21 +2650,49 @@ pub fn desktop_control_stop_session(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
 ) -> Result<bool, String> {
-    ensure_main_window(&window)?;
+    ensure_control_window(&window)?;
     let stopped = state.stop_session(&session_id)?;
     if !state.any_session_active()? {
         if let Some(overlay) = app.get_webview_window("companion-overlay") {
             let _ = overlay.hide();
         }
     }
+    let _ = app.emit(
+        "desktop-control://session-state",
+        state.sessions_snapshot()?,
+    );
     Ok(stopped)
 }
 
 #[tauri::command]
+pub fn desktop_control_pause_session(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    paused: bool,
+) -> Result<bool, String> {
+    ensure_control_window(&window)?;
+    let changed = state.pause_session(&session_id, paused)?;
+    let _ = app.emit(
+        "desktop-control://session-state",
+        state.sessions_snapshot()?,
+    );
+    Ok(changed)
+}
+
+#[tauri::command]
 pub fn desktop_control_sessions(
+    app: tauri::AppHandle,
     state: tauri::State<'_, DesktopControlState>,
 ) -> Result<Vec<ControlSession>, String> {
-    state.sessions_snapshot()
+    let sessions = state.sessions_snapshot()?;
+    if !sessions.iter().any(|session| session.active) {
+        if let Some(overlay) = app.get_webview_window("companion-overlay") {
+            let _ = overlay.hide();
+        }
+    }
+    Ok(sessions)
 }
 
 #[tauri::command]
@@ -939,15 +2702,74 @@ pub async fn desktop_control_request_action(
     state: tauri::State<'_, DesktopControlState>,
     session_id: String,
     target_application_id: String,
+    target_window_id: Option<String>,
     action: ControlAction,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     ensure_main_window(&window)?;
-    match state.begin_action(&session_id, &target_application_id, action.clone())? {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        action,
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+async fn request_action_impl(
+    app: &tauri::AppHandle,
+    state: &DesktopControlState,
+    session_id: &str,
+    target_application_id: &str,
+    target_window_id: Option<&str>,
+    action: ControlAction,
+    run_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    let context = AuditContext {
+        run_id,
+        tool_call_id,
+    };
+    let gate = match state.begin_action_for_target_with_context(
+        session_id,
+        target_application_id,
+        target_window_id,
+        action.clone(),
+        context.clone(),
+    ) {
+        Ok(gate) => gate,
+        Err(error) => {
+            let _ = state.record_named_audit_with_context(
+                session_id,
+                target_application_id,
+                target_window_id,
+                format!("{} (refused)", action_summary(&action)),
+                "refused",
+                "not_approved",
+                false,
+                false,
+                Some(error.clone()),
+                &context,
+            );
+            return Err(error);
+        }
+    };
+    match gate {
         ActionGate::Executed(result) => {
-            result?;
+            let result = result?;
             Ok(ActionOutcome {
                 action_id: format!("batch-{}", Uuid::new_v4()),
                 executed: true,
+                input_sent: result.input_sent,
+                state_verified: result.state_verified,
+                verification: result.verification,
+                audit_id: result.audit_id,
+                approval_level: result.approval_level,
             })
         }
         ActionGate::Pending {
@@ -958,27 +2780,432 @@ pub async fn desktop_control_request_action(
                 "desktop-control://action-pending",
                 PendingActionSummary {
                     action_id: action_id.clone(),
-                    session_id,
-                    action: action.clone(),
+                    session_id: session_id.to_string(),
+                    target_application_id: target_application_id.to_string(),
+                    target_window_id: target_window_id.map(str::to_string),
+                    approval_level: approval_level(&action),
+                    action: redacted_action_for_ui(&action),
                 },
             );
             match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
                 Ok(Ok(true)) => {
-                    state.execute(&action)?;
+                    let result = state.execute_for_target_with_context(
+                        session_id,
+                        target_application_id,
+                        target_window_id,
+                        &action,
+                        &context,
+                    )?;
                     Ok(ActionOutcome {
                         action_id,
                         executed: true,
+                        input_sent: result.input_sent,
+                        state_verified: result.state_verified,
+                        verification: result.verification,
+                        audit_id: result.audit_id,
+                        approval_level: result.approval_level,
                     })
                 }
-                Ok(Ok(false)) => Err("Control action was denied".to_string()),
+                Ok(Ok(false)) => {
+                    let _ = state.record_named_audit_with_context(
+                        session_id,
+                        target_application_id,
+                        target_window_id,
+                        format!("{} (denied)", action_summary(&action)),
+                        "denied",
+                        "operator_denied",
+                        false,
+                        false,
+                        Some("operator denied the pending action".to_string()),
+                        &context,
+                    );
+                    Err("Control action was denied".to_string())
+                }
                 // Timed out, or the sender was dropped without a response.
                 Ok(Err(_)) | Err(_) => {
                     state.remove_pending(&action_id);
+                    let _ = state.record_named_audit_with_context(
+                        session_id,
+                        target_application_id,
+                        target_window_id,
+                        format!("{} (timeout)", action_summary(&action)),
+                        "timeout",
+                        "not_approved",
+                        false,
+                        false,
+                        Some("operator approval timed out".to_string()),
+                        &context,
+                    );
                     Err("Control action approval timed out".to_string())
                 }
             }
         }
     }
+}
+
+#[tauri::command]
+pub fn tool_computer_list_targets(
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<Vec<ComputerTarget>, String> {
+    let _ = (turn_id, tool_call_id);
+    state.list_targets_for_session(&session_id)
+}
+
+#[tauri::command]
+pub fn tool_computer_inspect(
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    query: Option<String>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ComputerInspection, String> {
+    let _ = (turn_id, tool_call_id);
+    state.inspect_for_session(
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        query.as_deref(),
+    )
+}
+
+#[tauri::command]
+pub fn tool_computer_screenshot(
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, crate::AppState>,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    bounds: Option<ComputerBounds>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ComputerScreenshot, String> {
+    let (target, bytes, captured_bounds) = state.screenshot_for_session(
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        bounds,
+    )?;
+    let blob = crate::artifact_commands::store_for(&app, app_state.inner())?
+        .put(&bytes)
+        .map_err(|error| format!("Could not store screenshot artifact: {error}"))?;
+    let audit_id = state.record_screenshot_audit(
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        &blob.id,
+        &AuditContext {
+            run_id: turn_id,
+            tool_call_id,
+        },
+    )?;
+    Ok(ComputerScreenshot {
+        artifact_id: blob.id,
+        audit_id,
+        media_type: "image/png".to_string(),
+        size_bytes: blob.size,
+        content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        bounds: captured_bounds,
+        target,
+    })
+}
+
+#[tauri::command]
+pub fn tool_computer_clipboard_read(
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let (content, audit_id) = state.clipboard_for_session(
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        &AuditContext {
+            run_id: turn_id,
+            tool_call_id,
+        },
+    )?;
+    Ok(serde_json::json!({
+        "content": content,
+        "auditId": audit_id,
+        "note": "Clipboard reads are separately granted and are never included in the audit content",
+    }))
+}
+
+#[tauri::command]
+pub async fn tool_computer_focus(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::Focus,
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_click(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    element_id: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    button: Option<MouseButtonKind>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    let button = button.unwrap_or(MouseButtonKind::Left);
+    let action = if let Some(element_id) = element_id {
+        ControlAction::SemanticClick { element_id, button }
+    } else {
+        ControlAction::MouseClickAt {
+            x: x.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
+            y: y.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
+            button,
+        }
+    };
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        action,
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_double_click(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    element_id: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    button: Option<MouseButtonKind>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    let button = button.unwrap_or(MouseButtonKind::Left);
+    let action = if let Some(element_id) = element_id {
+        ControlAction::SemanticDoubleClick { element_id, button }
+    } else {
+        ControlAction::MouseDoubleClickAt {
+            x: x.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
+            y: y.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
+            button,
+        }
+    };
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        action,
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_scroll(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    delta_x: i32,
+    delta_y: i32,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::Scroll { delta_x, delta_y },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_type(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    text: String,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::TypeText { text },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_key(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    key: String,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::KeyPress { key },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_hotkey(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    keys: Vec<String>,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::Hotkey { keys },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_wait(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    milliseconds: u64,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::Wait { milliseconds },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_select(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    element_id: String,
+    value: String,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::Select { element_id, value },
+        turn_id,
+        tool_call_id,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn tool_computer_set_value(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopControlState>,
+    session_id: String,
+    target_application_id: String,
+    target_window_id: Option<String>,
+    element_id: String,
+    value: String,
+    turn_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> Result<ActionOutcome, String> {
+    request_action_impl(
+        &app,
+        state.inner(),
+        &session_id,
+        &target_application_id,
+        target_window_id.as_deref(),
+        ControlAction::SetValue { element_id, value },
+        turn_id,
+        tool_call_id,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1023,6 +3250,94 @@ mod tests {
 
     fn allow(apps: &[&str]) -> Vec<String> {
         apps.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn grants_carry_independent_capabilities_and_windows() {
+        let state = state();
+        let session = state
+            .start_session_with_options(
+                "manual",
+                allow(&["TestApp"]),
+                60_000,
+                SessionGrantOptions {
+                    allowed_windows: vec!["TestApp::window-1".to_string()],
+                    allow_screenshots: false,
+                    allow_keyboard_input: false,
+                    allow_clipboard_read: false,
+                    approval_policy: Some(ApprovalPolicy::PerAction),
+                },
+            )
+            .unwrap();
+        assert_eq!(session.allowed_windows, ["TestApp::window-1"]);
+        assert!(!session.allow_screenshots);
+        assert!(!session.allow_keyboard_input);
+        assert_eq!(session.approval_policy, ApprovalPolicy::PerAction);
+    }
+
+    #[test]
+    fn sensitive_targets_are_refused_even_when_allowlisted() {
+        let state = state();
+        let session = state
+            .start_session_impl("manual", allow(&["1Password"]), 60_000, true)
+            .unwrap();
+        let error = match state.begin_action(
+            &session.session_id,
+            "1Password",
+            ControlAction::MouseClick {
+                button: MouseButtonKind::Left,
+            },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("sensitive target must be refused"),
+        };
+        assert!(error.contains("Sensitive"));
+    }
+
+    #[test]
+    fn paused_session_refuses_actions_without_revoking_the_grant() {
+        let state = state();
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
+            .unwrap();
+        assert!(state.pause_session(&session.session_id, true).unwrap());
+        let error = match state.begin_action(
+            &session.session_id,
+            "Notes",
+            ControlAction::MouseMove { x: 1, y: 1 },
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("paused session must refuse actions"),
+        };
+        assert!(error.contains("paused"));
+        assert!(state.sessions_snapshot().unwrap()[0].active);
+        assert!(state.pause_session(&session.session_id, false).unwrap());
+    }
+
+    #[test]
+    fn audit_redacts_typed_text_and_preserves_execution_verification() {
+        let state = state();
+        let session = state
+            .start_session_impl("manual", allow(&["Notes"]), 60_000, true)
+            .unwrap();
+        let ActionGate::Executed(result) = state
+            .begin_action(
+                &session.session_id,
+                "Notes",
+                ControlAction::TypeText {
+                    text: "secret-value".to_string(),
+                },
+            )
+            .unwrap()
+        else {
+            panic!("approved batch must execute immediately");
+        };
+        let result = result.unwrap();
+        assert!(result.input_sent);
+        assert!(result.state_verified);
+        let audit = state.audit_snapshot().unwrap();
+        assert!(audit[0].action.contains("redacted"));
+        assert!(!audit[0].action.contains("secret-value"));
     }
 
     #[test]

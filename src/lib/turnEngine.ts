@@ -345,7 +345,29 @@ const MUTATING_TOOLS = RISK_ELIGIBLE_TOOLS;
 /** Tools whose calls are permission-gated and therefore need `turn_id`, so
  * Rust can scope a permission prompt (and, for run_shell/web_fetch, Stop-button
  * cancellation) to the right in-flight turn. */
-const PERMISSION_GATED_TOOLS = new Set([...MUTATING_TOOLS, 'remember', 'web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
+const PERMISSION_GATED_TOOLS = new Set([
+  ...MUTATING_TOOLS,
+  'remember',
+  'web_fetch',
+  'web_search',
+  ...COMPUTER_TOOL_NAMES,
+]);
 
 /**
  * Whether Plan Mode refuses `name` outright: every permission-gated tool

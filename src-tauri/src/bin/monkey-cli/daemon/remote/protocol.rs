@@ -1156,6 +1156,8 @@ pub struct DesktopControlActionRequest {
     /// Which allowlisted application/window this action is aimed at — the
     /// desktop-control core enforces this against the session allowlist.
     pub target_application_id: String,
+    #[serde(default)]
+    pub target_window_id: Option<String>,
     pub action: little_monkey_lib::desktop_control::ControlAction,
 }
 

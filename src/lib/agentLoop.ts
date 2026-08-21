@@ -574,12 +574,43 @@ export const formatVerifyNotice = verifyNoticeCodec.format;
  * doc, which suggested reusing `VERIFY_NOTE_PREFIX` for this message. */
 export const VERIFY_FIX_NOTE_PREFIX = '[Verify Fix]';
 
+function computerScreenshotContent(toolName: string, result: string): ChatContentPart[] | null {
+  if (toolName !== 'computer_screenshot') return null;
+  try {
+    const parsed = JSON.parse(result) as { content_base64?: unknown };
+    if (typeof parsed.content_base64 !== 'string' || parsed.content_base64.length === 0) return null;
+    const { content_base64: _content, ...metadata } = parsed;
+    return [
+      { type: 'text', text: JSON.stringify(metadata) },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${parsed.content_base64}` } },
+    ];
+  } catch {
+    return null;
+  }
+}
+
 export function isVerifyFixNotice(message: ChatMessage): boolean {
   return message.role === 'system' && typeof message.content === 'string' && message.content.startsWith(VERIFY_FIX_NOTE_PREFIX);
 }
 
 /** Tool names gated by the `webToolsEnabled` settings toggle — see `toolsForSettings`. */
 const WEB_TOOL_NAMES = new Set(['web_fetch', 'web_search']);
+const COMPUTER_TOOL_NAMES = new Set([
+  'computer_list_targets',
+  'computer_screenshot',
+  'computer_clipboard_read',
+  'computer_inspect',
+  'computer_focus',
+  'computer_click',
+  'computer_double_click',
+  'computer_scroll',
+  'computer_type',
+  'computer_key',
+  'computer_hotkey',
+  'computer_wait',
+  'computer_select',
+  'computer_set_value',
+]);
 
 /**
  * Filters `remember` out of the tool list offered to the model this turn
@@ -622,10 +653,12 @@ export function toolsForSettings(
   readSkillResourceToolEnabled = false,
   skillLearningToolEnabled = false,
   skillSearchToolEnabled = false,
+  desktopControlEnabled = false,
 ): ToolDef[] {
   const filtered = tools.filter((tool) => {
     if (!memoryEnabled && tool.function.name === 'remember') return false;
     if (!webToolsEnabled && WEB_TOOL_NAMES.has(tool.function.name)) return false;
+    if (!desktopControlEnabled && COMPUTER_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
   return [
@@ -2950,6 +2983,7 @@ async function runAgentTurnBody(
       // without one there is no evidence chain for a proposal to append to.
       cachedLearningMode() !== null && cachedLearningMode() !== 'off' && durable.recorder !== null,
       skillSearchToolEnabled,
+      settings.desktopControlEnabled,
     ),
     hasWorkspace,
   );
@@ -3716,7 +3750,7 @@ async function runAgentTurnBody(
       const toolMessage: ChatMessage = {
         role: 'tool',
         tool_call_id: toolCall.id,
-        content: modelResultContent,
+        content: computerScreenshotContent(toolCall.function.name, resultContent) ?? modelResultContent,
       };
       addMessage(toolMessage);
 
