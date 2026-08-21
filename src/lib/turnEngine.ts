@@ -626,6 +626,9 @@ export interface SkillToolContext {
    * reads use this map to prevent a mutable folder from being re-resolved at
    * a different hash or source after discovery. */
   invokedSkillSnapshots?: Map<string, { sha256: string; sourcePath: string }>;
+  /** Optional in-memory resource snapshots used by isolated evaluation arms;
+   * ordinary turns leave this unset and read through the native runtime. */
+  resourceSnapshots?: ReadonlyMap<string, ReadonlyMap<string, string>>;
   /** Commands the user explicitly selected with `/command` this turn. These
    * are the approval boundary for Ask and Manual skills. */
   explicitCommands?: ReadonlySet<string>;
@@ -1138,7 +1141,15 @@ async function executeToolCallInner(
       );
     }
     if (!skill.invokedSkillSnapshots?.has(command)) {
-      return stringifyToolError(new Error(`/${command} has no immutable native-skill snapshot for this turn.`));
+      const resources = skill.resourceSnapshots?.get(command);
+      if (!resources) {
+        return stringifyToolError(new Error(`/${command} has no immutable native-skill snapshot for this turn.`));
+      }
+      const path = typeof args.path === 'string' ? args.path : '';
+      const content = resources.get(path);
+      return content === undefined
+        ? stringifyToolError(new Error(`/${command} has no bundled resource at ${path || '(missing path)'}.`))
+        : content;
     }
   }
 

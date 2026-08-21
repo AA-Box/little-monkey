@@ -844,6 +844,29 @@ describe("executeToolCall / read_skill_resource invocation gate", () => {
     expect(result).toBe("resource contents");
   });
 
+  it("resolves an isolated evaluation resource from its frozen snapshot", async () => {
+    const context: SkillToolContext = {
+      availableSkills: [{ id: "review", source: "native", command: "review", name: "review", instructions: "i", version: "1.0.0", contentSha256: "a".repeat(64), permissions: [], resourceFiles: ["references/info.md"] }],
+      invokedCommands: new Set(["review"]),
+      maxSkillsPerTurn: 5,
+      resourceSnapshots: new Map([["review", new Map([["references/info.md", "frozen resource"]])]]),
+    };
+    const result = await executeToolCall(
+      call("read_skill_resource", { command: "review", path: "references/info.md" }),
+      null,
+      "turn-1",
+      emptyMcpRegistry,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      context,
+    );
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(result).toBe("frozen resource");
+  });
+
   it("returns a tool error without calling invoke when no skill context is configured", async () => {
     const result = await executeToolCall(call("read_skill_resource", { command: "review", path: "references/info.md" }), null, "turn-1", emptyMcpRegistry);
     expect(invokeMock).not.toHaveBeenCalled();

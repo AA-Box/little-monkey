@@ -13,8 +13,8 @@ use little_monkey_lib::native_skills::{
 use little_monkey_lib::prompts::PromptEntry;
 use little_monkey_lib::skill_activation::{SkillActivationPolicy, SkillActivationStore};
 use little_monkey_lib::skill_learning::{
-    EvaluationCaseReport, LearningMode, LearningPolicy, LearningSettings, PromotionOutcome,
-    SkillLearningStore,
+    snapshot_skill_resources, CandidateRequirements, EvaluationCaseReport, ImprovementParent,
+    LearningMode, LearningPolicy, LearningSettings, PromotionOutcome, SkillLearningStore,
 };
 
 const MAX_SKILLS_PER_TURN: usize = 5;
@@ -206,6 +206,27 @@ pub enum LearnedCmd {
     Policy {
         #[arg(value_enum)]
         policy: Option<CliLearningPolicy>,
+    },
+    Quality {
+        command: String,
+        #[arg(long, value_enum, default_value_t = CliSkillScope::Global)]
+        scope: CliSkillScope,
+        #[arg(long)]
+        json: bool,
+    },
+    ImprovementEvidence {
+        command: String,
+        #[arg(long, value_enum, default_value_t = CliSkillScope::Global)]
+        scope: CliSkillScope,
+        #[arg(long)]
+        json: bool,
+    },
+    Improve {
+        command: String,
+        #[arg(long, value_enum, default_value_t = CliSkillScope::Global)]
+        scope: CliSkillScope,
+        #[arg(long = "run", required = true)]
+        run_ids: Vec<String>,
     },
 }
 
@@ -729,6 +750,35 @@ fn run_activation(action: &ActivationCmd, data_dir: &Path) -> Result<(), String>
     }
 }
 
+fn learned_descriptor(
+    store: &SkillLearningStore,
+    data_dir: &Path,
+    workspace: Option<&Path>,
+    command: &str,
+    scope: SkillScope,
+) -> Result<SkillDescriptor, String> {
+    let mut matching = descriptors(data_dir, workspace)?
+        .into_iter()
+        .filter(|entry| {
+            entry.command == command
+                && little_monkey_lib::skill_learning::descriptor_scope(entry) == Some(scope)
+        })
+        .collect::<Vec<_>>();
+    matching.sort_by_key(|entry| !entry.managed);
+    let descriptor = matching
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("active /{command} was not found"))?;
+    if !descriptor.managed
+        || !store
+            .is_learned_version(&descriptor.sha256)
+            .map_err(|error| error.to_string())?
+    {
+        return Err("improvement is available only for managed learned skills".to_string());
+    }
+    Ok(descriptor)
+}
+
 /// The CLI half of the learning loop. Same durable store the desktop drives —
 /// this module only renders it, so a candidate staged in the app is promotable
 /// here and vice versa.
@@ -763,6 +813,100 @@ fn run_learned(
                 None => current,
             };
             println!("Learning policy: {:?}", next.policy);
+            Ok(())
+        }
+        LearnedCmd::Quality {
+            command,
+            scope,
+            json,
+        } => {
+            let command = command.trim_start_matches('/');
+            let scope = SkillScope::from(*scope);
+            let summary = store
+                .learned_skills(&manager, workspace, &packages)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|entry| entry.command == command && entry.scope == scope)
+                .ok_or_else(|| format!("active learned /{command} was not found"))?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&summary.quality)
+                        .map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("/{command}: {:?}", summary.quality.state);
+                for reason in summary.quality.reasons {
+                    println!("  {reason}");
+                }
+                println!(
+                    "  verified: {}/{}",
+                    summary.quality.verified_successes,
+                    summary.quality.verified_successes + summary.quality.verified_failures
+                );
+            }
+            Ok(())
+        }
+        LearnedCmd::ImprovementEvidence {
+            command,
+            scope,
+            json,
+        } => {
+            let command = command.trim_start_matches('/');
+            let scope = SkillScope::from(*scope);
+            let descriptor = learned_descriptor(&store, data_dir, workspace, command, scope)?;
+            let evidence = store
+                .improvement_evidence(scope, command, &descriptor.sha256)
+                .map_err(|error| error.to_string())?;
+            if *json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&evidence).map_err(|error| error.to_string())?
+                );
+            } else {
+                for item in evidence {
+                    println!(
+                        "{}  {:?} verification={:?} corrected={}",
+                        item.run_id, item.outcome, item.verification_passed, item.user_corrected
+                    );
+                }
+            }
+            Ok(())
+        }
+        LearnedCmd::Improve {
+            command,
+            scope,
+            run_ids,
+        } => {
+            let command = command.trim_start_matches('/');
+            let scope = SkillScope::from(*scope);
+            let descriptor = learned_descriptor(&store, data_dir, workspace, command, scope)?;
+            let resource_files = snapshot_skill_resources(&manager, &descriptor, workspace)
+                .map_err(|error| error.to_string())?;
+            let parent = ImprovementParent {
+                command: descriptor.command,
+                scope,
+                sha256: descriptor.sha256,
+                title: descriptor.name,
+                version: descriptor.version,
+                instructions: descriptor.instructions,
+                allowed_tools: descriptor.allowed_tools,
+                requirements: CandidateRequirements {
+                    bins: descriptor.requirements.bins,
+                    env: descriptor.requirements.env,
+                },
+                resource_files,
+            };
+            let candidate = store
+                .begin_improvement(&parent, run_ids)
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{} /{} parent={} selected={}",
+                candidate.candidate_id,
+                candidate.proposed_command,
+                candidate.parent_skill_sha256.unwrap_or_default(),
+                candidate.source_run_ids.len()
+            );
             Ok(())
         }
         LearnedCmd::List { json } => {

@@ -450,6 +450,13 @@ struct HistoryRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeSkillHistory {
+    pub sha256: String,
+    pub version: String,
+    pub stored_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct ManagedSkillState {
     #[serde(default = "default_true")]
@@ -680,6 +687,35 @@ impl NativeSkillManager {
         Ok(skills)
     }
 
+    /// Returns the native runtime's retained version metadata for one managed
+    /// command. Learning decorates this with its own provenance; it does not
+    /// maintain a second version database.
+    pub fn history(
+        &self,
+        scope: SkillScope,
+        primary_workspace: Option<&Path>,
+        command: &str,
+    ) -> Result<Vec<NativeSkillHistory>, SkillError> {
+        let _guard = self.lock()?;
+        let root = self.scope_root(scope, primary_workspace)?;
+        let state = load_state(&root)?;
+        Ok(state
+            .skills
+            .get(command)
+            .map(|entry| {
+                entry
+                    .history
+                    .iter()
+                    .map(|record| NativeSkillHistory {
+                        sha256: record.sha256.clone(),
+                        version: record.version.clone(),
+                        stored_at_unix_ms: record.stored_at_unix_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     /// Reads one bundled file from an installed skill's folder by its
     /// command name — the progressive-disclosure counterpart to `discover`'s
     /// `resource_files` listing: a model that has already invoked `/command`
@@ -771,9 +807,14 @@ impl NativeSkillManager {
                 if let Some(expected_source_path) = expected_source_path {
                     let current_source = fs::canonicalize(&candidate)
                         .map_err(|error| io_at("canonicalize skill source", &candidate, error))?;
-                    let expected_source = fs::canonicalize(expected_source_path).map_err(|error| {
-                        io_at("canonicalize expected skill source", expected_source_path, error)
-                    })?;
+                    let expected_source =
+                        fs::canonicalize(expected_source_path).map_err(|error| {
+                            io_at(
+                                "canonicalize expected skill source",
+                                expected_source_path,
+                                error,
+                            )
+                        })?;
                     if current_source != expected_source {
                         source_mismatch = true;
                         continue;
@@ -783,14 +824,15 @@ impl NativeSkillManager {
                 break;
             }
         }
-        let skill_dir = skill_dir
-            .ok_or_else(|| {
-                if source_mismatch {
-                    SkillError::Conflict(format!("/{command} resolved to a different skill source after invocation"))
-                } else {
-                    SkillError::NotFound(format!("no skill installed at /{command}"))
-                }
-            })?;
+        let skill_dir = skill_dir.ok_or_else(|| {
+            if source_mismatch {
+                SkillError::Conflict(format!(
+                    "/{command} resolved to a different skill source after invocation"
+                ))
+            } else {
+                SkillError::NotFound(format!("no skill installed at /{command}"))
+            }
+        })?;
         let relative = validate_relative_subdirectory(relative_path)?;
         if relative == Path::new("SKILL.md") {
             return Err(SkillError::Invalid(
@@ -4079,7 +4121,11 @@ esac
             )
             .unwrap();
         assert_eq!(contents, "reference");
-        fs::write(Path::new(&source_path).join("references/info.md"), "changed").unwrap();
+        fs::write(
+            Path::new(&source_path).join("references/info.md"),
+            "changed",
+        )
+        .unwrap();
         assert!(matches!(
             manager.read_resource_at_snapshot(
                 "summarize",
