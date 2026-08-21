@@ -117,6 +117,13 @@ requires:
 Review the requested scope. Report evidence, severity, and a concrete fix.
 ```
 
+The native-skill registry is live across desktop windows. Managed mutations
+emit an invalidation event, and the app watches the managed global root plus
+the global and workspace `.agents/skills`/`.littlemonkey/skills` roots. External
+edits trigger debounced rediscovery; a missing skill directory is watched
+through its nearest existing parent so creating the directory reattaches the
+recursive watch.
+
 ## Learned skills
 
 The loop, end to end:
