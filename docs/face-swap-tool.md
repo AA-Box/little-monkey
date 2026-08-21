@@ -1,6 +1,6 @@
 # GHOST face-swap Studio tool
 
-`examples/studio-tool-face-swap` is a local-only Studio sidecar. Its default
+`studio-tools/face-swap/studio-tool-face-swap` is a local-only Studio sidecar. Its default
 pipeline is:
 
 ```text
@@ -69,7 +69,7 @@ also accepts `FACE_SWAP_MODEL` for a local GHOST 3_256 model path.
 Open **Studio → Tools → Add your own binary** and select:
 
 ```text
-examples/studio-tool-face-swap
+studio-tools/face-swap/studio-tool-face-swap
 ```
 
 Every run requires the user to confirm they may use all supplied models. This

@@ -145,7 +145,7 @@ function run() {
       ...(codeformerModel
         ? ["--add-data", `${codeformerModel}${DATA_SEPARATOR}face-swap-models/models/codeformer.pth`]
         : []),
-      join(ROOT, "examples/studio-tool-face-swap.py"),
+      join(ROOT, "studio-tools/face-swap/studio-tool-face-swap.py"),
     ],
     { stdio: "inherit" },
   );
