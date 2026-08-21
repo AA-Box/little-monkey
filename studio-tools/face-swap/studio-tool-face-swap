@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TOOL_DATA_DIR="${LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR:-}"
+if [ -z "$TOOL_DATA_DIR" ]; then
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    TOOL_DATA_DIR="$XDG_CACHE_HOME/little-monkey/studio-tools/ghost-face-swap-local"
+  elif [ -n "${HOME:-}" ]; then
+    TOOL_DATA_DIR="$HOME/.cache/little-monkey/studio-tools/ghost-face-swap-local"
+  else
+    echo "Face Swap needs an app data directory. Set LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR." >&2
+    exit 1
+  fi
+fi
+VENV="${FACE_SWAP_VENV:-$TOOL_DATA_DIR/python}"
+REQUIREMENTS="$SCRIPT_DIR/studio-tool-face-swap-requirements.txt"
+STAMP="$VENV/.requirements.sha256"
+PYTHON="$VENV/bin/python"
+
+if [ ! -f "$REQUIREMENTS" ]; then
+  echo "Face Swap dependency manifest not found at $REQUIREMENTS." >&2
+  exit 1
+fi
+
+SYSTEM_PYTHON="${FACE_SWAP_SYSTEM_PYTHON:-}"
+if [ -z "$SYSTEM_PYTHON" ] && command -v python3 >/dev/null 2>&1; then
+  SYSTEM_PYTHON=$(command -v python3)
+fi
+if [ -z "$SYSTEM_PYTHON" ] && command -v python >/dev/null 2>&1; then
+  SYSTEM_PYTHON=$(command -v python)
+fi
+if [ -z "$SYSTEM_PYTHON" ] || [ ! -x "$SYSTEM_PYTHON" ]; then
+  echo "Face Swap needs Python 3.10–3.12. Install Python or set FACE_SWAP_SYSTEM_PYTHON." >&2
+  exit 1
+fi
+
+if [ ! -x "$PYTHON" ]; then
+  echo "Face Swap: creating its private Python environment at $VENV" >&2
+  "$SYSTEM_PYTHON" -m venv "$VENV"
+fi
+
+requirements_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$REQUIREMENTS" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$REQUIREMENTS" | awk '{print $1}'
+  else
+    "$SYSTEM_PYTHON" -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$REQUIREMENTS"
+  fi
+}
+
+REQUIREMENTS_SHA256=$(requirements_sha256)
+INSTALLED_SHA256=""
+if [ -f "$STAMP" ]; then
+  INSTALLED_SHA256=$(cat "$STAMP")
+fi
+if [ "$INSTALLED_SHA256" != "$REQUIREMENTS_SHA256" ]; then
+  echo "Face Swap: installing Python dependencies automatically (first launch only)" >&2
+  if ! "$PYTHON" -m pip --version >/dev/null 2>&1; then
+    "$PYTHON" -m ensurepip --upgrade
+  fi
+  "$PYTHON" -m pip install --disable-pip-version-check --upgrade pip
+  "$PYTHON" -m pip install --disable-pip-version-check --upgrade -r "$REQUIREMENTS"
+  printf '%s\n' "$REQUIREMENTS_SHA256" > "$STAMP"
+fi
+
+exec "$PYTHON" "$SCRIPT_DIR/studio-tool-face-swap.py" "$@"

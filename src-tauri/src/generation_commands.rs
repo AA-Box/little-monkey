@@ -1422,6 +1422,11 @@ fn tool_client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|error| error.to_string())
 }
 
+fn studio_tool_app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.profile_data_dir()
+        .map_err(|error| format!("Failed to resolve the Studio tool data directory: {error}"))
+}
+
 /// Starts a tool if it is not already running and returns what it declares.
 ///
 /// This is what makes a tool's UI appear: Studio draws its form from the
@@ -1433,8 +1438,12 @@ pub async fn studio_tool_manifest(
     tool_id: String,
 ) -> Result<studio_tools::ToolManifest, String> {
     let tool = find_tool(&app, &tool_id)?;
+    let app_data_dir = studio_tool_app_data_dir(&app)?;
     let client = tool_client(Duration::from_secs(30))?;
-    let (_, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    let (_, manifest) = state
+        .studio_tool
+        .ensure_ready(&tool, &app_data_dir, &client)
+        .await?;
     Ok(manifest)
 }
 
@@ -1451,8 +1460,12 @@ pub async fn studio_tool_run(
     inputs: std::collections::BTreeMap<String, serde_json::Value>,
 ) -> Result<Vec<GenerationEntry>, String> {
     let tool = find_tool(&app, &tool_id)?;
+    let app_data_dir = studio_tool_app_data_dir(&app)?;
     let client = tool_client(Duration::from_secs(30))?;
-    let (base_url, manifest) = state.studio_tool.ensure_ready(&tool, &client).await?;
+    let (base_url, manifest) = state
+        .studio_tool
+        .ensure_ready(&tool, &app_data_dir, &client)
+        .await?;
     let body = studio_tools::validate_inputs(&manifest, &inputs)?;
 
     let _ = app.emit(
