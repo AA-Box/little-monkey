@@ -10,7 +10,6 @@ import {
   type NativeSkillInstallPreview,
   type NativeSkillScope,
 } from "../../lib/nativeSkillsClient";
-import { skillLearningClient } from "../../lib/skillLearningClient";
 import { useNativeSkillsStore } from "../../store/nativeSkillsStore";
 import {
   skillActivationPolicyKey,
@@ -47,7 +46,6 @@ function SkillPolicySelect({ command, identity, defaultPolicy = "automatic" }: {
   const pinned = useSkillActivationPolicyStore((state) => state.isPinned(key));
   const setPolicy = useSkillActivationPolicyStore((state) => state.setPolicy);
   const setPinned = useSkillActivationPolicyStore((state) => state.setPinned);
-  const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
   return (
     <div className="flex items-center gap-1 text-[10px] text-faint">
       <label className="flex items-center gap-1">
@@ -57,7 +55,6 @@ function SkillPolicySelect({ command, identity, defaultPolicy = "automatic" }: {
           value={policy}
           onChange={(event) => {
             void setPolicy(key, event.target.value as SkillActivationPolicy);
-            bumpNativeSkills();
           }}
           className="h-6 rounded border border-border bg-background px-1 text-[10px] text-foreground"
         >
@@ -104,7 +101,9 @@ function groupByRepository(skills: NativeSkillDescriptor[]): { groups: RepoGroup
 }
 
 export function NativeSkillsManager() {
-  const [skills, setSkills] = useState<NativeSkillDescriptor[]>([]);
+  const skills = useNativeSkillsStore((state) => state.descriptors);
+  const registryError = useNativeSkillsStore((state) => state.error);
+  const refreshNativeSkills = useNativeSkillsStore((state) => state.refresh);
   const [scope, setScope] = useState<NativeSkillScope>("global");
   const [localPath, setLocalPath] = useState("");
   const [gitUrl, setGitUrl] = useState("");
@@ -113,23 +112,14 @@ export function NativeSkillsManager() {
   const [gitCandidates, setGitCandidates] = useState<{ pinnedCommit: string; list: GitSkillCandidate[] } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
-
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      // The learning-aware discovery: identical descriptors plus `learned`
-      // provenance for whichever active content hashes this app's learning
-      // loop installed, so a learned skill is visibly one here rather than
-      // only in the learning panel.
-      setSkills(await skillLearningClient.discover());
-      // Refresh is also the explicit invalidation point for Chat's frozen
-      // native-skill snapshots, including edits made outside the app.
-      bumpNativeSkills();
+      await refreshNativeSkills();
     } catch (reason) {
       setError(errorMessage(reason));
     }
-  }, []);
+  }, [refreshNativeSkills]);
 
   useEffect(() => { void refresh(); }, [refresh]);
 
@@ -238,7 +228,7 @@ export function NativeSkillsManager() {
         </Button>
       </div>
 
-      {error && <p className="rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">{error}</p>}
+      {(error ?? registryError) && <p className="rounded border border-danger bg-danger-soft px-2 py-1 text-xs text-danger">{error ?? registryError}</p>}
 
       <div className="grid gap-2 sm:grid-cols-[9rem_1fr_auto]">
         <select

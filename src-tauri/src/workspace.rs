@@ -393,6 +393,7 @@ pub fn set_primary_workspace_root(
     }
     record_recent(&app, Path::new(&info.path), &info.label);
     write_open_roots(&app, state.inner());
+    crate::native_skill_commands::sync_native_skill_watchers(&app);
     Ok(info)
 }
 
@@ -440,6 +441,7 @@ pub fn add_secondary_workspace_root(
 ) -> Result<WorkspaceRootInfo, String> {
     let info = add_secondary_workspace_root_impl(state.inner(), path)?;
     write_open_roots(&app, state.inner());
+    crate::native_skill_commands::sync_native_skill_watchers(&app);
     Ok(info)
 }
 
@@ -467,6 +469,7 @@ pub fn remove_secondary_workspace_root(
     remove_secondary_workspace_root_impl(state.inner(), id.clone())?;
     state.terminal.kill_workspace(&id, Some(&app));
     write_open_roots(&app, state.inner());
+    crate::native_skill_commands::sync_native_skill_watchers(&app);
     Ok(())
 }
 
@@ -649,6 +652,7 @@ pub fn restore_workspace_roots(
 ) -> Result<Vec<WorkspaceRootInfo>, String> {
     let infos = restore_workspace_roots_impl(state.inner(), read_open_roots(&app))?;
     write_open_roots(&app, state.inner());
+    crate::native_skill_commands::sync_native_skill_watchers(&app);
     Ok(infos)
 }
 
