@@ -107,6 +107,7 @@ export const studioLocale: Record<string, string> = {
   "Studio.tools.fromGallery": "Use the newest result",
   "Studio.tools.results": "Results",
   "Studio.tools.version": "Version {version}",
+  "Studio.tools.licenseDetails": "View license details",
 
   "Studio.noneForTab": "No model in your library can do this yet",
   "Studio.notDownloaded": "not downloaded",
