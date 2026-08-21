@@ -640,6 +640,52 @@ pub struct RecipeOutput {
     pub json: bool,
 }
 
+pub const AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AutonomousTaskGuidanceSnapshot {
+    pub guidance_id: String,
+    pub text: String,
+    pub applies_to: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AutonomousTaskOwnerSnapshot {
+    pub kind: String,
+    pub instance_id: String,
+    pub lease_epoch: u64,
+    pub lease_expires_at_ms: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+pub struct AutonomousTaskSnapshot {
+    pub schema_version: u32,
+    pub task_id: String,
+    pub objective: String,
+    pub source: String,
+    #[serde(default)]
+    pub relevant_files: Vec<String>,
+    pub current_workspace_revision: String,
+    pub max_repair_rounds: u32,
+    pub max_workers: u32,
+    #[serde(default)]
+    pub guidance: Vec<AutonomousTaskGuidanceSnapshot>,
+    #[serde(default)]
+    pub delivery_intent: Option<String>,
+    #[serde(default)]
+    pub execution_owner: Option<AutonomousTaskOwnerSnapshot>,
+    /// The exact durable task state captured at handoff, when submitted by
+    /// the desktop coordinator. CLI-created recipes may omit it.
+    #[serde(default)]
+    pub task_snapshot: Option<serde_json::Value>,
+    /// Succeeded node IDs from the desktop coordinator at handoff.
+    #[serde(default)]
+    pub completed_nodes: Vec<String>,
+    /// The node at the exact durable execution boundary.
+    #[serde(default)]
+    pub next_node_id: Option<String>,
+}
+
 /// A saved recipe, parsed from YAML or JSON (extension-sniffed — see
 /// [`parse_recipe`]). `permission_mode` deliberately has NO `#[serde(default)]`:
 /// omitting it from the recipe file is a hard parse error, not a silent
@@ -697,6 +743,11 @@ pub struct Recipe {
     /// submitter's policy and budgets.
     #[serde(default)]
     pub placed_run: Option<crate::node_placement::PlacedRunSnapshot>,
+    /// Frozen Universal AutonomousTask coordinator input. The daemon owns the
+    /// execution after this snapshot is accepted; it never reconstructs the
+    /// task from a recipe name or mutable desktop state.
+    #[serde(default)]
+    pub autonomous_task: Option<AutonomousTaskSnapshot>,
 }
 
 fn is_valid_recipe_name(name: &str) -> bool {
@@ -773,6 +824,65 @@ pub fn validate_recipe(recipe: &Recipe) -> Result<(), String> {
             return Err("a recipe cannot be both a desktop turn and a placed run".to_string());
         }
         placed.validate()?;
+    }
+    if let Some(task) = &recipe.autonomous_task {
+        if task.schema_version != AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported autonomous task snapshot version {} (expected {})",
+                task.schema_version, AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION
+            ));
+        }
+        if task.task_id.trim().is_empty() || task.objective.trim().is_empty() {
+            return Err("autonomous task snapshot requires task_id and objective".to_string());
+        }
+        if task.current_workspace_revision.trim().is_empty() {
+            return Err("autonomous task snapshot requires a workspace revision".to_string());
+        }
+        if !(1..=16).contains(&task.max_workers) {
+            return Err("autonomous task max_workers must be between 1 and 16".to_string());
+        }
+        if task.max_repair_rounds > 8 {
+            return Err("autonomous task max_repair_rounds must be at most 8".to_string());
+        }
+        for file in &task.relevant_files {
+            let path = std::path::Path::new(file);
+            if path.is_absolute() || file.split('/').any(|part| part == "..") {
+                return Err(format!(
+                    "autonomous task file scope escapes the workspace: {file}"
+                ));
+            }
+        }
+        if task.guidance.len() > 32 {
+            return Err("autonomous task guidance exceeds 32 items".to_string());
+        }
+        if task.completed_nodes.len() > 64 {
+            return Err("autonomous task completed node list exceeds 64 items".to_string());
+        }
+        if let Some(task_snapshot) = &task.task_snapshot {
+            let snapshot_bytes = serde_json::to_vec(task_snapshot).map_err(|error| {
+                format!("autonomous task snapshot is not serializable: {error}")
+            })?;
+            if snapshot_bytes.len() > 512 * 1024 {
+                return Err("autonomous task snapshot exceeds 512 KiB".to_string());
+            }
+        }
+        if let Some(owner) = &task.execution_owner {
+            if owner.instance_id.trim().is_empty()
+                || owner.lease_epoch == 0
+                || owner.lease_expires_at_ms == 0
+            {
+                return Err("autonomous task execution owner has an invalid lease".to_string());
+            }
+            if !matches!(owner.kind.as_str(), "desktop" | "daemon" | "remote") {
+                return Err(format!(
+                    "unsupported autonomous task execution owner '{}'",
+                    owner.kind
+                ));
+            }
+        }
+        if recipe.desktop_turn.is_some() {
+            return Err("an autonomous task recipe cannot also be a desktop turn".to_string());
+        }
     }
     Ok(())
 }
@@ -1431,7 +1541,38 @@ mod tests {
             channel_send: None,
             desktop_turn: None,
             placed_run: None,
+            autonomous_task: None,
         }
+    }
+
+    #[test]
+    fn autonomous_snapshot_requires_bounded_scopes_and_a_valid_owner_lease() {
+        let mut recipe = valid_recipe();
+        recipe.autonomous_task = Some(AutonomousTaskSnapshot {
+            schema_version: AUTONOMOUS_TASK_RECIPE_SCHEMA_VERSION,
+            task_id: "task-1".to_string(),
+            objective: "update the parser".to_string(),
+            source: "cli".to_string(),
+            relevant_files: vec!["src/parser.rs".to_string()],
+            current_workspace_revision: "revision-1".to_string(),
+            max_repair_rounds: 2,
+            max_workers: 4,
+            guidance: Vec::new(),
+            delivery_intent: Some("leave_worktree".to_string()),
+            execution_owner: Some(AutonomousTaskOwnerSnapshot {
+                kind: "daemon".to_string(),
+                instance_id: "daemon-1".to_string(),
+                lease_epoch: 1,
+                lease_expires_at_ms: 10,
+            }),
+            task_snapshot: None,
+            completed_nodes: Vec::new(),
+            next_node_id: Some("plan".to_string()),
+        });
+        validate_recipe(&recipe).expect("valid autonomous snapshot");
+        recipe.autonomous_task.as_mut().unwrap().relevant_files = vec!["../secret".to_string()];
+        let error = validate_recipe(&recipe).unwrap_err();
+        assert!(error.contains("escapes the workspace"));
     }
 
     /// **The policy really does survive the trip** (roadmap K17 S3).

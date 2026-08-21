@@ -52,7 +52,7 @@ describe("autonomous task execution", () => {
   it("runs a bounded plan, records authoritative evidence, and completes", async () => {
     const initial = task();
     const runtime: AutonomousTaskRuntime = {
-      executeNode: async (current, node) => ({ ok: true, summary: `${node.nodeId} complete`, evidence: node.taskClass === "investigation" ? [evidence(current, 0, "objective-worker")] : undefined }),
+      executeNode: async (current, node) => ({ ok: true, summary: `${node.nodeId} complete`, workspaceRevision: node.taskClass === "implementation" || node.taskClass === "integration" ? "r1" : undefined, evidence: node.taskClass === "investigation" ? [evidence(current, 0, "objective-worker")] : undefined }),
       verify: async (current) => ({ ok: true, summary: "checks passed", evidence: [evidence(current, 2, "verification")] }),
       review: async (current) => ({ ok: true, summary: "review passed", evidence: current.acceptanceCriteria.filter((criterion) => criterion.method === "review").map((criterion) => ({ ...evidence(current, current.acceptanceCriteria.indexOf(criterion), `review-${criterion.id}`), criterionId: criterion.id })) }),
     };
@@ -70,9 +70,9 @@ describe("autonomous task execution", () => {
     const runtime: AutonomousTaskRuntime = {
       executeNode: async (_current, node) => {
         if (node.taskClass === "implementation") { active += 1; maxActive = Math.max(maxActive, active); await Promise.resolve(); active -= 1; }
-        return { ok: true, summary: node.nodeId };
+        return { ok: true, summary: node.nodeId, workspaceRevision: node.taskClass === "implementation" || node.taskClass === "integration" ? "r1" : undefined };
       },
-      integrate: async () => ({ ok: true, summary: "integrated" }),
+      integrate: async () => ({ ok: true, summary: "integrated", workspaceRevision: "r1" }),
       verify: async (current) => ({ ok: true, summary: "verified", evidence: [evidence(current, 2, "verification")] }),
       review: async (current) => ({ ok: true, summary: "reviewed", evidence: current.acceptanceCriteria.filter((criterion) => criterion.method === "review").map((criterion) => ({ ...evidence(current, current.acceptanceCriteria.indexOf(criterion), `review-${criterion.id}`), criterionId: criterion.id })) }),
     };
@@ -82,7 +82,7 @@ describe("autonomous task execution", () => {
   });
 
   it("does not synthesize acceptance evidence", async () => {
-    const result = await runAutonomousTask({ task: task(), resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: { executeNode: async (_current, node) => ({ ok: true, summary: node.nodeId }), verify: async () => ({ ok: true, summary: "no evidence" }), review: async () => ({ ok: true, summary: "no evidence" }) } });
+    const result = await runAutonomousTask({ task: task(), resolvedTarget: { kind: "provider", providerId: "test", model: "model" } as never, runtime: { executeNode: async (_current, node) => ({ ok: true, summary: node.nodeId, workspaceRevision: node.taskClass === "implementation" || node.taskClass === "integration" ? "r1" : undefined }), verify: async () => ({ ok: true, summary: "no evidence" }), review: async () => ({ ok: true, summary: "no evidence" }) } });
     expect(result.outcome).toBe("WAITING_USER");
     expect(hasAuthoritativeAcceptanceEvidence(result)).toBe(false);
   });
