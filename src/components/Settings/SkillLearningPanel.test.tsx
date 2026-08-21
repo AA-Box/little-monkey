@@ -13,7 +13,7 @@ const mocks = vi.hoisted(() => ({
     runEvidence: vi.fn(),
     beginImprovement: vi.fn(),
   },
-  bump: vi.fn(),
+  refreshNativeSkills: vi.fn(),
   clearFocus: vi.fn(),
   draftCandidate: vi.fn(),
 }));
@@ -39,7 +39,8 @@ vi.mock("../../lib/nativeSkillsClient", async () => {
 });
 vi.mock("../../lib/skillLearningReflection", () => ({ draftCandidate: mocks.draftCandidate }));
 vi.mock("../../store/nativeSkillsStore", () => ({
-  useNativeSkillsStore: (selector: (state: { bump: () => void }) => unknown) => selector({ bump: mocks.bump }),
+  useNativeSkillsStore: (selector: (state: { descriptors: unknown[]; refresh: () => Promise<void> }) => unknown) =>
+    selector({ descriptors: [], refresh: mocks.refreshNativeSkills }),
 }));
 vi.mock("../../store/skillLearningFocusStore", () => ({
   useSkillLearningFocusStore: (
@@ -143,6 +144,7 @@ beforeEach(() => {
   mocks.client.listCandidates.mockResolvedValue([]);
   mocks.client.learnedSkills.mockResolvedValue([summary]);
   mocks.client.discover.mockResolvedValue([]);
+  mocks.refreshNativeSkills.mockResolvedValue(undefined);
   mocks.client.evaluations.mockResolvedValue([]);
   mocks.client.improvementEvidence.mockResolvedValue(
     Array.from({ length: 6 }, (_, index) => ({

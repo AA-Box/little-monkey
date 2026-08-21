@@ -183,7 +183,6 @@ export function SkillLearningPanel() {
    * command — the "before" half of an update candidate's diff. Loaded from the
    * same discovery the native skill list uses, so it is what a future run
    * would actually read, not a stored copy. */
-  const [installedBody, setInstalledBody] = useState<Record<string, string>>({});
   const [improvementEvidence, setImprovementEvidence] = useState<Record<string, ImprovementEvidence[]>>({});
   const [selectedImprovementEvidence, setSelectedImprovementEvidence] = useState<Record<string, string[]>>({});
   const [runEvidence, setRunEvidence] = useState<Record<string, RunEvidence>>({});
@@ -191,7 +190,11 @@ export function SkillLearningPanel() {
   const [qualityDetailsOpen, setQualityDetailsOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
+  const descriptors = useNativeSkillsStore((state) => state.descriptors);
+  const refreshNativeSkills = useNativeSkillsStore((state) => state.refresh);
+  /** The current installed instructions are the "before" half of an update
+   * candidate, read from the shared native-skill registry. */
+  const installedBody = Object.fromEntries(descriptors.map((entry) => [entry.command, entry.instructions]));
   const skillFocus = useSkillLearningFocusStore((state) => state.focus);
   const clearFocus = useSkillLearningFocusStore((state) => state.clear);
   const [focusedInstalledKey, setFocusedInstalledKey] = useState<string | null>(null);
@@ -199,16 +202,15 @@ export function SkillLearningPanel() {
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [nextSettings, nextCandidates, nextLearned, descriptors] = await Promise.all([
+      const [nextSettings, nextCandidates, nextLearned] = await Promise.all([
         skillLearningClient.settings(),
         skillLearningClient.listCandidates(),
         skillLearningClient.learnedSkills(),
-        skillLearningClient.discover(),
+        refreshNativeSkills(),
       ]);
       setSettings(nextSettings);
       setCandidates(nextCandidates);
       setLearned(nextLearned);
-      setInstalledBody(Object.fromEntries(descriptors.map((entry) => [entry.command, entry.instructions])));
       const withEvaluations = await Promise.all(
         nextCandidates
           .filter((candidate) => candidate.evaluation_ids.length > 0)
@@ -218,7 +220,7 @@ export function SkillLearningPanel() {
     } catch (reason) {
       setError(errorMessage(reason));
     }
-  }, []);
+  }, [refreshNativeSkills]);
 
   useEffect(() => {
     void refresh();
@@ -249,7 +251,6 @@ export function SkillLearningPanel() {
     setError(null);
     try {
       await operation();
-      bumpNativeSkills();
       await refresh();
     } catch (reason) {
       setError(errorMessage(reason));
