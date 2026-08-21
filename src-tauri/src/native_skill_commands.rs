@@ -6,7 +6,6 @@
 //! and collision-checked by the shared core on each discovery.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -23,9 +22,9 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{Emitter, Manager};
 
 #[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 pub const NATIVE_SKILLS_CHANGED_EVENT: &str = "native-skills://changed";
 
@@ -43,24 +42,18 @@ struct NativeSkillWatchEvent {
     recreate_watcher: bool,
 }
 
+#[cfg(unix)]
 fn watch_path_identity(path: &Path) -> Option<(u64, u64)> {
     let metadata = fs::symlink_metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        Some((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(windows)]
-    {
-        Some((
-            u64::from(metadata.volume_serial_number()?),
-            metadata.file_index()?,
-        ))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        None
-    }
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn watch_path_identity(_path: &Path) -> Option<(u64, u64)> {
+    // Windows deliberately relies on root remove/rename notifications here.
+    // The std::os::windows::fs identity methods are still unstable, and adding
+    // unsafe Win32 handle plumbing is unnecessary for this defensive path.
+    None
 }
 
 fn watcher_event_requires_recreation(
@@ -577,5 +570,24 @@ mod tests {
     fn changed_directory_identity_requests_recreation_for_coalesced_events() {
         assert!(identity_requires_recreation(Some((1, 2)), Some((3, 4))));
         assert!(!identity_requires_recreation(Some((1, 2)), Some((1, 2))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_root_events_recreate_without_directory_identity() {
+        let root = PathBuf::from(r"C:\native-skill-root");
+        let removed = Event {
+            kind: EventKind::Remove(RemoveKind::Folder),
+            paths: vec![root.clone()],
+            attrs: Default::default(),
+        };
+        let renamed = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            paths: vec![root.clone()],
+            attrs: Default::default(),
+        };
+
+        assert!(watcher_event_requires_recreation(&removed, &root, None));
+        assert!(watcher_event_requires_recreation(&renamed, &root, None));
     }
 }
