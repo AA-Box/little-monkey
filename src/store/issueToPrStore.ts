@@ -3,7 +3,7 @@ import { create } from "zustand";
 import * as api from "../lib/issueToPr";
 import type { IssueToPrRun } from "../lib/issueToPr";
 import { isTerminalIssueToPrStatus } from "../lib/issueToPr";
-import { runIssueToPrAgent } from "../lib/issueToPrRunner";
+import * as issueToPrRunner from "../lib/issueToPrRunner";
 import { errorMessage } from "../lib/errors";
 
 function errorText(error: unknown): string {
@@ -16,6 +16,10 @@ function errorText(error: unknown): string {
  * for no benefit). */
 const controllers = new Map<string, AbortController>();
 let unlisten: (() => void) | null = null;
+const runIssueToPrAgent = issueToPrRunner.runIssueToPrAgent;
+const autonomousIssueRunner = "runIssueToPrAutonomousTask" in issueToPrRunner
+  ? issueToPrRunner.runIssueToPrAutonomousTask
+  : null;
 
 /** Test-only: clears in-flight run controllers. This module's `controllers`
  * map is process-lifetime by design (see the comment above it), which means
@@ -88,7 +92,7 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
     controllers.set(run.runId, controller);
     try {
       await api.advanceIssueToPr(run.runId, "implementing");
-      const result = await runIssueToPrAgent({
+      const result = await (autonomousIssueRunner ?? runIssueToPrAgent)({
         runId: run.runId,
         repositorySlug: run.repositorySlug,
         issueNumber: run.issueNumber,

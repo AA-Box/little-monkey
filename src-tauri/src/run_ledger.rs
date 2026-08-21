@@ -5253,6 +5253,7 @@ fn derive_event_effects(event: &RunEvent) -> EventEffects<'_> {
                 reason,
             },
         ),
+        RunEvent::TaskEvent { .. } => ("task_event", None, Projection::None),
         // Neither half of a migration changes the run's status, and that is
         // deliberate. A departure is an attempt the target can still refuse, so
         // it must not close the run; an arrival re-opens nothing, because the
