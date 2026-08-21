@@ -83,6 +83,25 @@ def safe_members(archive: zipfile.ZipFile | tarfile.TarFile):
         yield member
 
 
+def extract_tar_safely(archive: tarfile.TarFile, destination: Path) -> None:
+    root = destination.resolve()
+    for member in safe_members(archive):
+        target = (root / member.name).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"archive traversal path: {member.name}")
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if not member.isfile():
+            raise RuntimeError(f"unsupported archive member: {member.name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise RuntimeError(f"unreadable archive member: {member.name}")
+        with source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
+
+
 def download_licenses(root: Path) -> None:
     licenses = root / "licenses"
     licenses.mkdir(parents=True, exist_ok=True)
@@ -128,8 +147,7 @@ def prepare(root: Path, include_codeformer: bool) -> None:
     with tempfile.TemporaryDirectory(dir=cache) as temporary:
         extracted = Path(temporary)
         with tarfile.open(cache / "codeformer-v0.1.0.tar.gz") as archive:
-            list(safe_members(archive))
-            archive.extractall(extracted)
+            extract_tar_safely(archive, extracted)
         unpacked = next(extracted.glob("CodeFormer-*/basicsr"), None)
         if unpacked is None:
             raise RuntimeError("CodeFormer archive is missing basicsr/")
