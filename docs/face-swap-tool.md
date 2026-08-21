@@ -7,10 +7,11 @@ pipeline is:
 InsightFace detection/embedding → GHOST 3_256 → optional CodeFormer
 ```
 
-No weights are stored in this repository and the sidecar never downloads them.
-The Studio checkbox records the user's acknowledgement; it does not grant a
-model license. The user/build publisher must verify the exact checkpoint terms,
-consent, privacy, and applicable biometric requirements.
+No weights are stored in this repository. After the user acknowledges the
+non-commercial notice, the sidecar downloads pinned public model assets to the
+app's private Studio-tool data directory and verifies their SHA-256 hashes.
+The acknowledgement does not grant a model license; users remain responsible
+for consent, privacy, and applicable biometric requirements.
 
 ## Automatic runtime setup
 
@@ -26,7 +27,11 @@ The launcher prints setup progress to the Studio tool log. No terminal command
 or manual `pip install` step is required. `FACE_SWAP_VENV` remains available
 for a deliberate test or packaging override; it is not the production default.
 
-Provide the model root yourself:
+The default first run downloads `buffalo_l`, GHOST 3_256, and the GHOST
+embedding converter automatically. Published Studio builds are discovered from
+the signed face-swap catalog automatically; the local launcher remains the
+fallback for development and offline installs. To use a separately licensed/custom pack,
+provide the model root yourself:
 
 ```sh
 export FACE_SWAP_MODEL_ROOT=/absolute/path/to/licensed-model-root
@@ -42,9 +47,10 @@ $FACE_SWAP_MODEL_ROOT/models/ghost_3_256.onnx
 $FACE_SWAP_MODEL_ROOT/models/crossface_ghost.onnx
 ```
 
-The public InsightFace model packs are not automatically commercially cleared;
-the SDK license and model license are separate. `FACE_SWAP_FACE_PACK` defaults
-to `buffalo_l`. `FACE_SWAP_PROVIDER=cpu` is the safest default.
+The public InsightFace model packs are not commercially cleared; the SDK license
+and model license are separate. `FACE_SWAP_FACE_PACK` defaults to `buffalo_l`.
+`FACE_SWAP_PROVIDER=cpu` is the safest default. Set
+`FACE_SWAP_DISABLE_AUTO_DOWNLOAD=1` to require all model files to already exist.
 
 This tool is explicitly **non-commercial use only** when using the public
 InsightFace model pack. Studio displays that warning on the available-tool card
@@ -66,7 +72,9 @@ export FACE_SWAP_EMBEDDING_CONVERTER_SHA256=<converter-sha256>
 The values above are placeholders and must not be copied literally. The tool
 also accepts `FACE_SWAP_MODEL` for a local GHOST 3_256 model path.
 
-Open **Studio → Tools → Add your own binary** and select:
+After the published catalog refreshes, open **Studio → Tools** and click **Install**
+on Face Swap. You do not need to add a binary manually. **Add your own binary**
+and **Import catalog** remain available for offline/self-hosted installs:
 
 ```text
 studio-tools/face-swap/studio-tool-face-swap
@@ -78,10 +86,12 @@ is an acknowledgement gate, not a substitute for a license.
 ## Optional CodeFormer restoration
 
 CodeFormer is opt-in because its project license is not a blanket commercial
-license. When the user selects CodeFormer in Studio, its optional PyTorch
-dependencies are downloaded and installed automatically into the same private
-environment. The official CodeFormer checkout and checkpoint must still be
-supplied locally:
+license. Here, “source” means the CodeFormer program checkout — not the input
+image. When the user selects CodeFormer in Studio, its optional PyTorch
+dependencies, official source checkout, and trained checkpoint (`codeformer.pth`)
+are downloaded and installed automatically into the same private environment.
+The source and checkpoint are pinned and SHA-256 verified. To use separately
+licensed/custom files instead, provide:
 
 ```sh
 export FACE_SWAP_CODEFORMER_HOME=/absolute/path/to/pinned/CodeFormer
@@ -89,9 +99,9 @@ export FACE_SWAP_CODEFORMER_MODEL=/absolute/path/to/model-root/models/codeformer
 export FACE_SWAP_CODEFORMER_SHA256=<codeformer-sha256>
 ```
 
-The Studio restorer choice is **CodeFormer (user-supplied)**. The official
-CodeFormer checkout and `codeformer.pth` must be supplied locally; only the
-Python dependencies are downloaded automatically.
+The Studio restorer choice is **CodeFormer**. It remains non-commercial under
+its upstream S-Lab license, and automatic download happens only after the
+non-commercial acknowledgement.
 
 ## Build a managed one-file tool
 
@@ -103,6 +113,7 @@ export FACE_SWAP_MODEL_ROOT=/absolute/path/to/licensed-model-root
 export FACE_SWAP_MODEL_LICENSE_FILE=/absolute/path/to/model-license.txt
 export FACE_SWAP_PYTHON=/absolute/path/to/python-with-face-swap-dependencies
 export FACE_SWAP_DOWNLOAD_URL=https://downloads.example.com/face-swap-ghost-3-256
+export FACE_SWAP_SIGNING_KEY="$(cat /secure/path/to/ed25519-private-key.pem)"
 pnpm face-swap:package
 ```
 
@@ -115,8 +126,10 @@ export FACE_SWAP_CODEFORMER_LICENSE_FILE=/absolute/path/to/codeformer-license.tx
 ```
 
 The builder requires model-license evidence, records SHA-256 metadata for the
-embedded models, and writes the executable to
-`packaging/face-swap/dist/`. The catalog is written only for an HTTPS URL.
+embedded models, signs the catalog with the pinned release key, and writes the
+executable to `packaging/face-swap/dist/`. The production workflow publishes
+platform binaries plus a rolling signed catalog; Studio refreshes that catalog
+automatically after the app release contains the signed-key verifier.
 
 References: [GHOST](https://github.com/ai-forever/ghost), [FaceFusion GHOST
 definitions](https://github.com/facefusion/facefusion/blob/master/facefusion/processors/modules/face_swapper/core.py),

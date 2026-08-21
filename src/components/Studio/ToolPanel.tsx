@@ -26,6 +26,7 @@ import {
   missingRequired,
   toolDefaults,
   toolsClient,
+  DEFAULT_STUDIO_TOOL_CATALOG_URL,
   type StudioTool,
   type ToolInput,
   type ToolInputs,
@@ -75,11 +76,18 @@ export function ToolPanel({ railSlot }: Props) {
     void refresh();
   }, [refresh]);
 
-  // The registry is the operator-editable component feed the Runtime Hub
-  // already reads. A failure here is not worth an error banner: it only means
-  // the "available" list stays empty, and the installed list — the half that
-  // matters — is unaffected.
+  // Refresh the publisher's signed Studio-tool catalog in the background. A
+  // failure is not worth an error banner: offline users can still see tools
+  // already imported or installed, and the catalog can be retried next launch.
   const loadAvailable = useCallback(async () => {
+    try {
+      await runtimeHubClient.componentSyncCatalog({
+        operationId: createM3OperationId("studio-tools-catalog"),
+        url: DEFAULT_STUDIO_TOOL_CATALOG_URL,
+      });
+    } catch {
+      // Catalog discovery is best-effort; install still verifies the artifact.
+    }
     try {
       const entries = await runtimeHubClient.componentListRegistry({
         operationId: createM3OperationId("studio-tools"),
@@ -94,9 +102,7 @@ export function ToolPanel({ railSlot }: Props) {
     void loadAvailable();
   }, [loadAvailable]);
 
-  /** A catalog is a small JSON file a publisher hands out. Importing one is
-   *  what puts entries behind the Install buttons below — the registry starts
-   *  empty and there is no catalog server to poll. */
+  /** Manual import remains the air-gapped/self-hosted fallback. */
   const importCatalog = async () => {
     const picked = await open({
       directory: false,

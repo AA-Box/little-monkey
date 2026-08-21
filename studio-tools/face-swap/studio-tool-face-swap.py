@@ -3,10 +3,11 @@
 
 The process is intentionally small and local-only. It loads an
 InsightFace face-analysis pack for detection/embeddings, then runs a selected
-GHOST ONNX model directly. CodeFormer restoration is optional and only loads
-from a pinned, user-supplied checkout and checkpoint. The launcher creates an
-isolated environment and installs the base requirements on first launch. Model
-files remain separate because their licenses and user rights must be verified.
+GHOST ONNX model directly. CodeFormer restoration is optional and loads from a
+pinned checkout and checkpoint that the sidecar provisions automatically after
+the acknowledgement gate. The launcher creates an isolated environment and
+installs the base requirements on first launch. Model files remain separate
+because their licenses and user rights must be verified.
 """
 
 from __future__ import annotations
@@ -14,12 +15,19 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hashlib
 import ipaddress
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
+import urllib.error
+import urllib.request
+import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,8 +39,8 @@ MANIFEST = {
     "id": "ghost-face-swap-local",
     "name": "Face Swap (GHOST 3_256)",
     "description": (
-        "Local face replacement using user-supplied GHOST weights. Use only images and identities "
-        "you have permission to edit."
+        "Local face replacement using the pinned GHOST 3_256 pipeline. Use only images and "
+        "identities you have permission to edit."
     ),
     "licenseNotice": {
         "title": "Non-commercial use only",
@@ -77,10 +85,10 @@ MANIFEST = {
             "required": False,
             "options": [
                 {"value": "none", "label": "None"},
-                {"value": "codeformer", "label": "CodeFormer (user-supplied)"},
+                {"value": "codeformer", "label": "CodeFormer (automatic setup)"},
             ],
             "default": "none",
-            "hint": "CodeFormer can improve detail but may alter identity; it requires separately supplied files and license permission.",
+            "hint": "CodeFormer can improve detail but may alter identity; its source and checkpoint are downloaded and verified automatically after acknowledgement.",
         },
         {
             "key": "codeformer_weight",
@@ -147,6 +155,29 @@ MANIFEST = {
 MAX_BODY_BYTES = 64 * 1024 * 1024
 MAX_IMAGE_BASE64_CHARS = 32 * 1024 * 1024
 MAX_IMAGE_EDGE = 12_000
+MAX_MODEL_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MODEL_DOWNLOADS = {
+    "buffalo_l": {
+        "url": "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip",
+        "sha256": "80ffe37d8a5940d59a7384c201a2a38d4741f2f3c51eef46ebb28218a7b0ca2f",
+    },
+    "ghost_3_256": {
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/ghost_3_256.onnx",
+        "sha256": "308d87f565e881b8872a5cbe711f97faeda6643e5d2b95ef757cc92a58662abd",
+    },
+    "crossface_ghost": {
+        "url": "https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_ghost.onnx",
+        "sha256": "9ec5862d9ff1f723a7380ea89baf87cddec9c56670d4db766702657939284957",
+    },
+}
+CODEFORMER_SOURCE_DOWNLOAD = {
+    "url": "https://github.com/sczhou/CodeFormer/archive/refs/tags/v0.1.0.tar.gz",
+    "sha256": "b1dafa3c624d2e79587170d6ce77020753126b18e0656ff27f72622c61594c96",
+}
+CODEFORMER_MODEL_DOWNLOAD = {
+    "url": "https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth",
+    "sha256": "1009e537e0c2a07d4cabce6355f53cb66767cd4b4297ec7a4a64ca4b8a5684b7",
+}
 
 
 class ToolError(RuntimeError):
@@ -179,16 +210,186 @@ def bundled_root() -> Path | None:
 def model_root() -> Path:
     configured = os.environ.get("FACE_SWAP_MODEL_ROOT") or os.environ.get("INSIGHTFACE_HOME")
     bundle = bundled_root()
+    tool_data = os.environ.get("LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR")
+    if not configured and not bundle and tool_data:
+        return Path(tool_data).expanduser() / "models"
     candidates = [
         Path(configured).expanduser() if configured else None,
         bundle / "face-swap-models" if bundle else None,
+        Path(tool_data).expanduser() / "models" if tool_data else None,
         Path.cwd() / "models",
         Path("~/.insightface").expanduser(),
     ]
     for candidate in candidates:
         if candidate is not None and candidate.is_dir():
             return candidate
-    return Path(configured).expanduser() if configured else Path("~/.insightface").expanduser()
+    if configured:
+        return Path(configured).expanduser()
+    if tool_data:
+        return Path(tool_data).expanduser() / "models"
+    return Path("~/.insightface").expanduser()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _download_file(url: str, destination: Path, expected_sha256: str, label: str) -> None:
+    if destination.is_file():
+        actual = _sha256_file(destination)
+        if actual == expected_sha256:
+            return
+        raise ToolError(
+            f"{label} already exists but its checksum is not trusted; remove it or set an explicit path"
+        )
+    if os.environ.get("FACE_SWAP_DISABLE_AUTO_DOWNLOAD") == "1":
+        raise ToolError(
+            f"{label} is missing. Automatic model downloads are disabled by "
+            "FACE_SWAP_DISABLE_AUTO_DOWNLOAD=1."
+        )
+    if not url.startswith("https://"):
+        raise ToolError(f"{label} has an unsafe download URL")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_name(f".{destination.name}.part")
+    digest = hashlib.sha256()
+    size = 0
+    print(f"face-swap: downloading {label}", file=sys.stderr, flush=True)
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "LittleMonkey-FaceSwap/1"})
+        with urllib.request.urlopen(request, timeout=120) as response, partial.open("wb") as stream:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_MODEL_DOWNLOAD_BYTES:
+                raise ToolError(f"{label} exceeds the model download size limit")
+            for block in iter(lambda: response.read(1024 * 1024), b""):
+                size += len(block)
+                if size > MAX_MODEL_DOWNLOAD_BYTES:
+                    raise ToolError(f"{label} exceeds the model download size limit")
+                stream.write(block)
+                digest.update(block)
+        actual = digest.hexdigest()
+        if actual != expected_sha256:
+            raise ToolError(f"{label} checksum mismatch: expected {expected_sha256}, found {actual}")
+        partial.replace(destination)
+    except ToolError:
+        partial.unlink(missing_ok=True)
+        raise
+    except (OSError, urllib.error.URLError, ValueError) as error:
+        partial.unlink(missing_ok=True)
+        raise ToolError(f"Could not download {label}: {error}") from error
+
+
+def _safe_archive_path(root: Path, member_name: str) -> Path:
+    target = (root / member_name).resolve()
+    root = root.resolve()
+    if target != root and root not in target.parents:
+        raise ToolError("A downloaded model archive contains an unsafe path")
+    return target
+
+
+def _extract_zip(archive: Path, destination: Path) -> None:
+    with zipfile.ZipFile(archive) as bundle:
+        for member in bundle.infolist():
+            target = _safe_archive_path(destination, member.filename)
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.open(member) as source, target.open("wb") as sink:
+                shutil.copyfileobj(source, sink)
+
+
+def _extract_tar(archive: Path, destination: Path) -> None:
+    with tarfile.open(archive, "r:gz") as bundle:
+        for member in bundle.getmembers():
+            if member.issym() or member.islnk():
+                raise ToolError("A downloaded CodeFormer archive contains a link")
+            target = _safe_archive_path(destination, member.name)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = bundle.extractfile(member)
+            if source is None:
+                raise ToolError("A downloaded CodeFormer archive contains an unreadable file")
+            with source, target.open("wb") as sink:
+                shutil.copyfileobj(source, sink)
+
+
+def _find_extracted_file(root: Path, filename: str) -> Path:
+    matches = list(root.rglob(filename))
+    if len(matches) != 1:
+        raise ToolError(f"The downloaded model archive did not contain exactly one {filename}")
+    return matches[0]
+
+
+def ensure_model_assets(root: Path, pack_name: str) -> None:
+    """Download only pinned, public non-commercial assets after acknowledgement."""
+    if pack_name not in MODEL_DOWNLOADS:
+        return
+    model_dir = face_analysis_model_dir(root, pack_name)
+    required = ("det_10g.onnx", "w600k_r50.onnx", "genderage.onnx")
+    if not all((model_dir / name).is_file() for name in required):
+        archive = root / ".downloads" / f"{pack_name}.zip"
+        _download_file(
+            MODEL_DOWNLOADS[pack_name]["url"],
+            archive,
+            MODEL_DOWNLOADS[pack_name]["sha256"],
+            f"InsightFace {pack_name} model pack",
+        )
+        with tempfile.TemporaryDirectory(dir=archive.parent) as temporary:
+            extracted = Path(temporary)
+            _extract_zip(archive, extracted)
+            model_dir.mkdir(parents=True, exist_ok=True)
+            for filename in required:
+                source = _find_extracted_file(extracted, filename)
+                destination = model_dir / filename
+                if not destination.exists():
+                    shutil.copy2(source, destination)
+
+    models_dir = root / "models"
+    if not os.environ.get("FACE_SWAP_MODEL"):
+        _download_file(
+            MODEL_DOWNLOADS["ghost_3_256"]["url"],
+            models_dir / "ghost_3_256.onnx",
+            MODEL_DOWNLOADS["ghost_3_256"]["sha256"],
+            "GHOST 3_256 model",
+        )
+    if not os.environ.get("FACE_SWAP_EMBEDDING_CONVERTER"):
+        _download_file(
+            MODEL_DOWNLOADS["crossface_ghost"]["url"],
+            models_dir / "crossface_ghost.onnx",
+            MODEL_DOWNLOADS["crossface_ghost"]["sha256"],
+            "GHOST embedding converter",
+        )
+
+
+def ensure_codeformer_assets(root: Path) -> None:
+    source = root / "codeformer-source"
+    if not (source / "basicsr").is_dir() and not os.environ.get("FACE_SWAP_CODEFORMER_HOME"):
+        archive = root / ".downloads" / "codeformer-v0.1.0.tar.gz"
+        _download_file(
+            CODEFORMER_SOURCE_DOWNLOAD["url"],
+            archive,
+            CODEFORMER_SOURCE_DOWNLOAD["sha256"],
+            "CodeFormer source",
+        )
+        with tempfile.TemporaryDirectory(dir=archive.parent) as temporary:
+            extracted = Path(temporary)
+            _extract_tar(archive, extracted)
+            unpacked = _find_extracted_file(extracted, "basicsr")
+            source.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(unpacked.parent, source, dirs_exist_ok=True)
+    if not os.environ.get("FACE_SWAP_CODEFORMER_MODEL"):
+        _download_file(
+            CODEFORMER_MODEL_DOWNLOAD["url"],
+            root / "models" / "codeformer.pth",
+            CODEFORMER_MODEL_DOWNLOAD["sha256"],
+            "CodeFormer checkpoint",
+        )
 
 
 def face_analysis_model_dir(root: Path, pack_name: str) -> Path:
@@ -202,8 +403,9 @@ def require_face_analysis_models(root: Path, pack_name: str) -> Path:
     if missing:
         raise ToolError(
             f"Face-analysis pack '{pack_name}' is incomplete at {model_dir}; "
-            f"missing: {', '.join(missing)}. Dependencies install automatically, "
-            "but model files must be supplied with the required license permission."
+            f"missing: {', '.join(missing)}. The pinned public pack downloads "
+            "automatically after the non-commercial acknowledgement; custom packs "
+            "must be supplied with the required license permission."
         )
     for filename, env_name in (
         ("det_10g.onnx", "FACE_SWAP_DETECTOR_SHA256"),
@@ -269,6 +471,7 @@ def codeformer_root() -> Path:
     candidates = [
         Path(configured).expanduser() if configured else None,
         bundle / "codeformer-source" if bundle else None,
+        model_root() / "codeformer-source",
         Path.cwd() / "CodeFormer",
         Path.cwd() / "codeformer",
     ]
@@ -277,8 +480,9 @@ def codeformer_root() -> Path:
             return candidate
     searched = ", ".join(str(candidate) for candidate in candidates if candidate is not None)
     raise ToolError(
-        "CodeFormer source is missing. Set FACE_SWAP_CODEFORMER_HOME to a pinned "
-        f"checkout containing basicsr/ (searched: {searched})"
+        "CodeFormer source is missing. It should download automatically after the "
+        "non-commercial acknowledgement; otherwise set FACE_SWAP_CODEFORMER_HOME "
+        f"to a pinned checkout containing basicsr/ (searched: {searched})"
     )
 
 
@@ -367,6 +571,7 @@ class FaceSwapRuntime:
 
             root = model_root()
             pack_name = os.environ.get("FACE_SWAP_FACE_PACK", "buffalo_l")
+            ensure_model_assets(root, pack_name)
             require_face_analysis_models(root, pack_name)
             ghost_model = find_ghost_model(root, "ghost_3_256")
             converter_model = find_embedding_converter(root)
@@ -465,6 +670,11 @@ class FaceSwapRuntime:
                     "Automatic CodeFormer dependency setup failed. Check the pip "
                     "output and try the run again."
                 ) from error
+        # A PyInstaller build already contains the verified source and
+        # checkpoint; its temporary bundle directory is read-only, so never
+        # attempt the first-run downloader there.
+        if bundled_root() is None:
+            ensure_codeformer_assets(model_root())
         source = codeformer_root()
         model_path = find_codeformer_model(model_root())
         verify_sha256(model_path, "FACE_SWAP_CODEFORMER_SHA256", "CodeFormer model")

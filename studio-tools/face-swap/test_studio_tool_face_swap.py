@@ -57,6 +57,20 @@ class FaceSwapToolContractTests(unittest.TestCase):
             with self.assertRaises(MODULE.ToolError):
                 MODULE.require_face_analysis_models(Path("/tmp/does-not-exist"), "buffalo_l")
 
+    def test_public_model_downloads_are_pinned_and_https_only(self):
+        downloads = [
+            *MODULE.MODEL_DOWNLOADS.values(),
+            MODULE.CODEFORMER_SOURCE_DOWNLOAD,
+            MODULE.CODEFORMER_MODEL_DOWNLOAD,
+        ]
+        self.assertTrue(all(item["url"].startswith("https://") for item in downloads))
+        self.assertTrue(all(len(item["sha256"]) == 64 for item in downloads))
+        self.assertEqual(MODULE.CODEFORMER_MODEL_DOWNLOAD["url"].split("/")[-1], "codeformer.pth")
+
+    def test_archive_path_guard_rejects_traversal(self):
+        with self.assertRaises(MODULE.ToolError):
+            MODULE._safe_archive_path(Path("/tmp/models"), "../../outside")
+
     def test_ghost_weight_validation(self):
         self.assertEqual(MODULE.FaceSwapRuntime._weight(0.5), 0.5)
         with self.assertRaises(MODULE.ToolError):

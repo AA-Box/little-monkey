@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, sign as cryptoSign } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { canonicalJson } from "./lib/mlxPackage.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const OUTPUT = join(ROOT, "packaging/face-swap/dist");
@@ -13,6 +15,13 @@ const VERSION = process.env.FACE_SWAP_VERSION ?? "ghost-3_256-0.2.0";
 const COMPONENT_ID = "face-swap-ghost-3_256";
 const SOURCE_ID = "little-monkey-face-swap";
 const DATA_SEPARATOR = process.platform === "win32" ? ";" : ":";
+const TARGET_OS = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform;
+const TARGET_ARCH = process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : process.arch;
+const SIGNATURE_METADATA_KEYS = [
+  "publisherSignatureAlgorithm",
+  "publisherSignatureKeyId",
+  "publisherSignatureBase64",
+];
 
 function requiredDirectory(name, value) {
   if (!value) throw new Error(`${name} is required`);
@@ -34,6 +43,28 @@ function requiredFile(name, value) {
 
 function sha256File(file) {
   return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+function signCatalogEntry(entry, privateKeyPem) {
+  const key = createPrivateKey(privateKeyPem);
+  if (key.asymmetricKeyType !== "ed25519") {
+    throw new Error(`FACE_SWAP_SIGNING_KEY is ${key.asymmetricKeyType}, expected ed25519`);
+  }
+  const unsigned = {
+    ...entry,
+    metadata: { ...entry.metadata },
+  };
+  for (const name of SIGNATURE_METADATA_KEYS) delete unsigned.metadata[name];
+  const signature = cryptoSign(null, canonicalJson(unsigned), key).toString("base64");
+  return {
+    ...entry,
+    metadata: {
+      ...entry.metadata,
+      publisherSignatureAlgorithm: "ed25519",
+      publisherSignatureKeyId: process.env.FACE_SWAP_SIGNING_KEY_ID ?? "release-2026-1",
+      publisherSignatureBase64: signature,
+    },
+  };
 }
 
 function run() {
@@ -129,6 +160,10 @@ function run() {
             "torch",
             "--hidden-import",
             "torchvision",
+            "--collect-all",
+            "torch",
+            "--collect-all",
+            "torchvision",
             "--collect-submodules",
             "basicsr",
             "--hidden-import",
@@ -152,7 +187,7 @@ function run() {
 
   if (!existsSync(BINARY)) throw new Error(`PyInstaller did not produce ${BINARY}`);
   const bytes = readFileSync(BINARY);
-  const catalog = [
+  let catalog = [
     {
       schemaVersion: 1,
       sourceId: SOURCE_ID,
@@ -172,21 +207,25 @@ function run() {
         modelLicenseFile: "licenses/model-license.txt",
         sourceRepository: "https://github.com/ai-forever/ghost",
         embeddingConverter: "crossface_ghost.onnx",
-        models: [
-          ...["det_10g.onnx", "w600k_r50.onnx", "genderage.onnx"].map((name) => ({
-            name: `face-analysis/${name}`,
-            sha256: sha256File(join(modelRoot, "models", packName, name)),
-          })),
-          { name: "ghost", sha256: sha256File(ghostModel) },
-          { name: "crossface_ghost", sha256: sha256File(embeddingConverter) },
-          ...(codeformerModel ? [{ name: "codeformer", sha256: sha256File(codeformerModel) }] : []),
-        ],
-        codeformerLicenseFile: codeformerLicense ? "licenses/codeformer-license.txt" : null,
+        faceAnalysisDetectorSha256: sha256File(join(modelRoot, "models", packName, "det_10g.onnx")),
+        faceAnalysisRecognitionSha256: sha256File(join(modelRoot, "models", packName, "w600k_r50.onnx")),
+        faceAnalysisGenderageSha256: sha256File(join(modelRoot, "models", packName, "genderage.onnx")),
+        ghostModelSha256: sha256File(ghostModel),
+        embeddingConverterSha256: sha256File(embeddingConverter),
+        codeformerSha256: codeformerModel ? sha256File(codeformerModel) : "none",
+        codeformerLicenseFile: codeformerLicense ? "licenses/codeformer-license.txt" : "none",
+        targetOs: TARGET_OS,
+        targetArch: TARGET_ARCH,
       },
     },
   ];
   const catalogPath = join(ROOT, "packaging/face-swap/face-swap-catalog.json");
   if (downloadUrl) {
+    const signingKey = process.env.FACE_SWAP_SIGNING_KEY;
+    if (!signingKey) {
+      throw new Error("FACE_SWAP_SIGNING_KEY is required when publishing a managed catalog");
+    }
+    catalog = catalog.map((entry) => signCatalogEntry(entry, signingKey));
     mkdirSync(dirname(catalogPath), { recursive: true });
     writeFileSync(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
   }
