@@ -87,12 +87,12 @@ fn autonomous_emitter() -> ClientIdentity {
     }
 }
 
-fn autonomous_target(value: &str) -> Result<ModelTargetSnapshot, String> {
+fn autonomous_recipe_target(value: &str) -> Result<recipes::RecipeTarget, String> {
     let (kind, remainder) = value.split_once(':').ok_or_else(|| {
         "--target must be ollama:model, provider:model, managed:model, or local-url:url|model"
             .to_string()
     })?;
-    let target = match kind {
+    Ok(match kind {
         "ollama" => recipes::RecipeTarget {
             ollama: Some(remainder.to_string()),
             ..Default::default()
@@ -122,8 +122,7 @@ fn autonomous_target(value: &str) -> Result<ModelTargetSnapshot, String> {
             }
         }
         _ => return Err(format!("unsupported autonomous task target kind '{kind}'")),
-    };
-    snapshot_target(&target)
+    })
 }
 
 fn autonomous_workspace(path: Option<&Path>) -> Result<WorkspaceContext, String> {
@@ -156,51 +155,19 @@ pub fn autonomous_start(
     if objective.is_empty() {
         return Err("Autonomous task objective must not be empty".to_string());
     }
-    let target = autonomous_target(target)?;
+    let recipe_target = autonomous_recipe_target(target)?;
+    recipe_target.validate()?;
     let workspace = autonomous_workspace(workspace)?;
     let run_id = format!("task-{}", uuid::Uuid::new_v4());
-    let emitter = autonomous_emitter();
-    let mut policy = permission_policy(PermissionMode::Auto, DEFAULT_APPROVAL_TIMEOUT_MS);
-    policy.allow_network = false;
-    policy.allow_external_mutations = false;
-    let spec = RunSpec {
-        schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
-        run_id: run_id.clone(),
-        idempotency_key: format!("cli-autonomous/{run_id}"),
-        created_at_ms: unix_time_ms()?,
-        kind: RunKind::AutonomousTask,
-        submitted_by: emitter.clone(),
-        task: objective.to_string(),
-        instructions: Some("Universal Autonomous Task Coordinator; plan, delegate, verify, review, and deliver with durable evidence.".to_string()),
-        input_artifact_ids: Vec::new(),
-        target,
-        workspace: Some(workspace),
-        permission_policy: policy,
-        budgets: RunBudgets { wall_time_ms: DEFAULT_WALL_TIME_MS, max_iterations: 128, max_model_calls: 256, max_tool_calls: 512, max_input_tokens: 1_000_000, max_output_tokens: 250_000, max_cost_micros: None, max_artifact_bytes: 256 * 1024 * 1024, max_event_count: 20_000 },
-    };
-    let ledger = autonomous_ledger()?;
-    let (_recorder, disposition) =
-        DurableRunRecorder::submit(ledger, &spec, format!("task:{run_id}"))?;
-    match disposition {
-        SubmissionDisposition::Ready { .. } => {
-            let result = serde_json::json!({ "run_id": run_id, "task_id": run_id, "status": "queued", "kind": "autonomous_task" });
-            if json_output {
-                println!("{result}");
-            } else {
-                println!(
-                    "Queued autonomous task {}",
-                    result["run_id"].as_str().unwrap_or_default()
-                );
-            }
-            Ok(())
-        }
-        SubmissionDisposition::AlreadyTerminal(status) => {
-            Err(format!("run already terminal: {status:?}"))
-        }
-        SubmissionDisposition::InterruptedReplayRefused => {
-            Err("existing task run requires reconciliation".to_string())
-        }
+    let recipe = Recipe { version: recipes::RECIPE_SCHEMA_VERSION, name: format!("autonomous-{run_id}"), description: Some("Durable autonomous task queued through the resident daemon.".to_string()), target: recipe_target, workspace: workspace.roots.first().map(|root| root.canonical_path.clone()), permission_mode: "auto".to_string(), system: Some("Plan the objective using repository evidence, execute bounded work, run verification, review the diff, and report structured evidence. Do not claim success without checks.".to_string()), prompt: objective.to_string(), params: Default::default(), max_iterations: Some(128), timeout_seconds: Some(DEFAULT_WALL_TIME_MS / 1_000), output: recipes::RecipeOutput { json: true }, channel_send: None, desktop_turn: None, placed_run: None };
+    let queued = crate::daemon::enqueue_frozen_recipe(recipe, &run_id)?;
+    let result = serde_json::json!({ "run_id": queued.run_id, "task_id": queued.run_id, "job_id": queued.job_id, "status": "queued", "kind": "autonomous_task" });
+    if json_output {
+        println!("{result}");
+    } else {
+        println!("Queued autonomous task {}", queued.run_id);
     }
+    Ok(())
 }
 
 fn autonomous_run_json(run: &little_monkey_lib::run_ledger::StoredRun) -> serde_json::Value {
@@ -1406,6 +1373,7 @@ async fn run_inner(
         kind: match (&recipe.placed_run, &recipe.desktop_turn) {
             (Some(placed), _) => placed.kind.clone(),
             (_, Some(_)) => RunKind::Interactive,
+            _ if recipe.name.starts_with("autonomous-") => RunKind::AutonomousTask,
             _ => RunKind::Workflow,
         },
         submitted_by,

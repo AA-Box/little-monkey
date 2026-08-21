@@ -27,6 +27,7 @@ import { runHeadlessAgent } from './headlessAgentRunner';
 import { wrapUntrustedContent } from './untrustedContent';
 import { startAutonomousTask, type AutonomousTaskRuntime } from './autonomousTaskRunner';
 import type { AutonomousTask } from './autonomousTask';
+import { runIssueToPrChecks } from './issueToPr';
 
 /** Hard cap on model/tool round trips — generous relative to
  * `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS` (15) since a full issue
@@ -79,9 +80,15 @@ export async function runIssueToPrAutonomousTask(
       implementation = await runIssueToPrAgent({ ...params, runId: params.runId, signal: context.signal });
       return { ok: implementation.outcome === 'completed', summary: implementation.summary };
     },
-    integrate: async () => ({ ok: true, summary: 'Issue-to-PR owned worktree remains under the issue flow for explicit delivery.' }),
-    verify: async (current) => ({ ok: implementation?.outcome === 'completed', summary: implementation?.summary ?? 'Implementation did not complete.', evidence: implementation?.outcome === 'completed' ? [{ evidenceId: `issue-checks-${params.runId}`, criterionId: current.acceptanceCriteria[2].id, name: 'Issue-to-PR checks', passed: true, authoritative: true, stale: false, summary: implementation.summary, exitCode: 0, durationMs: 0, createdAtMs: Date.now() }] : undefined }),
-    review: async (current) => ({ ok: implementation?.outcome === 'completed', summary: implementation?.summary ?? 'No implementation report.', evidence: implementation?.outcome === 'completed' ? [{ evidenceId: `issue-review-${params.runId}`, criterionId: current.acceptanceCriteria[1].id, name: 'Issue-to-PR worker review', passed: true, authoritative: true, stale: false, summary: 'The issue flow retains changes in its owned worktree for human delivery review.', exitCode: 0, durationMs: 0, createdAtMs: Date.now() }] : undefined }),
+    integrate: async () => ({ ok: true, summary: 'The issue flow retains its owned worktree; no shared workspace mutation is performed.' }),
+    verify: async (current) => {
+      if (implementation?.outcome !== 'completed') return { ok: false, summary: implementation?.summary ?? 'Implementation did not complete.' };
+      const checked = await runIssueToPrChecks(params.runId);
+      const passed = checked.checks.length > 0 && checked.checks.every((check) => check.passed);
+      const criterion = current.acceptanceCriteria.find((candidate) => candidate.method === 'verification_command');
+      return { ok: passed, summary: passed ? 'Issue repository checks passed.' : checked.checks.map((check) => `${check.label}: ${check.outputExcerpt}`).join('\n') || 'No repository checks were configured.', evidence: [{ evidenceId: `issue-checks-${params.runId}`, criterionId: criterion?.id ?? null, name: 'Issue-to-PR checks', passed, authoritative: true, stale: false, summary: checked.checks.map((check) => `${check.label}: ${check.outputExcerpt}`).join('\n'), exitCode: passed ? 0 : 1, durationMs: 0, createdAtMs: Date.now(), source: 'command' }] };
+    },
+    review: async () => ({ ok: true, summary: 'Implementation and checks are complete; human review is required before GitHub delivery.' }),
   };
   const started = await startAutonomousTask({ objective: `Implement GitHub issue #${params.issueNumber}: ${params.issueTitle}`, sessionId: params.sessionId ?? null, constraints: { strategy: 'DELEGATE', source: 'issue', untrustedSource: true, allowExternalDelivery: false }, runtime, signal: params.signal });
   const result = await started.completion;

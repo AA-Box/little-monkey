@@ -36,6 +36,7 @@
 //! be a category error. The techniques (private dir, marker file, dirty-tree
 //! refusal) are mirrored instead.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -69,6 +70,9 @@ pub struct AgentWorktreeStatus {
     pub dirty: bool,
     /// `git diff --stat HEAD` output plus a line per untracked file.
     pub diffstat: String,
+    pub changed_files: Vec<String>,
+    pub base_revision: String,
+    pub patch_digest: String,
 }
 
 fn base_dir(data_root: &Path) -> PathBuf {
@@ -250,10 +254,59 @@ pub fn status(data_root: &Path, path: &str) -> Result<AgentWorktreeStatus, Strin
             diffstat.push_str(&format!("\n{} (untracked)", line[2..].trim()));
         }
     }
+    let base_revision = run_git_ok(wt, &["rev-parse", "HEAD"])?;
+    let mut hasher = Sha256::new();
+    hasher.update(base_revision.as_bytes());
+    hasher.update(
+        run_git_ok(wt, &["diff", "HEAD", "--binary"])
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    let changed_files = interesting
+        .iter()
+        .filter_map(|line| line.get(3..))
+        .map(|path| path.trim().trim_matches('"').to_string())
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    for path in &changed_files {
+        hasher.update(path.as_bytes());
+        if let Ok(bytes) = std::fs::read(wt.join(path)) {
+            hasher.update(bytes);
+        }
+    }
     Ok(AgentWorktreeStatus {
         dirty,
         diffstat: diffstat.trim().to_string(),
+        changed_files,
+        base_revision,
+        patch_digest: format!("{:x}", hasher.finalize()),
     })
+}
+
+pub fn workspace_revision(data_root: &Path, workspace_root: &Path) -> Result<String, String> {
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let head = run_git_ok(&root, &["rev-parse", "HEAD"])?;
+    let status = run_git_ok(&root, &["status", "--porcelain"])?;
+    let mut hasher = Sha256::new();
+    hasher.update(head.as_bytes());
+    hasher.update(status.as_bytes());
+    hasher.update(
+        run_git_ok(&root, &["diff", "HEAD", "--binary"])
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    if let Ok(untracked) = run_git_ok(&root, &["ls-files", "--others", "--exclude-standard"]) {
+        for path in untracked.lines() {
+            hasher.update(path.as_bytes());
+            if let Ok(bytes) = std::fs::read(root.join(path)) {
+                hasher.update(bytes);
+            }
+        }
+    }
+    let _ = data_root;
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Removes a managed worktree (and its `agent/<uuid>` branch). Without
@@ -436,6 +489,16 @@ pub fn worktree_create(
 pub fn worktree_status(app: tauri::AppHandle, path: String) -> Result<AgentWorktreeStatus, String> {
     let data_root = profile_data_root(&app)?;
     status(&data_root, &path)
+}
+
+#[tauri::command]
+pub fn worktree_workspace_revision(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let data_root = profile_data_root(&app)?;
+    let workspace_root = workspace::primary_root_canon(state.inner())?;
+    workspace_revision(&data_root, &workspace_root)
 }
 
 #[tauri::command]

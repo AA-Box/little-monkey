@@ -1375,6 +1375,62 @@ impl DaemonPlacementQueue {
     }
 }
 
+/// Queue an immutable autonomous recipe through the resident daemon so task
+/// start has a real supervised executor rather than only a ledger row.
+pub(crate) fn enqueue_frozen_recipe(
+    recipe: Recipe,
+    submitted_run_id: &str,
+) -> Result<QueuedRun, String> {
+    let paths = DaemonPaths::resolve()?;
+    let config = DaemonConfig::load(&paths)
+        .map_err(|error| format!("this node's background runner is not configured: {error}"))?;
+    let mut store = DaemonStore::open(&paths)?;
+    if store.kill_switch()? {
+        return Err("this node's global kill switch is engaged".to_string());
+    }
+    let mut shared = SharedLedger::open(&paths.ledger_db)?;
+    let job_id = format!(
+        "job-autonomous-{}",
+        &sha256_hex(format!("autonomous:{submitted_run_id}").as_bytes())[..32]
+    );
+    let snapshot_path = paths.snapshots.join(format!("{job_id}.json"));
+    write_snapshot(&snapshot_path, &recipe)?;
+    let global_config_roots = global_config_roots_for_paths(&paths)?;
+    enqueue(
+        None,
+        &paths,
+        &global_config_roots,
+        &config,
+        &mut store,
+        &mut shared,
+        QueueOptions {
+            recipe: snapshot_path.to_string_lossy().into_owned(),
+            params: Vec::new(),
+            origin: QueueOrigin::Local,
+            deterministic_job_id: Some(job_id),
+            priority: 0,
+            max_attempts: 1,
+            max_runtime_ms: recipe
+                .timeout_seconds
+                .unwrap_or(7 * 24 * 60 * 60)
+                .saturating_mul(1_000),
+            max_memory_bytes: None,
+            owned_worktree: false,
+            repository: None,
+            branch_prefix: "autonomous/".to_string(),
+            allowed_remotes: vec!["origin".to_string()],
+            allow_commit: false,
+            allow_push: false,
+            allow_create_pull_request: false,
+            allow_review_comment: false,
+            parent_run_id: None,
+            snapshot_is_frozen: true,
+            frozen_execution: None,
+            appended_system: None,
+        },
+    )
+}
+
 /// The recipe target this node will execute a placed spec through.
 ///
 /// A `ManagedLlama` placement is resolved against **this node's** runtime hub,

@@ -386,6 +386,15 @@ export interface RunSubagentTaskParams {
     reason: string,
     toolCallId: string,
   ) => void;
+  onStructuredResult?: (result: RunSubagentTaskResult) => void;
+}
+
+export interface RunSubagentTaskResult {
+  report: string;
+  outcome: "done" | "error" | "cancelled";
+  changedFiles: string[];
+  worktree?: { id: string; path: string; branch: string; baseRevision: string; diffDigest: string };
+  usage?: { modelCalls: number; toolCalls: number; inputTokens: number; outputTokens: number; costMicros: number };
 }
 
 /**
@@ -431,7 +440,7 @@ function isErrorResult(result: string): boolean {
  * worktree bookkeeping failure must not corrupt the tool result.
  */
 export async function runSubagentTask(params: RunSubagentTaskParams): Promise<string> {
-  if (params.isolation !== 'worktree') return runSubagentTaskLoop(params);
+  if (params.isolation !== 'worktree') { const report = await runSubagentTaskLoop(params); params.onStructuredResult?.({ report, outcome: structuredOutcome(report), changedFiles: [] }); return report; }
 
   const resolved = resolveSubagentProfile(params.profile, useCustomAgentStore.getState().defs);
   const base = resolved.kind === 'builtin' ? resolved.profile : resolved.kind === 'custom' ? resolved.base : null;
@@ -472,6 +481,7 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
       // Nothing was produced — an empty worktree holds no agent work, so
       // removing it is safe on every outcome, cancellation included.
       await agentWorktreeClient.remove(created.path, false);
+      params.onStructuredResult?.({ report: result, outcome: structuredOutcome(result), changedFiles: [], worktree: { id: created.branch, path: created.path, branch: created.branch, baseRevision: st.base_revision, diffDigest: st.patch_digest } });
       return result;
     }
     useSessionStore
@@ -481,12 +491,24 @@ export async function runSubagentTask(params: RunSubagentTaskParams): Promise<st
         diffstat: st.diffstat,
         status: 'kept',
       });
+    params.onStructuredResult?.({ report: result, outcome: structuredOutcome(result), changedFiles: st.changed_files, worktree: { id: created.branch, path: created.path, branch: created.branch, baseRevision: st.base_revision, diffDigest: st.patch_digest } });
     return isErrorResult(result)
       ? result
       : `${result}\n\n[Changes were left in an isolated worktree at ${created.path} — NOT applied to the workspace. The user can apply or discard them from this agent's row.]\nDiffstat:\n${st.diffstat}`;
   } catch {
     return result;
   }
+}
+
+function structuredOutcome(result: string): RunSubagentTaskResult["outcome"] {
+  if (/cancel/i.test(result) && isErrorResult(result)) return "cancelled";
+  return isErrorResult(result) ? "error" : "done";
+}
+
+export async function runSubagentTaskStructured(params: RunSubagentTaskParams): Promise<RunSubagentTaskResult> {
+  let structured: RunSubagentTaskResult | undefined;
+  const report = await runSubagentTask({ ...params, onStructuredResult: (result) => { structured = result; params.onStructuredResult?.(result); } });
+  return structured ?? { report, outcome: structuredOutcome(report), changedFiles: [] };
 }
 
 async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<string> {

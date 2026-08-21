@@ -11,6 +11,8 @@ export type TaskExecutionStrategy = "DIRECT" | "PLAN" | "DELEGATE" | "PARALLEL_D
 export type TaskClass = "investigation" | "implementation" | "integration" | "verification" | "review" | "delivery";
 export type TaskNodeStatus = "pending" | "ready" | "running" | "succeeded" | "failed" | "blocked" | "cancelled";
 export type TaskIsolation = "shared" | "worktree";
+export type ExecutionPlacementKind = "local" | "worktree" | "docker" | "remote_node";
+export type DeliveryIntent = "leave_worktree" | "commit" | "push_owned_branch" | "open_or_update_pr";
 export type TaskOutcome =
   | "RUNNING"
   | "SUCCEEDED"
@@ -32,6 +34,10 @@ export interface TaskBudgetSnapshot {
   maxToolCalls: number;
   maxRepairRounds: number;
   maxWorkers: number;
+  maxConcurrentWorkers?: number;
+  maxNestingDepth?: number;
+  maxArtifactBytes?: number;
+  maxCostMicros?: number | null;
 }
 
 export interface TaskPermissionSnapshot {
@@ -48,7 +54,13 @@ export interface TaskConstraints {
   allowExternalDelivery?: boolean;
   source?: "user" | "issue" | "workflow" | "schedule" | "api";
   untrustedSource?: boolean;
+  deliveryIntent?: DeliveryIntent;
+  executionPlacement?: TaskExecutionPlacement;
 }
+
+export interface TaskExecutionPlacement { kind: ExecutionPlacementKind; targetId: string; nodeId: string; reason: string; }
+export interface TaskPlanningContext { currentWorkspaceRevision: string; relevantFiles: string[]; repositoryConventions: string[]; sourceMaterial: string[]; dependencyArtifactIds: string[]; upstreamDecisions: string[]; }
+export interface TaskUsage { modelCalls: number; toolCalls: number; inputTokens: number; outputTokens: number; costMicros: number; artifactBytes: number; workersStarted: number; }
 
 export interface AcceptanceCriterion {
   id: string;
@@ -71,6 +83,13 @@ export interface TaskPlanNode {
   attempt: number;
   workerId: string | null;
   resultSummary: string | null;
+  relevantFiles?: string[];
+  capabilities?: string[];
+  executionPlacement?: TaskExecutionPlacement;
+  budget?: Partial<TaskBudgetSnapshot>;
+  upstreamDecisions?: string[];
+  repairOf?: string | null;
+  mutationRevision?: string | null;
 }
 
 export interface TaskPlan {
@@ -90,6 +109,10 @@ export interface TaskWorker {
   targetSnapshot: ModelTargetSnapshot;
   startedAtMs: number | null;
   finishedAtMs: number | null;
+  executionPlacement?: TaskExecutionPlacement;
+  worktree?: { id: string; path: string; branch: string; baseRevision: string; diffDigest: string };
+  changedFiles?: string[];
+  usage?: Partial<TaskUsage>;
 }
 
 export interface TaskArtifact {
@@ -99,6 +122,7 @@ export interface TaskArtifact {
   path: string | null;
   digest: string | null;
   createdAtMs: number;
+  workspaceRevision?: string | null;
 }
 
 export interface VerificationEvidence {
@@ -112,6 +136,11 @@ export interface VerificationEvidence {
   exitCode: number | null;
   durationMs: number;
   createdAtMs: number;
+  command?: string | null;
+  commandDigest?: string | null;
+  workspaceRevision?: string | null;
+  testedRevision?: string | null;
+  source?: "command" | "diff" | "review" | "worker_report" | "user";
 }
 
 export interface TaskGuidance {
@@ -144,6 +173,11 @@ export interface AutonomousTask {
   outcome: TaskOutcome;
   summary: string | null;
   repairRounds: number;
+  planningContext?: TaskPlanningContext;
+  workspaceRevision?: string;
+  usage?: TaskUsage;
+  deliveryIntent?: DeliveryIntent;
+  waitingReason?: string | null;
 }
 
 export interface CreateAutonomousTaskInput {
@@ -154,6 +188,8 @@ export interface CreateAutonomousTaskInput {
   permissionSnapshot: TaskPermissionSnapshot;
   budgetSnapshot?: Partial<TaskBudgetSnapshot>;
   constraints?: TaskConstraints;
+  planningContext?: Partial<TaskPlanningContext>;
+  deliveryIntent?: DeliveryIntent;
 }
 
 export interface TaskEvent {
@@ -180,41 +216,59 @@ export function chooseTaskExecutionStrategy(input: Pick<CreateAutonomousTaskInpu
 }
 
 export function deriveAcceptanceCriteria(objective: string, source = "coordinator"): AcceptanceCriterion[] {
+  return deriveAcceptanceCriteriaFromContext(objective, source);
+}
+
+export function deriveAcceptanceCriteriaFromContext(objective: string, source = "coordinator", context?: Pick<TaskPlanningContext, "sourceMaterial" | "relevantFiles">): AcceptanceCriterion[] {
   const prefix = id("criterion");
+  const extracted = [...(context?.sourceMaterial ?? [])]
+    .flatMap((value) => value.split(/\r?\n/))
+    .map((line) => line.replace(/^\s*(?:[-*]|\d+[.)])\s*/, "").trim())
+    .filter((line) => line.length >= 8 && /\b(must|should|verify|accept|require|test|ensure|implement)\b/i.test(line))
+    .slice(0, 8);
   return [
-    { id: `${prefix}-objective`, description: `The requested objective is implemented: ${objective}`, status: "pending", method: "worker_report", source, evidenceIds: [], blocking: true },
+    ...extracted.map((description, index) => ({ id: `${prefix}-extracted-${index + 1}`, description, status: "pending" as const, method: "review" as const, source, evidenceIds: [], blocking: true })),
+    { id: `${prefix}-objective`, description: `The requested objective is implemented: ${objective}`, status: "pending", method: "review", source, evidenceIds: [], blocking: true },
     { id: `${prefix}-scope`, description: "The change stays within the requested scope and preserves unrelated behavior.", status: "pending", method: "review", source, evidenceIds: [], blocking: true },
-    { id: `${prefix}-verification`, description: "Relevant repository verification passes, or a user-visible reason explains why it could not run.", status: "pending", method: "verification_command", source, evidenceIds: [], blocking: true },
+    { id: `${prefix}-verification`, description: "Relevant repository verification passes against the current workspace revision.", status: "pending", method: "verification_command", source, evidenceIds: [], blocking: true },
   ];
 }
 
-function node(nodeId: string, taskClass: TaskClass, objective: string, dependencies: string[], mutationScope: string[], isolation: TaskIsolation): TaskPlanNode {
-  return { nodeId, taskClass, objective, dependencies, mutationScope, isolation, status: dependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null };
+function node(nodeId: string, taskClass: TaskClass, objective: string, dependencies: string[], mutationScope: string[], isolation: TaskIsolation, context?: TaskPlanningContext): TaskPlanNode {
+  return { nodeId, taskClass, objective, dependencies, mutationScope, isolation, status: dependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, relevantFiles: context?.relevantFiles.slice(0, 64), capabilities: taskClass === "implementation" ? ["read", "mutate", "verify"] : ["read"], upstreamDecisions: context?.upstreamDecisions.slice(-16), repairOf: null, mutationRevision: context?.currentWorkspaceRevision ?? null };
 }
 
-export function createTaskPlan(objective: string, strategy: TaskExecutionStrategy, maxWorkers = 4): TaskPlan {
+function independentSlices(files: readonly string[], maxWorkers: number): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const file of files) { const normalized = file.split("\\").join("/").replace(/^\.?\//, ""); const key = normalized.split("/")[0] || "workspace"; groups.set(key, [...(groups.get(key) ?? []), normalized]); }
+  return [...groups.values()].sort((left, right) => left[0].localeCompare(right[0])).slice(0, Math.max(1, Math.min(maxWorkers, 8)));
+}
+
+export function createTaskPlan(objective: string, strategy: TaskExecutionStrategy, maxWorkers = 4, context?: TaskPlanningContext): TaskPlan {
   const planId = id("plan");
   const implementObjective = `Implement the smallest safe change for: ${objective}`;
   const nodes: TaskPlanNode[] = [];
   if (strategy === "DIRECT") {
-    nodes.push(node("implement", "implementation", implementObjective, [], ["workspace"], "shared"));
-    nodes.push(node("verify", "verification", "Run the relevant configured verification commands.", ["implement"], ["workspace"], "shared"));
-    nodes.push(node("review", "review", "Review the resulting diff against the objective and acceptance criteria.", ["verify"], ["workspace"], "shared"));
+    nodes.push(node("implement", "implementation", implementObjective, [], context?.relevantFiles.length ? context.relevantFiles : ["workspace"], "shared", context));
+    nodes.push(node("verify", "verification", "Run the relevant configured verification commands against the current revision.", ["implement"], ["workspace"], "shared", context));
+    nodes.push(node("review", "review", "Review the resulting diff against the objective, extracted criteria, and planned scope.", ["verify"], ["workspace"], "shared", context));
   } else if (strategy === "PARALLEL_DELEGATE") {
     nodes.push(node("investigate", "investigation", `Inspect the repository and identify independent implementation slices for: ${objective}`, [], [], "shared"));
-    const count = Math.max(2, Math.min(maxWorkers, 4));
-    for (let index = 0; index < count; index += 1) nodes.push(node(`implement-${index + 1}`, "implementation", `${implementObjective} (scoped slice ${index + 1})`, ["investigate"], [`scope-${index + 1}`], "worktree"));
-    nodes.push(node("integrate", "integration", "Integrate worker patches, resolving conflicts conservatively.", nodes.slice(1).map((entry) => entry.nodeId), ["workspace"], "shared"));
-    nodes.push(node("verify", "verification", "Run the relevant configured verification commands.", ["integrate"], ["workspace"], "shared"));
-    nodes.push(node("review", "review", "Review the integrated diff against the objective and acceptance criteria.", ["verify"], ["workspace"], "shared"));
+    const slices = independentSlices(context?.relevantFiles ?? [], maxWorkers);
+    const workerNodes = slices.length > 1 ? slices : [context?.relevantFiles ?? []];
+    for (let index = 0; index < workerNodes.length; index += 1) { const scope = workerNodes[index].length ? workerNodes[index] : ["workspace"]; nodes.push(node(`implement-${index + 1}`, "implementation", `${implementObjective} in ${scope.join(", ")}`, ["investigate"], scope, "worktree", context)); }
+    nodes.push(node("integrate", "integration", "Inspect and integrate worker patches only after scope and overlap validation.", nodes.slice(1).map((entry) => entry.nodeId), ["workspace"], "shared", context));
+    nodes.push(node("verify", "verification", "Run the relevant configured verification commands against the integrated revision.", ["integrate"], ["workspace"], "shared", context));
+    nodes.push(node("review", "review", "Review the integrated diff against the extracted criteria and planned scopes.", ["verify"], ["workspace"], "shared", context));
   } else {
-    nodes.push(node("investigate", "investigation", `Inspect the repository and plan the implementation for: ${objective}`, [], [], "shared"));
-    nodes.push(node("implement", "implementation", implementObjective, ["investigate"], ["workspace"], strategy === "DELEGATE" ? "worktree" : "shared"));
-    nodes.push(node("integrate", "integration", "Integrate the implementation into the target workspace.", ["implement"], ["workspace"], "shared"));
-    nodes.push(node("verify", "verification", "Run the relevant configured verification commands.", ["integrate"], ["workspace"], "shared"));
-    nodes.push(node("review", "review", "Review the resulting diff against the objective and acceptance criteria.", ["verify"], ["workspace"], "shared"));
+    nodes.push(node("investigate", "investigation", `Inspect the repository and produce a structured implementation plan for: ${objective}`, [], [], "shared", context));
+    nodes.push(node("implement", "implementation", implementObjective, ["investigate"], context?.relevantFiles.length ? context.relevantFiles : ["workspace"], strategy === "DELEGATE" ? "worktree" : "shared", context));
+    nodes.push(node("integrate", "integration", "Inspect and integrate the implementation patch after scope validation.", ["implement"], ["workspace"], "shared", context));
+    nodes.push(node("verify", "verification", "Run the relevant configured verification commands against the integrated revision.", ["integrate"], ["workspace"], "shared", context));
+    nodes.push(node("review", "review", "Review the resulting diff against the objective and planned scope.", ["verify"], ["workspace"], "shared", context));
   }
-  return { planId, strategy, nodes, createdAtMs: now(), revision: 1, rationale: `Selected ${strategy} from task constraints and objective complexity.` };
+  if (context?.currentWorkspaceRevision) for (const entry of nodes) entry.executionPlacement = { kind: entry.isolation === "worktree" ? "worktree" : "local", targetId: "local", nodeId: entry.nodeId, reason: entry.isolation === "worktree" ? "mutating worker isolation" : "shared workspace coordinator stage" };
+  return { planId, strategy, nodes, createdAtMs: now(), revision: 1, rationale: `Structured plan for ${strategy}; scopes come from repository context and are validated before mutation.` };
 }
 
 export function validateTaskPlan(plan: TaskPlan): string[] {
@@ -227,6 +281,7 @@ export function validateTaskPlan(plan: TaskPlan): string[] {
   }
   const byId = new Map(plan.nodes.map((current) => [current.nodeId, current]));
   for (const current of plan.nodes) for (const dependency of current.dependencies) if (!byId.has(dependency)) errors.push(`${current.nodeId} depends on missing node ${dependency}`);
+  for (const current of plan.nodes) { if (current.taskClass === "implementation" && current.isolation === "worktree" && current.mutationScope.length === 0) errors.push(`${current.nodeId} worktree workers require a non-empty mutation scope`); if (current.mutationScope.some((scope) => scope.includes(".."))) errors.push(`${current.nodeId} mutation scope may not escape the workspace`); if (current.executionPlacement && current.executionPlacement.nodeId !== current.nodeId) errors.push(`${current.nodeId} placement must identify the same node`); }
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const visit = (currentId: string): void => {
@@ -247,13 +302,14 @@ export function createAutonomousTask(input: CreateAutonomousTaskInput): Autonomo
   const constraints = input.constraints ?? {};
   const strategy = chooseTaskExecutionStrategy(input);
   const timestamp = now();
+  const planningContext: TaskPlanningContext = { currentWorkspaceRevision: input.planningContext?.currentWorkspaceRevision ?? "unknown", relevantFiles: [...(input.planningContext?.relevantFiles ?? [])].slice(0, 128), repositoryConventions: [...(input.planningContext?.repositoryConventions ?? [])].slice(0, 32), sourceMaterial: [...(input.planningContext?.sourceMaterial ?? [])].slice(0, 32), dependencyArtifactIds: [...(input.planningContext?.dependencyArtifactIds ?? [])].slice(0, 64), upstreamDecisions: [...(input.planningContext?.upstreamDecisions ?? [])].slice(0, 32) };
   return {
     schemaVersion: AUTONOMOUS_TASK_SCHEMA_VERSION,
     taskId: id("task"), sessionId: input.sessionId ?? null, objective, source: constraints.source ?? "user", untrustedSource: constraints.untrustedSource ?? false,
     createdAtMs: timestamp, updatedAtMs: timestamp, targetSnapshot: structuredClone(input.targetSnapshot), workspaceRoots: structuredClone(input.workspaceRoots),
     permissionSnapshot: structuredClone(input.permissionSnapshot),
-    budgetSnapshot: { wallTimeMs: 30 * 60_000, maxModelCalls: 64, maxToolCalls: 128, maxRepairRounds: 2, maxWorkers: 4, ...input.budgetSnapshot },
-    constraints: { ...constraints, strategy }, plan: null, acceptanceCriteria: deriveAcceptanceCriteria(objective, constraints.source ?? "user"), workers: [], artifacts: [], verificationEvidence: [], guidance: [], outcome: "RUNNING", summary: null, repairRounds: 0,
+    budgetSnapshot: { wallTimeMs: 30 * 60_000, maxModelCalls: 64, maxToolCalls: 128, maxRepairRounds: 2, maxWorkers: 4, maxConcurrentWorkers: 4, maxNestingDepth: 1, maxArtifactBytes: 256 * 1024 * 1024, maxCostMicros: null, ...input.budgetSnapshot },
+    constraints: { ...constraints, strategy }, plan: null, acceptanceCriteria: deriveAcceptanceCriteriaFromContext(objective, constraints.source ?? "user", planningContext), workers: [], artifacts: [], verificationEvidence: [], guidance: [], outcome: "RUNNING", summary: null, repairRounds: 0, planningContext, workspaceRevision: planningContext.currentWorkspaceRevision, usage: { modelCalls: 0, toolCalls: 0, inputTokens: 0, outputTokens: 0, costMicros: 0, artifactBytes: 0, workersStarted: 0 }, deliveryIntent: input.deliveryIntent ?? constraints.deliveryIntent ?? "leave_worktree", waitingReason: null,
   };
 }
 
@@ -276,7 +332,7 @@ export function canRunTaskNodesTogether(left: TaskPlanNode, right: TaskPlanNode)
 
 export function buildWorkerContext(task: AutonomousTask, nodeToRun: TaskPlanNode): string {
   const objective = task.untrustedSource ? `<untrusted-task-objective>\n${task.objective}\n</untrusted-task-objective>` : task.objective;
-  return [`Task node: ${nodeToRun.nodeId}`, `Node objective: ${nodeToRun.objective}`, `Task objective: ${objective}`, "The task snapshot, workspace roots, permissions, target, and budget are immutable. Do not broaden scope or access secrets.", "Return a concise report of work performed, files changed, checks run, and any blocker."].join("\n");
+  return [`Task node: ${nodeToRun.nodeId}`, `Node objective: ${nodeToRun.objective}`, `Task objective: ${objective}`, `Relevant files: ${(nodeToRun.relevantFiles ?? task.planningContext?.relevantFiles ?? []).join(", ") || "inspect the repository first"}`, `Acceptance criteria:\n${task.acceptanceCriteria.map((criterion) => `- ${criterion.id}: ${criterion.description}`).join("\n")}`, `Repository conventions:\n${task.planningContext?.repositoryConventions.join("\n") || "follow existing repository conventions"}`, `Allowed capabilities: ${(nodeToRun.capabilities ?? ["read"]).join(", ")}`, `Execution placement: ${nodeToRun.executionPlacement?.kind ?? "local"}`, `Current workspace revision: ${task.workspaceRevision ?? "unknown"}`, `Operator guidance: ${task.guidance.slice(-8).map((item) => `${item.appliesTo}: ${item.text}`).join("\n") || "none"}`, "The task snapshot, workspace roots, permissions, target, and budget are immutable. Do not broaden scope or access secrets.", "Return a structured report of work performed, files changed, checks run, evidence, usage, and any blocker."].join("\n");
 }
 
 export function taskEvent(eventType: AutonomousTaskEventType, task: AutonomousTask, payload: Record<string, unknown> = {}): TaskEvent {
@@ -304,7 +360,7 @@ export function evidenceForCriterion(task: AutonomousTask, criterion: Acceptance
 }
 
 export function hasAuthoritativeAcceptanceEvidence(task: AutonomousTask): boolean {
-  return task.acceptanceCriteria.filter((criterion) => criterion.blocking).every((criterion) => criterion.status === "passed" && evidenceForCriterion(task, criterion).some((evidence) => evidence.authoritative && evidence.passed && !evidence.stale));
+  return task.acceptanceCriteria.filter((criterion) => criterion.blocking).every((criterion) => criterion.status === "passed" && evidenceForCriterion(task, criterion).some((evidence) => evidence.authoritative && evidence.passed && !evidence.stale && (!task.workspaceRevision || !evidence.testedRevision || evidence.testedRevision === task.workspaceRevision)));
 }
 
 export function taskSnapshotPayload(task: AutonomousTask): Record<string, unknown> {

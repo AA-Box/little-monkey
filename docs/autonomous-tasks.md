@@ -24,4 +24,6 @@ External issue text is marked untrusted in worker prompts. Workers receive immut
 
 The routing corpus in `src/lib/autonomousTaskEval.ts` is a deterministic smoke harness with sixteen fixture classes. It validates strategy selection and is intentionally separate from model-quality evaluation. Real repository checks remain authoritative only when the configured verification command returns success.
 
-Issue-to-PR uses the same coordinator contract through `runIssueToPrAutonomousTask`; GitHub delivery and merge remain outside the worker and retain the existing confirmation workflow.
+The desktop coordinator reattaches to non-terminal snapshots after restart; in-flight nodes are recovered as pending and completed worktree metadata is reused for integration. CLI `task start` submits an immutable recipe to the resident daemon, which supervises the headless task process; `task attach` reads the shared ledger and control commands append to it.
+
+Issue-to-PR uses the same bounded plan and authoritative repository-check contract through `runIssueToPrAutonomousTask`. Its owned worktree is deliberately not applied to the shared checkout, and GitHub delivery/merge remain outside the worker behind the existing confirmation workflow. A task with no configured verification command remains `WAITING_USER`; a worker report or ordinary review prose cannot satisfy acceptance evidence.

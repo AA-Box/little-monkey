@@ -1,7 +1,7 @@
 import { create } from "zustand";
 
 import { taskEvent, taskEventToRunEvent, type AutonomousTask, type TaskGuidance } from "../lib/autonomousTask";
-import { AutonomousTaskControl, startAutonomousTask, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
+import { AutonomousTaskControl, resumeAutonomousTask, startAutonomousTask, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
 import { appendRunEvent, listRuns, loadRunEvents, requestRunCancellation } from "../lib/runProtocol";
 
 const controls = new Map<string, AutonomousTaskControl>();
@@ -67,6 +67,13 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       const taskRuns = runs.filter((run) => run.spec.kind === "autonomous_task");
       const hydrated = (await Promise.all(taskRuns.map(async (run) => taskFromEvents(await loadRunEvents(run.spec.run_id))))).filter((task): task is AutonomousTask => task !== null);
       set((state) => ({ tasks: hydrated, pausedTaskIds: Object.fromEntries(runs.filter((run) => run.status === "paused").map((run) => [run.spec.run_id, true])), selectedTaskId: state.selectedTaskId && hydrated.some((task) => task.taskId === state.selectedTaskId) ? state.selectedTaskId : hydrated[0]?.taskId ?? null }));
+      await Promise.all(taskRuns.filter((run) => run.status === "running").map(async (run) => {
+        const task = hydrated.find((entry) => entry.taskId === run.spec.run_id);
+        if (task?.outcome !== "RUNNING" || controls.has(task.taskId)) return;
+        const handle = await resumeAutonomousTask({ task, onUpdate: publish });
+        started.set(handle.runId, handle); controls.set(handle.runId, handle.control); publish(handle.task);
+        void handle.completion.then((result) => { publish(result); started.delete(handle.runId); controls.delete(handle.runId); });
+      }));
     }),
     init: async () => { await get().refresh(); },
     start: (objective, sessionId) => withBusy(set, get, "start", async () => {
@@ -77,7 +84,12 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       return handle.task;
     }),
     pause: (taskId) => withBusy(set, get, `pause:${taskId}`, async () => { controls.get(taskId)?.pause(); await appendRunEvent(taskId, { type: "paused", payload: { reason: "Paused by the user." } }); set((state) => ({ pausedTaskIds: { ...state.pausedTaskIds, [taskId]: true } })); }),
-    resume: (taskId) => withBusy(set, get, `resume:${taskId}`, async () => { controls.get(taskId)?.resume(); await appendRunEvent(taskId, { type: "started", payload: { engine_id: "autonomous-task-resume" } }); set((state) => { const pausedTaskIds = { ...state.pausedTaskIds }; delete pausedTaskIds[taskId]; return { pausedTaskIds }; }); }),
+    resume: (taskId) => withBusy(set, get, `resume:${taskId}`, async () => {
+      const existing = controls.get(taskId);
+      if (existing) existing.resume();
+      else { const task = get().tasks.find((entry) => entry.taskId === taskId); if (!task) throw new Error("Task is not available for resume."); const handle = await resumeAutonomousTask({ task, onUpdate: publish }); started.set(handle.runId, handle); controls.set(handle.runId, handle.control); publish(handle.task); void handle.completion.then((result) => { publish(result); started.delete(handle.runId); controls.delete(handle.runId); }); }
+      await appendRunEvent(taskId, { type: "started", payload: { engine_id: "autonomous-task-resume" } }); set((state) => { const pausedTaskIds = { ...state.pausedTaskIds }; delete pausedTaskIds[taskId]; return { pausedTaskIds }; });
+    }),
     cancel: (taskId, reason = "Cancelled by the user.") => withBusy(set, get, `cancel:${taskId}`, async () => { controls.get(taskId)?.cancel(); await requestRunCancellation(taskId, reason); }),
     guide: (taskId, text, appliesTo = "future_nodes") => withBusy(set, get, `guide:${taskId}`, async () => {
       const current = get().tasks.find((task) => task.taskId === taskId);
@@ -85,6 +97,7 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
       const guidance: TaskGuidance = { guidanceId: `guidance-${Date.now()}`, text: text.trim().slice(0, 8_000), receivedAtMs: Date.now(), appliesTo };
       const next = { ...current, guidance: [...current.guidance, guidance].slice(-32), updatedAtMs: Date.now() };
       publish(next);
+      controls.get(taskId)?.guide(guidance);
       await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("guidance_received", next, { guidance })));
     }),
   };

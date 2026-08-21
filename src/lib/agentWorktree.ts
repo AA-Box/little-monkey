@@ -20,6 +20,9 @@ export interface AgentWorktreeStatus {
   dirty: boolean;
   /** `git diff --stat` (plus untracked-file lines) — empty when clean. */
   diffstat: string;
+  changed_files: string[];
+  base_revision: string;
+  patch_digest: string;
 }
 
 export interface AgentWorktreeApplied {
@@ -36,4 +39,5 @@ export const agentWorktreeClient = {
   /** Applies the worktree's diff onto the primary workspace root. On
    * conflict the command errors and the worktree is left in place. */
   apply: (path: string) => invoke<AgentWorktreeApplied>("worktree_apply", { path }),
+  workspaceRevision: () => invoke<string>("worktree_workspace_revision"),
 };

@@ -111,6 +111,11 @@ export const useIssueToPrStore = create<IssueToPrState>((set, get) => {
         // (see `cancel` below) — nothing left to record here.
         return;
       }
+      const coordinatorOutcome = "task" in result ? (result as { task?: { outcome?: string } }).task?.outcome : undefined;
+      if (coordinatorOutcome === "WAITING_USER" || coordinatorOutcome === "WAITING_APPROVAL") {
+        await api.advanceIssueToPr(run.runId, "opening_pr");
+        return;
+      }
       if (result.outcome === "error") {
         await api.advanceIssueToPr(run.runId, "failed", {
           error: result.summary,
