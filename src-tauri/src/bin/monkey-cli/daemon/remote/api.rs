@@ -7521,7 +7521,7 @@ mod tests {
                 "cmd-vclose",
                 "POST",
                 &close_path,
-                br#"{"protocol_version":1}"#,
+                br#"{"protocol_version":2}"#,
             ),
             2_500,
         );
