@@ -63,7 +63,7 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 /// Signed remote-plane protocol version. Mirrors `monkey-cli`'s
 /// `daemon::remote::protocol::REMOTE_PROTOCOL_VERSION`, checked by the same
 /// source-scanning test that checks [`REMOTE_ROUTES`].
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // The remote plane's route table

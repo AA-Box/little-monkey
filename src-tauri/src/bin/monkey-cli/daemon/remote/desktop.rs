@@ -25,7 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use little_monkey_lib::artifact_store::ArtifactStore;
 use little_monkey_lib::desktop_control::{
-    ActionGate, ControlAction, ControlSession, DesktopControlState, MAX_SESSION_LIFETIME_MS,
+    ActionGate, ActionOutcome, ApprovalPolicy, ControlAction, ControlSession, DesktopControlState,
+    SessionGrantOptions, MAX_SESSION_LIFETIME_MS,
 };
 use little_monkey_lib::run_ledger::RunLedger;
 use little_monkey_lib::run_protocol::{
@@ -507,6 +508,33 @@ impl DesktopControlRuntime {
         allowlist: Vec<String>,
         batch_requested: bool,
     ) -> Result<serde_json::Value, (u16, String)> {
+        self.start_with_options(
+            device_id,
+            device_label,
+            allowlist,
+            batch_requested,
+            Vec::new(),
+            MAX_SESSION_LIFETIME_MS,
+            true,
+            true,
+            false,
+            None,
+        )
+    }
+
+    pub fn start_with_options(
+        &self,
+        device_id: &str,
+        device_label: &str,
+        allowlist: Vec<String>,
+        batch_requested: bool,
+        allowed_windows: Vec<String>,
+        lifetime_ms: u64,
+        allow_screenshots: bool,
+        allow_keyboard_input: bool,
+        allow_clipboard_read: bool,
+        requested_policy: Option<ApprovalPolicy>,
+    ) -> Result<serde_json::Value, (u16, String)> {
         let consent = self.prompter.confirm_session(device_label);
         if consent == SessionConsent::Deny {
             return Err((
@@ -517,11 +545,28 @@ impl DesktopControlRuntime {
         // Batch mode requires BOTH a local "Allow (batch)" answer AND the
         // remote request asking for it — the remote flag alone is never enough.
         let approved_batch = batch_requested && consent == SessionConsent::AllowBatch;
+        let approval_policy =
+            if approved_batch && requested_policy != Some(ApprovalPolicy::PerAction) {
+                ApprovalPolicy::ApprovedBatch
+            } else {
+                ApprovalPolicy::PerAction
+            };
         let session = self
             .state
             // A gated mode (never "bypass"); the local consent prompt is the
             // human gate for the headless daemon.
-            .start_session_impl("auto", allowlist, MAX_SESSION_LIFETIME_MS, approved_batch)
+            .start_session_with_options(
+                "auto",
+                allowlist,
+                lifetime_ms,
+                SessionGrantOptions {
+                    allowed_windows,
+                    allow_screenshots,
+                    allow_keyboard_input,
+                    allow_clipboard_read,
+                    approval_policy: Some(approval_policy),
+                },
+            )
             .map_err(|error| (409, error))?;
         self.device_sessions
             .lock()
@@ -558,28 +603,38 @@ impl DesktopControlRuntime {
             .map_err(|error| (409, error))?;
         let executed = match gate {
             ActionGate::Executed(result) => {
-                result.map_err(|error| (502, error))?;
-                true
+                let result = result.map_err(|error| (502, error))?;
+                ActionOutcome::from_execution(
+                    format!("remote-batch-{}", uuid::Uuid::new_v4()),
+                    result,
+                )
             }
             ActionGate::Pending { action_id, .. } => {
                 let approve = self
                     .prompter
                     .confirm_action(device_label, &describe_action(&request.action));
-                let ran = self
+                let result = self
                     .state
-                    .finish_pending(&action_id, &request.action, approve)
+                    .finish_pending_with_result(&action_id, &request.action, approve)
                     .map_err(|error| (502, error))?;
-                if !ran && !approve {
+                if result.is_none() && !approve {
                     return Err((403, "Control action was denied on the runner".to_string()));
                 }
-                ran
+                let result = result.ok_or_else(|| {
+                    (
+                        409,
+                        "Approved control action was no longer pending".to_string(),
+                    )
+                })?;
+                ActionOutcome::from_execution(action_id, result)
             }
         };
         self.note_action(&request.session_id);
         Ok(serde_json::json!({
             "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
             "session_id": request.session_id,
-            "executed": executed,
+            "executed": executed.executed,
+            "outcome": executed,
         }))
     }
 
@@ -1010,7 +1065,9 @@ mod tests {
             session_id: String::new(),
             target_application_id: "Notes".into(),
             target_window_id: None,
-            action: ControlAction::MouseMove { x: 1, y: 2 },
+            action: ControlAction::MouseClick {
+                button: little_monkey_lib::desktop_control::MouseButtonKind::Left,
+            },
         }
     }
 

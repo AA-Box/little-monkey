@@ -3,6 +3,21 @@
 Use the native fixture from `computer-use.md` with a fresh profile and a
 manual approval grant scoped only to `Little Monkey TestApp`.
 
+Generate the machine-readable evidence envelope before running the native
+driver:
+
+```sh
+python3 src-tauri/fixtures/computer-use-e2e.py \
+  --report /tmp/little-monkey-computer-use-e2e.json
+```
+
+The harness validates the fixture but intentionally reports
+`awaiting_native_trace` until an interactive desktop runner supplies the
+actual UI actions. A runner may set `COMPUTER_USE_E2E_RUN=1` only when it has
+performed those actions through the native backend; it must then fill the
+`postconditions` fields rather than converting a simulated result into
+acceptance evidence.
+
 1. Feature off: Computer Use schemas are absent.
 2. Bypass mode: grant creation is refused.
 3. Empty grant: refused.
@@ -26,6 +41,6 @@ manual approval grant scoped only to `Little Monkey TestApp`.
 21. Browser routing: DOM/browser control is selected for web content; native control is not a pixel-browser bypass.
 22. Remote Windows runner: local consent, target verification, lock, revocation, audit, and emergency stop remain mandatory.
 
-Acceptance evidence should include the TestApp dark-mode/profile/save state,
-the verification result, the screenshot artifact id, the redacted audit row,
+Acceptance evidence is the JSON report plus the TestApp dark-mode/profile/save
+state, the verification result, screenshot artifact id, redacted audit row,
 and a negative test showing prompt injection cannot widen the grant.

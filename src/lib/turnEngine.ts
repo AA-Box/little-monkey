@@ -51,6 +51,7 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
+import { coordinateToolInvocation } from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -900,8 +901,11 @@ async function executeToolCallInner(
     learningRunId: skill?.runId,
     skillResourceSnapshot: name === 'read_skill_resource' && typeof args.command === 'string'
       ? skill?.invokedSkillSnapshots?.get(args.command.trim().replace(/^\//, '').toLowerCase())
-      : undefined,
+    : undefined,
   });
+
+  const coordination = coordinateToolInvocation(name, args);
+  if (coordination.error) return stringifyToolError(new Error(coordination.error));
 
   if (name === PROGRAMMATIC_TOOL_NAME) {
     if (!programmatic) {

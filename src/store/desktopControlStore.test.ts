@@ -52,6 +52,7 @@ function makePending(overrides: Partial<PendingActionSummary> = {}): PendingActi
     sessionId: "desktop-control-1",
     targetApplicationId: "Notes",
     approvalLevel: "high",
+    description: "key_press",
     action: { kind: "key_press", key: "a" },
     ...overrides,
   };

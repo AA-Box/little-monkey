@@ -210,10 +210,14 @@ pub enum ControlAction {
     SemanticClick {
         element_id: String,
         button: MouseButtonKind,
+        #[serde(default)]
+        expected_value: Option<String>,
     },
     SemanticDoubleClick {
         element_id: String,
         button: MouseButtonKind,
+        #[serde(default)]
+        expected_value: Option<String>,
     },
     Select {
         element_id: String,
@@ -708,8 +712,20 @@ fn production_semantic_backend(
 }
 
 fn run_native_command(program: &str, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(program)
-        .args(args)
+    run_native_command_with_env(program, args, &[])
+}
+
+fn run_native_command_with_env(
+    program: &str,
+    args: &[&str],
+    environment: &[(&str, String)],
+) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -848,12 +864,40 @@ fn native_snapshot() -> Result<NativeSnapshot, String> {
             return Err(WAYLAND_PORTAL_MESSAGE.to_string());
         }
         let bytes = run_native_command("python3", &["-c", LINUX_ATSPI_SCRIPT])?;
-        return serde_json::from_slice(&bytes)
-            .map_err(|error| format!("Linux AT-SPI returned invalid data: {error}"));
+        let mut snapshot: NativeSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Linux AT-SPI returned invalid data: {error}"))?;
+        normalize_linux_window_ids(&mut snapshot);
+        return Ok(snapshot);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
         Err("Semantic accessibility is not implemented on this platform".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_window_ids(snapshot: &mut NativeSnapshot) {
+    let Ok(output) = Command::new("wmctrl").args(["-l"]).output() else {
+        return;
+    };
+    let windows: Vec<(String, String)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(4, char::is_whitespace);
+            let id = fields.next()?.trim().to_string();
+            let _desktop = fields.next()?;
+            let _host = fields.next()?;
+            let title = fields.next()?.trim().to_string();
+            Some((id, title))
+        })
+        .collect();
+    for target in &mut snapshot.targets {
+        if let Some((window_id, _)) = windows.iter().find(|(_, title)| {
+            !target.window_title.is_empty()
+                && (title == &target.window_title || title.contains(&target.window_title))
+        }) {
+            target.window_id = window_id.clone();
+        }
     }
 }
 
@@ -881,6 +925,9 @@ fn sensitive_text(value: &str) -> bool {
         "powershell",
         "command prompt",
         "uac",
+        "windows security",
+        "credential ui",
+        "#32770",
         "sudo",
         "authentication",
         "auth dialog",
@@ -964,13 +1011,25 @@ fn bounded_elements(
 }
 
 fn element_center(element: &ComputerElement) -> Result<(i32, i32), String> {
-    if element.bounds.width <= 0.0 || element.bounds.height <= 0.0 {
+    if !element.bounds.x.is_finite()
+        || !element.bounds.y.is_finite()
+        || !element.bounds.width.is_finite()
+        || !element.bounds.height.is_finite()
+        || element.bounds.width <= 0.0
+        || element.bounds.height <= 0.0
+    {
         return Err("Accessibility element has no actionable bounds".to_string());
     }
-    Ok((
-        (element.bounds.x + element.bounds.width / 2.0).round() as i32,
-        (element.bounds.y + element.bounds.height / 2.0).round() as i32,
-    ))
+    let x = (element.bounds.x + element.bounds.width / 2.0).round();
+    let y = (element.bounds.y + element.bounds.height / 2.0).round();
+    if x < f64::from(i32::MIN)
+        || x > f64::from(i32::MAX)
+        || y < f64::from(i32::MIN)
+        || y > f64::from(i32::MAX)
+    {
+        return Err("Accessibility element bounds exceed native coordinate limits".to_string());
+    }
+    Ok((x as i32, y as i32))
 }
 
 fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerElement, String> {
@@ -981,7 +1040,15 @@ fn find_element(target: &ComputerTarget, element_id: &str) -> Result<ComputerEle
         Some(&target.window_id),
         false,
     )?;
-    let (elements, _) = bounded_elements(&native_snapshot()?, &verified, None);
+    let refreshed = native_snapshot()?;
+    let verified = checked_target(
+        refreshed,
+        &verified.application_id,
+        Some(&verified.window_id),
+        false,
+    )?;
+    let snapshot = native_snapshot()?;
+    let (elements, _) = bounded_elements(&snapshot, &verified, None);
     elements
         .into_iter()
         .find(|element| element.id == element_id)
@@ -1006,6 +1073,13 @@ impl DesktopSemanticBackend for NativeSemanticBackend {
     ) -> Result<ComputerInspection, String> {
         let snapshot = native_snapshot()?;
         let target = checked_target(snapshot, application_id, window_id, false)?;
+        let refreshed = native_snapshot()?;
+        let target = checked_target(
+            refreshed,
+            &target.application_id,
+            Some(&target.window_id),
+            false,
+        )?;
         let snapshot = native_snapshot()?;
         let (elements, truncated) = bounded_elements(&snapshot, &target, query);
         Ok(ComputerInspection {
@@ -1033,18 +1107,25 @@ impl DesktopSemanticBackend for NativeSemanticBackend {
     fn focus(&self, target: &ComputerTarget) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
-            let status = Command::new("open")
-                .args(["-b", &target.application_id])
-                .status();
-            return status
-                .map_err(|error| format!("Could not focus target: {error}"))
-                .and_then(|status| {
-                    if status.success() {
-                        Ok(())
-                    } else {
-                        Err("Could not focus target".to_string())
-                    }
-                });
+            let index = window_index(&target.window_id)?;
+            let bytes = run_native_command_with_env(
+                "osascript",
+                &["-l", "JavaScript", "-e", MACOS_FOCUS_SCRIPT],
+                &[
+                    ("LM_APP_ID", target.application_id.clone()),
+                    ("LM_WINDOW_INDEX", index.to_string()),
+                ],
+            )?;
+            if serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|json| json.get("focused").and_then(serde_json::Value::as_bool))
+                == Some(true)
+            {
+                return Ok(());
+            }
+            return Err(
+                "macOS Accessibility did not confirm the requested window focus".to_string(),
+            );
         }
         #[cfg(target_os = "windows")]
         {
@@ -1101,6 +1182,12 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
             return Err("Sensitive accessibility elements are blocked".to_string());
         }
+        if button == MouseButtonKind::Left {
+            let action = if double { "double_click" } else { "click" };
+            if native_semantic_action(target, element_id, action, None)? {
+                return Ok(());
+            }
+        }
         let (x, y) = element_center(&element)?;
         self.input.move_mouse(x, y)?;
         if double {
@@ -1126,11 +1213,21 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         if element.sensitive || sensitive_text(&format!("{} {}", element.role, element.label)) {
             return Err("Sensitive accessibility elements are blocked".to_string());
         }
+        let semantic_action = if select { "select" } else { "set_value" };
+        if native_semantic_action(target, element_id, semantic_action, Some(value))? {
+            return Ok(());
+        }
         let (x, y) = element_center(&element)?;
         self.input.move_mouse(x, y)?;
         self.input.click(MouseButtonKind::Left)?;
         if select {
-            self.input.hotkey(&["CTRL".to_string(), "A".to_string()])?;
+            let modifier = if cfg!(target_os = "macos") {
+                "CMD"
+            } else {
+                "CTRL"
+            };
+            self.input
+                .hotkey(&[modifier.to_string(), "A".to_string()])?;
         }
         self.input.type_text(value)
     }
@@ -1141,7 +1238,13 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
         bounds: Option<ComputerBounds>,
     ) -> Result<(Vec<u8>, ComputerBounds), String> {
         let requested = bounds.unwrap_or_else(|| target.bounds.clone());
-        if requested.width <= 0.0 || requested.height <= 0.0 {
+        if !requested.x.is_finite()
+            || !requested.y.is_finite()
+            || !requested.width.is_finite()
+            || !requested.height.is_finite()
+            || requested.width <= 0.0
+            || requested.height <= 0.0
+        {
             return Err("Target has no bounded screenshot region".to_string());
         }
         if target.bounds.width > 0.0
@@ -1153,8 +1256,8 @@ public static class LMWindow { [DllImport("user32.dll")] public static extern bo
             return Err("Screenshot region is outside the verified target bounds".to_string());
         }
         let path = std::env::temp_dir().join(format!("little-monkey-shot-{}.png", Uuid::new_v4()));
-        let x = requested.x.round().max(0.0) as i32;
-        let y = requested.y.round().max(0.0) as i32;
+        let x = requested.x.round() as i32;
+        let y = requested.y.round() as i32;
         let width = requested.width.round() as u32;
         let height = requested.height.round() as u32;
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
@@ -1238,7 +1341,7 @@ for (const p of safe(() => se.processes(), [])) {
     if (wi >= 32) break;
     const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
     const out=[]; let ei=0;
-    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const eb=rect(e); out.push({id:id+'::element-'+(ei-1),role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/password|secure|auth|credential/i.test(role+' '+label)}); }
+    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/password|secure|auth|credential/i.test(role+' '+label)}); }
     elements[id]=out; wi++;
   }
 }
@@ -1252,7 +1355,9 @@ Add-Type -AssemblyName UIAutomationTypes
 $root=[System.Windows.Automation.AutomationElement]::RootElement
 $targets=@();$elements=@{}
 $windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
-for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=$false;supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$list+=[ordered]@{id="$targetId::element-$j";role=$role;label=$label;value=$null;bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=@('click','double_click','set_value','select');sensitive=($role -match 'Edit' -and $label -match 'password|credential|secret')};}$elements[$targetId]=$list}
+function ValueOf($e) { try { return $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { try { return [string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState } catch { return $null } } }
+function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; return @($a | Select-Object -Unique) }
+for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=($w.Current.Name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$automation=$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=(ValueOf $e);bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=(ActionsOf $e);sensitive=($role -match 'Edit' -and $label -match 'password|credential|secret')};}$elements[$targetId]=$list}
 [ordered]@{targets=$targets;elements=$elements}|ConvertTo-Json -Compress -Depth 8
 "#;
 
@@ -1278,16 +1383,211 @@ def rect(o):
   b=o.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
   return {'x':b.x,'y':b.y,'width':b.width,'height':b.height}
  except Exception: return {'x':0,'y':0,'width':0,'height':0}
+def walk(node):
+ for child in list(node):
+  yield child
+  yield from walk(child)
 targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
 for app in list(desktop)[:64]:
  name=str(getattr(app,'name','')); aid='atspi:'+name
  for wi,w in enumerate(list(app)[:32]):
   title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]
-  for ei,e in enumerate(list(w)[:256]):
-   role=str(e.getRoleName()); label=str(getattr(e,'name','')); out.append({'id':tid+'::element-'+str(ei),'role':role,'label':label,'value':None,'bounds':rect(e),'enabled':True,'focused':False,'actions':['click','double_click','set_value','select'],'sensitive':('password' in (role+' '+label).lower())})
+  for ei,e in enumerate(list(walk(w))[:256]):
+   role=str(e.getRoleName()); label=str(getattr(e,'name','')); value=None
+   try: value=str(e.queryValue().getCurrentValue())
+   except Exception: pass
+   actions=[]
+   try:
+    qa=e.queryAction()
+    for ai in range(qa.nActions):
+     name=(qa.getActionName(ai) or '').lower()
+     if name in ('click','press','activate','select'): actions.append(name)
+   except Exception: pass
+   try: e.queryEditableText(); actions.append('set_value')
+   except Exception: pass
+   stable=(role+'-'+label).replace(' ','_')
+   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable[:80],'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':('password' in (role+' '+label).lower())})
   elements[tid]=out
 print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
 "#;
+
+#[cfg(target_os = "macos")]
+const MACOS_AX_ACTION_SCRIPT: &str = r#"
+ObjC.import('Foundation');
+const se = Application('System Events');
+const env = $.NSProcessInfo.processInfo.environment;
+const get = key => ObjC.unwrap(env.objectForKey(key));
+const appId = get('LM_APP_ID');
+const windowIndex = Number(get('LM_WINDOW_INDEX'));
+const elementIndex = Number(get('LM_ELEMENT_INDEX'));
+const action = get('LM_ACTION');
+const value = get('LM_VALUE');
+const process = se.processes.byBundleIdentifier(appId);
+const window = process.windows[windowIndex];
+const element = window.entireContents()[elementIndex];
+if (action === 'set_value') element.value = value;
+else if (action === 'select') element.click();
+else if (action === 'click') element.click();
+else if (action === 'double_click') { element.click(); element.click(); }
+else throw new Error('unsupported semantic action');
+JSON.stringify({semantic:true});
+"#;
+
+#[cfg(target_os = "macos")]
+const MACOS_FOCUS_SCRIPT: &str = r#"
+ObjC.import('Foundation');
+const se = Application('System Events');
+const env = $.NSProcessInfo.processInfo.environment;
+const get = key => ObjC.unwrap(env.objectForKey(key));
+const process = se.processes.byBundleIdentifier(get('LM_APP_ID'));
+process.frontmost = true;
+const window = process.windows[Number(get('LM_WINDOW_INDEX'))];
+try { window.performAction('AXRaise'); } catch (_) { window.raise(); }
+JSON.stringify({focused:true});
+"#;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_UIA_ACTION_SCRIPT: &str = r#"
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([int64]$env:LM_WINDOW_HANDLE))
+$desc=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
+$e=$desc.Item([int]$env:LM_ELEMENT_INDEX)
+$action=$env:LM_ACTION
+$performed=$false
+if($action -eq 'set_value') {
+  try { $p=$e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); $p.SetValue($env:LM_VALUE); $performed=$true } catch {}
+} elseif($action -eq 'select') {
+  try { $p=$e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); $performed=$true } catch {}
+} elseif($action -eq 'click' -or $action -eq 'double_click') {
+  try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {}
+  if(-not $performed) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $p.Toggle(); $performed=$true } catch {} }
+  if($performed -and $action -eq 'double_click') { try { $p.Invoke(); } catch {} }
+}
+if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
+"#;
+
+#[cfg(target_os = "linux")]
+const LINUX_ATSPI_ACTION_SCRIPT: &str = r#"
+import os, json
+import pyatspi
+def walk(node):
+ for child in list(node):
+  yield child
+  yield from walk(child)
+app_name=os.environ['LM_APP_NAME']; wi=int(os.environ['LM_WINDOW_INDEX']); ei=int(os.environ['LM_ELEMENT_INDEX'])
+a=None
+for candidate in list(pyatspi.Registry.getDesktop(0)):
+ if str(getattr(candidate,'name','')) == app_name: a=candidate; break
+if a is None: raise SystemExit('AT-SPI application is stale')
+w=list(a)[wi]; e=list(walk(w))[ei]; action=os.environ['LM_ACTION']
+if action in ('click','double_click','select'):
+ actions=e.queryAction(); done=False
+ for i in range(actions.nActions):
+  name=(actions.getActionName(i) or '').lower()
+  if name in ('click','press','activate','select'):
+   actions.doAction(i)
+   if action == 'double_click': actions.doAction(i)
+   done=True; break
+ if not done:
+  print(json.dumps({'semantic':False},separators=(',',':'))); raise SystemExit(0)
+elif action == 'set_value':
+ editable=e.queryEditableText(); editable.setTextContents(os.environ['LM_VALUE'])
+else: raise SystemExit('unsupported semantic action')
+print(json.dumps({'semantic':True},separators=(',',':')))
+"#;
+
+fn element_index(element_id: &str) -> Result<usize, String> {
+    element_id
+        .rsplit_once("::element-")
+        .and_then(|(_, index)| index.split("::").next())
+        .and_then(|index| index.parse::<usize>().ok())
+        .ok_or_else(|| "Accessibility element id has no stable provider index".to_string())
+}
+
+fn window_index(window_id: &str) -> Result<usize, String> {
+    window_id
+        .rsplit_once("::window-")
+        .and_then(|(_, index)| index.parse::<usize>().ok())
+        .ok_or_else(|| "Accessibility window id has no stable provider index".to_string())
+}
+
+fn native_semantic_action(
+    target: &ComputerTarget,
+    element_id: &str,
+    action: &str,
+    value: Option<&str>,
+) -> Result<bool, String> {
+    let element_index = element_index(element_id)?;
+    #[cfg(target_os = "macos")]
+    {
+        let window_index = window_index(&target.window_id)?;
+        let bytes = run_native_command_with_env(
+            "osascript",
+            &["-l", "JavaScript", "-e", MACOS_AX_ACTION_SCRIPT],
+            &[
+                ("LM_APP_ID", target.application_id.clone()),
+                ("LM_WINDOW_INDEX", window_index.to_string()),
+                ("LM_ELEMENT_INDEX", element_index.to_string()),
+                ("LM_ACTION", action.to_string()),
+                ("LM_VALUE", value.unwrap_or_default().to_string()),
+            ],
+        )?;
+        return serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
+            .ok_or_else(|| "macOS Accessibility action returned invalid data".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let bytes = run_native_command_with_env(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                WINDOWS_UIA_ACTION_SCRIPT,
+            ],
+            &[
+                ("LM_WINDOW_HANDLE", target.window_id.clone()),
+                ("LM_ELEMENT_INDEX", element_index.to_string()),
+                ("LM_ACTION", action.to_string()),
+                ("LM_VALUE", value.unwrap_or_default().to_string()),
+            ],
+        )?;
+        return serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
+            .ok_or_else(|| "Windows UI Automation action returned invalid data".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if is_wayland_session_from_env() {
+            return Err(WAYLAND_PORTAL_MESSAGE.to_string());
+        }
+        let window_index = window_index(&target.window_id)?;
+        let bytes = run_native_command_with_env(
+            "python3",
+            &["-c", LINUX_ATSPI_ACTION_SCRIPT],
+            &[
+                ("LM_APP_NAME", target.application_name.clone()),
+                ("LM_WINDOW_INDEX", window_index.to_string()),
+                ("LM_ELEMENT_INDEX", element_index.to_string()),
+                ("LM_ACTION", action.to_string()),
+                ("LM_VALUE", value.unwrap_or_default().to_string()),
+            ],
+        )?;
+        return serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|json| json.get("semantic").and_then(serde_json::Value::as_bool))
+            .ok_or_else(|| "Linux AT-SPI action returned invalid data".to_string());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (target, element_id, action, value, element_index);
+        Ok(false)
+    }
+}
 
 /// A single control session, scoped to an explicit, non-empty allowlist of
 /// application/window identifiers — see the module doc's comparison to
@@ -1375,7 +1675,19 @@ pub struct PendingActionSummary {
     pub target_application_id: String,
     pub target_window_id: Option<String>,
     pub approval_level: ApprovalLevel,
+    pub description: String,
     pub action: ControlAction,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationEvidence {
+    pub kind: String,
+    pub element_id: Option<String>,
+    pub expected_value: Option<String>,
+    pub observed_value: Option<String>,
+    pub matched: bool,
+    pub detail: String,
 }
 
 /// Result of a resolved (executed or denied) action, returned to the caller
@@ -1388,8 +1700,24 @@ pub struct ActionOutcome {
     pub input_sent: bool,
     pub state_verified: bool,
     pub verification: Option<String>,
+    pub verification_evidence: Option<VerificationEvidence>,
     pub audit_id: String,
     pub approval_level: ApprovalLevel,
+}
+
+impl ActionOutcome {
+    pub fn from_execution(action_id: String, result: ExecutionResult) -> Self {
+        Self {
+            action_id,
+            executed: true,
+            input_sent: result.input_sent,
+            state_verified: result.state_verified,
+            verification: result.verification,
+            verification_evidence: result.verification_evidence,
+            audit_id: result.audit_id,
+            approval_level: result.approval_level,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1408,6 +1736,7 @@ pub struct ComputerAuditRecord {
     pub input_sent: bool,
     pub state_verified: bool,
     pub verification: Option<String>,
+    pub verification_evidence: Option<VerificationEvidence>,
     pub screenshot_ref: Option<String>,
     pub created_at_ms: u64,
 }
@@ -1432,13 +1761,20 @@ pub struct ExecutionResult {
     input_sent: bool,
     state_verified: bool,
     verification: Option<String>,
+    verification_evidence: Option<VerificationEvidence>,
     audit_id: String,
     approval_level: ApprovalLevel,
 }
 
 fn validate_coordinates(target: &ComputerTarget, x: i32, y: i32) -> Result<(), String> {
-    if target.bounds.width <= 0.0 || target.bounds.height <= 0.0 {
-        return Ok(());
+    if !target.bounds.x.is_finite()
+        || !target.bounds.y.is_finite()
+        || !target.bounds.width.is_finite()
+        || !target.bounds.height.is_finite()
+        || target.bounds.width <= 0.0
+        || target.bounds.height <= 0.0
+    {
+        return Err("Target has no valid bounded coordinate region".to_string());
     }
     let inside_x =
         f64::from(x) >= target.bounds.x && f64::from(x) <= target.bounds.x + target.bounds.width;
@@ -1457,37 +1793,42 @@ fn action_summary(action: &ControlAction) -> String {
         ControlAction::SetValue { .. } | ControlAction::Select { .. } => {
             "set_value (content redacted)".to_string()
         }
+        ControlAction::SemanticClick {
+            element_id,
+            button,
+            expected_value,
+        } => format!(
+            "semantic_click element={element_id} button={button:?} expected_value={}",
+            expected_value.as_deref().unwrap_or("unspecified")
+        ),
+        ControlAction::SemanticDoubleClick {
+            element_id,
+            button,
+            expected_value,
+        } => format!(
+            "semantic_double_click element={element_id} button={button:?} expected_value={}",
+            expected_value.as_deref().unwrap_or("unspecified")
+        ),
         _ => serde_json::to_string(action).unwrap_or_else(|_| "unserializable_action".to_string()),
     }
 }
 
 fn approval_level(action: &ControlAction) -> ApprovalLevel {
-    let summary = action_summary(action).to_ascii_lowercase();
+    approval_level_for_name(&action_summary(action))
+}
+
+fn approval_level_for_name(action_name: &str) -> ApprovalLevel {
+    let summary = action_name.to_ascii_lowercase();
     if [
-        "delete", "destroy", "purchase", "payment", "confirm", "send",
+        "delete", "destroy", "remove", "purchase", "payment", "confirm", "send", "submit",
+        "publish", "revoke", "shutdown", "format", "erase",
     ]
     .iter()
     .any(|token| summary.contains(token))
     {
         return ApprovalLevel::Critical;
     }
-    match action {
-        ControlAction::Wait { .. } => ApprovalLevel::Low,
-        ControlAction::Focus | ControlAction::Scroll { .. } => ApprovalLevel::Medium,
-        _ => ApprovalLevel::High,
-    }
-}
-
-fn approval_level_for_name(action_name: &str) -> ApprovalLevel {
-    let summary = action_name.to_ascii_lowercase();
-    if [
-        "delete", "destroy", "purchase", "payment", "confirm", "send",
-    ]
-    .iter()
-    .any(|token| summary.contains(token))
-    {
-        ApprovalLevel::Critical
-    } else if summary.contains("screenshot")
+    if summary.contains("screenshot")
         || summary.contains("inspect")
         || summary.contains("clipboard")
     {
@@ -2095,6 +2436,208 @@ impl DesktopControlState {
             .any(|element| element.focused && element.sensitive))
     }
 
+    fn action_approval(
+        &self,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: &ControlAction,
+    ) -> (ApprovalLevel, String) {
+        let mut description = action_summary(action);
+        let element_id = match action {
+            ControlAction::SemanticClick { element_id, .. }
+            | ControlAction::SemanticDoubleClick { element_id, .. }
+            | ControlAction::Select { element_id, .. }
+            | ControlAction::SetValue { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        };
+        let mut element_unverified = false;
+        if let Some(element_id) = element_id {
+            if let Ok(inspection) =
+                self.semantic
+                    .inspect(target_application_id, target_window_id, None)
+            {
+                if let Some(element) = inspection
+                    .elements
+                    .iter()
+                    .find(|element| element.id == element_id)
+                {
+                    description.push_str(&format!(
+                        " role={} label={}",
+                        element.role,
+                        if element.label.is_empty() {
+                            "(unlabelled)"
+                        } else {
+                            &element.label
+                        }
+                    ));
+                } else {
+                    element_unverified = true;
+                }
+            } else {
+                element_unverified = true;
+            }
+        }
+        let level = if element_id.is_some() {
+            if element_unverified {
+                ApprovalLevel::Critical
+            } else {
+                approval_level_for_name(&description)
+            }
+        } else {
+            approval_level(action)
+        };
+        (level, description)
+    }
+
+    fn verify_postcondition(
+        &self,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        action: &ControlAction,
+        before_value: Option<String>,
+    ) -> (bool, Option<VerificationEvidence>, Option<String>) {
+        let element_id = match action {
+            ControlAction::SemanticClick { element_id, .. }
+            | ControlAction::SemanticDoubleClick { element_id, .. }
+            | ControlAction::Select { element_id, .. }
+            | ControlAction::SetValue { element_id, .. } => Some(element_id.as_str()),
+            _ => None,
+        };
+        if matches!(action, ControlAction::Focus) {
+            return match self
+                .semantic
+                .verify_target(target_application_id, target_window_id, true)
+            {
+                Ok(target) if target.focused => (
+                    true,
+                    Some(VerificationEvidence {
+                        kind: "target_focus".to_string(),
+                        element_id: None,
+                        expected_value: None,
+                        observed_value: Some("focused".to_string()),
+                        matched: true,
+                        detail: "the requested target is focused after the action".to_string(),
+                    }),
+                    Some("target focus verified after action".to_string()),
+                ),
+                Ok(_) => (
+                    false,
+                    Some(VerificationEvidence {
+                        kind: "target_focus".to_string(),
+                        element_id: None,
+                        expected_value: Some("focused".to_string()),
+                        observed_value: Some("not_focused".to_string()),
+                        matched: false,
+                        detail: "the target remained reachable but is not focused".to_string(),
+                    }),
+                    Some("target remained reachable but focus was not verified".to_string()),
+                ),
+                Err(error) => (
+                    false,
+                    Some(VerificationEvidence {
+                        kind: "target_focus".to_string(),
+                        element_id: None,
+                        expected_value: Some("focused".to_string()),
+                        observed_value: None,
+                        matched: false,
+                        detail: error.clone(),
+                    }),
+                    Some(format!("target focus could not be verified: {error}")),
+                ),
+            };
+        }
+        if let Some(element_id) = element_id {
+            let expected = match action {
+                ControlAction::SemanticClick { expected_value, .. }
+                | ControlAction::SemanticDoubleClick { expected_value, .. } => {
+                    expected_value.clone()
+                }
+                ControlAction::Select { value, .. } | ControlAction::SetValue { value, .. } => {
+                    Some(value.clone())
+                }
+                _ => None,
+            };
+            let inspected = self
+                .semantic
+                .inspect(target_application_id, target_window_id, None)
+                .ok()
+                .and_then(|inspection| {
+                    inspection
+                        .elements
+                        .into_iter()
+                        .find(|element| element.id == element_id)
+                });
+            let observed = inspected.as_ref().and_then(|element| element.value.clone());
+            let matched = if let Some(expected) = expected.as_deref() {
+                observed
+                    .as_deref()
+                    .is_some_and(|value| value.trim() == expected.trim())
+            } else {
+                before_value
+                    .as_deref()
+                    .zip(observed.as_deref())
+                    .is_some_and(|(before, after)| before != after)
+            };
+            let detail = if expected.is_some() {
+                "the inspected element value was compared with the requested postcondition"
+            } else {
+                "the inspected element value was compared before and after the semantic action"
+            };
+            return (
+                matched,
+                Some(VerificationEvidence {
+                    kind: "element_value".to_string(),
+                    element_id: Some(element_id.to_string()),
+                    expected_value: expected,
+                    observed_value: observed,
+                    matched,
+                    detail: detail.to_string(),
+                }),
+                Some(if matched {
+                    "element state verified after action".to_string()
+                } else {
+                    "input was sent; the requested element state was not verified".to_string()
+                }),
+            );
+        }
+        let detail = if matches!(action, ControlAction::Wait { .. }) {
+            "the target was revalidated after the wait"
+        } else {
+            "input delivery was confirmed, but no element postcondition was supplied"
+        };
+        let verified = matches!(action, ControlAction::Wait { .. })
+            && self
+                .semantic
+                .verify_target(target_application_id, target_window_id, false)
+                .is_ok();
+        (
+            verified,
+            Some(VerificationEvidence {
+                kind: "target_revalidation".to_string(),
+                element_id: None,
+                expected_value: None,
+                observed_value: None,
+                matched: verified,
+                detail: detail.to_string(),
+            }),
+            Some(detail.to_string()),
+        )
+    }
+
+    fn set_audit_verification_evidence(
+        &self,
+        audit_id: &str,
+        evidence: Option<VerificationEvidence>,
+    ) -> Result<(), String> {
+        if let Some(record) = lock(&self.audit, "desktop control audit")?
+            .iter_mut()
+            .find(|record| record.audit_id == audit_id)
+        {
+            record.verification_evidence = evidence;
+        }
+        Ok(())
+    }
+
     fn validate_action(
         session: &ControlSession,
         target: &ComputerTarget,
@@ -2176,6 +2719,23 @@ impl DesktopControlState {
                 "Keyboard input into a sensitive or authentication element is blocked".to_string(),
             );
         }
+        let before_value = match action {
+            ControlAction::SemanticClick { element_id, .. }
+            | ControlAction::SemanticDoubleClick { element_id, .. }
+            | ControlAction::Select { element_id, .. }
+            | ControlAction::SetValue { element_id, .. } => self
+                .semantic
+                .inspect(target_application_id, target_window_id, None)
+                .ok()
+                .and_then(|inspection| {
+                    inspection
+                        .elements
+                        .into_iter()
+                        .find(|element| element.id == *element_id)
+                        .and_then(|element| element.value)
+                }),
+            _ => None,
+        };
         let mut input_sent = false;
         match action {
             ControlAction::MouseMove { x, y } => {
@@ -2232,12 +2792,16 @@ impl DesktopControlState {
             ControlAction::Focus => {
                 self.semantic.focus(&target)?;
             }
-            ControlAction::SemanticClick { element_id, button } => {
+            ControlAction::SemanticClick {
+                element_id, button, ..
+            } => {
                 self.semantic
                     .click_element(&target, element_id, *button, false)?;
                 input_sent = true;
             }
-            ControlAction::SemanticDoubleClick { element_id, button } => {
+            ControlAction::SemanticDoubleClick {
+                element_id, button, ..
+            } => {
                 self.semantic
                     .click_element(&target, element_id, *button, true)?;
                 input_sent = true;
@@ -2254,19 +2818,12 @@ impl DesktopControlState {
                 std::thread::sleep(Duration::from_millis(*milliseconds))
             }
         }
-        let verified = self
-            .semantic
-            .verify_target(
-                target_application_id,
-                target_window_id,
-                Self::action_requires_frontmost(action),
-            )
-            .is_ok();
-        let verification = Some(if verified {
-            "target revalidated after action".to_string()
-        } else {
-            "input was sent; target state could not be revalidated".to_string()
-        });
+        let (verified, verification_evidence, verification) = self.verify_postcondition(
+            target_application_id,
+            target_window_id,
+            action,
+            before_value,
+        );
         let audit_id = self.record_audit_with_context(
             session_id,
             target_application_id,
@@ -2279,12 +2836,16 @@ impl DesktopControlState {
             verification.clone(),
             context,
         )?;
+        self.set_audit_verification_evidence(&audit_id, verification_evidence.clone())?;
+        let (approval_level, _) =
+            self.action_approval(target_application_id, target_window_id, action);
         Ok(ExecutionResult {
             input_sent,
             state_verified: verified,
             verification,
+            verification_evidence,
             audit_id,
-            approval_level: approval_level(action),
+            approval_level,
         })
     }
 
@@ -2344,6 +2905,7 @@ impl DesktopControlState {
             input_sent,
             state_verified,
             verification,
+            verification_evidence: None,
             screenshot_ref: None,
             created_at_ms: now_ms(),
         };
@@ -2431,7 +2993,8 @@ impl DesktopControlState {
             target_window_id,
             Self::action_requires_frontmost(&action),
         )?;
-        if session.approved_batch {
+        let (approval, _) = self.action_approval(target_application_id, target_window_id, &action);
+        if session.approved_batch && approval != ApprovalLevel::Critical {
             return Ok(ActionGate::Executed(self.execute_for_target_with_context(
                 session_id,
                 target_application_id,
@@ -2493,9 +3056,20 @@ impl DesktopControlState {
         action: &ControlAction,
         approve: bool,
     ) -> Result<bool, String> {
+        Ok(self
+            .finish_pending_with_result(action_id, action, approve)?
+            .is_some())
+    }
+
+    pub fn finish_pending_with_result(
+        &self,
+        action_id: &str,
+        action: &ControlAction,
+        approve: bool,
+    ) -> Result<Option<ExecutionResult>, String> {
         let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id)
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let _ = pending.sender.send(approve);
         if !approve {
@@ -2511,19 +3085,19 @@ impl DesktopControlState {
                 Some("operator denied the pending action".to_string()),
                 &pending.context,
             );
-            return Ok(false);
+            return Ok(None);
         }
         if &pending.action != action {
             return Err("Pending action payload changed before approval".to_string());
         }
-        self.execute_for_target_with_context(
+        let result = self.execute_for_target_with_context(
             &pending.session_id,
             &pending.target_application_id,
             pending.target_window_id.as_deref(),
             &pending.action,
             &pending.context,
         )?;
-        Ok(true)
+        Ok(Some(result))
     }
 
     fn deny_pending_for_session(&self, session_id: &str) -> Result<(), String> {
@@ -2632,13 +3206,14 @@ pub fn desktop_control_start_session(
             })),
         },
     )?;
-    // Best-effort visible indicator — reuses the existing always-on-top
-    // companion overlay window rather than building new window chrome (see
-    // the design doc). A failure to show it never fails session start
-    // itself: the session is still gated and stoppable either way, and the
-    // Settings panel's own session list is a second, always-available
-    // indicator.
-    let _ = crate::m7_companion::show_overlay(&app);
+    // The visible, always-on-top overlay is part of the safety invariant. Do
+    // not leave a live input session behind when the operator cannot see it.
+    if let Err(error) = crate::m7_companion::show_overlay(&app) {
+        let _ = state.stop_session(&session.session_id);
+        return Err(format!(
+            "Could not establish the desktop-control indicator: {error}"
+        ));
+    }
     let _ = app.emit("desktop-control://session-state", &session);
     Ok(session)
 }
@@ -2768,6 +3343,7 @@ async fn request_action_impl(
                 input_sent: result.input_sent,
                 state_verified: result.state_verified,
                 verification: result.verification,
+                verification_evidence: result.verification_evidence,
                 audit_id: result.audit_id,
                 approval_level: result.approval_level,
             })
@@ -2776,6 +3352,8 @@ async fn request_action_impl(
             action_id,
             receiver,
         } => {
+            let (approval_level, description) =
+                state.action_approval(target_application_id, target_window_id, &action);
             let _ = app.emit(
                 "desktop-control://action-pending",
                 PendingActionSummary {
@@ -2783,7 +3361,8 @@ async fn request_action_impl(
                     session_id: session_id.to_string(),
                     target_application_id: target_application_id.to_string(),
                     target_window_id: target_window_id.map(str::to_string),
-                    approval_level: approval_level(&action),
+                    approval_level,
+                    description,
                     action: redacted_action_for_ui(&action),
                 },
             );
@@ -2802,6 +3381,7 @@ async fn request_action_impl(
                         input_sent: result.input_sent,
                         state_verified: result.state_verified,
                         verification: result.verification,
+                        verification_evidence: result.verification_evidence,
                         audit_id: result.audit_id,
                         approval_level: result.approval_level,
                     })
@@ -2974,12 +3554,17 @@ pub async fn tool_computer_click(
     x: Option<i32>,
     y: Option<i32>,
     button: Option<MouseButtonKind>,
+    expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
-        ControlAction::SemanticClick { element_id, button }
+        ControlAction::SemanticClick {
+            element_id,
+            button,
+            expected_value,
+        }
     } else {
         ControlAction::MouseClickAt {
             x: x.ok_or_else(|| "computer_click needs element_id or x and y".to_string())?,
@@ -3011,12 +3596,17 @@ pub async fn tool_computer_double_click(
     x: Option<i32>,
     y: Option<i32>,
     button: Option<MouseButtonKind>,
+    expected_value: Option<String>,
     turn_id: Option<String>,
     tool_call_id: Option<String>,
 ) -> Result<ActionOutcome, String> {
     let button = button.unwrap_or(MouseButtonKind::Left);
     let action = if let Some(element_id) = element_id {
-        ControlAction::SemanticDoubleClick { element_id, button }
+        ControlAction::SemanticDoubleClick {
+            element_id,
+            button,
+            expected_value,
+        }
     } else {
         ControlAction::MouseDoubleClickAt {
             x: x.ok_or_else(|| "computer_double_click needs element_id or x and y".to_string())?,
@@ -3334,7 +3924,11 @@ mod tests {
         };
         let result = result.unwrap();
         assert!(result.input_sent);
-        assert!(result.state_verified);
+        assert!(!result.state_verified);
+        assert!(result
+            .verification
+            .as_deref()
+            .is_some_and(|message| message.contains("no element postcondition")));
         let audit = state.audit_snapshot().unwrap();
         assert!(audit[0].action.contains("redacted"));
         assert!(!audit[0].action.contains("secret-value"));

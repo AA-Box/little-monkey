@@ -28,8 +28,8 @@ export type ControlAction =
   | { kind: "key_press"; key: string }
   | { kind: "hotkey"; keys: string[] }
   | { kind: "focus" }
-  | { kind: "semantic_click"; element_id: string; button: MouseButtonKind }
-  | { kind: "semantic_double_click"; element_id: string; button: MouseButtonKind }
+  | { kind: "semantic_click"; element_id: string; button: MouseButtonKind; expected_value?: string | null }
+  | { kind: "semantic_double_click"; element_id: string; button: MouseButtonKind; expected_value?: string | null }
   | { kind: "select"; element_id: string; value: string }
   | { kind: "set_value"; element_id: string; value: string }
   | { kind: "wait"; milliseconds: number };
@@ -59,7 +59,17 @@ export interface PendingActionSummary {
   targetApplicationId: string;
   targetWindowId?: string | null;
   approvalLevel: ApprovalLevel;
+  description: string;
   action: ControlAction;
+}
+
+export interface VerificationEvidence {
+  kind: string;
+  elementId?: string | null;
+  expectedValue?: string | null;
+  observedValue?: string | null;
+  matched: boolean;
+  detail: string;
 }
 
 /** Mirrors `desktop_control::ActionOutcome`. */
@@ -69,6 +79,7 @@ export interface ActionOutcome {
   inputSent: boolean;
   stateVerified: boolean;
   verification?: string | null;
+  verificationEvidence?: VerificationEvidence | null;
   auditId: string;
   approvalLevel: ApprovalLevel;
 }

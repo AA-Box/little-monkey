@@ -28,8 +28,10 @@ targets fail closed. Results distinguish input sent from state verified.
 
 The approval levels are low for inspect/screenshot, medium for focus/scroll,
 high for typing/clicking/value mutation, and critical for destructive or
-external transactions. Approved-batch mode is an explicit grant choice and
-never widens the allowlist or disables the kill switch. A bounded wait loop
+external transactions, including a semantic element whose inspected role or
+label is destructive. Critical actions always require their own approval,
+even inside an approved batch. Approved-batch mode is an explicit grant
+choice and never widens the allowlist or disables the kill switch. A bounded wait loop
 must cap actions, duration, screenshots, retries, and model calls; callers
 must not turn Computer Use into an unbounded autonomous loop.
 
@@ -50,12 +52,12 @@ computer tool must not be used to drive a terminal. A malicious web page,
 file, MCP response, or model instruction cannot widen a grant or approve an
 action.
 
-For web content, the coordinator routes to the existing browser worker and
-its DOM/accessibility/origin grants when a browser session is available.
-Computer Use is for native applications and does not offer a pixel-based
-browser bypass. Native UI tasks use Computer Use, while the Universal Task
-Coordinator records the capability choice and its bounded evidence in the
-run ledger.
+For web content, the Universal Task Coordinator routes browser-capable tool
+names to the browser route when that capability is available and rejects a
+browser URL supplied to a native Computer Use call. Computer Use is for
+native applications and does not offer a pixel-based browser bypass. Native
+UI tasks use Computer Use, while the coordinator records the capability
+choice and bounded observe/authorize/execute/verify phases.
 
 ## Platform adapters
 
