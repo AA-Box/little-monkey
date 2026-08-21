@@ -307,7 +307,7 @@ export function validateTaskPlan(plan: TaskPlan, context?: TaskPlanningContext):
     if (current.executionRequirements?.needsNetwork && !current.capabilities?.includes("network")) errors.push(`${current.nodeId} requires network capability but does not request network`);
     if (current.executionRequirements?.isolation !== current.isolation) errors.push(`${current.nodeId} execution requirements and node isolation disagree`);
     if (current.executionPlacement?.kind === "worktree" && current.isolation !== "worktree") errors.push(`${current.nodeId} worktree placement requires worktree isolation`);
-    if (current.executionPlacement?.kind === "docker" || current.executionPlacement?.kind === "remote_node") errors.push(`${current.nodeId} requests unsupported placement '${current.executionPlacement.kind}' without a registered backend adapter`);
+    if ((current.executionPlacement?.kind === "docker" || current.executionPlacement?.kind === "remote_node") && !current.executionPlacement.targetId.trim()) errors.push(current.nodeId + " " + current.executionPlacement.kind + " placement requires a target id");
     if (context && context.relevantFiles.length > 0 && current.relevantFiles?.some((file) => file !== "workspace" && !context.relevantFiles.includes(file))) errors.push(`${current.nodeId} references files outside the planner's repository context`);
   }
   const visiting = new Set<string>();

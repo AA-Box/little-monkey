@@ -1231,6 +1231,10 @@ pub struct RunSpec {
     pub workspace: Option<WorkspaceContext>,
     pub permission_policy: PermissionPolicySnapshot,
     pub budgets: RunBudgets,
+    /// Frozen autonomous coordinator state transported with a remote
+    /// placement. Ordinary runs leave this absent.
+    #[serde(default)]
+    pub autonomous_task: Option<serde_json::Value>,
 }
 
 impl RunSpec {
@@ -1259,7 +1263,19 @@ impl RunSpec {
             workspace.validate()?;
         }
         self.permission_policy.validate()?;
-        self.budgets.validate()
+        self.budgets.validate()?;
+        if let Some(snapshot) = &self.autonomous_task {
+            let bytes = serde_json::to_vec(snapshot).map_err(|_| {
+                ProtocolValidationError::new("autonomous_task", "is not serializable")
+            })?;
+            if bytes.len() > 512 * 1024 {
+                return Err(ProtocolValidationError::new(
+                    "autonomous_task",
+                    "exceeds the 512 KiB limit",
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2233,6 +2249,7 @@ mod tests {
                 max_artifact_bytes: 10_000_000,
                 max_event_count: 10_000,
             },
+            autonomous_task: None,
         }
     }
 

@@ -4470,6 +4470,7 @@ mod tests {
                 max_artifact_bytes: 1_024,
                 max_event_count: 1_000,
             },
+            autonomous_task: None,
         }
     }
 

@@ -1381,6 +1381,12 @@ pub(crate) fn enqueue_frozen_recipe(
     recipe: Recipe,
     submitted_run_id: &str,
 ) -> Result<QueuedRun, String> {
+    if let Some(snapshot) = recipe.autonomous_task.as_ref() {
+        let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
+            "Autonomous task recipe requires an execution owner lease".to_string()
+        })?;
+        little_monkey_lib::recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
     let paths = DaemonPaths::resolve()?;
     let config = DaemonConfig::load(&paths)
         .map_err(|error| format!("this node's background runner is not configured: {error}"))?;
@@ -1581,7 +1587,12 @@ fn placed_recipe(
         channel_send: None,
         desktop_turn: None,
         placed_run: Some(snapshot),
-        autonomous_task: None,
+        autonomous_task: spec
+            .autonomous_task
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| format!("placed autonomous task snapshot is invalid: {error}"))?,
     };
     little_monkey_lib::recipes::validate_recipe(&recipe)
         .map_err(|error| format!("the placed spec does not form a runnable recipe: {error}"))?;

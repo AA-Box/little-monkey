@@ -390,6 +390,8 @@ export interface RunSubagentTaskParams {
   /** Node-level capability ceiling, intersected with the built-in profile and
    * the frozen task policy before tools are offered or dispatched. */
   capabilities?: readonly string[];
+  /** Called immediately before every model-requested tool side effect. */
+  beforeToolCall?: () => void | Promise<void>;
 }
 
 export interface RunSubagentTaskResult {
@@ -784,6 +786,7 @@ async function runSubagentTaskLoop(params: RunSubagentTaskParams): Promise<strin
         // `toolsForProfile` only shapes what's *offered*; this is the
         // enforcement point that makes it an actual authorization boundary.
         const allowed = isToolCallAllowed(toolCall, tools);
+        if (!aborted && allowed) await params.beforeToolCall?.();
         const resultContent = aborted
           ? CANCELLED_TOOL_RESULT
           : !allowed

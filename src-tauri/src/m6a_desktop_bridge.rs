@@ -310,7 +310,7 @@ pub async fn m6a_desktop_turn_submit(
             .unwrap_or(30 * 60)
             .to_string(),
         "--branch-prefix".to_string(),
-        "codex/desktop/".to_string(),
+        "desktop/".to_string(),
         "--allow-commit".to_string(),
         "false".to_string(),
         "--json".to_string(),
@@ -344,6 +344,10 @@ pub async fn autonomous_task_submit(
     if snapshot.task_id != request.task_id {
         return Err("Autonomous task id differs from its immutable recipe snapshot".to_string());
     }
+    let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
+        "Autonomous task submission requires an execution owner lease".to_string()
+    })?;
+    recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
     let status_text = crate::daemon_commands::command(vec![
         "daemon".to_string(),
         "status".to_string(),
