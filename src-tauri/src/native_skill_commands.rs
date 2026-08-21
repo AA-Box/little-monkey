@@ -6,6 +6,7 @@
 //! and collision-checked by the shared core on each discovery.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -17,8 +18,14 @@ use crate::native_skills::{
     NativeSkillManager, SkillDescriptor, SkillInstallPreview, SkillMutationResult, SkillScope,
 };
 use crate::AppState;
+use notify::event::{EventKind, ModifyKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{Emitter, Manager};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 pub const NATIVE_SKILLS_CHANGED_EVENT: &str = "native-skills://changed";
 
@@ -29,6 +36,68 @@ pub struct NativeSkillsCommandState {
 
 struct NativeSkillWatchHandle {
     _watcher: RecommendedWatcher,
+}
+
+#[derive(Clone, Copy)]
+struct NativeSkillWatchEvent {
+    recreate_watcher: bool,
+}
+
+fn watch_path_identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        Some((
+            u64::from(metadata.volume_serial_number()?),
+            metadata.file_index()?,
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+fn watcher_event_requires_recreation(
+    event: &notify::Event,
+    watched_path: &Path,
+    watched_identity: Option<(u64, u64)>,
+) -> bool {
+    identity_requires_recreation(watched_identity, watch_path_identity(watched_path))
+        || (event
+            .paths
+            .iter()
+            .any(|event_path| event_path == watched_path || event_path.starts_with(watched_path))
+            && matches!(
+                event.kind,
+                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+            ))
+}
+
+fn identity_requires_recreation(
+    watched_identity: Option<(u64, u64)>,
+    current_identity: Option<(u64, u64)>,
+) -> bool {
+    match (watched_identity, current_identity) {
+        (Some(previous), Some(current)) => previous != current,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+fn retain_watch_paths<T>(
+    handles: &mut BTreeMap<PathBuf, T>,
+    desired: &BTreeMap<PathBuf, bool>,
+    recreate_path: Option<&Path>,
+) {
+    handles.retain(|path, _| {
+        desired.contains_key(path) && !recreate_path.is_some_and(|target| target == path)
+    });
 }
 
 #[derive(Default)]
@@ -42,6 +111,7 @@ impl NativeSkillWatcher {
         app: &tauri::AppHandle,
         manager: &Arc<NativeSkillManager>,
         workspace: Option<&Path>,
+        recreate_path: Option<&Path>,
     ) -> Result<(), String> {
         let desired = manager
             .watch_targets(workspace)
@@ -52,16 +122,23 @@ impl NativeSkillWatcher {
             .handles
             .lock()
             .map_err(|_| "Native skill watcher lock poisoned".to_string())?;
-        handles.retain(|path, _| desired.contains_key(path));
+        retain_watch_paths(&mut handles, &desired, recreate_path);
         for (path, recursive) in desired {
             if handles.contains_key(&path) {
                 continue;
             }
-            let (tx, rx) = mpsc::channel::<()>();
+            let (tx, rx) = mpsc::channel::<NativeSkillWatchEvent>();
+            let watched_path = path.clone();
+            let watched_identity = watch_path_identity(&path);
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                    if event.is_ok() {
-                        let _ = tx.send(());
+                    if let Ok(event) = event {
+                        let recreate_watcher = watcher_event_requires_recreation(
+                            &event,
+                            &watched_path,
+                            watched_identity,
+                        );
+                        let _ = tx.send(NativeSkillWatchEvent { recreate_watcher });
                     }
                 })
                 .map_err(|error| format!("create native skill watcher: {error}"))?;
@@ -78,9 +155,13 @@ impl NativeSkillWatcher {
             let app = app.clone();
             let watcher_state = Arc::clone(self);
             let manager = Arc::clone(manager);
+            let thread_path = path.clone();
             thread::spawn(move || {
-                while rx.recv().is_ok() {
-                    while rx.recv_timeout(Duration::from_millis(150)).is_ok() {}
+                while let Ok(first_event) = rx.recv() {
+                    let mut recreate_watcher = first_event.recreate_watcher;
+                    while let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
+                        recreate_watcher |= event.recreate_watcher;
+                    }
                     let _ = watcher_state.sync(
                         &app,
                         &manager,
@@ -88,6 +169,11 @@ impl NativeSkillWatcher {
                             .ok()
                             .flatten()
                             .as_deref(),
+                        if recreate_watcher {
+                            Some(thread_path.as_path())
+                        } else {
+                            None
+                        },
                     );
                     let _ = app.emit(NATIVE_SKILLS_CHANGED_EVENT, "filesystem");
                 }
@@ -118,10 +204,11 @@ pub(crate) fn sync_native_skill_watchers(app: &tauri::AppHandle) {
     };
     if let Err(error) = native
         .watcher
-        .sync(app, &native.manager, workspace.as_deref())
+        .sync(app, &native.manager, workspace.as_deref(), None)
     {
         eprintln!("native skill watcher setup failed: {error}");
     }
+    let _ = app.emit(NATIVE_SKILLS_CHANGED_EVENT, "workspace");
 }
 
 fn emit_native_skills_changed(window: &tauri::Window) {
@@ -445,4 +532,50 @@ where
 
 fn command_error(error: crate::native_skills::SkillError) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        identity_requires_recreation, retain_watch_paths, watcher_event_requires_recreation,
+    };
+    use notify::event::{EventKind, ModifyKind, RemoveKind, RenameMode};
+    use notify::Event;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn same_path_root_replacement_drops_the_old_handle() {
+        let root = PathBuf::from("/tmp/native-skill-root");
+        let mut handles = BTreeMap::from([(root.clone(), ())]);
+        let desired = BTreeMap::from([(root.clone(), true)]);
+
+        retain_watch_paths(&mut handles, &desired, Some(&root));
+
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn root_remove_and_rename_events_request_recreation() {
+        let root = PathBuf::from("/tmp/native-skill-root");
+        let removed = Event {
+            kind: EventKind::Remove(RemoveKind::Folder),
+            paths: vec![root.clone()],
+            attrs: Default::default(),
+        };
+        let renamed = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            paths: vec![root.clone()],
+            attrs: Default::default(),
+        };
+
+        assert!(watcher_event_requires_recreation(&removed, &root, None));
+        assert!(watcher_event_requires_recreation(&renamed, &root, None));
+    }
+
+    #[test]
+    fn changed_directory_identity_requests_recreation_for_coalesced_events() {
+        assert!(identity_requires_recreation(Some((1, 2)), Some((3, 4))));
+        assert!(!identity_requires_recreation(Some((1, 2)), Some((1, 2))));
+    }
 }

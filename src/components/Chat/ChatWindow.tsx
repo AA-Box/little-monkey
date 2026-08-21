@@ -84,7 +84,6 @@ import { useBrowserWorkbenchStore } from "../../store/browserWorkbenchStore";
 import { useSideTaskStore } from "../../store/sideTaskStore";
 import { useMcpStore } from "../../store/mcpStore";
 import { useTerminalStore } from "../../store/terminalStore";
-import { nativeSkillsClient, type NativeSkillDescriptor } from "../../lib/nativeSkillsClient";
 import { useCustomAgentStore } from "../../store/customAgentStore";
 import type { SettingsTab } from "../Settings";
 import { visibleProviderModelsForProvider } from "../../lib/providerModelSelection";
@@ -421,8 +420,8 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
   const [activePackageSkills, setActivePackageSkills] = useState<ActiveSkillDescriptor[]>([]);
   const [activePluginSnapshots, setActivePluginSnapshots] = useState<ActivePluginRuntimeSnapshot[]>([]);
   const [pluginRuntimes, setPluginRuntimes] = useState<PluginRuntimeDescriptor[]>([]);
-  const [activeNativeSkills, setActiveNativeSkills] = useState<NativeSkillDescriptor[]>([]);
-  const nativeSkillsRevision = useNativeSkillsStore((state) => state.revision);
+  const activeNativeSkills = useNativeSkillsStore((state) => state.descriptors);
+  const refreshNativeSkills = useNativeSkillsStore((state) => state.refresh);
   const skillActivationPolicies = useSkillActivationPolicyStore((state) => state.policies);
   useEffect(() => {
     let cancelled = false;
@@ -430,18 +429,17 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       ecosystemClient.activeSkills().catch(() => [] as ActiveSkillDescriptor[]),
       ecosystemClient.activePluginSnapshots().catch(() => [] as ActivePluginRuntimeSnapshot[]),
       ecosystemClient.pluginRuntime().catch(() => [] as PluginRuntimeDescriptor[]),
-      nativeSkillsClient.discover().catch(() => [] as NativeSkillDescriptor[]),
+      refreshNativeSkills().catch(() => undefined),
       // Custom agent defs ride the same discovery pass (and the same
       // workspace-change deps) as skills; the store keeps its own state, so
       // nothing is destructured from this slot.
       useCustomAgentStore.getState().refresh(),
     ])
-      .then(([packageEntries, pluginSnapshots, runtimes, nativeEntries]) => {
+      .then(([packageEntries, pluginSnapshots, runtimes]) => {
         if (!cancelled) {
           setActivePackageSkills(packageEntries);
           setActivePluginSnapshots(pluginSnapshots);
           setPluginRuntimes(runtimes);
-          setActiveNativeSkills(nativeEntries);
         }
       })
       .catch(() => {
@@ -449,13 +447,12 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
           setActivePackageSkills([]);
           setActivePluginSnapshots([]);
           setPluginRuntimes([]);
-          setActiveNativeSkills([]);
         }
       });
     return () => {
       cancelled = true;
     };
-  }, [installedPackageKey, rootsKey, nativeSkillsRevision]);
+  }, [installedPackageKey, rootsKey, refreshNativeSkills]);
   const baseAvailableSkills = useMemo(
     () => [...localPromptSkills(promptEntries), ...nativeSkills(activeNativeSkills), ...packageSkills(activePackageSkills)],
     [promptEntries, activeNativeSkills, activePackageSkills, skillActivationPolicies],
@@ -578,9 +575,10 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
     // composer stays open. Freeze the exact current discovery immediately
     // before parsing the turn so hashes, instructions, and resource paths
     // all belong to one snapshot.
-    let freshNativeEntries: NativeSkillDescriptor[] = [];
+    let freshNativeEntries: typeof activeNativeSkills = [];
     try {
-      freshNativeEntries = await nativeSkillsClient.discover();
+      await refreshNativeSkills();
+      freshNativeEntries = useNativeSkillsStore.getState().descriptors;
     } catch {
       // Never reuse a stale external snapshot after discovery fails. Native
       // skills disappear for this turn, but ordinary chat remains available.
@@ -595,14 +593,13 @@ export default function ChatWindow({ sessionId, onManagePrompts, onOpenSettingsT
       ...freshAvailableSkills,
     ]);
     availableSkillsRef.current = freshAvailableSkills;
-    setActiveNativeSkills(freshNativeEntries);
     setActivePluginSnapshots(pluginSnapshots);
     setPluginRuntimes(runtimes);
     return [
       ...packageRuleInvocations(pluginSnapshots, parsed?.request ?? text.trim()),
       ...(parsed?.invocations ?? []),
     ];
-  }, [activePackageSkills, promptEntries]);
+  }, [activePackageSkills, promptEntries, refreshNativeSkills]);
 
   const resizeTextarea = useCallback(() => {
     const el = textareaRef.current;
