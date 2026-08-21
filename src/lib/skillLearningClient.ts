@@ -60,7 +60,7 @@ export interface CandidateProposal {
   description: string;
   proposed_command: string;
   proposed_skill_content: string;
-  proposed_resource_files: CandidateResourceFile[];
+  proposed_resource_files?: CandidateResourceFile[];
   allowed_tools: string[];
   requirements: CandidateRequirements;
 }

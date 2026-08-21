@@ -164,9 +164,9 @@ export async function reflectOnCandidate(
     const proposal = {
       ...reflection,
       scope: candidate.scope as NativeSkillScope,
-      proposed_resource_files: Array.isArray(reflection.proposed_resource_files)
-        ? reflection.proposed_resource_files
-        : [],
+      ...(Array.isArray(reflection.proposed_resource_files)
+        ? { proposed_resource_files: reflection.proposed_resource_files }
+        : {}),
       allowed_tools: Array.isArray(reflection.allowed_tools) ? reflection.allowed_tools : [],
       requirements:
         reflection.requirements && typeof reflection.requirements === "object"

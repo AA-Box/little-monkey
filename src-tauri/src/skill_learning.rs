@@ -2171,15 +2171,20 @@ impl SkillLearningStore {
                 )));
             }
             let append_evidence = |selected: &mut Vec<RunEvidence>, evidence: &RunEvidence| {
-                if selected.len() < MAX_IMPROVEMENT_EVIDENCE
-                    && !selected.iter().any(|entry| entry.run_id == evidence.run_id)
-                {
-                    selected.push(bounded_evidence(evidence));
+                if selected.iter().any(|entry| entry.run_id == evidence.run_id) {
+                    return Ok(());
                 }
+                if selected.len() >= MAX_IMPROVEMENT_EVIDENCE {
+                    return Err(SkillError::Invalid(format!(
+                        "the selected improvement evidence expands beyond {MAX_IMPROVEMENT_EVIDENCE} runs; select fewer corrected runs"
+                    )));
+                }
+                selected.push(bounded_evidence(evidence));
+                Ok(())
             };
-            append_evidence(&mut selected, &evidence);
+            append_evidence(&mut selected, &evidence)?;
             if let Some(correction) = &row.correction_evidence {
-                append_evidence(&mut selected, correction);
+                append_evidence(&mut selected, correction)?;
             }
         }
 
@@ -9835,6 +9840,22 @@ mod tests {
             .unwrap()
             .is_none());
 
+        for index in 2..=5 {
+            let mut additional = evidence_from_events(
+                &format!("use-{index}"),
+                "use the retry wrapper",
+                &verified_procedure_events(),
+            );
+            additional.invoked_skills = vec![InvokedSkillEvidence {
+                command: descriptor.command.clone(),
+                scope: "global".to_string(),
+                sha256: descriptor.sha256.clone(),
+            }];
+            store
+                .record_run(&additional, Some("session-extra"))
+                .unwrap();
+        }
+
         let parent = ImprovementParent {
             command: descriptor.command.clone(),
             scope: SkillScope::Global,
@@ -9864,6 +9885,46 @@ mod tests {
         assert_eq!(candidate.proposed_resource_files.len(), 1);
         assert_eq!(
             candidate.proposed_resource_files[0].path,
+            "references/checklist.md"
+        );
+
+        assert!(matches!(
+            store.begin_improvement(
+                &parent,
+                &[
+                    "use-1".to_string(),
+                    "use-2".to_string(),
+                    "use-3".to_string(),
+                    "use-4".to_string(),
+                    "use-5".to_string(),
+                ]
+            ),
+            Err(SkillError::Invalid(message)) if message.contains("expands beyond")
+        ));
+
+        let omitted_resources = CandidateProposal {
+            scope: SkillScope::Global,
+            title: candidate.title.clone(),
+            description: candidate.description.clone(),
+            proposed_command: candidate.proposed_command.clone(),
+            proposed_skill_content: "The improved retry wrapper.".to_string(),
+            proposed_resource_files: None,
+            allowed_tools: candidate.allowed_tools.clone(),
+            requirements: candidate.requirements.clone(),
+        };
+        let staged = store
+            .propose(
+                &candidate.candidate_id,
+                None,
+                &omitted_resources,
+                &manager,
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(staged.proposed_resource_files.len(), 1);
+        assert_eq!(
+            staged.proposed_resource_files[0].path,
             "references/checklist.md"
         );
 
