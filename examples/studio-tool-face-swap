@@ -2,7 +2,18 @@
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-VENV="${FACE_SWAP_VENV:-$SCRIPT_DIR/.face-swap-venv}"
+TOOL_DATA_DIR="${LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR:-}"
+if [ -z "$TOOL_DATA_DIR" ]; then
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    TOOL_DATA_DIR="$XDG_CACHE_HOME/little-monkey/studio-tools/ghost-face-swap-local"
+  elif [ -n "${HOME:-}" ]; then
+    TOOL_DATA_DIR="$HOME/.cache/little-monkey/studio-tools/ghost-face-swap-local"
+  else
+    echo "Face Swap needs an app data directory. Set LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR." >&2
+    exit 1
+  fi
+fi
+VENV="${FACE_SWAP_VENV:-$TOOL_DATA_DIR/python}"
 REQUIREMENTS="$SCRIPT_DIR/studio-tool-face-swap-requirements.txt"
 STAMP="$VENV/.requirements.sha256"
 PYTHON="$VENV/bin/python"

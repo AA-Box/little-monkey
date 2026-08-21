@@ -45,6 +45,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -68,6 +69,11 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_RUN_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 /// The tail of a tool's own output kept for diagnosis, as the engine keeps.
 const MAX_STDERR_TAIL: usize = 8 * 1024;
+/// Environment variable passed to sidecars for per-tool writable state.
+/// Runtime dependencies must never be installed beside a tool binary or in
+/// the repository that supplied it.
+const TOOL_DATA_DIR_ENV: &str = "LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR";
+const TOOL_DATA_DIR_NAME: &str = "studio-tools";
 
 const MAX_INPUTS: usize = 32;
 const MAX_IMAGE_INPUTS: usize = 4;
@@ -518,6 +524,17 @@ fn free_port() -> Result<u16, String> {
         .map_err(|error| format!("Failed to reserve a port for the tool: {error}"))
 }
 
+fn tool_data_dir(app_data_dir: &Path, tool_id: &str) -> Result<PathBuf, String> {
+    let directory = app_data_dir.join(TOOL_DATA_DIR_NAME).join(tool_id);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "Failed to create the Studio tool data directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    Ok(directory)
+}
+
 /// Keeps the last [`MAX_STDERR_TAIL`] bytes of a tool's output so a launch
 /// failure reports the tool's own words rather than a bare exit code.
 fn drain_output(stream: impl Read + Send + 'static, tail: Arc<Mutex<String>>) {
@@ -673,6 +690,7 @@ impl StudioToolState {
     pub async fn ensure_ready(
         &self,
         tool: &StudioTool,
+        app_data_dir: &Path,
         client: &reqwest::Client,
     ) -> Result<(String, ToolManifest), String> {
         // A warm tool answers from its cached manifest. Touched here so that
@@ -706,11 +724,13 @@ impl StudioToolState {
             ));
         }
         ensure_executable(&binary)?;
+        let data_dir = tool_data_dir(app_data_dir, &tool.id)?;
 
         let port = free_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let mut child = Command::new(&binary)
             .args(["--host", "127.0.0.1", "--port", &port.to_string()])
+            .env(TOOL_DATA_DIR_ENV, &data_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -926,6 +946,28 @@ mod tests {
             .unwrap()
     }
 
+    fn test_app_data_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "little-monkey-studio-tools-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn tool_runtime_data_lives_under_app_data() {
+        let app_data_dir = test_app_data_dir();
+        let runtime_dir = tool_data_dir(&app_data_dir, "ghost-face-swap-local").unwrap();
+        assert_eq!(
+            runtime_dir,
+            app_data_dir
+                .join(TOOL_DATA_DIR_NAME)
+                .join("ghost-face-swap-local")
+        );
+        assert!(runtime_dir.is_dir());
+    }
+
     #[tokio::test]
     async fn a_run_returns_the_media_the_tool_produced() {
         let base = serve_once(
@@ -1052,7 +1094,11 @@ mod tests {
             managed: false,
         };
         let client = test_client();
-        let (base_url, manifest) = state.ensure_ready(&tool, &client).await.unwrap();
+        let app_data_dir = test_app_data_dir();
+        let (base_url, manifest) = state
+            .ensure_ready(&tool, &app_data_dir, &client)
+            .await
+            .unwrap();
         assert_eq!(manifest.id, "echo");
         assert_eq!(state.running_tools(), vec!["echo".to_string()]);
 
@@ -1113,14 +1159,24 @@ mod tests {
 
         let state = StudioToolState::default();
         let client = test_client();
+        let app_data_dir = test_app_data_dir();
         for id in ["a", "b", "c"] {
-            state.ensure_ready(&tool(id), &client).await.unwrap();
+            state
+                .ensure_ready(&tool(id), &app_data_dir, &client)
+                .await
+                .unwrap();
         }
         assert_eq!(state.running_tools().len(), MAX_RESIDENT_TOOLS);
 
         // Touch "a" so "b" becomes the least recently used.
-        state.ensure_ready(&tool("a"), &client).await.unwrap();
-        state.ensure_ready(&tool("d"), &client).await.unwrap();
+        state
+            .ensure_ready(&tool("a"), &app_data_dir, &client)
+            .await
+            .unwrap();
+        state
+            .ensure_ready(&tool("d"), &app_data_dir, &client)
+            .await
+            .unwrap();
 
         let mut running = state.running_tools();
         running.sort();
@@ -1148,7 +1204,10 @@ mod tests {
             version: None,
             managed: false,
         };
-        let error = state.ensure_ready(&tool, &test_client()).await.unwrap_err();
+        let error = state
+            .ensure_ready(&tool, &test_app_data_dir(), &test_client())
+            .await
+            .unwrap_err();
         assert!(error.contains("/nonexistent/studio-tool-ghost"), "{error}");
         assert!(state.running_tools().is_empty());
     }

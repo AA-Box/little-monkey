@@ -29,6 +29,13 @@ The port is reserved by the app and handed over on the command line. Bind
 loopback only. Both stdout and stderr are drained by the app; the tail of them
 is what a user sees when a launch fails, so log the reason a start failed.
 
+The app also sets `LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR` to a private,
+per-tool directory under the active profile's app-data directory. Tools should
+put virtual environments, downloaded Python packages, caches, and other
+generated runtime state there. They must not write beside their executable or
+inside the repository. `FACE_SWAP_VENV` is a face-swap-specific test/build
+override, not the production path.
+
 Up to three tools stay resident at once, and each is left running between runs so
 a model is not reloaded per operation — alternating two tools (swap a face, then
 upscale the result) is the normal way these get used. Past that the least

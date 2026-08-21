@@ -81,10 +81,12 @@ function run() {
   if (codeformerHome && !existsSync(join(codeformerHome, "basicsr"))) {
     throw new Error(`FACE_SWAP_CODEFORMER_HOME is missing basicsr/: ${codeformerHome}`);
   }
-  const python = requiredFile(
-    "FACE_SWAP_PYTHON",
-    process.env.FACE_SWAP_PYTHON ?? join(ROOT, "examples/.face-swap-venv/bin/python"),
-  );
+  const configuredPython = process.env.FACE_SWAP_PYTHON;
+  const python = configuredPython
+    ? requiredFile("FACE_SWAP_PYTHON", configuredPython)
+    : process.platform === "win32"
+      ? "python"
+      : "python3";
   rmSync(OUTPUT, { recursive: true, force: true });
   mkdirSync(OUTPUT, { recursive: true });
   execFileSync(

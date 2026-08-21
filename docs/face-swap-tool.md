@@ -14,15 +14,17 @@ consent, privacy, and applicable biometric requirements.
 
 ## Automatic runtime setup
 
-Open the tool through Studio and the launcher automatically creates the private
-`examples/.face-swap-venv` environment and installs the bundled base
-requirements on first launch. It refreshes the environment only when the
-requirements file changes. The only prerequisite is Python 3.10–3.12 being
+Open the tool through Studio and the launcher automatically creates a private
+environment under the app's per-user Studio-tool data directory and installs
+the bundled base requirements on first launch. It refreshes the environment
+only when the requirements file changes; the repository and installed tool
+directory stay read-only. The only prerequisite is Python 3.10–3.12 being
 available on the machine; set `FACE_SWAP_SYSTEM_PYTHON` when it is not on the
 default `PATH`.
 
 The launcher prints setup progress to the Studio tool log. No terminal command
-or manual `pip install` step is required.
+or manual `pip install` step is required. `FACE_SWAP_VENV` remains available
+for a deliberate test or packaging override; it is not the production default.
 
 Provide the model root yourself:
 
@@ -99,7 +101,7 @@ assets explicitly supplied to the builder:
 ```sh
 export FACE_SWAP_MODEL_ROOT=/absolute/path/to/licensed-model-root
 export FACE_SWAP_MODEL_LICENSE_FILE=/absolute/path/to/model-license.txt
-export FACE_SWAP_PYTHON=examples/.face-swap-venv/bin/python
+export FACE_SWAP_PYTHON=/absolute/path/to/python-with-face-swap-dependencies
 export FACE_SWAP_DOWNLOAD_URL=https://downloads.example.com/face-swap-ghost-3-256
 pnpm face-swap:package
 ```

@@ -17,6 +17,8 @@ class FaceSwapToolContractTests(unittest.TestCase):
         self.assertIn('"$SYSTEM_PYTHON" -m venv "$VENV"', launcher)
         self.assertIn('"$PYTHON" -m pip install', launcher)
         self.assertIn('STAMP="$VENV/.requirements.sha256"', launcher)
+        self.assertIn("LITTLE_MONKEY_STUDIO_TOOL_DATA_DIR", launcher)
+        self.assertNotIn("$SCRIPT_DIR/.face-swap-venv", launcher)
 
     def test_manifest_declares_the_studio_face_swap_inputs(self):
         self.assertEqual(MODULE.MANIFEST["schemaVersion"], 1)
