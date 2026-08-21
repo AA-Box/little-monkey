@@ -18,6 +18,7 @@
 import { runSandboxVerification } from "./agentLoop";
 import { runHeadlessAgent, type HeadlessAgentResult } from "./headlessAgentRunner";
 import { composeSkillSystemPrompt, type SlashSkill } from "./skills";
+import type { SkillToolContext } from "./turnEngine";
 import {
   skillLearningClient,
   type EvaluationCase,
@@ -60,7 +61,7 @@ function stagedSkill(plan: EvaluationPlan): SlashSkill {
     contentSha256: plan.candidate_sha256,
     permissions: [],
     allowedTools: plan.allowed_tools,
-    resourceFiles: [],
+    resourceFiles: (plan.candidate_resource_files ?? []).map((resource) => resource.path),
   };
 }
 
@@ -77,7 +78,22 @@ function baselineSkill(plan: EvaluationPlan): SlashSkill | null {
     contentSha256: plan.baseline_sha256,
     permissions: [],
     allowedTools: plan.baseline_allowed_tools,
-    resourceFiles: [],
+    resourceFiles: (plan.baseline_resource_files ?? []).map((resource) => resource.path),
+  };
+}
+
+function evaluationSkillContext(
+  skill: SlashSkill,
+  resources: Array<{ path: string; content: string }>,
+): SkillToolContext {
+  return {
+    availableSkills: [skill],
+    invokedCommands: new Set([skill.command]),
+    explicitCommands: new Set([skill.command]),
+    maxSkillsPerTurn: 1,
+    resourceSnapshots: new Map([
+      [skill.command, new Map(resources.map((resource) => [resource.path, resource.content]))],
+    ]),
   };
 }
 
@@ -119,13 +135,17 @@ async function runArm(
   signal: AbortSignal,
 ): Promise<EvaluationCaseReport> {
   const runId = `${plan.evaluation_id}-${arm}-${testCase.case_id}`;
+  const skill = arm === "candidate" ? stagedSkill(plan) : baselineSkill(plan);
   const systemPrompt =
-    (() => {
-      const skill = arm === "candidate" ? stagedSkill(plan) : baselineSkill(plan);
-      return skill
-        ? composeSkillSystemPrompt(BASE_PROMPT, [{ skill, arguments: testCase.prompt, activation: "explicit" }])
+    skill
+      ? composeSkillSystemPrompt(BASE_PROMPT, [{ skill, arguments: testCase.prompt, activation: "explicit" }])
         : BASE_PROMPT;
-    })();
+  const skillContext = skill
+    ? evaluationSkillContext(
+        skill,
+        arm === "candidate" ? plan.candidate_resource_files ?? [] : plan.baseline_resource_files ?? [],
+      )
+    : undefined;
   const startedAt = Date.now();
   let result: HeadlessAgentResult;
   try {
@@ -138,6 +158,7 @@ async function runArm(
       toolProfile: "code",
       executionSource: "skill-learning-evaluation",
       workspaceRootOverride: sandboxPath,
+      skill: skillContext,
       // The candidate arm runs under exactly the tool restriction the skill
       // will carry once installed, so it cannot pass an evaluation using a
       // tool it will not have afterwards. The baseline has no skill and so

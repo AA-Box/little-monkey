@@ -175,6 +175,30 @@ describe("runCandidateEvaluation", () => {
     expect(calls.get("eval-abc-candidate-positive")?.systemPrompt).toContain("withRetry");
   });
 
+  it("passes candidate and parent resource snapshots to their evaluation arms", async () => {
+    const api = client({
+      planEvaluation: vi.fn(async () =>
+        plan({
+          candidate_resource_files: [{ path: "templates/report.md", content: "candidate template" }],
+          baseline_resource_files: [{ path: "templates/report.md", content: "parent template" }],
+          baseline_skill_instructions: "The current retry helper.",
+          baseline_allowed_tools: ["read_file"],
+          baseline_sha256: "b".repeat(64),
+        }),
+      ),
+    });
+    await runCandidateEvaluation("learn-1", new AbortController().signal, api as never);
+    const candidate = runHeadlessAgent.mock.calls.find((call: unknown[]) =>
+      (call[0] as { runId: string }).runId === "eval-abc-candidate-positive",
+    )?.[0] as { skill?: { availableSkills: Array<{ resourceFiles?: string[] }>; resourceSnapshots?: ReadonlyMap<string, ReadonlyMap<string, string>> } };
+    const baseline = runHeadlessAgent.mock.calls.find((call: unknown[]) =>
+      (call[0] as { runId: string }).runId === "eval-abc-baseline-positive",
+    )?.[0] as { skill?: { resourceSnapshots?: ReadonlyMap<string, ReadonlyMap<string, string>> } };
+    expect(candidate.skill?.availableSkills[0].resourceFiles).toEqual(["templates/report.md"]);
+    expect(candidate.skill?.resourceSnapshots?.get("retry-wrapper")?.get("templates/report.md")).toBe("candidate template");
+    expect(baseline.skill?.resourceSnapshots?.get("retry-wrapper")?.get("templates/report.md")).toBe("parent template");
+  });
+
   it("runs the candidate arm under the restriction the skill will carry once installed", async () => {
     // Otherwise an arm could pass using a tool the installed skill will not
     // have, and the evaluation would not be measuring what ships.

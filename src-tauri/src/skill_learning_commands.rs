@@ -19,11 +19,11 @@ use crate::run_commands::with_ledger;
 use crate::run_protocol::RunEventEnvelope;
 use crate::skill_learning::{
     approval_operation_digest, evidence_from_events, pre_task_source, reflection_brief,
-    ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution, EffectivenessRecord,
-    EvaluationCaseReport, EvaluationEnvironment, EvaluationMode, EvaluationPlan, EvaluationRecord,
-    ImprovementEvidence, ImprovementParent, LearnedSkillSummary, LearningCandidate, LearningMode,
-    LearningSettings, PreTaskFile, PreTaskSource, PreTaskState, PromotionOutcome, RunEvidence,
-    SkillLearningStore,
+    snapshot_skill_resources, ApprovalGrant, CandidateProposal, CaptureOutcome, CorrectedExecution,
+    EffectivenessRecord, EvaluationCaseReport, EvaluationEnvironment, EvaluationMode,
+    EvaluationPlan, EvaluationRecord, ImprovementEvidence, ImprovementParent, LearnedSkillSummary,
+    LearningCandidate, LearningMode, LearningSettings, PreTaskFile, PreTaskSource, PreTaskState,
+    PromotionOutcome, RunEvidence, SkillLearningStore,
 };
 use crate::AppState;
 
@@ -408,6 +408,7 @@ fn evidence_for_arm<'a>(
     let case_id = arm
         .strip_prefix("baseline-")
         .or_else(|| arm.strip_prefix("candidate-"))
+        .or_else(|| arm.strip_prefix("starting-state-"))
         .unwrap_or(arm);
     if let Some(index) = case_id
         .strip_prefix("improvement-")
@@ -416,6 +417,38 @@ fn evidence_for_arm<'a>(
         return environment.evidence_runs.get(index.saturating_sub(1));
     }
     environment.evidence_runs.first()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evidence_for_arm;
+    use crate::skill_learning::{EvaluationEnvironment, RunEvidence};
+
+    #[test]
+    fn starting_state_improvement_arm_uses_its_matching_evidence() {
+        let environment = EvaluationEnvironment {
+            workspace: None,
+            checkpoint_id: None,
+            requires_pre_task_state: true,
+            used_shell: false,
+            evidence_runs: vec![
+                RunEvidence {
+                    run_id: "run-1".to_string(),
+                    ..RunEvidence::default()
+                },
+                RunEvidence {
+                    run_id: "run-2".to_string(),
+                    ..RunEvidence::default()
+                },
+            ],
+        };
+
+        assert_eq!(
+            evidence_for_arm(&environment, "starting-state-improvement-2")
+                .map(|evidence| evidence.run_id.as_str()),
+            Some("run-2")
+        );
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -752,6 +785,7 @@ fn improvement_parent(
             "/{command} is not an active learned skill"
         )));
     }
+    let resource_files = snapshot_skill_resources(manager, &descriptor, workspace)?;
     Ok(ImprovementParent {
         command: descriptor.command,
         scope,
@@ -764,6 +798,7 @@ fn improvement_parent(
             bins: descriptor.requirements.bins,
             env: descriptor.requirements.env,
         },
+        resource_files,
     })
 }
 

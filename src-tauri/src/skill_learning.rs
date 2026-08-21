@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::native_skills::{
     LearnedProvenance, NativeSkillManager, SkillDescriptor, SkillError, SkillMutationResult,
-    SkillScope,
+    SkillScope, SkillSource,
 };
 use crate::run_protocol::{CheckpointKind, RunEvent, RunEventEnvelope, ToolOutcome};
 
@@ -311,8 +311,11 @@ pub struct CandidateProposal {
     pub description: String,
     pub proposed_command: String,
     pub proposed_skill_content: String,
+    /// `None` means the caller omitted the field and the backend should keep
+    /// the current parent bundle. `Some(vec![])` is an explicit request to
+    /// remove every resource file.
     #[serde(default)]
-    pub proposed_resource_files: Vec<CandidateResourceFile>,
+    pub proposed_resource_files: Option<Vec<CandidateResourceFile>>,
     #[serde(default)]
     pub allowed_tools: Vec<String>,
     #[serde(default)]
@@ -393,6 +396,8 @@ pub struct LearningCandidate {
     pub parent_allowed_tools: Vec<String>,
     #[serde(default)]
     pub parent_requirements: CandidateRequirements,
+    #[serde(default)]
+    pub parent_skill_resource_files: Vec<CandidateResourceFile>,
     #[serde(default)]
     pub evidence_runs: Vec<RunEvidence>,
 }
@@ -556,6 +561,10 @@ pub struct EvaluationPlan {
     pub baseline_allowed_tools: Vec<String>,
     #[serde(default)]
     pub baseline_sha256: Option<String>,
+    #[serde(default)]
+    pub candidate_resource_files: Vec<CandidateResourceFile>,
+    #[serde(default)]
+    pub baseline_resource_files: Vec<CandidateResourceFile>,
     pub cases: Vec<EvaluationCase>,
     /// The workspace the observed run happened in, so a runtime can make each
     /// arm a disposable copy of the state the procedure was learned against.
@@ -817,6 +826,7 @@ pub struct ImprovementParent {
     pub instructions: String,
     pub allowed_tools: Vec<String>,
     pub requirements: CandidateRequirements,
+    pub resource_files: Vec<CandidateResourceFile>,
 }
 
 /// What a runtime reports about one learned-skill use, once the run it
@@ -1217,6 +1227,15 @@ pub fn reflection_brief(candidate: &LearningCandidate) -> String {
             join_set(&candidate.parent_requirements.bins),
             join_set(&candidate.parent_requirements.env)
         ));
+        if !candidate.parent_skill_resource_files.is_empty() {
+            out.push_str("Existing bundled resource files (preserve unless the improvement deliberately changes them):\n");
+            for resource in &candidate.parent_skill_resource_files {
+                out.push_str(&format!(
+                    "\n--- {} ---\n{}\n",
+                    resource.path, resource.content
+                ));
+            }
+        }
     }
     if !candidate.evidence_runs.is_empty() {
         out.push_str("\nSelected improvement evidence:\n");
@@ -2151,7 +2170,17 @@ impl SkillLearningStore {
                     "run {run_id} cannot be proven to have invoked the selected parent version"
                 )));
             }
-            selected.push(bounded_evidence(&evidence));
+            let append_evidence = |selected: &mut Vec<RunEvidence>, evidence: &RunEvidence| {
+                if selected.len() < MAX_IMPROVEMENT_EVIDENCE
+                    && !selected.iter().any(|entry| entry.run_id == evidence.run_id)
+                {
+                    selected.push(bounded_evidence(evidence));
+                }
+            };
+            append_evidence(&mut selected, &evidence);
+            if let Some(correction) = &row.correction_evidence {
+                append_evidence(&mut selected, correction);
+            }
         }
 
         if let Some(existing) = state.candidates.values().find(|candidate| {
@@ -2208,7 +2237,7 @@ impl SkillLearningStore {
             ),
             proposed_command: parent.command.clone(),
             proposed_skill_content: String::new(),
-            proposed_resource_files: Vec::new(),
+            proposed_resource_files: parent.resource_files.clone(),
             allowed_tools: parent.allowed_tools.clone(),
             requirements: parent.requirements.clone(),
             parent_skill_sha256: Some(parent.sha256.clone()),
@@ -2255,6 +2284,7 @@ impl SkillLearningStore {
             parent_scope: Some(parent.scope),
             parent_allowed_tools: parent.allowed_tools.clone(),
             parent_requirements: parent.requirements.clone(),
+            parent_skill_resource_files: parent.resource_files.clone(),
             evidence_runs: selected,
         };
         prune_candidates(&mut state);
@@ -2383,6 +2413,7 @@ impl SkillLearningStore {
             parent_scope: None,
             parent_allowed_tools: Vec::new(),
             parent_requirements: CandidateRequirements::default(),
+            parent_skill_resource_files: Vec::new(),
             evidence_runs: Vec::new(),
         };
         prune_candidates(&mut state);
@@ -2521,6 +2552,7 @@ impl SkillLearningStore {
             parent_scope: None,
             parent_allowed_tools: Vec::new(),
             parent_requirements: CandidateRequirements::default(),
+            parent_skill_resource_files: Vec::new(),
             evidence_runs: Vec::new(),
         };
         prune_candidates(&mut state);
@@ -2652,11 +2684,29 @@ impl SkillLearningStore {
         let mut scoped_existing = existing.clone();
         scoped_existing.scope = scope;
         let workspace = self.workspace_for(&scoped_existing, workspace)?;
-        let validated = validate_proposal(proposal, scope)?;
+        let omitted_resources = proposal.proposed_resource_files.is_none();
+        let mut proposal_for_validation = proposal.clone();
+        if omitted_resources {
+            proposal_for_validation.proposed_resource_files =
+                Some(existing.proposed_resource_files.clone());
+        }
+        let mut validated = validate_proposal(&proposal_for_validation, scope)?;
 
         let descriptors = manager.discover(workspace.as_deref(), signed_packages)?;
         let (dedup, dedup_detail, parent) =
             classify_dedup(&validated, scope, &descriptors, &state, candidate_id);
+        let parent_resource_files = parent
+            .as_ref()
+            .map(|entry| snapshot_parent_resources(manager, entry, workspace.as_deref()))
+            .transpose()?
+            .unwrap_or_default();
+        if omitted_resources
+            && existing.proposed_resource_files.is_empty()
+            && !parent_resource_files.is_empty()
+        {
+            proposal_for_validation.proposed_resource_files = Some(parent_resource_files.clone());
+            validated = validate_proposal(&proposal_for_validation, scope)?;
+        }
         if let Some(expected_parent) = existing.parent_skill_sha256.as_deref() {
             if parent.as_ref().map(|entry| entry.sha256.as_str()) != Some(expected_parent) {
                 let entry = candidate_mut(&mut state, candidate_id)?;
@@ -2710,6 +2760,7 @@ impl SkillLearningStore {
                 env: entry.env.clone(),
             })
             .unwrap_or_default();
+        candidate.parent_skill_resource_files = parent_resource_files;
         candidate.candidate_sha256 = preview.sha256.clone();
         candidate.approval_digest = Some(preview.approval_digest.clone());
         candidate.staging_path = Some(staging.to_string_lossy().to_string());
@@ -2785,6 +2836,8 @@ impl SkillLearningStore {
             baseline_skill_instructions: entry.parent_skill_content.clone(),
             baseline_allowed_tools: entry.parent_allowed_tools.clone(),
             baseline_sha256: entry.parent_skill_sha256.clone(),
+            candidate_resource_files: entry.proposed_resource_files.clone(),
+            baseline_resource_files: entry.parent_skill_resource_files.clone(),
             cases,
             workspace_path: entry.workspace_path.clone(),
             observed_mutation: if entry.evidence_runs.is_empty() {
@@ -3495,6 +3548,7 @@ impl SkillLearningStore {
             parent_scope: None,
             parent_allowed_tools: Vec::new(),
             parent_requirements: CandidateRequirements::default(),
+            parent_skill_resource_files: Vec::new(),
             evidence_runs,
         };
         prune_candidates(state);
@@ -4140,7 +4194,8 @@ fn validate_proposal(
             "the proposed skill content exceeds {MAX_SKILL_CONTENT_BYTES} bytes"
         )));
     }
-    if proposal.proposed_resource_files.len() > MAX_RESOURCE_FILES {
+    let proposed_resource_files = proposal.proposed_resource_files.as_deref().unwrap_or(&[]);
+    if proposed_resource_files.len() > MAX_RESOURCE_FILES {
         return Err(SkillError::Invalid(format!(
             "a candidate may carry at most {MAX_RESOURCE_FILES} resource files"
         )));
@@ -4148,7 +4203,7 @@ fn validate_proposal(
     let mut total = content.len();
     let mut seen = BTreeSet::new();
     let mut resources = Vec::new();
-    for resource in &proposal.proposed_resource_files {
+    for resource in proposed_resource_files {
         let path = validate_resource_path(&resource.path)?;
         if !seen.insert(path.clone()) {
             return Err(SkillError::Invalid(format!(
@@ -4423,6 +4478,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<(), SkillError> {
 
 #[derive(Debug, Clone)]
 struct ParentSkill {
+    command: String,
     sha256: String,
     version: String,
     title: String,
@@ -4431,6 +4487,95 @@ struct ParentSkill {
     bins: BTreeSet<String>,
     env: BTreeSet<String>,
     scope: SkillScope,
+    resource_paths: Vec<String>,
+    source_path: Option<String>,
+}
+
+/// Copies the parent's bounded, UTF-8 resource bundle into a candidate
+/// snapshot. Improvement/evaluation never reads the mutable installed folder
+/// later, and an oversized or unreadable bundle fails closed instead of being
+/// silently dropped.
+pub fn snapshot_skill_resources(
+    manager: &NativeSkillManager,
+    descriptor: &SkillDescriptor,
+    workspace: Option<&Path>,
+) -> Result<Vec<CandidateResourceFile>, SkillError> {
+    let Some(source_path) = (match &descriptor.source {
+        SkillSource::Global { path } | SkillSource::Workspace { path } => Some(path.as_str()),
+        SkillSource::SignedPackage { .. } => None,
+    }) else {
+        return Ok(Vec::new());
+    };
+    if descriptor.resource_files.len() > MAX_RESOURCE_FILES {
+        return Err(SkillError::Invalid(format!(
+            "the parent skill carries more than {MAX_RESOURCE_FILES} resource files"
+        )));
+    }
+    let mut total = 0usize;
+    let mut resources = Vec::with_capacity(descriptor.resource_files.len());
+    for raw_path in &descriptor.resource_files {
+        let path = validate_resource_path(raw_path)?;
+        let content = manager.read_resource_at_snapshot(
+            &descriptor.command,
+            &path,
+            workspace,
+            &descriptor.sha256,
+            Path::new(source_path),
+        )?;
+        if content.len() > MAX_RESOURCE_BYTES {
+            return Err(SkillError::Invalid(format!(
+                "parent resource {path} exceeds {MAX_RESOURCE_BYTES} bytes"
+            )));
+        }
+        total += content.len();
+        if total > MAX_TOTAL_CANDIDATE_BYTES {
+            return Err(SkillError::Invalid(format!(
+                "the parent resource bundle exceeds {MAX_TOTAL_CANDIDATE_BYTES} bytes"
+            )));
+        }
+        resources.push(CandidateResourceFile { path, content });
+    }
+    Ok(resources)
+}
+
+fn snapshot_parent_resources(
+    manager: &NativeSkillManager,
+    parent: &ParentSkill,
+    workspace: Option<&Path>,
+) -> Result<Vec<CandidateResourceFile>, SkillError> {
+    let Some(source_path) = parent.source_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if parent.resource_paths.len() > MAX_RESOURCE_FILES {
+        return Err(SkillError::Invalid(format!(
+            "the parent skill carries more than {MAX_RESOURCE_FILES} resource files"
+        )));
+    }
+    let mut total = 0usize;
+    let mut resources = Vec::with_capacity(parent.resource_paths.len());
+    for raw_path in &parent.resource_paths {
+        let path = validate_resource_path(raw_path)?;
+        let content = manager.read_resource_at_snapshot(
+            &parent.command,
+            &path,
+            workspace,
+            &parent.sha256,
+            Path::new(source_path),
+        )?;
+        if content.len() > MAX_RESOURCE_BYTES {
+            return Err(SkillError::Invalid(format!(
+                "parent resource {path} exceeds {MAX_RESOURCE_BYTES} bytes"
+            )));
+        }
+        total += content.len();
+        if total > MAX_TOTAL_CANDIDATE_BYTES {
+            return Err(SkillError::Invalid(format!(
+                "the parent resource bundle exceeds {MAX_TOTAL_CANDIDATE_BYTES} bytes"
+            )));
+        }
+        resources.push(CandidateResourceFile { path, content });
+    }
+    Ok(resources)
 }
 
 /// The deterministic identity of one skill proposal, used everywhere two
@@ -4539,6 +4684,7 @@ fn classify_dedup(
         let learned = state.provenance.contains_key(&descriptor.sha256);
         let descriptor_scope_value = descriptor_scope(descriptor);
         let parent = ParentSkill {
+            command: descriptor.command.clone(),
             sha256: descriptor.sha256.clone(),
             version: descriptor.version.clone(),
             title: descriptor.name.clone(),
@@ -4547,6 +4693,13 @@ fn classify_dedup(
             bins: descriptor.requirements.bins.clone(),
             env: descriptor.requirements.env.clone(),
             scope: descriptor_scope_value.unwrap_or(scope),
+            resource_paths: descriptor.resource_files.clone(),
+            source_path: match &descriptor.source {
+                SkillSource::Global { path } | SkillSource::Workspace { path } => {
+                    Some(path.clone())
+                }
+                SkillSource::SignedPackage { .. } => None,
+            },
         };
         if !learned {
             return (
@@ -5868,10 +6021,10 @@ mod tests {
             description: "Wrap a flaky network call in the project's retry helper and verify with the test suite.".to_string(),
             proposed_command: command.to_string(),
             proposed_skill_content: content.to_string(),
-            proposed_resource_files: vec![CandidateResourceFile {
+            proposed_resource_files: Some(vec![CandidateResourceFile {
                 path: "references/checklist.md".to_string(),
                 content: "1. Locate the call.\n2. Wrap it.\n3. Run the tests.\n".to_string(),
-            }],
+            }]),
             allowed_tools: vec!["read_file".to_string(), "edit_file".to_string()],
             requirements: CandidateRequirements::default(),
         }
@@ -9113,7 +9266,7 @@ mod tests {
                 .to_string(),
             proposed_command: command.to_string(),
             proposed_skill_content: content.to_string(),
-            proposed_resource_files: Vec::new(),
+            proposed_resource_files: Some(Vec::new()),
             // Every tool the observed procedure used, including the shell the
             // verification runs in. A proposal that declared fewer would fail
             // its own evaluation rather than quietly dropping the requirement
@@ -9655,13 +9808,32 @@ mod tests {
         cancelled.run_id = "cancelled-use".to_string();
         cancelled.completed = false;
         cancelled.cancelled = true;
-        store.record_run(&cancelled, Some("session-1")).unwrap();
+        store.record_run(&cancelled, Some("session-2")).unwrap();
         assert!(!store
             .improvement_evidence(SkillScope::Global, &descriptor.command, &descriptor.sha256)
             .unwrap()
             .iter()
             .any(|entry| entry.run_id == "cancelled-use"));
         store.set_mode(LearningMode::Off).unwrap();
+        let corrected_evidence = evidence_from_events(
+            "correction-1",
+            "use the helper instead",
+            &verified_procedure_events(),
+        );
+        assert!(store
+            .record_correction(
+                "session-1",
+                "correction-1",
+                &CorrectedExecution {
+                    user_text: "that is wrong, use the helper instead".to_string(),
+                    succeeded: true,
+                    verification_passed: Some(true),
+                    event_ids: vec!["correction-event".to_string()],
+                    evidence: Some(corrected_evidence),
+                },
+            )
+            .unwrap()
+            .is_none());
 
         let parent = ImprovementParent {
             command: descriptor.command.clone(),
@@ -9675,6 +9847,7 @@ mod tests {
                 bins: descriptor.requirements.bins.clone(),
                 env: descriptor.requirements.env.clone(),
             },
+            resource_files: snapshot_skill_resources(&manager, &descriptor, None).unwrap(),
         };
         let candidate = store
             .begin_improvement(&parent, &["use-1".to_string()])
@@ -9684,7 +9857,15 @@ mod tests {
             candidate.parent_skill_sha256,
             Some(descriptor.sha256.clone())
         );
-        assert_eq!(candidate.evidence_runs.len(), 1);
+        assert_eq!(candidate.evidence_runs.len(), 2);
+        assert_eq!(candidate.evidence_runs[0].run_id, "use-1");
+        assert_eq!(candidate.evidence_runs[1].run_id, "correction-1");
+        assert_eq!(candidate.parent_skill_resource_files.len(), 1);
+        assert_eq!(candidate.proposed_resource_files.len(), 1);
+        assert_eq!(
+            candidate.proposed_resource_files[0].path,
+            "references/checklist.md"
+        );
 
         let repeated = store
             .begin_improvement(&parent, &["use-1".to_string()])

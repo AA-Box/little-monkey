@@ -798,7 +798,7 @@ export const MANAGE_SKILL_LEARNING_TOOL: ToolDef = {
             proposed_skill_content: { type: 'string', description: 'The reusable procedure itself, in Markdown. Generalize it — do not embed one-off values from the observed run.' },
             proposed_resource_files: {
               type: 'array',
-              description: 'Optional bundled reference files, read on demand via read_skill_resource. Paths are relative and stay inside the skill folder.',
+              description: 'Bundled reference files to preserve or intentionally change, read on demand via read_skill_resource. Include the parent files unless you deliberately want to add or remove them. Paths are relative and stay inside the skill folder.',
               items: {
                 type: 'object',
                 properties: {
@@ -825,7 +825,7 @@ export const MANAGE_SKILL_LEARNING_TOOL: ToolDef = {
               additionalProperties: false,
             },
           },
-          required: ['scope', 'title', 'description', 'proposed_command', 'proposed_skill_content', 'allowed_tools', 'requirements'],
+          required: ['scope', 'title', 'description', 'proposed_command', 'proposed_skill_content', 'proposed_resource_files', 'allowed_tools', 'requirements'],
           additionalProperties: false,
         },
       },

@@ -115,6 +115,7 @@ export interface LearningCandidate {
   parent_scope?: NativeSkillScope | null;
   parent_allowed_tools?: string[];
   parent_requirements?: CandidateRequirements;
+  parent_skill_resource_files?: CandidateResourceFile[];
   evidence_runs?: RunEvidence[];
 }
 
@@ -208,6 +209,8 @@ export interface EvaluationPlan {
   baseline_skill_instructions?: string | null;
   baseline_allowed_tools?: string[];
   baseline_sha256?: string | null;
+  candidate_resource_files?: CandidateResourceFile[];
+  baseline_resource_files?: CandidateResourceFile[];
   cases: EvaluationCase[];
   /** The workspace the observed run happened in. `null` means no reproducible
    * isolated environment can be built, which is an `unevaluated`, never a run

@@ -98,6 +98,10 @@ function valuesChanged(before: string[], after: string[]): boolean {
   return before.length !== after.length || before.some((value) => !after.includes(value)) || after.some((value) => !before.includes(value));
 }
 
+function resourcePaths(resources: Array<{ path: string }> | undefined): string[] {
+  return resources?.map((resource) => resource.path) ?? [];
+}
+
 function qualityLabel(state: SkillQualityState): string {
   if (state === "needs_attention") return "Needs attention";
   if (state === "healthy") return "Healthy";
@@ -449,6 +453,19 @@ export function SkillLearningPanel() {
                             {candidate.parent_scope && candidate.parent_scope !== candidate.scope && " ⚠️ widened from parent"}
                           </span>
                         </div>
+                        {(candidate.parent_skill_resource_files?.length ?? 0) > 0 || candidate.proposed_resource_files.length > 0 ? (
+                          <div className="mt-1 text-faint">
+                            <span>
+                              Bundled resources: {resourcePaths(candidate.parent_skill_resource_files).join(", ") || "none"} → {resourcePaths(candidate.proposed_resource_files).join(", ") || "none"}
+                            </span>
+                            {addedValues(resourcePaths(candidate.parent_skill_resource_files), resourcePaths(candidate.proposed_resource_files)).length > 0 && (
+                              <span className="text-success"> · + {addedValues(resourcePaths(candidate.parent_skill_resource_files), resourcePaths(candidate.proposed_resource_files)).join(", ")}</span>
+                            )}
+                            {addedValues(resourcePaths(candidate.proposed_resource_files), resourcePaths(candidate.parent_skill_resource_files)).length > 0 && (
+                              <span className="text-danger"> · − {addedValues(resourcePaths(candidate.proposed_resource_files), resourcePaths(candidate.parent_skill_resource_files)).join(", ")}</span>
+                            )}
+                          </div>
+                        ) : null}
                       </div>
                     )}
                     {editing ? (

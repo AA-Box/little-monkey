@@ -13,8 +13,8 @@ use little_monkey_lib::native_skills::{
 use little_monkey_lib::prompts::PromptEntry;
 use little_monkey_lib::skill_activation::{SkillActivationPolicy, SkillActivationStore};
 use little_monkey_lib::skill_learning::{
-    CandidateRequirements, EvaluationCaseReport, ImprovementParent, LearningMode, LearningPolicy,
-    LearningSettings, PromotionOutcome, SkillLearningStore,
+    snapshot_skill_resources, CandidateRequirements, EvaluationCaseReport, ImprovementParent,
+    LearningMode, LearningPolicy, LearningSettings, PromotionOutcome, SkillLearningStore,
 };
 
 const MAX_SKILLS_PER_TURN: usize = 5;
@@ -881,6 +881,8 @@ fn run_learned(
             let command = command.trim_start_matches('/');
             let scope = SkillScope::from(*scope);
             let descriptor = learned_descriptor(&store, data_dir, workspace, command, scope)?;
+            let resource_files = snapshot_skill_resources(&manager, &descriptor, workspace)
+                .map_err(|error| error.to_string())?;
             let parent = ImprovementParent {
                 command: descriptor.command,
                 scope,
@@ -893,6 +895,7 @@ fn run_learned(
                     bins: descriptor.requirements.bins,
                     env: descriptor.requirements.env,
                 },
+                resource_files,
             };
             let candidate = store
                 .begin_improvement(&parent, run_ids)
