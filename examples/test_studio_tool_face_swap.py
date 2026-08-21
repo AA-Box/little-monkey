@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 SCRIPT = Path(__file__).with_name("studio-tool-face-swap.py")
+LAUNCHER = Path(__file__).with_name("studio-tool-face-swap")
 SPEC = importlib.util.spec_from_file_location("studio_tool_face_swap", SCRIPT)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -11,6 +12,12 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FaceSwapToolContractTests(unittest.TestCase):
+    def test_launcher_bootstraps_and_caches_python_dependencies(self):
+        launcher = LAUNCHER.read_text(encoding="utf-8")
+        self.assertIn('"$SYSTEM_PYTHON" -m venv "$VENV"', launcher)
+        self.assertIn('"$PYTHON" -m pip install', launcher)
+        self.assertIn('STAMP="$VENV/.requirements.sha256"', launcher)
+
     def test_manifest_declares_the_studio_face_swap_inputs(self):
         self.assertEqual(MODULE.MANIFEST["schemaVersion"], 1)
         self.assertEqual(MODULE.MANIFEST["id"], "ghost-face-swap-local")

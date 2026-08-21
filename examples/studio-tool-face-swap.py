@@ -4,9 +4,9 @@
 The process is intentionally small and local-only. It loads an
 InsightFace face-analysis pack for detection/embeddings, then runs a selected
 GHOST ONNX model directly. CodeFormer restoration is optional and only loads
-from a pinned, user-supplied checkout and checkpoint. Install dependencies from
-the requirements files and provide model files where docs/face-swap-tool.md
-describes.
+from a pinned, user-supplied checkout and checkpoint. The launcher creates an
+isolated environment and installs the base requirements on first launch. Model
+files remain separate because their licenses and user rights must be verified.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import binascii
 import ipaddress
 import json
 import os
+import subprocess
 import sys
 import threading
 from http import HTTPStatus
@@ -201,7 +202,8 @@ def require_face_analysis_models(root: Path, pack_name: str) -> Path:
     if missing:
         raise ToolError(
             f"Face-analysis pack '{pack_name}' is incomplete at {model_dir}; "
-            f"missing: {', '.join(missing)}. Automatic model downloads are disabled."
+            f"missing: {', '.join(missing)}. Dependencies install automatically, "
+            "but model files must be supplied with the required license permission."
         )
     for filename, env_name in (
         ("det_10g.onnx", "FACE_SWAP_DETECTOR_SHA256"),
@@ -308,8 +310,8 @@ def providers() -> list[str]:
         import onnxruntime as ort
     except ImportError as error:
         raise ToolError(
-            "Missing face-swap dependencies. Run the install command in "
-            "docs/face-swap-tool.md."
+            "Automatic dependency setup did not complete. Check the launcher output "
+            "for the pip error and try opening the tool again."
         ) from error
 
     available = set(ort.get_available_providers())
@@ -359,8 +361,8 @@ class FaceSwapRuntime:
                 import onnxruntime as ort
             except ImportError as error:
                 raise ToolError(
-                    "Missing face-swap dependencies. Run the install command in "
-                    "docs/face-swap-tool.md."
+                    "Automatic dependency setup did not complete. Check the launcher "
+                    "output for the pip error and try opening the tool again."
                 ) from error
 
             root = model_root()
@@ -428,15 +430,41 @@ class FaceSwapRuntime:
     def _load_codeformer(self) -> None:
         if self._codeformer is not None:
             return
-        try:
-            import importlib
+        import importlib
 
+        try:
             torch = importlib.import_module("torch")
-        except ImportError as error:
-            raise ToolError(
-                "CodeFormer needs the optional PyTorch dependencies. Install "
-                "examples/studio-tool-face-swap-codeformer-requirements.txt."
-            ) from error
+        except ImportError:
+            requirements = Path(__file__).with_name(
+                "studio-tool-face-swap-codeformer-requirements.txt"
+            )
+            if not requirements.is_file():
+                raise ToolError("The optional CodeFormer dependency manifest is missing.")
+            print(
+                "face-swap: installing optional CodeFormer dependencies automatically",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--disable-pip-version-check",
+                        "--upgrade",
+                        "-r",
+                        str(requirements),
+                    ],
+                    check=True,
+                )
+                torch = importlib.import_module("torch")
+            except (OSError, ImportError, subprocess.CalledProcessError) as error:
+                raise ToolError(
+                    "Automatic CodeFormer dependency setup failed. Check the pip "
+                    "output and try the run again."
+                ) from error
         source = codeformer_root()
         model_path = find_codeformer_model(model_root())
         verify_sha256(model_path, "FACE_SWAP_CODEFORMER_SHA256", "CodeFormer model")

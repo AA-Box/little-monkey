@@ -12,15 +12,17 @@ The Studio checkbox records the user's acknowledgement; it does not grant a
 model license. The user/build publisher must verify the exact checkpoint terms,
 consent, privacy, and applicable biometric requirements.
 
-## Install the base runtime
+## Automatic runtime setup
 
-Use Python 3.10–3.12 from the repository root:
+Open the tool through Studio and the launcher automatically creates the private
+`examples/.face-swap-venv` environment and installs the bundled base
+requirements on first launch. It refreshes the environment only when the
+requirements file changes. The only prerequisite is Python 3.10–3.12 being
+available on the machine; set `FACE_SWAP_SYSTEM_PYTHON` when it is not on the
+default `PATH`.
 
-```sh
-python3 -m venv examples/.face-swap-venv
-examples/.face-swap-venv/bin/python -m pip install --upgrade pip
-examples/.face-swap-venv/bin/pip install -r examples/studio-tool-face-swap-requirements.txt
-```
+The launcher prints setup progress to the Studio tool log. No terminal command
+or manual `pip install` step is required.
 
 Provide the model root yourself:
 
@@ -74,19 +76,20 @@ is an acknowledgement gate, not a substitute for a license.
 ## Optional CodeFormer restoration
 
 CodeFormer is opt-in because its project license is not a blanket commercial
-license. Install its dependencies only if you have permission to use the
-checkpoint:
+license. When the user selects CodeFormer in Studio, its optional PyTorch
+dependencies are downloaded and installed automatically into the same private
+environment. The official CodeFormer checkout and checkpoint must still be
+supplied locally:
 
 ```sh
-examples/.face-swap-venv/bin/pip install -r examples/studio-tool-face-swap-codeformer-requirements.txt
 export FACE_SWAP_CODEFORMER_HOME=/absolute/path/to/pinned/CodeFormer
 export FACE_SWAP_CODEFORMER_MODEL=/absolute/path/to/model-root/models/codeformer.pth
 export FACE_SWAP_CODEFORMER_SHA256=<codeformer-sha256>
 ```
 
 The Studio restorer choice is **CodeFormer (user-supplied)**. The official
-CodeFormer checkout and `codeformer.pth` must be supplied locally; runtime
-downloads are disabled.
+CodeFormer checkout and `codeformer.pth` must be supplied locally; only the
+Python dependencies are downloaded automatically.
 
 ## Build a managed one-file tool
 
