@@ -44,6 +44,7 @@ export interface AutonomousTaskRuntimeContext {
   placement?: TaskExecutionPlacement;
   planningContext?: TaskPlanningContext;
   approval?: { requestId: string; confirmation: string; operationDigest?: string };
+  beforeSideEffect?: () => void;
 }
 
 export interface AutonomousTaskRuntime {
@@ -53,6 +54,17 @@ export interface AutonomousTaskRuntime {
   verify?: (task: AutonomousTask, node: TaskPlanNode, context: AutonomousTaskRuntimeContext) => Promise<TaskNodeResult>;
   review?: (task: AutonomousTask, node: TaskPlanNode, context: AutonomousTaskRuntimeContext) => Promise<TaskNodeResult>;
   deliver?: (task: AutonomousTask, context: AutonomousTaskRuntimeContext) => Promise<TaskNodeResult>;
+}
+
+export type AutonomousTaskPlacementAdapter = (
+  task: AutonomousTask,
+  node: TaskPlanNode,
+  context: AutonomousTaskRuntimeContext,
+) => Promise<TaskNodeResult>;
+
+export interface AutonomousTaskPlacementAdapters {
+  docker?: AutonomousTaskPlacementAdapter;
+  remote_node?: AutonomousTaskPlacementAdapter;
 }
 
 export interface AutonomousTaskEventSink {
@@ -76,12 +88,27 @@ export class AutonomousTaskControl {
   private readonly controller = new AbortController();
   private guidance: AutonomousTask["guidance"] = [];
   private approval: { requestId: string; confirmation: string; operationDigest?: string } | null = null;
+  private activeExecutions = 0;
+  private safePointWaiters: Array<() => void> = [];
 
   get signal(): AbortSignal { return this.controller.signal; }
   get isPaused(): boolean { return this.paused; }
   pause(): void { if (!this.controller.signal.aborted) this.paused = true; }
   resume(): void { this.paused = false; this.wake?.(); this.wake = null; }
   cancel(): void { this.controller.abort(); this.resume(); }
+  beginExecution(): void { this.activeExecutions += 1; }
+  endExecution(): void {
+    this.activeExecutions = Math.max(0, this.activeExecutions - 1);
+    if (this.activeExecutions === 0) {
+      const waiters = this.safePointWaiters.splice(0);
+      for (const resolve of waiters) resolve();
+    }
+  }
+  waitForSafePoint(): Promise<void> {
+    if (this.activeExecutions === 0) return Promise.resolve();
+    return new Promise((resolve) => this.safePointWaiters.push(resolve));
+  }
+  relinquish(): void { this.controller.abort(); this.resume(); }
   guide(guidance: AutonomousTask["guidance"][number]): void { this.guidance.push(structuredClone(guidance)); this.guidance = this.guidance.slice(-8); this.wake?.(); this.wake = null; }
   drainGuidance(): AutonomousTask["guidance"] { const next = this.guidance; this.guidance = []; return next; }
   approve(requestId: string, confirmation: string, operationDigest?: string): void { this.approval = { requestId, confirmation, operationDigest }; this.wake?.(); this.wake = null; }
@@ -244,12 +271,15 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       }
       const executions = workers.map(async (worker) => {
         const node = task.plan!.nodes.find((candidate) => candidate.nodeId === worker.nodeId)!;
-        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined };
-        if (node.taskClass === "integration" && params.runtime.integrate) return params.runtime.integrate(task, node, [...results.values()], context);
-        if (node.taskClass === "verification" && params.runtime.verify) return params.runtime.verify(task, node, context);
-        if (node.taskClass === "review" && params.runtime.review) return params.runtime.review(task, node, context);
-        if (node.taskClass === "delivery" && params.runtime.deliver) return params.runtime.deliver(task, context);
-        return params.runtime.executeNode(task, node, context);
+        const context: AutonomousTaskRuntimeContext = { resolvedTarget: params.resolvedTarget, signal, worker, placement: worker.executionPlacement, planningContext: task.planningContext, approval: params.approval ?? params.control?.drainApproval() ?? undefined, beforeSideEffect: stopIfNeeded };
+        params.control?.beginExecution();
+        try {
+          if (node.taskClass === "integration" && params.runtime.integrate) return params.runtime.integrate(task, node, [...results.values()], context);
+          if (node.taskClass === "verification" && params.runtime.verify) return params.runtime.verify(task, node, context);
+          if (node.taskClass === "review" && params.runtime.review) return params.runtime.review(task, node, context);
+          if (node.taskClass === "delivery" && params.runtime.deliver) return params.runtime.deliver(task, context);
+          return params.runtime.executeNode(task, node, context);
+        } finally { params.control?.endExecution(); }
       });
       const completed = await Promise.all(executions);
       for (let index = 0; index < completed.length; index += 1) {
@@ -330,7 +360,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
   return task;
 }
 
-export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget): AutonomousTaskRuntime {
+export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget, placementAdapters: AutonomousTaskPlacementAdapters = {}): AutonomousTaskRuntime {
   return {
     plan: async (task, context) => {
       const result = await runSubagentTask({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-planner`, description: "Plan autonomous task", prompt: `Inspect the repository and return JSON only. Build a context-aware DAG with real file scopes; never invent numbered scopes. Schema: {plan:{planId,strategy,nodes:[...]},acceptanceCriteria:[...],summary}\n${buildWorkerContext(task, { nodeId: "planner", taskClass: "investigation", objective: task.objective, dependencies: [], mutationScope: [], isolation: "shared", status: "running", attempt: 1, workerId: null, resultSummary: null })}`, profile: "explore", capabilities: ["read"], target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal });
@@ -339,8 +369,11 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget): Au
       return { plan: createTaskPlan(task.objective, task.constraints.strategy ?? "PLAN", task.budgetSnapshot.maxWorkers, task.planningContext), summary: "Model plan was invalid; used repository-context fallback." };
     },
     executeNode: async (task, node, context) => {
-      if (node.executionPlacement?.kind === "docker" || node.executionPlacement?.kind === "remote_node") {
-        return { ok: false, summary: `Execution placement '${node.executionPlacement.kind}' has no configured backend adapter; refusing local fallback.` };
+      const placementKind = node.executionPlacement?.kind;
+      if (placementKind === "docker" || placementKind === "remote_node") {
+        const adapter = placementAdapters[placementKind];
+        if (!adapter) return { ok: false, summary: "Execution placement '" + placementKind + "' has no registered backend adapter; refusing local fallback." };
+        return adapter(task, node, context);
       }
       const required = new Set(node.capabilities ?? ["read"]);
       const allowed = new Set(["read", "verify"]);
@@ -351,7 +384,7 @@ export function defaultAutonomousTaskRuntime(resolvedTarget: ResolvedTarget): Au
       for (const capability of [...required]) if (!allowed.has(capability)) {
         return { ok: false, summary: `Node '${node.nodeId}' requested capability '${capability}' outside the frozen permission ceiling.` };
       }
-      const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal });
+      const result = await runSubagentTaskStructured({ sessionId: task.sessionId ?? task.taskId, runId: task.taskId, parentCheckpointId: null, taskId: `${task.taskId}-${node.nodeId}`, description: node.objective.slice(0, 120), prompt: buildWorkerContext(task, node), profile: node.taskClass === "investigation" || node.taskClass === "review" ? "explore" : "code", capabilities: [...required], isolation: node.isolation === "worktree" ? "worktree" : undefined, target: resolvedTarget, effort: effortForTarget(resolvedTarget), parentSignal: context.signal, beforeToolCall: context.beforeSideEffect });
       const afterRevision = node.isolation === "shared" ? await agentWorktreeClient.workspaceRevision().catch(() => undefined) : result.worktree?.diffDigest;
       const changedFiles = node.isolation === "shared" ? await agentWorktreeClient.workspaceChangedFiles().catch(() => result.changedFiles ?? []) : result.changedFiles ?? [];
       const patchDigest = afterRevision ? await textDigest(JSON.stringify({ afterRevision, changedFiles })) ?? afterRevision : result.worktree?.diffDigest;

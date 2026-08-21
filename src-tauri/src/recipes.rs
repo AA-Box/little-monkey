@@ -23,6 +23,8 @@
 //! nothing should run unattended without an explicit policy choice.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -649,12 +651,88 @@ pub struct AutonomousTaskGuidanceSnapshot {
     pub applies_to: String,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AutonomousTaskOwnerSnapshot {
     pub kind: String,
     pub instance_id: String,
     pub lease_epoch: u64,
     pub lease_expires_at_ms: u64,
+}
+
+fn autonomous_owner_path(task_id: &str) -> Result<PathBuf, String> {
+    if task_id.is_empty()
+        || task_id.len() > 256
+        || !task_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("Autonomous task id contains unsupported path characters".to_string());
+    }
+    let data_dir = app_paths::data_dir()
+        .ok_or_else(|| "Could not resolve the Little Monkey data directory".to_string())?;
+    Ok(data_dir
+        .join("daemon")
+        .join("autonomous-owners")
+        .join(format!("{task_id}.json")))
+}
+
+/// Claims the immutable execution owner for a task. The first writer wins;
+/// retries with the exact same lease are idempotent, while every competing
+/// epoch or instance is rejected instead of overwriting the checkpoint.
+pub fn claim_autonomous_task_owner(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<(), String> {
+    let path = autonomous_owner_path(task_id)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Autonomous owner path has no parent".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create autonomous owner directory: {error}"))?;
+    let bytes = serde_json::to_vec_pretty(owner)
+        .map_err(|error| format!("Could not serialize autonomous owner: {error}"))?;
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(&bytes)
+                .map_err(|error| format!("Could not persist autonomous owner: {error}"))?;
+            file.sync_all()
+                .map_err(|error| format!("Could not sync autonomous owner: {error}"))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing: AutonomousTaskOwnerSnapshot =
+                serde_json::from_slice(&std::fs::read(&path).map_err(|read_error| {
+                    format!("Could not read autonomous owner: {read_error}")
+                })?)
+                .map_err(|read_error| {
+                    format!("Autonomous owner checkpoint is invalid: {read_error}")
+                })?;
+            if existing == *owner {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Autonomous task {task_id} is already owned by {} at lease epoch {}",
+                    existing.instance_id, existing.lease_epoch
+                ))
+            }
+        }
+        Err(error) => Err(format!("Could not claim autonomous task owner: {error}")),
+    }
+}
+
+pub fn autonomous_task_owner_matches(
+    task_id: &str,
+    owner: &AutonomousTaskOwnerSnapshot,
+) -> Result<bool, String> {
+    let path = autonomous_owner_path(task_id)?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Could not read autonomous owner: {error}")),
+    };
+    let existing: AutonomousTaskOwnerSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Autonomous owner checkpoint is invalid: {error}"))?;
+    Ok(existing == *owner)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]

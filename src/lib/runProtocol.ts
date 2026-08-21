@@ -157,6 +157,7 @@ export interface RunSpecWire {
   workspace: WorkspaceContextWire | null;
   permission_policy: PermissionPolicySnapshotWire;
   budgets: RunBudgetsWire;
+  autonomous_task?: Record<string, unknown> | null;
 }
 
 export interface UsageSnapshotWire {

@@ -2,7 +2,7 @@ import { create } from "zustand";
 
 import { taskEvent, taskEventToRunEvent, type AutonomousTask, type TaskGuidance } from "../lib/autonomousTask";
 import { AutonomousTaskControl, resumeAutonomousTask, startAutonomousTask, submitAutonomousTaskToDaemon, type StartedAutonomousTask } from "../lib/autonomousTaskRunner";
-import { appendRunEvent, listRuns, loadRunEvents, requestRunCancellation } from "../lib/runProtocol";
+import { appendRunEvent, decideRunPermission, listRuns, loadRunEvents, requestRunCancellation } from "../lib/runProtocol";
 
 const controls = new Map<string, AutonomousTaskControl>();
 const started = new Map<string, StartedAutonomousTask>();
@@ -106,6 +106,11 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
     approve: (taskId, confirmation) => withBusy(set, get, `approve:${taskId}`, async () => {
       const current = get().tasks.find((task) => task.taskId === taskId);
       if (!current?.waitingApproval || !confirmation.trim()) throw new Error("Task approval requires the exact confirmation phrase.");
+      if (current.waitingApproval.confirmationPhrase && confirmation.trim() !== current.waitingApproval.confirmationPhrase) throw new Error("The confirmation phrase does not match the frozen delivery preview.");
+      if (current.executionOwner.kind === "daemon") {
+        await decideRunPermission(taskId, current.waitingApproval.requestId, current.waitingApproval.operationDigest, "allow_once");
+        return;
+      }
       const existing = controls.get(taskId);
       if (existing) existing.approve(current.waitingApproval.requestId, confirmation.trim(), current.waitingApproval.operationDigest);
       else {
@@ -117,10 +122,20 @@ export const useAutonomousTaskStore = create<AutonomousTaskStoreState>((set, get
     continueInBackground: (taskId) => withBusy(set, get, `handoff:${taskId}`, async () => {
       const current = get().tasks.find((task) => task.taskId === taskId);
       if (!current || current.outcome !== "RUNNING") throw new Error("Only a running autonomous task can continue in the background.");
-      const accepted = await submitAutonomousTaskToDaemon(current);
+      const control = controls.get(taskId);
+      control?.pause();
+      await control?.waitForSafePoint();
+      let accepted;
+      try { accepted = await submitAutonomousTaskToDaemon(current); }
+      catch (error) { control?.resume(); throw error; }
       const next = { ...current, executionOwner: { kind: "daemon" as const, instanceId: accepted.job_id, leaseEpoch: current.executionOwner.leaseEpoch + 1, leaseExpiresAtMs: Date.now() + 60_000 }, updatedAtMs: Date.now() };
-      await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff", next, { job_id: accepted.job_id, run_id: accepted.run_id, owner: next.executionOwner })));
-      controls.get(taskId)?.cancel();
+      try {
+        await appendRunEvent(taskId, taskEventToRunEvent(taskEvent("execution_handoff", next, { job_id: accepted.job_id, run_id: accepted.run_id, owner: next.executionOwner })));
+      } catch (error) {
+        control?.relinquish();
+        throw error;
+      }
+      control?.relinquish();
       publish(next);
     }),
   };

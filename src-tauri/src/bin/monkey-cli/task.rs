@@ -26,9 +26,10 @@ use little_monkey_lib::recipes::{self, DesktopTurnSnapshot, Recipe};
 use little_monkey_lib::run_ledger::RunLedger;
 use little_monkey_lib::run_protocol::{
     CapabilityAssessment, CapabilityState, ClientIdentity, ClientKind, ModelCapabilitiesSnapshot,
-    ModelTargetSnapshot, PermissionMode as RunPermissionMode, PermissionPolicySnapshot, RootAccess,
-    RootGrant, RunBudgets, RunEvent, RunKind, RunSpec, RunStatus, ToolPermissionRule,
-    ToolPolicyDecision, WorkspaceContext, RUN_PROTOCOL_SCHEMA_VERSION,
+    ModelTargetSnapshot, PermissionDecision, PermissionMode as RunPermissionMode,
+    PermissionPolicySnapshot, RiskLevel, RootAccess, RootGrant, RunBudgets, RunEvent, RunKind,
+    RunSpec, RunStatus, ToolPermissionRule, ToolPolicyDecision, WorkspaceContext,
+    RUN_PROTOCOL_SCHEMA_VERSION,
 };
 use little_monkey_lib::run_scope::RunScope;
 use little_monkey_lib::workspace;
@@ -888,8 +889,19 @@ fn invocation_identity(explicit_run_key: Option<&str>) -> Result<InvocationIdent
         }
     };
     let digest = sha256_hex(seed.as_bytes());
+    let autonomous_task_id = explicit_run_key
+        .and_then(|value| value.strip_prefix("autonomous-task:"))
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+        });
     Ok(InvocationIdentity {
-        run_id: format!("cli-task-{}", &digest[..32]),
+        run_id: autonomous_task_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("cli-task-{}", &digest[..32])),
         idempotency_key: format!("cli-task/{digest}"),
     })
 }
@@ -1360,26 +1372,341 @@ async fn autonomous_phase(
     Ok(changed)
 }
 
-struct AutonomousExecutorResult {
-    files_changed: Vec<String>,
-    final_message: Option<String>,
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FrozenAutonomousNode {
+    node_id: String,
+    task_class: String,
+    objective: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    status: String,
 }
 
-fn autonomous_phase_completed(snapshot: &recipes::AutonomousTaskSnapshot, phase: &str) -> bool {
-    let completed = |id: &str| snapshot.completed_nodes.iter().any(|item| item == id);
-    if completed(phase) {
-        return true;
+fn frozen_autonomous_nodes(
+    snapshot: &recipes::AutonomousTaskSnapshot,
+) -> Result<Vec<FrozenAutonomousNode>, String> {
+    let nodes = snapshot
+        .task_snapshot
+        .as_ref()
+        .and_then(|task| task.get("plan"))
+        .and_then(|plan| plan.get("nodes"))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("frozen autonomous plan is invalid: {error}"))?
+        .unwrap_or_else(|| {
+            serde_json::json!([
+                { "nodeId": "plan", "taskClass": "planning", "objective": "Inspect the repository and produce a concrete plan using only real files.", "dependencies": [] },
+                { "nodeId": "implement", "taskClass": "implementation", "objective": "Implement the objective within the frozen file scope.", "dependencies": ["plan"] },
+                { "nodeId": "verify", "taskClass": "verification", "objective": "Run authoritative verification for the current workspace.", "dependencies": ["implement"] },
+                { "nodeId": "review", "taskClass": "review", "objective": "Review the current diff against the objective and return strict JSON.", "dependencies": ["verify"] },
+                { "nodeId": "delivery", "taskClass": "delivery", "objective": "Complete the frozen delivery intent.", "dependencies": ["review"] }
+            ])
+        });
+    let nodes: Vec<FrozenAutonomousNode> = serde_json::from_value(nodes)
+        .map_err(|error| format!("frozen autonomous plan is invalid: {error}"))?;
+    if nodes.is_empty() || nodes.len() > 128 {
+        return Err("frozen autonomous plan must contain between 1 and 128 nodes".to_string());
     }
-    match (phase, snapshot.next_node_id.as_deref()) {
-        ("plan", Some("implement" | "integrate" | "verify" | "review" | "delivery"))
-        | ("implement", Some("verify" | "review" | "delivery"))
-        | ("verify", Some("review" | "delivery"))
-        | ("review", Some("delivery")) => true,
-        ("plan", _) => completed("investigate") || completed("planner"),
-        ("implement", _) => completed("integration") || completed("implementation"),
-        ("verify", _) => completed("verification"),
-        _ => false,
+    let ids = nodes
+        .iter()
+        .map(|node| node.node_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    if ids.len() != nodes.len() || nodes.iter().any(|node| node.node_id.trim().is_empty()) {
+        return Err("frozen autonomous plan contains duplicate or empty node ids".to_string());
     }
+    for node in &nodes {
+        if node
+            .dependencies
+            .iter()
+            .any(|dependency| !ids.contains(dependency.as_str()))
+        {
+            return Err(format!(
+                "frozen autonomous node '{}' depends on an unknown node",
+                node.node_id
+            ));
+        }
+    }
+    Ok(nodes)
+}
+
+fn autonomous_owner_guard(snapshot: &recipes::AutonomousTaskSnapshot) -> Result<(), String> {
+    let Some(owner) = snapshot.execution_owner.as_ref() else {
+        return Ok(());
+    };
+    if owner.lease_expires_at_ms <= unix_time_ms()? {
+        return Err(format!(
+            "autonomous task execution lease expired for {}",
+            owner.instance_id
+        ));
+    }
+    if !recipes::autonomous_task_owner_matches(&snapshot.task_id, owner)? {
+        return Err(format!(
+            "autonomous task execution owner checkpoint does not match {}",
+            owner.instance_id
+        ));
+    }
+    Ok(())
+}
+
+fn autonomous_waiting_snapshot(
+    snapshot: &recipes::AutonomousTaskSnapshot,
+    node_id: &str,
+    request_id: &str,
+    digest: &str,
+    expires_at_ms: u64,
+    confirmation_phrase: &str,
+) -> serde_json::Value {
+    let mut value = snapshot.task_snapshot.clone().unwrap_or_else(|| {
+        serde_json::json!({
+            "taskId": snapshot.task_id,
+            "objective": snapshot.objective,
+            "outcome": "RUNNING"
+        })
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.insert("outcome".to_string(), serde_json::json!("WAITING_APPROVAL"));
+        object.insert(
+            "waitingReason".to_string(),
+            serde_json::json!("Git delivery requires approval."),
+        );
+        object.insert(
+            "waitingApproval".to_string(),
+            serde_json::json!({
+                "requestId": request_id,
+                "operationDigest": digest,
+                "expiresAtMs": expires_at_ms,
+                "confirmationPhrase": confirmation_phrase,
+                "nodeId": node_id
+            }),
+        );
+    }
+    value
+}
+
+fn autonomous_delivery_steps(
+    snapshot: &recipes::AutonomousTaskSnapshot,
+) -> Result<Vec<String>, String> {
+    let task = snapshot.task_snapshot.as_ref();
+    let intent = task
+        .and_then(|value| value.get("deliveryIntent"))
+        .and_then(|value| value.as_str())
+        .or(snapshot.delivery_intent.as_deref())
+        .unwrap_or("leave_worktree");
+    let current = task
+        .and_then(|value| value.get("deliveryStep"))
+        .and_then(|value| value.as_str());
+    let mut steps = match intent {
+        "leave_worktree" => Vec::new(),
+        "push_owned_branch" => vec!["commit", "push"],
+        "open_or_update_pr" => {
+            let has_pr = task
+                .and_then(|value| value.get("deliveryTarget"))
+                .and_then(|value| value.get("prNumber"))
+                .and_then(|value| value.as_u64())
+                .is_some_and(|number| number > 0);
+            vec![
+                "commit",
+                "push",
+                if has_pr {
+                    "update_draft_pr"
+                } else {
+                    "create_draft_pr"
+                },
+            ]
+        }
+        "commit_only" | "commit" => vec!["commit"],
+        other => return Err(format!("unsupported autonomous delivery intent '{other}'")),
+    }
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    if let Some(current) = current {
+        if let Some(index) = steps.iter().position(|step| step == current) {
+            steps = steps.split_off(index);
+        }
+    }
+    Ok(steps)
+}
+
+fn autonomous_delivery_mutation(
+    snapshot: &recipes::AutonomousTaskSnapshot,
+    step: &str,
+) -> Result<little_monkey_lib::m5_delivery::DeliveryMutation, String> {
+    let target = snapshot
+        .task_snapshot
+        .as_ref()
+        .and_then(|task| task.get("deliveryTarget"))
+        .ok_or_else(|| "Autonomous Git delivery requires a frozen delivery target".to_string())?;
+    let string = |field: &str| {
+        target
+            .get(field)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("Frozen delivery target is missing '{field}'"))
+    };
+    let worktree_id = string("worktreeId")?;
+    match step {
+        "commit" => {
+            let paths = target
+                .get("changedFiles")
+                .and_then(|value| value.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|paths| !paths.is_empty())
+                .unwrap_or_else(|| vec![".".to_string()]);
+            Ok(little_monkey_lib::m5_delivery::DeliveryMutation::Commit {
+                worktree_id,
+                paths,
+                message: snapshot.objective.chars().take(120).collect(),
+            })
+        }
+        "push" => Ok(little_monkey_lib::m5_delivery::DeliveryMutation::Push {
+            worktree_id,
+            remote: string("remote")?,
+        }),
+        "create_draft_pr" => Ok(
+            little_monkey_lib::m5_delivery::DeliveryMutation::CreateDraftPr {
+                worktree_id,
+                base: string("base")?,
+                title: string("title")?,
+                body: target
+                    .get("body")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        ),
+        "update_draft_pr" => Ok(
+            little_monkey_lib::m5_delivery::DeliveryMutation::UpdateDraftPr {
+                worktree_id,
+                pr_number: target
+                    .get("prNumber")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        "Updating a draft PR requires its frozen PR number".to_string()
+                    })?,
+                title: string("title")?,
+                body: target
+                    .get("body")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            },
+        ),
+        other => Err(format!("unsupported autonomous delivery step '{other}'")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_autonomous_delivery(
+    snapshot: &recipes::AutonomousTaskSnapshot,
+    node_id: &str,
+    recorder: &DurableRunRecorder,
+    state: &little_monkey_lib::AppState,
+) -> Result<(), String> {
+    for step in autonomous_delivery_steps(snapshot)? {
+        autonomous_owner_guard(snapshot)?;
+        let mutation = autonomous_delivery_mutation(snapshot, &step)?;
+        let preview =
+            little_monkey_lib::m5_delivery::prepare_mutation_impl(mutation.clone(), state)?;
+        let request_id = format!(
+            "delivery-{}",
+            &sha256_hex(format!("{}:{step}:{}", snapshot.task_id, preview.digest).as_bytes())[..24]
+        );
+        let expires_at_ms = preview.expires_at_ms;
+        recorder.emit(RunEvent::PermissionRequested {
+            request_id: request_id.clone(),
+            tool_call_id: format!("autonomous-{node_id}"),
+            tool_name: "git_delivery".to_string(),
+            operation_sha256: preview.digest.clone(),
+            expires_at_ms,
+            detail: format!("Approval required for autonomous {step} delivery."),
+            risk_level: Some(RiskLevel::High),
+            risk_reason: Some(
+                "Autonomous delivery changes a repository or GitHub state.".to_string(),
+            ),
+        })?;
+        recorder.emit(RunEvent::AwaitingApproval {
+            request_id: request_id.clone(),
+            operation_sha256: preview.digest.clone(),
+            expires_at_ms,
+            reason: Some(format!(
+                "Waiting for approval of autonomous {step} delivery."
+            )),
+        })?;
+        autonomous_task_event(
+            recorder,
+            &snapshot.task_id,
+            "waiting_approval",
+            serde_json::json!({
+                "node_id": node_id,
+                "step": step,
+                "snapshot": autonomous_waiting_snapshot(snapshot, node_id, &request_id, &preview.digest, expires_at_ms, &preview.confirmation_phrase)
+            }),
+        )?;
+        loop {
+            let ledger = autonomous_ledger()?;
+            let approval = ledger
+                .load_approval(&recorder.run_id(), &request_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("Approval '{request_id}' disappeared from the ledger"))?;
+            match approval.decision {
+                Some(PermissionDecision::AllowOnce | PermissionDecision::AllowForRun) => {
+                    little_monkey_lib::m5_delivery::execute_mutation_impl(
+                        mutation,
+                        preview.digest.clone(),
+                        preview.confirmation_phrase.clone(),
+                        state,
+                    )
+                    .await?;
+                    recorder.emit(RunEvent::ExternalMutationConfirmed {
+                        mutation_id: preview.digest.clone(),
+                        confirmation_ref: Some(request_id.clone()),
+                        summary: format!("Autonomous {step} delivery completed."),
+                    })?;
+                    autonomous_task_event(
+                        recorder,
+                        &snapshot.task_id,
+                        "delivery_finished",
+                        serde_json::json!({ "step": step, "intent": snapshot.delivery_intent, "status": "fulfilled", "digest": preview.digest }),
+                    )?;
+                    break;
+                }
+                Some(PermissionDecision::Deny | PermissionDecision::Expired) => {
+                    return Err(format!("Autonomous {step} delivery was not approved."));
+                }
+                None if unix_time_ms()? >= expires_at_ms => {
+                    recorder.emit(RunEvent::PermissionDecided {
+                        request_id: request_id.clone(),
+                        operation_sha256: preview.digest.clone(),
+                        decision: PermissionDecision::Expired,
+                        decided_by: autonomous_emitter(),
+                    })?;
+                    return Err(format!("Autonomous {step} delivery approval expired."));
+                }
+                None => tokio::time::sleep(Duration::from_millis(200)).await,
+            }
+        }
+    }
+    if autonomous_delivery_steps(snapshot)?.is_empty() {
+        autonomous_task_event(
+            recorder,
+            &snapshot.task_id,
+            "delivery_finished",
+            serde_json::json!({ "intent": "leave_worktree", "status": "left_in_managed_workspace" }),
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1397,12 +1724,16 @@ async fn run_autonomous_task_executor(
     workspace_root: &Path,
     max_iterations: usize,
 ) -> Result<AutonomousExecutorResult, String> {
-    if let Some(owner) = &snapshot.execution_owner {
-        if owner.lease_expires_at_ms <= unix_time_ms()? {
-            return Err(format!(
-                "autonomous task execution lease expired for {}",
-                owner.instance_id
-            ));
+    autonomous_owner_guard(snapshot)?;
+    let nodes = frozen_autonomous_nodes(snapshot)?;
+    let mut completed = snapshot
+        .completed_nodes
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for node in &nodes {
+        if node.status == "succeeded" {
+            completed.insert(node.node_id.clone());
         }
     }
     autonomous_task_event(
@@ -1426,152 +1757,165 @@ async fn run_autonomous_task_executor(
         &snapshot.task_id,
         "plan_created",
         serde_json::json!({
-            "strategy": "PLAN",
-            "nodes": ["plan", "implement", "verify", "review", "delivery"],
+            "strategy": "FROZEN_DAG",
+            "nodes": nodes.iter().map(|node| serde_json::json!({
+                "node_id": node.node_id,
+                "task_class": node.task_class,
+                "dependencies": node.dependencies
+            })).collect::<Vec<_>>(),
             "scope": snapshot.relevant_files
         }),
     )?;
-    if !autonomous_phase_completed(snapshot, "plan") {
-        autonomous_phase(
-            snapshot,
-            recorder,
-            client,
-            target,
-            state,
-            perms,
-            history,
-            options,
-            mcp_entries,
-            attached_stacks,
-            "plan",
-            "Inspect the repository and produce a concrete plan using only real files.",
-            max_iterations,
-        )
-        .await?;
-    }
-
     let mut files_changed = Vec::new();
-    let mut final_message = None;
-    for round in 0..=snapshot.max_repair_rounds {
-        let changed = if autonomous_phase_completed(snapshot, "implement") {
+    let mut next_hint = snapshot.next_node_id.clone();
+    for _ in 0..nodes.len() {
+        autonomous_owner_guard(snapshot)?;
+        let ready = nodes
+            .iter()
+            .filter(|node| {
+                !completed.contains(&node.node_id)
+                    && node
+                        .dependencies
+                        .iter()
+                        .all(|dependency| completed.contains(dependency))
+            })
+            .collect::<Vec<_>>();
+        let Some(node) = next_hint
+            .as_deref()
+            .and_then(|id| ready.iter().copied().find(|node| node.node_id == id))
+            .or_else(|| ready.first().copied())
+        else {
+            if completed.len() == nodes.len() {
+                break;
+            }
+            return Err(
+                "Frozen autonomous DAG made no progress; dependency state is invalid.".to_string(),
+            );
+        };
+        next_hint = None;
+        autonomous_task_event(
+            recorder,
+            &snapshot.task_id,
+            "node_started",
+            serde_json::json!({ "node_id": node.node_id, "task_class": node.task_class, "dependencies": node.dependencies }),
+        )?;
+        let changed = if node.task_class == "delivery" {
+            execute_autonomous_delivery(snapshot, &node.node_id, recorder, state).await?;
             Vec::new()
         } else {
-            autonomous_phase(
-                snapshot, recorder, client, target, state, perms, history, options,
-                mcp_entries, attached_stacks, "implement",
-                "Implement the objective now. Mutate only the frozen file scope and preserve unrelated changes.", max_iterations,
-            ).await?
+            let changed = autonomous_phase(
+                snapshot,
+                recorder,
+                client,
+                target,
+                state,
+                perms,
+                history,
+                options,
+                mcp_entries,
+                attached_stacks,
+                &node.task_class,
+                &node.objective,
+                max_iterations,
+            )
+            .await?;
+            if node.task_class == "verification" {
+                let verification = Command::new("git")
+                    .args(["diff", "--check", "--"])
+                    .current_dir(workspace_root)
+                    .output()
+                    .map_err(|error| format!("verification command could not start: {error}"))?;
+                let summary = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&verification.stdout),
+                    String::from_utf8_lossy(&verification.stderr)
+                );
+                let passed = verification.status.success();
+                autonomous_task_event(
+                    recorder,
+                    &snapshot.task_id,
+                    "verification_finished",
+                    serde_json::json!({ "node_id": node.node_id, "name": "git diff --check", "passed": passed, "authoritative": true, "workspace_revision": snapshot.current_workspace_revision, "summary": summary.trim() }),
+                )?;
+                if !passed {
+                    return Err(format!("verification failed: {}", summary.trim()));
+                }
+            }
+            if node.task_class == "review" {
+                let review_text = history
+                    .last()
+                    .and_then(|message| message.get("content"))
+                    .and_then(|content| content.as_str())
+                    .unwrap_or_default();
+                let review_json = review_text
+                    .match_indices('{')
+                    .next()
+                    .and_then(|(start, _)| {
+                        serde_json::from_str::<serde_json::Value>(&review_text[start..]).ok()
+                    });
+                if review_json
+                    .as_ref()
+                    .and_then(|value| value.get("verdict"))
+                    .and_then(|value| value.as_str())
+                    != Some("pass")
+                {
+                    return Err("structured autonomous review did not pass".to_string());
+                }
+                autonomous_task_event(
+                    recorder,
+                    &snapshot.task_id,
+                    "review_evidence",
+                    serde_json::json!({ "node_id": node.node_id, "authoritative": true, "structured": review_json.is_some(), "verdict": review_json.as_ref().and_then(|value| value.get("verdict")) }),
+                )?;
+            }
+            changed
         };
         files_changed.extend(changed);
         files_changed.sort();
         files_changed.dedup();
-
-        let verification_started = std::time::Instant::now();
-        let verification = Command::new("git")
-            .args(["diff", "--check", "--"])
-            .current_dir(workspace_root)
-            .output()
-            .map_err(|error| format!("verification command could not start: {error}"))?;
-        let verification_summary = format!(
-            "{}{}",
-            String::from_utf8_lossy(&verification.stdout),
-            String::from_utf8_lossy(&verification.stderr)
-        );
-        let verification_ok = verification.status.success();
+        completed.insert(node.node_id.clone());
         autonomous_task_event(
             recorder,
             &snapshot.task_id,
-            "verification_finished",
-            serde_json::json!({
-                "name": "git diff --check",
-                "passed": verification_ok,
-                "authoritative": true,
-                "workspace_revision": snapshot.current_workspace_revision,
-                "duration_ms": verification_started.elapsed().as_millis(),
-                "summary": verification_summary.trim()
-            }),
+            "node_finished",
+            serde_json::json!({ "node_id": node.node_id, "task_class": node.task_class, "status": "succeeded" }),
         )?;
-
-        let review_changed = if autonomous_phase_completed(snapshot, "review") {
-            Vec::new()
-        } else {
-            autonomous_phase(
-                snapshot, recorder, client, target, state, perms, history, options,
-                mcp_entries, attached_stacks, "review",
-                "Review the current diff against the objective and return strict JSON: {\"verdict\":\"pass\"|\"changes_required\",\"findings\":[]}. Do not mutate files.", max_iterations,
-            ).await?
-        };
-        files_changed.extend(review_changed);
-        let review_text = history
-            .last()
-            .and_then(|message| message.get("content"))
-            .and_then(|content| content.as_str())
-            .unwrap_or_default();
-        let review_json = review_text
-            .match_indices('{')
-            .next()
-            .and_then(|(start, _)| {
-                serde_json::from_str::<serde_json::Value>(&review_text[start..]).ok()
-            });
-        let review_ok = autonomous_phase_completed(snapshot, "review")
-            || review_json
-                .as_ref()
-                .and_then(|value| value.get("verdict"))
-                .and_then(|value| value.as_str())
-                == Some("pass");
-        autonomous_task_event(
-            recorder,
-            &snapshot.task_id,
-            "review_evidence",
-            serde_json::json!({ "authoritative": review_ok, "structured": review_json.is_some(), "verdict": review_json.as_ref().and_then(|value| value.get("verdict")) }),
-        )?;
-        if verification_ok && review_ok {
-            final_message = Some(
-                "Autonomous plan, implementation, verification, and review completed.".to_string(),
-            );
-            break;
-        }
-        if round == snapshot.max_repair_rounds {
-            return Err(format!(
-                "autonomous task exhausted {} repair round(s): verification_ok={verification_ok}, review_ok={review_ok}",
-                snapshot.max_repair_rounds
-            ));
-        }
-        autonomous_task_event(
-            recorder,
-            &snapshot.task_id,
-            "plan_changed",
-            serde_json::json!({ "reason": "verification or structured review failed", "repair_round": round + 1 }),
-        )?;
-        autonomous_phase(
-            snapshot,
-            recorder,
-            client,
-            target,
-            state,
-            perms,
-            history,
-            options,
-            mcp_entries,
-            attached_stacks,
-            "repair",
-            "Diagnose the verification/review failure, then make the smallest repair within scope.",
-            max_iterations,
-        )
-        .await?;
     }
-    autonomous_task_event(
-        recorder,
-        &snapshot.task_id,
-        "delivery_finished",
-        serde_json::json!({ "intent": snapshot.delivery_intent, "status": "left_in_managed_workspace" }),
-    )?;
+    if completed.len() != nodes.len() {
+        return Err("Frozen autonomous DAG did not complete every node.".to_string());
+    }
     Ok(AutonomousExecutorResult {
         files_changed,
-        final_message,
+        final_message: Some(
+            "Frozen autonomous task plan completed with verification and review evidence."
+                .to_string(),
+        ),
     })
 }
 
+struct AutonomousExecutorResult {
+    files_changed: Vec<String>,
+    final_message: Option<String>,
+}
+
+fn autonomous_phase_completed(snapshot: &recipes::AutonomousTaskSnapshot, phase: &str) -> bool {
+    let completed = |id: &str| snapshot.completed_nodes.iter().any(|item| item == id);
+    if completed(phase) {
+        return true;
+    }
+    match (phase, snapshot.next_node_id.as_deref()) {
+        ("plan", Some("implement" | "integrate" | "verify" | "review" | "delivery"))
+        | ("implement", Some("verify" | "review" | "delivery"))
+        | ("verify", Some("review" | "delivery"))
+        | ("review", Some("delivery")) => true,
+        ("plan", _) => completed("investigate") || completed("planner"),
+        ("implement", _) => completed("integration") || completed("implementation"),
+        ("verify", _) => completed("verification"),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     cli: &crate::Cli,
     client: &reqwest::Client,
@@ -1589,6 +1933,13 @@ async fn run_inner(
         workspace_root.as_deref(),
         &global_config_roots,
     )?;
+
+    if let Some(snapshot) = recipe.autonomous_task.as_ref() {
+        let owner = snapshot.execution_owner.as_ref().ok_or_else(|| {
+            "Autonomous task recipe requires an execution owner lease".to_string()
+        })?;
+        recipes::claim_autonomous_task_owner(&snapshot.task_id, owner)?;
+    }
 
     let overrides = parse_param_flags(param_flags)?;
     let rendered = recipes::render_recipe(&recipe, &overrides)?;
@@ -1752,6 +2103,9 @@ async fn run_inner(
                 max_event_count: 10_000_000,
             },
         },
+        autonomous_task: recipe.autonomous_task.as_ref().map(|snapshot| {
+            serde_json::to_value(snapshot).expect("autonomous snapshot is serializable")
+        }),
     };
     // **The half of K17 S3 that makes a travelled policy more than paperwork.**
     //

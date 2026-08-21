@@ -24,6 +24,17 @@ use store::DeliveryStore;
 
 const PREVIEW_TTL_MS: u64 = 5 * 60 * 1_000;
 
+pub fn current_branch(root: &Path) -> Result<String, String> {
+    let branch = git::git_text(root, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err(
+            "The repository is in a detached HEAD state; choose a named base branch.".to_string(),
+        );
+    }
+    validate_git_token("base branch", &branch)?;
+    Ok(branch)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryPolicy {

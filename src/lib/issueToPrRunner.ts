@@ -47,6 +47,7 @@ export interface RunIssueToPrAgentParams {
   issueTitle: string;
   issueBody: string;
   branch: string;
+  baseRef: string;
   worktreeId?: string;
   /** The secondary workspace root label `issue_to_pr.rs` attached for this
    * run's owned worktree — every tool path the model uses must be prefixed
@@ -96,7 +97,7 @@ export async function runIssueToPrAutonomousTask(
   let implementation: IssueToPrAgentResult | null = null;
   const resolvedTarget = await resolveTarget();
   const baseRuntime = defaultAutonomousTaskRuntime(resolvedTarget);
-  const deliveryTarget: TaskDeliveryTarget = { worktreeId: params.worktreeId ?? params.runId, repositorySlug: params.repositorySlug, branch: params.branch, remote: 'origin', base: 'develop', title: `Issue #${params.issueNumber}: ${params.issueTitle}`, body: `Implements GitHub issue #${params.issueNumber}.` };
+  const deliveryTarget: TaskDeliveryTarget = { worktreeId: params.worktreeId ?? params.runId, repositorySlug: params.repositorySlug, branch: params.branch, remote: 'origin', base: params.baseRef, title: `Issue #${params.issueNumber}: ${params.issueTitle}`, body: `Implements GitHub issue #${params.issueNumber}.` };
   const runtime: AutonomousTaskRuntime = {
     ...baseRuntime,
     executeNode: async (task, node, context) => {
