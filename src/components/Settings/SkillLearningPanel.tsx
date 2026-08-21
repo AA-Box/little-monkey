@@ -15,11 +15,14 @@ import {
 import {
   skillLearningClient,
   type EvaluationRecord,
+  type ImprovementEvidence,
   type LearnedSkillSummary,
   type LearningCandidate,
   type LearningPolicy,
   type LearningSettings,
   type LearningSourceKind,
+  type RunEvidence,
+  type SkillQualityState,
 } from "../../lib/skillLearningClient";
 import { nativeSkillsClient, type NativeSkillScope } from "../../lib/nativeSkillsClient";
 import { runCandidateEvaluation } from "../../lib/skillLearningEval";
@@ -52,6 +55,7 @@ const POLICY_LABELS: Array<{ value: LearningPolicy; label: string; detail: strin
 const SOURCE_LABELS: Record<LearningSourceKind, string> = {
   explicit_user_instruction: "you asked for it",
   manual_run_capture: "you saved the run",
+  manual_improvement: "you requested an evidence-backed improvement",
   user_correction: "your correction verified",
   verification_repair: "verification repair",
   successful_novel_procedure: "verified procedure",
@@ -83,6 +87,54 @@ function parseList(value: string): string[] {
     .split(/[\n,]/)
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function addedValues(before: string[], after: string[]): string[] {
+  const previous = new Set(before);
+  return after.filter((value, index) => after.indexOf(value) === index && !previous.has(value));
+}
+
+function valuesChanged(before: string[], after: string[]): boolean {
+  return before.length !== after.length || before.some((value) => !after.includes(value)) || after.some((value) => !before.includes(value));
+}
+
+function resourcePaths(resources: Array<{ path: string }> | undefined): string[] {
+  return resources?.map((resource) => resource.path) ?? [];
+}
+
+function qualityLabel(state: SkillQualityState): string {
+  if (state === "needs_attention") return "Needs attention";
+  if (state === "healthy") return "Healthy";
+  return "Not enough data";
+}
+
+function qualityClass(state: SkillQualityState): string {
+  if (state === "needs_attention") return "bg-danger-soft text-danger";
+  if (state === "healthy") return "bg-success-soft text-success";
+  return "bg-warning-soft text-warning";
+}
+
+function boundedDiff(before: string, after: string): Array<{ kind: "context" | "removed" | "added"; text: string }> {
+  const left = before.split("\n");
+  const right = after.split("\n");
+  const lines: Array<{ kind: "context" | "removed" | "added"; text: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < left.length || j < right.length) {
+    if (left[i] === right[j]) {
+      if (i < left.length) lines.push({ kind: "context", text: left[i] });
+      i += 1;
+      j += 1;
+    } else {
+      if (i < left.length) lines.push({ kind: "removed", text: left[i++] });
+      if (j < right.length) lines.push({ kind: "added", text: right[j++] });
+    }
+    if (lines.length >= 240) {
+      lines.push({ kind: "context", text: "… diff truncated …" });
+      break;
+    }
+  }
+  return lines;
 }
 
 function candidateDraft(candidate: LearningCandidate): CandidateDraft {
@@ -132,6 +184,11 @@ export function SkillLearningPanel() {
    * same discovery the native skill list uses, so it is what a future run
    * would actually read, not a stored copy. */
   const [installedBody, setInstalledBody] = useState<Record<string, string>>({});
+  const [improvementEvidence, setImprovementEvidence] = useState<Record<string, ImprovementEvidence[]>>({});
+  const [selectedImprovementEvidence, setSelectedImprovementEvidence] = useState<Record<string, string[]>>({});
+  const [runEvidence, setRunEvidence] = useState<Record<string, RunEvidence>>({});
+  const [improvementOpen, setImprovementOpen] = useState<string | null>(null);
+  const [qualityDetailsOpen, setQualityDetailsOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const bumpNativeSkills = useNativeSkillsStore((state) => state.bump);
@@ -347,9 +404,68 @@ export function SkillLearningPanel() {
                       <div className="flex flex-col gap-1">
                         <span className="text-faint">Installed now ({shortHash(candidate.parent_skill_sha256)})</span>
                         <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded border border-border bg-surface p-2 font-mono text-[11px] text-muted">
-                          {installedBody[candidate.proposed_command] ?? "(loading the installed version…)"}
+                          {candidate.parent_skill_content ?? installedBody[candidate.proposed_command] ?? "(loading the installed version…)"}
                         </pre>
                         <span className="text-faint">Proposed ({shortHash(candidate.candidate_sha256)})</span>
+                      </div>
+                    )}
+                    {candidate.parent_skill_sha256 && candidate.proposed_skill_content && (
+                      <div className="flex flex-col gap-1">
+                        <span className="text-faint">Instruction diff</span>
+                        <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded border border-border bg-surface p-2 font-mono text-[11px]">
+                          {boundedDiff(
+                            candidate.parent_skill_content ?? installedBody[candidate.proposed_command] ?? "",
+                            candidate.proposed_skill_content,
+                          ).map((line, index) => (
+                            <span
+                              key={`${index}:${line.kind}`}
+                              className={`block ${line.kind === "removed" ? "text-danger" : line.kind === "added" ? "text-success" : "text-muted"}`}
+                            >
+                              {line.kind === "removed" ? "- " : line.kind === "added" ? "+ " : "  "}
+                              {line.text}
+                            </span>
+                          ))}
+                        </pre>
+                        <div className="grid gap-1 text-faint sm:grid-cols-2">
+                          <span>
+                            Allowed tools: {candidate.allowed_tools.join(", ") || "unrestricted"}
+                            {addedValues(candidate.parent_allowed_tools ?? [], candidate.allowed_tools).length > 0 && (
+                              <span className="text-warning"> · + {addedValues(candidate.parent_allowed_tools ?? [], candidate.allowed_tools).join(", ")} ⚠️ widened</span>
+                            )}
+                            {valuesChanged(candidate.parent_allowed_tools ?? [], candidate.allowed_tools) && addedValues(candidate.parent_allowed_tools ?? [], candidate.allowed_tools).length === 0 && " ⚠️ changed"}
+                          </span>
+                          <span>
+                            Required binaries: {(candidate.requirements.bins ?? []).join(", ") || "none"}
+                            {addedValues(candidate.parent_requirements?.bins ?? [], candidate.requirements.bins).length > 0 && (
+                              <span className="text-warning"> · + {addedValues(candidate.parent_requirements?.bins ?? [], candidate.requirements.bins).join(", ")} ⚠️ widened</span>
+                            )}
+                            {valuesChanged(candidate.parent_requirements?.bins ?? [], candidate.requirements.bins) && addedValues(candidate.parent_requirements?.bins ?? [], candidate.requirements.bins).length === 0 && " ⚠️ changed"}
+                          </span>
+                          <span>
+                            Required environment: {(candidate.requirements.env ?? []).join(", ") || "none"}
+                            {addedValues(candidate.parent_requirements?.env ?? [], candidate.requirements.env).length > 0 && (
+                              <span className="text-warning"> · + {addedValues(candidate.parent_requirements?.env ?? [], candidate.requirements.env).join(", ")} ⚠️ widened</span>
+                            )}
+                            {valuesChanged(candidate.parent_requirements?.env ?? [], candidate.requirements.env) && addedValues(candidate.parent_requirements?.env ?? [], candidate.requirements.env).length === 0 && " ⚠️ changed"}
+                          </span>
+                          <span>
+                            Scope: {candidate.parent_scope ? `${candidate.parent_scope} → ${candidate.scope}` : candidate.scope}
+                            {candidate.parent_scope && candidate.parent_scope !== candidate.scope && " ⚠️ widened from parent"}
+                          </span>
+                        </div>
+                        {(candidate.parent_skill_resource_files?.length ?? 0) > 0 || candidate.proposed_resource_files.length > 0 ? (
+                          <div className="mt-1 text-faint">
+                            <span>
+                              Bundled resources: {resourcePaths(candidate.parent_skill_resource_files).join(", ") || "none"} → {resourcePaths(candidate.proposed_resource_files).join(", ") || "none"}
+                            </span>
+                            {addedValues(resourcePaths(candidate.parent_skill_resource_files), resourcePaths(candidate.proposed_resource_files)).length > 0 && (
+                              <span className="text-success"> · + {addedValues(resourcePaths(candidate.parent_skill_resource_files), resourcePaths(candidate.proposed_resource_files)).join(", ")}</span>
+                            )}
+                            {addedValues(resourcePaths(candidate.proposed_resource_files), resourcePaths(candidate.parent_skill_resource_files)).length > 0 && (
+                              <span className="text-danger"> · − {addedValues(resourcePaths(candidate.proposed_resource_files), resourcePaths(candidate.parent_skill_resource_files)).join(", ")}</span>
+                            )}
+                          </div>
+                        ) : null}
                       </div>
                     )}
                     {editing ? (
@@ -457,9 +573,22 @@ export function SkillLearningPanel() {
                       </pre>
                     )}
                     {(evaluations[candidate.candidate_id] ?? []).map((record) => (
-                      <p key={record.evaluation_id} className="text-faint">
-                        {record.evaluation_id} [{record.mode}]: {record.verdict} — {record.summary}
-                      </p>
+                      <div key={record.evaluation_id} className="rounded border border-border bg-surface p-2 text-[11px]">
+                        <div className="font-medium text-muted">Evaluation ({record.mode}) · {record.verdict}</div>
+                        <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-2">
+                          <span className="text-faint">Case</span><span className="text-faint">Current</span><span className="text-faint">Proposed</span>
+                          {record.cases.flatMap((testCase) => {
+                            const baseline = record.reports.find((report) => report.case_id === testCase.case_id && report.arm === "baseline");
+                            const proposed = record.reports.find((report) => report.case_id === testCase.case_id && report.arm === "candidate");
+                            return [
+                              <span key={`${testCase.case_id}:name`} className="text-faint">{testCase.name}</span>,
+                              <span key={`${testCase.case_id}:baseline`}>{baseline?.verification_passed === true ? "Passed" : baseline?.verification_passed === false ? "Failed" : "Unknown"}</span>,
+                              <span key={`${testCase.case_id}:candidate`}>{proposed?.verification_passed === true ? "Passed" : proposed?.verification_passed === false ? "Failed" : "Unknown"}</span>,
+                            ];
+                          })}
+                        </div>
+                        <p className="mt-1 text-faint">{record.summary}</p>
+                      </div>
                     ))}
                   </div>
                 )}
@@ -578,7 +707,14 @@ export function SkillLearningPanel() {
         {learned.length === 0 ? (
           <p className="text-xs text-faint">Nothing has been promoted yet.</p>
         ) : (
-          learned.map((summary) => (
+          learned.map((summary) => {
+            const quality = summary.quality;
+            const improveKey = `${summary.scope}:${summary.command}`;
+            const openImprovement = improvementOpen === improveKey;
+            const evidence = improvementEvidence[improveKey] ?? [];
+            const selected = selectedImprovementEvidence[improveKey] ?? [];
+            const hasOpenCandidate = Boolean(quality.open_improvement_candidate_id);
+            return (
             <div
               key={`${summary.scope}:${summary.command}:${summary.active_sha256}`}
               id={`learned-skill-${summary.scope}:${summary.command}`}
@@ -622,10 +758,177 @@ export function SkillLearningPanel() {
                 {summary.previous_sha256.length > 0 &&
                   ` · previous versions ${summary.previous_sha256.map(shortHash).join(", ")}`}
               </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className={`rounded px-1.5 py-0.5 text-[10px] ${qualityClass(quality.state)}`}
+                  title={quality.reasons.join(" ")}
+                  onClick={() => setQualityDetailsOpen((current) => (current === improveKey ? null : improveKey))}
+                >
+                  {qualityLabel(quality.state)}
+                </button>
+                <span className="text-faint">
+                  Verified: {quality.verified_successes}/{quality.verified_successes + quality.verified_failures} · Failures: {quality.verified_failures} · Corrections: {quality.corrections}
+                </span>
+                {quality.last_used_at_unix_ms !== null && (
+                  <span className="text-faint">Last used: {new Date(quality.last_used_at_unix_ms).toLocaleString()}</span>
+                )}
+              </div>
+              <div className="mt-1 rounded border border-border bg-surface px-2 py-1 text-[11px] text-faint">
+                <div>{quality.reasons[0] ?? "No quality evidence yet."}</div>
+                {qualityDetailsOpen === improveKey && (
+                  <div className="mt-2 flex flex-col gap-1 border-t border-border pt-1">
+                    <span className="font-medium text-muted">Quality details</span>
+                    {quality.reasons.map((reason) => <span key={reason}>• {reason}</span>)}
+                    <span>Verified: {quality.verified_successes} passed · {quality.verified_failures} failed</span>
+                    {quality.unknown_verification > 0 && <span>! {quality.unknown_verification} unverified run(s) — not counted as success</span>}
+                    {quality.cancelled_runs > 0 && <span>! {quality.cancelled_runs} cancelled run(s) — not counted as failure</span>}
+                    <span className="mt-1 font-medium text-muted">Recent evidence</span>
+                    {quality.recent_runs.length === 0 ? <span>No runs recorded for this version.</span> : quality.recent_runs.map((recentRun) => {
+                      const evidenceKey = `${improveKey}:${recentRun.run_id}`;
+                      const loadedEvidence = runEvidence[evidenceKey];
+                      return (
+                        <div key={recentRun.run_id} className="flex flex-col gap-0.5">
+                          <span>
+                            {recentRun.outcome === "cancelled" ? "—" : recentRun.verification_passed === true ? "✓" : recentRun.verification_passed === false ? "✕" : "!"} {recentRun.run_id.slice(0, 12)} · {recentRun.user_corrected ? "correction" : recentRun.outcome} · {new Date(recentRun.recorded_at_unix_ms).toLocaleString()}
+                            {recentRun.failure_signature && ` · ${recentRun.failure_signature}`}
+                          </span>
+                          {recentRun.evidence_available && (
+                            <button
+                              type="button"
+                              className="self-start text-accent underline"
+                              disabled={busy !== null}
+                              onClick={() => {
+                                if (loadedEvidence) {
+                                  setRunEvidence((current) => {
+                                    const next = { ...current };
+                                    delete next[evidenceKey];
+                                    return next;
+                                  });
+                                  return;
+                                }
+                                void run(`evidence:${evidenceKey}`, async () => {
+                                  const evidence = await skillLearningClient.runEvidence(summary.scope, summary.command, recentRun.run_id);
+                                  setRunEvidence((current) => ({ ...current, [evidenceKey]: evidence }));
+                                });
+                              }}
+                            >
+                              {loadedEvidence ? "Hide evidence" : "View evidence"}
+                            </button>
+                          )}
+                          {loadedEvidence && (
+                            <div className="rounded border border-border bg-background px-1.5 py-1">
+                              <span>{loadedEvidence.tool_calls.length} bounded tool call(s) · {loadedEvidence.verifications.length} verification(s)</span>
+                              {loadedEvidence.tool_calls.map((call) => (
+                                <span key={call.tool_call_id} className="block">
+                                  {call.succeeded ? "✓" : "✕"} {call.tool_name}{call.failure_excerpt ? ` · ${call.failure_excerpt}` : ""}
+                                </span>
+                              ))}
+                              {loadedEvidence.verifications.map((verification) => (
+                                <span key={verification.event_id} className="block">
+                                  {verification.passed ? "✓" : "✕"} {verification.name}: {verification.summary}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {summary.history.length > 0 && (
+                      <>
+                        <span className="mt-1 font-medium text-muted">History</span>
+                        {summary.history.map((version) => (
+                          <span key={version.sha256}>
+                            {shortHash(version.sha256)} · {version.version} · {version.sha256 === summary.active_sha256 ? "current" : "previous"} · {version.uses} use{version.uses === 1 ? "" : "s"} · {version.failures} failure{version.failures === 1 ? "" : "s"} · {version.corrections} correction{version.corrections === 1 ? "" : "s"}
+                          </span>
+                        ))}
+                      </>
+                    )}
+                  </div>
+                )}
+                {openImprovement && (
+                  <div className="mt-2 flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-medium text-muted">Improvement evidence (max 5)</span>
+                      <span>{selected.length}/5 selected</span>
+                    </div>
+                    {evidence.length === 0 ? (
+                      <span>Use this skill in a completed run before improving it.</span>
+                    ) : (
+                      evidence.map((item) => {
+                        const checked = selected.includes(item.run_id);
+                        return (
+                          <label key={item.run_id} className="flex items-start gap-2">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={!checked && selected.length >= 5}
+                              onChange={(event) => {
+                                const next = event.target.checked
+                                  ? [...selected, item.run_id]
+                                  : selected.filter((runId) => runId !== item.run_id);
+                                setSelectedImprovementEvidence((current) => ({ ...current, [improveKey]: next }));
+                              }}
+                            />
+                            <span>
+                              <span className="font-mono text-muted">{item.run_id.slice(0, 12)}</span> · {item.user_corrected ? "correction" : item.outcome === "cancelled" ? "cancelled" : item.verification_passed === false ? "verification failed" : item.verification_passed === true ? "verified success" : item.outcome}
+                              <span className="ml-1">· {new Date(item.recorded_at_unix_ms).toLocaleString()}</span>
+                              {item.summary && <span className="block">{item.summary}</span>}
+                            </span>
+                          </label>
+                        );
+                      })
+                    )}
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={busy !== null || selected.length === 0}
+                        onClick={() =>
+                          void run(`begin-improvement:${improveKey}`, async () => {
+                            const candidate = await skillLearningClient.beginImprovement(summary.scope, summary.command, selected);
+                            setExpanded(candidate.candidate_id);
+                            setImprovementOpen(null);
+                          })
+                        }
+                      >
+                        Begin improvement
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
               {/* All four actions go straight to the native skill backend — a
                   learned skill is an ordinary versioned skill once installed,
                   and this panel must not grow a second copy of that logic. */}
               <div className="mt-1.5 flex flex-wrap justify-end gap-1">
+                <Button
+                  variant={hasOpenCandidate ? "secondary" : "ghost"}
+                  size="sm"
+                  disabled={busy !== null || quality.improvement_evidence_count === 0}
+                  title={quality.improvement_evidence_count === 0 ? "Use this skill in a completed run before improving it." : undefined}
+                  onClick={() => {
+                    if (hasOpenCandidate) {
+                      setExpanded(quality.open_improvement_candidate_id);
+                      return;
+                    }
+                    if (openImprovement) {
+                      setImprovementOpen(null);
+                      return;
+                    }
+                    void run(`improvement-evidence:${improveKey}`, async () => {
+                      const next = await skillLearningClient.improvementEvidence(summary.scope, summary.command);
+                      setImprovementEvidence((current) => ({ ...current, [improveKey]: next }));
+                      setSelectedImprovementEvidence((current) => ({
+                        ...current,
+                        [improveKey]: next.slice(0, Math.min(5, next.length)).map((item) => item.run_id),
+                      }));
+                      setImprovementOpen(improveKey);
+                    });
+                  }}
+                >
+                  <Wand2 size={12} /> {hasOpenCandidate ? "Review improvement" : "Improve skill"}
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -682,7 +985,8 @@ export function SkillLearningPanel() {
                 </Button>
               </div>
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </section>

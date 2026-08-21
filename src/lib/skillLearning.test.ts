@@ -141,6 +141,19 @@ describe("reflectOnCandidate", () => {
     expect(runId).toBe("run-2");
   });
 
+  it("preserves omitted resource files for the backend default", async () => {
+    const stage = vi.fn(async (..._args: unknown[]) => candidate({ status: "staged" }));
+    const reflectionWithoutResources: Record<string, unknown> = { ...validReflection.reflection };
+    delete reflectionWithoutResources.proposed_resource_files;
+    await reflectOnCandidate(
+      candidate(),
+      callWith([toolCall({ ...validReflection, reflection: reflectionWithoutResources })]),
+      { client: clientWith({ stage }) },
+    );
+    const [, proposal] = stage.mock.calls[0] as unknown as [string, Record<string, unknown>];
+    expect(Object.prototype.hasOwnProperty.call(proposal, "proposed_resource_files")).toBe(false);
+  });
+
   it("reads the backend's own evidence brief rather than assembling one", async () => {
     const reflectionBrief = vi.fn(async () => "1. edit_file [succeeded] (mutating)\n   arguments: {\"path\":\"src/lib.rs\"}\n");
     const callModel = callWith([toolCall(validReflection)]);
