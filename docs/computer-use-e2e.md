@@ -11,12 +11,12 @@ python3 src-tauri/fixtures/computer-use-e2e.py \
   --report /tmp/little-monkey-computer-use-e2e.json
 ```
 
-The harness validates the fixture but intentionally reports
-`awaiting_native_trace` until an interactive desktop runner supplies the
-actual UI actions. A runner may set `COMPUTER_USE_E2E_RUN=1` only when it has
-performed those actions through the native backend; it must then fill the
-`postconditions` fields rather than converting a simulated result into
-acceptance evidence.
+The harness validates the fixture and, when `COMPUTER_USE_E2E_RUN=1`, launches
+`computer-use-native-driver.py`. That executable discovers the real
+accessibility window, performs the semantic actions, restarts the fixture,
+captures a screenshot, and proves the negative security cases. A fabricated
+trace dictionary is rejected; acceptance evidence is produced only by the
+driver's required provider/pid/window/action/postcondition envelope.
 
 1. Feature off: Computer Use schemas are absent.
 2. Bypass mode: grant creation is refused.

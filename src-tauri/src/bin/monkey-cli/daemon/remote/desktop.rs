@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use little_monkey_lib::artifact_store::ArtifactStore;
 use little_monkey_lib::desktop_control::{
     ActionGate, ActionOutcome, ApprovalPolicy, ControlAction, ControlSession, DesktopControlState,
@@ -38,7 +39,9 @@ use little_monkey_lib::run_protocol::{
 use crate::daemon::store::DaemonPaths;
 use crate::durable_run::{CliRunEventSink, DurableRunRecorder};
 
-use super::protocol::{DesktopControlActionRequest, MAX_REMOTE_ARTIFACT_BYTES};
+use super::protocol::{
+    DesktopControlActionRequest, DesktopControlTargetRequest, MAX_REMOTE_ARTIFACT_BYTES,
+};
 use super::store::{DesktopSessionKiller, RemoteStore};
 
 /// Capture a screenshot at least this often while a session is active.
@@ -635,6 +638,121 @@ impl DesktopControlRuntime {
             "session_id": request.session_id,
             "executed": executed.executed,
             "outcome": executed,
+        }))
+    }
+
+    /// `POST /v1/remote/desktop-control/list-targets`.
+    pub fn list_targets(
+        &self,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        self.require_owned_session(device_id, session_id)?;
+        let targets = self
+            .state
+            .list_targets_for_session(session_id)
+            .map_err(|error| (409, error))?;
+        Ok(serde_json::json!({
+            "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
+            "session_id": session_id,
+            "targets": targets,
+        }))
+    }
+
+    /// `POST /v1/remote/desktop-control/inspect`.
+    pub fn inspect(
+        &self,
+        device_id: &str,
+        request: DesktopControlTargetRequest,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        self.require_owned_session(device_id, &request.session_id)?;
+        let application_id = request.target_application_id.ok_or((
+            400,
+            "desktop-control inspect requires target_application_id".to_string(),
+        ))?;
+        let inspection = self
+            .state
+            .inspect_for_session(
+                &request.session_id,
+                &application_id,
+                request.target_window_id.as_deref(),
+                request.query.as_deref(),
+            )
+            .map_err(|error| (409, error))?;
+        Ok(serde_json::json!({
+            "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
+            "session_id": request.session_id,
+            "inspection": inspection,
+        }))
+    }
+
+    /// `POST /v1/remote/desktop-control/screenshot`.
+    pub fn screenshot(
+        &self,
+        device_id: &str,
+        request: DesktopControlTargetRequest,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        self.require_owned_session(device_id, &request.session_id)?;
+        let application_id = request.target_application_id.ok_or((
+            400,
+            "desktop-control screenshot requires target_application_id".to_string(),
+        ))?;
+        let (target, bytes, bounds) = self
+            .state
+            .screenshot_for_session(
+                &request.session_id,
+                &application_id,
+                request.target_window_id.as_deref(),
+                request.bounds,
+            )
+            .map_err(|error| (409, error))?;
+        let store = ArtifactStore::with_max_blob_size(
+            app_data(&self.paths).join("content-v1"),
+            MAX_REMOTE_ARTIFACT_BYTES,
+        )
+        .map_err(|error| (500, error.to_string()))?;
+        let blob = store
+            .put(&bytes)
+            .map_err(|error| (500, error.to_string()))?;
+        let audit_id = self
+            .state
+            .record_screenshot_audit_for_remote(
+                &request.session_id,
+                &application_id,
+                request.target_window_id.as_deref(),
+                &blob.id,
+            )
+            .map_err(|error| (500, error))?;
+        Ok(serde_json::json!({
+            "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
+            "session_id": request.session_id,
+            "artifact_id": blob.id,
+            "audit_id": audit_id,
+            "media_type": "image/png",
+            "size_bytes": blob.size,
+            "content_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "bounds": bounds,
+            "target": target,
+        }))
+    }
+
+    /// `POST /v1/remote/desktop-control/pause` and `/resume`.
+    pub fn pause(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        self.require_owned_session(device_id, session_id)?;
+        let changed = self
+            .state
+            .pause_session(session_id, paused)
+            .map_err(|error| (500, error))?;
+        Ok(serde_json::json!({
+            "protocol_version": super::protocol::REMOTE_PROTOCOL_VERSION,
+            "session_id": session_id,
+            "paused": paused,
+            "changed": changed,
         }))
     }
 

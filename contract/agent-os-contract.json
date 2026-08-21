@@ -375,6 +375,36 @@
     {
       "plane": "control",
       "method": "POST",
+      "path": "/v1/remote/desktop-control/list-targets",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/inspect",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/screenshot",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/pause",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
+      "path": "/v1/remote/desktop-control/resume",
+      "gate": "action:ControlDesktop"
+    },
+    {
+      "plane": "control",
+      "method": "POST",
       "path": "/v1/remote/desktop-control/stop",
       "gate": "action:ControlDesktop"
     },

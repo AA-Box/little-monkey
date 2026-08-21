@@ -207,6 +207,36 @@ pub const REMOTE_ROUTES: &[RemoteRouteSpec] = &[
     RemoteRouteSpec {
         plane: RemotePlane::Control,
         method: "POST",
+        path: "/v1/remote/desktop-control/list-targets",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/inspect",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/screenshot",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/pause",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
+        path: "/v1/remote/desktop-control/resume",
+        gate: RemoteGate::Action("ControlDesktop"),
+    },
+    RemoteRouteSpec {
+        plane: RemotePlane::Control,
+        method: "POST",
         path: "/v1/remote/desktop-control/stop",
         gate: RemoteGate::Action("ControlDesktop"),
     },

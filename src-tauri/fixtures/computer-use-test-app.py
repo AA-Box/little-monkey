@@ -24,6 +24,7 @@ class TestApp:
         self.profile = tk.StringVar(value="Test profile")
         self.status = tk.StringVar(value="Not saved")
         self.dynamic_count = 0
+        self.load_profile()
 
         menu = tk.Menu(root)
         file_menu = tk.Menu(menu, tearoff=False)
@@ -76,6 +77,17 @@ class TestApp:
             ttk.Label(self.list_frame, text=f"List item {index}").pack(anchor="w", padx=10, pady=2)
 
         self.root.after(100, self.apply_theme)
+
+    def load_profile(self) -> None:
+        try:
+            with open(PROFILE_PATH, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if isinstance(saved.get("profile"), str):
+                self.profile.set(saved["profile"])
+            if isinstance(saved.get("dark"), bool):
+                self.dark.set(saved["dark"])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
 
     def save(self) -> None:
         with open(PROFILE_PATH, "w", encoding="utf-8") as handle:

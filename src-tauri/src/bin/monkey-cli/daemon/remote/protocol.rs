@@ -1180,6 +1180,25 @@ pub struct DesktopControlStopRequest {
     pub session_id: String,
 }
 
+/// Read-only target selection request shared by list/inspect/screenshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopControlTargetRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub target_application_id: Option<String>,
+    #[serde(default)]
+    pub target_window_id: Option<String>,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub bounds: Option<little_monkey_lib::desktop_control::ComputerBounds>,
+}
+
+/// Pause/resume uses the same ownership body as stop, but remains a separate
+/// route and capability operation at the HTTP layer.
+pub type DesktopControlPauseRequest = DesktopControlStopRequest;
+
 /// Body of `POST /v1/remote/migration/preflight` — metadata only, so a target
 /// refuses before a byte of workspace crosses the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]

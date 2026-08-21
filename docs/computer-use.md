@@ -74,6 +74,11 @@ same grant and revocation rules, and record the remote device/run identity.
 The controller cannot approve an OS permission or escape the runner's local
 allowlist.
 
+The remote Computer Use surface mirrors the local observe/act lifecycle through
+`/v1/remote/desktop-control/list-targets`, `/inspect`, `/screenshot`,
+`/action`, `/pause`, `/resume`, and `/stop`. Read-only observation still
+requires the owned session and the paired `ControlDesktop` grant.
+
 ## Verification and recovery
 
 The normal loop is semantic target listing → bounded inspection → screenshot

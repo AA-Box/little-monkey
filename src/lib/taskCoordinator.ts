@@ -9,6 +9,12 @@ export interface CoordinationDecision {
   error?: string;
 }
 
+export interface CoordinationHooks<T> {
+  onPhase?: (phase: CoordinationPhase, attempt: number) => void | Promise<void>;
+  execute: (attempt: number) => T | Promise<T>;
+  verify?: (result: T, attempt: number) => boolean | Promise<boolean>;
+}
+
 const NATIVE_PREFIX = 'computer_';
 const BROWSER_TOOLS = new Set(['browser_click', 'browser_inspect', 'browser_navigate', 'web_fetch', 'web_search']);
 
@@ -42,4 +48,30 @@ export function coordinateToolInvocation(
     phases: ['observe', 'decide', 'authorize', 'execute', 'verify'],
     maxAttempts: 1,
   };
+}
+
+/** Executes the coordinator-owned lifecycle with a hard attempt budget. The
+ * dispatcher supplies the native observe/authorize hooks; the tool backend
+ * remains responsible for its own final target revalidation and postcondition
+ * check. No caller may silently bypass these phases by invoking the tool
+ * directly through this path.
+ */
+export async function runCoordinatedInvocation<T>(
+  decision: CoordinationDecision,
+  hooks: CoordinationHooks<T>,
+): Promise<T> {
+  if (decision.error) throw new Error(decision.error);
+  const attempts = Math.max(1, Math.min(decision.maxAttempts, 2));
+  let result!: T;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    for (const phase of decision.phases) {
+      if (phase === 'execute') {
+        result = await hooks.execute(attempt);
+      } else {
+        await hooks.onPhase?.(phase, attempt);
+      }
+    }
+    if (!hooks.verify || await hooks.verify(result, attempt) || attempt === attempts) return result;
+  }
+  return result;
 }

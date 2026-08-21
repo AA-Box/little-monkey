@@ -26,14 +26,14 @@ use super::protocol::{
     all_peer_capabilities, canonical_request, capability_block, effective_capabilities,
     legacy_capabilities, peer_capabilities_of, sha256_hex, terminal_digest, ApprovalRequestBody,
     CancelRequestBody, DesktopControlActionRequest, DesktopControlStartRequest,
-    DesktopControlStopRequest, DeviceCapability, DeviceCommand, DeviceCommandControl,
-    DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest, DeviceCommandState,
-    DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest, MigrationReceipt,
-    PairAcceptRequest, PeerArtifactStored, PeerArtifactUpload, PeerHelloRequest, PeerHelloResponse,
-    RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary, SignedRequestHeaders,
-    TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest, VoiceCloseRequest,
-    DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES, MAX_VOICE_CHUNK_BYTES,
-    PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
+    DesktopControlStopRequest, DesktopControlTargetRequest, DeviceCapability, DeviceCommand,
+    DeviceCommandControl, DeviceCommandRecovery, DeviceCommandResult, DeviceCommandStartRequest,
+    DeviceCommandState, DeviceSurface, MigrationAcceptRequest, MigrationPreflightRequest,
+    MigrationReceipt, PairAcceptRequest, PeerArtifactStored, PeerArtifactUpload, PeerHelloRequest,
+    PeerHelloResponse, RemoteAction, RemoteHostConfig, RemoteScopes, RunSummary,
+    SignedRequestHeaders, TalkTicketRequest, TalkTicketResponse, VoiceChunkRequest,
+    VoiceCloseRequest, DEFAULT_TALK_TICKET_TTL_MS, DEVICE_LEASE_MS, MAX_REMOTE_BODY_BYTES,
+    MAX_VOICE_CHUNK_BYTES, PHYSICAL_DEVICE_CAPABILITIES, REMOTE_PROTOCOL_VERSION,
 };
 use super::store::{
     CommandReservation, DeviceArtifact, DeviceRecord, KeyringRemoteSecrets, MobileCaptureRecord,
@@ -753,6 +753,26 @@ impl RemoteApi {
                 require_action(scopes, RemoteAction::ControlDesktop)
                     .and_then(|_| self.desktop_control_action(&request.body, device_id))
             }
+            ("POST", ["v1", "remote", "desktop-control", "list-targets"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_list_targets(&request.body, device_id))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "inspect"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_inspect(&request.body, device_id))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "screenshot"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_screenshot(&request.body, device_id))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "pause"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_pause(&request.body, device_id, true))
+            }
+            ("POST", ["v1", "remote", "desktop-control", "resume"]) => {
+                require_action(scopes, RemoteAction::ControlDesktop)
+                    .and_then(|_| self.desktop_control_pause(&request.body, device_id, false))
+            }
             ("POST", ["v1", "remote", "desktop-control", "stop"]) => {
                 require_action(scopes, RemoteAction::ControlDesktop)
                     .and_then(|_| self.desktop_control_stop(&request.body, device_id))
@@ -1363,6 +1383,78 @@ impl RemoteApi {
             })?;
         let target = request.session_id.clone();
         let value = runtime.action(device_id, &self.device_label(device_id), request)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_list_targets(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlTargetRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control list-targets request: {error}"),
+                )
+            })?;
+        let target = request.session_id.clone();
+        let value = runtime.list_targets(device_id, &request.session_id)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_inspect(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlTargetRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control inspect request: {error}"),
+                )
+            })?;
+        let target = request.session_id.clone();
+        let value = runtime.inspect(device_id, request)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_screenshot(
+        &self,
+        body: &[u8],
+        device_id: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlTargetRequest =
+            serde_json::from_slice(body).map_err(|error| {
+                (
+                    400,
+                    format!("Invalid desktop-control screenshot request: {error}"),
+                )
+            })?;
+        let target = request.session_id.clone();
+        let value = runtime.screenshot(device_id, request)?;
+        Ok((200, value, Some(target)))
+    }
+
+    fn desktop_control_pause(
+        &self,
+        body: &[u8],
+        device_id: &str,
+        paused: bool,
+    ) -> Result<(u16, serde_json::Value, Option<String>), (u16, String)> {
+        let runtime = self.require_desktop()?;
+        let request: DesktopControlStopRequest = serde_json::from_slice(body).map_err(|error| {
+            (
+                400,
+                format!("Invalid desktop-control pause/resume request: {error}"),
+            )
+        })?;
+        let target = request.session_id.clone();
+        let value = runtime.pause(device_id, &request.session_id, paused)?;
         Ok((200, value, Some(target)))
     }
 

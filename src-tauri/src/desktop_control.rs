@@ -55,6 +55,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -118,6 +119,10 @@ pub struct ComputerTarget {
     pub application_id: String,
     pub application_name: String,
     pub window_id: String,
+    /// Provider-specific identity retained across X11 window-id
+    /// normalization. It is intentionally not exposed to model callers.
+    #[serde(skip)]
+    pub(crate) provider_window_id: Option<String>,
     pub window_title: String,
     pub bounds: ComputerBounds,
     pub focused: bool,
@@ -390,6 +395,7 @@ impl DesktopSemanticBackend for NullSemanticBackend {
             application_id: application_id.to_string(),
             application_name: application_id.to_string(),
             window_id: window_id.unwrap_or("window").to_string(),
+            provider_window_id: None,
             window_title: application_id.to_string(),
             bounds: ComputerBounds::default(),
             focused: true,
@@ -892,6 +898,7 @@ fn normalize_linux_window_ids(snapshot: &mut NativeSnapshot) {
         })
         .collect();
     for target in &mut snapshot.targets {
+        target.provider_window_id = Some(target.window_id.clone());
         if let Some((window_id, _)) = windows.iter().find(|(_, title)| {
             !target.window_title.is_empty()
                 && (title == &target.window_title || title.contains(&target.window_title))
@@ -1341,7 +1348,7 @@ for (const p of safe(() => se.processes(), [])) {
     if (wi >= 32) break;
     const title = String(safe(() => w.name(), '')); const id = app + '::window-' + wi; const target = {targetId:id,applicationId:app,applicationName:name,windowId:id,windowTitle:title,bounds:rect(w),focused:front && wi===0,sensitive:false,supportedActions:['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']}; targets.push(target);
     const out=[]; let ei=0;
-    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/password|secure|auth|credential/i.test(role+' '+label)}); }
+    for (const e of safe(() => w.entireContents(), [])) { if (ei++ >= 256) break; const role=String(safe(() => e.role(),'')); const subrole=String(safe(() => e.attribute('AXSubrole'),'')); const label=String(safe(() => e.description(), safe(() => e.name(),''))); const value=safe(() => e.value(), null); const native=String(safe(() => e.attribute('AXIdentifier'), '')); const stable=native.replace(/[^A-Za-z0-9._-]/g,'_'); const eb=rect(e); out.push({id:id+'::element-'+(ei-1)+'::native-'+stable,role,label,value:value===null?null:String(value),bounds:eb,enabled:Boolean(safe(() => e.enabled(),true)),focused:Boolean(safe(() => e.focused(),false)),actions:['click','double_click','set_value','select'],sensitive:/AXSecureTextField|securetextfield|password|secure|auth|credential/i.test(role+' '+subrole+' '+label)}); }
     elements[id]=out; wi++;
   }
 }
@@ -1357,7 +1364,7 @@ $targets=@();$elements=@{}
 $windows=$root.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition)
 function ValueOf($e) { try { return $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value } catch { try { return [string]$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState } catch { return $null } } }
 function ActionsOf($e) { $a=@(); try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern) | Out-Null; $a+='click'; $a+='double_click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern) | Out-Null; $a+='click' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern) | Out-Null; $a+='set_value' } catch {}; try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern) | Out-Null; $a+='select' } catch {}; return @($a | Select-Object -Unique) }
-for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=($w.Current.Name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$automation=$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=(ValueOf $e);bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=(ActionsOf $e);sensitive=($role -match 'Edit' -and $label -match 'password|credential|secret')};}$elements[$targetId]=$list}
+for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){ $w=$windows.Item($i);$p=$w.Current.ProcessId;$id="process:$p";$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";$r=$w.Current.BoundingRectangle;$t=[ordered]@{targetId=$targetId;applicationId=$id;applicationName=$w.Current.Name;windowId=$windowId;windowTitle=$w.Current.Name;bounds=@{x=$r.X;y=$r.Y;width=$r.Width;height=$r.Height};focused=$w.Current.HasKeyboardFocus;sensitive=($w.Current.Name -match 'UAC|Windows Security|credential|password');supportedActions=@('inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot')};$targets+=$t;$list=@();$desc=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition);for($j=0;$j -lt $desc.Count -and $j -lt 256;$j++){ $e=$desc.Item($j);$label=$e.Current.Name;$role=$e.Current.ControlType.ProgrammaticName;$er=$e.Current.BoundingRectangle;$automation=$e.Current.AutomationId;if([string]::IsNullOrWhiteSpace($automation)){try{$automation=($e.GetRuntimeId() -join '-')}catch{$automation=''}};$stable=($automation -replace '[^A-Za-z0-9._-]','_');$list+=[ordered]@{id="$targetId::element-$j::native-$stable";role=$role;label=$label;value=(ValueOf $e);bounds=@{x=$er.X;y=$er.Y;width=$er.Width;height=$er.Height};enabled=$e.Current.IsEnabled;focused=$e.Current.HasKeyboardFocus;actions=(ActionsOf $e);sensitive=([bool]$e.Current.IsPassword -or ($role -match 'Edit' -and $label -match 'password|credential|secret'))};}$elements[$targetId]=$list}
 [ordered]@{targets=$targets;elements=$elements}|ConvertTo-Json -Compress -Depth 8
 "#;
 
@@ -1406,7 +1413,7 @@ for app in list(desktop)[:64]:
    try: e.queryEditableText(); actions.append('set_value')
    except Exception: pass
    stable=(role+'-'+label).replace(' ','_')
-   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable[:80],'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':('password' in (role+' '+label).lower())})
+   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable[:80],'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
   elements[tid]=out
 print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
 "#;
@@ -1565,7 +1572,11 @@ fn native_semantic_action(
         if is_wayland_session_from_env() {
             return Err(WAYLAND_PORTAL_MESSAGE.to_string());
         }
-        let window_index = window_index(&target.window_id)?;
+        let provider_window_id = target
+            .provider_window_id
+            .as_deref()
+            .unwrap_or(&target.window_id);
+        let window_index = window_index(provider_window_id)?;
         let bytes = run_native_command_with_env(
             "python3",
             &["-c", LINUX_ATSPI_ACTION_SCRIPT],
@@ -1662,7 +1673,10 @@ struct PendingControlAction {
     target_window_id: Option<String>,
     action: ControlAction,
     context: AuditContext,
-    sender: oneshot::Sender<bool>,
+    approval_level: ApprovalLevel,
+    approval_digest: String,
+    description: String,
+    sender: Option<oneshot::Sender<bool>>,
 }
 
 /// Serializable snapshot of a pending action, emitted to the frontend so it
@@ -1688,6 +1702,18 @@ pub struct VerificationEvidence {
     pub observed_value: Option<String>,
     pub matched: bool,
     pub detail: String,
+}
+
+impl VerificationEvidence {
+    fn redacted_for_audit(&self) -> Self {
+        let mut redacted = self.clone();
+        if self.kind == "element_value" {
+            redacted.expected_value = None;
+            redacted.observed_value = None;
+            redacted.detail = format!("{}; values redacted from durable audit", self.detail);
+        }
+        redacted
+    }
 }
 
 /// Result of a resolved (executed or denied) action, returned to the caller
@@ -1799,7 +1825,11 @@ fn action_summary(action: &ControlAction) -> String {
             expected_value,
         } => format!(
             "semantic_click element={element_id} button={button:?} expected_value={}",
-            expected_value.as_deref().unwrap_or("unspecified")
+            if expected_value.is_some() {
+                "(redacted)"
+            } else {
+                "unspecified"
+            }
         ),
         ControlAction::SemanticDoubleClick {
             element_id,
@@ -1807,10 +1837,39 @@ fn action_summary(action: &ControlAction) -> String {
             expected_value,
         } => format!(
             "semantic_double_click element={element_id} button={button:?} expected_value={}",
-            expected_value.as_deref().unwrap_or("unspecified")
+            if expected_value.is_some() {
+                "(redacted)"
+            } else {
+                "unspecified"
+            }
         ),
         _ => serde_json::to_string(action).unwrap_or_else(|_| "unserializable_action".to_string()),
     }
+}
+
+fn approval_digest(
+    session_id: &str,
+    target_application_id: &str,
+    target_window_id: Option<&str>,
+    action: &ControlAction,
+    approval: ApprovalLevel,
+    description: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"little-monkey-computer-approval-v1\0");
+    let action_json = serde_json::to_string(action).unwrap_or_default();
+    for value in [
+        session_id,
+        target_application_id,
+        target_window_id.unwrap_or(""),
+        &format!("{approval:?}"),
+        description,
+        &action_json,
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn approval_level(action: &ControlAction) -> ApprovalLevel {
@@ -2633,7 +2692,7 @@ impl DesktopControlState {
             .iter_mut()
             .find(|record| record.audit_id == audit_id)
         {
-            record.verification_evidence = evidence;
+            record.verification_evidence = evidence.map(|value| value.redacted_for_audit());
         }
         Ok(())
     }
@@ -2948,6 +3007,25 @@ impl DesktopControlState {
         Ok(audit_id)
     }
 
+    /// Records a screenshot requested through the paired daemon. The remote
+    /// path has no frontend turn/tool identity, but it must still create the
+    /// same durable audit row as the local screenshot command.
+    pub fn record_screenshot_audit_for_remote(
+        &self,
+        session_id: &str,
+        target_application_id: &str,
+        target_window_id: Option<&str>,
+        artifact_id: &str,
+    ) -> Result<String, String> {
+        self.record_screenshot_audit(
+            session_id,
+            target_application_id,
+            target_window_id,
+            artifact_id,
+            &AuditContext::default(),
+        )
+    }
+
     /// Validates the session/allowlist, then either executes immediately
     /// (approved-batch session) or registers a pending approval and returns
     /// the receiver half of its oneshot channel for the caller to await.
@@ -2993,7 +3071,8 @@ impl DesktopControlState {
             target_window_id,
             Self::action_requires_frontmost(&action),
         )?;
-        let (approval, _) = self.action_approval(target_application_id, target_window_id, &action);
+        let (approval, description) =
+            self.action_approval(target_application_id, target_window_id, &action);
         if session.approved_batch && approval != ApprovalLevel::Critical {
             return Ok(ActionGate::Executed(self.execute_for_target_with_context(
                 session_id,
@@ -3003,6 +3082,14 @@ impl DesktopControlState {
                 &context,
             )));
         }
+        let approval_digest = approval_digest(
+            session_id,
+            target_application_id,
+            target_window_id,
+            &action,
+            approval,
+            &description,
+        );
         let (sender, receiver) = oneshot::channel::<bool>();
         let action_id = format!("control-action-{}", Uuid::new_v4());
         lock(&self.pending, "pending control actions")?.insert(
@@ -3013,7 +3100,10 @@ impl DesktopControlState {
                 target_window_id: target_window_id.map(str::to_string),
                 action: action.clone(),
                 context,
-                sender,
+                approval_level: approval,
+                approval_digest,
+                description,
+                sender: Some(sender),
             },
         );
         Ok(ActionGate::Pending {
@@ -3028,14 +3118,71 @@ impl DesktopControlState {
     /// `respond_if_pending` split between this pure lookup and the
     /// `#[tauri::command]` wrapper that turns "not found" into an `Err`.
     pub fn resolve_if_pending(&self, action_id: &str, approve: bool) -> Result<bool, String> {
-        let Some(pending) = lock(&self.pending, "pending control actions")?.remove(action_id)
-        else {
+        let mut pending = lock(&self.pending, "pending control actions")?;
+        if !pending.contains_key(action_id) {
             return Ok(false);
-        };
+        }
         // If the receiving end was already dropped (e.g. the request timed
         // out just before this call), there's nothing left to notify.
-        let _ = pending.sender.send(approve);
+        let sender = pending
+            .get_mut(action_id)
+            .and_then(|pending| pending.sender.take());
+        let Some(sender) = sender else {
+            return Ok(false);
+        };
+        let _ = sender.send(approve);
+        if !approve {
+            pending.remove(action_id);
+        }
         Ok(true)
+    }
+
+    fn take_approved_pending(
+        &self,
+        action_id: &str,
+        action: &ControlAction,
+    ) -> Result<ExecutionResult, String> {
+        let pending = lock(&self.pending, "pending control actions")?
+            .remove(action_id)
+            .ok_or_else(|| "Approved control action was no longer pending".to_string())?;
+        if &pending.action != action {
+            return Err("Pending action payload changed before approval".to_string());
+        }
+        let (approval, description) = self.action_approval(
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+        );
+        let digest = approval_digest(
+            &pending.session_id,
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+            approval,
+            &description,
+        );
+        if approval != pending.approval_level || digest != pending.approval_digest {
+            let _ = self.record_named_audit_with_context(
+                &pending.session_id,
+                &pending.target_application_id,
+                pending.target_window_id.as_deref(),
+                format!("{} (approval invalidated)", pending.description),
+                "refused",
+                "approval_invalidated",
+                false,
+                false,
+                Some("Target semantics or risk changed while approval was pending".to_string()),
+                &pending.context,
+            );
+            return Err("Control action approval was invalidated by a target or risk change; approve the refreshed action".to_string());
+        }
+        self.execute_for_target_with_context(
+            &pending.session_id,
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+            &pending.context,
+        )
     }
 
     /// Complete a pending per-action approval that a non-batch session
@@ -3071,7 +3218,9 @@ impl DesktopControlState {
         else {
             return Ok(None);
         };
-        let _ = pending.sender.send(approve);
+        if let Some(sender) = pending.sender {
+            let _ = sender.send(approve);
+        }
         if !approve {
             let _ = self.record_named_audit_with_context(
                 &pending.session_id,
@@ -3089,6 +3238,22 @@ impl DesktopControlState {
         }
         if &pending.action != action {
             return Err("Pending action payload changed before approval".to_string());
+        }
+        let (approval, description) = self.action_approval(
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+        );
+        let digest = approval_digest(
+            &pending.session_id,
+            &pending.target_application_id,
+            pending.target_window_id.as_deref(),
+            &pending.action,
+            approval,
+            &description,
+        );
+        if approval != pending.approval_level || digest != pending.approval_digest {
+            return Err("Control action approval was invalidated by a target or risk change; approve the refreshed action".to_string());
         }
         let result = self.execute_for_target_with_context(
             &pending.session_id,
@@ -3109,7 +3274,9 @@ impl DesktopControlState {
             .collect();
         for id in matching {
             if let Some(action) = pending.remove(&id) {
-                let _ = action.sender.send(false);
+                if let Some(sender) = action.sender {
+                    let _ = sender.send(false);
+                }
             }
         }
         Ok(())
@@ -3143,7 +3310,9 @@ impl DesktopControlState {
             let mut pending = lock(&self.pending, "pending control actions")?;
             let count = pending.len();
             for (_, action) in pending.drain() {
-                let _ = action.sender.send(false);
+                if let Some(sender) = action.sender {
+                    let _ = sender.send(false);
+                }
             }
             count
         };
@@ -3368,13 +3537,7 @@ async fn request_action_impl(
             );
             match tokio::time::timeout(ACTION_APPROVAL_TIMEOUT, receiver).await {
                 Ok(Ok(true)) => {
-                    let result = state.execute_for_target_with_context(
-                        session_id,
-                        target_application_id,
-                        target_window_id,
-                        &action,
-                        &context,
-                    )?;
+                    let result = state.take_approved_pending(&action_id, &action)?;
                     Ok(ActionOutcome {
                         action_id,
                         executed: true,
@@ -3932,6 +4095,48 @@ mod tests {
         let audit = state.audit_snapshot().unwrap();
         assert!(audit[0].action.contains("redacted"));
         assert!(!audit[0].action.contains("secret-value"));
+    }
+
+    #[test]
+    fn durable_value_verification_evidence_is_redacted_but_outcome_can_retain_it() {
+        let evidence = VerificationEvidence {
+            kind: "element_value".to_string(),
+            element_id: Some("element-1".to_string()),
+            expected_value: Some("secret-value".to_string()),
+            observed_value: Some("secret-value".to_string()),
+            matched: true,
+            detail: "compared".to_string(),
+        };
+        let audit = evidence.redacted_for_audit();
+        assert!(audit.expected_value.is_none());
+        assert!(audit.observed_value.is_none());
+        assert!(audit.detail.contains("redacted"));
+        assert_eq!(evidence.expected_value.as_deref(), Some("secret-value"));
+    }
+
+    #[test]
+    fn approval_digest_changes_when_target_semantics_or_risk_changes() {
+        let action = ControlAction::SetValue {
+            element_id: "element-1".to_string(),
+            value: "hello".to_string(),
+        };
+        let first = approval_digest(
+            "session",
+            "Notes",
+            Some("window"),
+            &action,
+            ApprovalLevel::High,
+            "Edit",
+        );
+        let changed_label = approval_digest(
+            "session",
+            "Notes",
+            Some("window"),
+            &action,
+            ApprovalLevel::Critical,
+            "Delete",
+        );
+        assert_ne!(first, changed_label);
     }
 
     #[test]

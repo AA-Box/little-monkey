@@ -51,7 +51,7 @@ import { protocolToolCallId } from './durableRun';
 import { formatSkillSearchResults, formatSkillToolResult, type SkillRankingSignals, type SlashSkill } from './skills';
 import { rasterizeSvgToPng, type RasterizedPng } from './imageGeneration';
 import { errorMessage } from "./errors";
-import { coordinateToolInvocation } from './taskCoordinator';
+import { coordinateToolInvocation, runCoordinatedInvocation } from './taskCoordinator';
 import {
   formatProgrammaticExecutionResult,
   PROGRAMMATIC_TOOL_NAME,
@@ -1263,23 +1263,59 @@ async function executeToolCallInner(
   const durableExtensionInvocationId = extensionBinding
     ? await extensionInvocationId(turnId, toolCall.id, extensionBinding)
     : undefined;
-  const invocation = name.startsWith('mcp__')
-    ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
-    : name.startsWith('ext__')
-      ? invokeExecutableExtensionTool(
-          name,
-          args,
-          durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
-          extensionRegistry ?? new Map(),
-        )
-          .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
-      : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
-  return raceInvocationWithStop(
-    invocation,
-    turnId,
-    signal,
-    name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
-  );
+  return runCoordinatedInvocation(coordination, {
+    onPhase: async (phase) => {
+      if (coordination.route !== 'native') return;
+      if (phase === 'authorize' && typeof args.session_id !== 'string') {
+        throw new Error('Native Computer Use requires an active session grant.');
+      }
+      if (phase === 'observe' && name !== 'computer_list_targets') {
+        const observation = await invoke('tool_computer_list_targets', {
+          session_id: args.session_id,
+          turn_id: turnId,
+          tool_call_id: protocolToolCallId(toolCall.id),
+        });
+        const observationText = stringifyToolResult(observation);
+        try {
+          const parsed = JSON.parse(observationText) as { error?: unknown };
+          if (parsed && typeof parsed === 'object' && parsed.error) {
+            throw new Error(String(parsed.error));
+          }
+        } catch (error) {
+          if (error instanceof SyntaxError) throw error;
+          throw error;
+        }
+      }
+    },
+    execute: () => {
+      const invocation = name.startsWith('mcp__')
+        ? invokeMcpTool(name, args, turnId, protocolToolCallId(toolCall.id), mcpRegistry)
+        : name.startsWith('ext__')
+          ? invokeExecutableExtensionTool(
+              name,
+              args,
+              durableExtensionInvocationId ?? protocolToolCallId(`${turnId}:${toolCall.id}:${name}`),
+              extensionRegistry ?? new Map(),
+            )
+              .then((result) => result.tool_result ?? result.output_json, stringifyToolError)
+          : invoke(`tool_${name}`, args).then(stringifyToolResult, stringifyToolError);
+      return raceInvocationWithStop(
+        invocation,
+        turnId,
+        signal,
+        name.startsWith('ext__') ? durableExtensionInvocationId : undefined,
+      );
+    },
+    verify: (result) => {
+      if (coordination.route !== 'native' || typeof result !== 'string') return true;
+      try {
+        const parsed = JSON.parse(result) as { executed?: boolean; stateVerified?: boolean };
+        return parsed.executed !== true || parsed.stateVerified !== false;
+      } catch {
+        return true;
+      }
+    },
+  }).catch(stringifyToolError);
 }
 
 /** Races an in-flight tool `invoke` against the Stop button: on abort, the
