@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use little_monkey_lib::knowledge_core::KnowledgeStack;
@@ -68,6 +69,258 @@ pub fn parse_param_flags(raw: &[String]) -> Result<HashMap<String, String>, Stri
         map.insert(k.to_string(), v.to_string());
     }
     Ok(map)
+}
+
+fn autonomous_ledger() -> Result<RunLedger, String> {
+    let data = crate::app_data_dir()
+        .ok_or_else(|| "Could not resolve the app data directory".to_string())?;
+    std::fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+    RunLedger::open(data.join(RUN_DATABASE_FILE)).map_err(|error| error.to_string())
+}
+
+fn autonomous_emitter() -> ClientIdentity {
+    ClientIdentity {
+        client_id: "monkey-cli-autonomous-task".to_string(),
+        instance_id: format!("pid-{}", std::process::id()),
+        kind: ClientKind::Cli,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+fn autonomous_target(value: &str) -> Result<ModelTargetSnapshot, String> {
+    let (kind, remainder) = value.split_once(':').ok_or_else(|| {
+        "--target must be ollama:model, provider:model, managed:model, or local-url:url|model"
+            .to_string()
+    })?;
+    let target = match kind {
+        "ollama" => recipes::RecipeTarget {
+            ollama: Some(remainder.to_string()),
+            ..Default::default()
+        },
+        "provider" => {
+            let (provider, model) = remainder
+                .split_once('/')
+                .ok_or_else(|| "provider target must be provider:id/model".to_string())?;
+            recipes::RecipeTarget {
+                provider: Some(provider.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            }
+        }
+        "managed" => recipes::RecipeTarget {
+            managed_model: Some(remainder.to_string()),
+            ..Default::default()
+        },
+        "local-url" => {
+            let (url, model) = remainder.split_once('|').ok_or_else(|| {
+                "local-url target must be local-url:http://host|model".to_string()
+            })?;
+            recipes::RecipeTarget {
+                local_url: Some(url.to_string()),
+                model: Some(model.to_string()),
+                ..Default::default()
+            }
+        }
+        _ => return Err(format!("unsupported autonomous task target kind '{kind}'")),
+    };
+    snapshot_target(&target)
+}
+
+fn autonomous_workspace(path: Option<&Path>) -> Result<WorkspaceContext, String> {
+    let path = path.unwrap_or_else(|| Path::new("."));
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve workspace '{}': {error}", path.display()))?;
+    let canonical_path = canonical.to_string_lossy().to_string();
+    let digest = sha256_hex(canonical_path.as_bytes());
+    Ok(WorkspaceContext {
+        workspace_id: format!("workspace-{}", &digest[..24]),
+        primary_root_id: "root-primary".to_string(),
+        roots: vec![RootGrant {
+            root_id: "root-primary".to_string(),
+            canonical_path,
+            access: RootAccess::ReadWrite,
+            allow_symlinks_within_root: true,
+        }],
+        repository_policy: None,
+    })
+}
+
+pub fn autonomous_start(
+    objective: &str,
+    target: &str,
+    workspace: Option<&Path>,
+    json_output: bool,
+) -> Result<(), String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err("Autonomous task objective must not be empty".to_string());
+    }
+    let target = autonomous_target(target)?;
+    let workspace = autonomous_workspace(workspace)?;
+    let run_id = format!("task-{}", uuid::Uuid::new_v4());
+    let emitter = autonomous_emitter();
+    let mut policy = permission_policy(PermissionMode::Auto, DEFAULT_APPROVAL_TIMEOUT_MS);
+    policy.allow_network = false;
+    policy.allow_external_mutations = false;
+    let spec = RunSpec {
+        schema_version: RUN_PROTOCOL_SCHEMA_VERSION,
+        run_id: run_id.clone(),
+        idempotency_key: format!("cli-autonomous/{run_id}"),
+        created_at_ms: unix_time_ms()?,
+        kind: RunKind::AutonomousTask,
+        submitted_by: emitter.clone(),
+        task: objective.to_string(),
+        instructions: Some("Universal Autonomous Task Coordinator; plan, delegate, verify, review, and deliver with durable evidence.".to_string()),
+        input_artifact_ids: Vec::new(),
+        target,
+        workspace: Some(workspace),
+        permission_policy: policy,
+        budgets: RunBudgets { wall_time_ms: DEFAULT_WALL_TIME_MS, max_iterations: 128, max_model_calls: 256, max_tool_calls: 512, max_input_tokens: 1_000_000, max_output_tokens: 250_000, max_cost_micros: None, max_artifact_bytes: 256 * 1024 * 1024, max_event_count: 20_000 },
+    };
+    let ledger = autonomous_ledger()?;
+    let (_recorder, disposition) =
+        DurableRunRecorder::submit(ledger, &spec, format!("task:{run_id}"))?;
+    match disposition {
+        SubmissionDisposition::Ready { .. } => {
+            let result = serde_json::json!({ "run_id": run_id, "task_id": run_id, "status": "queued", "kind": "autonomous_task" });
+            if json_output {
+                println!("{result}");
+            } else {
+                println!(
+                    "Queued autonomous task {}",
+                    result["run_id"].as_str().unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
+        SubmissionDisposition::AlreadyTerminal(status) => {
+            Err(format!("run already terminal: {status:?}"))
+        }
+        SubmissionDisposition::InterruptedReplayRefused => {
+            Err("existing task run requires reconciliation".to_string())
+        }
+    }
+}
+
+fn autonomous_run_json(run: &little_monkey_lib::run_ledger::StoredRun) -> serde_json::Value {
+    serde_json::json!({ "run_id": run.spec.run_id, "task": run.spec.task, "kind": run.spec.kind, "status": run.status, "last_sequence": run.last_sequence, "updated_at_ms": run.updated_at_ms })
+}
+
+pub fn autonomous_status(run_id: Option<&str>, json_output: bool) -> Result<(), String> {
+    let ledger = autonomous_ledger()?;
+    let runs = if let Some(run_id) = run_id {
+        vec![ledger
+            .load_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("unknown run '{run_id}'"))?]
+    } else {
+        ledger
+            .list_runs(200, false)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|run| run.spec.kind == RunKind::AutonomousTask)
+            .collect()
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&runs.iter().map(autonomous_run_json).collect::<Vec<_>>())
+                .map_err(|error| error.to_string())?
+        );
+    } else {
+        for run in runs {
+            println!("{}\t{:?}\t{}", run.spec.run_id, run.status, run.spec.task);
+        }
+    }
+    Ok(())
+}
+
+pub fn autonomous_attach(run_id: &str, follow: bool, json_output: bool) -> Result<(), String> {
+    let mut after = 0;
+    loop {
+        let ledger = autonomous_ledger()?;
+        let run = ledger
+            .load_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("unknown run '{run_id}'"))?;
+        if run.spec.kind != RunKind::AutonomousTask {
+            return Err("run is not an autonomous task".to_string());
+        }
+        let events = ledger
+            .load_events(run_id, after, 1_000)
+            .map_err(|error| error.to_string())?;
+        for event in &events {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(event).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "{}\t{:?}\t{}",
+                    event.sequence, event.event, event.occurred_at_ms
+                );
+            }
+        }
+        after = events.last().map(|event| event.sequence).unwrap_or(after);
+        if !follow || run.status.is_terminal() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn autonomous_emit(run_id: &str, event: RunEvent) -> Result<(), String> {
+    let ledger = autonomous_ledger()?;
+    let recorder = DurableRunRecorder::attach(
+        ledger,
+        run_id,
+        format!("task-control:{run_id}"),
+        autonomous_emitter(),
+    )?;
+    recorder.emit(event)
+}
+
+pub fn autonomous_guide(run_id: &str, guidance: &str) -> Result<(), String> {
+    let guidance = guidance.trim();
+    if guidance.is_empty() {
+        return Err("guidance must not be empty".to_string());
+    }
+    autonomous_emit(
+        run_id,
+        RunEvent::TaskEvent {
+            task_id: run_id.to_string(),
+            event_type: "guidance_received".to_string(),
+            payload: serde_json::json!({ "guidance": guidance, "applies_to": "future_nodes", "source": "cli" }),
+        },
+    )
+}
+
+pub fn autonomous_pause(run_id: &str) -> Result<(), String> {
+    autonomous_emit(
+        run_id,
+        RunEvent::Paused {
+            reason: Some("Paused by CLI user.".to_string()),
+        },
+    )
+}
+pub fn autonomous_resume(run_id: &str) -> Result<(), String> {
+    autonomous_emit(
+        run_id,
+        RunEvent::Started {
+            engine_id: "autonomous-task-cli-resume".to_string(),
+        },
+    )
+}
+pub fn autonomous_cancel(run_id: &str) -> Result<(), String> {
+    autonomous_emit(
+        run_id,
+        RunEvent::CancellationRequested {
+            requested_by: autonomous_emitter(),
+            reason: Some("Cancelled by CLI user.".to_string()),
+        },
+    )
 }
 
 /// Bridges a recipe's own `RecipeTarget` (a shared-lib, parsed-from-YAML

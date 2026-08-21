@@ -2211,6 +2211,7 @@ fn event_type(event: &RunEvent) -> &'static str {
         RunEvent::NeedsReconciliation { .. } => "needs_reconciliation",
         RunEvent::MigrationDeparted { .. } => "migration_departed",
         RunEvent::MigrationArrived { .. } => "migration_arrived",
+        RunEvent::TaskEvent { .. } => "task_event",
     }
 }
 

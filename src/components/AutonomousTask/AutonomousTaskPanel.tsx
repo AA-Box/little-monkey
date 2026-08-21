@@ -1,0 +1,65 @@
+import { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, Loader2, Pause, Play, Square, X, XCircle } from "lucide-react";
+
+import { useAutonomousTaskStore } from "../../store/autonomousTaskStore";
+import { Button, IconButton, StatusPill, type PillTone } from "../ui";
+
+interface AutonomousTaskPanelProps {
+  sessionId: string;
+  onClose: () => void;
+}
+
+function tone(outcome: string): PillTone {
+  if (outcome === "SUCCEEDED") return "success";
+  if (["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "CANCELLED"].includes(outcome)) return "danger";
+  return "warning";
+}
+
+function label(value: string): string {
+  return value.replace(/_/g, " ").toLowerCase().replace(/^./, (character) => character.toUpperCase());
+}
+
+export function AutonomousTaskPanel({ sessionId, onClose }: AutonomousTaskPanelProps) {
+  const store = useAutonomousTaskStore();
+  const [objective, setObjective] = useState("");
+
+  useEffect(() => { void store.init(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const selected = useMemo(() => store.tasks.find((task) => task.taskId === store.selectedTaskId) ?? null, [store.tasks, store.selectedTaskId]);
+  const paused = selected ? Boolean(store.pausedTaskIds[selected.taskId]) : false;
+  const running = selected?.outcome === "RUNNING" && !paused;
+  const controllable = selected?.outcome === "RUNNING" || paused;
+
+  return (
+    <section className="flex h-full min-h-0 flex-col" aria-labelledby="autonomous-task-title">
+      <header className="flex shrink-0 items-start justify-between gap-3 border-b border-border px-5 py-4">
+        <div><h2 id="autonomous-task-title" className="text-sm font-semibold text-foreground">Autonomous task</h2><p className="mt-1 max-w-2xl text-xs leading-5 text-muted">One objective, bounded workers, durable evidence, and optional Git delivery.</p></div>
+        <IconButton size="sm" aria-label="Close autonomous tasks" title="Close" onClick={onClose}><X size={15} /></IconButton>
+      </header>
+      <form className="flex shrink-0 gap-2 border-b border-border px-5 py-3" onSubmit={(event) => { event.preventDefault(); if (objective.trim()) void store.start(objective.trim(), sessionId).then(() => setObjective("")); }}>
+        <input className="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-2 text-sm text-foreground outline-none focus:border-accent" placeholder="What should Little Monkey complete?" value={objective} onChange={(event) => setObjective(event.target.value)} />
+        <Button type="submit" variant="primary" disabled={!objective.trim() || store.busy.start}><Play size={14} /> Start</Button>
+      </form>
+      {store.error && <p role="alert" className="mx-5 mt-3 rounded-md border border-danger/40 bg-danger/10 p-3 text-xs text-danger">{store.error}</p>}
+      <div className="grid min-h-0 flex-1 gap-4 overflow-hidden p-5 xl:grid-cols-[minmax(15rem,.8fr)_minmax(0,1.5fr)]">
+        <div className="min-h-0 overflow-y-auto rounded-lg border border-border bg-surface p-3">
+          <div className="flex items-center justify-between"><h3 className="text-xs font-semibold text-foreground">Tasks</h3><Button variant="ghost" onClick={() => void store.refresh()}>Refresh</Button></div>
+          <div className="mt-2 space-y-1.5">
+            {store.tasks.length === 0 && <p className="rounded-md border border-dashed border-border p-5 text-center text-xs text-faint">No autonomous tasks yet.</p>}
+            {store.tasks.map((task) => <button key={task.taskId} type="button" onClick={() => store.select(task.taskId)} className={`w-full rounded-md border p-2.5 text-left ${task.taskId === store.selectedTaskId ? "border-accent bg-accent/10" : "border-border bg-background"}`}><p className="truncate text-xs font-medium text-foreground">{task.objective}</p><div className="mt-1.5"><StatusPill tone={tone(task.outcome)}>{label(task.outcome)}</StatusPill></div></button>)}
+          </div>
+        </div>
+        <div className="min-h-0 overflow-y-auto rounded-lg border border-border bg-surface p-4">
+          {!selected ? <p className="p-8 text-center text-xs text-faint">Select a task to inspect its plan and evidence.</p> : <div className="space-y-4">
+            <div className="flex items-start justify-between gap-3"><div><h3 className="text-sm font-semibold text-foreground">{selected.objective}</h3><p className="mt-1 text-[11px] text-faint">{selected.taskId} · {selected.plan?.strategy ?? "planning"}</p></div><StatusPill tone={tone(selected.outcome)}>{label(selected.outcome)}</StatusPill></div>
+            {controllable && <div className="flex flex-wrap gap-2">{running ? <><Button variant="ghost" onClick={() => void store.pause(selected.taskId)}><Pause size={13} /> Pause</Button><Button variant="ghost" onClick={() => void store.cancel(selected.taskId)}><Square size={13} /> Cancel</Button></> : <Button variant="ghost" onClick={() => void store.resume(selected.taskId)}><Play size={13} /> Resume</Button>}</div>}
+            <section><h4 className="text-xs font-semibold text-foreground">Plan</h4><div className="mt-2 space-y-1.5">{selected.plan?.nodes.map((node) => <div key={node.nodeId} className="flex items-center gap-2 rounded-md border border-border px-2.5 py-2 text-xs"><span className="w-24 shrink-0 text-faint">{label(node.taskClass)}</span><span className="min-w-0 flex-1 text-foreground">{node.objective}</span>{node.status === "succeeded" ? <CheckCircle2 className="text-success" size={14} /> : node.status === "failed" ? <XCircle className="text-danger" size={14} /> : node.status === "running" ? <Loader2 className="animate-spin text-accent" size={14} /> : <span className="text-faint">{label(node.status)}</span>}</div>)}</div></section>
+            <section><h4 className="text-xs font-semibold text-foreground">Acceptance criteria</h4><div className="mt-2 space-y-1.5">{selected.acceptanceCriteria.map((criterion) => <div key={criterion.id} className="rounded-md border border-border px-2.5 py-2 text-xs"><div className="flex justify-between gap-2"><span className="text-foreground">{criterion.description}</span><span className={criterion.status === "passed" ? "text-success" : "text-muted"}>{label(criterion.status)}</span></div>{criterion.evidenceIds.length > 0 && <p className="mt-1 text-[11px] text-faint">Evidence: {criterion.evidenceIds.join(", ")}</p>}</div>)}</div></section>
+            {selected.verificationEvidence.length > 0 && <section><h4 className="text-xs font-semibold text-foreground">Verification evidence</h4><div className="mt-2 space-y-1.5">{selected.verificationEvidence.map((evidence) => <div key={evidence.evidenceId} className="rounded-md border border-border px-2.5 py-2 text-xs"><div className="flex justify-between"><span>{evidence.name}</span><span className={evidence.passed && !evidence.stale ? "text-success" : "text-danger"}>{evidence.passed && !evidence.stale ? "Passed" : evidence.stale ? "Stale" : "Failed"}</span></div><p className="mt-1 text-[11px] text-faint">exit {evidence.exitCode ?? "n/a"} · {evidence.durationMs} ms</p></div>)}</div></section>}
+          </div>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export default AutonomousTaskPanel;

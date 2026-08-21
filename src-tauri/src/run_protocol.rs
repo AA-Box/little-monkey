@@ -338,6 +338,7 @@ pub fn classify(kind: &RunKind, priority: i32) -> ProcessClass {
         | RunKind::CrewCoordinator
         | RunKind::Sandboxed => ProcessClass::Batch,
         RunKind::Background => ProcessClass::Background,
+        RunKind::AutonomousTask => ProcessClass::Background,
         RunKind::Scheduled => ProcessClass::Maintenance,
     };
     if priority < 0 && declared.rank() < ProcessClass::Background.rank() {
@@ -359,6 +360,9 @@ pub enum RunKind {
     Browser,
     Acp,
     Background,
+    /// Coordinator-owned task run whose plan, workers, evidence, and delivery
+    /// are projected from `TaskEvent` records.
+    AutonomousTask,
     /// Evidence ledger for a remote desktop-control session: periodic and
     /// start/stop screenshots recorded as `ArtifactAdded` events (see
     /// `daemon/remote/desktop.rs`).
@@ -1720,6 +1724,14 @@ pub enum RunEvent {
         mutation_id: String,
         reason: String,
     },
+    /// Domain event emitted by the autonomous-task coordinator. The run ledger
+    /// stores it without interpreting task-specific state; the payload is
+    /// validated and the coordinator snapshot is the replay source of truth.
+    TaskEvent {
+        task_id: String,
+        event_type: String,
+        payload: serde_json::Value,
+    },
     /// This run's frozen process image left for another owned node (roadmap
     /// K18), recorded on the origin's half of the chain.
     ///
@@ -1983,6 +1995,23 @@ impl RunEvent {
             } => {
                 validate_protocol_id("event.mutation_id", mutation_id)?;
                 validate_text("event.reason", reason, MAX_EVENT_TEXT_BYTES, false)?;
+            }
+            Self::TaskEvent {
+                task_id,
+                event_type,
+                payload,
+            } => {
+                validate_protocol_id("event.task_id", task_id)?;
+                validate_single_line("event.event_type", event_type, MAX_LABEL_BYTES)?;
+                let bytes = serde_json::to_vec(payload).map_err(|_| {
+                    ProtocolValidationError::new("event.payload", "must be valid JSON")
+                })?;
+                if bytes.len() > MAX_EVENT_JSON_BYTES {
+                    return Err(ProtocolValidationError::new(
+                        "event.payload",
+                        format!("exceeds the {MAX_EVENT_JSON_BYTES}-byte limit"),
+                    ));
+                }
             }
             Self::MigrationDeparted {
                 target_node_id,

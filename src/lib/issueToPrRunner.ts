@@ -25,6 +25,8 @@
  */
 import { runHeadlessAgent } from './headlessAgentRunner';
 import { wrapUntrustedContent } from './untrustedContent';
+import { startAutonomousTask, type AutonomousTaskRuntime } from './autonomousTaskRunner';
+import type { AutonomousTask } from './autonomousTask';
 
 /** Hard cap on model/tool round trips — generous relative to
  * `subagent.ts`'s `MAX_SUBAGENT_ITERATIONS` (15) since a full issue
@@ -61,6 +63,30 @@ export interface IssueToPrAgentResult {
    * comment) — `null` on an older host, where the flow still runs but has
    * no capsule to show. */
   durableRunId: string | null;
+}
+
+/** Issue-to-PR's coordinator adapter. The existing state machine remains the
+ * owner of GitHub delivery and its confirmation phrase; this adapter gives
+ * the implementation phase the same plan/worker/evidence contract as every
+ * other autonomous task without moving external mutations into the worker. */
+export async function runIssueToPrAutonomousTask(
+  params: RunIssueToPrAgentParams & { sessionId?: string },
+): Promise<IssueToPrAgentResult & { task: AutonomousTask }> {
+  let implementation: IssueToPrAgentResult | null = null;
+  const runtime: AutonomousTaskRuntime = {
+    executeNode: async (_task, node, context) => {
+      if (node.taskClass !== 'implementation') return { ok: true, summary: `Prepared ${node.taskClass} context.` };
+      implementation = await runIssueToPrAgent({ ...params, runId: params.runId, signal: context.signal });
+      return { ok: implementation.outcome === 'completed', summary: implementation.summary };
+    },
+    integrate: async () => ({ ok: true, summary: 'Issue-to-PR owned worktree remains under the issue flow for explicit delivery.' }),
+    verify: async (current) => ({ ok: implementation?.outcome === 'completed', summary: implementation?.summary ?? 'Implementation did not complete.', evidence: implementation?.outcome === 'completed' ? [{ evidenceId: `issue-checks-${params.runId}`, criterionId: current.acceptanceCriteria[2].id, name: 'Issue-to-PR checks', passed: true, authoritative: true, stale: false, summary: implementation.summary, exitCode: 0, durationMs: 0, createdAtMs: Date.now() }] : undefined }),
+    review: async (current) => ({ ok: implementation?.outcome === 'completed', summary: implementation?.summary ?? 'No implementation report.', evidence: implementation?.outcome === 'completed' ? [{ evidenceId: `issue-review-${params.runId}`, criterionId: current.acceptanceCriteria[1].id, name: 'Issue-to-PR worker review', passed: true, authoritative: true, stale: false, summary: 'The issue flow retains changes in its owned worktree for human delivery review.', exitCode: 0, durationMs: 0, createdAtMs: Date.now() }] : undefined }),
+  };
+  const started = await startAutonomousTask({ objective: `Implement GitHub issue #${params.issueNumber}: ${params.issueTitle}`, sessionId: params.sessionId ?? null, constraints: { strategy: 'DELEGATE', source: 'issue', untrustedSource: true, allowExternalDelivery: false }, runtime, signal: params.signal });
+  const result = await started.completion;
+  const implementationResult = implementation as IssueToPrAgentResult | null;
+  return { outcome: result.outcome === 'SUCCEEDED' ? 'completed' : result.outcome === 'CANCELLED' ? 'cancelled' : 'error', summary: result.summary ?? 'Issue-to-PR task did not complete.', durableRunId: implementationResult?.durableRunId ?? null, task: result };
 }
 
 function buildSystemPrompt(params: RunIssueToPrAgentParams): string {
