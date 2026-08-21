@@ -46,8 +46,6 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
-// Only the MLX release-key verifier checks a signature here.
-#[cfg(target_os = "macos")]
 use ring::signature;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -105,11 +103,11 @@ const KEYCHAIN_ACCOUNT: &str = "lan-state-hmac-v1";
 /// component, the pinned publisher key both check out.
 pub const DEFAULT_COMPONENT_CATALOG_URL: &str =
     "https://github.com/AA-Box/little-monkey/releases/download/mlx-catalog/mlx-catalog.json";
-#[cfg(target_os = "macos")]
 const MLX_RELEASE_KEY_ID: &str = "release-2026-1";
-#[cfg(target_os = "macos")]
 const MLX_RELEASE_PUBLIC_KEY_HEX: &str =
     "84db8c4dfdca72589631be1513f45083e893c9c373ba5be6e49928e43c7b828c";
+const STUDIO_TOOL_SIGNATURE_ALGORITHM: &str = "ed25519";
+const STUDIO_TOOL_SIGNATURE_KEY_ID: &str = MLX_RELEASE_KEY_ID;
 
 fn lock<T>(mutex: &Mutex<T>) -> M3HubResult<MutexGuard<'_, T>> {
     mutex.lock().map_err(|_| M3HubError::LockPoisoned)
@@ -3221,6 +3219,56 @@ fn ensure_private_directory(path: &Path) -> M3HubResult<()> {
     Ok(())
 }
 
+pub(crate) fn verify_published_component_signature(
+    entry: &M3ComponentCatalogEntry,
+) -> M3HubResult<()> {
+    let algorithm = entry
+        .metadata
+        .get("publisherSignatureAlgorithm")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature algorithm is missing".to_string(),
+        })?;
+    let key_id = entry
+        .metadata
+        .get("publisherSignatureKeyId")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature key id is missing".to_string(),
+        })?;
+    let encoded = entry
+        .metadata
+        .get("publisherSignatureBase64")
+        .ok_or_else(|| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is missing".to_string(),
+        })?;
+    if algorithm != STUDIO_TOOL_SIGNATURE_ALGORITHM || key_id != STUDIO_TOOL_SIGNATURE_KEY_ID {
+        return Err(M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is not from the pinned release key".to_string(),
+        });
+    }
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: format!("publisher signature is not valid base64: {error}"),
+        })?;
+    let payload = crate::m3_runtime_hub::canonical_component_catalog_payload(entry)?;
+    let public_key =
+        decode_hex(MLX_RELEASE_PUBLIC_KEY_HEX).map_err(|message| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message,
+        })?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+        .verify(&payload, &signature_bytes)
+        .map_err(|_| M3HubError::Invalid {
+            field: "componentCatalog.signature".to_string(),
+            message: "publisher signature is invalid".to_string(),
+        })
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct ProductionMlxSignatureVerifier;
@@ -3244,7 +3292,6 @@ impl MlxSignatureVerifier for ProductionMlxSignatureVerifier {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("pinned key is not valid hexadecimal".to_string());
