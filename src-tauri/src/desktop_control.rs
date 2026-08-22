@@ -1754,6 +1754,7 @@ function ResolveElement {
       $candidateStable=($automation -replace '[^A-Za-z0-9._-]','_')
       if($candidateStable -eq $stable){return $candidate}
     }
+    throw 'UIAutomation element is stale'
   }
   return $candidates.Item([int]$env:LM_ELEMENT_INDEX)
 }

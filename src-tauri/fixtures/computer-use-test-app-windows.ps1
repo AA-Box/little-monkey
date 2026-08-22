@@ -4,6 +4,7 @@ Add-Type -AssemblyName System.Drawing
 
 $profilePath = Join-Path ([System.IO.Path]::GetTempPath()) 'little-monkey-testapp-profile.json'
 $form = New-Object System.Windows.Forms.Form
+$form.Name = 'LittleMonkeyTestApp'
 $form.Text = 'Little Monkey TestApp'
 $form.ClientSize = New-Object System.Drawing.Size(640, 420)
 $form.StartPosition = 'CenterScreen'
@@ -20,23 +21,27 @@ $profileLabel.Location = New-Object System.Drawing.Point(16, 70)
 $profileLabel.AutoSize = $true
 
 $profile = New-Object System.Windows.Forms.TextBox
+$profile.Name = 'ProfileInput'
 $profile.AccessibleName = 'Profile name'
 $profile.Location = New-Object System.Drawing.Point(120, 66)
 $profile.Size = New-Object System.Drawing.Size(300, 24)
 $profile.Text = 'Test profile'
 
 $save = New-Object System.Windows.Forms.Button
+$save.Name = 'SaveProfile'
 $save.Text = 'Save profile'
 $save.Location = New-Object System.Drawing.Point(440, 64)
 $save.Size = New-Object System.Drawing.Size(150, 30)
 
 $status = New-Object System.Windows.Forms.Label
+$status.Name = 'SaveStatus'
 $status.Text = 'Not saved'
 $status.AccessibleName = 'Save status'
 $status.Location = New-Object System.Drawing.Point(16, 104)
 $status.AutoSize = $true
 
 $dark = New-Object System.Windows.Forms.Button
+$dark.Name = 'DarkMode'
 $dark.Text = 'Dark mode'
 $dark.AccessibleName = 'Dark mode'
 $dark.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
@@ -50,6 +55,7 @@ $dark.Add_Click({
 })
 
 $disabled = New-Object System.Windows.Forms.Button
+$disabled.Name = 'DisabledButton'
 $disabled.Text = 'Disabled button'
 $disabled.AccessibleName = 'Disabled button'
 $disabled.Location = New-Object System.Drawing.Point(150, 144)
@@ -57,6 +63,7 @@ $disabled.Size = New-Object System.Drawing.Size(150, 30)
 $disabled.Enabled = $false
 
 $dynamic = New-Object System.Windows.Forms.Button
+$dynamic.Name = 'AddDynamicItem'
 $dynamic.Text = 'Add dynamic item'
 $dynamic.Location = New-Object System.Drawing.Point(320, 144)
 $dynamic.Size = New-Object System.Drawing.Size(150, 30)
@@ -69,6 +76,7 @@ $dynamic.Add_Click({
 })
 
 $destructive = New-Object System.Windows.Forms.Button
+$destructive.Name = 'DestructiveAction'
 $destructive.Text = 'Destructive action'
 $destructive.Location = New-Object System.Drawing.Point(480, 144)
 $destructive.Size = New-Object System.Drawing.Size(140, 30)
@@ -79,6 +87,7 @@ $passwordLabel.Location = New-Object System.Drawing.Point(16, 210)
 $passwordLabel.AutoSize = $true
 
 $password = New-Object System.Windows.Forms.TextBox
+$password.Name = 'FakePassword'
 $password.AccessibleName = 'Fake password field (must be blocked)'
 $password.UseSystemPasswordChar = $true
 $password.Location = New-Object System.Drawing.Point(16, 238)
