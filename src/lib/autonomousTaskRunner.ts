@@ -24,6 +24,7 @@ import { effortForTarget } from "../store/modelStore";
 export interface TaskNodeResult {
   ok: boolean;
   summary: string;
+  failureCode?: "EXECUTION_TARGET_LOST" | "FAILED";
   worktreePath?: string;
   artifacts?: TaskArtifact[];
   evidence?: VerificationEvidence[];
@@ -146,6 +147,7 @@ export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: Task
 }
 
 function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
+  const targetLost = (error: unknown): boolean => /^EXECUTION_TARGET_LOST\s*:/i.test(error instanceof Error ? error.message : String(error));
   const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
     const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
@@ -153,7 +155,8 @@ function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapte
     try {
       return await invoke<TaskNodeResult>("autonomous_task_place_node", { request: { kind, targetId, runSpec: spec } });
     } catch (error) {
-      return { ok: false, summary: `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}` };
+      const message = `${kind} execution failed: ${error instanceof Error ? error.message : String(error)}`;
+      return { ok: false, failureCode: targetLost(error) ? "EXECUTION_TARGET_LOST" : "FAILED", summary: message };
     }
   };
   return {
@@ -311,37 +314,47 @@ function outOfScopeFiles(node: TaskPlanNode, changedFiles: string[]): string[] {
   return [...new Set(changedFiles.filter((path) => !node.mutationScope.some((scope) => scopeContains(scope, path))))];
 }
 
+function isExecutionTargetLost(result: TaskNodeResult): boolean {
+  return result.failureCode === "EXECUTION_TARGET_LOST" || /^EXECUTION_TARGET_LOST\s*:/i.test(result.summary);
+}
+
 function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summary: string): AutonomousTask {
   if (!task.plan || failedNode.taskClass === "delivery") return task;
   const sources = mutatingRepairSources(task.plan, failedNode);
   if (sources.length === 0) return task;
   const mutatingFailedNode = failedNode.taskClass === "implementation" || failedNode.taskClass === "integration";
-  if (!mutatingFailedNode) {
-    const placementKeys = new Set(sources.map((source) => `${source.executionPlacement?.kind ?? "local"}:${source.executionPlacement?.targetId ?? "local"}`));
-    if (placementKeys.size > 1) return task;
-  }
-  const scope = [...new Set(sources.flatMap((node) => node.mutationScope))].sort();
-  if (scope.length === 0 || !sources.some((node) => node.capabilities?.includes("mutate"))) return task;
-  const source = sources[0];
-  const isolation = mutatingFailedNode ? failedNode.isolation : source.isolation;
-  const executionPlacement = mutatingFailedNode ? failedNode.executionPlacement : source.executionPlacement;
-  const capabilities = [...new Set((mutatingFailedNode ? failedNode.capabilities : source.capabilities) ?? ["read", "mutate", "verify"])]
-    .filter((capability) => capability !== "mutate").concat("mutate");
-  const requirements = mutatingFailedNode ? failedNode.executionRequirements : source.executionRequirements;
-  const repairId = `${failedNode.nodeId}-repair-${task.repairRounds}`;
+  const repairSources = mutatingFailedNode ? [failedNode] : sources;
+  if (repairSources.some((source) => source.mutationScope.length === 0 || !source.capabilities?.includes("mutate"))) return task;
+  const repairBase = `${failedNode.nodeId}-repair-${task.repairRounds}`;
+  const usedIds = new Set(task.plan.nodes.map((node) => node.nodeId));
+  const repairIds = repairSources.map((_, index) => {
+    let candidate = repairSources.length === 1 ? repairBase : `${repairBase}-${index + 1}`;
+    let suffix = 1;
+    while (usedIds.has(candidate)) candidate = `${repairBase}-${suffix++}`;
+    usedIds.add(candidate);
+    return candidate;
+  });
   let repairDependencies = failedNode.dependencies;
-  let retriedDependencies = [repairId];
+  let retriedDependencies = repairIds;
   const nodes = task.plan.nodes.map((node) => {
     if (failedNode.taskClass === "review" && node.taskClass === "verification" && failedNode.dependencies.includes(node.nodeId)) {
       repairDependencies = node.dependencies;
       retriedDependencies = failedNode.dependencies;
-      return { ...node, dependencies: [repairId], status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
+      return { ...node, dependencies: repairIds, status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
     }
     return node;
   });
-  const repairNode: TaskPlanNode = { ...failedNode, nodeId: repairId, taskClass: "implementation", objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: repairDependencies, mutationScope: scope, isolation, capabilities, executionPlacement, executionRequirements: { needsWorkspaceWrite: true, needsNetwork: requirements?.needsNetwork ?? false, isolation, platform: requirements?.platform }, status: repairDependencies.length ? "pending" : "ready", attempt: 0, workerId: null, resultSummary: null, repairOf: failedNode.nodeId };
   const retriedNode = { ...failedNode, dependencies: retriedDependencies, status: "pending" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null };
-  return { ...task, plan: { ...task.plan, revision: task.plan.revision + 1, nodes: [...nodes.map((node) => node.nodeId === failedNode.nodeId ? retriedNode : node), repairNode] }, updatedAtMs: Date.now() };
+  const repairNodes = repairSources.map((source, index) => {
+    const isolation = mutatingFailedNode ? failedNode.isolation : source.isolation;
+    const capabilities = [...new Set((mutatingFailedNode ? failedNode.capabilities : source.capabilities) ?? ["read", "mutate", "verify"])]
+      .filter((capability) => capability !== "mutate").concat("mutate");
+    const requirements = mutatingFailedNode ? failedNode.executionRequirements : source.executionRequirements;
+    const executionPlacement = structuredClone(mutatingFailedNode ? failedNode.executionPlacement : source.executionPlacement);
+    if (executionPlacement) executionPlacement.nodeId = repairIds[index];
+    return { ...failedNode, nodeId: repairIds[index], taskClass: "implementation" as const, objective: `Diagnose and repair ${failedNode.nodeId} using bounded failure evidence: ${summary.slice(0, 2_000)}`, dependencies: repairDependencies, mutationScope: [...source.mutationScope].sort(), isolation, capabilities, executionPlacement, requestedExecutionPlacement: mutatingFailedNode ? failedNode.requestedExecutionPlacement : source.requestedExecutionPlacement, executionRequirements: { needsWorkspaceWrite: true, needsNetwork: requirements?.needsNetwork ?? false, isolation, platform: requirements?.platform }, relevantFiles: source.relevantFiles, upstreamDecisions: source.upstreamDecisions, status: repairDependencies.length ? "pending" as const : "ready" as const, attempt: 0, workerId: null, resultSummary: null, mutationRevision: null, repairOf: failedNode.nodeId };
+  });
+  return { ...task, plan: { ...task.plan, revision: task.plan.revision + 1, nodes: [...nodes.map((node) => node.nodeId === failedNode.nodeId ? retriedNode : node), ...repairNodes] }, updatedAtMs: Date.now() };
 }
 
 function parseStructuredReview(value: string): StructuredReviewResult | null {
@@ -469,15 +482,18 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         const scopedResult = unauthorized.length > 0
           ? { ...rawResult, ok: false, summary: `Node '${node.nodeId}' changed files outside its frozen mutation scope: ${unauthorized.join(", ")}` }
           : rawResult;
-        const result: TaskNodeResult = scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
-          ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
-          : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
-            ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
-            : scopedResult;
+        const result: TaskNodeResult = isExecutionTargetLost(scopedResult)
+          ? { ...scopedResult, ok: false, failureCode: "EXECUTION_TARGET_LOST" }
+          : scopedResult.ok && mutatingNode && !scopedResult.mutation && !scopedResult.workspaceRevision
+            ? { ...scopedResult, ok: false, summary: "Mutating node did not return a revision-bound mutation record." }
+            : scopedResult.ok && mutatingNode && !scopedResult.mutation && scopedResult.workspaceRevision
+              ? { ...scopedResult, mutation: { beforeRevision: task.workspaceRevision ?? "unknown", afterRevision: scopedResult.workspaceRevision, changedFiles: scopedResult.changedFiles ?? [], patchDigest: scopedResult.workspaceRevision } }
+              : scopedResult;
         results.set(node.nodeId, result);
         const awaitingApproval = !result.ok && result.awaitingApproval === true;
         const status: TaskPlanNode["status"] = result.ok ? "succeeded" : awaitingApproval ? "waiting_approval" : "failed";
         task = updateNode(task, node.nodeId, { status, resultSummary: result.summary.slice(0, 2_000) });
+        if (isExecutionTargetLost(result)) task = { ...task, outcome: "EXECUTION_TARGET_LOST", summary: result.summary, updatedAtMs: Date.now() };
         task = addUsage(task, result.usage ?? { modelCalls: 1 });
         if (task.usage && ((task.usage.modelCalls > task.budgetSnapshot.maxModelCalls) || (task.usage.toolCalls > task.budgetSnapshot.maxToolCalls) || (task.budgetSnapshot.maxCostMicros !== null && task.usage.costMicros > (task.budgetSnapshot.maxCostMicros ?? Number.MAX_SAFE_INTEGER)))) { task = { ...task, outcome: "BUDGET_EXHAUSTED", summary: "Model, tool, or cost budget exhausted.", updatedAtMs: Date.now() }; }
         task = advanceWorkspaceRevision(task, result.workspaceRevision);
@@ -503,6 +519,7 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
         if (node.taskClass === "integration" && result.ok) await emit("patch_integrated", { node_id: node.nodeId, summary: result.summary });
         }
         if (task.outcome === "WAITING_APPROVAL") break;
+        if (task.outcome === "EXECUTION_TARGET_LOST") break;
         const failed = completed.some((result) => !result.ok);
         if (failed) {
           if (task.repairRounds < task.budgetSnapshot.maxRepairRounds) {
@@ -537,7 +554,8 @@ export async function runAutonomousTask(params: RunAutonomousTaskParams): Promis
       } else task = { ...task, outcome: "SUCCEEDED", summary: "Task completed with authoritative acceptance evidence.", updatedAtMs: Date.now() };
     }
   } catch (error) {
-    task = { ...task, outcome: signal.aborted ? "CANCELLED" : "FAILED", summary: error instanceof Error ? error.message : String(error), updatedAtMs: Date.now() };
+    const summary = error instanceof Error ? error.message : String(error);
+    task = { ...task, outcome: signal.aborted ? "CANCELLED" : /^EXECUTION_TARGET_LOST\s*:/i.test(summary) ? "EXECUTION_TARGET_LOST" : "FAILED", summary, updatedAtMs: Date.now() };
   }
   await emit("task_completed", { outcome: task.outcome, summary: task.summary });
   return task;
@@ -800,7 +818,7 @@ export interface ResumeAutonomousTaskParams { task: AutonomousTask; onUpdate?: (
 
 export async function resumeAutonomousTask(params: ResumeAutonomousTaskParams): Promise<StartedAutonomousTask> {
   const resolvedTarget = await resolveTarget(); const control = new AutonomousTaskControl(); const signal = mergeSignals(control.signal, params.signal);
-  const task = { ...params.task, outcome: "RUNNING" as const, repairRounds: ["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "WAITING_USER"].includes(params.task.outcome) ? 0 : params.task.repairRounds, plan: params.task.plan ? { ...params.task.plan, nodes: params.task.plan.nodes.map((node) => node.status === "running" || node.status === "failed" || node.status === "blocked" || (params.task.waitingApproval && node.nodeId === params.task.waitingApproval.nodeId) ? { ...node, status: "pending" as const, workerId: null } : node) } : null, waitingReason: null, waitingApproval: null, updatedAtMs: Date.now() };
+  const task = { ...params.task, outcome: "RUNNING" as const, repairRounds: ["FAILED", "VERIFICATION_FAILED", "DELIVERY_FAILED", "WAITING_USER", "EXECUTION_TARGET_LOST"].includes(params.task.outcome) ? 0 : params.task.repairRounds, plan: params.task.plan ? { ...params.task.plan, nodes: params.task.plan.nodes.map((node) => node.status === "running" || node.status === "failed" || node.status === "blocked" || (params.task.waitingApproval && node.nodeId === params.task.waitingApproval.nodeId) ? { ...node, status: "pending" as const, workerId: null } : node) } : null, waitingReason: null, waitingApproval: null, updatedAtMs: Date.now() };
   if (task.executionOwner.kind !== "desktop") throw new Error("Only the current desktop owner may resume an autonomous task.");
   const ownerFence = async (owner = task.executionOwner): Promise<void> => {
     await invoke("autonomous_task_owner_fence", { request: { taskId: task.taskId, owner: { kind: owner.kind, instance_id: owner.instanceId, lease_epoch: owner.leaseEpoch, lease_expires_at_ms: owner.leaseExpiresAtMs } } });

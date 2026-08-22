@@ -450,6 +450,10 @@ fn consume_autonomous_placement_boundary(
     }
 }
 
+fn autonomous_execution_target_lost(error: impl std::fmt::Display) -> String {
+    format!("EXECUTION_TARGET_LOST: {error}")
+}
+
 fn autonomous_placement_path_in_scope(path: &str, scopes: &[String]) -> bool {
     scopes.iter().any(|scope| {
         let scope = scope.trim_end_matches('/');
@@ -493,8 +497,9 @@ fn autonomous_placement_result(
     snapshot_id: &str,
     runner_result: Value,
 ) -> Result<Value, String> {
-    if runner_result.get("ok").and_then(Value::as_bool) == Some(false) {
-        return Ok(runner_result);
+    let mut result = normalize_autonomous_placement_result(runner_result);
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Ok(result);
     }
     let after_revision = crate::agent_worktrees::workspace_revision(data_dir, workspace)?;
     let changed_files =
@@ -502,7 +507,6 @@ fn autonomous_placement_result(
     let patch =
         crate::agent_worktrees::patch_bytes_since_snapshot(data_dir, workspace, snapshot_id)?;
     let patch_digest = format!("{:x}", Sha256::digest(&patch));
-    let mut result = runner_result;
     if let Some(object) = result.as_object_mut() {
         let ok = object
             .get("ok")
@@ -551,6 +555,45 @@ fn autonomous_placement_result(
         }
     }
     Ok(result)
+}
+
+fn normalize_autonomous_placement_result(mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        let target_lost = object
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "execution_target_lost")
+            || object
+                .get("failureCode")
+                .and_then(Value::as_str)
+                .is_some_and(|code| code == "EXECUTION_TARGET_LOST")
+            || object
+                .get("final_message")
+                .or_else(|| object.get("finalMessage"))
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.trim_start().starts_with("EXECUTION_TARGET_LOST:"));
+        if target_lost {
+            object.insert(
+                "failureCode".to_string(),
+                Value::String("EXECUTION_TARGET_LOST".to_string()),
+            );
+            if !object.contains_key("summary") {
+                if let Some(message) = object
+                    .get("final_message")
+                    .or_else(|| object.get("finalMessage"))
+                    .cloned()
+                {
+                    object.insert("summary".to_string(), message);
+                }
+            }
+        }
+        let ok = object
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or_else(|| object.get("status").and_then(Value::as_str) == Some("ok"));
+        object.insert("ok".to_string(), Value::Bool(ok));
+    }
+    result
 }
 
 fn parse_typed_json<T: DeserializeOwned>(output: &str) -> Result<T, String> {
@@ -1686,7 +1729,8 @@ pub async fn autonomous_task_place_node(
                     request.target_id.clone(),
                     "--json".into(),
                 ])
-                .await?;
+                .await
+                .map_err(autonomous_execution_target_lost)?;
                 let accepted = parse_json(&output)?;
                 let submitted_run_id = accepted
                     .get("placement")
@@ -1700,17 +1744,17 @@ pub async fn autonomous_task_place_node(
                     + std::time::Duration::from_millis(run_spec.budgets.wall_time_ms);
                 loop {
                     if Instant::now() >= deadline {
-                        return Err(
-                            "Remote autonomous node placement exceeded its frozen wall-time budget"
-                                .to_string(),
-                        );
+                        return Err(autonomous_execution_target_lost(
+                            "Remote autonomous node placement exceeded its frozen wall-time budget",
+                        ));
                     }
                     let _ = command(vec![
                         "daemon".into(),
                         "remote".into(),
                         "placement-sync".into(),
                     ])
-                    .await;
+                    .await
+                    .map_err(autonomous_execution_target_lost)?;
                     let rows = parse_json(
                         &command(vec![
                             "daemon".into(),
@@ -1718,7 +1762,8 @@ pub async fn autonomous_task_place_node(
                             "placements".into(),
                             "--json".into(),
                         ])
-                        .await?,
+                        .await
+                        .map_err(autonomous_execution_target_lost)?,
                     )?;
                     if let Some(row) =
                         rows.get("placements")
@@ -1733,11 +1778,11 @@ pub async fn autonomous_task_place_node(
                         let state = row.get("state").and_then(Value::as_str).unwrap_or_default();
                         if matches!(state, "succeeded" | "failed" | "cancelled") {
                             if state != "succeeded" {
-                                return Err(row
-                                    .get("last_error")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("remote autonomous node failed")
-                                    .to_string());
+                                return Err(autonomous_execution_target_lost(
+                                    row.get("last_error")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("remote autonomous node failed"),
+                                ));
                             }
                             let result = row.get("result").cloned().ok_or_else(|| {
                                 "Remote node succeeded without a transported node result"
@@ -1787,7 +1832,8 @@ pub async fn autonomous_task_place_node(
                                         "--output".into(),
                                         patch_path.to_string_lossy().into_owned(),
                                     ])
-                                    .await?;
+                                    .await
+                                    .map_err(autonomous_execution_target_lost)?;
                                     let patch_bytes = std::fs::read(&patch_path).map_err(|error| {
                                         format!("Could not read fetched remote patch: {error}")
                                     })?;
@@ -1920,12 +1966,12 @@ pub async fn autonomous_task_place_node(
                 parse_json(&output_text)
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(autonomous_execution_target_lost)?;
             let runner_result = match runner_result {
                 Ok(result) => result,
                 Err(error) => {
                     let _ = crate::agent_worktrees::discard_snapshot(&data_dir, &local_snapshot.id);
-                    return Err(error);
+                    return Err(autonomous_execution_target_lost(error));
                 }
             };
             let _ = std::fs::remove_file(&spec_path);
@@ -2463,6 +2509,23 @@ mod tests {
         let mut granted_mobile = valid;
         granted_mobile.mobile_capabilities = vec!["view-sessions".to_string(), "chat".to_string()];
         assert!(validate_remote_pair_request(&granted_mobile).is_ok());
+    }
+
+    #[test]
+    fn autonomous_placement_normalizes_target_loss_before_backend_specific_processing() {
+        let result = normalize_autonomous_placement_result(serde_json::json!({
+            "status": "execution_target_lost",
+            "final_message": "EXECUTION_TARGET_LOST: Docker daemon unavailable"
+        }));
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["failureCode"], "EXECUTION_TARGET_LOST");
+        assert_eq!(result["summary"], result["final_message"]);
+
+        let result = normalize_autonomous_placement_result(serde_json::json!({
+            "status": "ok"
+        }));
+        assert_eq!(result["ok"], true);
+        assert!(result.get("failureCode").is_none());
     }
 
     /// A verbatim `monkey daemon status --json` payload, as a string.

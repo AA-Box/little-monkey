@@ -583,6 +583,289 @@ fn model_fixture() -> HttpFixture {
     .expect("bind the model fixture")
 }
 
+/// The autonomous coordinator fixture uses the product's real model boundary
+/// as well. The planner response deliberately asks for two worktree workers so
+/// the test exercises the resident daemon, parallel scheduling, worktree
+/// creation/application, integration, configured verification, and structured
+/// review in one process-level run.
+fn autonomous_model_fixture() -> HttpFixture {
+    let planner = serde_json::json!({
+        "plan": {
+            "planId": "autonomous-e2e-plan",
+            "strategy": "PARALLEL_DELEGATE",
+            "revision": 1,
+            "rationale": "Two independent repository workers feed one integration barrier.",
+            "nodes": [
+                {
+                    "nodeId": "implement-frontend",
+                    "taskClass": "implementation",
+                    "objective": "Inspect the README and prepare the frontend slice.",
+                    "dependencies": [],
+                    "mutationScope": ["README.md"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["README.md"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-frontend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "implement-backend",
+                    "taskClass": "implementation",
+                    "objective": "Inspect the README and prepare the backend slice.",
+                    "dependencies": [],
+                    "mutationScope": ["README.md"],
+                    "isolation": "worktree",
+                    "relevantFiles": ["README.md"],
+                    "capabilities": ["read", "mutate"],
+                    "executionPlacement": {"kind": "worktree", "targetId": "local", "nodeId": "implement-backend"},
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree"}
+                },
+                {
+                    "nodeId": "integrate",
+                    "taskClass": "integration",
+                    "objective": "Integrate the worker results after scope inspection.",
+                    "dependencies": ["implement-frontend", "implement-backend"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["README.md"],
+                    "capabilities": ["read", "mutate"],
+                    "executionRequirements": {"needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "shared"}
+                },
+                {
+                    "nodeId": "verify",
+                    "taskClass": "verification",
+                    "objective": "Run the configured verification command.",
+                    "dependencies": ["integrate"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["README.md"],
+                    "capabilities": ["read", "verify"]
+                },
+                {
+                    "nodeId": "review",
+                    "taskClass": "review",
+                    "objective": "Return a structured review of the integrated repository.",
+                    "dependencies": ["verify"],
+                    "mutationScope": ["workspace"],
+                    "isolation": "shared",
+                    "relevantFiles": ["README.md"],
+                    "capabilities": ["read", "verify"]
+                }
+            ]
+        },
+        "acceptanceCriteria": [
+            {"id": "verify-readme", "description": "The configured verification command passes.", "method": "verification_command", "blocking": true, "provenance": {"kind": "planner", "fragment": "configured verification"}},
+            {"id": "review-readme", "description": "The structured review passes.", "method": "review", "blocking": true, "provenance": {"kind": "planner", "fragment": "structured review"}},
+            {"id": "scope-readme", "description": "Workers stay inside README.md.", "method": "workspace_boundary", "blocking": true, "provenance": {"kind": "planner", "fragment": "README.md scope"}}
+        ],
+        "planningContext": {"relevantFiles": ["README.md"]},
+        "summary": "parallel autonomous coordinator fixture"
+    });
+    let review = serde_json::json!({
+        "verdict": "pass",
+        "findings": [],
+        "filesReviewed": ["README.md"],
+        "acceptanceCriteria": ["verify-readme", "review-readme", "scope-readme"],
+        "securityFindings": [],
+        "testCoverageFindings": []
+    });
+    HttpFixture::spawn(move |head, body, _index| {
+        if !head.contains("/chat/completions") {
+            return json_response(r#"{"error":"unexpected autonomous model route"}"#);
+        }
+        let content = if body.contains("phase: review") || body.contains("bounded 'review' phase") {
+            review.to_string()
+        } else if body.contains("phase: planner") {
+            planner.to_string()
+        } else {
+            "autonomous phase completed".to_string()
+        };
+        sse_response(&[
+            serde_json::json!({"choices": [{"index": 0, "delta": {"content": content}}]}),
+            serde_json::json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        ])
+    })
+    .expect("bind the autonomous model fixture")
+}
+
+fn autonomous_e2e_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("start git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn run_autonomous_coordinator_end_to_end(root: &Path) {
+    if !isolation_is_real(root) {
+        println!(
+            "{SKIPPED} on this platform: autonomous coordinator profile isolation is unavailable"
+        );
+        return;
+    }
+    let model = autonomous_model_fixture();
+    let workspace = root.join("autonomous-workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    autonomous_e2e_git(&workspace, &["init", "-q"]);
+    autonomous_e2e_git(&workspace, &["config", "user.email", "e2e@example.test"]);
+    autonomous_e2e_git(&workspace, &["config", "user.name", "Autonomous E2E"]);
+    std::fs::write(workspace.join("README.md"), "autonomous fixture\n").expect("README");
+    autonomous_e2e_git(&workspace, &["add", "README.md"]);
+    autonomous_e2e_git(&workspace, &["commit", "-q", "-m", "fixture baseline"]);
+
+    let roots = little_monkey_lib::app_paths::ensure_agent_config_roots().expect("config roots");
+    let data_dir = little_monkey_lib::app_paths::data_dir().expect("data dir");
+    std::fs::create_dir_all(&data_dir).expect("data directory");
+    let workspace_key = workspace.canonicalize().expect("canonical workspace");
+    let verify_config = serde_json::json!({
+        workspace_key.to_string_lossy(): {
+            "commands": [{
+                "id": "autonomous-e2e-verify",
+                "label": "Autonomous E2E verification",
+                "command": "git diff --check --",
+                "kind": "custom",
+                "enabled": true,
+                "timeoutSecs": 30
+            }]
+        }
+    });
+    std::fs::write(
+        data_dir.join("verify_configs.json"),
+        serde_json::to_vec_pretty(&verify_config).expect("verify config JSON"),
+    )
+    .expect("verify config");
+    assert_eq!(
+        crate::verify_cli::enabled_commands_at(
+            &data_dir.join("verify_configs.json"),
+            &workspace_key
+        )
+        .len(),
+        1,
+        "the real CLI verification config was not visible to the coordinator"
+    );
+
+    let paths = DaemonPaths::under(&roots.legacy);
+    paths.ensure().expect("daemon paths");
+    let config = DaemonConfig::default();
+    config.save(&paths).expect("daemon config");
+    let cli = std::env::var(CLI_ENV).expect("real monkey-cli path");
+    let target = format!("local-url:{}|autonomous-e2e", model.base);
+    let started = std::process::Command::new(cli)
+        .args([
+            "task",
+            "start",
+            "Run the autonomous coordinator fixture",
+            "--target",
+            &target,
+            "--workspace",
+            workspace.to_str().expect("workspace UTF-8"),
+            "--json",
+        ])
+        .current_dir(&workspace)
+        .output()
+        .expect("start autonomous task process");
+    assert!(
+        started.status.success(),
+        "task start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let queued: serde_json::Value = serde_json::from_slice(&started.stdout).expect("queued JSON");
+    let job_id = queued["job_id"]
+        .as_str()
+        .expect("queued job id")
+        .to_string();
+    let run_id = queued["run_id"]
+        .as_str()
+        .expect("queued run id")
+        .to_string();
+
+    let mut engine = DaemonEngine::new(
+        DaemonStore::open(&paths).expect("engine store"),
+        SharedLedger::open(&paths.ledger_db).expect("engine ledger"),
+        paths.clone(),
+        config,
+        RealProcessAdapter::current().expect("process adapter"),
+        SilentNotifier,
+        SystemClock,
+        "autonomous-e2e-daemon".to_string(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let terminal = loop {
+        engine.tick().expect("daemon tick");
+        let state = DaemonStore::open(&paths)
+            .expect("state read")
+            .get_job(&job_id)
+            .expect("job read")
+            .expect("job")
+            .state;
+        if matches!(
+            state,
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+        ) {
+            break state;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "autonomous task did not finish: {state:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    let diagnostic_events = SharedLedger::open(&paths.ledger_db)
+        .expect("diagnostic ledger")
+        .run_ledger()
+        .expect("diagnostic run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("diagnostic events");
+    assert_eq!(
+        terminal,
+        JobState::Succeeded,
+        "autonomous task failed; log: {}\nevents: {}",
+        std::fs::read_to_string(paths.logs.join(format!("{job_id}.log"))).unwrap_or_default(),
+        serde_json::to_string(&diagnostic_events).unwrap_or_default()
+    );
+    let events = SharedLedger::open(&paths.ledger_db)
+        .expect("ledger")
+        .run_ledger()
+        .expect("run ledger")
+        .load_events(&run_id, 0, 1_000)
+        .expect("run events");
+    let rendered = serde_json::to_string(&events).expect("event JSON");
+    assert!(
+        rendered.contains("\"parallel\":true"),
+        "parallel workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"isolation\":\"worktree\""),
+        "worktree workers missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verification_evidence\""),
+        "verification evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"authoritative\":true"),
+        "authoritative evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"review_evidence\""),
+        "review evidence missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"verdict\":\"pass\""),
+        "structured review missing: {rendered}"
+    );
+    assert!(
+        model.count() >= 6,
+        "coordinator did not run planner, workers, integration, verify, and review"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The isolated profile
 // ---------------------------------------------------------------------------
@@ -740,6 +1023,17 @@ fn a_slack_message_becomes_an_agent_reply_end_to_end() {
                 run_end_to_end(&root, world).await;
             })
         },
+    );
+}
+
+/// The real CLI start path queues an autonomous coordinator and the resident
+/// daemon executes the actual process, worktree, integration, verification,
+/// and structured-review boundaries against a temporary Git repository.
+#[test]
+fn autonomous_coordinator_runs_through_the_resident_daemon_end_to_end() {
+    in_isolated_process(
+        "autonomous_coordinator_runs_through_the_resident_daemon_end_to_end",
+        |root| Box::pin(async move { run_autonomous_coordinator_end_to_end(&root).await }),
     );
 }
 
