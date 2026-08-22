@@ -1652,6 +1652,18 @@ for app in list(desktop)[:64]:
    try: value=str(e.queryValue().getCurrentValue())
    except Exception: pass
    try:
+    editable=e.queryEditableText()
+    count=getattr(editable,'characterCount',0)
+    if callable(count): count=count()
+    value=str(editable.getText(0,int(count)))
+   except Exception:
+    try:
+     text_iface=e.queryText()
+     count=getattr(text_iface,'characterCount',0)
+     if callable(count): count=count()
+     value=str(text_iface.getText(0,int(count)))
+    except Exception: pass
+   try:
     state=e.getState()
     if 'check' in role.lower() or 'toggle' in role.lower(): value='on' if state.contains(pyatspi.STATE_CHECKED) else 'off'
    except Exception: pass
