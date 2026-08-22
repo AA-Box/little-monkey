@@ -100,6 +100,8 @@ the grant or bypassing a security boundary.
 ## Acceptance fixture
 
 Run `python3 src-tauri/fixtures/computer-use-test-app.py` on a desktop session.
+The Linux/X11 CI lane uses `computer-use-test-app-linux.py`, a GTK3 equivalent,
+because GTK exposes the AT-SPI tree required for native semantic-action coverage.
 The native fixture contains a dark-mode toggle, profile input/save state,
 menu, list and scroll region, dialog, disabled control, dynamic content,
 destructive confirmation, and a fake password field. The fake password field

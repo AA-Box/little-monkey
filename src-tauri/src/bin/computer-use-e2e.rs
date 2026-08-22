@@ -53,6 +53,12 @@ fn launch(fixture: &str) -> Result<Child, String> {
         } else {
             command.arg(fixture);
         }
+    } else if cfg!(target_os = "linux") {
+        if let Ok(script) = std::env::var("COMPUTER_USE_FIXTURE_SCRIPT") {
+            command.arg(script);
+        } else {
+            command.arg(fixture);
+        }
     } else {
         command.arg(fixture);
     }

@@ -1641,13 +1641,25 @@ def walk(node, path=()):
   yield child, child_path
   yield from walk(child, child_path)
 targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
+try: only_pid=int(__import__('os').environ.get('COMPUTER_USE_FIXTURE_PID','0') or 0)
+except Exception: only_pid=0
+def process_id(app):
+ try: return int(app.get_process_id())
+ except Exception: return 0
 for app in list(desktop)[:64]:
- name=str(getattr(app,'name','')); aid='atspi:'+name
+ if only_pid and process_id(app) not in (0, only_pid): continue
+ raw_name=str(getattr(app,'name','') or '')
+ name=raw_name or ('Python' if only_pid and process_id(app)==only_pid else raw_name)
+ aid='atspi:'+name
  for wi,w in enumerate(list(app)[:32]):
   title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]
   for ei,(e,path) in enumerate(list(walk(w))[:256]):
    role=str(e.getRoleName()); label=str(getattr(e,'name','')); value=None
    try: value=str(e.queryValue().getCurrentValue())
+   except Exception: pass
+   try:
+    state=e.getState()
+    if 'check' in role.lower() or 'toggle' in role.lower(): value='on' if state.contains(pyatspi.STATE_CHECKED) else 'off'
    except Exception: pass
    actions=[]
    try:
@@ -1659,7 +1671,11 @@ for app in list(desktop)[:64]:
    try: e.queryEditableText(); actions.append('set_value')
    except Exception: pass
    stable=provider_part(e,path)
-   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable,'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':True,'focused':False,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
+   try: enabled=bool(e.getState().contains(pyatspi.STATE_ENABLED))
+   except Exception: enabled=True
+   try: focused=bool(e.getState().contains(pyatspi.STATE_FOCUSED))
+   except Exception: focused=False
+   out.append({'id':tid+'::element-'+str(ei)+'::native-'+stable,'role':role,'label':label,'value':value,'bounds':rect(e),'enabled':enabled,'focused':focused,'actions':list(dict.fromkeys(actions)),'sensitive':any(token in (role+' '+label).lower() for token in ('password','secure','credential','authentication'))})
   elements[tid]=out
 print(json.dumps({'targets':targets,'elements':elements},separators=(',',':')))
 "#;

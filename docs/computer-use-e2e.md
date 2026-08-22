@@ -18,7 +18,9 @@ The harness validates the fixture and, when `COMPUTER_USE_E2E_RUN=1`, launches
 `computer-use-native-driver.py`. Set `COMPUTER_USE_PRODUCTION_BACKEND=1` for
 the acceptance path used by CI; it invokes the Rust production backend, which
 creates the scoped grant and approval gates before the OS accessibility
-provider performs the semantic actions. The driver discovers the real
+provider performs the semantic actions. On Linux/X11 the driver uses the GTK3
+fixture (the Tk fixture remains the cross-platform readiness fixture) so the
+AT-SPI assertions exercise a real accessible application. The driver discovers the real
 accessibility window, restarts the fixture, captures a screenshot, inspects
 the audit, and proves the negative security cases. A fabricated trace
 dictionary is rejected. CI runs this production path on macOS Accessibility,

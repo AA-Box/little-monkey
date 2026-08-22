@@ -61,6 +61,30 @@ def fixture_python() -> str:
     raise RuntimeError("no Python interpreter with tkinter is available for the native fixture")
 
 
+def linux_fixture_python() -> str:
+    candidates = [
+        os.environ.get("COMPUTER_USE_LINUX_PYTHON", ""),
+        "/usr/bin/python3",
+        sys.executable,
+        shutil.which("python3") or "",
+    ]
+    probe_code = "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk"
+    for candidate in dict.fromkeys(path for path in candidates if path):
+        try:
+            probe = subprocess.run(
+                [candidate, "-c", probe_code],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    raise RuntimeError("no Python interpreter with GTK3 is available for the Linux fixture")
+
+
 def launch(fixture: Path, interpreter: str) -> subprocess.Popen[bytes]:
     process = subprocess.Popen([interpreter, str(fixture)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     wait_for_process(process)
@@ -222,7 +246,7 @@ def main() -> int:
     screenshot = args.trace.with_suffix(".png")
     profile = Path(os.environ.get("TMPDIR", "/tmp")) / "little-monkey-testapp-profile.json"
     profile.unlink(missing_ok=True)
-    interpreter = fixture_python()
+    interpreter = linux_fixture_python() if platform.system() == "Linux" else fixture_python()
     if os.environ.get("COMPUTER_USE_PRODUCTION_BACKEND") == "1":
         repo_root = Path(__file__).resolve().parents[2]
         command = os.environ.get("COMPUTER_USE_BACKEND_DRIVER_COMMAND")
@@ -265,6 +289,11 @@ def main() -> int:
             production_environment["COMPUTER_USE_FIXTURE_COMMAND"] = "powershell.exe"
             production_environment["COMPUTER_USE_FIXTURE_SCRIPT"] = str(
                 repo_root / "src-tauri" / "fixtures" / "computer-use-test-app-windows.ps1"
+            )
+        elif platform.system() == "Linux":
+            production_environment["COMPUTER_USE_FIXTURE_COMMAND"] = interpreter
+            production_environment["COMPUTER_USE_FIXTURE_SCRIPT"] = str(
+                args.fixture.with_name("computer-use-test-app-linux.py")
             )
         completed = subprocess.run(
             production_command
