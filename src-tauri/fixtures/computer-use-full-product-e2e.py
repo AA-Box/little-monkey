@@ -61,7 +61,7 @@ def main() -> int:
         node,
         str(repo / "node_modules/vite/bin/vite.js"),
         "--host",
-        "127.0.0.1",
+        "localhost",
         "--port",
         "1420",
     ]
