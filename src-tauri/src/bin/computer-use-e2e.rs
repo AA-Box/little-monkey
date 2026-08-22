@@ -59,7 +59,11 @@ fn launch(fixture: &str) -> Result<Child, String> {
     let child = command
         .spawn()
         .map_err(|error| format!("could not launch fixture: {error}"))?;
-    thread::sleep(Duration::from_secs(2));
+    thread::sleep(Duration::from_secs(if cfg!(target_os = "windows") {
+        8
+    } else {
+        2
+    }));
     Ok(child)
 }
 
