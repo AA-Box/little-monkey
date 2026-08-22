@@ -7,7 +7,7 @@ import os
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 
 PROFILE_PATH = os.path.join(os.environ.get("TMPDIR", "/tmp"), "little-monkey-testapp-profile.json")
@@ -102,6 +102,7 @@ class TestApp:
 
 
 if __name__ == "__main__":
+    GLib.set_prgname("Little Monkey TestApp")
     application = Gtk.Application(application_id="com.aabox.LittleMonkeyTestApp")
     fixture = {}
 
