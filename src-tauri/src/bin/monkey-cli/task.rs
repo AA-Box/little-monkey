@@ -159,20 +159,25 @@ fn autonomous_workspace_revision(path: &Path) -> Result<String, String> {
             String::from_utf8_lossy(&head.stderr).trim()
         ));
     }
-    let status = Command::new("git")
-        .args(["status", "--porcelain=v1"])
+    let diff = Command::new("git")
+        .args(["diff", "--binary", "HEAD", "--"])
         .current_dir(path)
         .output()
-        .map_err(|error| format!("could not inspect workspace changes: {error}"))?;
-    let mut material = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    material.push('\n');
-    material.push_str(&String::from_utf8_lossy(&status.stdout));
-    Ok(sha256_hex(material.as_bytes()))
+        .map_err(|error| format!("could not inspect workspace diff: {error}"))?;
+    let mut material = head.stdout;
+    material.push(b'\n');
+    material.extend_from_slice(&diff.stdout);
+    for relative in autonomous_changed_files(path)? {
+        material.extend_from_slice(relative.as_bytes());
+        material.push(0);
+        material.extend(autonomous_path_state(path, &relative)?.bytes());
+    }
+    Ok(sha256_hex(&material))
 }
 
 fn autonomous_changed_files(path: &Path) -> Result<Vec<String>, String> {
     let output = Command::new("git")
-        .args(["status", "--porcelain=v1"])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(path)
         .output()
         .map_err(|error| format!("could not inspect changed files: {error}"))?;
@@ -182,150 +187,164 @@ fn autonomous_changed_files(path: &Path) -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let mut files = output
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| {
-            let line = String::from_utf8_lossy(line).trim_end().to_string();
-            if line.len() < 4 {
-                return None;
-            }
-            let value = line[3..].trim();
-            Some(
-                value
-                    .rsplit_once(" -> ")
-                    .map_or(value, |(_, renamed)| renamed)
-                    .to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    let mut skip_rename_source = false;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if skip_rename_source {
+            skip_rename_source = false;
+            continue;
+        }
+        if record.len() < 4 {
+            continue;
+        }
+        if matches!(record[0], b'R' | b'C') {
+            skip_rename_source = true;
+        }
+        files.push(String::from_utf8_lossy(&record[3..]).to_string());
+    }
     files.sort();
     files.dedup();
     Ok(files)
 }
 
-fn autonomous_patch_digest(path: &Path) -> Result<String, String> {
-    let diff = Command::new("git")
-        .args(["diff", "--binary", "HEAD", "--"])
-        .current_dir(path)
-        .output()
-        .map_err(|error| format!("could not calculate patch digest: {error}"))?;
-    if !diff.status.success() {
-        return Err(format!(
-            "could not calculate patch digest: {}",
-            String::from_utf8_lossy(&diff.stderr).trim()
-        ));
-    }
-    let status = Command::new("git")
-        .args(["status", "--porcelain=v1"])
-        .current_dir(path)
-        .output()
-        .map_err(|error| format!("could not calculate patch digest: {error}"))?;
-    let mut material = diff.stdout;
-    material.extend_from_slice(&status.stdout);
-    let untracked = Command::new("git")
-        .args(["ls-files", "--others", "--exclude-standard", "-z"])
-        .current_dir(path)
-        .output()
-        .map_err(|error| {
-            format!("could not enumerate untracked files for patch digest: {error}")
-        })?;
-    if !untracked.status.success() {
-        return Err(format!(
-            "could not enumerate untracked files for patch digest: {}",
-            String::from_utf8_lossy(&untracked.stderr).trim()
-        ));
-    }
-    for relative in untracked.stdout.split(|byte| *byte == 0) {
-        if relative.is_empty() {
-            continue;
-        }
-        material.extend_from_slice(relative);
-        material.push(0);
-        let file = path.join(String::from_utf8_lossy(relative).as_ref());
-        if file.is_file() {
-            material.extend_from_slice(&std::fs::read(&file).map_err(|error| {
-                format!("could not read untracked file for patch digest: {error}")
-            })?);
-        }
-    }
-    Ok(sha256_hex(&material))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutonomousPathState {
+    Missing,
+    File(Vec<u8>),
+    Symlink(Vec<u8>),
+    Other,
 }
 
-fn autonomous_patch_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let path_arg = path.to_string_lossy().into_owned();
-    let tracked = Command::new("git")
-        .args(["-C", path_arg.as_str(), "diff", "--binary", "--"])
-        .output()
-        .map_err(|error| format!("could not collect autonomous patch: {error}"))?;
-    if !tracked.status.success() {
-        return Err(format!(
-            "could not collect autonomous patch (git exited {})",
-            tracked.status
-        ));
-    }
-    let untracked = Command::new("git")
-        .args([
-            "-C",
-            path_arg.as_str(),
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "-z",
-        ])
-        .output()
-        .map_err(|error| format!("could not enumerate autonomous patch files: {error}"))?;
-    if !untracked.status.success() {
-        return Err(format!(
-            "could not enumerate autonomous patch files: {}",
-            untracked.status
-        ));
-    }
-    let mut patch = tracked.stdout;
-    for relative in untracked.stdout.split(|byte| *byte == 0).filter(|value| !value.is_empty()) {
-        let relative = String::from_utf8(relative.to_vec())
-            .map_err(|error| format!("autonomous patch path is not UTF-8: {error}"))?;
-        let output = Command::new("git")
-            .args([
-                "-C",
-                path_arg.as_str(),
-                "diff",
-                "--no-index",
-                "--binary",
-                "--",
-                "/dev/null",
-                relative.as_str(),
-            ])
-            .output()
-            .map_err(|error| format!("could not collect untracked autonomous patch: {error}"))?;
-        if !output.status.success() && output.status.code() != Some(1) {
-            return Err(format!(
-                "could not collect untracked autonomous patch: {}",
-                output.status
-            ));
+impl AutonomousPathState {
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Missing => b"missing".to_vec(),
+            Self::File(bytes) => bytes,
+            Self::Symlink(bytes) => [b"symlink:".as_slice(), &bytes].concat(),
+            Self::Other => b"other".to_vec(),
         }
-        patch.extend(output.stdout);
     }
-    Ok(patch)
 }
 
 #[derive(Default)]
 struct AutonomousWorkspaceBaseline {
-    files: HashMap<String, Option<Vec<u8>>>,
+    files: HashMap<String, Option<AutonomousPathState>>,
+}
+
+fn autonomous_safe_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(format!(
+            "autonomous workspace path escapes its root: '{relative}'"
+        ));
+    }
+    let components = relative_path.components().collect::<Vec<_>>();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        if index + 1 == components.len() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "autonomous workspace path traverses a symlink: '{relative}'"
+                ))
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(format!(
+                    "autonomous workspace path traverses a non-directory: '{relative}'"
+                ))
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect autonomous workspace path '{relative}': {error}"
+                ))
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn autonomous_path_state(root: &Path, relative: &str) -> Result<AutonomousPathState, String> {
+    let absolute = autonomous_safe_path(root, relative)?;
+    let metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AutonomousPathState::Missing)
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect autonomous path '{relative}': {error}"
+            ))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(absolute)
+            .map_err(|error| format!("could not read autonomous symlink '{relative}': {error}"))?;
+        return Ok(AutonomousPathState::Symlink(
+            target.to_string_lossy().as_bytes().to_vec(),
+        ));
+    }
+    if metadata.is_file() {
+        return Ok(AutonomousPathState::File(std::fs::read(absolute).map_err(
+            |error| format!("could not read autonomous file '{relative}': {error}"),
+        )?));
+    }
+    Ok(AutonomousPathState::Other)
+}
+
+fn autonomous_head_path_state(path: &Path, relative: &str) -> Result<AutonomousPathState, String> {
+    let tree = Command::new("git")
+        .args(["ls-tree", "-z", "HEAD", "--", relative])
+        .current_dir(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !tree.status.success() || tree.stdout.is_empty() {
+        return Ok(AutonomousPathState::Missing);
+    }
+    let record = tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .find(|record| !record.is_empty())
+        .unwrap_or_default();
+    let mode = record
+        .split(|byte| *byte == b' ')
+        .next()
+        .unwrap_or_default();
+    let show = Command::new("git")
+        .args(["show", &format!("HEAD:{relative}")])
+        .current_dir(path)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !show.status.success() {
+        return Err(format!("could not read HEAD state for '{relative}'"));
+    }
+    if mode == b"120000" {
+        Ok(AutonomousPathState::Symlink(show.stdout))
+    } else {
+        Ok(AutonomousPathState::File(show.stdout))
+    }
 }
 
 fn autonomous_workspace_baseline(path: &Path) -> Result<AutonomousWorkspaceBaseline, String> {
     let mut files = HashMap::new();
     for relative in autonomous_changed_files(path)? {
-        let absolute = path.join(&relative);
-        let contents = if absolute.is_file() {
-            Some(std::fs::read(&absolute).map_err(|error| {
-                format!("could not snapshot pre-node file '{relative}': {error}")
-            })?)
-        } else {
-            None
-        };
-        files.insert(relative, contents);
+        files.insert(
+            relative.clone(),
+            Some(autonomous_path_state(path, &relative)?),
+        );
     }
     Ok(AutonomousWorkspaceBaseline { files })
 }
@@ -337,21 +356,205 @@ fn autonomous_workspace_delta(
     let current = autonomous_changed_files(path)?;
     let mut paths = baseline.files.keys().cloned().collect::<HashSet<_>>();
     paths.extend(current);
-    let mut delta = paths
-        .into_iter()
-        .filter(|relative| {
-            let before = baseline.files.get(relative).cloned().unwrap_or(None);
-            let absolute = path.join(relative);
-            let after = if absolute.is_file() {
-                std::fs::read(&absolute).ok()
-            } else {
-                None
-            };
-            before != after
-        })
-        .collect::<Vec<_>>();
+    let mut delta = Vec::new();
+    for relative in paths {
+        let before = baseline
+            .files
+            .get(&relative)
+            .cloned()
+            .flatten()
+            .unwrap_or(autonomous_head_path_state(path, &relative)?);
+        let after = autonomous_path_state(path, &relative)?;
+        if before != after {
+            delta.push(relative);
+        }
+    }
     delta.sort();
     Ok(delta)
+}
+
+#[cfg(unix)]
+fn autonomous_create_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn autonomous_create_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::windows::fs::symlink_file(target, destination).map_err(|error| error.to_string())
+}
+
+fn autonomous_remove_path(root: &Path, relative: &str) -> Result<(), String> {
+    let absolute = autonomous_safe_path(root, relative)?;
+    let metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(absolute).map_err(|error| error.to_string())
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(absolute).map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn autonomous_restore_state(
+    root: &Path,
+    relative: &str,
+    state: &AutonomousPathState,
+) -> Result<(), String> {
+    let absolute = autonomous_safe_path(root, relative)?;
+    autonomous_remove_path(root, relative)?;
+    match state {
+        AutonomousPathState::Missing => Ok(()),
+        AutonomousPathState::File(bytes) => {
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(absolute, bytes).map_err(|error| error.to_string())
+        }
+        AutonomousPathState::Symlink(target) => {
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            autonomous_create_symlink(&String::from_utf8_lossy(target), &absolute)
+        }
+        AutonomousPathState::Other => {
+            Err(format!("unsupported autonomous path type for '{relative}'"))
+        }
+    }
+}
+
+fn autonomous_materialize_patch_state(
+    path: &Path,
+    state: &AutonomousPathState,
+) -> Result<bool, String> {
+    match state {
+        AutonomousPathState::Missing => Ok(false),
+        AutonomousPathState::File(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        AutonomousPathState::Symlink(target) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            autonomous_create_symlink(&String::from_utf8_lossy(target), path)?;
+            Ok(true)
+        }
+        AutonomousPathState::Other => Err("unsupported autonomous path type in patch".to_string()),
+    }
+}
+
+fn autonomous_rewrite_patch_paths(
+    patch: Vec<u8>,
+    relative: &str,
+    before_exists: bool,
+    after_exists: bool,
+) -> Vec<u8> {
+    let mut rewritten = Vec::new();
+    let mut first = true;
+    let mut old_header = false;
+    let mut new_header = false;
+    for line in patch.split_inclusive(|byte| *byte == b'\n') {
+        if first {
+            rewritten
+                .extend_from_slice(format!("diff --git a/{relative} b/{relative}\n").as_bytes());
+            first = false;
+        } else if line.starts_with(b"--- ") && !old_header {
+            rewritten.extend_from_slice(
+                if before_exists {
+                    format!("--- a/{relative}\n").into_bytes()
+                } else {
+                    b"--- /dev/null\n".to_vec()
+                }
+                .as_slice(),
+            );
+            old_header = true;
+        } else if line.starts_with(b"+++ ") && !new_header {
+            rewritten.extend_from_slice(
+                if after_exists {
+                    format!("+++ b/{relative}\n").into_bytes()
+                } else {
+                    b"+++ /dev/null\n".to_vec()
+                }
+                .as_slice(),
+            );
+            new_header = true;
+        } else {
+            rewritten.extend_from_slice(line);
+        }
+    }
+    rewritten
+}
+
+fn autonomous_patch_bytes_since_baseline(
+    path: &Path,
+    baseline: &AutonomousWorkspaceBaseline,
+) -> Result<Vec<u8>, String> {
+    let temp = std::env::temp_dir().join(format!(
+        "lm-autonomous-patch-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&temp)
+        .map_err(|error| format!("could not create autonomous patch staging directory: {error}"))?;
+    let mut patch = Vec::new();
+    for relative in autonomous_workspace_delta(path, baseline)? {
+        let before = baseline
+            .files
+            .get(&relative)
+            .cloned()
+            .flatten()
+            .unwrap_or(autonomous_head_path_state(path, &relative)?);
+        let after = autonomous_path_state(path, &relative)?;
+        if before == after {
+            continue;
+        }
+        let before_path = temp.join("before").join(&relative);
+        let after_path = autonomous_safe_path(path, &relative)?;
+        let before_exists = autonomous_materialize_patch_state(&before_path, &before)?;
+        let after_exists = !matches!(after, AutonomousPathState::Missing);
+        let before_arg = if before_exists {
+            before_path.to_string_lossy().into_owned()
+        } else {
+            "/dev/null".to_string()
+        };
+        let after_arg = if after_exists {
+            after_path.to_string_lossy().into_owned()
+        } else {
+            "/dev/null".to_string()
+        };
+        let output = Command::new("git")
+            .args([
+                "diff",
+                "--no-index",
+                "--binary",
+                "--no-prefix",
+                "--",
+                &before_arg,
+                &after_arg,
+            ])
+            .output()
+            .map_err(|error| format!("could not collect exact autonomous patch: {error}"))?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(format!(
+                "could not collect exact autonomous patch for '{relative}'"
+            ));
+        }
+        patch.extend(autonomous_rewrite_patch_paths(
+            output.stdout,
+            &relative,
+            before_exists,
+            after_exists,
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+    Ok(patch)
 }
 
 fn autonomous_restore_baseline_path(
@@ -359,17 +562,8 @@ fn autonomous_restore_baseline_path(
     relative: &str,
     baseline: &AutonomousWorkspaceBaseline,
 ) -> Result<(), String> {
-    let absolute = path.join(relative);
-    if let Some(contents) = baseline.files.get(relative).cloned().flatten() {
-        if let Some(parent) = absolute.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                format!("could not recreate parent for unauthorized file '{relative}': {error}")
-            })?;
-        }
-        std::fs::write(&absolute, contents).map_err(|error| {
-            format!("could not restore unauthorized file '{relative}': {error}")
-        })?;
-        return Ok(());
+    if let Some(Some(state)) = baseline.files.get(relative) {
+        return autonomous_restore_state(path, relative, state);
     }
     let tracked = Command::new("git")
         .args(["ls-files", "--error-unmatch", "--", relative])
@@ -379,7 +573,14 @@ fn autonomous_restore_baseline_path(
         .unwrap_or(false);
     if tracked {
         let restored = Command::new("git")
-            .args(["restore", "--source=HEAD", "--staged", "--worktree", "--", relative])
+            .args([
+                "restore",
+                "--source=HEAD",
+                "--staged",
+                "--worktree",
+                "--",
+                relative,
+            ])
             .current_dir(path)
             .output()
             .map_err(|error| format!("could not restore tracked file '{relative}': {error}"))?;
@@ -389,14 +590,8 @@ fn autonomous_restore_baseline_path(
                 String::from_utf8_lossy(&restored.stderr).trim()
             ));
         }
-    } else if absolute.is_file() || absolute.is_symlink() {
-        std::fs::remove_file(&absolute).map_err(|error| {
-            format!("could not remove unauthorized file '{relative}': {error}")
-        })?;
-    } else if absolute.is_dir() {
-        std::fs::remove_dir_all(&absolute).map_err(|error| {
-            format!("could not remove unauthorized directory '{relative}': {error}")
-        })?;
+    } else {
+        autonomous_remove_path(path, relative)?;
     }
     Ok(())
 }
@@ -1703,6 +1898,10 @@ struct FrozenAutonomousNode {
     #[serde(default)]
     execution_placement: Option<serde_json::Value>,
     #[serde(default)]
+    requested_execution_placement: Option<serde_json::Value>,
+    #[serde(default)]
+    placement_fulfilled: bool,
+    #[serde(default)]
     execution_requirements: Option<serde_json::Value>,
     #[serde(default)]
     budget: Option<serde_json::Value>,
@@ -1712,6 +1911,40 @@ struct FrozenAutonomousNode {
     repair_of: Option<String>,
     #[serde(default)]
     mutation_revision: Option<String>,
+}
+
+fn consumed_placement_node(
+    node: &FrozenAutonomousNode,
+    placement_kind: &str,
+) -> FrozenAutonomousNode {
+    let mut placed = node.clone();
+    let requested = placed.execution_placement.clone();
+    let isolation = if placement_kind == "docker" {
+        "shared".to_string()
+    } else {
+        placed.isolation.clone()
+    };
+    let mut requirements = placed.execution_requirements.clone();
+    if let Some(object) = requirements
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        object.insert("isolation".to_string(), serde_json::json!(isolation));
+    }
+    placed.dependencies.clear();
+    placed.isolation = isolation;
+    placed.execution_requirements = requirements;
+    placed.requested_execution_placement = requested.clone();
+    placed.placement_fulfilled = true;
+    placed.execution_placement = Some(serde_json::json!({
+        "kind": "local",
+        "targetId": "local",
+        "nodeId": placed.node_id,
+        "reason": format!("already fulfilled by {placement_kind} placement executor"),
+        "requestedPlacement": requested,
+        "placementFulfilled": true
+    }));
+    placed
 }
 
 fn autonomous_plan_value(snapshot: &recipes::AutonomousTaskSnapshot) -> Option<serde_json::Value> {
@@ -1853,6 +2086,21 @@ fn validate_autonomous_nodes(
                     node.node_id
                 ));
             }
+            if node.placement_fulfilled && matches!(kind, "docker" | "remote_node") {
+                return Err(format!(
+                    "autonomous node '{}' attempted a second external placement after placement was fulfilled",
+                    node.node_id
+                ));
+            }
+            if node.placement_fulfilled && node.requested_execution_placement.is_none() {
+                return Err(format!(
+                    "autonomous node '{}' marked placement fulfilled without placement provenance",
+                    node.node_id
+                ));
+            }
+        }
+        if node.placement_fulfilled && node.execution_placement.is_none() {
+            return Err(format!("autonomous node '{}' marked placement fulfilled without a receiver execution contract", node.node_id));
         }
     }
     Ok(nodes)
@@ -1872,8 +2120,7 @@ fn autonomous_depends_on(
         return false;
     };
     let found = node.dependencies.iter().any(|dependency| {
-        dependency == ancestor_id
-            || autonomous_depends_on(by_id, dependency, ancestor_id, visiting)
+        dependency == ancestor_id || autonomous_depends_on(by_id, dependency, ancestor_id, visiting)
     });
     visiting.remove(node_id);
     found
@@ -1931,6 +2178,82 @@ fn validate_autonomous_terminal_contract(nodes: &[FrozenAutonomousNode]) -> Resu
                     mutation.node_id, review.node_id
                 ));
             }
+        }
+    }
+    let terminal_verifications = verifications
+        .iter()
+        .copied()
+        .filter(|verification| {
+            !verifications.iter().any(|other| {
+                other.node_id != verification.node_id
+                    && autonomous_depends_on(
+                        &by_id,
+                        &other.node_id,
+                        &verification.node_id,
+                        &mut HashSet::new(),
+                    )
+            })
+        })
+        .collect::<Vec<_>>();
+    let terminal_reviews = reviews
+        .iter()
+        .copied()
+        .filter(|review| {
+            !reviews.iter().any(|other| {
+                other.node_id != review.node_id
+                    && autonomous_depends_on(
+                        &by_id,
+                        &other.node_id,
+                        &review.node_id,
+                        &mut HashSet::new(),
+                    )
+            })
+        })
+        .collect::<Vec<_>>();
+    for mutation in nodes
+        .iter()
+        .filter(|node| matches!(node.task_class.as_str(), "implementation" | "integration"))
+    {
+        if !terminal_verifications.iter().any(|verification| {
+            autonomous_depends_on(
+                &by_id,
+                &verification.node_id,
+                &mutation.node_id,
+                &mut HashSet::new(),
+            )
+        }) {
+            return Err(format!(
+                "mutating node '{}' is not covered by final verification evidence",
+                mutation.node_id
+            ));
+        }
+        if !terminal_reviews.iter().any(|review| {
+            autonomous_depends_on(
+                &by_id,
+                &review.node_id,
+                &mutation.node_id,
+                &mut HashSet::new(),
+            )
+        }) {
+            return Err(format!(
+                "mutating node '{}' is not covered by final review evidence",
+                mutation.node_id
+            ));
+        }
+    }
+    for delivery in nodes.iter().filter(|node| node.task_class == "delivery") {
+        if !terminal_reviews.iter().any(|review| {
+            autonomous_depends_on(
+                &by_id,
+                &delivery.node_id,
+                &review.node_id,
+                &mut HashSet::new(),
+            )
+        }) {
+            return Err(format!(
+                "delivery node '{}' must depend on final review evidence",
+                delivery.node_id
+            ));
         }
     }
     Ok(())
@@ -2030,7 +2353,7 @@ fn autonomous_repair_sources(
         }
         pending.extend(node.dependencies.iter().cloned());
     }
-    if sources.is_empty() {
+    if !integrations.is_empty() {
         integrations
     } else {
         sources
@@ -2054,6 +2377,31 @@ fn schedule_autonomous_repair(
     if repair_sources.is_empty() {
         return Ok(false);
     }
+    if !matches!(
+        failed_node.task_class.as_str(),
+        "implementation" | "integration"
+    ) {
+        let placement_keys = repair_sources
+            .iter()
+            .map(|source| {
+                let placement = source.execution_placement.as_ref();
+                format!(
+                    "{}:{}",
+                    placement
+                        .and_then(|value| value.get("kind"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("local"),
+                    placement
+                        .and_then(|value| value.get("targetId"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("local")
+                )
+            })
+            .collect::<HashSet<_>>();
+        if placement_keys.len() > 1 {
+            return Ok(false);
+        }
+    }
     let mut repair_scope = HashSet::new();
     for source in &repair_sources {
         repair_scope.extend(source.mutation_scope.iter().cloned());
@@ -2064,7 +2412,10 @@ fn schedule_autonomous_repair(
     let source = repair_sources
         .first()
         .ok_or_else(|| "autonomous repair has no mutating causal ancestor".to_string())?;
-    let placement = if matches!(failed_node.task_class.as_str(), "implementation" | "integration") {
+    let placement = if matches!(
+        failed_node.task_class.as_str(),
+        "implementation" | "integration"
+    ) {
         failed_node.execution_placement.clone()
     } else {
         source.execution_placement.clone()
@@ -2147,6 +2498,8 @@ fn schedule_autonomous_repair(
         relevant_files: failed_node.relevant_files.clone(),
         capabilities,
         execution_placement: placement,
+        requested_execution_placement: None,
+        placement_fulfilled: false,
         execution_requirements,
         budget: failed_node.budget.clone(),
         upstream_decisions: failed_node.upstream_decisions.clone(),
@@ -2215,11 +2568,19 @@ fn frozen_autonomous_nodes(
 ) -> Result<Vec<FrozenAutonomousNode>, String> {
     if let Some(plan) = autonomous_plan_value(snapshot) {
         let nodes = validate_autonomous_plan(&serde_json::json!({ "plan": plan }))?;
-        if snapshot
-            .execution_owner
-            .as_ref()
-            .is_none_or(|owner| owner.kind != "remote")
-        {
+        let placement_child = nodes.len() == 1
+            && snapshot
+                .execution_owner
+                .as_ref()
+                .is_some_and(|owner| owner.kind == "remote")
+            && nodes[0].placement_fulfilled
+            && nodes[0]
+                .execution_placement
+                .as_ref()
+                .is_some_and(|placement| {
+                    placement.get("kind").and_then(|value| value.as_str()) == Some("local")
+                });
+        if !placement_child {
             validate_autonomous_terminal_contract(&nodes)?;
         }
         return Ok(nodes);
@@ -2235,6 +2596,8 @@ fn frozen_autonomous_nodes(
         relevant_files: Vec::new(),
         capabilities: vec!["read".to_string()],
         execution_placement: Some(serde_json::json!({ "kind": "local", "targetId": "local", "nodeId": "planner" })),
+        requested_execution_placement: None,
+        placement_fulfilled: false,
         execution_requirements: None,
         budget: None,
         upstream_decisions: Vec::new(),
@@ -2879,10 +3242,7 @@ async fn run_autonomous_verification(
     Ok(())
 }
 
-fn autonomous_node_evidence(
-    run_id: &str,
-    node_id: &str,
-) -> Result<Vec<serde_json::Value>, String> {
+fn autonomous_node_evidence(run_id: &str, node_id: &str) -> Result<Vec<serde_json::Value>, String> {
     let ledger = autonomous_ledger()?;
     let events = ledger
         .load_events(run_id, 0, 10_000)
@@ -2894,12 +3254,17 @@ fn autonomous_node_evidence(
                 event_type,
                 payload,
                 ..
-            } if matches!(event_type.as_str(), "verification_evidence" | "review_evidence")
-                && payload
-                    .get("node_id")
-                    .or_else(|| payload.get("nodeId"))
-                    .and_then(|value| value.as_str())
-                    == Some(node_id) => Some(payload),
+            } if matches!(
+                event_type.as_str(),
+                "verification_evidence" | "review_evidence"
+            ) && payload
+                .get("node_id")
+                .or_else(|| payload.get("nodeId"))
+                .and_then(|value| value.as_str())
+                == Some(node_id) =>
+            {
+                Some(payload)
+            }
             _ => None,
         })
         .collect())
@@ -2925,7 +3290,10 @@ fn autonomous_authoritative_evidence_gate(
         let evidence = autonomous_node_evidence(&recorder.run_id(), &node.node_id)?;
         let mut latest = HashMap::<String, (u64, serde_json::Value)>::new();
         for payload in evidence.into_iter().filter(|payload| {
-            payload.get("authoritative").and_then(|value| value.as_bool()) == Some(true)
+            payload
+                .get("authoritative")
+                .and_then(|value| value.as_bool())
+                == Some(true)
         }) {
             let key = payload
                 .get("command_digest")
@@ -2988,6 +3356,7 @@ async fn execute_autonomous_docker_node(
     node: &FrozenAutonomousNode,
     objective: &str,
     before_revision: &str,
+    baseline: &AutonomousWorkspaceBaseline,
     workspace_root: &Path,
     run_spec: &RunSpec,
 ) -> Result<serde_json::Value, String> {
@@ -2996,7 +3365,12 @@ async fn execute_autonomous_docker_node(
         .as_ref()
         .and_then(|placement| placement.get("targetId"))
         .and_then(|value| value.as_str())
-        .ok_or_else(|| format!("autonomous Docker node '{}' has no image target", node.node_id))?;
+        .ok_or_else(|| {
+            format!(
+                "autonomous Docker node '{}' has no image target",
+                node.node_id
+            )
+        })?;
     if image.starts_with('-') {
         return Err("autonomous Docker image cannot start with '-'".to_string());
     }
@@ -3006,6 +3380,7 @@ async fn execute_autonomous_docker_node(
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("Could not create Docker placement directory: {error}"))?;
     let spec_path = directory.join(format!("docker-{}.json", uuid::Uuid::new_v4()));
+    let child_node = consumed_placement_node(node, "docker");
     let mut docker_spec = run_spec.clone();
     docker_spec.run_id = format!("{}-{}", snapshot.task_id, node.node_id);
     docker_spec.idempotency_key = format!("autonomous-placement/{}", docker_spec.run_id);
@@ -3034,7 +3409,7 @@ async fn execute_autonomous_docker_node(
             "objective": node.objective,
             "source": snapshot.source,
             "workspaceRevision": before_revision,
-            "plan": { "planId": format!("docker-{}", docker_spec.run_id), "strategy": "PLAN", "nodes": [node], "createdAtMs": unix_time_ms()?, "revision": 1, "rationale": "Docker autonomous node placement" },
+            "plan": { "planId": format!("docker-{}", docker_spec.run_id), "strategy": "PLAN", "nodes": [child_node], "createdAtMs": unix_time_ms()?, "revision": 1, "rationale": "Docker autonomous node placement" },
             "outcome": "RUNNING"
         },
         "completed_nodes": [],
@@ -3093,13 +3468,9 @@ async fn execute_autonomous_docker_node(
         return Ok(result);
     }
     let after_revision = autonomous_workspace_revision(workspace_root)?;
-    let changed_files = autonomous_changed_files(workspace_root)?;
-    let patch_bytes = autonomous_patch_bytes(workspace_root)?;
-    let patch_digest = if patch_bytes.is_empty() {
-        autonomous_patch_digest(workspace_root)?
-    } else {
-        sha256_hex(&patch_bytes)
-    };
+    let changed_files = autonomous_workspace_delta(workspace_root, baseline)?;
+    let patch_bytes = autonomous_patch_bytes_since_baseline(workspace_root, baseline)?;
+    let patch_digest = sha256_hex(&patch_bytes);
     object.insert("changedFiles".to_string(), serde_json::json!(changed_files));
     object.insert(
         "workspaceRevision".to_string(),
@@ -3272,7 +3643,9 @@ async fn run_autonomous_task_executor(
                     .and_then(|value| value.get("diffDigest").or_else(|| value.get("diff_digest")))
                     .and_then(|value| value.as_str())
                     .ok_or_else(|| {
-                        format!("recovered worker '{node_id}' omitted its frozen worktree diff digest")
+                        format!(
+                            "recovered worker '{node_id}' omitted its frozen worktree diff digest"
+                        )
                     })?;
                 if status.patch_digest != expected_worktree_digest {
                     return Err(format!(
@@ -3282,7 +3655,11 @@ async fn run_autonomous_task_executor(
                 }
                 if let Some(expected_mutation_digest) = worker
                     .get("mutation")
-                    .and_then(|value| value.get("patchDigest").or_else(|| value.get("patch_digest")))
+                    .and_then(|value| {
+                        value
+                            .get("patchDigest")
+                            .or_else(|| value.get("patch_digest"))
+                    })
                     .and_then(|value| value.as_str())
                 {
                     if expected_mutation_digest != status.patch_digest {
@@ -3411,7 +3788,8 @@ async fn run_autonomous_task_executor(
                                 &worker_data_root,
                                 workspace_root,
                             )?;
-                            let worker_state = crate::build_state(&Some(PathBuf::from(&record.path)))?;
+                            let worker_state =
+                                crate::build_state(&Some(PathBuf::from(&record.path)))?;
                             let changed = autonomous_phase(
                                 &worker_snapshot,
                                 recorder,
@@ -3523,11 +3901,11 @@ async fn run_autonomous_task_executor(
                     )?);
                 }
                 let after_revision = autonomous_workspace_revision(workspace_root)?;
-                let actual_changed = autonomous_changed_files(workspace_root)?;
+                let actual_changed = changed.clone();
                 changed.extend(actual_changed.clone());
                 changed.sort();
                 changed.dedup();
-                let patch_digest = autonomous_patch_digest(workspace_root)?;
+                let patch_digest = sha256_hex(actual_changed.join("\n").as_bytes());
                 completed.insert(node.node_id.clone());
                 files_changed.extend(changed);
                 files_changed.sort();
@@ -3574,12 +3952,7 @@ async fn run_autonomous_task_executor(
         let node = node.clone();
         next_hint = None;
         if node.task_class == "delivery" {
-            autonomous_authoritative_evidence_gate(
-                recorder,
-                &nodes,
-                &completed,
-                workspace_root,
-            )?;
+            autonomous_authoritative_evidence_gate(recorder, &nodes, &completed, workspace_root)?;
         }
         validate_autonomous_node_capabilities(&effective_snapshot, &node, run_spec)?;
         let node_objective = format!(
@@ -3609,14 +3982,7 @@ async fn run_autonomous_task_executor(
             }),
         )?;
         let before_revision = autonomous_workspace_revision(workspace_root)?;
-        let mutation_baseline = if matches!(
-            node.task_class.as_str(),
-            "implementation" | "integration"
-        ) {
-            Some(autonomous_workspace_baseline(workspace_root)?)
-        } else {
-            None
-        };
+        let node_baseline = autonomous_workspace_baseline(workspace_root)?;
         let placement_result = if let Some(placement) = &node.execution_placement {
             let kind = placement
                 .get("kind")
@@ -3633,6 +3999,7 @@ async fn run_autonomous_task_executor(
                         )
                     })?;
                 let remote_run_id = format!("{}-{}", effective_snapshot.task_id, node.node_id);
+                let child_node = consumed_placement_node(&node, "remote_node");
                 let mut remote_spec = run_spec.clone();
                 remote_spec.run_id = remote_run_id.clone();
                 remote_spec.idempotency_key = format!("autonomous-placement/{remote_run_id}");
@@ -3658,7 +4025,7 @@ async fn run_autonomous_task_executor(
                         "objective": node.objective,
                         "source": effective_snapshot.source,
                         "workspaceRevision": before_revision,
-                        "plan": { "planId": format!("remote-{remote_run_id}"), "strategy": "PLAN", "nodes": [node], "createdAtMs": unix_time_ms()?, "revision": 1, "rationale": "Remote autonomous node placement" },
+                        "plan": { "planId": format!("remote-{remote_run_id}"), "strategy": "PLAN", "nodes": [child_node], "createdAtMs": unix_time_ms()?, "revision": 1, "rationale": "Remote autonomous node placement" },
                         "outcome": "RUNNING"
                     },
                     "completed_nodes": [],
@@ -3821,6 +4188,7 @@ async fn run_autonomous_task_executor(
                     &node,
                     &node_objective,
                     &before_revision,
+                    &node_baseline,
                     workspace_root,
                     run_spec,
                 )
@@ -3834,7 +4202,9 @@ async fn run_autonomous_task_executor(
                                 .unwrap_or("Docker autonomous node returned an unsuccessful result")
                                 .to_string());
                         }
-                        if let Some(evidence) = result.get("evidence").and_then(|value| value.as_array()) {
+                        if let Some(evidence) =
+                            result.get("evidence").and_then(|value| value.as_array())
+                        {
                             for item in evidence {
                                 let mut payload = item.clone();
                                 if let Some(object) = payload.as_object_mut() {
@@ -3935,11 +4305,14 @@ async fn run_autonomous_task_executor(
                 &after_revision,
                 &completed,
             );
+            let planner_changed = autonomous_workspace_delta(workspace_root, &node_baseline)?;
+            let planner_patch =
+                autonomous_patch_bytes_since_baseline(workspace_root, &node_baseline)?;
             autonomous_task_event(
                 recorder,
                 &effective_snapshot.task_id,
                 "node_mutation",
-                serde_json::json!({ "node_id": node.node_id, "before_revision": before_revision, "after_revision": after_revision, "changed_files": autonomous_changed_files(workspace_root)?, "patch_digest": autonomous_patch_digest(workspace_root)?, "timestamp_ms": unix_time_ms()?, "mutation": false }),
+                serde_json::json!({ "node_id": node.node_id, "before_revision": before_revision, "after_revision": after_revision, "changed_files": planner_changed, "patch_digest": sha256_hex(&planner_patch), "timestamp_ms": unix_time_ms()?, "mutation": false }),
             )?;
             autonomous_task_event(
                 recorder,
@@ -4126,8 +4499,10 @@ async fn run_autonomous_task_executor(
                 }
             }
         };
-        if let Some(baseline) = mutation_baseline.as_ref() {
-            if let Err(error) = enforce_autonomous_mutation_scope(workspace_root, baseline, &node) {
+        if matches!(node.task_class.as_str(), "implementation" | "integration") {
+            if let Err(error) =
+                enforce_autonomous_mutation_scope(workspace_root, &node_baseline, &node)
+            {
                 if schedule_autonomous_repair(
                     &mut effective_snapshot,
                     &mut nodes,
@@ -4211,7 +4586,7 @@ async fn run_autonomous_task_executor(
             )?;
         }
         let after_revision = autonomous_workspace_revision(workspace_root)?;
-        let actual_changed = autonomous_changed_files(workspace_root)?;
+        let actual_changed = autonomous_workspace_delta(workspace_root, &node_baseline)?;
         if !matches!(
             node.task_class.as_str(),
             "implementation" | "integration" | "delivery"
@@ -4255,10 +4630,10 @@ async fn run_autonomous_task_executor(
         mutation_files.extend(changed.clone());
         mutation_files.sort();
         mutation_files.dedup();
-        let mut patch_digest = autonomous_patch_digest(workspace_root)?;
+        let patch_bytes = autonomous_patch_bytes_since_baseline(workspace_root, &node_baseline)?;
+        let mut patch_digest = sha256_hex(&patch_bytes);
         let mut result_artifacts = Vec::new();
         if node.task_class == "implementation" || node.task_class == "integration" {
-            let patch_bytes = autonomous_patch_bytes(workspace_root)?;
             if !patch_bytes.is_empty() {
                 patch_digest = sha256_hex(&patch_bytes);
                 let app_data = crate::app_data_dir().ok_or_else(|| {
@@ -5098,7 +5473,9 @@ mod tests {
                     "isolation": "worktree",
                     "relevantFiles": ["src/module.ts"],
                     "capabilities": ["read", "mutate"],
-                    "executionPlacement": { "kind": "worktree", "targetId": "local", "nodeId": "implement" },
+                    "executionPlacement": { "kind": "local", "targetId": "local", "nodeId": "implement", "requestedPlacement": { "kind": "worktree", "targetId": "local", "nodeId": "implement" }, "placementFulfilled": true },
+                    "requestedExecutionPlacement": { "kind": "worktree", "targetId": "local", "nodeId": "implement" },
+                    "placementFulfilled": true,
                     "executionRequirements": { "needsWorkspaceWrite": true, "needsNetwork": false, "isolation": "worktree" },
                     "budget": { "maxModelCalls": 4 },
                     "upstreamDecisions": ["decision-1"],
@@ -5136,6 +5513,8 @@ mod tests {
                 vec!["read".to_string(), "verify".to_string()]
             },
             execution_placement: None,
+            requested_execution_placement: None,
+            placement_fulfilled: false,
             execution_requirements: None,
             budget: None,
             upstream_decisions: Vec::new(),
@@ -5151,6 +5530,42 @@ mod tests {
         assert!(validate_autonomous_nodes(vec![node])
             .unwrap_err()
             .contains("non-mutating"));
+    }
+
+    #[test]
+    fn consumed_external_placement_is_local_on_the_receiving_executor() {
+        let mut node = test_node("implement", "implementation", Vec::new());
+        node.isolation = "worktree".to_string();
+        node.execution_placement = Some(
+            serde_json::json!({ "kind": "docker", "targetId": "runner", "nodeId": "implement" }),
+        );
+        let child = consumed_placement_node(&node, "docker");
+        assert_eq!(child.isolation, "shared");
+        assert_eq!(
+            child
+                .execution_placement
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(|value| value.as_str()),
+            Some("local")
+        );
+        assert_eq!(
+            child.requested_execution_placement,
+            node.execution_placement
+        );
+        assert!(child.placement_fulfilled);
+    }
+
+    #[test]
+    fn terminal_contract_rejects_mutation_branch_not_reaching_final_barrier() {
+        let nodes = vec![
+            test_node("unconnected", "implementation", Vec::new()),
+            test_node("integrate", "integration", Vec::new()),
+            test_node("verify", "verification", vec!["integrate"]),
+            test_node("review", "review", vec!["verify"]),
+        ];
+        let error = validate_autonomous_terminal_contract(&nodes).unwrap_err();
+        assert!(error.contains("unconnected"), "{error}");
     }
 
     #[test]

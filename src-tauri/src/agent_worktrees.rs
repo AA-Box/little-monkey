@@ -86,6 +86,10 @@ pub struct WorkspaceSnapshot {
 struct WorkspaceSnapshotEntry {
     path: String,
     existed: bool,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    symlink_target: Option<String>,
 }
 
 fn base_dir(data_root: &Path) -> PathBuf {
@@ -122,31 +126,178 @@ fn relative_path(value: &str) -> Result<PathBuf, String> {
 }
 
 fn workspace_changed_files(root: &Path) -> Result<Vec<String>, String> {
-    let porcelain = run_git_ok(root, &["status", "--porcelain=v1"])?;
-    let mut files = porcelain
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 4 {
-                return None;
-            }
-            let value = line[3..].trim();
-            if value.ends_with(MARKER_FILE) {
-                return None;
-            }
-            Some(
-                value
-                    .rsplit_once(" -> ")
-                    .map_or(value, |(_, renamed)| renamed)
-                    .to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let output = run_git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut files = Vec::new();
+    let mut skip_rename_source = false;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if skip_rename_source {
+            skip_rename_source = false;
+            continue;
+        }
+        if record.len() < 4 {
+            continue;
+        }
+        if matches!(record[0], b'R' | b'C') {
+            skip_rename_source = true;
+        }
+        let value = String::from_utf8_lossy(&record[3..]).to_string();
+        if value != MARKER_FILE {
+            files.push(value);
+        }
+    }
     files.sort();
     files.dedup();
     Ok(files)
 }
 
-fn snapshot_entries(data_root: &Path, snapshot_id: &str) -> Result<(PathBuf, Vec<WorkspaceSnapshotEntry>), String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkspacePathState {
+    Missing,
+    File(Vec<u8>),
+    Symlink(Vec<u8>),
+    Other,
+}
+
+impl WorkspacePathState {
+    fn bytes(self) -> Vec<u8> {
+        match self {
+            Self::Missing => b"missing".to_vec(),
+            Self::File(bytes) => bytes,
+            Self::Symlink(bytes) => [b"symlink:".as_slice(), &bytes].concat(),
+            Self::Other => b"other".to_vec(),
+        }
+    }
+}
+
+fn safe_workspace_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative = relative_path(relative)?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        if index + 1 == components.len() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "Workspace path traverses a symlink: '{relative:?}'"
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(format!(
+                        "Workspace path traverses a non-directory: '{relative:?}'"
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Could not inspect workspace path: {error}")),
+        }
+    }
+    Ok(current)
+}
+
+fn workspace_path_state(root: &Path, relative: &str) -> Result<WorkspacePathState, String> {
+    let absolute = safe_workspace_path(root, relative)?;
+    let metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WorkspacePathState::Missing);
+        }
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect workspace path '{relative}': {error}"
+            ))
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let target = std::fs::read_link(&absolute)
+            .map_err(|error| format!("Could not read workspace symlink '{relative}': {error}"))?;
+        return Ok(WorkspacePathState::Symlink(
+            target.to_string_lossy().as_bytes().to_vec(),
+        ));
+    }
+    if metadata.is_file() {
+        return Ok(WorkspacePathState::File(std::fs::read(&absolute).map_err(
+            |error| format!("Could not read workspace file '{relative}': {error}"),
+        )?));
+    }
+    Ok(WorkspacePathState::Other)
+}
+
+fn remove_workspace_path(root: &Path, relative: &str) -> Result<(), String> {
+    let absolute = safe_workspace_path(root, relative)?;
+    let metadata = match std::fs::symlink_metadata(&absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "Could not inspect workspace path '{relative}': {error}"
+            ))
+        }
+    };
+    if metadata.file_type().is_symlink() || metadata.is_file() {
+        std::fs::remove_file(&absolute).map_err(|error| error.to_string())
+    } else if metadata.is_dir() {
+        std::fs::remove_dir_all(&absolute).map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn create_workspace_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(target, destination).map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn create_workspace_symlink(target: &str, destination: &Path) -> Result<(), String> {
+    std::os::windows::fs::symlink_file(target, destination).map_err(|error| error.to_string())
+}
+
+fn restore_workspace_state(
+    root: &Path,
+    relative: &str,
+    state: &WorkspacePathState,
+) -> Result<(), String> {
+    let absolute = safe_workspace_path(root, relative)?;
+    remove_workspace_path(root, relative)?;
+    match state {
+        WorkspacePathState::Missing => Ok(()),
+        WorkspacePathState::File(bytes) => {
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(absolute, bytes).map_err(|error| error.to_string())
+        }
+        WorkspacePathState::Symlink(target) => {
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let target = String::from_utf8_lossy(target);
+            create_workspace_symlink(&target, &absolute)
+        }
+        WorkspacePathState::Other => {
+            Err(format!("Unsupported workspace path type for '{relative}'"))
+        }
+    }
+}
+
+fn snapshot_entries(
+    data_root: &Path,
+    snapshot_id: &str,
+) -> Result<(PathBuf, Vec<WorkspaceSnapshotEntry>), String> {
     let dir = snapshot_dir(data_root, snapshot_id)?;
     let raw = std::fs::read_to_string(dir.join("entries.json"))
         .map_err(|error| format!("Could not read workspace snapshot: {error}"))?;
@@ -168,22 +319,33 @@ pub fn snapshot(data_root: &Path, workspace_root: &Path) -> Result<WorkspaceSnap
     let mut entries = Vec::new();
     for relative in &changed_files {
         let relative_path = relative_path(relative)?;
-        let source = root.join(&relative_path);
-        let existed = source.is_file();
-        if existed {
-            let destination = files_dir.join(&relative_path);
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    format!("Could not create snapshot parent for '{relative}': {error}")
+        let state = workspace_path_state(&root, relative)?;
+        let (existed, kind, symlink_target) = match state {
+            WorkspacePathState::Missing => (false, "missing".to_string(), None),
+            WorkspacePathState::File(bytes) => {
+                let destination = files_dir.join(&relative_path);
+                if let Some(parent) = destination.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| {
+                        format!("Could not create snapshot parent for '{relative}': {error}")
+                    })?;
+                }
+                std::fs::write(destination, bytes).map_err(|error| {
+                    format!("Could not snapshot workspace file '{relative}': {error}")
                 })?;
+                (true, "file".to_string(), None)
             }
-            std::fs::copy(&source, &destination).map_err(|error| {
-                format!("Could not snapshot workspace file '{relative}': {error}")
-            })?;
-        }
+            WorkspacePathState::Symlink(target) => (
+                true,
+                "symlink".to_string(),
+                Some(String::from_utf8_lossy(&target).to_string()),
+            ),
+            WorkspacePathState::Other => (true, "other".to_string(), None),
+        };
         entries.push(WorkspaceSnapshotEntry {
             path: relative.clone(),
             existed,
+            kind,
+            symlink_target,
         });
     }
     let entries_json = serde_json::to_vec(&entries).map_err(|error| error.to_string())?;
@@ -207,21 +369,219 @@ pub fn changed_files_since_snapshot(
         .canonicalize()
         .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
     let current = workspace_changed_files(&root)?;
-    let mut paths = entries.iter().map(|entry| entry.path.clone()).collect::<HashSet<_>>();
+    let mut paths = entries
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
     paths.extend(current);
-    let mut changed = paths
-        .into_iter()
-        .filter(|relative| {
-            let before_entry = entries.iter().find(|entry| entry.path == *relative);
-            let before = before_entry.and_then(|entry| {
-                entry.existed.then(|| std::fs::read(dir.join("files").join(relative)).ok())
-            }).flatten();
-            let after = std::fs::read(root.join(relative)).ok();
-            before != after
-        })
-        .collect::<Vec<_>>();
+    let mut changed = Vec::new();
+    for relative in paths {
+        let before_entry = entries.iter().find(|entry| entry.path == relative);
+        let before = before_entry
+            .map(|entry| {
+                if !entry.existed {
+                    WorkspacePathState::Missing
+                } else if entry.kind == "symlink" {
+                    WorkspacePathState::Symlink(
+                        entry
+                            .symlink_target
+                            .clone()
+                            .unwrap_or_default()
+                            .into_bytes(),
+                    )
+                } else if entry.kind == "other" {
+                    WorkspacePathState::Other
+                } else {
+                    WorkspacePathState::File(
+                        std::fs::read(dir.join("files").join(&relative)).unwrap_or_default(),
+                    )
+                }
+            })
+            .unwrap_or(WorkspacePathState::Missing);
+        let after = workspace_path_state(&root, &relative)?;
+        if before != after {
+            changed.push(relative);
+        }
+    }
     changed.sort();
     Ok(changed)
+}
+
+fn git_head_state(root: &Path, relative: &str) -> Result<WorkspacePathState, String> {
+    let tree = run_git(root, &["ls-tree", "-z", "HEAD", "--", relative])?;
+    if !tree.status.success() || tree.stdout.is_empty() {
+        return Ok(WorkspacePathState::Missing);
+    }
+    let record = tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .find(|record| !record.is_empty())
+        .unwrap_or_default();
+    let mode = record
+        .split(|byte| *byte == b' ')
+        .next()
+        .unwrap_or_default();
+    let bytes = run_git(root, &["show", &format!("HEAD:{relative}")])?;
+    if !bytes.status.success() {
+        return Err(format!("Could not read HEAD state for '{relative}'"));
+    }
+    if mode == b"120000" {
+        Ok(WorkspacePathState::Symlink(bytes.stdout))
+    } else {
+        Ok(WorkspacePathState::File(bytes.stdout))
+    }
+}
+
+fn materialize_patch_state(path: &Path, state: &WorkspacePathState) -> Result<bool, String> {
+    match state {
+        WorkspacePathState::Missing => Ok(false),
+        WorkspacePathState::File(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            std::fs::write(path, bytes).map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+        WorkspacePathState::Symlink(target) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            create_workspace_symlink(&String::from_utf8_lossy(target), path)?;
+            Ok(true)
+        }
+        WorkspacePathState::Other => {
+            Err("Unsupported workspace path type in autonomous patch".to_string())
+        }
+    }
+}
+
+fn rewrite_patch_paths(
+    patch: Vec<u8>,
+    relative: &str,
+    before_exists: bool,
+    after_exists: bool,
+) -> Vec<u8> {
+    let mut rewritten = Vec::new();
+    let mut first = true;
+    let mut old_header = false;
+    let mut new_header = false;
+    for line in patch.split_inclusive(|byte| *byte == b'\n') {
+        if first {
+            rewritten
+                .extend_from_slice(format!("diff --git a/{relative} b/{relative}\n").as_bytes());
+            first = false;
+        } else if line.starts_with(b"--- ") && !old_header {
+            rewritten.extend_from_slice(
+                if before_exists {
+                    format!("--- a/{relative}\n").into_bytes()
+                } else {
+                    b"--- /dev/null\n".to_vec()
+                }
+                .as_slice(),
+            );
+            old_header = true;
+        } else if line.starts_with(b"+++ ") && !new_header {
+            rewritten.extend_from_slice(
+                if after_exists {
+                    format!("+++ b/{relative}\n").into_bytes()
+                } else {
+                    b"+++ /dev/null\n".to_vec()
+                }
+                .as_slice(),
+            );
+            new_header = true;
+        } else {
+            rewritten.extend_from_slice(line);
+        }
+    }
+    rewritten
+}
+
+pub fn patch_bytes_since_snapshot(
+    data_root: &Path,
+    workspace_root: &Path,
+    snapshot_id: &str,
+) -> Result<Vec<u8>, String> {
+    let (dir, entries) = snapshot_entries(data_root, snapshot_id)?;
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let changed = changed_files_since_snapshot(data_root, &root, snapshot_id)?;
+    let temp = std::env::temp_dir().join(format!(
+        "lm-autonomous-patch-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir(&temp)
+        .map_err(|error| format!("Could not create autonomous patch staging directory: {error}"))?;
+    let mut patch = Vec::new();
+    for relative in changed {
+        let before = if let Some(entry) = entries.iter().find(|entry| entry.path == relative) {
+            if !entry.existed {
+                WorkspacePathState::Missing
+            } else if entry.kind == "symlink" {
+                WorkspacePathState::Symlink(
+                    entry
+                        .symlink_target
+                        .clone()
+                        .unwrap_or_default()
+                        .into_bytes(),
+                )
+            } else if entry.kind == "other" {
+                WorkspacePathState::Other
+            } else {
+                WorkspacePathState::File(
+                    std::fs::read(dir.join("files").join(&relative))
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+        } else {
+            git_head_state(&root, &relative)?
+        };
+        let after = workspace_path_state(&root, &relative)?;
+        if before == after {
+            continue;
+        }
+        let before_path = temp.join("before").join(&relative);
+        let after_path = safe_workspace_path(&root, &relative)?;
+        let before_exists = materialize_patch_state(&before_path, &before)?;
+        let after_exists = !matches!(after, WorkspacePathState::Missing);
+        let before_arg = if before_exists {
+            before_path.to_string_lossy().into_owned()
+        } else {
+            "/dev/null".to_string()
+        };
+        let after_arg = if after_exists {
+            after_path.to_string_lossy().into_owned()
+        } else {
+            "/dev/null".to_string()
+        };
+        let output = run_git(
+            &root,
+            &[
+                "diff",
+                "--no-index",
+                "--binary",
+                "--no-prefix",
+                "--",
+                &before_arg,
+                &after_arg,
+            ],
+        )?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            let _ = std::fs::remove_dir_all(&temp);
+            return Err(format!(
+                "Could not collect autonomous patch for '{relative}'"
+            ));
+        }
+        patch.extend(rewrite_patch_paths(
+            output.stdout,
+            &relative,
+            before_exists,
+            after_exists,
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&temp);
+    Ok(patch)
 }
 
 pub fn restore_workspace_paths(
@@ -236,25 +596,26 @@ pub fn restore_workspace_paths(
         .map_err(|error| format!("Could not resolve workspace root: {error}"))?;
     for value in paths {
         let relative = relative_path(value)?;
-        let absolute = root.join(&relative);
         if let Some(entry) = entries.iter().find(|entry| entry.path == *value) {
-            if entry.existed {
-                let source = dir.join("files").join(&relative);
-                if let Some(parent) = absolute.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                std::fs::copy(source, &absolute).map_err(|error| {
-                    format!("Could not restore workspace path '{value}': {error}")
-                })?;
-            } else if absolute.is_file() || absolute.is_symlink() {
-                std::fs::remove_file(&absolute).map_err(|error| {
-                    format!("Could not remove workspace path '{value}': {error}")
-                })?;
-            } else if absolute.is_dir() {
-                std::fs::remove_dir_all(&absolute).map_err(|error| {
-                    format!("Could not remove workspace path '{value}': {error}")
-                })?;
-            }
+            let state = if !entry.existed {
+                WorkspacePathState::Missing
+            } else if entry.kind == "symlink" {
+                WorkspacePathState::Symlink(
+                    entry
+                        .symlink_target
+                        .clone()
+                        .unwrap_or_default()
+                        .into_bytes(),
+                )
+            } else if entry.kind == "other" {
+                WorkspacePathState::Other
+            } else {
+                WorkspacePathState::File(
+                    std::fs::read(dir.join("files").join(&relative))
+                        .map_err(|error| error.to_string())?,
+                )
+            };
+            restore_workspace_state(&root, value, &state)?;
             continue;
         }
         let tracked = run_git(&root, &["ls-files", "--error-unmatch", "--", value])
@@ -263,12 +624,17 @@ pub fn restore_workspace_paths(
         if tracked {
             run_git_ok(
                 &root,
-                &["restore", "--source=HEAD", "--staged", "--worktree", "--", value],
+                &[
+                    "restore",
+                    "--source=HEAD",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    value,
+                ],
             )?;
-        } else if absolute.is_file() || absolute.is_symlink() {
-            std::fs::remove_file(&absolute).map_err(|error| error.to_string())?;
-        } else if absolute.is_dir() {
-            std::fs::remove_dir_all(&absolute).map_err(|error| error.to_string())?;
+        } else {
+            remove_workspace_path(&root, value)?;
         }
     }
     Ok(())
@@ -442,19 +808,18 @@ pub fn require_registered(data_root: &Path, path: &str) -> Result<AgentWorktreeR
 pub fn status(data_root: &Path, path: &str) -> Result<AgentWorktreeStatus, String> {
     let record = require_registered(data_root, path)?;
     let wt = Path::new(&record.path);
-    let porcelain = run_git_ok(wt, &["status", "--porcelain"])?;
-    let interesting: Vec<&str> = porcelain
-        .lines()
-        .filter(|line| !line.ends_with(MARKER_FILE))
-        .collect();
-    let dirty = !interesting.is_empty();
+    let changed_files = workspace_changed_files(wt)?;
+    let dirty = !changed_files.is_empty();
     let mut diffstat = run_git_ok(wt, &["diff", "--stat", "HEAD"])
         .unwrap_or_default()
         .trim_end()
         .to_string();
-    for line in &interesting {
-        if line.starts_with("??") {
-            diffstat.push_str(&format!("\n{} (untracked)", line[2..].trim()));
+    for path in &changed_files {
+        let tracked = run_git(wt, &["ls-files", "--error-unmatch", "--", path])
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !tracked {
+            diffstat.push_str(&format!("\n{path} (untracked)"));
         }
     }
     let base_revision = run_git_ok(wt, &["rev-parse", "HEAD"])?;
@@ -465,17 +830,9 @@ pub fn status(data_root: &Path, path: &str) -> Result<AgentWorktreeStatus, Strin
             .unwrap_or_default()
             .as_bytes(),
     );
-    let changed_files = interesting
-        .iter()
-        .filter_map(|line| line.get(3..))
-        .map(|path| path.trim().trim_matches('"').to_string())
-        .filter(|path| !path.is_empty())
-        .collect::<Vec<_>>();
     for path in &changed_files {
         hasher.update(path.as_bytes());
-        if let Ok(bytes) = std::fs::read(wt.join(path)) {
-            hasher.update(bytes);
-        }
+        hasher.update(workspace_path_state(wt, path)?.bytes());
     }
     Ok(AgentWorktreeStatus {
         dirty,
@@ -491,22 +848,14 @@ pub fn workspace_revision(data_root: &Path, workspace_root: &Path) -> Result<Str
         .canonicalize()
         .map_err(|error| error.to_string())?;
     let head = run_git_ok(&root, &["rev-parse", "HEAD"])?;
-    let status = run_git_ok(&root, &["status", "--porcelain"])?;
+    let diff = run_git_ok(&root, &["diff", "--binary", "HEAD", "--"])?;
     let mut hasher = Sha256::new();
     hasher.update(head.as_bytes());
-    hasher.update(status.as_bytes());
-    hasher.update(
-        run_git_ok(&root, &["diff", "HEAD", "--binary"])
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    if let Ok(untracked) = run_git_ok(&root, &["ls-files", "--others", "--exclude-standard"]) {
-        for path in untracked.lines() {
-            hasher.update(path.as_bytes());
-            if let Ok(bytes) = std::fs::read(root.join(path)) {
-                hasher.update(bytes);
-            }
-        }
+    hasher.update(diff.as_bytes());
+    for path in workspace_changed_files(&root)? {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(workspace_path_state(&root, &path)?.bytes());
     }
     let _ = data_root;
     Ok(format!("{:x}", hasher.finalize()))
@@ -961,10 +1310,81 @@ mod tests {
         let changed = changed_files_since_snapshot(&data, &repo, &saved.id).unwrap();
         assert_eq!(changed, vec!["a.txt".to_string(), "secret.txt".to_string()]);
         restore_workspace_paths(&data, &repo, &saved.id, &["secret.txt".to_string()]).unwrap();
-        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "allowed\n");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).unwrap(),
+            "allowed\n"
+        );
         assert!(!repo.join("secret.txt").exists());
         discard_snapshot(&data, &saved.id).unwrap();
         assert!(!snapshot_dir(&data, &saved.id).unwrap().exists());
+    }
+
+    #[test]
+    fn workspace_snapshot_enumerates_preexisting_untracked_directories_file_by_file() {
+        let data = temp_dir("data-untracked-tree");
+        let repo = init_repo("untracked-tree");
+        std::fs::create_dir_all(repo.join("generated")).unwrap();
+        std::fs::write(repo.join("generated/preexisting.json"), "before\n").unwrap();
+        let saved = snapshot(&data, &repo).unwrap();
+        assert_eq!(saved.changed_files, vec!["generated/preexisting.json"]);
+        std::fs::write(repo.join("generated/secret.json"), "secret\n").unwrap();
+        assert_eq!(
+            changed_files_since_snapshot(&data, &repo, &saved.id).unwrap(),
+            vec!["generated/secret.json"]
+        );
+        restore_workspace_paths(
+            &data,
+            &repo,
+            &saved.id,
+            &["generated/secret.json".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("generated/preexisting.json")).unwrap(),
+            "before\n"
+        );
+        assert!(!repo.join("generated/secret.json").exists());
+    }
+
+    #[test]
+    fn workspace_snapshot_patch_contains_only_the_exact_node_delta() {
+        let data = temp_dir("data-exact-patch");
+        let repo = init_repo("exact-patch");
+        std::fs::write(repo.join("a.txt"), "user dirty\n").unwrap();
+        let saved = snapshot(&data, &repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "worker change\n").unwrap();
+        std::fs::write(repo.join("node.txt"), "node only\n").unwrap();
+        let patch = patch_bytes_since_snapshot(&data, &repo, &saved.id).unwrap();
+        let text = String::from_utf8_lossy(&patch);
+        assert!(text.contains("-user dirty"), "{text}");
+        assert!(text.contains("+worker change"), "{text}");
+        assert!(text.contains("node.txt"), "{text}");
+        assert!(
+            !text.contains("hello"),
+            "pre-node HEAD content leaked into patch: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_snapshot_restores_symlink_identity_without_following_target() {
+        let data = temp_dir("data-symlink");
+        let repo = init_repo("symlink");
+        let outside = temp_dir("symlink-target");
+        std::fs::write(outside.join("secret.txt"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), repo.join("link.txt")).unwrap();
+        let saved = snapshot(&data, &repo).unwrap();
+        std::fs::remove_file(repo.join("link.txt")).unwrap();
+        std::fs::write(repo.join("link.txt"), "attacker\n").unwrap();
+        restore_workspace_paths(&data, &repo, &saved.id, &["link.txt".to_string()]).unwrap();
+        assert!(std::fs::symlink_metadata(repo.join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "outside\n"
+        );
     }
 
     #[test]

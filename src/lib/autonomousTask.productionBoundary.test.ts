@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 vi.mock("@tauri-apps/api/core", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@tauri-apps/api/core")>();
@@ -20,10 +22,10 @@ vi.mock("./agentWorktree", () => ({
 }));
 
 import { createAutonomousTask, createTaskPlan, installTaskPlan } from "./autonomousTask";
-import { defaultAutonomousTaskRuntime, runAutonomousTask } from "./autonomousTaskRunner";
+import { buildAutonomousPlacementRunSpec, defaultAutonomousTaskRuntime, runAutonomousTask } from "./autonomousTaskRunner";
 import { agentWorktreeClient } from "./agentWorktree";
 
-const target = { kind: "provider", key: "provider:test:model", label: "test" } as never;
+const target = { kind: "provider", key: "provider:test:model", label: "test", displayName: "test", providerId: "test", endpoint: "https://example.test", model: "model", credentialRefId: "credential:test", capabilities: { toolCalling: { state: "yes", evidence: "test" }, vision: { state: "unknown", evidence: "test" } }, availability: { status: "available", evidence: "test" } } as never;
 const roots = [{ id: "root", path: "/tmp", label: "workspace", is_primary: true }];
 const permissions = { mode: "auto", unattended: true, allowNetwork: false, allowExternalMutations: false };
 
@@ -41,5 +43,14 @@ describe("default autonomous runtime production boundary", () => {
     expect(result.outcome).toBe("WAITING_USER");
     expect(agentWorktreeClient.workspaceRestorePaths).toHaveBeenCalledWith("snapshot-1", ["secret.txt"]);
     expect(agentWorktreeClient.workspaceSnapshotDiscard).toHaveBeenCalled();
+  });
+
+  it.each(["remote_node", "docker"] as const)("consumes %s placement before the receiver process runs", async (kind) => {
+    const base = createAutonomousTask({ objective: "edit allowed.ts", targetSnapshot: target, workspaceRoots: roots, permissionSnapshot: permissions, constraints: { strategy: "DIRECT" }, planningContext: { relevantFiles: ["allowed.ts"] } });
+    const plan = createTaskPlan("edit allowed.ts", "DIRECT", 1, base.planningContext);
+    const sourceNode = { ...plan.nodes.find((node) => node.taskClass === "implementation")!, executionPlacement: { kind, targetId: kind === "docker" ? "runner:latest" : "runner-1", nodeId: "implement", reason: "test placement" } };
+    const spec = buildAutonomousPlacementRunSpec(installTaskPlan(base, plan), sourceNode, kind);
+    const receiver = await promisify(execFile)(process.execPath, ["-e", "const spec=JSON.parse(process.argv[1]); const node=spec.autonomous_task.task_snapshot.plan.nodes[0]; if(node.executionPlacement.kind !== 'local' || node.executionPlacement.placementFulfilled !== true) process.exit(2); console.log(node.requestedExecutionPlacement.kind)", JSON.stringify(spec)]);
+    expect(receiver.stdout.trim()).toBe(kind);
   });
 });

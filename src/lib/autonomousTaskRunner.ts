@@ -72,10 +72,31 @@ export interface AutonomousTaskPlacementAdapters {
   remote_node?: AutonomousTaskPlacementAdapter;
 }
 
-function placementRunSpec(task: AutonomousTask, node: TaskPlanNode): RunSpecWire {
+function consumedPlacementNode(node: TaskPlanNode, kind: "docker" | "remote_node"): TaskPlanNode {
+  const requestedPlacement = structuredClone(node.executionPlacement);
+  const isolation = kind === "docker" ? "shared" as const : node.isolation;
+  return {
+    ...structuredClone(node),
+    dependencies: [],
+    isolation,
+    requestedExecutionPlacement: requestedPlacement,
+    executionPlacement: {
+      kind: "local",
+      targetId: "local",
+      nodeId: node.nodeId,
+      reason: `already fulfilled by ${kind} placement executor`,
+      requestedPlacement,
+      placementFulfilled: true,
+    },
+    executionRequirements: node.executionRequirements ? { ...structuredClone(node.executionRequirements), isolation } : undefined,
+  };
+}
+
+export function buildAutonomousPlacementRunSpec(task: AutonomousTask, node: TaskPlanNode, kind: "docker" | "remote_node"): RunSpecWire {
+  const placedNode = consumedPlacementNode(node, kind);
   const taskSnapshot = {
     ...structuredClone(task),
-    plan: task.plan ? { ...structuredClone(task.plan), nodes: [{ ...structuredClone(node), dependencies: [] }] } : null,
+    plan: task.plan ? { ...structuredClone(task.plan), nodes: [placedNode] } : null,
     outcome: "RUNNING",
     executionOwner: { kind: "remote", instanceId: `placement-${task.taskId}-${node.nodeId}`, leaseEpoch: 1, leaseExpiresAtMs: Date.now() + task.budgetSnapshot.wallTimeMs },
     updatedAtMs: Date.now(),
@@ -87,7 +108,7 @@ function placementRunSpec(task: AutonomousTask, node: TaskPlanNode): RunSpecWire
     created_at_ms: Date.now(),
     kind: "autonomous_task",
     submitted_by: { client_id: "little-monkey-desktop-autonomous", instance_id: task.taskId, kind: "desktop", version: "1.0.0" },
-    task: node.objective,
+    task: placedNode.objective,
     instructions: "Execute only the frozen autonomous task node and return durable evidence.",
     input_artifact_ids: [],
     target: modelTargetToRunWire(task.targetSnapshot),
@@ -107,9 +128,9 @@ function placementRunSpec(task: AutonomousTask, node: TaskPlanNode): RunSpecWire
     autonomous_task: {
       schema_version: 1,
       task_id: `${task.taskId}-${node.nodeId}`,
-      objective: node.objective,
+      objective: placedNode.objective,
       source: task.source,
-      relevant_files: node.relevantFiles ?? task.planningContext?.relevantFiles ?? [],
+      relevant_files: placedNode.relevantFiles ?? task.planningContext?.relevantFiles ?? [],
       current_workspace_revision: task.workspaceRevision ?? task.planningContext?.currentWorkspaceRevision ?? "unknown",
       max_repair_rounds: task.budgetSnapshot.maxRepairRounds,
       max_workers: 1,
@@ -119,14 +140,14 @@ function placementRunSpec(task: AutonomousTask, node: TaskPlanNode): RunSpecWire
       previous_execution_owner: null,
       task_snapshot: taskSnapshot,
       completed_nodes: [],
-      next_node_id: node.nodeId,
+      next_node_id: placedNode.nodeId,
     },
   };
 }
 
 function defaultAutonomousTaskPlacementAdapters(): AutonomousTaskPlacementAdapters {
   const execute = async (kind: "docker" | "remote_node", task: AutonomousTask, node: TaskPlanNode): Promise<TaskNodeResult> => {
-    const spec = placementRunSpec(task, node);
+    const spec = buildAutonomousPlacementRunSpec(task, node, kind);
     const targetId = node.executionPlacement?.targetId?.trim();
     if (!targetId) return { ok: false, summary: `Execution placement '${kind}' has no target id.` };
     try {
@@ -276,7 +297,7 @@ function mutatingRepairSources(plan: TaskPlan, failedNode: TaskPlanNode): TaskPl
   };
   if (failedNode.taskClass === "implementation") sources.push(failedNode);
   else visit(failedNode);
-  if (sources.length === 0) sources.push(...integrations);
+  if (integrations.length > 0) return [...new Map(integrations.map((node) => [node.nodeId, node])).values()];
   return [...new Map(sources.map((node) => [node.nodeId, node])).values()];
 }
 
@@ -294,10 +315,14 @@ function insertRepairNode(task: AutonomousTask, failedNode: TaskPlanNode, summar
   if (!task.plan || failedNode.taskClass === "delivery") return task;
   const sources = mutatingRepairSources(task.plan, failedNode);
   if (sources.length === 0) return task;
+  const mutatingFailedNode = failedNode.taskClass === "implementation" || failedNode.taskClass === "integration";
+  if (!mutatingFailedNode) {
+    const placementKeys = new Set(sources.map((source) => `${source.executionPlacement?.kind ?? "local"}:${source.executionPlacement?.targetId ?? "local"}`));
+    if (placementKeys.size > 1) return task;
+  }
   const scope = [...new Set(sources.flatMap((node) => node.mutationScope))].sort();
   if (scope.length === 0 || !sources.some((node) => node.capabilities?.includes("mutate"))) return task;
   const source = sources[0];
-  const mutatingFailedNode = failedNode.taskClass === "implementation" || failedNode.taskClass === "integration";
   const isolation = mutatingFailedNode ? failedNode.isolation : source.isolation;
   const executionPlacement = mutatingFailedNode ? failedNode.executionPlacement : source.executionPlacement;
   const capabilities = [...new Set((mutatingFailedNode ? failedNode.capabilities : source.capabilities) ?? ["read", "mutate", "verify"])]
