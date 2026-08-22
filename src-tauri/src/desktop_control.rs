@@ -1624,7 +1624,7 @@ function ActionsOf($e) {
   }
   return @($a | Select-Object -Unique)
 }
-function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$rect.X;$y=[double]$rect.Y;$width=[double]$rect.Width;$height=[double]$rect.Height}catch{};[ordered]@{x=$x;y=$y;width=$width;height=$height} }
+function RectOf($rect) { $x=0.0;$y=0.0;$width=0.0;$height=0.0;try{$x=[double]$rect.X;$y=[double]$rect.Y;$width=[double]$rect.Width;$height=[double]$rect.Height}catch{};foreach($key in @('x','y','width','height')){ $value=Get-Variable $key -ValueOnly; if([double]::IsNaN($value) -or [double]::IsInfinity($value)){Set-Variable $key 0.0} };[ordered]@{x=$x;y=$y;width=$width;height=$height} }
 function AncestorText($e) { $parts=@();$current=$e;for($k=0;$k -lt 8;$k++){try{$current=$walker.GetParent($current);if($null -eq $current){break};$parts+=[string]$current.Current.Name}catch{break}};return ($parts -join ' ') }
 for($i=0;$i -lt $windows.Count -and $i -lt 64;$i++){
   $w=$windows.Item($i);$p=$w.Current.ProcessId;$id=if($fixtureFallback){"process:$onlyPid"}else{"process:$p"};$name=[string]$w.Current.Name;$windowId=[string]$w.Current.NativeWindowHandle;$targetId="$id::window-$i";
