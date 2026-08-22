@@ -1582,9 +1582,9 @@ if($action -eq 'set_value') {
   try { $p=$e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern); $p.Select(); $performed=$true } catch {}
 } elseif($action -eq 'click' -or $action -eq 'double_click') {
   $toggleSupported=$false
-  try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $toggleSupported=$true; $before=$p.Current.ToggleState; $p.Toggle(); $after=$p.Current.ToggleState; $performed=$after -ne $before } catch {}
+  try { $p=$e.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern); $toggleSupported=$true; $p.Toggle(); $performed=$true } catch {}
   if(-not $performed -and -not $toggleSupported) { try { $p=$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern); $p.Invoke(); $performed=$true } catch {} }
-  if($performed -and $action -eq 'double_click') { try { $p.Invoke(); } catch {} }
+  if($performed -and $action -eq 'double_click') { try { if($toggleSupported) { $p.Toggle() } else { $p.Invoke() } } catch {} }
 }
 if($performed) { [ordered]@{semantic=$true}|ConvertTo-Json -Compress } else { [ordered]@{semantic=$false}|ConvertTo-Json -Compress }
 "#;
