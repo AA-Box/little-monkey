@@ -130,7 +130,8 @@ fn find_profile_element<'a>(inspection: &'a ComputerInspection) -> Option<&'a Co
         !element.sensitive
             && (element.label == "Profile name"
                 || element.value.as_deref() == Some("Test profile")
-                || element.value.as_deref() == Some("hello"))
+                || element.value.as_deref() == Some("hello")
+                || element.role.to_ascii_lowercase().contains("edit"))
             && element.actions.iter().any(|action| action == "set_value")
     })
 }
