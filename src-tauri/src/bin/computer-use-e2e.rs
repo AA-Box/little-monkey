@@ -224,11 +224,21 @@ fn run(fixture: &str, trace_path: &str, screenshot_path: &str) -> Result<(), Str
                 ..SessionGrantOptions::default()
             },
         )?;
-        let targets = state.list_targets_for_session(&session.session_id)?;
-        let target = targets
-            .iter()
-            .find(|target| target_is_fixture(target))
-            .cloned()
+        let mut target = None;
+        for attempt in 0..20 {
+            match state.list_targets_for_session(&session.session_id) {
+                Ok(targets) => {
+                    target = targets.into_iter().find(|target| target_is_fixture(target));
+                    if target.is_some() {
+                        break;
+                    }
+                }
+                Err(error) if attempt == 19 => return Err(error),
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        let target = target
             .ok_or_else(|| "production accessibility provider did not find fixture".to_string())?;
         let first = inspect(&state, &session.session_id, &target)?;
         let secure = first.sensitive_element_count > 0;
