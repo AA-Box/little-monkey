@@ -4928,23 +4928,30 @@ mod tests {
                 bounds: None,
             })
             .map_err(|error| error.to_string())?;
-            let listed = json(call(
-                "remote-list-discovery",
-                "POST",
-                "/v1/remote/desktop-control/list-targets",
-                list_body,
-            ))?;
-            let target = listed["targets"]
-                .as_array()
-                .and_then(|targets| {
-                    targets
-                        .iter()
-                        .find(|target| target["windowTitle"] == "Little Monkey TestApp")
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    "signed remote runner did not discover the fixture window".to_string()
-                })?;
+            let mut target = None;
+            for attempt in 0..20 {
+                let listed = json(call(
+                    &format!("remote-list-discovery-{attempt}"),
+                    "POST",
+                    "/v1/remote/desktop-control/list-targets",
+                    list_body.clone(),
+                ))?;
+                target = listed["targets"]
+                    .as_array()
+                    .and_then(|targets| {
+                        targets
+                            .iter()
+                            .find(|target| target["windowTitle"] == "Little Monkey TestApp")
+                    })
+                    .cloned();
+                if target.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            let target = target.ok_or_else(|| {
+                "signed remote runner did not discover the fixture window".to_string()
+            })?;
             let application_id = target["applicationId"].as_str().unwrap().to_string();
             let window_id = target["windowId"].as_str().unwrap().to_string();
             let stop_discovery = serde_json::to_vec(&DesktopControlStopRequest {
