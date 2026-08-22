@@ -319,8 +319,10 @@ fn focus_fixture_for_native_actions(
     session_id: &str,
     target: &ComputerTarget,
 ) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     run_action(state, session_id, target, ControlAction::Focus)?;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = (state, session_id, target);
     Ok(())
 }
 
