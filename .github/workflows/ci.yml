@@ -374,6 +374,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stage CLI sidecar placeholder
+        # The production acceptance binary is built through the Tauri crate,
+        # whose build script requires the platform-named external binary even
+        # though this job does not package the desktop app.
+        run: node scripts/ensure-cli-sidecar-placeholder.mjs
+
       - name: Run native Computer Use acceptance (macOS)
         if: matrix.os == 'macos-latest'
         run: |
