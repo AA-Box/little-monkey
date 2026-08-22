@@ -1641,15 +1641,9 @@ def walk(node, path=()):
   yield child, child_path
   yield from walk(child, child_path)
 targets=[]; elements={}; desktop=pyatspi.Registry.getDesktop(0)
-try: only_pid=int(__import__('os').environ.get('COMPUTER_USE_FIXTURE_PID','0') or 0)
-except Exception: only_pid=0
-def process_id(app):
- try: return int(app.get_process_id())
- except Exception: return 0
 for app in list(desktop)[:64]:
- if only_pid and process_id(app) not in (0, only_pid): continue
  raw_name=str(getattr(app,'name','') or '')
- name=raw_name or ('Python' if only_pid and process_id(app)==only_pid else raw_name)
+ name=raw_name or 'Python'
  aid='atspi:'+name
  for wi,w in enumerate(list(app)[:32]):
   title=str(getattr(w,'name','')); tid=aid+'::window-'+str(wi); st=w.getState(); target={'targetId':tid,'applicationId':aid,'applicationName':name,'windowId':tid,'windowTitle':title,'bounds':rect(w),'focused':bool(st.contains(pyatspi.STATE_ACTIVE)),'sensitive':False,'supportedActions':['inspect','focus','click','double_click','scroll','type','key','hotkey','screenshot']};targets.append(target); out=[]

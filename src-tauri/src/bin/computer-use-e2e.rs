@@ -123,11 +123,14 @@ fn target_is_fixture(target: &ComputerTarget) -> bool {
 
 fn target_is_primary_fixture(target: &ComputerTarget) -> bool {
     target.window_title == "Little Monkey TestApp"
-        || (target.window_title.is_empty()
-            && target
-                .application_name
+        || (target
+            .application_name
+            .to_ascii_lowercase()
+            .contains("python")
+            && !target
+                .window_title
                 .to_ascii_lowercase()
-                .contains("python"))
+                .contains("secondary"))
 }
 
 fn find_element<'a>(

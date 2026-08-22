@@ -295,6 +295,9 @@ def main() -> int:
             production_environment["COMPUTER_USE_FIXTURE_SCRIPT"] = str(
                 args.fixture.with_name("computer-use-test-app-linux.py")
             )
+            production_environment["GDK_BACKEND"] = "x11"
+            production_environment["GTK_MODULES"] = "gail:atk-bridge"
+            production_environment.pop("NO_AT_BRIDGE", None)
         completed = subprocess.run(
             production_command
             + ["--fixture", str(args.fixture), "--trace", str(args.trace), "--screenshot", str(screenshot)],
