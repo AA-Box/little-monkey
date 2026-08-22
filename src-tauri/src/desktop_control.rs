@@ -1659,7 +1659,7 @@ for app in list(desktop)[:64]:
    try:
     qa=e.queryAction()
     for ai in range(qa.nActions):
-     name=(qa.getActionName(ai) or '').lower()
+     name=(qa.getName(ai) or '').lower()
      if name in ('click','press','activate','select'): actions.append(name)
    except Exception: pass
    try: e.queryEditableText(); actions.append('set_value')
@@ -1861,7 +1861,7 @@ action=os.environ['LM_ACTION']
 if action in ('click','double_click','select'):
  actions=e.queryAction(); done=False
  for i in range(actions.nActions):
-  name=(actions.getActionName(i) or '').lower()
+  name=(actions.getName(i) or '').lower()
   if name in ('click','press','activate','select'):
    actions.doAction(i)
    if action == 'double_click': actions.doAction(i)
